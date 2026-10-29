@@ -60,12 +60,13 @@ pub struct RewriteResult {
     pub backup_directory: PathBuf,
 }
 
-/// A partial world save. Chunk regions and optional player data are replaced in
-/// one recoverable transaction; level, entity, POI, and other files are not
+/// A partial world save. Regions and optional player data are replaced in
+/// one recoverable transaction; level, POI, and other files are not
 /// implied by this type.
 #[derive(Default)]
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
+    entity_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedWorldClocks>,
 }
@@ -74,6 +75,27 @@ struct PlannedChunk {
     dimension: DimensionId,
     draft: crate::edit::ChunkDraft,
     region_timestamp_seconds: u32,
+}
+
+struct PlannedEntityChunk {
+    dimension: DimensionId,
+    position: crate::world::ChunkPos,
+    source_nbt: Option<Vec<u8>>,
+    replacement: Option<Vec<u8>>,
+    region_timestamp_seconds: u32,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum RegionKind {
+    Blocks,
+    Entities,
+}
+
+struct RegionChange {
+    position: crate::world::ChunkPos,
+    source_nbt: Option<Vec<u8>>,
+    replacement: Option<Vec<u8>>,
+    timestamp: u32,
 }
 
 struct PlannedPlayerData {
@@ -115,6 +137,86 @@ impl WorldSavePlan {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Add an entity chunk to a coordinated partial save. The caller must
+    /// validate entity ownership, movement and all simulated side effects.
+    /// Missing entity regions are not yet supported by the transaction layer.
+    pub fn add_entity_chunk(
+        &mut self,
+        dimension: DimensionId,
+        position: crate::world::ChunkPos,
+        source: Option<&nbt::NamedTag>,
+        document: &nbt::NamedTag,
+        region_timestamp_seconds: u32,
+        mut validate: impl FnMut(Option<&nbt::NamedTag>, &nbt::NamedTag) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .entity_chunks
+                .iter()
+                .any(|chunk| chunk.dimension == dimension && chunk.position == position),
+            "world save plan contains a duplicate entity chunk"
+        );
+        validate(source, document)?;
+        if let Some(source) = source {
+            validate_entity_document(source, position)?;
+            ensure!(
+                source.name == document.name
+                    && source.value.get("DataVersion") == document.value.get("DataVersion")
+                    && source.value.get("Position") == document.value.get("Position"),
+                "entity chunk identity changed"
+            );
+            let Tag::Compound(before) = &source.value else {
+                unreachable!()
+            };
+            let Tag::Compound(after) = &document.value else {
+                anyhow::bail!("entity chunk must be a compound")
+            };
+            let other_fields = |fields: &[(nbt::JavaString, Tag)]| {
+                fields
+                    .iter()
+                    .filter(|(name, _)| {
+                        !["DataVersion", "Position", "Entities"]
+                            .iter()
+                            .any(|key| name.matches(key))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let encoded_fields = |fields: &[(nbt::JavaString, Tag)]| {
+                nbt::write(&nbt::NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(other_fields(fields)),
+                })
+            };
+            ensure!(
+                encoded_fields(before)? == encoded_fields(after)?,
+                "unrecognized entity chunk fields changed"
+            );
+        }
+        let empty = validate_entity_document(document, position)?;
+        let Tag::Compound(fields) = &document.value else {
+            unreachable!()
+        };
+        let has_extra_fields = fields.iter().any(|(name, _)| {
+            !["DataVersion", "Position", "Entities"]
+                .iter()
+                .any(|key| name.matches(key))
+        });
+        let preserve_empty = source.is_some() && (!document.name.0.is_empty() || has_extra_fields);
+        self.entity_chunks.push(PlannedEntityChunk {
+            dimension,
+            position,
+            source_nbt: source.map(nbt::write).transpose()?,
+            replacement: if empty && !preserve_empty {
+                None
+            } else {
+                Some(nbt::write(document)?)
+            },
+            region_timestamp_seconds,
+        });
+        Ok(())
     }
 
     /// Add one existing player's replacement to the same transaction as all
@@ -168,9 +270,31 @@ impl WorldSavePlan {
 #[derive(Debug)]
 pub struct WorldSaveResult {
     pub region_paths: Vec<PathBuf>,
+    pub entity_region_paths: Vec<PathBuf>,
     pub player_paths: Vec<PathBuf>,
     pub world_clocks_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
+}
+
+fn validate_entity_document(
+    document: &nbt::NamedTag,
+    position: crate::world::ChunkPos,
+) -> Result<bool> {
+    let Tag::Compound(fields) = &document.value else {
+        anyhow::bail!("entity chunk must be a compound")
+    };
+    for key in ["DataVersion", "Position", "Entities"] {
+        ensure!(
+            fields.iter().filter(|(name, _)| name.matches(key)).count() <= 1,
+            "duplicate entity chunk {key}"
+        );
+    }
+    crate::world::decode_entity_chunk(document.clone(), position)?;
+    Ok(match document.value.get("Entities") {
+        None => true,
+        Some(Tag::List { values, .. }) => values.is_empty(),
+        _ => unreachable!("entity list was validated"),
+    })
 }
 
 fn validate_player_document(document: &crate::nbt::NamedTag) -> Result<()> {
@@ -363,7 +487,7 @@ impl WorldWriteGuard {
     /// Write validated chunk drafts and optional player data as one recoverable
     /// transaction.
     ///
-    /// Level, entity, POI, and other world data are not included, so a gameplay
+    /// Level, POI, entity creation/removal and other world data are not implied, so a gameplay
     /// session must not enable saving from this partial plan.
     pub fn write_plan(
         &mut self,
@@ -371,10 +495,13 @@ impl WorldWriteGuard {
         mut validate_change: impl FnMut(&DimensionId, &crate::edit::BlockChange) -> Result<()>,
     ) -> Result<WorldSaveResult> {
         ensure!(
-            !plan.chunks.is_empty() || !plan.players.is_empty() || plan.world_clocks.is_some(),
+            !plan.chunks.is_empty()
+                || !plan.entity_chunks.is_empty()
+                || !plan.players.is_empty()
+                || plan.world_clocks.is_some(),
             "world save plan is empty"
         );
-        let mut groups = BTreeMap::<(DimensionId, i32, i32), Vec<(&PlannedChunk, Vec<u8>)>>::new();
+        let mut groups = BTreeMap::<(RegionKind, DimensionId, i32, i32), Vec<RegionChange>>::new();
         for chunk in &plan.chunks {
             chunk
                 .draft
@@ -383,12 +510,35 @@ impl WorldWriteGuard {
             let replacement = nbt::write(chunk.draft.document())?;
             groups
                 .entry((
+                    RegionKind::Blocks,
                     chunk.dimension.clone(),
                     position.x.div_euclid(REGION_SIDE),
                     position.z.div_euclid(REGION_SIDE),
                 ))
                 .or_default()
-                .push((chunk, replacement));
+                .push(RegionChange {
+                    position,
+                    source_nbt: Some(chunk.draft.source_nbt().to_vec()),
+                    replacement: Some(replacement),
+                    timestamp: chunk.region_timestamp_seconds,
+                });
+        }
+        for chunk in &plan.entity_chunks {
+            let position = chunk.position;
+            groups
+                .entry((
+                    RegionKind::Entities,
+                    chunk.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default()
+                .push(RegionChange {
+                    position,
+                    source_nbt: chunk.source_nbt.clone(),
+                    replacement: chunk.replacement.clone(),
+                    timestamp: chunk.region_timestamp_seconds,
+                });
         }
 
         let backup_root = self.root.join(".minecraft-native-backups");
@@ -415,16 +565,19 @@ impl WorldWriteGuard {
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut region_paths = Vec::with_capacity(groups.len());
+        let mut entity_region_paths = Vec::new();
         let mut player_paths = Vec::with_capacity(plan.players.len());
         let mut world_clocks_path = None;
 
-        for (group_index, ((dimension, region_x, region_z), chunks)) in
+        for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
         {
-            let region_dir = dimension
-                .region_dir(&self.root)
-                .canonicalize()
-                .context("cannot open dimension region directory")?;
+            let region_dir = match kind {
+                RegionKind::Blocks => dimension.region_dir(&self.root),
+                RegionKind::Entities => dimension.entity_region_dir(&self.root),
+            }
+            .canonicalize()
+            .context("cannot open dimension region directory")?;
             ensure!(
                 region_dir.starts_with(&self.root),
                 "region directory is outside the world"
@@ -472,40 +625,70 @@ impl WorldWriteGuard {
             }
 
             let mut expected_chunks = Vec::with_capacity(chunks.len());
-            for (planned, replacement) in chunks {
-                let position = planned.draft.position();
+            for planned in chunks {
+                let position = planned.position;
                 let original_nbt = RegionReader::open_for_region(stage.path(), region_x, region_z)?
-                    .read_chunk_nbt_bytes(position.x, position.z)?
-                    .context("cannot rewrite a missing chunk")?;
+                    .read_chunk_nbt_bytes(position.x, position.z)?;
                 ensure!(
-                    planned.draft.source_nbt() == original_nbt,
+                    planned.source_nbt == original_nbt,
                     "chunk changed after its draft was created"
                 );
-                let source = nbt::read(&original_nbt)?;
-                validate_chunk(&source.value, position.x, position.z)?;
-                let draft = nbt::read(&replacement).context("invalid chunk draft NBT")?;
-                validate_chunk(&draft.value, position.x, position.z)?;
-                ensure!(
-                    nbt::write(&draft)? == replacement,
-                    "chunk draft cannot be reserialized without changing its bytes"
-                );
-                write_staged_chunk(
-                    stage.as_file_mut(),
-                    position.x,
-                    position.z,
-                    &replacement,
-                    planned.region_timestamp_seconds,
-                )?;
-                expected_chunks.push((position, replacement));
+                if let Some(original) = &original_nbt {
+                    let source = nbt::read(original)?;
+                    match kind {
+                        RegionKind::Blocks => {
+                            validate_chunk(&source.value, position.x, position.z)?
+                        }
+                        RegionKind::Entities => {
+                            validate_entity_document(&source, position)?;
+                        }
+                    }
+                }
+                if let Some(replacement) = &planned.replacement {
+                    let draft = nbt::read(replacement).context("invalid chunk draft NBT")?;
+                    match kind {
+                        RegionKind::Blocks => validate_chunk(&draft.value, position.x, position.z)?,
+                        RegionKind::Entities => {
+                            validate_entity_document(&draft, position)?;
+                        }
+                    }
+                    ensure!(
+                        nbt::write(&draft)? == *replacement,
+                        "chunk draft cannot be reserialized without changing its bytes"
+                    );
+                    write_staged_chunk(
+                        stage.as_file_mut(),
+                        position.x,
+                        position.z,
+                        replacement,
+                        planned.timestamp,
+                    )?;
+                } else if original_nbt.is_some() {
+                    let external_file =
+                        region_dir.join(format!("c.{}.{}.mcc", position.x, position.z));
+                    match fs::symlink_metadata(&external_file) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Ok(_) => anyhow::bail!(
+                            "clearing a chunk with external storage is not yet supported"
+                        ),
+                        Err(error) => return Err(error.into()),
+                    }
+                    clear_staged_chunk(
+                        stage.as_file_mut(),
+                        position.x,
+                        position.z,
+                        planned.timestamp,
+                    )?;
+                }
+                expected_chunks.push((position, planned.replacement));
             }
             stage.as_file_mut().flush()?;
             stage.as_file().sync_all()?;
             for (position, expected) in expected_chunks {
                 let saved = RegionReader::open_for_region(stage.path(), region_x, region_z)?
-                    .read_chunk(position.x, position.z)?
-                    .context("staged chunk disappeared")?;
+                    .read_chunk_nbt_bytes(position.x, position.z)?;
                 ensure!(
-                    nbt::write(&saved)? == expected,
+                    saved == expected,
                     "staged chunk failed the NBT round-trip check"
                 );
             }
@@ -516,7 +699,10 @@ impl WorldWriteGuard {
                 stage,
                 original_hash,
             });
-            region_paths.push(canonical);
+            match kind {
+                RegionKind::Blocks => region_paths.push(canonical),
+                RegionKind::Entities => entity_region_paths.push(canonical),
+            }
         }
 
         for planned in &plan.players {
@@ -665,9 +851,11 @@ impl WorldWriteGuard {
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nplayers={}\nworld_clocks={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\nplayers={}\nworld_clocks={}",
             region_paths.len(),
             plan.chunks.len(),
+            entity_region_paths.len(),
+            plan.entity_chunks.len(),
             plan.players.len(),
             plan.world_clocks.is_some() as usize
         )?;
@@ -687,6 +875,7 @@ impl WorldWriteGuard {
 
         Ok(WorldSaveResult {
             region_paths,
+            entity_region_paths,
             player_paths,
             world_clocks_path,
             backup_directory,
@@ -920,10 +1109,10 @@ fn write_staged_chunk(
     let previous_offset = u64::from(previous_location >> 8);
     let previous_sectors = u64::from(previous_location & 255);
     ensure!(
-        previous_offset >= 2 && previous_sectors > 0,
-        "cannot rewrite an absent chunk"
+        previous_location == 0 || (previous_offset >= 2 && previous_sectors > 0),
+        "invalid chunk location"
     );
-    let reuse = allocation as u64 <= previous_sectors;
+    let reuse = previous_location != 0 && allocation as u64 <= previous_sectors;
     let offset = if reuse {
         previous_offset
     } else {
@@ -951,6 +1140,16 @@ fn write_staged_chunk(
     file.write_all(&location.to_be_bytes())?;
     file.seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
     file.write_all(&timestamp_seconds.to_be_bytes())?;
+    Ok(())
+}
+
+fn clear_staged_chunk(file: &mut File, x: i32, z: i32, timestamp: u32) -> Result<()> {
+    let index =
+        x.rem_euclid(REGION_SIDE) as u64 + z.rem_euclid(REGION_SIDE) as u64 * REGION_SIDE as u64;
+    file.seek(SeekFrom::Start(index * 4))?;
+    file.write_all(&0u32.to_be_bytes())?;
+    file.seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
+    file.write_all(&timestamp.to_be_bytes())?;
     Ok(())
 }
 
@@ -1340,6 +1539,282 @@ mod tests {
         region[start..start + 4].copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
         region[start + 4] = 2;
         region[start + 5..start + 5 + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    fn entity_chunk(x: i32, entities: Vec<Tag>) -> NamedTag {
+        NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Position".into(), Tag::IntArray(vec![x, 0])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: entities,
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn coordinated_save_moves_entity_between_existing_and_absent_chunks() {
+        let world = test_world();
+        let (block_path, mut block_bytes, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut block_bytes, 0, 2, &terrain, 10);
+        fs::write(&block_path, &block_bytes).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            ("unrecognized".into(), Tag::Int(7)),
+        ]);
+        let source = entity_chunk(0, vec![entity.clone()]);
+        let untouched = entity_chunk(
+            2,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let mut original = vec![0; 4 * SECTOR_SIZE as usize];
+        store_record(&mut original, 0, 2, &source, 11);
+        store_record(&mut original, 2, 3, &untouched, 12);
+        fs::write(&path, &original).unwrap();
+        let destination = entity_chunk(1, vec![entity]);
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            100,
+        )
+        .unwrap();
+        plan.add_entity_chunk(
+            dimension.clone(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &entity_chunk(0, vec![]),
+            101,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        plan.add_entity_chunk(
+            dimension.clone(),
+            ChunkPos { x: 1, z: 0 },
+            None,
+            &destination,
+            102,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            result.entity_region_paths,
+            vec![path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-1/r.0.0.mca")).unwrap(),
+            original
+        );
+        let mut reader = RegionReader::open_for_region(&path, 0, 0).unwrap();
+        assert!(reader.read_chunk(0, 0).unwrap().is_none());
+        assert_eq!(reader.read_chunk(1, 0).unwrap().unwrap(), destination);
+        assert_eq!(reader.read_chunk(2, 0).unwrap().unwrap(), untouched);
+        let saved = fs::read(&path).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(saved[4096..4100].try_into().unwrap()),
+            101
+        );
+        assert_eq!(
+            u32::from_be_bytes(saved[4100..4104].try_into().unwrap()),
+            102
+        );
+        assert_ne!(fs::read(&block_path).unwrap(), block_bytes);
+    }
+
+    #[test]
+    fn stale_or_invalid_entity_chunks_never_replace_world_files() {
+        let world = test_world();
+        let (block_path, mut original_blocks, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut original_blocks, 0, 2, &terrain, 10);
+        fs::write(&block_path, &original_blocks).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let entity = Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]);
+        let source = entity_chunk(0, vec![entity.clone()]);
+        let mut original = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut original, 0, 2, &source, 11);
+        fs::write(&path, &original).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            100,
+        )
+        .unwrap();
+        assert!(
+            plan.add_entity_chunk(
+                dimension.clone(),
+                ChunkPos { x: 1, z: 0 },
+                None,
+                &source,
+                1,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        let mut ambiguous = source.clone();
+        let Tag::Compound(fields) = &mut ambiguous.value else {
+            unreachable!()
+        };
+        fields.push(("Position".into(), Tag::IntArray(vec![0, 0])));
+        assert!(
+            plan.add_entity_chunk(
+                dimension.clone(),
+                ChunkPos { x: 0, z: 0 },
+                Some(&source),
+                &ambiguous,
+                1,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        plan.add_entity_chunk(
+            dimension,
+            ChunkPos { x: 0, z: 0 },
+            None,
+            &entity_chunk(0, vec![entity]),
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&block_path).unwrap(), original_blocks);
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn empty_entity_chunk_keeps_unknown_root_fields() {
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let mut source = entity_chunk(
+            0,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Float(f32::NAN)));
+        let mut replacement = source.clone();
+        let Tag::Compound(fields) = &mut replacement.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Entities"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![],
+        };
+        let mut bytes = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut bytes, 0, 2, &source, 1);
+        fs::write(&path, bytes).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        assert!(
+            plan.add_entity_chunk(
+                dimension.clone(),
+                ChunkPos { x: 0, z: 0 },
+                Some(&source),
+                &entity_chunk(0, vec![]),
+                2,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        plan.add_entity_chunk(
+            dimension,
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &replacement,
+            2,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let saved = RegionReader::open_for_region(&path, 0, 0)
+            .unwrap()
+            .read_chunk(0, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            nbt::write(&saved).unwrap(),
+            nbt::write(&replacement).unwrap()
+        );
+    }
+
+    #[test]
+    fn clearing_entity_chunk_refuses_to_remove_an_external_file() {
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let external = directory.join("c.0.0.mcc");
+        let source = entity_chunk(
+            0,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let mut bytes = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut bytes, 0, 2, &source, 1);
+        fs::write(&path, &bytes).unwrap();
+        fs::write(&external, b"unrelated external data").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &entity_chunk(0, vec![]),
+            2,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(&external).unwrap(), b"unrelated external data");
     }
 
     fn block_draft(

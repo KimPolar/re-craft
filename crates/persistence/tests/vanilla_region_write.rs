@@ -139,6 +139,33 @@ public class RegionWriteOracle {
                     throw new AssertionError("Java could not read the rebuilt heightmap");
             }
             System.out.println("OK");
+        } else if (args[0].equals("seedEntity")) {
+            Files.createDirectories(dir);
+            Path entities = world.resolve("dimensions/minecraft/overworld/entities");
+            Files.createDirectories(entities);
+            var level = new CompoundTag(); var data = new CompoundTag(); data.putInt("DataVersion", 5023); level.put("Data", data);
+            NbtIo.writeCompressed(level, world.resolve("level.dat"));
+            var entity = new CompoundTag(); entity.putString("id", "minecraft:falling_block"); entity.putIntArray("UUID", new int[]{1,2,3,4}); entity.putLong("future", 42);
+            var pos = new ListTag(); pos.add(DoubleTag.valueOf(1.5)); pos.add(DoubleTag.valueOf(2)); pos.add(DoubleTag.valueOf(3)); entity.put("Pos", pos);
+            var chunk = new CompoundTag(); chunk.putInt("DataVersion", 5023); chunk.putIntArray("Position", new int[]{0,0}); chunk.putLong("future_chunk", 17);
+            var list = new ListTag(); list.add(entity); chunk.put("Entities", list);
+            try (var region = open(entities); var out = region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk, (DataOutput)out); }
+            System.out.println("OK");
+        } else if (args[0].equals("verifyEntity")) {
+            Path entities = world.resolve("dimensions/minecraft/overworld/entities");
+            try (var region = open(entities)) {
+                try (var in = region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                    var source = NbtIo.read((DataInput)in);
+                    if (source.getLongOr("future_chunk",0) != 17 || !source.getListOrEmpty("Entities").isEmpty()) throw new AssertionError("source chunk was not preserved");
+                }
+                try (var in = region.getChunkDataInputStream(new ChunkPos(1,0))) {
+                    var destination = NbtIo.read((DataInput)in);
+                    if (!Arrays.equals(destination.getIntArray("Position").orElseThrow(), new int[]{1,0})) throw new AssertionError("position");
+                    var list=destination.getListOrEmpty("Entities"); var entity=list.getCompoundOrEmpty(0);
+                    if (list.size()!=1 || !entity.getStringOr("id", "").equals("minecraft:falling_block") || entity.getLongOr("future",0)!=42 || entity.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=17.5) throw new AssertionError("entity data");
+                }
+            }
+            System.out.println("OK");
         } else if (args[0].equals("locked")) {
             System.out.println(DirectoryLock.isLocked(world) ? "LOCKED" : "UNLOCKED");
         } else if (args[0].equals("tryCreate")) {
@@ -200,6 +227,108 @@ fn state(name: &str) -> BlockState {
         name: name.into(),
         properties: Vec::new(),
     }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn entity_chunk_drafts_commit_and_load_in_java() {
+    use glam::DVec3;
+    use native_persistence::nbt::{NamedTag, Tag};
+    use native_session::saved_falling_block::{self, EntityReplacement, FallingSaveState};
+    use native_world::loaded::ChunkPos as RuntimeChunkPos;
+    use std::collections::BTreeMap;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-entity-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let java_source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&java_source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&java_source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seedEntity").lines().any(|line| line == "OK"));
+    let path = world.join("dimensions/minecraft/overworld/entities/r.0.0.mca");
+    let original = RegionReader::open(&path)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let Some(Tag::List { values, .. }) = original.value.get("Entities") else {
+        panic!()
+    };
+    let falling = saved_falling_block::draft(
+        &NamedTag {
+            name: "".into(),
+            value: values[0].clone(),
+        },
+        FallingSaveState {
+            position: DVec3::new(17.5, 2.0, 3.0),
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            no_gravity: false,
+            time: 1,
+            drop_item: true,
+            cancel_drop: false,
+        },
+    )
+    .unwrap();
+    let left = RuntimeChunkPos { x: 0, z: 0 };
+    let right = RuntimeChunkPos { x: 1, z: 0 };
+    let drafts = saved_falling_block::draft_entity_chunks_with_optional_sources(
+        &BTreeMap::from([(left, Some(&original)), (right, None)]),
+        &[EntityReplacement::Falling(&falling)],
+    )
+    .unwrap();
+    let dimension = DimensionId::parse("overworld").unwrap();
+    let mut plan = WorldSavePlan::new();
+    assert!(
+        drafts[&left]
+            .add_to_save_plan(
+                &mut plan,
+                dimension.clone(),
+                ChunkPos { x: 0, z: 0 },
+                None,
+                100
+            )
+            .is_err()
+    );
+    drafts[&left]
+        .add_to_save_plan(
+            &mut plan,
+            dimension.clone(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&original),
+            100,
+        )
+        .unwrap();
+    drafts[&right]
+        .add_to_save_plan(&mut plan, dimension, ChunkPos { x: 1, z: 0 }, None, 101)
+        .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert!(invoke("verifyEntity").lines().any(|line| line == "OK"));
 }
 
 #[test]

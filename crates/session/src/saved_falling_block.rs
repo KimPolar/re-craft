@@ -71,6 +71,38 @@ impl FallingEntityChunkDraft {
     pub fn source_was_absent(&self) -> bool {
         self.source_nbt.is_none()
     }
+
+    /// Add this prepared chunk to the partial world transaction. All source and
+    /// destination chunks and other world changes still require coordination.
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut native_persistence::save::WorldSavePlan,
+        dimension: native_persistence::world::DimensionId,
+        position: native_persistence::world::ChunkPos,
+        source: Option<&NamedTag>,
+        timestamp: u32,
+    ) -> Result<()> {
+        plan.add_entity_chunk(
+            dimension,
+            position,
+            source,
+            &self.document,
+            timestamp,
+            |source, _| {
+                match source {
+                    Some(source) => ensure!(
+                        self.matches_source(source)?,
+                        "entity chunk draft source differs"
+                    ),
+                    None => ensure!(
+                        self.source_was_absent(),
+                        "entity chunk draft source differs"
+                    ),
+                }
+                Ok(())
+            },
+        )
+    }
 }
 
 pub enum EntityReplacement<'a> {

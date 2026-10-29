@@ -1390,7 +1390,10 @@ fn read_region_document(
     reader.read_chunk(x, z)
 }
 
-fn decode_entity_chunk(document: NamedTag, expected: ChunkPos) -> Result<SavedEntityChunk> {
+pub(crate) fn decode_entity_chunk(
+    document: NamedTag,
+    expected: ChunkPos,
+) -> Result<SavedEntityChunk> {
     use crate::nbt::TagType;
     ensure!(
         matches!(&document.value, Tag::Compound(_)),

@@ -104,5 +104,27 @@ public class SavedItemOracle {
                 !LongTag.valueOf(987654321L).equals(tag.get("unknown_plugin_field")))
                 throw new AssertionError("Rust item draft differs from Java decoding");
         }
+        if (args.length > 2) {
+            var tag = NbtIo.read(Path.of(args[2]));
+            var input = TagValueInput.create(ProblemReporter.DISCARDING, registry, tag);
+            var item = (TestItem) unsafe.allocateInstance(TestItem.class); item.loadExtra(input);
+            var identity = net.minecraft.core.UUIDUtil.CODEC.parse(NbtOps.INSTANCE, tag.get("UUID")).getOrThrow();
+            var thrower = net.minecraft.core.UUIDUtil.CODEC.parse(NbtOps.INSTANCE, tag.get("Thrower")).getOrThrow();
+            var throwerField = ItemEntity.class.getDeclaredField("thrower"); throwerField.setAccessible(true);
+            var decodedThrower = (net.minecraft.world.entity.EntityReference<?>)throwerField.get(item);
+            var rotation = input.read("Rotation",net.minecraft.world.phys.Vec2.CODEC).orElseThrow();
+            if (!identity.equals(new java.util.UUID((1L<<32)|2L,(3L<<32)|4L)) ||
+                !thrower.equals(new java.util.UUID((5L<<32)|6L,(7L<<32)|8L)) ||
+                decodedThrower == null || !decodedThrower.getUUID().equals(thrower) ||
+                !new java.util.UUID((9L<<32)|8L,(7L<<32)|6L).equals(owner.get(item)) ||
+                age.getInt(item)!=42 || delay.getInt(item)!=9 || health.getInt(item)!=4 ||
+                item.getItem().getItem()!=Items.STONE || item.getItem().getCount()!=3 || item.getItem().getMaxStackSize()!=99 ||
+                !input.read("Pos",net.minecraft.world.phys.Vec3.CODEC).orElseThrow().equals(new net.minecraft.world.phys.Vec3(2,63,-2)) ||
+                !input.read("Motion",net.minecraft.world.phys.Vec3.CODEC).orElseThrow().equals(new net.minecraft.world.phys.Vec3(0.25,-0.5,0)) ||
+                rotation.x!=30 || rotation.y!=-15 || input.getBooleanOr("OnGround",true) || input.getBooleanOr("NoGravity",true) ||
+                input.getShortOr("Fire",(short)0)!=12 || !input.getBooleanOr("Invulnerable",false) || input.getIntOr("invulnerable_time",0)!=3 ||
+                input.getDoubleOr("fall_distance",0)!=2.5 || input.getShortOr("Air",(short)0)!=280 || input.getIntOr("PortalCooldown",0)!=7)
+                throw new AssertionError("new item document differs from Java decoding");
+        }
     }
 }

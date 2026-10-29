@@ -938,7 +938,7 @@ fn validate_runtime_inventory(
     Ok(())
 }
 
-fn encode_stack(item: &ItemStack, slot: Option<u8>) -> Tag {
+pub(crate) fn encode_stack(item: &ItemStack, slot: Option<u8>) -> Tag {
     let mut fields = Vec::new();
     if let Some(slot) = slot {
         fields.push(("Slot".into(), Tag::Byte(slot as i8)));

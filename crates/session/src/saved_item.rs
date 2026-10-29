@@ -56,6 +56,161 @@ pub struct ItemDraft {
     document: NamedTag,
 }
 
+/// A new item document has no original entity; a caller must still coordinate
+/// its creation, UUID, chunk membership and all effects in the world save.
+pub struct CreatedItemDraft {
+    document: NamedTag,
+}
+
+/// Base entity fields that cannot be inferred from item-specific state.
+pub struct CreatedItemBase {
+    pub rotation: [f32; 2],
+    pub fall_distance: f64,
+    pub air: i16,
+    pub portal_cooldown: i32,
+}
+
+impl CreatedItemDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+}
+
+fn validate_created_custom_data(value: &Tag, depth: usize) -> Result<()> {
+    ensure!(depth <= 512, "item custom data exceeds supported nesting");
+    match value {
+        Tag::Compound(fields) => {
+            let mut keys = std::collections::BTreeSet::new();
+            for (name, value) in fields {
+                ensure!(
+                    keys.insert(name.0.clone()),
+                    "duplicate item custom-data field"
+                );
+                validate_created_custom_data(value, depth + 1)?;
+            }
+        }
+        Tag::List { values, .. } => {
+            for value in values {
+                validate_created_custom_data(value, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Encode a new ordinary item entity with a caller-supplied stable UUID.
+/// The caller must supply the actual ownership and all simulated fields.
+pub fn draft_created(
+    uuid: [i32; 4],
+    owner: Option<[i32; 4]>,
+    thrower: Option<[i32; 4]>,
+    base: CreatedItemBase,
+    state: ItemSaveState<'_>,
+) -> Result<CreatedItemDraft> {
+    ensure!(
+        state.position.is_finite()
+            && state.position.x.abs() <= 30_000_512.0
+            && state.position.z.abs() <= 30_000_512.0
+            && state.position.y.abs() <= 20_000_000.0,
+        "position would be clamped"
+    );
+    ensure!(
+        state.velocity.is_finite() && state.velocity.abs().max_element() <= 10.0,
+        "velocity would be discarded"
+    );
+    ensure!(
+        state.invulnerable_time >= 0,
+        "invalid invulnerability duration"
+    );
+    ensure!(
+        base.rotation.iter().all(|value| value.is_finite())
+            && base.fall_distance.is_finite()
+            && base.fall_distance >= 0.0
+            && base.portal_cooldown >= 0,
+        "invalid base entity state"
+    );
+    ensure!(
+        (1..=99).contains(&state.stack.count()),
+        "item count outside codec range"
+    );
+    ResourceId::parse(state.stack.id()).context("invalid item identifier")?;
+    ensure!(
+        state.stack.max_count().is_some()
+            && crate::equippable::saved_inventory_max(state.stack.id(), state.stack.components())
+                == state.stack.max_count(),
+        "item prototype cannot be reconstructed from saved components"
+    );
+    let Tag::Compound(components) = state.stack.components() else {
+        bail!("invalid item components")
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for (name, value) in components {
+        ensure!(keys.insert(name.0.clone()), "duplicate item component");
+        ensure!(
+            (name.matches("minecraft:max_stack_size") && matches!(value, Tag::Int(1..=99)))
+                || (name.matches("minecraft:damage") && matches!(value, Tag::Int(0..)))
+                || (name.matches("minecraft:custom_data") && matches!(value, Tag::Compound(_))),
+            "unsupported new item component"
+        );
+        if name.matches("minecraft:custom_data") {
+            validate_created_custom_data(value, 0)?;
+        }
+    }
+    let vector = |v: DVec3| Tag::List {
+        element_type: TagType::Double,
+        values: v.to_array().into_iter().map(Tag::Double).collect(),
+    };
+    let mut fields = vec![
+        ("id".into(), Tag::String("minecraft:item".into())),
+        ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+        ("Pos".into(), vector(state.position)),
+        ("Motion".into(), vector(state.velocity)),
+        (
+            "Rotation".into(),
+            Tag::List {
+                element_type: TagType::Float,
+                values: base.rotation.into_iter().map(Tag::Float).collect(),
+            },
+        ),
+        ("fall_distance".into(), Tag::Double(base.fall_distance)),
+        ("Air".into(), Tag::Short(base.air)),
+        ("PortalCooldown".into(), Tag::Int(base.portal_cooldown)),
+        ("OnGround".into(), Tag::Byte(i8::from(state.on_ground))),
+        ("NoGravity".into(), Tag::Byte(i8::from(state.no_gravity))),
+        ("Age".into(), Tag::Short(state.age)),
+        ("PickupDelay".into(), Tag::Short(state.pickup_delay)),
+        ("Health".into(), Tag::Short(state.health)),
+        ("Fire".into(), Tag::Short(state.fire_ticks)),
+        (
+            "Invulnerable".into(),
+            Tag::Byte(i8::from(state.invulnerable)),
+        ),
+        (
+            "invulnerable_time".into(),
+            Tag::Int(state.invulnerable_time),
+        ),
+        ("Item".into(), player_data::encode_stack(state.stack, None)),
+    ];
+    if let Some(owner) = owner {
+        fields.push(("Owner".into(), Tag::IntArray(owner.to_vec())));
+    }
+    if let Some(thrower) = thrower {
+        fields.push(("Thrower".into(), Tag::IntArray(thrower.to_vec())));
+    }
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(fields),
+    };
+    // Re-read using the same strict path used for loaded entities.
+    ensure!(
+        read(&document.value)?.is_some(),
+        "cannot decode new item entity"
+    );
+    native_persistence::nbt::write(&document).context("cannot encode new item entity")?;
+    Ok(CreatedItemDraft { document })
+}
+
 impl ItemDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -321,6 +476,62 @@ pub fn read(entity: &Tag) -> Result<Option<SavedItemState>> {
 mod tests {
     use super::*;
     use native_persistence::nbt::JavaString;
+
+    #[test]
+    fn created_item_rejects_unresolved_or_invalid_state() {
+        let ordinary =
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let unknown =
+            ItemStack::unresolved("example:unknown".into(), 1, Tag::Compound(vec![])).unwrap();
+        let unsupported = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            Tag::Compound(vec![("minecraft:custom_name".into(), Tag::Int(5))]),
+        )
+        .unwrap();
+        let duplicate_data = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("x".into(), Tag::Int(1)), ("x".into(), Tag::Int(2))]),
+            )]),
+        )
+        .unwrap();
+        let base = || CreatedItemBase {
+            rotation: [0.0, 0.0],
+            fall_distance: 0.0,
+            air: 300,
+            portal_cooldown: 0,
+        };
+        fn state(stack: &ItemStack) -> ItemSaveState<'_> {
+            ItemSaveState {
+                position: DVec3::new(1.0, 2.0, 3.0),
+                velocity: DVec3::ZERO,
+                on_ground: false,
+                no_gravity: false,
+                age: 0,
+                pickup_delay: 10,
+                health: 5,
+                fire_ticks: 0,
+                invulnerable: false,
+                invulnerable_time: 0,
+                stack,
+            }
+        }
+        assert!(draft_created([1, 2, 3, 4], None, None, base(), state(&ordinary)).is_ok());
+        assert!(draft_created([1, 2, 3, 4], None, None, base(), state(&unknown)).is_err());
+        assert!(draft_created([1, 2, 3, 4], None, None, base(), state(&unsupported)).is_err());
+        assert!(draft_created([1, 2, 3, 4], None, None, base(), state(&duplicate_data)).is_err());
+        let mut invalid = state(&ordinary);
+        invalid.velocity.x = 11.0;
+        assert!(draft_created([1, 2, 3, 4], None, None, base(), invalid).is_err());
+        let mut invalid_base = base();
+        invalid_base.rotation[0] = f32::NAN;
+        assert!(draft_created([1, 2, 3, 4], None, None, invalid_base, state(&ordinary)).is_err());
+    }
 
     fn vector(v: [f64; 3]) -> Tag {
         Tag::List {
@@ -623,12 +834,51 @@ mod tests {
             native_persistence::nbt::write(draft.document()).unwrap(),
         )
         .unwrap();
+        let created_stack = ItemStack::new(
+            "minecraft:stone".into(),
+            3,
+            99,
+            Tag::Compound(vec![("minecraft:max_stack_size".into(), Tag::Int(99))]),
+        )
+        .unwrap();
+        let created = draft_created(
+            [1, 2, 3, 4],
+            Some([9, 8, 7, 6]),
+            Some([5, 6, 7, 8]),
+            CreatedItemBase {
+                rotation: [30.0, -15.0],
+                fall_distance: 2.5,
+                air: 280,
+                portal_cooldown: 7,
+            },
+            ItemSaveState {
+                position: DVec3::new(2.0, 63.0, -2.0),
+                velocity: DVec3::new(0.25, -0.5, 0.0),
+                on_ground: false,
+                no_gravity: false,
+                age: 42,
+                pickup_delay: 9,
+                health: 4,
+                fire_ticks: 12,
+                invulnerable: true,
+                invulnerable_time: 3,
+                stack: &created_stack,
+            },
+        )
+        .unwrap();
+        let created_path = temp.path().join("created-item.nbt");
+        std::fs::write(
+            &created_path,
+            native_persistence::nbt::write(created.document()).unwrap(),
+        )
+        .unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)
             .arg("SavedItemOracle")
             .arg(temp.path())
-            .arg(draft_path));
+            .arg(draft_path)
+            .arg(created_path));
         let resistance: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(temp.path().join("resistance.json")).unwrap())
                 .unwrap();

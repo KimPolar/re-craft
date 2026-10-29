@@ -190,6 +190,13 @@ public class RegionWriteOracle {
             var list = new ListTag(); list.add(entity); chunk.put("Entities", list);
             try (var region = open(entities); var out = region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk, (DataOutput)out); }
             System.out.println("OK");
+        } else if (args[0].equals("verifyNewItem")) {
+            Path entities = world.resolve("dimensions/minecraft/overworld/entities");
+            try (var region = open(entities); var in = region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                var chunk=NbtIo.read((DataInput)in); var list=chunk.getListOrEmpty("Entities"); var item=list.getCompoundOrEmpty(0);
+                if (list.size()!=1 || !item.getStringOr("id","").equals("minecraft:item") || !Arrays.equals(item.getIntArray("UUID").orElseThrow(), new int[]{1,2,3,4}) || item.getCompoundOrEmpty("Item").getIntOr("count",0)!=3 || item.getShortOr("PickupDelay",(short)0)!=10) throw new AssertionError("new item");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("verifyCreatedEntityDirectory")) {
             Path entities = world.resolve("dimensions/minecraft/overworld/entities");
             if (!Files.isRegularFile(entities.resolve("r.0.0.mca"))) throw new AssertionError("missing created region");
@@ -355,6 +362,96 @@ fn created_entity_directory_and_region_are_readable_by_java() {
             .lines()
             .any(|line| line == "OK")
     );
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn new_item_draft_is_readable_from_java_region() {
+    use glam::DVec3;
+    use native_persistence::nbt::Tag;
+    use native_session::{inventory::ItemStack, saved_falling_block, saved_item};
+    use native_world::loaded::ChunkPos as RuntimeChunkPos;
+    use std::collections::BTreeMap;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-new-item-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seedEntity").lines().any(|line| line == "OK"));
+    let directory = world.join("dimensions/minecraft/overworld/entities");
+    std::fs::remove_file(directory.join("r.0.0.mca")).unwrap();
+    let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+    let created = saved_item::draft_created(
+        [1, 2, 3, 4],
+        None,
+        None,
+        saved_item::CreatedItemBase {
+            rotation: [0.0, 0.0],
+            fall_distance: 0.0,
+            air: 300,
+            portal_cooldown: 0,
+        },
+        saved_item::ItemSaveState {
+            position: DVec3::new(1.5, 2.0, 3.0),
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            no_gravity: false,
+            age: 0,
+            pickup_delay: 10,
+            health: 5,
+            fire_ticks: 0,
+            invulnerable: false,
+            invulnerable_time: 0,
+            stack: &stack,
+        },
+    )
+    .unwrap();
+    let pos = RuntimeChunkPos { x: 0, z: 0 };
+    let drafts = saved_falling_block::draft_entity_chunks_with_item_changes(
+        &BTreeMap::from([(pos, None)]),
+        &[],
+        &[],
+        &[created],
+    )
+    .unwrap();
+    let mut plan = WorldSavePlan::new();
+    drafts[&pos]
+        .add_to_save_plan(
+            &mut plan,
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 0, z: 0 },
+            None,
+            101,
+        )
+        .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert!(invoke("verifyNewItem").lines().any(|line| line == "OK"));
 }
 
 #[test]

@@ -367,6 +367,7 @@ pub struct LocalSession {
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
+    flight: physics::FlightState,
     game_mode: GameMode,
     vitals: survival::PlayerVitals,
     experience: experience::Experience,
@@ -453,6 +454,7 @@ impl LocalSession {
             player_random: native_core::random::LegacyRandom::new(0),
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,
+            flight: physics::FlightState::default(),
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
             experience: experience::Experience::default(),
@@ -505,6 +507,11 @@ impl LocalSession {
     pub fn set_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
+        if mode == GameMode::Spectator {
+            self.flight.flying = true;
+        } else if mode != GameMode::Creative {
+            self.flight.flying = false;
+        }
         Arc::make_mut(&mut self.snapshot).game_mode = mode;
     }
 
@@ -1084,7 +1091,7 @@ impl LocalSession {
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
-        let moving_slowly = self.game_mode != GameMode::Spectator
+        let moving_slowly = !self.flight.flying
             && (self.player.pose == PlayerPose::Crawling
                 || (fits_crouching && (self.previous_sneak || !fits_standing)));
         self.sprint.previous_sneak = self.previous_sneak;
@@ -1104,6 +1111,13 @@ impl LocalSession {
             using_item: self.food_use.is_active(),
             moving_slowly,
         };
+        let start_flight_jump =
+            self.flight
+                .update(self.game_mode, input.jump, false, self.motion.on_ground);
+        if start_flight_jump {
+            self.motion.start_flying_jump(input);
+        }
+        let flying = self.flight.flying;
         self.vitals
             .tick_peaceful_regeneration(self.survival_rules, (self.tick as i32).wrapping_add(1));
         self.vitals.tick_air(false, false, self.game_mode);
@@ -1116,6 +1130,25 @@ impl LocalSession {
                 false,
                 self.motion
                     .tick_spectator(input, self.sneak, self.flight_speed),
+            )
+        } else if flying {
+            self.motion.tick_flying(
+                input,
+                self.sneak,
+                self.flight_speed,
+                0.6,
+                |position, requested, on_ground| {
+                    (
+                        requested,
+                        movement::resolve_player(
+                            position,
+                            requested,
+                            on_ground,
+                            self.player.height(),
+                            block_shape,
+                        ),
+                    )
+                },
             )
         } else {
             self.motion
@@ -1151,7 +1184,9 @@ impl LocalSession {
             },
         );
         self.sprint.after_move(major_collision);
-        if self.game_mode == GameMode::Spectator {
+        self.flight
+            .after_movement(self.game_mode, self.motion.on_ground);
+        if flying {
             self.fall_distance = 0.0;
         } else {
             self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
@@ -1215,7 +1250,7 @@ impl LocalSession {
             PlayerPose::Standing
         } else {
             self.player.pose.after_movement(
-                self.sneak,
+                self.sneak && !self.flight.flying,
                 false,
                 fits_standing,
                 fits_crouching,
@@ -1371,6 +1406,8 @@ impl LocalSession {
         self.experience = experience::Experience::default();
         self.experience_orbs.reset_player_pickup_delay();
         self.player_random = native_core::random::LegacyRandom::new(0);
+        self.flight = physics::FlightState::default();
+        self.flight.flying = self.game_mode == GameMode::Spectator;
         self.death = None;
         self.death_processed = false;
         self.score = 0;
@@ -2311,6 +2348,38 @@ mod tests {
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }
         }
+    }
+
+    #[test]
+    fn demo_creative_double_jump_enables_and_landing_disables_flight() {
+        let mut session = LocalSession::demo();
+        session.set_game_mode(GameMode::Creative);
+        session.motion.position = DVec3::new(5.5, 8.0, 5.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        for jump in [true, false, true] {
+            session.submit_command(PlayerCommand::Move {
+                forward: 0.0,
+                strafe: 0.0,
+                jump,
+            });
+            session.update(TICK);
+        }
+        assert!(session.flight.flying);
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        session.submit_command(PlayerCommand::Sneak(true));
+        for _ in 0..60 {
+            session.update(TICK);
+            if session.motion.on_ground {
+                break;
+            }
+        }
+        assert!(session.motion.on_ground);
+        assert!(!session.flight.flying);
     }
 
     #[test]

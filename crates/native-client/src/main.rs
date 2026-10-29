@@ -920,13 +920,18 @@ fn prepare_existing_world(
             .and_then(player_inventory::saved_game_mode)
             .unwrap_or(default_mode);
         session.set_game_mode(mode);
-        if mode == native_session::GameMode::Spectator
-            && let Some(saved) = &player_data
+        if matches!(
+            mode,
+            native_session::GameMode::Spectator | native_session::GameMode::Creative
+        ) && let Some(saved) = &player_data
         {
             let speed = native_session::player_data::read_saved_flight_speed(saved)
-                .context("cannot read saved spectator flight speed")?;
+                .context("cannot read saved player flight speed")?;
             session
                 .restore_saved_flight_speed(speed)
+                .map_err(anyhow::Error::msg)?;
+            session
+                .restore_saved_flying(native_session::player_data::read_saved_flying(saved))
                 .map_err(anyhow::Error::msg)?;
         }
         session.set_game_master_permission(reader.allow_commands()?);

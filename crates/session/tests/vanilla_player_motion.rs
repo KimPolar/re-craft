@@ -147,7 +147,7 @@ fn saved_flight_speed_matches_vanilla_abilities_codec() {
         .arg("SavedAbilitiesOracle")
         .arg(&output));
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(rows.len(), 15);
+    assert_eq!(rows.len(), 22);
     for row in rows {
         let index = row["index"].as_u64().unwrap();
         let mut abilities = vec![];
@@ -173,6 +173,13 @@ fn saved_flight_speed_matches_vanilla_abilities_codec() {
             }
             13 => abilities.push(("flySpeed".into(), Tag::Float(f32::NAN))),
             14 => abilities.push(("flySpeed".into(), Tag::Float(f32::INFINITY))),
+            15 => abilities.push(("flying".into(), Tag::Byte(1))),
+            16 => abilities.push(("flying".into(), Tag::Byte(0))),
+            17 => abilities.push(("flying".into(), Tag::Int(256))),
+            18 => abilities.push(("flying".into(), Tag::Int(2))),
+            19 => abilities.push(("flying".into(), Tag::Float(0.5))),
+            20 => abilities.push(("flying".into(), Tag::Double(-0.25))),
+            21 => abilities.push(("flying".into(), Tag::Double(f64::NAN))),
             _ => {}
         }
         let fields = if index == 0 {
@@ -187,7 +194,12 @@ fn saved_flight_speed_matches_vanilla_abilities_codec() {
             value: Tag::Compound(fields),
         };
         let result = native_session::player_data::read_saved_flight_speed(&player);
-        if index >= 13 {
+        assert_eq!(
+            native_session::player_data::read_saved_flying(&player),
+            row["flying"].as_bool().unwrap(),
+            "case {index}"
+        );
+        if index == 13 || index == 14 {
             assert!(
                 result.is_err(),
                 "nonfinite speed must not enter the simulator"

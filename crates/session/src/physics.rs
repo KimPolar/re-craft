@@ -42,6 +42,51 @@ pub fn adjust_flight_speed(speed: f32, steps: i32) -> f32 {
     (speed + steps as f32 * 0.005_f32).clamp(0.0, 0.2)
 }
 
+/// Client flight toggle, including Java's seven-tick double-jump window.
+#[derive(Default)]
+pub struct FlightState {
+    pub flying: bool,
+    previous_jump: bool,
+    trigger_time: u8,
+}
+
+impl FlightState {
+    /// Returns true when flight started on the ground and needs a jump impulse.
+    pub fn update(
+        &mut self,
+        mode: crate::GameMode,
+        jump: bool,
+        swimming: bool,
+        on_ground: bool,
+    ) -> bool {
+        let mut start_jump = false;
+        if mode == crate::GameMode::Spectator {
+            self.flying = true;
+        } else if mode == crate::GameMode::Creative {
+            if jump && !self.previous_jump {
+                if self.trigger_time == 0 {
+                    self.trigger_time = 7;
+                } else if !swimming {
+                    self.flying = !self.flying;
+                    start_jump = self.flying && on_ground;
+                    self.trigger_time = 0;
+                }
+            }
+        } else {
+            self.flying = false;
+        }
+        self.previous_jump = jump;
+        self.trigger_time = self.trigger_time.saturating_sub(1);
+        start_jump
+    }
+
+    pub fn after_movement(&mut self, mode: crate::GameMode, on_ground: bool) {
+        if mode != crate::GameMode::Spectator && on_ground {
+            self.flying = false;
+        }
+    }
+}
+
 /// The modified friction returned by 26.3 for the supported vanilla blocks.
 pub fn ground_friction(block: &str) -> f32 {
     match block {
@@ -60,8 +105,25 @@ impl MotionState {
         descend: bool,
         flight_speed: f32,
     ) -> DVec3 {
+        self.on_ground = false;
+        self.tick_flying(input, descend, flight_speed, 0.6, |_, requested, _| {
+            (requested, requested)
+        })
+        .1
+    }
+
+    /// Player flight uses ordinary collision while retaining vertical momentum.
+    pub fn tick_flying(
+        &mut self,
+        input: MovementInput,
+        descend: bool,
+        flight_speed: f32,
+        block_friction: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
         let vertical = i32::from(input.jump) - i32::from(descend);
         self.velocity.y += f64::from(vertical as f32 * flight_speed * 3.0_f32);
+        self.jump_delay = self.jump_delay.saturating_sub(1);
         if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
             self.velocity.x = 0.0;
             self.velocity.z = 0.0;
@@ -72,24 +134,81 @@ impl MotionState {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
         let cosine = f64::from(java_sin(f64::from(radians), true));
-        let speed = if input.sprinting {
-            flight_speed * 2.0
+        if input.jump && self.on_ground && self.jump_delay == 0 {
+            self.jump_from_ground(input.sprinting, sine, cosine);
+            self.jump_delay = 10;
+        } else if !input.jump {
+            self.jump_delay = 0;
+        }
+        let friction = if self.on_ground {
+            modified_friction(block_friction, 1.0)
+        } else {
+            1.0
+        };
+        let speed = if self.on_ground {
+            let ground_speed = if input.sprinting {
+                (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32
+            } else {
+                0.1_f32
+            };
+            if f64::from(friction) > 0.6 {
+                ground_speed * (0.21600002_f32 / (friction * friction * friction))
+            } else {
+                ground_speed
+            }
+        } else if input.sprinting {
+            flight_speed * 2.0_f32
         } else {
             flight_speed
         };
-        let (left, forward) = keyboard_input(-input.right, input.forward, false, input.using_item);
+        let (left, forward) = keyboard_input(
+            -input.right,
+            input.forward,
+            input.moving_slowly,
+            input.using_item,
+        );
         let x = f64::from(left) * f64::from(speed);
         let z = f64::from(forward) * f64::from(speed);
         self.velocity.x += x * cosine - z * sine;
         self.velocity.z += z * cosine + x * sine;
-        let actual = self.velocity;
+        let vertical_velocity = self.velocity.y;
+        let (requested, actual) = collide(self.position, self.velocity, self.on_ground);
         self.position += actual;
-        self.velocity.x *= f64::from(0.91_f32);
-        self.velocity.y *= 0.6;
-        self.velocity.z *= f64::from(0.91_f32);
-        self.on_ground = false;
-        self.jump_delay = 0;
-        actual
+        let epsilon = f64::from(1.0e-5_f32);
+        let blocked_x = (requested.x - actual.x).abs() >= epsilon;
+        let blocked_z = (requested.z - actual.z).abs() >= epsilon;
+        self.on_ground = requested.y != actual.y && requested.y < 0.0;
+        if blocked_x {
+            self.velocity.x = 0.0;
+        }
+        if blocked_z {
+            self.velocity.z = 0.0;
+        }
+        let horizontal_drag = friction * modified_friction(0.91, 1.0);
+        self.velocity.x *= f64::from(horizontal_drag);
+        self.velocity.y = vertical_velocity * 0.6;
+        self.velocity.z *= f64::from(horizontal_drag);
+        (
+            (blocked_x || blocked_z) && !minor_collision(left, forward, sine, cosine, actual),
+            actual,
+        )
+    }
+
+    fn jump_from_ground(&mut self, sprinting: bool, sine: f64, cosine: f64) {
+        self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
+        if sprinting {
+            self.velocity.x -= sine * 0.2;
+            self.velocity.z += cosine * 0.2;
+        }
+    }
+
+    pub fn start_flying_jump(&mut self, input: MovementInput) {
+        let radians = input.yaw_degrees * 0.017453292_f32;
+        self.jump_from_ground(
+            input.sprinting,
+            f64::from(java_sin(f64::from(radians), false)),
+            f64::from(java_sin(f64::from(radians), true)),
+        );
     }
 
     /// Advance one 20 TPS tick. `collide` resolves the requested movement and
@@ -449,6 +568,35 @@ pub fn java_sin(radians: f64, cosine: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creative_flight_toggles_on_a_fresh_double_jump_within_the_window() {
+        for gap in 1..=7 {
+            let mut flight = FlightState::default();
+            assert!(!flight.update(crate::GameMode::Creative, true, false, false));
+            for _ in 0..gap {
+                flight.update(crate::GameMode::Creative, false, false, false);
+            }
+            assert!(!flight.update(crate::GameMode::Creative, true, false, false));
+            assert_eq!(flight.flying, gap <= 5, "gap {gap}");
+        }
+        let mut flight = FlightState::default();
+        flight.update(crate::GameMode::Creative, true, false, false);
+        for _ in 0..8 {
+            flight.update(crate::GameMode::Creative, true, false, false);
+        }
+        assert!(!flight.flying, "holding jump is not a second press");
+        flight.update(crate::GameMode::Creative, false, false, false);
+        flight.update(crate::GameMode::Creative, true, false, false);
+        flight.update(crate::GameMode::Creative, false, false, false);
+        assert!(flight.update(crate::GameMode::Creative, true, false, true));
+        assert!(flight.flying);
+        flight.after_movement(crate::GameMode::Creative, true);
+        assert!(!flight.flying);
+        flight.update(crate::GameMode::Spectator, false, false, true);
+        flight.after_movement(crate::GameMode::Spectator, true);
+        assert!(flight.flying);
+    }
 
     #[test]
     fn velocity_persists_when_input_is_released_and_ice_reduces_drag() {

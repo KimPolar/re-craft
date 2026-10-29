@@ -342,6 +342,15 @@ pub fn read_saved_flight_speed(player: &NamedTag) -> Result<f32> {
     Ok(speed)
 }
 
+pub fn read_saved_flying(player: &NamedTag) -> bool {
+    player
+        .value
+        .get("abilities")
+        .and_then(|abilities| abilities.get("flying"))
+        .and_then(numeric_double)
+        .is_some_and(|value| value != 0.0)
+}
+
 /// Read the 26.3 health and food fields without writing the player document.
 pub fn read_saved_vitals(
     player: &NamedTag,
@@ -659,6 +668,26 @@ impl PlayerStateDraft {
 
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         self.0.matches_source(current)
+    }
+
+    pub(crate) fn set_flying(&mut self, original: &NamedTag, flying: bool) -> Result<()> {
+        let source = unique_field(&original.value, "abilities")?;
+        if let Some(value @ Tag::Compound(_)) = source {
+            unique_field(value, "flying")?;
+        }
+        if read_saved_flying(original) == flying {
+            return Ok(());
+        }
+        let mut abilities = match source {
+            Some(value @ Tag::Compound(_)) => value.clone(),
+            None => Tag::Compound(Vec::new()),
+            Some(_) => bail!("saved abilities cannot be preserved safely"),
+        };
+        set_field(&mut abilities, "flying", Some(Tag::Byte(i8::from(flying))))?;
+        set_field(&mut self.0.document.value, "abilities", Some(abilities))?;
+        native_persistence::nbt::write(&self.0.document)
+            .context("player flight draft cannot be encoded")?;
+        Ok(())
     }
 }
 
@@ -1309,6 +1338,39 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flight_draft_preserves_other_abilities_and_rejects_ambiguous_data() {
+        let mut original = player_with_inventory();
+        let abilities = Tag::Compound(vec![
+            ("flying".into(), Tag::Byte(0)),
+            ("flySpeed".into(), Tag::Float(0.125)),
+            ("unknown".into(), Tag::String("keep".into())),
+        ]);
+        set_field(&mut original.value, "abilities", Some(abilities.clone())).unwrap();
+        let inventory = read_saved_player(&original).unwrap();
+        let mut draft = PlayerStateDraft(draft_player_inventory(&original, &inventory).unwrap());
+        draft.set_flying(&original, true).unwrap();
+        assert!(read_saved_flying(draft.document()));
+        let result = draft.document().value.get("abilities").unwrap();
+        assert_eq!(result.get("flySpeed"), Some(&Tag::Float(0.125)));
+        assert_eq!(result.get("unknown"), Some(&Tag::String("keep".into())));
+        assert_eq!(original.value.get("abilities"), Some(&abilities));
+        assert!(draft.matches_source(&original).unwrap());
+        let mut duplicate = original.clone();
+        if let Tag::Compound(entries) = &mut duplicate.value {
+            entries.push(("abilities".into(), abilities));
+        }
+        assert!(draft.set_flying(&duplicate, true).is_err());
+        let mut invalid = original.clone();
+        set_field(
+            &mut invalid.value,
+            "abilities",
+            Some(Tag::String("invalid".into())),
+        )
+        .unwrap();
+        assert!(draft.set_flying(&invalid, true).is_err());
+    }
 
     #[test]
     fn player_state_draft_preserves_unknown_data_and_round_trips_simulated_fields() {

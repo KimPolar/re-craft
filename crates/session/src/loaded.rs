@@ -156,6 +156,7 @@ pub struct LoadedSession {
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
+    flight: crate::physics::FlightState,
     food_use: crate::survival::FoodUse,
     mining: mining::Mining,
     first_person: crate::animation::FirstPersonState,
@@ -553,6 +554,15 @@ impl LoadedSession {
         Ok(())
     }
 
+    pub fn restore_saved_flying(&mut self, flying: bool) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("saved flight state must be restored before the first tick");
+        }
+        self.flight.flying = self.game_mode == GameMode::Spectator
+            || (self.game_mode == GameMode::Creative && flying);
+        Ok(())
+    }
+
     /// Capture simulated player data at a tick boundary. This draft cannot be
     /// written until changed chunks, entities, ticks and other state are handled.
     pub fn draft_player_state(
@@ -605,7 +615,9 @@ impl LoadedSession {
             experience: self.experience,
             score: self.score,
         };
-        crate::player_data::draft_player_state(original, &state, &self.inventory)
+        let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
+        draft.set_flying(original, self.flight.flying)?;
+        Ok(draft)
     }
 
     /// Construct a block-state-only draft from a dirty resident or parked chunk.
@@ -862,6 +874,11 @@ impl LoadedSession {
     pub fn set_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
+        if mode == GameMode::Spectator {
+            self.flight.flying = true;
+        } else if mode != GameMode::Creative {
+            self.flight.flying = false;
+        }
         Arc::make_mut(&mut self.snapshot).game_mode = mode;
     }
 
@@ -1074,6 +1091,7 @@ impl LoadedSession {
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
+            flight: crate::physics::FlightState::default(),
             food_use: crate::survival::FoodUse::default(),
             mining: mining::Mining::default(),
             first_person: crate::animation::FirstPersonState::default(),
@@ -2618,6 +2636,8 @@ impl LoadedSession {
             self.oxygen_valid = true;
         }
         self.player_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
+        self.flight = crate::physics::FlightState::default();
+        self.flight.flying = self.game_mode == GameMode::Spectator;
         self.experience_orbs.reset_player_pickup_delay();
         self.food_use = crate::survival::FoodUse::default();
         self.mining.release();
@@ -5279,7 +5299,7 @@ impl LoadedSession {
         }
         self.breathing_effects.tick();
         self.fall.tick_effects();
-        self.swimming = if self.game_mode == GameMode::Spectator {
+        self.swimming = if self.flight.flying {
             false
         } else if self.swimming {
             self.sprint.active && in_water
@@ -5288,7 +5308,7 @@ impl LoadedSession {
                 && under_water
                 && matches!(fluid_view.at(self.motion.position.floor().as_ivec3()), fluid::Cell::Fluid(state) if state.kind == FluidKind::Water)
         };
-        if self.game_mode != GameMode::Spectator {
+        if !self.flight.flying {
             self.motion.velocity = contacts.water.push(self.motion.velocity, 0.014);
             let lava_strength = if self.world.dimension == "minecraft:the_nether" {
                 0.007
@@ -5306,7 +5326,7 @@ impl LoadedSession {
             crate::movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing =
             crate::movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
-        let moving_slowly = self.game_mode != GameMode::Spectator
+        let moving_slowly = !self.flight.flying
             && ((!self.swimming && fits_crouching && (self.previous_sneak || !fits_standing))
                 || (self.player.pose == PlayerPose::Crawling && !in_water));
         self.sprint.previous_sneak = self.previous_sneak;
@@ -5331,6 +5351,16 @@ impl LoadedSession {
             using_item: self.food_use.is_active(),
             moving_slowly,
         };
+        let start_flight_jump = self.flight.update(
+            self.game_mode,
+            input.jump,
+            self.swimming,
+            self.motion.on_ground,
+        );
+        if start_flight_jump {
+            self.motion.start_flying_jump(input);
+        }
+        let flying = self.flight.flying;
         let player_height = self.player.height();
         let fall_distance = self.fall_distance;
         let sneak = self.sneak;
@@ -5380,6 +5410,25 @@ impl LoadedSession {
                 self.motion
                     .tick_spectator(input, self.sneak, self.flight_speed),
             )
+        } else if flying {
+            self.motion.tick_flying(
+                input,
+                self.sneak,
+                self.flight_speed,
+                friction,
+                |position, requested, on_ground| {
+                    (
+                        requested,
+                        crate::movement::resolve_player(
+                            position,
+                            requested,
+                            on_ground,
+                            player_height,
+                            block_shape,
+                        ),
+                    )
+                },
+            )
         } else if let Some((kind, depth)) = liquid {
             let above = (self.motion.position + DVec3::Y * 0.9).floor().as_ivec3();
             let movement = crate::physics::FluidMovement {
@@ -5414,6 +5463,8 @@ impl LoadedSession {
             },
         );
         self.sprint.after_move(major_collision);
+        self.flight
+            .after_movement(self.game_mode, self.motion.on_ground);
         // LivingEntity refreshes fluid interaction after moving if it was not
         // already in water, so entering water on the landing tick cancels fall damage.
         let moved_bounds = crate::movement::player_bounds(self.motion.position, player_height);
@@ -5429,7 +5480,7 @@ impl LoadedSession {
                 .water
                 .depth
                     > 0.0);
-        if self.game_mode == GameMode::Spectator || landing_in_water {
+        if flying || landing_in_water {
             self.fall_distance = 0.0;
         } else {
             self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
@@ -5541,7 +5592,7 @@ impl LoadedSession {
             PlayerPose::Standing
         } else {
             self.player.pose.after_movement(
-                self.sneak,
+                self.sneak && !self.flight.flying,
                 self.swimming,
                 fits_standing,
                 fits_crouching,
@@ -9222,6 +9273,51 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn creative_flight_collides_with_walls_and_ends_on_landing() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        for y in 7..=14 {
+            assert!(session.set(IVec3::new(8, y, 7), session.states[3]));
+        }
+        session.motion.position = DVec3::new(8.5, 8.0, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        for jump in [true, false, true] {
+            session.submit_command(PlayerCommand::Move {
+                forward: 0.0,
+                strafe: 0.0,
+                jump,
+            });
+            session.update(TICK);
+        }
+        assert!(session.flight.flying);
+        session.submit_command(PlayerCommand::Move {
+            forward: 1.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        for _ in 0..25 {
+            session.update(TICK);
+        }
+        assert!(session.motion.position.z >= 8.3 - 1.0e-6);
+        assert!(session.flight.flying);
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        session.submit_command(PlayerCommand::Sneak(true));
+        for _ in 0..60 {
+            session.update(TICK);
+            if session.motion.on_ground {
+                break;
+            }
+        }
+        assert!(session.motion.on_ground);
+        assert!(!session.flight.flying);
     }
 
     #[test]

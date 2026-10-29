@@ -34,6 +34,19 @@ use crate::{
     renderer::Renderer,
 };
 
+pub(crate) fn atmospheric_fog_color(
+    fog: [f32; 3],
+    sky: [f32; 3],
+    sky_end: f32,
+    chunks: u32,
+) -> [f32; 3] {
+    let distance = (sky_end / 16.0).min(chunks as f32);
+    let fraction = (distance / 32.0).clamp(0.0, 1.0);
+    let value = 0.25 + fraction * 0.75;
+    let amount = 1.0 - f64::from(value).powf(0.25) as f32;
+    std::array::from_fn(|i| fog[i] + amount * (sky[i] - fog[i]))
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub yaw: f32,
@@ -150,6 +163,8 @@ pub fn run_play(
             sky_background_current: None,
             sky_fog_previous: None,
             sky_fog_current: None,
+            sky_mix_previous: None,
+            sky_mix_current: None,
             sky_tick: None,
             sky_base: None,
             sky_lightmap: None,
@@ -249,6 +264,8 @@ struct PlayState {
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
     sky_fog_current: Option<[f32; 2]>,
+    sky_mix_previous: Option<([f32; 3], f32)>,
+    sky_mix_current: Option<([f32; 3], f32)>,
     sky_tick: Option<u64>,
     sky_base: Option<Arc<native_world::lighting::LightmapSettings>>,
     sky_lightmap: Option<Arc<[[[f32; 3]; 16]; 16]>>,
@@ -545,7 +562,12 @@ impl Viewer {
                             .map(|state| state.total_ticks)
                     })
                 });
-                if let Some((value, fog_range)) = value {
+                if let Some(crate::sky_background::BackgroundSample {
+                    color: value,
+                    fog_range,
+                    sky_mix,
+                }) = value
+                {
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_background_previous.is_none()
                     {
@@ -560,6 +582,13 @@ impl Viewer {
                         play.sky_fog_previous = play.sky_fog_current.or(fog_range);
                     }
                     play.sky_fog_current = fog_range;
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.sky_mix_previous.is_none()
+                        || play.sky_mix_current.is_none()
+                    {
+                        play.sky_mix_previous = play.sky_mix_current.or(sky_mix);
+                    }
+                    play.sky_mix_current = sky_mix;
                 }
                 play.sky_background_tick = Some(snapshot.tick);
                 play.sky_background_revision = Some(snapshot.world_revision);
@@ -568,9 +597,18 @@ impl Viewer {
                 (play.sky_background_previous, play.sky_background_current)
             {
                 let partial = play.session.partial_tick().clamp(0.0, 1.0);
-                renderer.set_sky_color(std::array::from_fn(|i| {
-                    previous[i] + partial * (current[i] - previous[i])
-                }));
+                let mut color =
+                    std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
+                if let (Some((previous_sky, previous_end)), Some((current_sky, current_end))) =
+                    (play.sky_mix_previous, play.sky_mix_current)
+                {
+                    let sky = std::array::from_fn(|i| {
+                        previous_sky[i] + partial * (current_sky[i] - previous_sky[i])
+                    });
+                    let end = previous_end + partial * (current_end - previous_end);
+                    color = atmospheric_fog_color(color, sky, end, play.streamer.radius().max(2));
+                }
+                renderer.set_sky_color(color);
                 renderer.set_fog_range(match (play.sky_fog_previous, play.sky_fog_current) {
                     (Some(previous), Some(current)) => Some(std::array::from_fn(|i| {
                         previous[i] + partial * (current[i] - previous[i])

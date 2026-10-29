@@ -9,6 +9,8 @@ import net.minecraft.world.attribute.*;
 import net.minecraft.world.clock.*;
 import net.minecraft.world.timeline.AttributeTrack;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.ARGB;
+import net.minecraft.util.Mth;
 import org.joml.Vector3f;
 
 public class SkyBackgroundOracle {
@@ -48,6 +50,13 @@ public class SkyBackgroundOracle {
             var interpolator = new SpatialAttributeInterpolator();
             interpolator.accumulate(1.0, map);
             var row = new JsonArray(); row.add(interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_START_DISTANCE, 10f)); output.add(row);
+        }
+        for (var item : input.getAsJsonArray("fogColorCases")) {
+            var c = item.getAsJsonObject();
+            float distance = Math.min(c.get("end").getAsFloat() / 16f, c.get("chunks").getAsInt());
+            float t = 1f - (float)Math.pow(Mth.clampedLerp(distance / 32f, 0.25f, 1f), 0.25);
+            var color = ARGB.srgbLerp(t, new Vector3f(0.2f, 0.6f, 0.9f), new Vector3f(0.8f, 0.3f, 0.05f));
+            var row = new JsonArray(); row.add(color.x()); row.add(color.y()); row.add(color.z()); output.add(row);
         }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }

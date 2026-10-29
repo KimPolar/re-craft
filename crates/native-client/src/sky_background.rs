@@ -149,8 +149,8 @@ impl FloatLayer {
     }
 }
 
-fn fog_layers(attributes: Option<&Value>) -> Result<[Option<FloatLayer>; 2]> {
-    let mut result = [None; 2];
+fn fog_layers(attributes: Option<&Value>) -> Result<[Option<FloatLayer>; 3]> {
+    let mut result = [None; 3];
     let Some(attributes) = attributes else {
         return Ok(result);
     };
@@ -165,6 +165,7 @@ fn fog_layers(attributes: Option<&Value>) -> Result<[Option<FloatLayer>; 2]> {
         let index = match id.path.as_str() {
             "visual/fog_start_distance" => 0,
             "visual/fog_end_distance" => 1,
+            "visual/sky_fog_end_distance" => 2,
             _ => continue,
         };
         ensure!(result[index].is_none(), "duplicate fog distance");
@@ -177,11 +178,21 @@ pub struct SkyBackground {
     base: [f32; 3],
     biomes: BTreeMap<String, Option<ColorLayer>>,
     tracks: Vec<SkyTrack>,
-    fog_base: Option<[f32; 2]>,
-    fog_biomes: BTreeMap<String, Option<[Option<FloatLayer>; 2]>>,
+    fog_base: Option<[f32; 3]>,
+    fog_biomes: BTreeMap<String, Option<[Option<FloatLayer>; 3]>>,
     fog_tracks: Option<Vec<FogTrack>>,
+    fog_sky_base: Option<[f32; 3]>,
+    fog_sky_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
+    fog_sky_tracks: Option<Vec<SkyTrack>>,
     min_y: i32,
     max_y: i32,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BackgroundSample {
+    pub color: [f32; 3],
+    pub fog_range: Option<[f32; 2]>,
+    pub sky_mix: Option<([f32; 3], f32)>,
 }
 
 impl SkyBackground {
@@ -217,7 +228,7 @@ impl SkyBackground {
         };
         let fog_base = if skybox == "none" {
             fog_layers(dimension.get("attributes")).ok().map(|layers| {
-                let defaults = [0.0, 1024.0];
+                let defaults = [0.0, 1024.0, 512.0];
                 std::array::from_fn(|i| {
                     layers[i].map_or(defaults[i], |layer| layer.apply(defaults[i]))
                 })
@@ -225,7 +236,18 @@ impl SkyBackground {
         } else {
             None
         };
+        let fog_sky_base = if skybox == "none" {
+            match dimension.get("attributes") {
+                None => Some([0.0; 3]),
+                Some(attributes) => find_color_attribute(attributes, "visual/sky_color")
+                    .ok()
+                    .map(|layer| layer.map_or([0.0; 3], |layer| layer.apply([0.0; 3]))),
+            }
+        } else {
+            None
+        };
         let mut fog_biomes = BTreeMap::new();
+        let mut fog_sky_biomes = BTreeMap::new();
         let mut biomes = BTreeMap::new();
         for id in source.list_data("worldgen/biome")? {
             let path = format!("data/{}/worldgen/biome/{}.json", id.namespace, id.path);
@@ -241,11 +263,19 @@ impl SkyBackground {
                 .flatten();
             let name = format!("{}:{}", id.namespace, id.path);
             fog_biomes.insert(name.clone(), fog_layers(biome.get("attributes")).ok());
+            fog_sky_biomes.insert(
+                name.clone(),
+                match biome.get("attributes") {
+                    None => Some(None),
+                    Some(attributes) => find_color_attribute(attributes, "visual/sky_color").ok(),
+                },
+            );
             ensure!(biomes.insert(name, layer).is_none(), "duplicate biome");
         }
         ensure!(!biomes.is_empty(), "biome registry is empty");
         let mut tracks = Vec::new();
         let mut fog_tracks = Some(Vec::new());
+        let mut fog_sky_tracks = Some(Vec::new());
         for timeline in
             native_resources::fluid_environment::load_dimension_timelines(source, dimension_type)?
         {
@@ -260,6 +290,7 @@ impl SkyBackground {
                     && let Some(index) = match id.path.as_str() {
                         "visual/fog_start_distance" => Some(0),
                         "visual/fog_end_distance" => Some(1),
+                        "visual/sky_fog_end_distance" => Some(2),
                         _ => None,
                     }
                 {
@@ -270,6 +301,17 @@ impl SkyBackground {
                             }
                         }
                         Err(_) => fog_tracks = None,
+                    }
+                }
+                if skybox == "none" && id.namespace == "minecraft" && id.path == "visual/sky_color"
+                {
+                    match SkyTrack::parse(&timeline, value, false) {
+                        Ok(track) => {
+                            if let Some(tracks) = &mut fog_sky_tracks {
+                                tracks.push(track);
+                            }
+                        }
+                        Err(_) => fog_sky_tracks = None,
                     }
                 }
                 if id.namespace == "minecraft" && id.path == attribute {
@@ -286,6 +328,9 @@ impl SkyBackground {
             fog_base,
             fog_biomes,
             fog_tracks,
+            fog_sky_base,
+            fog_sky_biomes,
+            fog_sky_tracks,
             min_y,
             max_y,
         }))
@@ -296,7 +341,7 @@ impl SkyBackground {
         world: &World,
         position: DVec3,
         mut clock_ticks: impl FnMut(&ResourceId) -> Option<i64>,
-    ) -> Option<([f32; 3], Option<[f32; 2]>)> {
+    ) -> Option<BackgroundSample> {
         let min_y = self.min_y.div_euclid(4) * 4;
         let max_y = (self.max_y - 1).div_euclid(4) * 4;
         let grouped = group_biomes(position, |x, y, z| {
@@ -315,7 +360,7 @@ impl SkyBackground {
                 arg
             };
         }
-        let fog_range = (|| {
+        let fog_values = (|| {
             let mut range = interpolate_fog(&grouped, &self.fog_biomes, self.fog_base?)?;
             for track in self.fog_tracks.as_ref()? {
                 let arg = track.track.sample(clock_ticks(&track.track.clock)?)[0];
@@ -326,9 +371,28 @@ impl SkyBackground {
                 .apply(range[track.index]);
             }
             range[1] = range[1].max(0.0);
+            range[2] = range[2].max(0.0);
             range.iter().all(|n| n.is_finite()).then_some(range)
         })();
-        Some((value, fog_range))
+        let fog_range = fog_values.map(|values| [values[0], values[1]]);
+        let sky_mix = (|| {
+            let mut sky =
+                interpolate_optional_color(&grouped, &self.fog_sky_biomes, self.fog_sky_base?)?;
+            for track in self.fog_sky_tracks.as_ref()? {
+                let arg = track.sample(clock_ticks(&track.clock)?);
+                sky = if track.multiply {
+                    std::array::from_fn(|i| sky[i] * arg[i])
+                } else {
+                    arg
+                };
+            }
+            Some((sky, fog_values?[2]))
+        })();
+        Some(BackgroundSample {
+            color: value,
+            fog_range,
+            sky_mix,
+        })
     }
 }
 
@@ -390,16 +454,40 @@ fn interpolate_color(
     result
 }
 
+fn interpolate_optional_color(
+    grouped: &[(&str, f64)],
+    layers: &BTreeMap<String, Option<Option<ColorLayer>>>,
+    base: [f32; 3],
+) -> Option<[f32; 3]> {
+    let mut total = 0.0;
+    let mut result: Option<[f32; 3]> = None;
+    for &(id, weight) in grouped {
+        let color = layers
+            .get(id)?
+            .as_ref()?
+            .map_or(base, |layer| layer.apply(base));
+        total += weight;
+        result = Some(match result {
+            None => color,
+            Some(current) => {
+                let t = (weight / total) as f32;
+                std::array::from_fn(|i| current[i] + t * (color[i] - current[i]))
+            }
+        });
+    }
+    result
+}
+
 fn interpolate_fog(
     grouped: &[(&str, f64)],
-    layers: &BTreeMap<String, Option<[Option<FloatLayer>; 2]>>,
-    base: [f32; 2],
-) -> Option<[f32; 2]> {
+    layers: &BTreeMap<String, Option<[Option<FloatLayer>; 3]>>,
+    base: [f32; 3],
+) -> Option<[f32; 3]> {
     let mut total = 0.0;
-    let mut result: Option<[f32; 2]> = None;
+    let mut result: Option<[f32; 3]> = None;
     for &(id, weight) in grouped {
         let layers = layers.get(id)?.as_ref()?;
-        let value: [f32; 2] =
+        let value: [f32; 3] =
             std::array::from_fn(|i| layers[i].map_or(base[i], |layer| layer.apply(base[i])));
         total += weight;
         result = Some(match result {
@@ -469,7 +557,13 @@ mod tests {
             }
         }
         let fog_track = json!({"modifier":"multiply","keyframes":[{"ticks":0,"value":1.0},{"ticks":12000,"value":0.5}]});
-        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases});
+        let mut fog_color_cases = Vec::new();
+        for chunks in [2, 4, 12, 32, 64] {
+            for end in [0.0, 128.0, 512.0, 2048.0] {
+                fog_color_cases.push(json!({"chunks":chunks,"end":end}));
+            }
+        }
+        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases});
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SkyBackgroundOracle.java");
         let input_file = temp.path().join("input.json");
@@ -541,9 +635,9 @@ mod tests {
         let fog_distance_layers = BTreeMap::from([
             ("a".into(), Some(fog_layers(Some(&biomes[0])).unwrap())),
             ("b".into(), Some(fog_layers(Some(&biomes[1])).unwrap())),
-            ("c".into(), Some([None; 2])),
+            ("c".into(), Some([None; 3])),
         ]);
-        assert_eq!(expected.len(), cases.len() + 6);
+        assert_eq!(expected.len(), cases.len() + 6 + fog_color_cases.len());
         for (case, expected) in cases.iter().zip(&expected) {
             let p = &case["position"];
             let position = DVec3::new(
@@ -571,7 +665,7 @@ mod tests {
             })
             .unwrap();
             let mut distance =
-                interpolate_fog(&grouped, &fog_distance_layers, [10.0, 96.0]).unwrap();
+                interpolate_fog(&grouped, &fog_distance_layers, [10.0, 96.0, 512.0]).unwrap();
             distance[1] *= fog_distance_track.sample(case["tick"].as_i64().unwrap())[0];
             for i in 0..2 {
                 assert!(
@@ -601,10 +695,26 @@ mod tests {
             "override", "add", "subtract", "multiply", "minimum", "maximum",
         ]
         .into_iter()
-        .zip(&expected[cases.len()..])
+        .zip(&expected[cases.len()..cases.len() + 6])
         {
             let layer = FloatLayer::parse(&json!({"modifier":name,"argument":3.0})).unwrap();
             assert_eq!(layer.apply(10.0), expected[0], "modifier {name}");
+        }
+        for (case, expected) in fog_color_cases.iter().zip(&expected[cases.len() + 6..]) {
+            let actual = crate::preview_app::atmospheric_fog_color(
+                [0.2, 0.6, 0.9],
+                [0.8, 0.3, 0.05],
+                case["end"].as_f64().unwrap() as f32,
+                case["chunks"].as_u64().unwrap() as u32,
+            );
+            for i in 0..3 {
+                assert!(
+                    (actual[i] - expected[i]).abs() < 0.000002,
+                    "fog color case {case}, channel {i}: {} != {}",
+                    actual[i],
+                    expected[i]
+                );
+            }
         }
         assert!(
             SkyBackground::load(&mut resources, "minecraft:overworld", -64, 320)
@@ -614,7 +724,7 @@ mod tests {
         let nether = SkyBackground::load(&mut resources, "minecraft:the_nether", 0, 128)
             .unwrap()
             .unwrap();
-        assert_eq!(nether.fog_base, Some([10.0, 96.0]));
+        assert_eq!(nether.fog_base, Some([10.0, 96.0, 512.0]));
         for (biome, expected) in [
             ("minecraft:nether_wastes", [0x33, 0x08, 0x08]),
             ("minecraft:soul_sand_valley", [0x1b, 0x47, 0x45]),
@@ -696,22 +806,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(background.base, [1.0; 3]);
-        assert_eq!(background.fog_base, Some([10.0, 96.0]));
+        assert_eq!(background.fog_base, Some([10.0, 96.0, 512.0]));
         let groups = group_biomes(DVec3::ZERO, |_, _, _| Some("example:test")).unwrap();
+        assert_eq!(
+            interpolate_optional_color(
+                &groups,
+                &background.fog_sky_biomes,
+                background.fog_sky_base.unwrap()
+            ),
+            Some([0.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            background.fog_sky_tracks.as_ref().unwrap()[0].sample(0),
+            [1.0, 0.0, 0.0]
+        );
         let mut range = interpolate_fog(
             &groups,
             &background.fog_biomes,
             background.fog_base.unwrap(),
         )
         .unwrap();
-        assert_eq!(range, [15.0, 64.0]);
+        assert_eq!(range, [15.0, 64.0, 512.0]);
         let track = &background.fog_tracks.as_ref().unwrap()[0];
         range[track.index] = FloatLayer {
             value: track.track.sample(10)[0],
             modifier: track.modifier,
         }
         .apply(range[track.index]);
-        assert_eq!(range, [15.0, 80.0]);
+        assert_eq!(range, [15.0, 80.0, 512.0]);
         let fog = gaussian_biomes(
             DVec3::ZERO,
             |_, _, _| Some("example:test"),
@@ -766,30 +888,53 @@ mod tests {
             )]),
             tracks: vec![SkyTrack::parse(&timeline, &track, false).unwrap()],
             fog_base: None,
-            fog_biomes: BTreeMap::from([("minecraft:plains".into(), Some([None; 2]))]),
+            fog_biomes: BTreeMap::from([("minecraft:plains".into(), Some([None; 3]))]),
             fog_tracks: Some(Vec::new()),
+            fog_sky_base: None,
+            fog_sky_biomes: BTreeMap::new(),
+            fog_sky_tracks: None,
             min_y: 0,
             max_y: 16,
         };
         assert_eq!(
             background.sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0)),
-            Some(([0.2, 0.4, 0.6], None))
+            Some(BackgroundSample {
+                color: [0.2, 0.4, 0.6],
+                fog_range: None,
+                sky_mix: None
+            })
         );
         assert_eq!(
             background.sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(10)),
-            Some(([0.0; 3], None))
+            Some(BackgroundSample {
+                color: [0.0; 3],
+                fog_range: None,
+                sky_mix: None
+            })
         );
         assert!(
             background
                 .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| None)
                 .is_none()
         );
-        background.fog_base = Some([10.0, 96.0]);
+        background.fog_base = Some([10.0, 96.0, 512.0]);
+        background.fog_sky_base = Some([0.1, 0.2, 0.3]);
+        background
+            .fog_sky_biomes
+            .insert("minecraft:plains".into(), Some(None));
+        background.fog_sky_tracks = Some(Vec::new());
         assert_eq!(
             background
                 .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
                 .unwrap()
-                .1,
+                .sky_mix,
+            Some(([0.1, 0.2, 0.3], 512.0))
+        );
+        assert_eq!(
+            background
+                .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
+                .unwrap()
+                .fog_range,
             Some([10.0, 96.0])
         );
         background.fog_biomes.insert(
@@ -803,6 +948,7 @@ mod tests {
                     value: 0.5,
                     modifier: FloatModifier::Multiply,
                 }),
+                None,
             ]),
         );
         background.fog_tracks = Some(vec![
@@ -817,7 +963,7 @@ mod tests {
             background
                 .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
                 .unwrap()
-                .1,
+                .fog_range,
             Some([15.0, 56.0])
         );
         background
@@ -827,7 +973,7 @@ mod tests {
             background
                 .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
                 .unwrap()
-                .1,
+                .fog_range,
             None
         );
         world.chunks.remove(&ChunkPos { x: -1, z: -1 });

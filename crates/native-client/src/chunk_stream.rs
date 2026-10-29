@@ -73,6 +73,10 @@ pub struct ChunkStreamer {
 }
 
 impl ChunkStreamer {
+    pub fn radius(&self) -> u32 {
+        self.radius
+    }
+
     pub fn start(
         mut reader: WorldReader,
         defaults: Defaults,

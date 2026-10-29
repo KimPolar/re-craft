@@ -115,8 +115,8 @@ pub struct LoadedSession {
     recipes: Option<Arc<CraftingRecipes>>,
     loot: Option<Arc<BlockLootTables>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
-    soil_ticks: BTreeMap<(u64, u64), (IVec3, SoilKind)>,
-    soil_tick_sequence: u64,
+    soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
+    soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     block_drops: bool,
@@ -988,7 +988,7 @@ impl LoadedSession {
             loot: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
-            soil_tick_sequence: 0,
+            soil_pending: BTreeSet::new(),
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             block_drops: true,
@@ -3797,15 +3797,25 @@ impl LoadedSession {
     }
 
     fn advance_block_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, true);
+        self.advance_scheduled_block_ticks(true, true, true);
     }
 
     #[cfg(test)]
     fn advance_sand_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, false);
+        self.advance_scheduled_block_ticks(true, false, false);
     }
 
-    fn advance_scheduled_block_ticks(&mut self, process_sand: bool, process_buttons: bool) {
+    #[cfg(test)]
+    fn advance_soil_ticks(&mut self) {
+        self.advance_scheduled_block_ticks(false, false, true);
+    }
+
+    fn advance_scheduled_block_ticks(
+        &mut self,
+        process_sand: bool,
+        process_buttons: bool,
+        process_soil: bool,
+    ) {
         let revision = self.revision;
         if process_sand && self.sand_deferred_revision != Some(revision) {
             self.sand_ticks.append(&mut self.sand_deferred);
@@ -3815,6 +3825,7 @@ impl LoadedSession {
         }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
+        let mut deferred_soil = Vec::new();
         let mut executed = 0;
         while executed < 65_536 {
             let sand_order = process_sand
@@ -3823,21 +3834,20 @@ impl LoadedSession {
             let button_order = process_buttons
                 .then(|| self.button_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
-            let process_sand_next = match (sand_order, button_order) {
-                (Some(sand), Some(button)) => sand <= button,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => break,
-            };
-            let order = if process_sand_next {
-                sand_order.expect("selected sand tick has an order")
-            } else {
-                button_order.expect("selected button tick has an order")
+            let soil_order = process_soil
+                .then(|| self.soil_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
+            let Some((order, kind)) = [(sand_order, 0), (button_order, 1), (soil_order, 2)]
+                .into_iter()
+                .filter_map(|(order, kind)| order.map(|order| (order, kind)))
+                .min()
+            else {
+                break;
             };
             if order.0 > i128::from(self.tick) {
                 break;
             }
-            if process_sand_next {
+            if kind == 0 {
                 let (order, key) = self
                     .sand_ticks
                     .pop_first()
@@ -3892,7 +3902,7 @@ impl LoadedSession {
                         });
                     }
                 }
-            } else {
+            } else if kind == 1 {
                 let (order, key) = self
                     .button_ticks
                     .pop_first()
@@ -3920,8 +3930,60 @@ impl LoadedSession {
                 if self.set_stone_button_power(relative, false) {
                     self.push_button_sound(relative, false);
                 }
+            } else {
+                let (order, (absolute, soil)) = self
+                    .soil_ticks
+                    .pop_first()
+                    .expect("selected soil tick remains queued");
+                let Some(relative) = subtract(absolute, self.origin) else {
+                    deferred_soil.push((order, (absolute, soil)));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    deferred_soil.push((order, (absolute, soil)));
+                    continue;
+                };
+                let matches_soil = self
+                    .world
+                    .state(id)
+                    .and_then(|state| SoilKind::from_name(&state.name))
+                    == Some(soil);
+                let blocked = if matches_soil && soil == SoilKind::Farmland {
+                    let Some(above) = add(relative, IVec3::Y) else {
+                        self.soil_pending
+                            .remove(&(absolute.x, absolute.y, absolute.z, soil));
+                        executed += 1;
+                        continue;
+                    };
+                    let Cell::State(above) =
+                        cell(&self.world, self.origin, self.bounds, above, self.states[0])
+                    else {
+                        deferred_soil.push((order, (absolute, soil)));
+                        continue;
+                    };
+                    self.world
+                        .state(above)
+                        .and_then(|state| known_soil_cover(&state.name))
+                        == Some(true)
+                } else {
+                    false
+                };
+                self.soil_pending
+                    .remove(&(absolute.x, absolute.y, absolute.z, soil));
+                self.mark_tick_chunk_dirty(absolute.x, absolute.z);
+                executed += 1;
+                if matches_soil && (soil == SoilKind::Path || blocked) {
+                    self.set(relative, self.states[2]);
+                }
             }
         }
+        self.soil_ticks.extend(deferred_soil);
         if process_sand {
             self.sand_deferred.extend(deferred_sand);
             // Block edits during this pass may have resolved an earlier deferred
@@ -4267,67 +4329,22 @@ impl LoadedSession {
                 .and_then(|state| SoilKind::from_name(&state.name))
             && let Some(absolute) = add(self.origin, below)
         {
-            let key = (self.tick.saturating_add(1), self.soil_tick_sequence);
-            self.soil_tick_sequence = self.soil_tick_sequence.wrapping_add(1);
-            self.soil_ticks.insert(key, (absolute, kind));
-            self.mark_tick_chunk_dirty(absolute.x, absolute.z);
-        }
-    }
-
-    fn advance_soil_ticks(&mut self) {
-        let mut deferred = Vec::new();
-        let mut executed = 0;
-        while let Some((&key, _)) = self.soil_ticks.first_key_value() {
-            if key.0 > self.tick || executed >= 65_536 {
-                break;
-            }
-            let (_, (absolute, kind)) = self.soil_ticks.pop_first().expect("scheduled soil tick");
-            executed += 1;
-            let Some(relative) = subtract(absolute, self.origin) else {
-                deferred.push((key, (absolute, kind)));
-                continue;
-            };
-            let Cell::State(id) = cell(
-                &self.world,
-                self.origin,
-                self.bounds,
-                relative,
-                self.states[0],
-            ) else {
-                deferred.push((key, (absolute, kind)));
-                continue;
-            };
-            if self
-                .world
-                .state(id)
-                .and_then(|state| SoilKind::from_name(&state.name))
-                != Some(kind)
-            {
-                continue;
-            }
-            if kind == SoilKind::Path {
-                self.set(relative, self.states[2]);
-                continue;
-            }
-            let Some(above) = add(relative, IVec3::Y) else {
-                continue;
-            };
-            let Cell::State(above) =
-                cell(&self.world, self.origin, self.bounds, above, self.states[0])
-            else {
-                deferred.push((key, (absolute, kind)));
-                continue;
-            };
-            let blocked = self
-                .world
-                .state(above)
-                .and_then(|state| known_soil_cover(&state.name))
-                == Some(true);
-            if blocked {
-                self.set(relative, self.states[2]);
+            let key = (absolute.x, absolute.y, absolute.z, kind);
+            if self.soil_pending.insert(key) {
+                let sequence = self.block_tick_sequence;
+                self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+                self.soil_ticks.insert(
+                    (
+                        i128::from(self.tick) + 1,
+                        0,
+                        i64::try_from(sequence).unwrap_or(i64::MAX),
+                        sequence,
+                    ),
+                    (absolute, kind),
+                );
+                self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             }
         }
-        self.soil_ticks.extend(deferred);
     }
 
     fn react_lava(&mut self, position: IVec3) -> bool {
@@ -4552,7 +4569,6 @@ impl LoadedSession {
         let camera_target_eye_height = self.player.pose.eye_height();
         let camera_sprinting = self.sprint.active;
         self.apply_streaming();
-        self.advance_soil_ticks();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
         self.advance_fluid_ticks();
@@ -9957,6 +9973,72 @@ mod tests {
             session.advance_soil_ticks();
             assert!(session.draft_block_ticks(chunk).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn soil_ticks_deduplicate_and_share_block_tick_work_limit() {
+        let mut session = session();
+        let soil = IVec3::new(8, 2, 6);
+        let path = session.intern_block(state("minecraft:dirt_path", &[]));
+        assert!(session.set(soil, path));
+        assert!(session.set(soil + IVec3::Y, session.states[3]));
+        assert!(session.set(soil + IVec3::Y, session.states[0]));
+        assert!(session.set(soil + IVec3::Y, session.states[3]));
+        assert_eq!(session.soil_ticks.len(), 1);
+
+        session.tick = 1;
+        let stale = SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: (session.origin + IVec3::new(9, 2, 7)).to_array(),
+            delay: 0,
+            priority: 0,
+        };
+        session.enqueue_saved_sand(&vec![stale; 65_536]);
+        session.advance_block_ticks();
+        assert_eq!(session.soil_ticks.len(), 1);
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, soil, session.states[0]), Cell::State(id) if id == path)
+        );
+
+        session.advance_block_ticks();
+        assert!(session.soil_ticks.is_empty());
+        assert!(session.soil_pending.is_empty());
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, soil, session.states[0]), Cell::State(id) if id == session.states[2])
+        );
+    }
+
+    #[test]
+    fn soil_tick_waits_for_its_chunk_and_runs_after_reload() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let soil = IVec3::new(8, 2, 6);
+        let absolute = session.origin + soil;
+        let path = session.intern_block(state("minecraft:dirt_path", &[]));
+        assert!(session.set(soil, path));
+        assert!(session.set(soil + IVec3::Y, session.states[3]));
+        session.queue_chunk_window(remote, 0);
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert_eq!(session.soil_ticks.len(), 1);
+        assert!(session.draft_block_ticks(home).is_err());
+        session.queue_chunk_window(home, 0);
+        session.update(TICK);
+        assert!(session.soil_ticks.is_empty());
+        assert!(session.soil_pending.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:dirt"
+        );
     }
 
     #[test]

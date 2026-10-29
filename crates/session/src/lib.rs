@@ -1382,7 +1382,7 @@ fn selected_inventory_block(inventory: &PlayerInventory) -> Block {
     inventory_block(inventory, PlayerSlot::Storage(inventory.selected()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum SoilKind {
     Path,
     Farmland,

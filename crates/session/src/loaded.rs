@@ -116,6 +116,8 @@ pub struct LoadedSession {
     loot: Option<Arc<BlockLootTables>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
+    soil_deferred: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
+    soil_deferred_revision: Option<u64>,
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
@@ -988,6 +990,8 @@ impl LoadedSession {
             loot: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
+            soil_deferred: BTreeMap::new(),
+            soil_deferred_revision: None,
             soil_pending: BTreeSet::new(),
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
@@ -1833,9 +1837,14 @@ impl LoadedSession {
             "stone-button tick is missing its scheduled order"
         );
         let mut queued_soil = BTreeSet::new();
-        for (order, &(absolute, soil)) in self.soil_ticks.iter().filter(|(_, (absolute, _))| {
-            absolute.x.div_euclid(16) == pos.x && absolute.z.div_euclid(16) == pos.z
-        }) {
+        for (order, &(absolute, soil)) in
+            self.soil_ticks
+                .iter()
+                .chain(&self.soil_deferred)
+                .filter(|(_, (absolute, _))| {
+                    absolute.x.div_euclid(16) == pos.x && absolute.z.div_euclid(16) == pos.z
+                })
+        {
             queued_soil.insert((absolute.x, absolute.y, absolute.z, soil));
             let delay = i32::try_from(order.0 - i128::from(self.tick))
                 .context("soil tick delay cannot be represented in NBT")?;
@@ -3873,6 +3882,9 @@ impl LoadedSession {
         if process_buttons && self.button_deferred_revision != Some(revision) {
             self.button_ticks.append(&mut self.button_deferred);
         }
+        if process_soil && self.soil_deferred_revision != Some(revision) {
+            self.soil_ticks.append(&mut self.soil_deferred);
+        }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
@@ -4038,7 +4050,10 @@ impl LoadedSession {
                 }
             }
         }
-        self.soil_ticks.extend(deferred_soil);
+        if process_soil {
+            self.soil_deferred.extend(deferred_soil);
+            self.soil_deferred_revision = Some(revision);
+        }
         if process_sand {
             self.sand_deferred.extend(deferred_sand);
             // Block edits during this pass may have resolved an earlier deferred
@@ -10088,11 +10103,12 @@ mod tests {
         for _ in 0..5 {
             session.update(TICK);
         }
-        assert_eq!(session.soil_ticks.len(), 1);
+        assert_eq!(session.soil_deferred.len(), 1);
         assert!(session.draft_block_ticks(home).unwrap()[0].delay < 0);
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert!(session.soil_ticks.is_empty());
+        assert!(session.soil_deferred.is_empty());
         assert!(session.soil_pending.is_empty());
         assert_eq!(
             session
@@ -10167,11 +10183,28 @@ mod tests {
         };
         session.enqueue_saved_soil(std::slice::from_ref(&tick));
         session.advance_block_ticks();
+        assert_eq!(session.soil_deferred.len(), 1);
+        assert!(session.soil_ticks.is_empty());
+        for _ in 0..4 {
+            session.advance_block_ticks();
+            assert_eq!(session.soil_deferred.len(), 1);
+            assert!(session.soil_ticks.is_empty());
+        }
         assert_eq!(
             session
                 .draft_block_ticks(session.player_chunk().unwrap())
                 .unwrap(),
             vec![tick]
+        );
+        assert!(session.set(relative + IVec3::Y, session.states[0]));
+        session.advance_block_ticks();
+        assert!(session.soil_deferred.is_empty());
+        assert!(session.soil_pending.is_empty());
+        assert!(
+            session
+                .draft_block_ticks(session.player_chunk().unwrap())
+                .unwrap()
+                .is_empty()
         );
     }
 

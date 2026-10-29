@@ -141,7 +141,7 @@ impl WorldSavePlan {
 
     /// Add an entity chunk to a coordinated partial save. The caller must
     /// validate entity ownership, movement and all simulated side effects.
-    /// Missing entity regions are not yet supported by the transaction layer.
+    /// The dimension's entity directory must already exist.
     pub fn add_entity_chunk(
         &mut self,
         dimension: DimensionId,
@@ -584,37 +584,65 @@ impl WorldWriteGuard {
             );
             let name = format!("r.{region_x}.{region_z}.mca");
             let region_path = region_dir.join(&name);
-            let metadata = fs::symlink_metadata(&region_path)
-                .with_context(|| format!("cannot inspect region {}", region_path.display()))?;
+            let existing = match fs::symlink_metadata(&region_path) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_file() && ordinary(&metadata),
+                        "region must be an ordinary file"
+                    );
+                    let canonical = region_path.canonicalize()?;
+                    ensure!(
+                        canonical.parent() == Some(region_dir.as_path()),
+                        "region resolves outside its directory"
+                    );
+                    Some(canonical)
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && kind == RegionKind::Entities =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect region {}", region_path.display())
+                    });
+                }
+            };
             ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "region must be an ordinary file"
+                existing.is_some() || chunks.iter().any(|chunk| chunk.replacement.is_some()),
+                "a wholly absent entity region cannot yet be tracked as an unchanged dependency"
             );
-            let canonical = region_path.canonicalize()?;
-            ensure!(
-                canonical.parent() == Some(region_dir.as_path()),
-                "region resolves outside its directory"
-            );
+            let target = existing.clone().unwrap_or_else(|| region_path.clone());
 
             let mut stage = tempfile::Builder::new()
                 .prefix(".native-region-")
                 .tempfile_in(&region_dir)?;
-            let mut original = File::open(&canonical)?;
-            let original_length = original.metadata()?.len();
-            ensure!(
-                original_length >= HEADER_SIZE
-                    && original_length.is_multiple_of(SECTOR_SIZE)
-                    && original_length / SECTOR_SIZE <= MAX_OFFSET + 1,
-                "invalid or unsupported region file length"
-            );
-            std::io::copy(&mut original, stage.as_file_mut())?;
+            if let Some(path) = &existing {
+                let mut original = File::open(path)?;
+                let original_length = original.metadata()?.len();
+                ensure!(
+                    original_length >= HEADER_SIZE
+                        && original_length.is_multiple_of(SECTOR_SIZE)
+                        && original_length / SECTOR_SIZE <= MAX_OFFSET + 1,
+                    "invalid or unsupported region file length"
+                );
+                std::io::copy(&mut original, stage.as_file_mut())?;
+            } else {
+                stage.as_file_mut().set_len(HEADER_SIZE)?;
+            }
             stage.as_file_mut().flush()?;
-            let original_hash = hash_file(stage.path())?;
+            let original_hash = existing
+                .as_ref()
+                .map(|_| hash_file(stage.path()))
+                .transpose()?;
             let external = audit_region(stage.as_file_mut(), &region_dir, region_x, region_z)?;
 
             let group_backup = backup.path().join(format!("region-{group_index}"));
             fs::create_dir(&group_backup)?;
-            copy_sync(&canonical, &group_backup.join(&name))?;
+            if let Some(path) = &existing {
+                copy_sync(path, &group_backup.join(&name))?;
+            }
             for path in &external {
                 let file_name = path.file_name().context("external chunk has no filename")?;
                 let backup_path = group_backup.join(file_name);
@@ -692,16 +720,15 @@ impl WorldWriteGuard {
                     "staged chunk failed the NBT round-trip check"
                 );
             }
-            drop(original);
             replacements.push(crate::save_transaction::Replacement {
-                target: canonical.clone(),
-                backup: group_backup.join(name),
+                target: target.clone(),
+                backup: existing.map(|_| group_backup.join(name)),
                 stage,
                 original_hash,
             });
             match kind {
-                RegionKind::Blocks => region_paths.push(canonical),
-                RegionKind::Entities => entity_region_paths.push(canonical),
+                RegionKind::Blocks => region_paths.push(target),
+                RegionKind::Entities => entity_region_paths.push(target),
             }
         }
 
@@ -763,9 +790,9 @@ impl WorldWriteGuard {
             );
             replacements.push(crate::save_transaction::Replacement {
                 target: canonical.clone(),
-                backup: player_backup,
+                backup: Some(player_backup),
                 stage,
-                original_hash,
+                original_hash: Some(original_hash),
             });
             player_paths.push(canonical);
         }
@@ -841,9 +868,9 @@ impl WorldWriteGuard {
             );
             replacements.push(crate::save_transaction::Replacement {
                 target: canonical.clone(),
-                backup: clock_backup,
+                backup: Some(clock_backup),
                 stage,
-                original_hash,
+                original_hash: Some(original_hash),
             });
             world_clocks_path = Some(canonical);
         }
@@ -1054,9 +1081,9 @@ impl WorldWriteGuard {
             &backup_directory,
             vec![crate::save_transaction::Replacement {
                 target: canonical.clone(),
-                backup,
+                backup: Some(backup),
                 stage,
-                original_hash: baseline_hash,
+                original_hash: Some(baseline_hash),
             }],
             dependencies,
         )
@@ -1702,7 +1729,7 @@ mod tests {
             dimension,
             ChunkPos { x: 0, z: 0 },
             None,
-            &entity_chunk(0, vec![entity]),
+            &entity_chunk(0, vec![]),
             1,
             |_, _| Ok(()),
         )
@@ -1711,6 +1738,29 @@ mod tests {
         assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(fs::read(&block_path).unwrap(), original_blocks);
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn missing_empty_region_is_not_silently_ignored_or_created() {
+        let world = test_world();
+        let (block_path, original_blocks, _) = fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 32, z: 0 },
+            None,
+            &entity_chunk(32, vec![]),
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert!(!directory.join("r.1.0.mca").exists());
+        assert_eq!(fs::read(block_path).unwrap(), original_blocks);
         assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 

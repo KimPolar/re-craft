@@ -24,9 +24,9 @@ const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 
 pub(crate) struct Replacement {
     pub target: PathBuf,
-    pub backup: PathBuf,
+    pub backup: Option<PathBuf>,
     pub stage: NamedTempFile,
-    pub original_hash: [u8; 32],
+    pub original_hash: Option<[u8; 32]>,
 }
 
 pub(crate) struct Dependency {
@@ -46,8 +46,10 @@ struct Manifest {
 #[serde(deny_unknown_fields)]
 struct FileRecord {
     target: String,
-    backup: String,
-    original: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original: Option<String>,
     replacement: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stage: Option<String>,
@@ -91,7 +93,12 @@ fn ordinary(metadata: &fs::Metadata) -> bool {
 }
 
 /// Reject traversal, reparse points and non-regular files before opening them.
-fn checked_file(base: &Path, relative: &str, target: bool) -> Result<PathBuf> {
+fn checked_path(
+    base: &Path,
+    relative: &str,
+    target: bool,
+    allow_absent: bool,
+) -> Result<(PathBuf, bool)> {
     ensure!(
         !relative.is_empty() && relative.len() <= 4096,
         "invalid transaction path length"
@@ -112,8 +119,27 @@ fn checked_file(base: &Path, relative: &str, target: bool) -> Result<PathBuf> {
         }
         first = false;
         path.push(name);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error)
+                if allow_absent
+                    && components.peek().is_none()
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let parent = path
+                    .parent()
+                    .context("transaction target has no parent")?
+                    .canonicalize()?;
+                ensure!(
+                    parent.starts_with(base),
+                    "transaction path escapes its directory"
+                );
+                return Ok((path, false));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            }
+            Ok(metadata) => metadata,
+        };
         ensure!(
             ordinary(&metadata),
             "transaction path contains a link or reparse point"
@@ -132,7 +158,15 @@ fn checked_file(base: &Path, relative: &str, target: bool) -> Result<PathBuf> {
         path.canonicalize()?.starts_with(base),
         "transaction path escapes its directory"
     );
-    Ok(path)
+    Ok((path, true))
+}
+
+fn checked_file(base: &Path, relative: &str, target: bool) -> Result<PathBuf> {
+    Ok(checked_path(base, relative, target, false)?.0)
+}
+
+fn checked_target(base: &Path, relative: &str) -> Result<(PathBuf, bool)> {
+    checked_path(base, relative, true, true)
 }
 
 fn relative(base: &Path, path: &Path) -> Result<String> {
@@ -160,37 +194,83 @@ fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// New targets are limited to vanilla entity region files. A corrupt recovery
+/// record must not turn rollback into deletion of an arbitrary world file.
+fn valid_created_entity_region(value: &str) -> bool {
+    let components: Option<Vec<_>> = Path::new(value)
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let Some(parts) = components else {
+        return false;
+    };
+    if parts.len() < 5 || parts[0] != "dimensions" || parts[parts.len() - 2] != "entities" {
+        return false;
+    }
+    let namespace = parts[1];
+    let dimension_path = parts[2..parts.len() - 2].join("/");
+    if crate::world::DimensionId::parse(&format!("{namespace}:{dimension_path}")).is_err() {
+        return false;
+    }
+    let name = parts[parts.len() - 1];
+    let pieces: Vec<_> = name.split('.').collect();
+    if pieces.len() != 4 || pieces[0] != "r" || pieces[3] != "mca" {
+        return false;
+    }
+    let (Ok(x), Ok(z)) = (pieces[1].parse::<i32>(), pieces[2].parse::<i32>()) else {
+        return false;
+    };
+    name == format!("r.{x}.{z}.mca")
+}
+
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
-    ensure!(manifest.version == 1, "unsupported transaction version");
+    ensure!(
+        matches!(manifest.version, 1 | 2),
+        "unsupported transaction version"
+    );
     ensure!(
         !manifest.files.is_empty() && manifest.files.len() + manifest.dependencies.len() <= 4096,
         "invalid transaction file count"
     );
     let mut targets = BTreeSet::new();
     let mut backups = BTreeSet::new();
-    for (target, backup, original, replacement) in manifest
-        .files
-        .iter()
-        .map(|r| (&r.target, &r.backup, &r.original, Some(&r.replacement)))
-        .chain(
-            manifest
-                .dependencies
-                .iter()
-                .map(|r| (&r.target, &r.backup, &r.original, None)),
-        )
-    {
+    for record in &manifest.files {
         ensure!(
-            targets.insert(target.to_lowercase()),
+            targets.insert(record.target.to_lowercase()),
             "duplicate transaction target"
         );
         ensure!(
-            backups.insert(backup.to_lowercase()),
-            "duplicate transaction backup"
-        );
-        ensure!(
-            valid_digest(original) && replacement.is_none_or(|hash| valid_digest(hash)),
+            valid_digest(&record.replacement),
             "invalid transaction hash"
         );
+        match (&record.backup, &record.original) {
+            (Some(backup), Some(original)) => {
+                ensure!(
+                    backups.insert(backup.to_lowercase()),
+                    "duplicate transaction backup"
+                );
+                ensure!(valid_digest(original), "invalid transaction hash");
+            }
+            (None, None) if manifest.version == 2 => ensure!(
+                valid_created_entity_region(&record.target),
+                "invalid created region path"
+            ),
+            _ => bail!("invalid transaction original"),
+        }
+    }
+    for record in &manifest.dependencies {
+        ensure!(
+            targets.insert(record.target.to_lowercase()),
+            "duplicate transaction target"
+        );
+        ensure!(
+            backups.insert(record.backup.to_lowercase()),
+            "duplicate transaction backup"
+        );
+        ensure!(valid_digest(&record.original), "invalid transaction hash");
     }
     let mut stages = BTreeSet::new();
     for record in &manifest.files {
@@ -273,19 +353,27 @@ fn prepare(
     let mut records = Vec::with_capacity(files.len());
     for file in &files {
         let target = relative(root, &file.target)?;
-        let backup = relative(&backup_dir, &file.backup)?;
-        let original = format!(
-            "{:x}",
-            sha2::digest::Output::<sha2::Sha256>::from(file.original_hash)
-        );
-        ensure!(
-            digest(&checked_file(root, &target, true)?)? == original,
-            "world file changed during staging"
-        );
-        ensure!(
-            digest(&checked_file(&backup_dir, &backup, false)?)? == original,
-            "world backup does not match the original"
-        );
+        let (path, exists) = checked_target(root, &target)?;
+        let (backup, original) = match (&file.backup, file.original_hash) {
+            (Some(backup), Some(hash)) => {
+                let backup = relative(&backup_dir, backup)?;
+                let original = format!("{:x}", sha2::digest::Output::<sha2::Sha256>::from(hash));
+                ensure!(
+                    exists && digest(&path)? == original,
+                    "world file changed during staging"
+                );
+                ensure!(
+                    digest(&checked_file(&backup_dir, &backup, false)?)? == original,
+                    "world backup does not match the original"
+                );
+                (Some(backup), Some(original))
+            }
+            (None, None) => {
+                ensure!(!exists, "world file appeared during staging");
+                (None, None)
+            }
+            _ => bail!("transaction original and backup must both be present or absent"),
+        };
         ensure!(
             file.stage.path().parent() == file.target.parent(),
             "staged file is not in the target directory"
@@ -315,7 +403,11 @@ fn prepare(
         });
     }
     let manifest = Manifest {
-        version: 1,
+        version: if records.iter().any(|record| record.original.is_none()) {
+            2
+        } else {
+            1
+        },
         files: records,
         dependencies: dependency_records,
     };
@@ -360,20 +452,31 @@ fn check_dependencies(root: &Path, manifest: &Manifest) -> Result<()> {
 }
 
 fn replace_one(root: &Path, record: &FileRecord, file: Replacement) -> Result<()> {
-    let target = checked_file(root, &record.target, true)?;
-    ensure!(
-        digest(&target)? == record.original,
-        "world file changed before replacement: {}",
-        target.display()
-    );
+    let (target, exists) = checked_target(root, &record.target)?;
+    match &record.original {
+        Some(original) => ensure!(
+            exists && digest(&target)? == *original,
+            "world file changed before replacement: {}",
+            target.display()
+        ),
+        None => ensure!(
+            !exists,
+            "world file appeared before creation: {}",
+            target.display()
+        ),
+    }
     ensure!(
         digest(file.stage.path())? == record.replacement,
         "staged world file changed"
     );
-    file.stage
-        .persist(&target)
-        .map_err(|error| error.error)
-        .with_context(|| format!("cannot atomically replace {}", target.display()))?;
+    if record.original.is_some() {
+        file.stage.persist(&target).map_err(|error| error.error)
+    } else {
+        file.stage
+            .persist_noclobber(&target)
+            .map_err(|error| error.error)
+    }
+    .with_context(|| format!("cannot atomically install {}", target.display()))?;
     Ok(())
 }
 
@@ -495,36 +598,69 @@ pub(crate) fn recover(root: &Path) -> Result<bool> {
         );
     }
     for record in &manifest.files {
-        let target = checked_file(root, &record.target, true)?;
-        let actual = digest(&target)?;
-        ensure!(
-            actual == record.original || actual == record.replacement,
-            "world file was changed outside the transaction: {}",
-            target.display()
-        );
-        ensure!(
-            digest(&checked_file(&backup_dir, &record.backup, false)?)? == record.original,
-            "world backup changed"
-        );
+        let (target, exists) = checked_target(root, &record.target)?;
+        match (&record.original, &record.backup) {
+            (Some(original), Some(backup)) => {
+                ensure!(
+                    exists,
+                    "world file was changed outside the transaction: {}",
+                    target.display()
+                );
+                let actual = digest(&target)?;
+                ensure!(
+                    actual == *original || actual == record.replacement,
+                    "world file was changed outside the transaction: {}",
+                    target.display()
+                );
+                ensure!(
+                    digest(&checked_file(&backup_dir, backup, false)?)? == *original,
+                    "world backup changed"
+                );
+            }
+            (None, None) => ensure!(
+                !exists || digest(&target)? == record.replacement,
+                "world file was changed outside the transaction: {}",
+                target.display()
+            ),
+            _ => bail!("invalid transaction original"),
+        }
     }
     for record in &manifest.files {
-        let target = checked_file(root, &record.target, true)?;
+        let (target, exists) = checked_target(root, &record.target)?;
+        let Some(original) = &record.original else {
+            if exists {
+                ensure!(
+                    digest(&target)? == record.replacement,
+                    "world file changed during recovery"
+                );
+                fs::remove_file(&target).context("cannot remove created transaction file")?;
+            }
+            continue;
+        };
+        ensure!(exists, "world file changed during recovery");
         let actual = digest(&target)?;
-        if actual == record.original {
+        if actual == *original {
             continue;
         }
         ensure!(
             actual == record.replacement,
             "world file changed during recovery"
         );
-        let backup = checked_file(&backup_dir, &record.backup, false)?;
+        let backup = checked_file(
+            &backup_dir,
+            record
+                .backup
+                .as_deref()
+                .context("missing transaction backup")?,
+            false,
+        )?;
         let mut stage = tempfile::Builder::new()
             .prefix(".native-restore-")
             .tempfile_in(target.parent().context("target has no parent")?)?;
         std::io::copy(&mut File::open(backup)?, stage.as_file_mut())?;
         stage.as_file().sync_all()?;
         ensure!(
-            digest(stage.path())? == record.original,
+            digest(stage.path())? == *original,
             "restored backup failed verification"
         );
         stage
@@ -551,9 +687,13 @@ pub(crate) fn recover(root: &Path) -> Result<bool> {
     }
     check_dependencies(root, &manifest)?;
     for record in &manifest.files {
-        let target = checked_file(root, &record.target, true)?;
+        let (target, exists) = checked_target(root, &record.target)?;
+        let unchanged = match &record.original {
+            Some(original) => exists && digest(&target)? == *original,
+            None => !exists,
+        };
         ensure!(
-            digest(&target)? == record.original,
+            unchanged,
             "world file changed during recovery: {}",
             target.display()
         );
@@ -587,6 +727,7 @@ mod tests {
             .unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("dimensions/minecraft/overworld/region")).unwrap();
+        fs::create_dir_all(root.join("dimensions/minecraft/overworld/entities")).unwrap();
         fs::create_dir_all(root.join("players/data")).unwrap();
         fs::create_dir_all(root.join(".minecraft-native-backups/transaction-fixture")).unwrap();
         fs::write(
@@ -629,9 +770,9 @@ mod tests {
                 stage.write_all(value).unwrap();
                 Replacement {
                     target,
-                    backup: backup.join(backup_name),
+                    backup: Some(backup.join(backup_name)),
                     stage,
-                    original_hash,
+                    original_hash: Some(original_hash),
                 }
             })
             .collect();
@@ -651,6 +792,131 @@ mod tests {
             dependencies,
         )
         .unwrap()
+    }
+
+    fn created_region(root: &Path) -> Replacement {
+        let target = root.join("dimensions/minecraft/overworld/entities/r.1.0.mca");
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-region-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new region").unwrap();
+        Replacement {
+            target,
+            backup: None,
+            original_hash: None,
+            stage,
+        }
+    }
+
+    #[test]
+    fn new_file_commits_without_overwriting_an_existing_target() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let new = created_region(&root);
+        let path = new.target.clone();
+        commit(&root, &backup, vec![new], vec![]).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"new region");
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(backup.join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert!(manifest.files[0].original.is_none());
+    }
+
+    #[test]
+    fn new_file_creation_never_clobbers_an_outside_writer() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let new = created_region(&root);
+        let path = new.target.clone();
+        let mut prepared = prepare(&root, &backup, vec![new], vec![]).unwrap();
+        fs::write(&path, b"outside writer").unwrap();
+        assert!(replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).is_err());
+        drop(prepared);
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"outside writer");
+        fs::remove_file(&path).unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recovery_records_only_allow_new_entity_region_paths() {
+        assert!(valid_created_entity_region(
+            "dimensions/minecraft/overworld/entities/r.-1.0.mca"
+        ));
+        assert!(valid_created_entity_region(
+            "dimensions/example/deep/world/entities/r.5.-9.mca"
+        ));
+        for invalid in [
+            "players/data/player.dat",
+            "dimensions/minecraft/overworld/region/r.0.0.mca",
+            "dimensions/minecraft/overworld/entities/r.01.0.mca",
+            "dimensions/minecraft/../entities/r.0.0.mca",
+            "dimensions/minecraft/overworld/entities/session.lock",
+        ] {
+            assert!(!valid_created_entity_region(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn new_region_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_NEW_REGION_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let (mut files, deps) = replacements(&root);
+        files.push(created_region(&root));
+        let mut prepared = prepare(
+            &root,
+            &root.join(".minecraft-native-backups/transaction-fixture"),
+            files,
+            deps,
+        )
+        .unwrap();
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(1)).unwrap();
+        std::process::exit(24);
+    }
+
+    #[test]
+    fn crash_recovery_removes_new_region_and_restores_existing_files() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "save_transaction::tests::new_region_crash_helper",
+                "--nocapture",
+            ])
+            .env("NATIVE_NEW_REGION_CRASH_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(24),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let new = root.join("dimensions/minecraft/overworld/entities/r.1.0.mca");
+        let existing = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        assert_eq!(fs::read(&new).unwrap(), b"new region");
+        assert_eq!(fs::read(&existing).unwrap(), NEW_REGION);
+        fs::write(&new, b"changed elsewhere").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), NEW_REGION);
+        assert_eq!(fs::read(&new).unwrap(), b"changed elsewhere");
+        fs::write(&new, b"new region").unwrap();
+        assert!(WorldWriteGuard::recover_interrupted(&root).unwrap());
+        assert!(!new.exists());
+        assert_eq!(fs::read(existing).unwrap(), OLD_REGION);
+        assert_eq!(
+            fs::read(root.join("players/data/player.dat")).unwrap(),
+            OLD_PLAYER
+        );
+        assert!(!WorldWriteGuard::recover_interrupted(&root).unwrap());
     }
 
     #[test]

@@ -151,18 +151,23 @@ public class RegionWriteOracle {
             var list = new ListTag(); list.add(entity); chunk.put("Entities", list);
             try (var region = open(entities); var out = region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk, (DataOutput)out); }
             System.out.println("OK");
-        } else if (args[0].equals("verifyEntity")) {
+        } else if (args[0].equals("verifyEntity") || args[0].equals("verifyEntityNewRegion")) {
             Path entities = world.resolve("dimensions/minecraft/overworld/entities");
+            boolean newRegion=args[0].equals("verifyEntityNewRegion");
             try (var region = open(entities)) {
                 try (var in = region.getChunkDataInputStream(new ChunkPos(0,0))) {
                     var source = NbtIo.read((DataInput)in);
                     if (source.getLongOr("future_chunk",0) != 17 || !source.getListOrEmpty("Entities").isEmpty()) throw new AssertionError("source chunk was not preserved");
                 }
-                try (var in = region.getChunkDataInputStream(new ChunkPos(1,0))) {
+            }
+            int chunkX=newRegion ? 32 : 1;
+            if (!Files.isRegularFile(entities.resolve("r." + (newRegion ? 1 : 0) + ".0.mca"))) throw new AssertionError("missing region");
+            try (var region = open(entities, newRegion ? 1 : 0, RegionFileVersion.VERSION_NONE)) {
+                try (var in = region.getChunkDataInputStream(new ChunkPos(chunkX,0))) {
                     var destination = NbtIo.read((DataInput)in);
-                    if (!Arrays.equals(destination.getIntArray("Position").orElseThrow(), new int[]{1,0})) throw new AssertionError("position");
+                    if (!Arrays.equals(destination.getIntArray("Position").orElseThrow(), new int[]{chunkX,0})) throw new AssertionError("position");
                     var list=destination.getListOrEmpty("Entities"); var entity=list.getCompoundOrEmpty(0);
-                    if (list.size()!=1 || !entity.getStringOr("id", "").equals("minecraft:falling_block") || entity.getLongOr("future",0)!=42 || entity.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=17.5) throw new AssertionError("entity data");
+                    if (list.size()!=1 || !entity.getStringOr("id", "").equals("minecraft:falling_block") || entity.getLongOr("future",0)!=42 || entity.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=(newRegion ? 513.5 : 17.5)) throw new AssertionError("entity data");
                 }
             }
             System.out.println("OK");
@@ -232,6 +237,16 @@ fn state(name: &str) -> BlockState {
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn entity_chunk_drafts_commit_and_load_in_java() {
+    exercise_entity_chunk_drafts(false);
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn entity_chunk_drafts_create_region_readable_by_java() {
+    exercise_entity_chunk_drafts(true);
+}
+
+fn exercise_entity_chunk_drafts(new_region: bool) {
     use glam::DVec3;
     use native_persistence::nbt::{NamedTag, Tag};
     use native_session::saved_falling_block::{self, EntityReplacement, FallingSaveState};
@@ -283,7 +298,7 @@ fn entity_chunk_drafts_commit_and_load_in_java() {
             value: values[0].clone(),
         },
         FallingSaveState {
-            position: DVec3::new(17.5, 2.0, 3.0),
+            position: DVec3::new(if new_region { 513.5 } else { 17.5 }, 2.0, 3.0),
             velocity: DVec3::ZERO,
             on_ground: false,
             no_gravity: false,
@@ -294,7 +309,10 @@ fn entity_chunk_drafts_commit_and_load_in_java() {
     )
     .unwrap();
     let left = RuntimeChunkPos { x: 0, z: 0 };
-    let right = RuntimeChunkPos { x: 1, z: 0 };
+    let right = RuntimeChunkPos {
+        x: if new_region { 32 } else { 1 },
+        z: 0,
+    };
     let drafts = saved_falling_block::draft_entity_chunks_with_optional_sources(
         &BTreeMap::from([(left, Some(&original)), (right, None)]),
         &[EntityReplacement::Falling(&falling)],
@@ -323,12 +341,26 @@ fn entity_chunk_drafts_commit_and_load_in_java() {
         )
         .unwrap();
     drafts[&right]
-        .add_to_save_plan(&mut plan, dimension, ChunkPos { x: 1, z: 0 }, None, 101)
+        .add_to_save_plan(
+            &mut plan,
+            dimension,
+            ChunkPos { x: right.x, z: 0 },
+            None,
+            101,
+        )
         .unwrap();
     let mut guard = WorldWriteGuard::acquire(&world).unwrap();
     guard.write_plan(plan, |_, _| Ok(())).unwrap();
     drop(guard);
-    assert!(invoke("verifyEntity").lines().any(|line| line == "OK"));
+    assert!(
+        invoke(if new_region {
+            "verifyEntityNewRegion"
+        } else {
+            "verifyEntity"
+        })
+        .lines()
+        .any(|line| line == "OK")
+    );
 }
 
 #[test]

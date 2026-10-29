@@ -921,11 +921,21 @@ fn prepare_existing_world(
             .unwrap_or(default_mode);
         session.set_game_mode(mode);
         session.set_game_master_permission(reader.allow_commands()?);
-        match resources.vanilla_block_ids().and_then(|registry| {
-            native_resources::respawn_tags::load_fire_tag(&mut resources, &registry)
-        }) {
-            Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
-            Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
+        match resources.vanilla_block_ids() {
+            Ok(registry) => {
+                match native_resources::respawn_tags::load_fire_tag(&mut resources, &registry) {
+                    Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
+                    Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
+                }
+                match native_resources::respawn_tags::load_farmland_maintainers(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_farmland_maintainers(Arc::new(tag)),
+                    Err(error) => eprintln!("Farmland maintenance tag is unavailable: {error:#}"),
+                }
+            }
+            Err(error) => eprintln!("Block tags are unavailable: {error:#}"),
         }
         session.set_survival_rules(native_session::survival::SurvivalRules {
             difficulty: difficulty.difficulty,

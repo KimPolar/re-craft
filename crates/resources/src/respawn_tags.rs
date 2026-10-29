@@ -45,6 +45,25 @@ pub fn load_fire_tag(
     .context("cannot resolve falling-block fire tag")
 }
 
+/// Resolve the active tag that lets a block above farmland preserve it.
+pub fn load_farmland_maintainers(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:maintains_farmland")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve farmland maintenance tag")
+}
+
 impl RespawnBlockTags {
     pub fn load(provider: &mut impl ResourceProvider, registry: BTreeSet<String>) -> Result<Self> {
         ensure!(!registry.is_empty(), "block registry is empty");
@@ -232,6 +251,31 @@ mod tests {
     }
 
     #[test]
+    fn farmland_maintainers_resolve_pack_replacements_and_nested_tags() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/maintains_farmland.json".into(),
+                vec![
+                    br#"{"values":["minecraft:dirt"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#minecraft:extra_maintainers"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/minecraft/tags/block/extra_maintainers.json".into(),
+                vec![br#"{"values":["minecraft:stone"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = ["minecraft:stone", "minecraft:dirt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            load_farmland_maintainers(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:stone".into()])
+        );
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn installed_falling_fire_tag_loads() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -242,5 +286,19 @@ mod tests {
         let fire = load_fire_tag(&mut source, &registry).unwrap();
         assert!(fire.contains("minecraft:fire"));
         assert!(!fire.contains("minecraft:stone"));
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_farmland_maintainers_load() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = source.vanilla_block_ids().unwrap();
+        let tag = load_farmland_maintainers(&mut source, &registry).unwrap();
+        assert!(tag.contains("minecraft:moving_piston"));
+        assert!(tag.contains("minecraft:oak_fence_gate"));
+        assert!(!tag.contains("minecraft:stone"));
     }
 }

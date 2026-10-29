@@ -119,6 +119,7 @@ pub struct LoadedSession {
     soil_deferred: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
     soil_deferred_revision: Option<u64>,
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
+    farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     block_drops: bool,
@@ -839,6 +840,11 @@ impl LoadedSession {
         self.sand_deferred_revision = None;
     }
 
+    pub fn set_farmland_maintainers(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.farmland_maintainers = Some(tag);
+        self.soil_deferred_revision = None;
+    }
+
     pub fn set_crafting_recipes(&mut self, recipes: Arc<CraftingRecipes>) {
         self.recipes = Some(recipes);
     }
@@ -993,6 +999,7 @@ impl LoadedSession {
             soil_deferred: BTreeMap::new(),
             soil_deferred_revision: None,
             soil_pending: BTreeSet::new(),
+            farmland_maintainers: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             block_drops: true,
@@ -3191,17 +3198,33 @@ impl LoadedSession {
         }
     }
 
-    fn placement_block(&self, relative: IVec3, block: Block) -> Option<Block> {
-        if SoilKind::from_block(block).is_none() {
-            return Some(block);
+    fn soil_cover(&self, soil: SoilKind, name: &str) -> Option<bool> {
+        if soil == SoilKind::Farmland
+            && self
+                .farmland_maintainers
+                .as_ref()
+                .is_some_and(|tag| tag.contains(name))
+        {
+            return Some(false);
         }
+        let solid = known_soil_cover(name)?;
+        if solid && soil == SoilKind::Farmland && self.farmland_maintainers.is_none() {
+            return None;
+        }
+        Some(solid)
+    }
+
+    fn placement_block(&self, relative: IVec3, block: Block) -> Option<Block> {
+        let Some(kind) = SoilKind::from_block(block) else {
+            return Some(block);
+        };
         let above = add(relative, IVec3::Y)?;
         let Cell::State(id) = cell(&self.world, self.origin, self.bounds, above, self.states[0])
         else {
             return None;
         };
         let state = self.world.state(id)?;
-        let blocked = known_soil_cover(&state.name)?;
+        let blocked = self.soil_cover(kind, &state.name)?;
         Some(placed_soil(block, blocked))
     }
 
@@ -3427,11 +3450,9 @@ impl LoadedSession {
                 else {
                     return true;
                 };
-                if self
-                    .world
-                    .state(above)
-                    .and_then(|state| known_soil_cover(&state.name))
-                    != Some(false)
+                if self.world.state(above).and_then(|state| {
+                    self.soil_cover(SoilKind::from_block(block).unwrap(), &state.name)
+                }) != Some(false)
                 {
                     return true;
                 }
@@ -4032,7 +4053,7 @@ impl LoadedSession {
                     let Some(blocked) = self
                         .world
                         .state(above)
-                        .and_then(|state| known_soil_cover(&state.name))
+                        .and_then(|state| self.soil_cover(SoilKind::Farmland, &state.name))
                     else {
                         deferred_soil.push((order, (absolute, soil)));
                         continue;
@@ -4384,13 +4405,7 @@ impl LoadedSession {
                 self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
             }
         }
-        let solid_above = self
-            .world
-            .state(new)
-            .and_then(|state| known_soil_cover(&state.name))
-            == Some(true);
-        if solid_above
-            && let Some(below) = add(position, IVec3::NEG_Y)
+        if let Some(below) = add(position, IVec3::NEG_Y)
             && let Cell::State(id) =
                 cell(&self.world, self.origin, self.bounds, below, self.states[0])
             && let Some(kind) = self
@@ -4399,6 +4414,13 @@ impl LoadedSession {
                 .and_then(|state| SoilKind::from_name(&state.name))
             && let Some(absolute) = add(self.origin, below)
         {
+            let blocked = self
+                .world
+                .state(new)
+                .and_then(|state| self.soil_cover(kind, &state.name));
+            if blocked == Some(false) || (blocked.is_none() && kind != SoilKind::Farmland) {
+                return;
+            }
             let key = (absolute.x, absolute.y, absolute.z, kind);
             if self.soil_pending.insert(key) {
                 let sequence = self.block_tick_sequence;
@@ -6456,6 +6478,7 @@ mod tests {
         )
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
     }
 
@@ -10175,6 +10198,8 @@ mod tests {
         let unknown = session.intern_block(state("custom:unknown", &[]));
         assert!(session.set(relative, farmland));
         assert!(session.set(relative + IVec3::Y, unknown));
+        session.soil_ticks.clear();
+        session.soil_pending.clear();
         let tick = SavedBlockTick {
             block: "minecraft:farmland".into(),
             position: absolute.to_array(),
@@ -10205,6 +10230,72 @@ mod tests {
                 .draft_block_ticks(session.player_chunk().unwrap())
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn farmland_maintainer_tag_controls_placement_and_scheduled_ticks() {
+        let mut session = session();
+        let relative = IVec3::new(8, 2, 6);
+        session.set_farmland_maintainers(Arc::new(BTreeSet::from(["minecraft:stone".into()])));
+        assert!(session.set(relative + IVec3::Y, session.states[3]));
+        assert_eq!(
+            session.placement_block(relative, Block::Farmland(0)),
+            Some(Block::Farmland(0))
+        );
+        assert_eq!(
+            session.placement_block(relative, Block::DirtPath),
+            Some(Block::Dirt)
+        );
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+        assert!(session.set(relative, farmland));
+        let absolute = session.origin + relative;
+        session.enqueue_saved_soil(&[SavedBlockTick {
+            block: "minecraft:farmland".into(),
+            position: absolute.to_array(),
+            delay: 0,
+            priority: 0,
+        }]);
+        session.advance_block_ticks();
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:farmland"
+        );
+        session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
+        assert!(session.set(relative + IVec3::Y, session.states[0]));
+        assert!(session.set(relative + IVec3::Y, session.states[3]));
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:dirt"
+        );
+    }
+
+    #[test]
+    fn farmland_tick_waits_until_maintenance_tag_is_available() {
+        let mut session = session();
+        session.farmland_maintainers = None;
+        let relative = IVec3::new(8, 2, 6);
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+        assert!(session.set(relative, farmland));
+        assert!(session.set(relative + IVec3::Y, session.states[3]));
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.soil_deferred.len(), 1);
+        session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
+        session.advance_block_ticks();
+        assert!(session.soil_deferred.is_empty());
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == session.states[2])
         );
     }
 

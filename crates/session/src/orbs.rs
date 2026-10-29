@@ -100,6 +100,33 @@ impl Default for Orbs {
 }
 
 impl Orbs {
+    pub(crate) fn push_from_soil_expansion(&mut self, block: IVec3) {
+        let mut changed = false;
+        for entity in &mut self.entities {
+            let before = entity.visual.position;
+            if !Self::active(&self.active_chunks, before) {
+                continue;
+            }
+            let Some(delta) =
+                native_world::movement::soil_expansion_push(orb_bounds(before), block)
+            else {
+                continue;
+            };
+            entity.visual.position.y += delta;
+            entity.visual.previous_position = entity.visual.position;
+            if crate::items::item_section_order(before)
+                != crate::items::item_section_order(entity.visual.position)
+            {
+                entity.section_sequence = self.next_section_sequence;
+                self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+            }
+            changed = true;
+        }
+        if changed {
+            self.update_snapshot();
+        }
+    }
+
     pub fn snapshot(&self) -> Arc<[ExperienceOrb]> {
         Arc::clone(&self.snapshot)
     }

@@ -132,6 +132,105 @@ fn run(command: &mut Command) {
     );
 }
 
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn soil_expansion_teleport_matches_java_shapes() {
+    use glam::{DVec3, IVec3};
+    use native_world::movement::{BoundingBox, soil_expansion_push};
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SoilPushOracle.java");
+    std::fs::write(&source, r#"
+import java.nio.file.*;
+import java.util.*;
+import com.google.gson.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.EmptyBlockGetter;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.*;
+public class SoilPushOracle {
+  public static void main(String[] args) throws Exception {
+    SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var pos=new BlockPos(10,64,-12);
+    var dirt=Blocks.DIRT.defaultBlockState().getCollisionShape(EmptyBlockGetter.INSTANCE,pos);
+    var source=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
+    var out=new JsonArray();
+    for(var block:List.of(Blocks.DIRT_PATH,Blocks.FARMLAND)) {
+      var old=block.defaultBlockState().getCollisionShape(EmptyBlockGetter.INSTANCE,pos);
+      var added=Shapes.joinUnoptimized(old,dirt,BooleanOp.ONLY_SECOND).move(pos);
+      var rows=new JsonArray();
+      for(var entry:source) {
+        var a=entry.getAsJsonArray();
+        var box=new AABB(a.get(0).getAsDouble(),a.get(1).getAsDouble(),a.get(2).getAsDouble(),a.get(3).getAsDouble(),a.get(4).getAsDouble(),a.get(5).getAsDouble());
+        if(!box.intersects(added.bounds())) rows.add(JsonNull.INSTANCE);
+        else rows.add(1.0+Shapes.collide(Direction.Axis.Y,box.move(0,1,0),List.of(added),-1.0));
+      }
+      out.add(rows);
+    }
+    Files.writeString(Path.of(args[1]),out.toString());
+  }
+}
+"#).unwrap();
+    let block = IVec3::new(10, 64, -12);
+    let mut boxes = Vec::new();
+    for x in [-0.31, -0.125, 0.0, 0.5, 1.0, 1.125] {
+        for z in [-0.31, 0.0, 0.5, 1.0] {
+            for y in [-0.5, 0.0, 0.9, 0.9375, 0.93750001, 0.96875, 0.99999999, 1.0] {
+                for (width, height) in [(0.25, 0.25), (0.6, 1.8), (0.98, 0.98)] {
+                    let min = block.as_dvec3() + DVec3::new(x, y, z);
+                    boxes.push(BoundingBox {
+                        min,
+                        max: min + DVec3::new(width, height, width),
+                    });
+                }
+            }
+        }
+    }
+    let input = temp.path().join("boxes.json");
+    let output = temp.path().join("results.json");
+    let values: Vec<_> = boxes
+        .iter()
+        .map(|b| [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z])
+        .collect();
+    std::fs::write(&input, serde_json::to_vec(&values).unwrap()).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SoilPushOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Vec<Option<f64>>> =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    for block_rows in rows {
+        assert_eq!(block_rows.len(), boxes.len());
+        for (index, (bounds, expected)) in boxes.iter().zip(block_rows).enumerate() {
+            let actual = soil_expansion_push(*bounds, block);
+            match (actual, expected) {
+                (None, None) => {}
+                (Some(a), Some(b)) if (a - b).abs() < 1.0e-10 => {}
+                _ => panic!("case {index}: {bounds:?} native {actual:?}, Java {expected:?}"),
+            }
+        }
+    }
+    println!(
+        "Compared {} soil expansion boxes against both Java block shapes",
+        boxes.len()
+    );
+}
+
 fn same_volume(actual: &[Aabb], expected: &serde_json::Value) -> bool {
     let a: Vec<[f64; 6]> = actual
         .iter()

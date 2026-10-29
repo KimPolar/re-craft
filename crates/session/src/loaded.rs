@@ -4091,6 +4091,7 @@ impl LoadedSession {
                 self.mark_tick_chunk_dirty(absolute.x, absolute.z);
                 executed += 1;
                 if matches_soil && (soil == SoilKind::Path || blocked) {
+                    self.push_entities_from_soil(relative, absolute);
                     self.set(relative, self.states[2]);
                 }
             }
@@ -4108,6 +4109,33 @@ impl LoadedSession {
         if process_buttons {
             self.button_deferred.extend(deferred_buttons);
             self.button_deferred_revision = Some(revision);
+        }
+    }
+
+    fn push_entities_from_soil(&mut self, relative: IVec3, absolute: IVec3) {
+        let bounds =
+            crate::movement::player_bounds(self.motion.position, self.player.pose.height());
+        if let Some(delta) = native_world::movement::soil_expansion_push(bounds, relative) {
+            self.motion.position.y += delta;
+            self.player.position = self.motion.position.as_vec3();
+            self.camera.snap_position(self.motion.position);
+        }
+        self.dropped_items.push_from_soil_expansion(absolute);
+        self.experience_orbs.push_from_soil_expansion(absolute);
+        for entity in &mut self.falling_sand {
+            let at = entity.motion.position.floor().as_ivec3();
+            if !self.world.chunks.contains_key(&ChunkPos {
+                x: at.x.div_euclid(16),
+                z: at.z.div_euclid(16),
+            }) {
+                continue;
+            }
+            if let Some(delta) =
+                native_world::movement::soil_expansion_push(entity.motion.bounds(), absolute)
+            {
+                entity.motion.position.y += delta;
+                entity.previous = entity.motion.position;
+            }
         }
     }
 
@@ -10115,6 +10143,121 @@ mod tests {
             session.advance_soil_ticks();
             assert!(session.draft_block_ticks(chunk).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn soil_tick_lifts_player_items_orbs_and_falling_blocks() {
+        use native_persistence::nbt::Tag;
+        for (name, properties) in [
+            ("minecraft:dirt_path", &[][..]),
+            ("minecraft:farmland", &[("moisture", "7")][..]),
+        ] {
+            let mut session = session();
+            let soil = IVec3::new(8, 2, 6);
+            let absolute = session.origin + soil;
+            let soil_id = session.intern_block(state(name, properties));
+            assert!(session.set(soil, soil_id));
+            assert!(session.set(soil + IVec3::Y, session.states[3]));
+            let relative_position = soil.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+            let absolute_position = session.origin.as_dvec3() + relative_position;
+            session.motion.position = relative_position;
+            session.player.position = relative_position.as_vec3();
+            session
+                .dropped_items
+                .spawn_saved(crate::saved_item::SavedItemState {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position: absolute_position,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    pickup_delay: 10,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]))
+                        .unwrap(),
+                });
+            session
+                .experience_orbs
+                .spawn_saved(crate::saved_orb::SavedOrb {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position: absolute_position,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    value: 1,
+                    count: 1,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                });
+            let motion = crate::falling_block::AirborneMotion {
+                position: absolute_position,
+                velocity: DVec3::ZERO,
+                age: 0,
+                no_gravity: true,
+            };
+            session.falling_sand.push(FallingSand {
+                previous: motion.position,
+                motion,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+            });
+            let old_items = session.dropped_items.snapshot();
+            let old_orbs = session.experience_orbs.snapshot();
+            session.tick = 1;
+            session.advance_block_ticks();
+
+            assert_eq!(session.motion.position.y, f64::from(soil.y) + 1.0, "{name}");
+            assert_eq!(session.player.position.y, soil.y as f32 + 1.0);
+            let current_items = session.dropped_items.snapshot();
+            let item = &current_items[0];
+            assert_eq!(item.position.y, f64::from(absolute.y) + 1.0);
+            assert_eq!(item.previous_position, item.position);
+            let orb = session.experience_orbs.snapshot()[0];
+            assert_eq!(orb.position.y, f64::from(absolute.y) + 1.0);
+            assert_eq!(orb.previous_position, orb.position);
+            assert_eq!(
+                session.falling_sand[0].motion.position.y,
+                f64::from(absolute.y) + 1.0
+            );
+            assert_eq!(
+                session.falling_sand[0].previous,
+                session.falling_sand[0].motion.position
+            );
+            assert_eq!(old_items[0].position, absolute_position);
+            assert_eq!(old_orbs[0].position, absolute_position);
+        }
+    }
+
+    #[test]
+    fn surviving_farmland_does_not_lift_entities() {
+        let mut session = session();
+        let soil = IVec3::new(8, 2, 6);
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "7")]));
+        assert!(session.set(soil, farmland));
+        assert!(session.set(soil + IVec3::Y, session.states[3]));
+        assert!(session.set(soil + IVec3::Y, session.states[0]));
+        let before = soil.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+        session.motion.position = before;
+        session.player.position = before.as_vec3();
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.motion.position, before);
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, soil, session.states[0]), Cell::State(id) if id == farmland)
+        );
     }
 
     #[test]

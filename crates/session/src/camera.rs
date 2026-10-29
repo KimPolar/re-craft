@@ -54,6 +54,11 @@ impl CameraMotion {
         self.position += offset;
     }
 
+    pub(crate) fn snap_position(&mut self, position: DVec3) {
+        self.previous_position = position;
+        self.position = position;
+    }
+
     /// Java updates bob from the velocity and contact state before player movement.
     pub fn begin_bob_tick(&mut self, velocity: DVec3, grounded_and_alive: bool) {
         self.previous_walk_distance = self.walk_distance;

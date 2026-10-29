@@ -696,6 +696,15 @@ impl LocalSession {
                     || checked_add(position, IVec3::Y)
                         .is_some_and(|above| self.world.block(above).is_solid()))
             {
+                let bounds =
+                    movement::player_bounds(self.motion.position, self.player.pose.height());
+                if let Some(delta) = native_world::movement::soil_expansion_push(bounds, position) {
+                    self.motion.position.y += delta;
+                    self.player.position = self.motion.position.as_vec3();
+                    self.camera.snap_position(self.motion.position);
+                }
+                self.dropped_items.push_from_soil_expansion(position);
+                self.experience_orbs.push_from_soil_expansion(position);
                 self.set_block(position, Block::Dirt);
             }
         }
@@ -2237,6 +2246,21 @@ mod tests {
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }
         }
+    }
+
+    #[test]
+    fn demo_soil_tick_lifts_player_on_the_expanded_surface() {
+        let soil = IVec3::new(5, 3, 5);
+        let mut world = World::demo();
+        world.set_block(soil, Block::DirtPath);
+        let mut session = LocalSession::new(world);
+        assert!(session.set_block(soil + IVec3::Y, Block::Stone));
+        session.motion.position = soil.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+        session.player.position = session.motion.position.as_vec3();
+        session.tick = 1;
+        session.advance_soil_ticks();
+        assert_eq!(session.motion.position.y, f64::from(soil.y) + 1.0);
+        assert_eq!(session.world.block(soil), Block::Dirt);
     }
 
     #[test]

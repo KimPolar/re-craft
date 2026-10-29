@@ -313,6 +313,26 @@ impl Default for ItemEntities {
 }
 
 impl ItemEntities {
+    pub(crate) fn push_from_soil_expansion(&mut self, block: IVec3) {
+        for entity in &mut self.entities {
+            let before = entity.item.position;
+            if !Self::active(&self.active_chunks, before) {
+                continue;
+            }
+            let Some(delta) =
+                native_world::movement::soil_expansion_push(item_bounds(before), block)
+            else {
+                continue;
+            };
+            entity.item.position.y += delta;
+            entity.item.previous_position = entity.item.position;
+            if item_section_order(before) != item_section_order(entity.item.position) {
+                entity.section_sequence = self.next_section_sequence;
+                self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+            }
+        }
+    }
+
     pub(crate) fn validate_item_chunk_group(
         &self,
         positions: &BTreeSet<native_world::loaded::ChunkPos>,

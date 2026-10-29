@@ -3,7 +3,7 @@
 //! This only resolves movement against supplied shapes. Entity motion, fluids,
 //! world borders and effects still need their own simulation.
 
-use glam::DVec3;
+use glam::{DVec3, IVec3};
 
 const EPSILON: f64 = 1.0e-7;
 
@@ -86,6 +86,23 @@ impl BoundingBox {
         self.max.cmpgt(other.min + DVec3::splat(tolerance)).all()
             && self.min.cmplt(other.max - DVec3::splat(tolerance)).all()
     }
+}
+
+/// Relative teleport used when a 15/16-high soil block becomes a full block.
+/// Java queries entities intersecting the added shape, then clips a one-block
+/// downward probe against that shape alone.
+pub fn soil_expansion_push(bounds: BoundingBox, block: IVec3) -> Option<f64> {
+    let base = block.as_dvec3();
+    let added = BoundingBox {
+        min: base + DVec3::new(0.0, 15.0 / 16.0, 0.0),
+        max: base + DVec3::ONE,
+    };
+    if !bounds.max.cmpgt(added.min).all() || !bounds.min.cmplt(added.max).all() {
+        return None;
+    }
+    let shape = CollisionShape::new(vec![added]);
+    let clipped = shape.clip(bounds.moved(DVec3::Y), 1, -1.0);
+    Some(1.0 + clipped)
 }
 
 /// Apply the 26.3 player's edge restraint before resolving block collisions.

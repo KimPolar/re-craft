@@ -313,6 +313,13 @@ impl Default for ItemEntities {
 }
 
 impl ItemEntities {
+    pub(crate) fn has_in_chunk(&self, pos: native_world::loaded::ChunkPos) -> bool {
+        let chunk = BTreeSet::from([pos]);
+        self.entities
+            .iter()
+            .any(|entity| Self::active_in(&chunk, entity.item.position))
+    }
+
     pub(crate) fn push_from_soil_expansion(&mut self, block: IVec3) {
         for entity in &mut self.entities {
             let before = entity.item.position;

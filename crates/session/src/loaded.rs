@@ -825,6 +825,26 @@ impl LoadedSession {
             || self.tick_chunks_needing_dirty.contains(&position)
     }
 
+    // Activated entity data is the source for drafts even when its terrain is
+    // no longer resident. Empty chunks only need retaining when occupied.
+    fn retain_entity_chunk(&self, pos: ChunkPos) -> bool {
+        let occupied = || {
+            self.dropped_items.has_in_chunk(pos)
+                || self.experience_orbs.has_in_chunk(pos)
+                || self.falling_sand.iter().any(|entity| {
+                    let at = entity.motion.position.floor().as_ivec3();
+                    at.x.div_euclid(16) == pos.x && at.z.div_euclid(16) == pos.z
+                })
+        };
+        match self.entity_chunks.get(&pos) {
+            Some(SavedEntityData::Present(chunk)) => {
+                (self.item_chunks_seen.contains(&pos) && !chunk.entities().is_empty()) || occupied()
+            }
+            Some(SavedEntityData::Empty) => occupied(),
+            _ => false,
+        }
+    }
+
     pub fn set_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
@@ -2712,6 +2732,11 @@ impl LoadedSession {
                     .copied()
                     .filter(|pos| self.has_unsaved_chunk_changes(*pos))
                     .collect();
+                let retained_entities: BTreeSet<_> = outside
+                    .iter()
+                    .copied()
+                    .filter(|pos| self.retain_entity_chunk(*pos))
+                    .collect();
                 let world = Arc::make_mut(&mut self.world);
                 for pos in outside {
                     let chunk = world
@@ -2726,7 +2751,9 @@ impl LoadedSession {
                         self.parked_chunks.insert(pos, chunk);
                         respawn_changed = true;
                     } else {
-                        if self.entity_chunks.remove(&pos).is_some() {
+                        if !retained_entities.contains(&pos)
+                            && self.entity_chunks.remove(&pos).is_some()
+                        {
                             respawn_changed = true;
                         }
                         self.entity_collision_cache.remove(&pos);
@@ -2788,7 +2815,9 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
-            self.entity_chunks.remove(&pos);
+            if !self.retain_entity_chunk(pos) {
+                self.entity_chunks.remove(&pos);
+            }
             self.entity_collision_cache.remove(&pos);
             self.spawn_heightmaps.remove(&pos);
             if !self.fluid_chunks_seen.contains(&pos) {
@@ -2905,7 +2934,14 @@ impl LoadedSession {
                     });
                     match Arc::make_mut(&mut self.world).import_chunk(&source, pos) {
                         Ok(true) => {
-                            self.entity_chunks.insert(pos, entity_data);
+                            // Preserve the original source of already-simulated
+                            // entities even if a later entity read fails.
+                            if !matches!(
+                                self.entity_chunks.get(&pos),
+                                Some(SavedEntityData::Present(_) | SavedEntityData::Empty)
+                            ) {
+                                self.entity_chunks.insert(pos, entity_data);
+                            }
                             self.entity_collision_cache.insert(pos, OnceLock::new());
                             if let Some(maps) = heightmaps {
                                 self.spawn_heightmaps.insert(pos, maps);
@@ -7121,6 +7157,144 @@ mod tests {
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert!(session.snapshot().experience_orbs.is_empty());
+    }
+
+    #[test]
+    fn entity_source_survives_clean_terrain_eviction_and_failed_reload() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 2.0, 3.5);
+        let item = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("NoGravity".into(), Tag::Byte(1)),
+            ("PickupDelay".into(), Tag::Short(i16::MAX)),
+            (
+                "Item".into(),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:stone".into())),
+                    ("count".into(), Tag::Int(1)),
+                ]),
+            ),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![item],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::clone(&document),
+                })),
+            )
+            .unwrap();
+        session.update(TICK);
+        assert!(!session.has_unsaved_chunk_changes(home));
+        session.queue_chunk_window(remote, 0);
+        session.update(TICK);
+        assert!(!session.world.chunks.contains_key(&home));
+        assert!(!session.parked_chunks.contains_key(&home));
+        assert!(
+            session
+                .draft_existing_entity_chunk(home)
+                .unwrap()
+                .matches_source(&document)
+                .unwrap()
+        );
+
+        let (incoming, _, _) = fixture();
+        session.queue_chunk_window(home, 0);
+        session.queue_loaded_chunk(home, incoming);
+        session.update(TICK);
+        assert_eq!(session.snapshot().dropped_items.len(), 1);
+        assert!(
+            session
+                .draft_existing_entity_chunk(home)
+                .unwrap()
+                .matches_source(&document)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn occupied_empty_entity_chunk_survives_terrain_eviction() {
+        use native_persistence::nbt::{Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 2.0, 3.5);
+        let item = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("NoGravity".into(), Tag::Byte(1)),
+            ("PickupDelay".into(), Tag::Short(i16::MAX)),
+            (
+                "Item".into(),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:stone".into())),
+                    ("count".into(), Tag::Int(1)),
+                ]),
+            ),
+        ]);
+        session
+            .dropped_items
+            .spawn_saved(crate::saved_item::read(&item).unwrap().unwrap());
+        session.update(TICK);
+        session.queue_chunk_window(remote, 0);
+        session.update(TICK);
+        assert!(!session.world.chunks.contains_key(&home));
+        assert!(matches!(
+            session.saved_entity_chunk(home),
+            Some(SavedEntityData::Empty)
+        ));
+
+        let mut vacant = self::session();
+        vacant
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        vacant.update(TICK);
+        vacant.queue_chunk_window(remote, 0);
+        vacant.update(TICK);
+        assert!(vacant.saved_entity_chunk(home).is_none());
     }
 
     #[test]

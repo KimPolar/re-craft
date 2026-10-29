@@ -4298,6 +4298,10 @@ impl LoadedSession {
             {
                 continue;
             }
+            if kind == SoilKind::Path {
+                self.set(relative, self.states[2]);
+                continue;
+            }
             let Some(above) = add(relative, IVec3::Y) else {
                 continue;
             };
@@ -9915,7 +9919,11 @@ mod tests {
                 session.update(TICK);
                 assert_eq!(
                     name_at(&session.snapshot()),
-                    if remove_cover { name } else { "minecraft:dirt" }
+                    if remove_cover && name == "minecraft:farmland" {
+                        name
+                    } else {
+                        "minecraft:dirt"
+                    }
                 );
                 assert_eq!(name_at(&old), name);
             }

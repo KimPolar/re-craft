@@ -692,8 +692,9 @@ impl LocalSession {
         {
             let (_, position, kind) = self.soil_ticks.pop_front().expect("checked scheduled tick");
             if SoilKind::from_block(self.world.block(position)) == Some(kind)
-                && checked_add(position, IVec3::Y)
-                    .is_some_and(|above| self.world.block(above).is_solid())
+                && (kind == SoilKind::Path
+                    || checked_add(position, IVec3::Y)
+                        .is_some_and(|above| self.world.block(above).is_solid()))
             {
                 self.set_block(position, Block::Dirt);
             }
@@ -2200,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn covered_soil_reverts_on_the_next_tick_and_rechecks_its_above_block() {
+    fn scheduled_soil_ticks_follow_path_and_farmland_cover_rules() {
         for soil in [Block::DirtPath, Block::Farmland(0), Block::Farmland(7)] {
             for remove_cover in [false, true] {
                 let position = IVec3::new(5, 3, 5);
@@ -2220,7 +2221,11 @@ mod tests {
                 session.update(TICK);
                 assert_eq!(
                     session.snapshot().world.demo().unwrap().block(position),
-                    if remove_cover { soil } else { Block::Dirt }
+                    if remove_cover && soil != Block::DirtPath {
+                        soil
+                    } else {
+                        Block::Dirt
+                    }
                 );
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }

@@ -2564,6 +2564,14 @@ impl LoadedSession {
         self.world_clocks.get(id).copied()
     }
 
+    /// Snapshot all shared dimension clocks for a coordinated persistence plan.
+    pub fn world_clocks(
+        &self,
+    ) -> BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>
+    {
+        self.world_clocks.clone()
+    }
+
     fn apply_streaming(&mut self) {
         let mut changed = false;
         let mut respawn_changed = false;

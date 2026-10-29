@@ -67,6 +67,7 @@ pub struct RewriteResult {
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
     players: Vec<PlannedPlayerData>,
+    world_clocks: Option<PlannedWorldClocks>,
 }
 
 struct PlannedChunk {
@@ -77,6 +78,11 @@ struct PlannedChunk {
 
 struct PlannedPlayerData {
     uuid_words: [i32; 4],
+    source_nbt: Vec<u8>,
+    document: crate::nbt::NamedTag,
+}
+
+struct PlannedWorldClocks {
     source_nbt: Vec<u8>,
     document: crate::nbt::NamedTag,
 }
@@ -138,12 +144,32 @@ impl WorldSavePlan {
         });
         Ok(())
     }
+
+    /// Add a replacement for the 26.3 shared clock file to this transaction.
+    /// Unknown document and per-clock fields are carried forward from `source`.
+    pub fn add_world_clocks(
+        &mut self,
+        source: &crate::nbt::NamedTag,
+        clocks: &BTreeMap<DimensionId, crate::world::SavedClock>,
+    ) -> Result<()> {
+        ensure!(
+            self.world_clocks.is_none(),
+            "world save plan contains duplicate world clocks"
+        );
+        let document = crate::world::WorldReader::update_world_clock_document(source, clocks)?;
+        self.world_clocks = Some(PlannedWorldClocks {
+            source_nbt: nbt::write(source)?,
+            document,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct WorldSaveResult {
     pub region_paths: Vec<PathBuf>,
     pub player_paths: Vec<PathBuf>,
+    pub world_clocks_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
 }
 
@@ -345,7 +371,7 @@ impl WorldWriteGuard {
         mut validate_change: impl FnMut(&DimensionId, &crate::edit::BlockChange) -> Result<()>,
     ) -> Result<WorldSaveResult> {
         ensure!(
-            !plan.chunks.is_empty() || !plan.players.is_empty(),
+            !plan.chunks.is_empty() || !plan.players.is_empty() || plan.world_clocks.is_some(),
             "world save plan is empty"
         );
         let mut groups = BTreeMap::<(DimensionId, i32, i32), Vec<(&PlannedChunk, Vec<u8>)>>::new();
@@ -384,10 +410,13 @@ impl WorldWriteGuard {
         let backup = tempfile::Builder::new()
             .prefix("transaction-")
             .tempdir_in(&backup_root)?;
-        let mut replacements = Vec::with_capacity(groups.len() + plan.players.len());
+        let mut replacements = Vec::with_capacity(
+            groups.len() + plan.players.len() + plan.world_clocks.is_some() as usize,
+        );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut region_paths = Vec::with_capacity(groups.len());
         let mut player_paths = Vec::with_capacity(plan.players.len());
+        let mut world_clocks_path = None;
 
         for (group_index, ((dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
@@ -555,13 +584,92 @@ impl WorldWriteGuard {
             player_paths.push(canonical);
         }
 
+        if let Some(planned) = &plan.world_clocks {
+            let mut clock_directory = self.root.clone();
+            for component in ["data", "minecraft"] {
+                clock_directory.push(component);
+                let metadata = fs::symlink_metadata(&clock_directory)
+                    .context("cannot inspect world clock data directory")?;
+                ensure!(
+                    metadata.is_dir() && ordinary(&metadata),
+                    "world clock data path must contain ordinary directories"
+                );
+            }
+            let clock_directory = clock_directory.canonicalize()?;
+            ensure!(
+                clock_directory.starts_with(&self.root),
+                "world clock data directory is outside the world"
+            );
+            let clock_path = clock_directory.join("world_clocks.dat");
+            let metadata = fs::symlink_metadata(&clock_path)
+                .context("cannot inspect existing world clock data")?;
+            ensure!(
+                metadata.is_file() && ordinary(&metadata),
+                "world clock data must be an ordinary file"
+            );
+            let canonical = clock_path.canonicalize()?;
+            ensure!(
+                canonical.parent() == Some(clock_directory.as_path()),
+                "world clock data resolves outside its directory"
+            );
+            let original_bytes = fs::read(&canonical)?;
+            let compressed = original_bytes.starts_with(&[0x1f, 0x8b]);
+            let current = if compressed {
+                nbt::read_gzip(original_bytes.as_slice())
+            } else {
+                nbt::read(&original_bytes)
+            }
+            .context("cannot decode current world clock data")?;
+            ensure!(
+                nbt::write(&current)? == planned.source_nbt,
+                "world clock data changed after its draft was created"
+            );
+            let original_hash = hash_file(&canonical)?;
+            let clock_backup_dir = backup.path().join("world-data");
+            fs::create_dir_all(&clock_backup_dir)?;
+            let clock_backup = clock_backup_dir.join("world_clocks.dat");
+            copy_sync(&canonical, &clock_backup)?;
+
+            let replacement = nbt::write(&planned.document)?;
+            let staged_bytes = if compressed {
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&replacement)?;
+                gzip.finish()?
+            } else {
+                replacement.clone()
+            };
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&clock_directory)?;
+            stage.write_all(&staged_bytes)?;
+            stage.flush()?;
+            stage.as_file().sync_all()?;
+            let staged = if compressed {
+                nbt::read_gzip(File::open(stage.path())?)?
+            } else {
+                nbt::read(&staged_bytes)?
+            };
+            ensure!(
+                nbt::write(&staged)? == replacement,
+                "staged world clock data failed the NBT round-trip check"
+            );
+            replacements.push(crate::save_transaction::Replacement {
+                target: canonical.clone(),
+                backup: clock_backup,
+                stage,
+                original_hash,
+            });
+            world_clocks_path = Some(canonical);
+        }
+
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nplayers={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nplayers={}\nworld_clocks={}",
             region_paths.len(),
             plan.chunks.len(),
-            plan.players.len()
+            plan.players.len(),
+            plan.world_clocks.is_some() as usize
         )?;
         note.sync_all()?;
         let backup_directory = backup.keep();
@@ -572,7 +680,7 @@ impl WorldWriteGuard {
         crate::save_transaction::commit(&self.root, &backup_directory, replacements, dependencies)
             .with_context(|| {
                 format!(
-                    "cannot atomically replace world regions; backup retained at {}",
+                    "cannot atomically replace world data; backup retained at {}",
                     backup_directory.display()
                 )
             })?;
@@ -580,6 +688,7 @@ impl WorldWriteGuard {
         Ok(WorldSaveResult {
             region_paths,
             player_paths,
+            world_clocks_path,
             backup_directory,
         })
     }
@@ -1664,6 +1773,40 @@ mod tests {
             .unwrap();
         let original_player_bytes = gzip.finish().unwrap();
         fs::write(&player_path, &original_player_bytes).unwrap();
+        let clock_path = world.path().join("data/minecraft/world_clocks.dat");
+        fs::create_dir_all(clock_path.parent().unwrap()).unwrap();
+        let clock_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:overworld".into(),
+                        Tag::Compound(vec![
+                            ("total_ticks".into(), Tag::Long(1_000)),
+                            ("future_clock_field".into(), Tag::String("preserved".into())),
+                        ]),
+                    )]),
+                ),
+                ("future_root_field".into(), Tag::Int(42)),
+            ]),
+        };
+        let mut clock_gzip = GzEncoder::new(Vec::new(), Compression::default());
+        clock_gzip
+            .write_all(&nbt::write(&clock_source).unwrap())
+            .unwrap();
+        let original_clock_bytes = clock_gzip.finish().unwrap();
+        fs::write(&clock_path, &original_clock_bytes).unwrap();
+        let clock_states = BTreeMap::from([(
+            DimensionId::parse("overworld").unwrap(),
+            crate::world::SavedClock {
+                total_ticks: 1_001,
+                partial_tick: 0.25,
+                rate: 1.0,
+                paused: false,
+            },
+        )]);
         let mut source_zero = original_zero;
         let chunk_zero = editable_chunk(0);
         let chunk_one = editable_chunk(1);
@@ -1725,6 +1868,7 @@ mod tests {
             },
         )
         .unwrap();
+        plan.add_world_clocks(&clock_source, &clock_states).unwrap();
         assert_eq!(plan.chunk_count(), 3);
 
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
@@ -1748,6 +1892,34 @@ mod tests {
         assert_eq!(
             result.player_paths,
             vec![player_path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            result.world_clocks_path,
+            Some(clock_path.canonicalize().unwrap())
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("world-data/world_clocks.dat")).unwrap(),
+            original_clock_bytes
+        );
+        let saved_clock_file = nbt::read_gzip(File::open(&clock_path).unwrap()).unwrap();
+        assert_eq!(
+            saved_clock_file.value.get("future_root_field"),
+            Some(&Tag::Int(42))
+        );
+        assert_eq!(
+            saved_clock_file
+                .value
+                .get("data")
+                .unwrap()
+                .get("minecraft:overworld")
+                .unwrap()
+                .get("future_clock_field"),
+            Some(&Tag::String("preserved".into()))
+        );
+        assert_eq!(
+            crate::world::WorldReader::update_world_clock_document(&clock_source, &clock_states)
+                .unwrap(),
+            saved_clock_file
         );
         assert_eq!(
             fs::read(
@@ -1932,6 +2104,63 @@ mod tests {
         assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
         assert_eq!(fs::read(&region_path).unwrap(), before_region);
         assert_eq!(fs::read(&player_path).unwrap(), stale_player_bytes);
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn world_save_plan_rejects_stale_clocks_before_replacement() {
+        let world = test_world();
+        let (region_path, original_region, _) = fixture(world.path());
+        let clock_path = world.path().join("data/minecraft/world_clocks.dat");
+        fs::create_dir_all(clock_path.parent().unwrap()).unwrap();
+        let clock_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:overworld".into(),
+                        Tag::Compound(vec![("total_ticks".into(), Tag::Long(10))]),
+                    )]),
+                ),
+            ]),
+        };
+        let write_clock = |document: &NamedTag| {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&nbt::write(document).unwrap()).unwrap();
+            fs::write(&clock_path, gzip.finish().unwrap()).unwrap();
+        };
+        write_clock(&clock_source);
+        let clocks = BTreeMap::from([(
+            DimensionId::parse("overworld").unwrap(),
+            crate::world::SavedClock {
+                total_ticks: 11,
+                ..crate::world::SavedClock::default()
+            },
+        )]);
+        let mut plan = WorldSavePlan::new();
+        plan.add_world_clocks(&clock_source, &clocks).unwrap();
+
+        let stale_clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:overworld".into(),
+                        Tag::Compound(vec![("total_ticks".into(), Tag::Long(12))]),
+                    )]),
+                ),
+            ]),
+        };
+        write_clock(&stale_clock);
+        let stale_clock_bytes = fs::read(&clock_path).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&clock_path).unwrap(), stale_clock_bytes);
+        assert_eq!(fs::read(&region_path).unwrap(), original_region);
         assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 

@@ -668,6 +668,89 @@ fn nbt_long(tag: &Tag) -> Option<i64> {
     }
 }
 
+fn clock_long(tag: &Tag) -> Option<i64> {
+    match tag {
+        Tag::Byte(value) => Some(i64::from(*value)),
+        Tag::Short(value) => Some(i64::from(*value)),
+        Tag::Int(value) => Some(i64::from(*value)),
+        Tag::Long(value) => Some(*value),
+        Tag::Float(value) => Some(*value as i64),
+        Tag::Double(value) => Some(*value as i64),
+        _ => None,
+    }
+}
+
+fn clock_float(tag: &Tag) -> Option<f32> {
+    match tag {
+        Tag::Byte(value) => Some(f32::from(*value)),
+        Tag::Short(value) => Some(f32::from(*value)),
+        Tag::Int(value) => Some(*value as f32),
+        Tag::Long(value) => Some(*value as f32),
+        Tag::Float(value) => Some(*value),
+        Tag::Double(value) => Some(*value as f32),
+        _ => None,
+    }
+}
+
+fn parse_world_clocks(root: &NamedTag) -> Result<BTreeMap<DimensionId, SavedClock>> {
+    match root.value.get("DataVersion") {
+        Some(Tag::Int(TARGET_DATA_VERSION)) => {}
+        Some(Tag::Int(version)) => {
+            bail!("unsupported world clocks DataVersion {version}; expected {TARGET_DATA_VERSION}")
+        }
+        _ => bail!("world clocks document is missing integer DataVersion"),
+    }
+    let Some(Tag::Compound(entries)) = root.value.get("data") else {
+        bail!("world clocks data must be a compound");
+    };
+    let mut clocks = BTreeMap::new();
+    for (name, entry) in entries {
+        let name = String::from_utf16(&name.0).context("invalid clock identifier")?;
+        let id = DimensionId::parse(&name).context("invalid clock identifier")?;
+        ensure!(
+            matches!(entry, Tag::Compound(_)),
+            "clock {name} must be a compound"
+        );
+        let total_ticks = entry
+            .get("total_ticks")
+            .and_then(clock_long)
+            .with_context(|| format!("clock {name} is missing total_ticks"))?;
+        let partial_tick = match entry.get("partial_tick") {
+            None => 0.0,
+            Some(value) => clock_float(value).context("invalid partial_tick")?,
+        };
+        let rate = match entry.get("rate") {
+            None => 1.0,
+            Some(value) => clock_float(value).context("invalid clock rate")?,
+        };
+        ensure!(rate > 0.0, "clock {name} rate must be positive");
+        let paused = match entry.get("paused") {
+            None => false,
+            Some(value) => nbt_bool(value).context("invalid clock paused state")?,
+        };
+        ensure!(
+            clocks
+                .insert(
+                    id,
+                    SavedClock {
+                        total_ticks,
+                        partial_tick,
+                        rate,
+                        paused,
+                    }
+                )
+                .is_none(),
+            "duplicate clock {name}"
+        );
+    }
+    Ok(clocks)
+}
+
+fn replace_clock_field(fields: &mut Vec<(JavaString, Tag)>, name: &str, value: Tag) {
+    fields.retain(|(key, _)| !key.matches(name));
+    fields.push((JavaString::from(name), value));
+}
+
 fn string_list(tag: &Tag, name: &str) -> Result<Vec<String>> {
     let Tag::List {
         element_type,
@@ -1004,100 +1087,81 @@ impl WorldReader {
         })
     }
 
-    /// Read shared world-clock states without modifying the original file.
-    /// Clocks absent from this map are initialized to `SavedClock::default()`.
-    pub fn world_clocks(&self) -> Result<BTreeMap<DimensionId, SavedClock>> {
+    /// Read the shared clock document without modifying the original file.
+    pub fn world_clocks_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/world_clocks.dat");
         let file = match File::open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error).with_context(|| format!("cannot open {}", path.display()));
             }
         };
         let bytes = nbt::decompress_limited(file)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let root = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let document = if bytes.starts_with(&[0x1f, 0x8b]) {
             nbt::read_gzip(bytes.as_slice())
         } else {
             nbt::read(&bytes)
         }
         .with_context(|| format!("invalid {}", path.display()))?;
-        match root.value.get("DataVersion") {
-            Some(Tag::Int(TARGET_DATA_VERSION)) => {}
-            Some(Tag::Int(version)) => bail!(
-                "unsupported world clocks DataVersion {version}; expected {TARGET_DATA_VERSION}"
-            ),
-            _ => bail!("{} is missing integer DataVersion", path.display()),
-        }
-        let Some(Tag::Compound(entries)) = root.value.get("data") else {
+        parse_world_clocks(&document)?;
+        Ok(Some(document))
+    }
+
+    /// Read shared world-clock states without modifying the original file.
+    /// Clocks absent from this map are initialized to `SavedClock::default()`.
+    pub fn world_clocks(&self) -> Result<BTreeMap<DimensionId, SavedClock>> {
+        self.world_clocks_document()?
+            .map(|document| parse_world_clocks(&document))
+            .unwrap_or_else(|| Ok(BTreeMap::new()))
+    }
+
+    /// Serialize updated clock states while retaining unrecognized NBT fields.
+    /// The supplied map is expected to contain the complete set of loaded clocks.
+    pub fn update_world_clock_document(
+        source: &NamedTag,
+        clocks: &BTreeMap<DimensionId, SavedClock>,
+    ) -> Result<NamedTag> {
+        parse_world_clocks(source)?;
+        let mut document = source.clone();
+        let Tag::Compound(root) = &mut document.value else {
+            bail!("world clocks document must be a compound");
+        };
+        let data = root
+            .iter_mut()
+            .rev()
+            .find(|(name, _)| name.matches("data"))
+            .map(|(_, value)| value)
+            .context("world clocks data is missing")?;
+        let Tag::Compound(entries) = data else {
             bail!("world clocks data must be a compound");
         };
-        let as_long = |tag: &Tag| -> Option<i64> {
-            match tag {
-                Tag::Byte(v) => Some(i64::from(*v)),
-                Tag::Short(v) => Some(i64::from(*v)),
-                Tag::Int(v) => Some(i64::from(*v)),
-                Tag::Long(v) => Some(*v),
-                Tag::Float(v) => Some(*v as i64),
-                Tag::Double(v) => Some(*v as i64),
-                _ => None,
-            }
-        };
-        let as_float = |tag: &Tag| -> Option<f32> {
-            match tag {
-                Tag::Byte(v) => Some(f32::from(*v)),
-                Tag::Short(v) => Some(f32::from(*v)),
-                Tag::Int(v) => Some(*v as f32),
-                Tag::Long(v) => Some(*v as f32),
-                Tag::Float(v) => Some(*v),
-                Tag::Double(v) => Some(*v as f32),
-                _ => None,
-            }
-        };
-        let mut clocks = BTreeMap::new();
-        for (name, entry) in entries {
-            let name = String::from_utf16(&name.0).context("invalid clock identifier")?;
-            let id = DimensionId::parse(&name).context("invalid clock identifier")?;
-            ensure!(
-                matches!(entry, Tag::Compound(_)),
-                "clock {name} must be a compound"
+        for (id, clock) in clocks {
+            ensure!(clock.rate > 0.0, "clock rate must be positive");
+            let name = format!("{}:{}", id.namespace, id.path);
+            let existing = entries
+                .iter()
+                .rev()
+                .find(|(key, _)| key.matches(&name))
+                .map(|(_, value)| value.clone());
+            let mut fields = match existing {
+                Some(Tag::Compound(fields)) => fields,
+                Some(_) => bail!("clock {name} must be a compound"),
+                None => Vec::new(),
+            };
+            replace_clock_field(&mut fields, "total_ticks", Tag::Long(clock.total_ticks));
+            replace_clock_field(&mut fields, "partial_tick", Tag::Float(clock.partial_tick));
+            replace_clock_field(&mut fields, "rate", Tag::Float(clock.rate));
+            replace_clock_field(
+                &mut fields,
+                "paused",
+                Tag::Byte(if clock.paused { 1 } else { 0 }),
             );
-            let total_ticks = entry
-                .get("total_ticks")
-                .and_then(as_long)
-                .with_context(|| format!("clock {name} is missing total_ticks"))?;
-            let partial_tick = match entry.get("partial_tick") {
-                None => 0.0,
-                Some(v) => as_float(v).context("invalid partial_tick")?,
-            };
-            let rate = match entry.get("rate") {
-                None => 1.0,
-                Some(v) => as_float(v).context("invalid clock rate")?,
-            };
-            ensure!(rate > 0.0, "clock {name} rate must be positive");
-            let paused = match entry.get("paused") {
-                None => false,
-                Some(v) => nbt_bool(v).context("invalid clock paused state")?,
-            };
-            ensure!(
-                clocks
-                    .insert(
-                        id,
-                        SavedClock {
-                            total_ticks,
-                            partial_tick,
-                            rate,
-                            paused
-                        }
-                    )
-                    .is_none(),
-                "duplicate clock {name}"
-            );
+            replace_clock_field(entries, &name, Tag::Compound(fields));
         }
-        Ok(clocks)
+        parse_world_clocks(&document)?;
+        Ok(document)
     }
 
     /// Java 26.3 stores the shared game-rule map under data/minecraft.
@@ -1461,6 +1525,7 @@ mod tests {
             name: "".into(),
             value: Tag::Compound(vec![
                 ("DataVersion".into(), Tag::Int(version)),
+                ("future_root".into(), Tag::String("keep me".into())),
                 (
                     "data".into(),
                     Tag::Compound(vec![(
@@ -1468,6 +1533,7 @@ mod tests {
                         Tag::Compound(vec![
                             ("total_ticks".into(), Tag::Long(-50)),
                             ("rate".into(), Tag::Float(rate)),
+                            ("future_clock".into(), Tag::Int(81)),
                         ]),
                     )]),
                 ),
@@ -1485,6 +1551,55 @@ mod tests {
             }
         );
         assert_eq!(before, std::fs::read(&path).unwrap());
+        let source = reader.world_clocks_document().unwrap().unwrap();
+        let overworld = DimensionId::parse("overworld").unwrap();
+        let updated = WorldReader::update_world_clock_document(
+            &source,
+            &BTreeMap::from([
+                (
+                    DimensionId::parse("example:test").unwrap(),
+                    SavedClock {
+                        total_ticks: 14,
+                        partial_tick: 0.25,
+                        rate: 2.5,
+                        paused: true,
+                    },
+                ),
+                (
+                    overworld.clone(),
+                    SavedClock {
+                        total_ticks: 99,
+                        ..SavedClock::default()
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.value.get("future_root"),
+            Some(&Tag::String("keep me".into()))
+        );
+        assert_eq!(
+            updated
+                .value
+                .get("data")
+                .unwrap()
+                .get("example:test")
+                .unwrap()
+                .get("future_clock"),
+            Some(&Tag::Int(81))
+        );
+        let saved_clocks = parse_world_clocks(&updated).unwrap();
+        assert_eq!(
+            saved_clocks[&DimensionId::parse("example:test").unwrap()],
+            SavedClock {
+                total_ticks: 14,
+                partial_tick: 0.25,
+                rate: 2.5,
+                paused: true,
+            }
+        );
+        assert_eq!(saved_clocks[&overworld].total_ticks, 99);
         write_gzip(&path, &file(TARGET_DATA_VERSION, 0.0));
         assert!(reader.world_clocks().is_err());
         write_gzip(&path, &file(1, 1.0));

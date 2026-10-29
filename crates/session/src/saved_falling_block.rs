@@ -269,6 +269,16 @@ pub fn draft_entity_chunks_with_optional_sources(
     originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
     replacements: &[EntityReplacement<'_>],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_removals(originals, replacements, &[])
+}
+
+/// Remove explicitly tracked saved items while coordinating all source and
+/// destination chunks. The caller must also save the pickup or merge effects.
+pub fn draft_entity_chunks_with_removals(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
+    replacements: &[EntityReplacement<'_>],
+    removed_items: &[saved_item::ItemDraft],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     let empty: BTreeMap<_, _> = originals
         .iter()
         .filter(|(_, source)| source.is_none())
@@ -299,7 +309,8 @@ pub fn draft_entity_chunks_with_optional_sources(
         .iter()
         .map(|(&pos, source)| (pos, source.unwrap_or_else(|| &empty[&pos])))
         .collect();
-    let mut drafts = draft_entity_chunks_with_moves(&complete, replacements)?;
+    let mut drafts =
+        draft_entity_chunks_with_moves_and_removals(&complete, replacements, removed_items)?;
     for pos in empty.keys() {
         drafts
             .get_mut(pos)
@@ -315,6 +326,14 @@ pub fn draft_entity_chunks_with_optional_sources(
 pub fn draft_entity_chunks_with_moves(
     originals: &BTreeMap<native_world::loaded::ChunkPos, &NamedTag>,
     replacements: &[EntityReplacement<'_>],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_moves_and_removals(originals, replacements, &[])
+}
+
+fn draft_entity_chunks_with_moves_and_removals(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, &NamedTag>,
+    replacements: &[EntityReplacement<'_>],
+    removed_items: &[saved_item::ItemDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     use std::collections::BTreeSet;
 
@@ -357,8 +376,33 @@ pub fn draft_entity_chunks_with_moves(
             "entity destination chunk is unavailable"
         );
     }
+    let mut removals = BTreeMap::new();
+    for removal in removed_items {
+        let uuid = saved_item::optional_uuid(&removal.document().value, "UUID")?
+            .context("removed item has no UUID")?;
+        ensure!(
+            !requested.contains_key(&uuid) && removals.insert(uuid, removal).is_none(),
+            "duplicate entity change UUID"
+        );
+        ensure!(
+            owners.contains_key(&uuid),
+            "removed item is missing from source chunks"
+        );
+        let position = saved_item::read(&removal.document().value)?
+            .context("removed entity is not an item")?
+            .position;
+        let destination = native_world::loaded::ChunkPos {
+            x: (position.x.floor() as i32).div_euclid(16),
+            z: (position.z.floor() as i32).div_euclid(16),
+        };
+        ensure!(
+            originals.contains_key(&destination),
+            "removed item's final chunk is unavailable"
+        );
+    }
 
     let mut matched = BTreeSet::new();
+    let mut matched_removals = BTreeSet::new();
     let mut incoming: BTreeMap<_, Vec<Tag>> = BTreeMap::new();
     for (&position, original) in originals {
         let Some(Tag::List { values, .. }) = original.value.get("Entities") else {
@@ -366,6 +410,28 @@ pub fn draft_entity_chunks_with_moves(
         };
         let mut entities = Vec::with_capacity(values.len());
         for entity in values {
+            if let Some((uuid, removal)) = saved_item::optional_uuid(entity, "UUID")?
+                .and_then(|uuid| removals.get(&uuid).map(|removal| (uuid, *removal)))
+            {
+                let source = NamedTag {
+                    name: "".into(),
+                    value: entity.clone(),
+                };
+                ensure!(
+                    removal.matches_source(&source)?,
+                    "removed item source changed"
+                );
+                let position_in_source = saved_item::read(entity)?
+                    .context("removed source is not an item")?
+                    .position;
+                ensure!(
+                    (position_in_source.x.floor() as i32).div_euclid(16) == position.x
+                        && (position_in_source.z.floor() as i32).div_euclid(16) == position.z,
+                    "removed source item is outside its chunk"
+                );
+                matched_removals.insert(uuid);
+                continue;
+            }
             let replacement = saved_item::optional_uuid(entity, "UUID")?
                 .and_then(|uuid| requested.get(&uuid).map(|replacement| (uuid, *replacement)));
             if let Some((uuid, replacement)) = replacement {
@@ -414,6 +480,10 @@ pub fn draft_entity_chunks_with_moves(
     ensure!(
         matched.len() == requested.len(),
         "replacement entity is missing from source chunks"
+    );
+    ensure!(
+        matched_removals.len() == removals.len(),
+        "removed item is missing from source chunks"
     );
     for (position, moved) in incoming {
         let Tag::Compound(fields) = &mut drafts.get_mut(&position).unwrap().document.value else {
@@ -664,6 +734,117 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    #[test]
+    fn removed_item_requires_its_source_and_final_chunks_and_preserves_others() {
+        use native_world::loaded::ChunkPos;
+        let origin = ChunkPos { x: 0, z: 0 };
+        let destination = ChunkPos { x: 1, z: 0 };
+        let item = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: vec![Tag::Double(1.5), Tag::Double(2.0), Tag::Double(3.0)],
+                },
+            ),
+            (
+                "Item".into(),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:stone".into())),
+                    ("count".into(), Tag::Int(3)),
+                ]),
+            ),
+        ]);
+        let other = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+            ("future".into(), Tag::Int(7)),
+        ]);
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![0, 0])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![item.clone(), other.clone()],
+                    },
+                ),
+            ]),
+        };
+        let saved = saved_item::read(&item).unwrap().unwrap();
+        let make_removal = || {
+            saved_item::draft(
+                &NamedTag {
+                    name: "".into(),
+                    value: item.clone(),
+                },
+                saved_item::ItemSaveState {
+                    position: DVec3::new(17.5, 2.0, 3.0),
+                    velocity: saved.velocity,
+                    on_ground: saved.on_ground,
+                    no_gravity: saved.no_gravity,
+                    age: saved.age,
+                    pickup_delay: saved.pickup_delay,
+                    health: saved.health,
+                    fire_ticks: saved.fire_ticks,
+                    invulnerable: saved.invulnerable,
+                    invulnerable_time: saved.invulnerable_time,
+                    stack: &saved.stack,
+                },
+            )
+            .unwrap()
+        };
+        let removal = make_removal();
+        assert!(
+            draft_entity_chunks_with_removals(
+                &BTreeMap::from([(origin, Some(&original))]),
+                &[],
+                &[make_removal()]
+            )
+            .is_err()
+        );
+        let sources = BTreeMap::from([(origin, Some(&original)), (destination, None)]);
+        assert!(
+            draft_entity_chunks_with_removals(&sources, &[], &[make_removal(), make_removal()])
+                .is_err()
+        );
+        let drafts = draft_entity_chunks_with_removals(&sources, &[], &[removal]).unwrap();
+        let Some(Tag::List { values, .. }) = drafts[&origin].document().value.get("Entities")
+        else {
+            panic!()
+        };
+        assert_eq!(values, &vec![other]);
+        assert!(drafts[&destination].source_was_absent());
+        let mut changed = original.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            unreachable!()
+        };
+        let (_, Tag::List { values, .. }) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Entities"))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(entity_fields) = &mut values[0] else {
+            unreachable!()
+        };
+        entity_fields.push(("changed".into(), Tag::Int(1)));
+        assert!(
+            draft_entity_chunks_with_removals(
+                &BTreeMap::from([(origin, Some(&changed)), (destination, None)]),
+                &[],
+                &[make_removal()]
+            )
+            .is_err()
+        );
     }
 
     #[test]

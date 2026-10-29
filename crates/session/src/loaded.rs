@@ -1735,8 +1735,8 @@ impl LoadedSession {
     }
 
     /// Prepare a group of known entity chunks including transfers into empty
-    /// chunks. This does not enable a world write or account for entity creation
-    /// and removal; those remain separate prerequisites.
+    /// chunks, including known non-merge removals of saved items. This does not
+    /// enable a world write: creation and other effects remain prerequisites.
     pub fn draft_existing_entity_chunks(
         &self,
         positions: &std::collections::BTreeSet<ChunkPos>,
@@ -1753,6 +1753,7 @@ impl LoadedSession {
         let mut originals = std::collections::BTreeMap::new();
         let mut falling = Vec::new();
         let mut items = Vec::new();
+        let mut removed_items = Vec::new();
         let mut orbs = Vec::new();
         for &pos in positions {
             let chunk = match self.entity_chunks.get(&pos) {
@@ -1775,10 +1776,15 @@ impl LoadedSession {
                     );
                 } else if let Some(saved) = crate::saved_item::read(entity)? {
                     let uuid = saved.uuid.context("item has no stable UUID")?;
-                    items.push(
-                        self.draft_saved_item_entity(uuid)?
-                            .context("item was removed or could not be simulated")?,
-                    );
+                    if let Some(item) = self.draft_saved_item_entity(uuid)? {
+                        items.push(item);
+                    } else {
+                        removed_items.push(
+                            self.dropped_items
+                                .draft_removed_item(uuid)?
+                                .context("item was removed or could not be simulated")?,
+                        );
+                    }
                 } else if let Some(saved) = crate::saved_orb::read(entity)? {
                     let uuid = saved.uuid.context("experience orb has no stable UUID")?;
                     orbs.push(
@@ -1826,6 +1832,8 @@ impl LoadedSession {
         }
         self.dropped_items
             .validate_item_chunk_group(positions, &self.saved_item_uuids)?;
+        self.dropped_items
+            .validate_removed_item_chunk_group(positions, &self.saved_item_uuids)?;
         self.experience_orbs
             .validate_chunk_group(positions, &self.saved_orb_uuids)?;
         let replacements: Vec<_> = falling
@@ -1834,9 +1842,10 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_optional_sources(
+        crate::saved_falling_block::draft_entity_chunks_with_removals(
             &originals,
             &replacements,
+            &removed_items,
         )
     }
 
@@ -7293,6 +7302,12 @@ mod tests {
             .set_initial_entity_chunk(home, SavedEntityData::Present(chunk))
             .unwrap();
         session.dirty_chunks.insert(home);
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_err(),
+            "an entity that has not loaded must not be treated as removed"
+        );
         session.update(TICK);
         assert_eq!(session.snapshot().experience_orbs.len(), 1);
         assert_eq!(session.snapshot().experience_orbs[0].position, absolute);
@@ -7535,6 +7550,11 @@ mod tests {
             .set_initial_entity_chunk(home, SavedEntityData::Present(chunk))
             .unwrap();
         session.dirty_chunks.insert(home);
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_err()
+        );
         session.update(TICK);
         assert_eq!(session.snapshot().dropped_items.len(), 1);
         let initial = session.snapshot().dropped_items[0].clone();
@@ -7580,6 +7600,13 @@ mod tests {
                 .is_none()
         );
         assert!(session.draft_existing_entity_chunk(home).is_err());
+        let drafts = session
+            .draft_existing_entity_chunks(&BTreeSet::from([home]))
+            .unwrap();
+        let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities") else {
+            panic!("missing entity list")
+        };
+        assert!(values.is_empty(), "picked-up saved item must not respawn");
         session.queue_chunk_window(remote, 0);
         session.update(TICK);
         session.queue_chunk_window(home, 0);

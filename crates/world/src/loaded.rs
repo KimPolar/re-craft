@@ -27,6 +27,7 @@ pub struct BiomeId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockEditError {
     UnknownState,
+    UnknownCurrentState,
     MissingChunk,
     MissingSection,
     MissingBlockData,
@@ -39,6 +40,7 @@ pub enum ChunkImportError {
     PositionMismatch,
     UnknownBlockState,
     UnknownBiome,
+    StaleBlockEdit,
 }
 
 impl std::fmt::Display for ChunkImportError {
@@ -49,6 +51,7 @@ impl std::fmt::Display for ChunkImportError {
             Self::PositionMismatch => "chunk position does not match its key",
             Self::UnknownBlockState => "chunk contains an unknown block-state ID",
             Self::UnknownBiome => "chunk contains an unknown biome ID",
+            Self::StaleBlockEdit => "source chunk conflicts with a pending block edit",
         })
     }
 }
@@ -59,6 +62,7 @@ impl std::fmt::Display for BlockEditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::UnknownState => "unknown block state",
+            Self::UnknownCurrentState => "current block has an unknown block-state ID",
             Self::MissingChunk => "chunk is not loaded",
             Self::MissingSection => "section is not loaded",
             Self::MissingBlockData => "section has no block-state data",
@@ -103,6 +107,29 @@ impl<T: Ord + Clone> Registry<T> {
 pub struct ChunkPos {
     pub x: i32,
     pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BlockPosition {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl BlockPosition {
+    pub fn chunk(self) -> ChunkPos {
+        ChunkPos {
+            x: self.x.div_euclid(16),
+            z: self.z.div_euclid(16),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockEdit {
+    pub position: BlockPosition,
+    pub original: BlockState,
+    pub replacement: BlockState,
 }
 
 /// A fluid tick saved by Java as a chunk-relative delay and priority.
@@ -151,6 +178,7 @@ pub struct World {
     pub missing_chunks: BTreeSet<ChunkPos>,
     pub saved_fluid_ticks: BTreeMap<ChunkPos, Vec<SavedFluidTick>>,
     pub saved_block_ticks: BTreeMap<ChunkPos, Vec<SavedBlockTick>>,
+    block_edits: Arc<BTreeMap<BlockPosition, BlockEdit>>,
 }
 
 impl World {
@@ -186,6 +214,24 @@ impl World {
         self.biomes.entries.len()
     }
 
+    /// Pending block changes, retained independently of chunk residency.
+    pub fn block_edits(&self) -> impl Iterator<Item = &BlockEdit> {
+        self.block_edits.values()
+    }
+
+    pub fn block_edits_in_chunk(&self, pos: ChunkPos) -> impl Iterator<Item = &BlockEdit> {
+        self.block_edits
+            .values()
+            .filter(move |edit| edit.position.chunk() == pos)
+    }
+
+    pub fn dirty_chunk_positions(&self) -> BTreeSet<ChunkPos> {
+        self.block_edits
+            .values()
+            .map(|edit| edit.position.chunk())
+            .collect()
+    }
+
     pub fn biomes(&self) -> impl Iterator<Item = &str> {
         self.biomes.entries.iter().map(String::as_str)
     }
@@ -209,6 +255,27 @@ impl World {
         }
         if self.chunks.contains_key(&pos) {
             return Ok(false);
+        }
+        let pending_edits: Vec<_> = self.block_edits_in_chunk(pos).cloned().collect();
+        for edit in &pending_edits {
+            let section_y = i8::try_from(edit.position.y.div_euclid(16))
+                .map_err(|_| ChunkImportError::StaleBlockEdit)?;
+            let index = edit.position.x.rem_euclid(16) as usize
+                + edit.position.z.rem_euclid(16) as usize * 16
+                + edit.position.y.rem_euclid(16) as usize * 256;
+            let Some(blocks) = chunk
+                .sections
+                .get(&section_y)
+                .and_then(|section| section.blocks.as_ref())
+            else {
+                return Err(ChunkImportError::StaleBlockEdit);
+            };
+            let Some(source_state) = blocks.get(index).and_then(|id| source.state(*id)) else {
+                return Err(ChunkImportError::UnknownBlockState);
+            };
+            if source_state != &edit.original && source_state != &edit.replacement {
+                return Err(ChunkImportError::StaleBlockEdit);
+            }
         }
         for section in chunk.sections.values() {
             if section
@@ -240,7 +307,7 @@ impl World {
             .cloned()
             .map(|biome| self.intern_biome(biome))
             .collect();
-        let sections = chunk
+        let mut sections: BTreeMap<_, _> = chunk
             .sections
             .iter()
             .map(|(&y, section)| {
@@ -258,6 +325,23 @@ impl World {
                 (y, Arc::new(section))
             })
             .collect();
+        for edit in &pending_edits {
+            let replacement = self.intern_state(edit.replacement.clone());
+            let section_y = i8::try_from(edit.position.y.div_euclid(16))
+                .expect("overlay section was validated before registry changes");
+            let index = edit.position.x.rem_euclid(16) as usize
+                + edit.position.z.rem_euclid(16) as usize * 16
+                + edit.position.y.rem_euclid(16) as usize * 256;
+            let section = sections
+                .get_mut(&section_y)
+                .expect("overlay section was validated before registry changes");
+            let section = Arc::make_mut(section);
+            section
+                .blocks
+                .as_mut()
+                .expect("overlay block data was validated before registry changes")[index] =
+                replacement;
+        }
         self.chunks.insert(
             pos,
             Arc::new(Chunk {
@@ -325,6 +409,17 @@ impl World {
         if blocks[index] == state {
             return Ok(false);
         }
+        let block_position = BlockPosition { x, y, z };
+        let current = self
+            .state(blocks[index])
+            .ok_or(BlockEditError::UnknownCurrentState)?
+            .clone();
+        let replacement = self.state(state).expect("state was checked").clone();
+        let original = self
+            .block_edits
+            .get(&block_position)
+            .map(|edit| edit.original.clone())
+            .unwrap_or(current);
         let chunk = Arc::make_mut(self.chunks.get_mut(&position).expect("chunk was checked"));
         let section = Arc::make_mut(
             chunk
@@ -333,6 +428,19 @@ impl World {
                 .expect("section was checked"),
         );
         section.blocks.as_mut().expect("block data was checked")[index] = state;
+        let block_edits = Arc::make_mut(&mut self.block_edits);
+        if replacement == original {
+            block_edits.remove(&block_position);
+        } else {
+            block_edits.insert(
+                block_position,
+                BlockEdit {
+                    position: block_position,
+                    original,
+                    replacement,
+                },
+            );
+        }
         Ok(true)
     }
 
@@ -502,8 +610,32 @@ mod tests {
         let mut fresh = source.clone();
         fresh.saved_block_ticks.remove(&pos);
         assert!(dest.import_chunk(&fresh, pos).unwrap());
+        assert_eq!(dest.block_id(-32, 0, 64), Some(dest_air));
+        assert_eq!(dest.block_edits_in_chunk(pos).count(), 1);
         assert!(!dest.saved_block_ticks.contains_key(&pos));
         assert!(!dest.saved_fluid_ticks.contains_key(&pos));
+
+        dest.chunks.remove(&pos);
+        let mut stale = source.clone();
+        let dirt = stale.intern_state(BlockState {
+            name: "minecraft:dirt".into(),
+            properties: BTreeMap::new(),
+        });
+        let mut stale_chunk = (**stale.chunks.get(&pos).unwrap()).clone();
+        Arc::make_mut(stale_chunk.sections.get_mut(&0).unwrap())
+            .blocks
+            .as_mut()
+            .unwrap()[0] = dirt;
+        stale.chunks.insert(pos, Arc::new(stale_chunk));
+        let state_count = dest.state_count();
+        assert_eq!(
+            dest.import_chunk(&stale, pos),
+            Err(ChunkImportError::StaleBlockEdit)
+        );
+        assert_eq!(dest.state_count(), state_count);
+        assert!(!dest.chunks.contains_key(&pos));
+        assert!(dest.import_chunk(&fresh, pos).unwrap());
+        assert_eq!(dest.block_id(-32, 0, 64), Some(dest_air));
     }
 
     #[test]
@@ -561,6 +693,20 @@ mod tests {
             &world.chunks[&neighbor],
             &previous.chunks[&neighbor]
         ));
+        let edit = world.block_edits().next().unwrap();
+        assert_eq!(edit.position, BlockPosition { x: -1, y: -1, z: 0 });
+        assert_eq!(edit.original, *world.state(air).unwrap());
+        assert_eq!(edit.replacement, *world.state(stone).unwrap());
+        assert_eq!(world.dirty_chunk_positions(), BTreeSet::from([pos]));
+        let edited_snapshot = world.clone();
+        assert!(world.set_block_id(-1, -1, 0, air).unwrap());
+        assert_eq!(world.block_id(-1, -1, 0), Some(air));
+        assert_eq!(world.block_edits().count(), 0);
+        assert_eq!(edited_snapshot.block_edits().count(), 1);
+        assert_eq!(
+            edited_snapshot.block_edits().next().unwrap().replacement,
+            *edited_snapshot.state(stone).unwrap()
+        );
         assert_eq!(
             world.set_block_id(16, 0, 0, stone),
             Err(BlockEditError::MissingChunk)

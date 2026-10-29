@@ -541,6 +541,18 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Restore the player's saved flight speed before starting the session.
+    pub fn restore_saved_flight_speed(&mut self, speed: f32) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("saved flight speed must be restored before the first tick");
+        }
+        if !speed.is_finite() {
+            return Err("invalid saved flight speed");
+        }
+        self.flight_speed = speed;
+        Ok(())
+    }
+
     /// Capture simulated player data at a tick boundary. This draft cannot be
     /// written until changed chunks, entities, ticks and other state are handled.
     pub fn draft_player_state(
@@ -9210,6 +9222,30 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn saved_spectator_flight_speed_is_restored_and_wheel_clamps_it() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        session.restore_saved_flight_speed(0.75).unwrap();
+        session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        session.update(TICK);
+        assert_eq!(session.motion.position.y, 12.25);
+        assert!(session.restore_saved_flight_speed(0.1).is_err());
+        // Java also clamps on a horizontal-only scroll, whose vertical steps are zero.
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(0));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.2);
+        let mut invalid = self::session();
+        assert!(invalid.restore_saved_flight_speed(f32::NAN).is_err());
+        assert!(invalid.restore_saved_flight_speed(f32::INFINITY).is_err());
     }
 
     #[test]

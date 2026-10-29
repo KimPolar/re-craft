@@ -330,6 +330,18 @@ pub fn read_saved_experience(player: &NamedTag) -> crate::experience::Experience
     }
 }
 
+/// Abilities.Packed uses a lenient optional numeric float with a 0.05 default.
+pub fn read_saved_flight_speed(player: &NamedTag) -> Result<f32> {
+    let speed = player
+        .value
+        .get("abilities")
+        .and_then(|abilities| abilities.get("flySpeed"))
+        .and_then(numeric_float)
+        .unwrap_or(0.05);
+    ensure!(speed.is_finite(), "saved flight speed is not finite");
+    Ok(speed)
+}
+
 /// Read the 26.3 health and food fields without writing the player document.
 pub fn read_saved_vitals(
     player: &NamedTag,

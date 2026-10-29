@@ -54,6 +54,12 @@ impl HotbarScroll {
         (steps_x, steps_y)
     }
 
+    /// A horizontal-only whole step still triggers Java's speed clamp.
+    pub fn spectator(&mut self, delta: (f64, f64)) -> Option<i32> {
+        let (x, y) = self.steps(delta);
+        (x != 0 || y != 0).then_some(y)
+    }
+
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.remainder_x = 0.0;
@@ -125,10 +131,10 @@ mod tests {
     #[test]
     fn spectator_wheel_uses_only_vertical_steps_and_consumes_horizontal() {
         let mut scroll = HotbarScroll::default();
-        assert_eq!(scroll.steps((1.2, 0.4)), (1, 0));
-        assert_eq!(scroll.steps((0.0, 0.7)), (0, 1));
-        assert_eq!(scroll.steps((-0.4, -0.2)), (0, 0));
-        assert_eq!(scroll.steps((-0.7, -0.8)), (-1, -1));
+        assert_eq!(scroll.spectator((1.2, 0.4)), Some(0));
+        assert_eq!(scroll.spectator((0.0, 0.7)), Some(1));
+        assert_eq!(scroll.spectator((-0.4, -0.2)), None);
+        assert_eq!(scroll.spectator((-0.7, -0.8)), Some(-1));
     }
 
     #[test]
@@ -266,9 +272,13 @@ public class ScrollWheelOracle {
         for ((delta_x, delta_y), (steps_x, steps_y, speed_bits)) in
             deltas.into_iter().zip(java_steps)
         {
-            assert_eq!(flight_scroll.steps((delta_x, delta_y)), (steps_x, steps_y));
-            if steps_y != 0 {
-                flight_speed = native_session::physics::adjust_flight_speed(flight_speed, steps_y);
+            let flight_steps = flight_scroll.spectator((delta_x, delta_y));
+            assert_eq!(
+                flight_steps,
+                (steps_x != 0 || steps_y != 0).then_some(steps_y)
+            );
+            if let Some(steps) = flight_steps {
+                flight_speed = native_session::physics::adjust_flight_speed(flight_speed, steps);
             }
             assert_eq!(flight_speed.to_bits(), speed_bits as u32);
             let expected_steps = if steps_y != 0 { steps_y } else { -steps_x };

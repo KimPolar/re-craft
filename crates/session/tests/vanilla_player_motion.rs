@@ -125,6 +125,83 @@ fn classpath(game: &Path, classes: &Path) -> OsString {
     std::env::join_paths(paths).unwrap()
 }
 
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn saved_flight_speed_matches_vanilla_abilities_codec() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SavedAbilitiesOracle.java");
+    std::fs::write(&source, include_str!("java/SavedAbilitiesOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let output = temp.path().join("abilities.json");
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SavedAbilitiesOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), 15);
+    for row in rows {
+        let index = row["index"].as_u64().unwrap();
+        let mut abilities = vec![];
+        match index {
+            2 => abilities.push(("flySpeed".into(), Tag::Float(0.125))),
+            3 => abilities.push(("flySpeed".into(), Tag::Float(0.75))),
+            4 => abilities.push(("flySpeed".into(), Tag::Float(-0.1))),
+            5 => abilities.push(("flySpeed".into(), Tag::Byte(1))),
+            6 => abilities.push(("flySpeed".into(), Tag::Int(2))),
+            7 => abilities.push(("flySpeed".into(), Tag::Double(0.012345678901))),
+            8 => abilities.push(("flySpeed".into(), Tag::String("invalid".into()))),
+            9 => {
+                abilities.push(("flySpeed".into(), Tag::Float(0.125)));
+                abilities.push(("flying".into(), Tag::String("invalid".into())));
+            }
+            10 => {
+                abilities.push(("flySpeed".into(), Tag::Float(0.125)));
+                abilities.push(("walkSpeed".into(), Tag::String("invalid".into())));
+            }
+            11 => {
+                abilities.push(("flySpeed".into(), Tag::Float(0.125)));
+                abilities.push(("mayfly".into(), Tag::Int(2)));
+            }
+            13 => abilities.push(("flySpeed".into(), Tag::Float(f32::NAN))),
+            14 => abilities.push(("flySpeed".into(), Tag::Float(f32::INFINITY))),
+            _ => {}
+        }
+        let fields = if index == 0 {
+            vec![]
+        } else if index == 12 {
+            vec![("abilities".into(), Tag::String("invalid".into()))]
+        } else {
+            vec![("abilities".into(), Tag::Compound(abilities))]
+        };
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(fields),
+        };
+        let result = native_session::player_data::read_saved_flight_speed(&player);
+        if index >= 13 {
+            assert!(
+                result.is_err(),
+                "nonfinite speed must not enter the simulator"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().to_bits(),
+                row["bits"].as_i64().unwrap() as u32,
+                "case {index}"
+            );
+        }
+    }
+}
+
 const EXPERIENCE_ORACLE: &str = r#"
 import java.nio.file.*;
 import java.util.UUID;

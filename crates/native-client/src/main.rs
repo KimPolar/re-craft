@@ -920,6 +920,15 @@ fn prepare_existing_world(
             .and_then(player_inventory::saved_game_mode)
             .unwrap_or(default_mode);
         session.set_game_mode(mode);
+        if mode == native_session::GameMode::Spectator
+            && let Some(saved) = &player_data
+        {
+            let speed = native_session::player_data::read_saved_flight_speed(saved)
+                .context("cannot read saved spectator flight speed")?;
+            session
+                .restore_saved_flight_speed(speed)
+                .map_err(anyhow::Error::msg)?;
+        }
         session.set_game_master_permission(reader.allow_commands()?);
         match resources.vanilla_block_ids() {
             Ok(registry) => {
@@ -1827,8 +1836,7 @@ impl ApplicationHandler for App {
                     let snapshot = self.session.snapshot();
                     if self.captured && snapshot.death.is_none() && !snapshot.inventory.is_open() {
                         if snapshot.game_mode == native_session::GameMode::Spectator {
-                            let (_, vertical) = self.hotbar_scroll.steps(amount);
-                            if vertical != 0 {
+                            if let Some(vertical) = self.hotbar_scroll.spectator(amount) {
                                 self.session
                                     .submit_command(PlayerCommand::AdjustFlightSpeed(vertical));
                             }

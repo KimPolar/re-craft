@@ -208,6 +208,67 @@ fn vec(value: &Value) -> DVec3 {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn spectator_flight_matches_vanilla_air_movement() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SpectatorFlightOracle.java");
+    std::fs::write(&source, include_str!("java/SpectatorFlightOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let output = temp.path().join("flight.json");
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SpectatorFlightOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), 16 * 64);
+    let mut motion = MotionState {
+        position: DVec3::ZERO,
+        velocity: DVec3::ZERO,
+        on_ground: false,
+        jump_delay: 0,
+    };
+    for row in &rows {
+        if row["tick"].as_u64() == Some(0) {
+            motion.position = DVec3::ZERO;
+            motion.velocity = DVec3::new(row["seed"].as_f64().unwrap() * 0.001, -0.02, 0.03);
+        }
+        motion.tick_spectator(
+            MovementInput {
+                forward: row["forward"].as_f64().unwrap() as f32,
+                right: row["right"].as_f64().unwrap() as f32,
+                yaw_degrees: row["yaw"].as_f64().unwrap() as f32,
+                jump: row["jump"].as_bool().unwrap(),
+                sprinting: row["sprint"].as_bool().unwrap(),
+                using_item: false,
+                moving_slowly: false,
+            },
+            row["down"].as_bool().unwrap(),
+        );
+        let expected_position = vec(&row["position"]);
+        let expected_velocity = vec(&row["velocity"]);
+        assert!(
+            (motion.position - expected_position).length() < 1e-6,
+            "{row}: {:?}",
+            motion.position
+        );
+        assert!(
+            (motion.velocity - expected_velocity).length() < 1e-6,
+            "{row}: {:?}",
+            motion.velocity
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

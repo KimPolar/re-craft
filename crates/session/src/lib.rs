@@ -1075,8 +1075,9 @@ impl LocalSession {
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
-        let moving_slowly = self.player.pose == PlayerPose::Crawling
-            || (fits_crouching && (self.previous_sneak || !fits_standing));
+        let moving_slowly = self.game_mode != GameMode::Spectator
+            && (self.player.pose == PlayerPose::Crawling
+                || (fits_crouching && (self.previous_sneak || !fits_standing)));
         self.sprint.previous_sneak = self.previous_sneak;
         self.sprint.moving_slowly = moving_slowly;
         self.sprint.insufficient_food = !self.vitals.can_sprint(self.game_mode);
@@ -1101,7 +1102,9 @@ impl LocalSession {
             self.vitals.record_jump(self.game_mode, input.sprinting);
         }
         let before_move = self.motion.position;
-        let (major_collision, actual) =
+        let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
+            (false, self.motion.tick_spectator(input, self.sneak))
+        } else {
             self.motion
                 .tick_resolved(input, 0.6, |position, requested, on_ground| {
                     let adjusted = movement::back_off(
@@ -1121,7 +1124,8 @@ impl LocalSession {
                         block_shape,
                     );
                     (adjusted, actual)
-                });
+                })
+        };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
         self.vitals.record_movement(
@@ -1134,7 +1138,11 @@ impl LocalSession {
             },
         );
         self.sprint.after_move(major_collision);
-        self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
+        if self.game_mode == GameMode::Spectator {
+            self.fall_distance = 0.0;
+        } else {
+            self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
+        }
         if self.motion.on_ground {
             let support = movement::supporting_block(
                 self.motion.position,
@@ -1190,13 +1198,17 @@ impl LocalSession {
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_crawling = movement::can_fit(self.motion.position, CRAWL_HEIGHT, block_shape);
-        self.player.pose = self.player.pose.after_movement(
-            self.sneak,
-            false,
-            fits_standing,
-            fits_crouching,
-            fits_crawling,
-        );
+        self.player.pose = if self.game_mode == GameMode::Spectator {
+            PlayerPose::Standing
+        } else {
+            self.player.pose.after_movement(
+                self.sneak,
+                false,
+                fits_standing,
+                fits_crouching,
+                fits_crawling,
+            )
+        };
         self.previous_sneak = self.sneak;
         self.player.position = self.motion.position.as_vec3();
         self.player.vertical_velocity = (self.motion.velocity.y * 20.0) as f32;
@@ -2286,6 +2298,29 @@ mod tests {
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }
         }
+    }
+
+    #[test]
+    fn demo_spectator_can_fly_through_blocks() {
+        let mut world = World::demo();
+        for y in 3..=5 {
+            world.set_block(IVec3::new(5, y, 4), Block::Stone);
+        }
+        let mut session = LocalSession::new(world);
+        session.set_game_mode(GameMode::Spectator);
+        session.motion.position = DVec3::new(5.5, 3.0, 5.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        session.submit_command(PlayerCommand::Move {
+            forward: 1.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        for _ in 0..20 {
+            session.update(TICK);
+        }
+        assert!(session.motion.position.z < 4.0);
+        assert_eq!(session.motion.position.y, 3.0);
     }
 
     #[test]

@@ -48,6 +48,40 @@ pub fn ground_friction(block: &str) -> f32 {
 }
 
 impl MotionState {
+    /// Default spectator flight in air, with the player's no-physics movement.
+    pub fn tick_spectator(&mut self, input: MovementInput, descend: bool) -> DVec3 {
+        let vertical = i32::from(input.jump) - i32::from(descend);
+        self.velocity.y += f64::from(vertical as f32 * 0.05_f32 * 3.0_f32);
+        if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
+            self.velocity.x = 0.0;
+            self.velocity.z = 0.0;
+        }
+        if self.velocity.y.abs() < 0.003 {
+            self.velocity.y = 0.0;
+        }
+        let radians = input.yaw_degrees * 0.017453292_f32;
+        let sine = f64::from(java_sin(f64::from(radians), false));
+        let cosine = f64::from(java_sin(f64::from(radians), true));
+        let speed = if input.sprinting {
+            0.05_f32 * 2.0
+        } else {
+            0.05_f32
+        };
+        let (left, forward) = keyboard_input(-input.right, input.forward, false, input.using_item);
+        let x = f64::from(left) * f64::from(speed);
+        let z = f64::from(forward) * f64::from(speed);
+        self.velocity.x += x * cosine - z * sine;
+        self.velocity.z += z * cosine + x * sine;
+        let actual = self.velocity;
+        self.position += actual;
+        self.velocity.x *= f64::from(0.91_f32);
+        self.velocity.y *= 0.6;
+        self.velocity.z *= f64::from(0.91_f32);
+        self.on_ground = false;
+        self.jump_delay = 0;
+        actual
+    }
+
     /// Advance one 20 TPS tick. `collide` resolves the requested movement and
     /// returns the movement that is actually possible from the given position.
     /// Returns whether a non-minor horizontal collision occurred.

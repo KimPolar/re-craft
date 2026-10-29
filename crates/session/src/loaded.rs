@@ -5259,20 +5259,24 @@ impl LoadedSession {
         }
         self.breathing_effects.tick();
         self.fall.tick_effects();
-        self.swimming = if self.swimming {
+        self.swimming = if self.game_mode == GameMode::Spectator {
+            false
+        } else if self.swimming {
             self.sprint.active && in_water
         } else {
             self.sprint.active
                 && under_water
                 && matches!(fluid_view.at(self.motion.position.floor().as_ivec3()), fluid::Cell::Fluid(state) if state.kind == FluidKind::Water)
         };
-        self.motion.velocity = contacts.water.push(self.motion.velocity, 0.014);
-        let lava_strength = if self.world.dimension == "minecraft:the_nether" {
-            0.007
-        } else {
-            0.0023333333333333335
-        };
-        self.motion.velocity = contacts.lava.push(self.motion.velocity, lava_strength);
+        if self.game_mode != GameMode::Spectator {
+            self.motion.velocity = contacts.water.push(self.motion.velocity, 0.014);
+            let lava_strength = if self.world.dimension == "minecraft:the_nether" {
+                0.007
+            } else {
+                0.0023333333333333335
+            };
+            self.motion.velocity = contacts.lava.push(self.motion.velocity, lava_strength);
+        }
         if in_water {
             self.fall_distance = 0.0;
         } else if contacts.lava.depth > 0.0 {
@@ -5282,9 +5286,9 @@ impl LoadedSession {
             crate::movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing =
             crate::movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
-        let moving_slowly =
-            (!self.swimming && fits_crouching && (self.previous_sneak || !fits_standing))
-                || (self.player.pose == PlayerPose::Crawling && !in_water);
+        let moving_slowly = self.game_mode != GameMode::Spectator
+            && ((!self.swimming && fits_crouching && (self.previous_sneak || !fits_standing))
+                || (self.player.pose == PlayerPose::Crawling && !in_water));
         self.sprint.previous_sneak = self.previous_sneak;
         self.sprint.moving_slowly = moving_slowly;
         self.sprint.insufficient_food = !self.vitals.can_sprint(self.game_mode);
@@ -5350,7 +5354,9 @@ impl LoadedSession {
             self.vitals.record_jump(self.game_mode, input.sprinting);
         }
         let before_move = self.motion.position;
-        let (major_collision, actual) = if let Some((kind, depth)) = liquid {
+        let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
+            (false, self.motion.tick_spectator(input, self.sneak))
+        } else if let Some((kind, depth)) = liquid {
             let above = (self.motion.position + DVec3::Y * 0.9).floor().as_ivec3();
             let movement = crate::physics::FluidMovement {
                 kind,
@@ -5399,7 +5405,7 @@ impl LoadedSession {
                 .water
                 .depth
                     > 0.0);
-        if landing_in_water {
+        if self.game_mode == GameMode::Spectator || landing_in_water {
             self.fall_distance = 0.0;
         } else {
             self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
@@ -5507,13 +5513,17 @@ impl LoadedSession {
             crate::movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_crawling =
             crate::movement::can_fit(self.motion.position, CRAWL_HEIGHT, block_shape);
-        self.player.pose = self.player.pose.after_movement(
-            self.sneak,
-            self.swimming,
-            fits_standing,
-            fits_crouching,
-            fits_crawling,
-        );
+        self.player.pose = if self.game_mode == GameMode::Spectator {
+            PlayerPose::Standing
+        } else {
+            self.player.pose.after_movement(
+                self.sneak,
+                self.swimming,
+                fits_standing,
+                fits_crouching,
+                fits_crawling,
+            )
+        };
         self.previous_sneak = self.sneak;
         self.player.position = self.motion.position.as_vec3();
         self.player.vertical_velocity = (self.motion.velocity.y * 20.0) as f32;
@@ -9188,6 +9198,46 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn spectator_flies_through_blocks_without_falling() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        for y in 1..=3 {
+            assert!(session.set(IVec3::new(8, y, 7), session.states[3]));
+        }
+        session.motion.position = DVec3::new(8.5, 1.0, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        session.submit_command(PlayerCommand::Move {
+            forward: 1.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        for _ in 0..20 {
+            session.update(TICK);
+        }
+        assert!(session.motion.position.z < 7.0);
+        assert_eq!(session.motion.position.y, 1.0);
+        assert_eq!(session.fall_distance, 0.0);
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        session.update(TICK);
+        assert!(session.motion.position.y > 1.0);
+        let raised = session.motion.position.y;
+        session.motion.velocity.y = 0.0;
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        session.submit_command(PlayerCommand::Sneak(true));
+        session.update(TICK);
+        assert!(session.motion.position.y < raised);
     }
 
     #[test]

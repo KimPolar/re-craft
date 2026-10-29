@@ -151,6 +151,16 @@ public class RegionWriteOracle {
             var list = new ListTag(); list.add(entity); chunk.put("Entities", list);
             try (var region = open(entities); var out = region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk, (DataOutput)out); }
             System.out.println("OK");
+        } else if (args[0].equals("verifyCreatedEntityDirectory")) {
+            Path entities = world.resolve("dimensions/minecraft/overworld/entities");
+            if (!Files.isRegularFile(entities.resolve("r.0.0.mca"))) throw new AssertionError("missing created region");
+            try (var region = open(entities); var in = region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                var chunk = NbtIo.read((DataInput)in);
+                var list = chunk.getListOrEmpty("Entities");
+                var entity = list.getCompoundOrEmpty(0);
+                if (chunk.getLongOr("future_chunk",0)!=17 || list.size()!=1 || entity.getLongOr("future",0)!=42 || entity.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=1.5) throw new AssertionError("created entity data");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("verifyEntity") || args[0].equals("verifyEntityNewRegion")) {
             Path entities = world.resolve("dimensions/minecraft/overworld/entities");
             boolean newRegion=args[0].equals("verifyEntityNewRegion");
@@ -244,6 +254,68 @@ fn entity_chunk_drafts_commit_and_load_in_java() {
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn entity_chunk_drafts_create_region_readable_by_java() {
     exercise_entity_chunk_drafts(true);
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn created_entity_directory_and_region_are_readable_by_java() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-entity-dir-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seedEntity").lines().any(|line| line == "OK"));
+    let directory = world.join("dimensions/minecraft/overworld/entities");
+    let region = directory.join("r.0.0.mca");
+    let document = RegionReader::open(&region)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&region).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(
+        DimensionId::parse("overworld").unwrap(),
+        ChunkPos { x: 0, z: 0 },
+        None,
+        &document,
+        100,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert!(
+        invoke("verifyCreatedEntityDirectory")
+            .lines()
+            .any(|line| line == "OK")
+    );
 }
 
 fn exercise_entity_chunk_drafts(new_region: bool) {

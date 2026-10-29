@@ -141,7 +141,8 @@ impl WorldSavePlan {
 
     /// Add an entity chunk to a coordinated partial save. The caller must
     /// validate entity ownership, movement and all simulated side effects.
-    /// The dimension's entity directory must already exist.
+    /// Missing entity directories are created before region staging and may
+    /// remain empty if staging fails or the process is interrupted.
     pub fn add_entity_chunk(
         &mut self,
         dimension: DimensionId,
@@ -565,6 +566,42 @@ impl WorldWriteGuard {
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut absent_dependencies = Vec::new();
+        let mut entity_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
+        for ((kind, dimension, _, _), chunks) in &groups {
+            if *kind != RegionKind::Entities {
+                continue;
+            }
+            let directory = dimension.entity_region_dir(&self.root);
+            let (_, exists) = crate::save_transaction::checked_directory(&self.root, &directory)?;
+            if !exists {
+                ensure!(
+                    chunks.iter().all(|chunk| chunk.source_nbt.is_none()),
+                    "entity directory changed after its draft was created"
+                );
+            }
+            let entry = entity_directories
+                .entry(directory)
+                .or_insert((exists, false));
+            ensure!(entry.0 == exists, "entity directory changed during staging");
+            entry.1 |= chunks.iter().any(|chunk| chunk.replacement.is_some());
+        }
+        for (directory, (exists, needed)) in &entity_directories {
+            if !exists && *needed {
+                // Only a single, verified final component is created. A failed
+                // save can leave this directory empty, never remove outside data.
+                fs::create_dir(directory).with_context(|| {
+                    format!("cannot create entity directory {}", directory.display())
+                })?;
+                ensure!(
+                    crate::save_transaction::checked_directory(&self.root, directory)?.1,
+                    "entity directory disappeared"
+                );
+            } else if !exists {
+                absent_dependencies.push(crate::save_transaction::Dependency::AbsentDirectory {
+                    target: directory.clone(),
+                });
+            }
+        }
         let mut region_paths = Vec::with_capacity(groups.len());
         let mut entity_region_paths = Vec::new();
         let mut player_paths = Vec::with_capacity(plan.players.len());
@@ -573,6 +610,12 @@ impl WorldWriteGuard {
         for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
         {
+            if kind == RegionKind::Entities
+                && entity_directories.get(&dimension.entity_region_dir(&self.root))
+                    == Some(&(false, false))
+            {
+                continue;
+            }
             let region_dir = match kind {
                 RegionKind::Blocks => dimension.region_dir(&self.root),
                 RegionKind::Entities => dimension.entity_region_dir(&self.root),
@@ -1783,7 +1826,7 @@ mod tests {
         let world = test_world();
         fixture(world.path());
         let directory = world.path().join("dimensions/minecraft/overworld/entities");
-        fs::create_dir_all(&directory).unwrap();
+        assert!(!directory.exists());
         let mut document = entity_chunk(32, vec![]);
         let Tag::Compound(fields) = &mut document.value else {
             unreachable!()
@@ -1807,6 +1850,120 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved, document);
+    }
+
+    #[test]
+    fn missing_entity_directory_is_an_absent_dependency_when_unchanged() {
+        let world = test_world();
+        let (block_path, mut original_blocks, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut original_blocks, 0, 2, &terrain, 10);
+        fs::write(&block_path, &original_blocks).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            100,
+        )
+        .unwrap();
+        for x in [0, 32, 64] {
+            plan.add_entity_chunk(
+                dimension.clone(),
+                ChunkPos { x, z: 0 },
+                None,
+                &entity_chunk(x, vec![]),
+                1,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        }
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert!(!directory.exists());
+        assert_ne!(fs::read(&block_path).unwrap(), original_blocks);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(result.backup_directory.join("transaction.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["version"], 3);
+        assert_eq!(manifest["absent_directories"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_entity_directory_rejects_expected_existing_source() {
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        let source = entity_chunk(0, vec![]);
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &source,
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn failed_staging_preserves_files_and_may_leave_an_empty_entity_directory() {
+        let world = test_world();
+        let (block_path, mut bytes, _) = fixture(world.path());
+        let expected = editable_chunk(0);
+        let mut current = expected.clone();
+        let Tag::Compound(fields) = &mut current.value else {
+            unreachable!()
+        };
+        fields.push(("external_change".into(), Tag::Int(1)));
+        store_record(&mut bytes, 0, 2, &current, 10);
+        fs::write(&block_path, &bytes).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &expected,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            100,
+        )
+        .unwrap();
+        plan.add_entity_chunk(
+            dimension,
+            ChunkPos { x: 0, z: 0 },
+            None,
+            &entity_chunk(
+                0,
+                vec![Tag::Compound(vec![(
+                    "id".into(),
+                    Tag::String("minecraft:pig".into()),
+                )])],
+            ),
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&block_path).unwrap(), bytes);
+        assert!(directory.is_dir());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+        assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 
     #[test]

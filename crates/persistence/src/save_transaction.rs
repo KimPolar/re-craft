@@ -32,6 +32,7 @@ pub(crate) struct Replacement {
 pub(crate) enum Dependency {
     Present { target: PathBuf, backup: PathBuf },
     Absent { target: PathBuf },
+    AbsentDirectory { target: PathBuf },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,6 +43,8 @@ struct Manifest {
     dependencies: Vec<DependencyRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     absent_dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    absent_directories: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,6 +174,48 @@ fn checked_target(base: &Path, relative: &str) -> Result<(PathBuf, bool)> {
     checked_path(base, relative, true, true)
 }
 
+/// Inspect a directory without following links; only its final component may
+/// be absent. Callers must still use create_dir rather than create_dir_all.
+pub(crate) fn checked_directory(base: &Path, path: &Path) -> Result<(PathBuf, bool)> {
+    let relative = relative(base, path)?;
+    relative_path_key(&relative)?;
+    let mut current = base.to_path_buf();
+    let mut parts = Path::new(&relative).components().peekable();
+    while let Some(part) = parts.next() {
+        let Component::Normal(name) = part else {
+            bail!("invalid directory path")
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Err(error)
+                if parts.peek().is_none() && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                ensure!(
+                    current
+                        .parent()
+                        .context("directory has no parent")?
+                        .canonicalize()?
+                        .starts_with(base),
+                    "directory escapes the world"
+                );
+                return Ok((current, false));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot inspect {}", current.display()));
+            }
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && ordinary(&metadata),
+                "directory path contains a link or non-directory"
+            ),
+        }
+    }
+    ensure!(
+        current.canonicalize()?.starts_with(base),
+        "directory escapes the world"
+    );
+    Ok((current, true))
+}
+
 fn relative(base: &Path, path: &Path) -> Result<String> {
     let path = path
         .strip_prefix(base)
@@ -251,16 +296,23 @@ fn valid_created_entity_region(value: &str) -> bool {
     name == format!("r.{x}.{z}.mca")
 }
 
+fn valid_entity_directory(value: &str) -> bool {
+    valid_created_entity_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
+}
+
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2),
+        matches!(manifest.version, 1 | 2 | 3),
         "unsupported transaction version"
     );
     ensure!(
-        (!manifest.files.is_empty() || !manifest.absent_dependencies.is_empty())
+        (!manifest.files.is_empty()
+            || !manifest.absent_dependencies.is_empty()
+            || !manifest.absent_directories.is_empty())
             && manifest.files.len()
                 + manifest.dependencies.len()
                 + manifest.absent_dependencies.len()
+                + manifest.absent_directories.len()
                 <= 4096,
         "invalid transaction file count"
     );
@@ -283,7 +335,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                 );
                 ensure!(valid_digest(original), "invalid transaction hash");
             }
-            (None, None) if manifest.version == 2 => ensure!(
+            (None, None) if manifest.version >= 2 => ensure!(
                 valid_created_entity_region(&record.target),
                 "invalid created region path"
             ),
@@ -302,7 +354,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         ensure!(valid_digest(&record.original), "invalid transaction hash");
     }
     ensure!(
-        manifest.version == 2 || manifest.absent_dependencies.is_empty(),
+        manifest.version >= 2 || manifest.absent_dependencies.is_empty(),
         "invalid transaction version for absent dependencies"
     );
     for target in &manifest.absent_dependencies {
@@ -313,6 +365,23 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         ensure!(
             targets.insert(relative_path_key(target)?),
             "duplicate transaction target"
+        );
+    }
+    ensure!(
+        manifest.version >= 3 || manifest.absent_directories.is_empty(),
+        "invalid transaction version for absent directories"
+    );
+    for directory in &manifest.absent_directories {
+        ensure!(
+            valid_entity_directory(directory),
+            "invalid absent entity directory path"
+        );
+        let key = relative_path_key(directory)?;
+        ensure!(targets.insert(key.clone()), "duplicate transaction target");
+        let prefix = format!("{key}{}", std::path::MAIN_SEPARATOR);
+        ensure!(
+            !targets.iter().any(|target| target.starts_with(&prefix)),
+            "absent directory overlaps a transaction target"
         );
     }
     let mut stages = BTreeSet::new();
@@ -433,6 +502,7 @@ fn prepare(
     }
     let mut dependency_records = Vec::with_capacity(dependencies.len());
     let mut absent_dependencies = Vec::new();
+    let mut absent_directories = Vec::new();
     for dependency in &dependencies {
         match dependency {
             Dependency::Present { target, backup } => {
@@ -461,10 +531,24 @@ fn prepare(
                 );
                 absent_dependencies.push(target);
             }
+            Dependency::AbsentDirectory { target } => {
+                let target_relative = relative(root, target)?;
+                ensure!(
+                    valid_entity_directory(&target_relative),
+                    "invalid absent entity directory path"
+                );
+                ensure!(
+                    !checked_directory(root, target)?.1,
+                    "absent entity directory appeared during staging"
+                );
+                absent_directories.push(target_relative);
+            }
         }
     }
     let manifest = Manifest {
-        version: if !absent_dependencies.is_empty()
+        version: if !absent_directories.is_empty() {
+            3
+        } else if !absent_dependencies.is_empty()
             || records.iter().any(|record| record.original.is_none())
         {
             2
@@ -474,6 +558,7 @@ fn prepare(
         files: records,
         dependencies: dependency_records,
         absent_dependencies,
+        absent_directories,
     };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
@@ -517,6 +602,14 @@ fn check_dependencies(root: &Path, manifest: &Manifest) -> Result<()> {
         ensure!(
             !exists,
             "absent world dependency appeared: {}",
+            path.display()
+        );
+    }
+    for relative in &manifest.absent_directories {
+        let (path, exists) = checked_directory(root, &root.join(relative))?;
+        ensure!(
+            !exists,
+            "absent entity directory appeared: {}",
             path.display()
         );
     }
@@ -1034,6 +1127,61 @@ mod tests {
         assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
         assert_eq!(fs::read(&missing).unwrap(), b"outside");
         fs::remove_file(missing).unwrap();
+        assert!(WorldWriteGuard::recover_interrupted(&root).unwrap());
+        assert_eq!(fs::read(region).unwrap(), OLD_REGION);
+    }
+
+    #[test]
+    fn absent_entity_directory_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_ABSENT_DIRECTORY_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let (files, mut deps) = replacements(&root);
+        deps.push(Dependency::AbsentDirectory {
+            target: root.join("dimensions/minecraft/overworld/entities"),
+        });
+        let mut prepared = prepare(
+            &root,
+            &root.join(".minecraft-native-backups/transaction-fixture"),
+            files,
+            deps,
+        )
+        .unwrap();
+        assert_eq!(prepared.manifest.version, 3);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        std::process::exit(26);
+    }
+
+    #[test]
+    fn recovery_detects_an_entity_directory_created_after_interruption() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let absent = root.join("dimensions/minecraft/overworld/entities");
+        fs::remove_dir(&absent).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "save_transaction::tests::absent_entity_directory_crash_helper",
+                "--nocapture",
+            ])
+            .env("NATIVE_ABSENT_DIRECTORY_CRASH_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(26),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        fs::create_dir(&absent).unwrap();
+        fs::write(absent.join("outside.dat"), b"outside").unwrap();
+        assert!(WorldWriteGuard::recover_interrupted(&root).is_err());
+        assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
+        assert_eq!(fs::read(absent.join("outside.dat")).unwrap(), b"outside");
+        fs::remove_file(absent.join("outside.dat")).unwrap();
+        fs::remove_dir(&absent).unwrap();
         assert!(WorldWriteGuard::recover_interrupted(&root).unwrap());
         assert_eq!(fs::read(region).unwrap(), OLD_REGION);
     }

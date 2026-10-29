@@ -186,9 +186,41 @@ struct ItemEntity {
     no_gravity: bool,
     owner: Option<[i32; 4]>,
     _saved_source: Option<Arc<Tag>>,
+    created: Option<CreatedItemIdentity>,
     id: u32,
     section_sequence: u64,
     _damage_state: ItemDamageState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CreatedItemIdentity {
+    uuid: Option<[i32; 4]>,
+    origin: DVec3,
+    thrower: CreatedThrower,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreatedThrower {
+    Known(Option<[i32; 4]>),
+    Unknown,
+}
+
+impl CreatedItemIdentity {
+    fn new(origin: DVec3, thrower: CreatedThrower) -> Self {
+        let mut bytes = [0_u8; 16];
+        let uuid = getrandom::fill(&mut bytes).ok().map(|_| uuid_v4(bytes));
+        Self {
+            uuid,
+            origin,
+            thrower,
+        }
+    }
+}
+
+fn uuid_v4(mut bytes: [u8; 16]) -> [i32; 4] {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    std::array::from_fn(|i| i32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
 }
 
 #[derive(Clone)]
@@ -313,6 +345,8 @@ pub(crate) struct ItemEntities {
     entities: Vec<ItemEntity>,
     // Retain actual removals separately from chunks that failed to load.
     removed_saved: Vec<RemovedSavedItem>,
+    removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
+    invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
     uncoordinated_saved_merge: bool,
     random: LegacyRandom,
@@ -328,6 +362,8 @@ impl Default for ItemEntities {
         Self {
             entities: Vec::new(),
             removed_saved: Vec::new(),
+            removed_created_chunks: BTreeSet::new(),
+            invalid_removed_created_position: false,
             saved_merges: Vec::new(),
             uncoordinated_saved_merge: false,
             random: LegacyRandom::new(0),
@@ -472,10 +508,31 @@ impl ItemEntities {
                 .transpose()?
                 .flatten();
             let source = uuid.and_then(|uuid| saved_uuids.get(&uuid).copied());
+            let origin = entity.created.as_ref().map(|created| created.origin);
+            if let Some(origin) = origin {
+                ensure!(
+                    origin.is_finite()
+                        && origin.x.abs() <= 30_000_512.0
+                        && origin.z.abs() <= 30_000_512.0,
+                    "created item has an invalid origin"
+                );
+            }
+            let origin_chunk = origin.map(|origin| native_world::loaded::ChunkPos {
+                x: (origin.x.floor() as i32).div_euclid(16),
+                z: (origin.z.floor() as i32).div_euclid(16),
+            });
             if !positions.contains(&destination)
                 && !source.is_some_and(|pos| positions.contains(&pos))
+                && !origin_chunk.is_some_and(|pos| positions.contains(&pos))
             {
                 continue;
+            }
+            if let Some(created) = &entity.created {
+                ensure!(created.uuid.is_some(), "new item UUID is unavailable");
+                ensure!(
+                    created.thrower != CreatedThrower::Unknown,
+                    "new item thrower is unknown"
+                );
             }
             let uuid = uuid.context("new item needs coordinated creation")?;
             ensure!(seen.insert(uuid), "duplicate live item UUID");
@@ -619,6 +676,14 @@ impl ItemEntities {
             "saved item merge effects need coordinated saving"
         );
         self.validate_saved_merges(positions, saved_uuids)?;
+        ensure!(
+            !self.invalid_removed_created_position,
+            "removed created item has an invalid position"
+        );
+        ensure!(
+            self.removed_created_chunks.is_disjoint(positions),
+            "removed created item needs coordinated lifecycle saving"
+        );
         let mut seen = BTreeSet::new();
         let mut live = BTreeSet::new();
         if !self.removed_saved.is_empty() {
@@ -761,6 +826,7 @@ impl ItemEntities {
             no_gravity: saved.no_gravity,
             owner: saved.owner,
             _saved_source: Some(saved.source),
+            created: None,
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState {
@@ -798,6 +864,10 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            created: Some(CreatedItemIdentity::new(
+                position,
+                CreatedThrower::Known(None),
+            )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState::default(),
@@ -855,6 +925,7 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            created: Some(CreatedItemIdentity::new(position, CreatedThrower::Unknown)),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState::default(),
@@ -909,6 +980,7 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            created: Some(CreatedItemIdentity::new(position, CreatedThrower::Unknown)),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState::default(),
@@ -1072,6 +1144,10 @@ impl ItemEntities {
                     no_gravity: false,
                     owner: None,
                     _saved_source: None,
+                    created: Some(CreatedItemIdentity::new(
+                        location,
+                        CreatedThrower::Known(None),
+                    )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
                     _damage_state: ItemDamageState::default(),
@@ -1393,6 +1469,24 @@ impl ItemEntities {
                     entity: entity.clone(),
                 }),
         );
+        for (entity, removed) in self.entities.iter().zip(&removed) {
+            if *removed && let Some(created) = &entity.created {
+                for position in [created.origin, entity.item.position] {
+                    if !position.is_finite()
+                        || position.x.abs() > 30_000_512.0
+                        || position.z.abs() > 30_000_512.0
+                    {
+                        self.invalid_removed_created_position = true;
+                        continue;
+                    }
+                    self.removed_created_chunks
+                        .insert(native_world::loaded::ChunkPos {
+                            x: (position.x.floor() as i32).div_euclid(16),
+                            z: (position.z.floor() as i32).div_euclid(16),
+                        });
+                }
+            }
+        }
         let mut index = 0;
         self.entities.retain(|_| {
             let keep = !removed[index];
@@ -1576,6 +1670,94 @@ mod tests {
     use native_resources::packs::ResourceProvider;
 
     #[test]
+    fn created_items_keep_random_uuid_and_original_chunk_when_streamed() {
+        use native_world::loaded::ChunkPos;
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let origin = DVec3::new(0.5, 70.0, 0.5);
+        items.spawn_from_entity(origin, stack.clone());
+        items.spawn_from_entity(origin, stack);
+        let identity = items.entities[0].created.clone().unwrap();
+        let uuid = identity.uuid.expect("OS randomness is available");
+        assert_eq!((uuid[1] as u32 >> 12) & 0xf, 4);
+        assert_eq!((uuid[2] as u32 >> 30) & 0x3, 2);
+        assert_ne!(
+            identity.uuid,
+            items.entities[1].created.as_ref().unwrap().uuid
+        );
+        assert_eq!(identity.thrower, CreatedThrower::Known(None));
+        items.entities.pop();
+        items.entities[0].item.position.x = 32.5;
+        let origin_chunk = ChunkPos { x: 0, z: 0 };
+        let destination = ChunkPos { x: 2, z: 0 };
+        items.set_active_chunks(BTreeSet::from([origin_chunk]));
+        items.set_active_chunks(BTreeSet::from([destination]));
+        assert_eq!(items.entities[0].created.as_ref(), Some(&identity));
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([origin_chunk]), &Default::default())
+                .is_err()
+        );
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([destination]), &Default::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uuid_generation_does_not_change_game_random_stream() {
+        let bytes = [0xff; 16];
+        let uuid = uuid_v4(bytes);
+        assert_eq!(uuid, [-1, -45057, -1073741825, -1]);
+        let mut first = ItemEntities::default();
+        let mut second = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        first.spawn_from_entity(DVec3::ZERO, stack.clone());
+        second.spawn_from_entity(DVec3::ZERO, stack);
+        assert_eq!(first.entities[0].velocity, second.entities[0].velocity);
+        assert_eq!(first.random.next_long(), second.random.next_long());
+    }
+
+    #[test]
+    fn expired_created_item_blocks_both_affected_chunks() {
+        use native_world::loaded::ChunkPos;
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(0.5, 70.0, 0.5), stack);
+        items.entities[0].item.position.x = 32.5;
+        items.entities[0].lifetime = 5999;
+        items.tick(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            &mut Arc::new(PlayerInventory::default()),
+            |_| &[],
+            |_| 0.6,
+        );
+        assert!(items.entities.is_empty());
+        for x in [0, 2] {
+            assert!(
+                items
+                    .validate_removed_item_chunk_group(
+                        &BTreeSet::from([ChunkPos { x, z: 0 }]),
+                        &Default::default()
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            items
+                .validate_removed_item_chunk_group(
+                    &BTreeSet::from([ChunkPos { x: 1, z: 0 }]),
+                    &Default::default()
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn vanilla_damage_prototypes_and_active_tags_resolve_together() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1627,6 +1809,7 @@ mod tests {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            created: None,
             id: 0,
             section_sequence: 0,
             _damage_state: ItemDamageState::default(),
@@ -2316,6 +2499,7 @@ mod tests {
                             no_gravity: true,
                             owner: None,
                             _saved_source: None,
+                            created: None,
                             id: index as u32,
                             section_sequence: 0,
                             _damage_state: ItemDamageState::default(),
@@ -2393,6 +2577,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: index as u32,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),
@@ -2461,6 +2646,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: index as u32,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),
@@ -2542,6 +2728,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: count,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),
@@ -2595,6 +2782,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: 0,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),
@@ -2651,6 +2839,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: index as u32,
                 section_sequence: index as u64,
                 _damage_state: ItemDamageState::default(),
@@ -2695,6 +2884,7 @@ mod tests {
             no_gravity: true,
             owner: None,
             _saved_source: None,
+            created: None,
             id: 0,
             section_sequence: 4,
             _damage_state: ItemDamageState::default(),
@@ -2730,6 +2920,7 @@ mod tests {
             no_gravity: true,
             owner: None,
             _saved_source: None,
+            created: None,
             id: 0,
             section_sequence: 0,
             _damage_state: ItemDamageState::default(),
@@ -2786,6 +2977,7 @@ mod tests {
             no_gravity: true,
             owner: Some([1, 2, 3, 4]),
             _saved_source: None,
+            created: None,
             id: 0,
             section_sequence: 0,
             _damage_state: ItemDamageState::default(),
@@ -3798,6 +3990,7 @@ public class ItemMotionOracle {
                         no_gravity: true,
                         owner: None,
                         _saved_source: None,
+                        created: None,
                         id: 0,
                         section_sequence: 0,
                         _damage_state: ItemDamageState::default(),
@@ -3860,6 +4053,7 @@ public class ItemMotionOracle {
                             no_gravity: true,
                             owner: None,
                             _saved_source: None,
+                            created: None,
                             id: i as u32,
                             section_sequence: 0,
                             _damage_state: ItemDamageState::default(),
@@ -3941,6 +4135,7 @@ public class ItemMotionOracle {
                 no_gravity: case["no_gravity"].as_bool().unwrap(),
                 owner: None,
                 _saved_source: None,
+                created: None,
                 id: index as u32,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),

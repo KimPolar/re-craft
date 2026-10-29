@@ -20,7 +20,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use flate2::{Compression, write::ZlibEncoder};
+use flate2::{
+    Compression,
+    write::{GzEncoder, ZlibEncoder},
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -35,6 +38,21 @@ const HEADER_SIZE: u64 = 2 * SECTOR_SIZE;
 const REGION_SIDE: i32 = 32;
 const MAX_OFFSET: u64 = 0x00ff_ffff;
 
+fn ordinary(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// The backup contains the original region and any external chunks it references.
 #[derive(Debug)]
 pub struct RewriteResult {
@@ -42,18 +60,25 @@ pub struct RewriteResult {
     pub backup_directory: PathBuf,
 }
 
-/// The chunk portion of a future world-wide save. Every region touched by this
-/// plan is replaced in one recoverable transaction; player and level files are
-/// intentionally not implied by this type yet.
+/// A partial world save. Chunk regions and optional player data are replaced in
+/// one recoverable transaction; level, entity, POI, and other files are not
+/// implied by this type.
 #[derive(Default)]
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
+    players: Vec<PlannedPlayerData>,
 }
 
 struct PlannedChunk {
     dimension: DimensionId,
     draft: crate::edit::ChunkDraft,
     region_timestamp_seconds: u32,
+}
+
+struct PlannedPlayerData {
+    uuid_words: [i32; 4],
+    source_nbt: Vec<u8>,
+    document: crate::nbt::NamedTag,
 }
 
 impl WorldSavePlan {
@@ -85,12 +110,76 @@ impl WorldSavePlan {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Add one existing player's replacement to the same transaction as all
+    /// planned chunks. The caller must validate the player-state draft against
+    /// its captured source before adding it.
+    pub fn add_player_data(
+        &mut self,
+        uuid_words: [i32; 4],
+        source: &crate::nbt::NamedTag,
+        document: &crate::nbt::NamedTag,
+        mut validate: impl FnMut(&crate::nbt::NamedTag, &crate::nbt::NamedTag) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .players
+                .iter()
+                .any(|player| player.uuid_words == uuid_words),
+            "world save plan contains duplicate player data"
+        );
+        validate(source, document)?;
+        validate_player_document(source)?;
+        validate_player_document(document)?;
+        self.players.push(PlannedPlayerData {
+            uuid_words,
+            source_nbt: nbt::write(source)?,
+            document: document.clone(),
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct WorldSaveResult {
     pub region_paths: Vec<PathBuf>,
+    pub player_paths: Vec<PathBuf>,
     pub backup_directory: PathBuf,
+}
+
+fn validate_player_document(document: &crate::nbt::NamedTag) -> Result<()> {
+    let crate::nbt::Tag::Compound(fields) = &document.value else {
+        anyhow::bail!("player data must be an NBT compound")
+    };
+    let versions: Vec<_> = fields
+        .iter()
+        .filter(|(name, _)| name.matches("DataVersion"))
+        .collect();
+    ensure!(
+        matches!(
+            versions.as_slice(),
+            [(_, crate::nbt::Tag::Int(TARGET_DATA_VERSION))]
+        ),
+        "player data must contain one Minecraft 26.3 DataVersion"
+    );
+    nbt::write(document).context("cannot encode player data")?;
+    Ok(())
+}
+
+fn player_data_filename(uuid_words: [i32; 4]) -> String {
+    let mut bytes = [0; 16];
+    for (index, word) in uuid_words.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    let hex = format!("{:032x}", u128::from_be_bytes(bytes));
+    format!(
+        "{}-{}-{}-{}-{}.dat",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// A recoverable native save was interrupted; opening must wait for recovery.
@@ -245,18 +334,20 @@ impl WorldWriteGuard {
         )
     }
 
-    /// Write all validated chunk drafts across any number of dimensions and
-    /// region files as one recoverable transaction.
+    /// Write validated chunk drafts and optional player data as one recoverable
+    /// transaction.
     ///
-    /// This plan does not include player or level data, so a gameplay session
-    /// must not enable saving from it until those files and all cross-chunk
-    /// side effects are included by a higher-level coordinator.
+    /// Level, entity, POI, and other world data are not included, so a gameplay
+    /// session must not enable saving from this partial plan.
     pub fn write_plan(
         &mut self,
         plan: WorldSavePlan,
         mut validate_change: impl FnMut(&DimensionId, &crate::edit::BlockChange) -> Result<()>,
     ) -> Result<WorldSaveResult> {
-        ensure!(!plan.chunks.is_empty(), "world save plan is empty");
+        ensure!(
+            !plan.chunks.is_empty() || !plan.players.is_empty(),
+            "world save plan is empty"
+        );
         let mut groups = BTreeMap::<(DimensionId, i32, i32), Vec<(&PlannedChunk, Vec<u8>)>>::new();
         for chunk in &plan.chunks {
             chunk
@@ -293,9 +384,10 @@ impl WorldWriteGuard {
         let backup = tempfile::Builder::new()
             .prefix("transaction-")
             .tempdir_in(&backup_root)?;
-        let mut replacements = Vec::with_capacity(groups.len());
+        let mut replacements = Vec::with_capacity(groups.len() + plan.players.len());
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut region_paths = Vec::with_capacity(groups.len());
+        let mut player_paths = Vec::with_capacity(plan.players.len());
 
         for (group_index, ((dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
@@ -398,12 +490,78 @@ impl WorldWriteGuard {
             region_paths.push(canonical);
         }
 
+        for planned in &plan.players {
+            let mut player_directory = self.root.clone();
+            for component in ["players", "data"] {
+                player_directory.push(component);
+                let player_dir_metadata = fs::symlink_metadata(&player_directory)
+                    .context("cannot inspect player data directory")?;
+                ensure!(
+                    player_dir_metadata.is_dir() && ordinary(&player_dir_metadata),
+                    "player data path must contain ordinary directories"
+                );
+            }
+            let player_directory = player_directory.canonicalize()?;
+            ensure!(
+                player_directory.starts_with(&self.root),
+                "player data directory is outside the world"
+            );
+            let filename = player_data_filename(planned.uuid_words);
+            let player_path = player_directory.join(&filename);
+            let metadata = fs::symlink_metadata(&player_path)
+                .context("cannot inspect existing player data")?;
+            ensure!(
+                metadata.is_file() && ordinary(&metadata),
+                "player data must be an ordinary file"
+            );
+            let canonical = player_path.canonicalize()?;
+            ensure!(
+                canonical.parent() == Some(player_directory.as_path()),
+                "player data resolves outside its directory"
+            );
+            let current = nbt::read_gzip(File::open(&canonical)?)
+                .context("cannot decode current player data")?;
+            ensure!(
+                nbt::write(&current)? == planned.source_nbt,
+                "player data changed after its draft was created"
+            );
+            let original_hash = hash_file(&canonical)?;
+            let player_backup_dir = backup.path().join("players");
+            fs::create_dir_all(&player_backup_dir)?;
+            let player_backup = player_backup_dir.join(&filename);
+            copy_sync(&canonical, &player_backup)?;
+
+            let replacement = nbt::write(&planned.document)?;
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&replacement)?;
+            let compressed = gzip.finish()?;
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&player_directory)?;
+            stage.write_all(&compressed)?;
+            stage.flush()?;
+            stage.as_file().sync_all()?;
+            let staged = nbt::read_gzip(File::open(stage.path())?)?;
+            ensure!(
+                nbt::write(&staged)? == replacement,
+                "staged player data failed the NBT round-trip check"
+            );
+            replacements.push(crate::save_transaction::Replacement {
+                target: canonical.clone(),
+                backup: player_backup,
+                stage,
+                original_hash,
+            });
+            player_paths.push(canonical);
+        }
+
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated chunk backup\nregions={}\nchunks={}",
-            replacements.len(),
-            plan.chunks.len()
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nplayers={}",
+            region_paths.len(),
+            plan.chunks.len(),
+            plan.players.len()
         )?;
         note.sync_all()?;
         let backup_directory = backup.keep();
@@ -421,6 +579,7 @@ impl WorldWriteGuard {
 
         Ok(WorldSaveResult {
             region_paths,
+            player_paths,
             backup_directory,
         })
     }
@@ -1468,6 +1627,43 @@ mod tests {
     fn world_save_plan_commits_multiple_chunks_across_regions_atomically() {
         let world = test_world();
         let (region_zero, original_zero, outside) = fixture(world.path());
+        let player_data_dir = world.path().join("players/data");
+        fs::create_dir_all(&player_data_dir).unwrap();
+        let player_uuid = [0x1234_5678, 0x2345_6789, 0x3456_789a, 0x4567_89ab];
+        let player_filename = player_data_filename(player_uuid);
+        assert_eq!(player_filename, "12345678-2345-6789-3456-789a456789ab.dat");
+        let player_path = player_data_dir.join(&player_filename);
+        let player_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "Pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: vec![Tag::Double(1.0), Tag::Double(64.0), Tag::Double(2.0)],
+                    },
+                ),
+                ("unknown_player_data".into(), Tag::Long(99)),
+            ]),
+        };
+        let mut player_replacement = player_source.clone();
+        let Tag::Compound(fields) = &mut player_replacement.value else {
+            unreachable!()
+        };
+        let (_, position) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Pos"))
+            .unwrap();
+        *position = Tag::List {
+            element_type: TagType::Double,
+            values: vec![Tag::Double(8.5), Tag::Double(65.0), Tag::Double(2.5)],
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&player_source).unwrap())
+            .unwrap();
+        let original_player_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &original_player_bytes).unwrap();
         let mut source_zero = original_zero;
         let chunk_zero = editable_chunk(0);
         let chunk_one = editable_chunk(1);
@@ -1518,6 +1714,17 @@ mod tests {
             7_002,
         )
         .unwrap();
+        plan.add_player_data(
+            player_uuid,
+            &player_source,
+            &player_replacement,
+            |source, replacement| {
+                anyhow::ensure!(source == &player_source);
+                anyhow::ensure!(replacement == &player_replacement);
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(plan.chunk_count(), 3);
 
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
@@ -1537,6 +1744,24 @@ mod tests {
                 region_zero.canonicalize().unwrap(),
                 region_one.canonicalize().unwrap()
             ]
+        );
+        assert_eq!(
+            result.player_paths,
+            vec![player_path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            fs::read(
+                result
+                    .backup_directory
+                    .join("players")
+                    .join(&player_filename)
+            )
+            .unwrap(),
+            original_player_bytes
+        );
+        assert_eq!(
+            nbt::read_gzip(File::open(&player_path).unwrap()).unwrap(),
+            player_replacement
         );
         assert_eq!(
             fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
@@ -1602,6 +1827,11 @@ mod tests {
             )
             .unwrap();
         stale_plan
+            .add_player_data(player_uuid, &player_replacement, &player_source, |_, _| {
+                Ok(())
+            })
+            .unwrap();
+        stale_plan
             .add_chunk(
                 dimension,
                 block_draft(
@@ -1636,6 +1866,72 @@ mod tests {
         assert!(guard.write_plan(stale_plan, |_, _| Ok(())).is_err());
         assert_eq!(fs::read(&region_zero).unwrap(), before_failed_plan_zero);
         assert_eq!(fs::read(&region_one).unwrap(), stale_region);
+        assert_eq!(
+            nbt::read_gzip(File::open(&player_path).unwrap()).unwrap(),
+            player_replacement
+        );
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn world_save_plan_rejects_stale_player_before_replacing_chunks() {
+        let world = test_world();
+        let (region_path, mut original_region, _) = fixture(world.path());
+        let source_chunk = editable_chunk(0);
+        store_record(&mut original_region, 0, 2, &source_chunk, 1_000);
+        fs::write(&region_path, &original_region).unwrap();
+        let player_data_dir = world.path().join("players/data");
+        fs::create_dir_all(&player_data_dir).unwrap();
+        let player_uuid = [0x1234_5678, 0x2345_6789, 0x3456_789a, 0x4567_89ab];
+        let player_path = player_data_dir.join(player_data_filename(player_uuid));
+        let player_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION))]),
+        };
+        let player_replacement = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("changed".into(), Tag::Byte(1)),
+            ]),
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&player_source).unwrap())
+            .unwrap();
+        fs::write(&player_path, gzip.finish().unwrap()).unwrap();
+
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &source_chunk,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            7_000,
+        )
+        .unwrap();
+        plan.add_player_data(player_uuid, &player_source, &player_replacement, |_, _| {
+            Ok(())
+        })
+        .unwrap();
+        let mut stale_player = player_source.clone();
+        let Tag::Compound(fields) = &mut stale_player.value else {
+            unreachable!()
+        };
+        fields.push(("external_change".into(), Tag::Int(1)));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&stale_player).unwrap()).unwrap();
+        let stale_player_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &stale_player_bytes).unwrap();
+
+        let before_region = fs::read(&region_path).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path).unwrap(), before_region);
+        assert_eq!(fs::read(&player_path).unwrap(), stale_player_bytes);
         assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 

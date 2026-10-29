@@ -9,6 +9,7 @@
 //! world data can be committed in the same transaction.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -38,6 +39,57 @@ const MAX_OFFSET: u64 = 0x00ff_ffff;
 #[derive(Debug)]
 pub struct RewriteResult {
     pub region_path: PathBuf,
+    pub backup_directory: PathBuf,
+}
+
+/// The chunk portion of a future world-wide save. Every region touched by this
+/// plan is replaced in one recoverable transaction; player and level files are
+/// intentionally not implied by this type yet.
+#[derive(Default)]
+pub struct WorldSavePlan {
+    chunks: Vec<PlannedChunk>,
+}
+
+struct PlannedChunk {
+    dimension: DimensionId,
+    draft: crate::edit::ChunkDraft,
+    region_timestamp_seconds: u32,
+}
+
+impl WorldSavePlan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_chunk(
+        &mut self,
+        dimension: DimensionId,
+        draft: crate::edit::ChunkDraft,
+        region_timestamp_seconds: u32,
+    ) -> Result<()> {
+        let position = draft.position();
+        ensure!(
+            !self.chunks.iter().any(|entry| {
+                entry.dimension == dimension && entry.draft.position() == position
+            }),
+            "world save plan contains a duplicate chunk"
+        );
+        self.chunks.push(PlannedChunk {
+            dimension,
+            draft,
+            region_timestamp_seconds,
+        });
+        Ok(())
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+#[derive(Debug)]
+pub struct WorldSaveResult {
+    pub region_paths: Vec<PathBuf>,
     pub backup_directory: PathBuf,
 }
 
@@ -191,6 +243,186 @@ impl WorldWriteGuard {
             Some(&replacement),
             Some(region_timestamp_seconds),
         )
+    }
+
+    /// Write all validated chunk drafts across any number of dimensions and
+    /// region files as one recoverable transaction.
+    ///
+    /// This plan does not include player or level data, so a gameplay session
+    /// must not enable saving from it until those files and all cross-chunk
+    /// side effects are included by a higher-level coordinator.
+    pub fn write_plan(
+        &mut self,
+        plan: WorldSavePlan,
+        mut validate_change: impl FnMut(&DimensionId, &crate::edit::BlockChange) -> Result<()>,
+    ) -> Result<WorldSaveResult> {
+        ensure!(!plan.chunks.is_empty(), "world save plan is empty");
+        let mut groups = BTreeMap::<(DimensionId, i32, i32), Vec<(&PlannedChunk, Vec<u8>)>>::new();
+        for chunk in &plan.chunks {
+            chunk
+                .draft
+                .validate_for_write(|change| validate_change(&chunk.dimension, change))?;
+            let position = chunk.draft.position();
+            let replacement = nbt::write(chunk.draft.document())?;
+            groups
+                .entry((
+                    chunk.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default()
+                .push((chunk, replacement));
+        }
+
+        let backup_root = self.root.join(".minecraft-native-backups");
+        match fs::symlink_metadata(&backup_root) {
+            Ok(meta) => ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "backup directory must be an ordinary directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&backup_root)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let backup_root = backup_root.canonicalize()?;
+        ensure!(
+            backup_root.parent() == Some(self.root.as_path()),
+            "backup directory is outside the world"
+        );
+        let backup = tempfile::Builder::new()
+            .prefix("transaction-")
+            .tempdir_in(&backup_root)?;
+        let mut replacements = Vec::with_capacity(groups.len());
+        let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
+        let mut region_paths = Vec::with_capacity(groups.len());
+
+        for (group_index, ((dimension, region_x, region_z), chunks)) in
+            groups.into_iter().enumerate()
+        {
+            let region_dir = dimension
+                .region_dir(&self.root)
+                .canonicalize()
+                .context("cannot open dimension region directory")?;
+            ensure!(
+                region_dir.starts_with(&self.root),
+                "region directory is outside the world"
+            );
+            let name = format!("r.{region_x}.{region_z}.mca");
+            let region_path = region_dir.join(&name);
+            let metadata = fs::symlink_metadata(&region_path)
+                .with_context(|| format!("cannot inspect region {}", region_path.display()))?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "region must be an ordinary file"
+            );
+            let canonical = region_path.canonicalize()?;
+            ensure!(
+                canonical.parent() == Some(region_dir.as_path()),
+                "region resolves outside its directory"
+            );
+
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-region-")
+                .tempfile_in(&region_dir)?;
+            let mut original = File::open(&canonical)?;
+            let original_length = original.metadata()?.len();
+            ensure!(
+                original_length >= HEADER_SIZE
+                    && original_length.is_multiple_of(SECTOR_SIZE)
+                    && original_length / SECTOR_SIZE <= MAX_OFFSET + 1,
+                "invalid or unsupported region file length"
+            );
+            std::io::copy(&mut original, stage.as_file_mut())?;
+            stage.as_file_mut().flush()?;
+            let original_hash = hash_file(stage.path())?;
+            let external = audit_region(stage.as_file_mut(), &region_dir, region_x, region_z)?;
+
+            let group_backup = backup.path().join(format!("region-{group_index}"));
+            fs::create_dir(&group_backup)?;
+            copy_sync(&canonical, &group_backup.join(&name))?;
+            for path in &external {
+                let file_name = path.file_name().context("external chunk has no filename")?;
+                let backup_path = group_backup.join(file_name);
+                if !backup_path.exists() {
+                    copy_sync(path, &backup_path)?;
+                }
+                dependencies.insert(path.clone(), backup_path);
+            }
+
+            let mut expected_chunks = Vec::with_capacity(chunks.len());
+            for (planned, replacement) in chunks {
+                let position = planned.draft.position();
+                let original_nbt = RegionReader::open_for_region(stage.path(), region_x, region_z)?
+                    .read_chunk_nbt_bytes(position.x, position.z)?
+                    .context("cannot rewrite a missing chunk")?;
+                ensure!(
+                    planned.draft.source_nbt() == original_nbt,
+                    "chunk changed after its draft was created"
+                );
+                let source = nbt::read(&original_nbt)?;
+                validate_chunk(&source.value, position.x, position.z)?;
+                let draft = nbt::read(&replacement).context("invalid chunk draft NBT")?;
+                validate_chunk(&draft.value, position.x, position.z)?;
+                ensure!(
+                    nbt::write(&draft)? == replacement,
+                    "chunk draft cannot be reserialized without changing its bytes"
+                );
+                write_staged_chunk(
+                    stage.as_file_mut(),
+                    position.x,
+                    position.z,
+                    &replacement,
+                    planned.region_timestamp_seconds,
+                )?;
+                expected_chunks.push((position, replacement));
+            }
+            stage.as_file_mut().flush()?;
+            stage.as_file().sync_all()?;
+            for (position, expected) in expected_chunks {
+                let saved = RegionReader::open_for_region(stage.path(), region_x, region_z)?
+                    .read_chunk(position.x, position.z)?
+                    .context("staged chunk disappeared")?;
+                ensure!(
+                    nbt::write(&saved)? == expected,
+                    "staged chunk failed the NBT round-trip check"
+                );
+            }
+            drop(original);
+            replacements.push(crate::save_transaction::Replacement {
+                target: canonical.clone(),
+                backup: group_backup.join(name),
+                stage,
+                original_hash,
+            });
+            region_paths.push(canonical);
+        }
+
+        let mut note = File::create(backup.path().join("backup.txt"))?;
+        writeln!(
+            note,
+            "Minecraft Native coordinated chunk backup\nregions={}\nchunks={}",
+            replacements.len(),
+            plan.chunks.len()
+        )?;
+        note.sync_all()?;
+        let backup_directory = backup.keep();
+        let dependencies = dependencies
+            .into_iter()
+            .map(|(target, backup)| crate::save_transaction::Dependency { target, backup })
+            .collect();
+        crate::save_transaction::commit(&self.root, &backup_directory, replacements, dependencies)
+            .with_context(|| {
+                format!(
+                    "cannot atomically replace world regions; backup retained at {}",
+                    backup_directory.display()
+                )
+            })?;
+
+        Ok(WorldSaveResult {
+            region_paths,
+            backup_directory,
+        })
     }
 
     fn rewrite_chunk_data(
@@ -382,6 +614,76 @@ impl WorldWriteGuard {
             backup_directory,
         })
     }
+}
+
+fn write_staged_chunk(
+    file: &mut File,
+    chunk_x: i32,
+    chunk_z: i32,
+    encoded: &[u8],
+    timestamp_seconds: u32,
+) -> Result<()> {
+    let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
+    compressor.write_all(encoded)?;
+    let compressed = compressor.finish()?;
+    let length = compressed
+        .len()
+        .checked_add(1)
+        .context("chunk payload length overflow")?;
+    ensure!(
+        length <= u32::MAX as usize,
+        "chunk payload exceeds 32-bit length"
+    );
+    let allocation = length
+        .checked_add(4)
+        .context("chunk allocation overflow")?
+        .div_ceil(SECTOR_SIZE as usize);
+    ensure!(
+        allocation <= 255,
+        "rewritten chunk needs external storage, which is not yet supported"
+    );
+
+    let index = chunk_x.rem_euclid(REGION_SIDE) as u64
+        + chunk_z.rem_euclid(REGION_SIDE) as u64 * REGION_SIDE as u64;
+    file.seek(SeekFrom::Start(index * 4))?;
+    let mut previous_location = [0u8; 4];
+    file.read_exact(&mut previous_location)?;
+    let previous_location = u32::from_be_bytes(previous_location);
+    let previous_offset = u64::from(previous_location >> 8);
+    let previous_sectors = u64::from(previous_location & 255);
+    ensure!(
+        previous_offset >= 2 && previous_sectors > 0,
+        "cannot rewrite an absent chunk"
+    );
+    let reuse = allocation as u64 <= previous_sectors;
+    let offset = if reuse {
+        previous_offset
+    } else {
+        file.metadata()?.len() / SECTOR_SIZE
+    };
+    let sectors = if reuse {
+        previous_sectors
+    } else {
+        allocation as u64
+    };
+    ensure!(
+        offset <= MAX_OFFSET && offset + sectors <= MAX_OFFSET + 1,
+        "region has no addressable space for the rewritten chunk"
+    );
+    file.seek(SeekFrom::Start(offset * SECTOR_SIZE))?;
+    file.write_all(&(length as u32).to_be_bytes())?;
+    file.write_all(&[2])?;
+    file.write_all(&compressed)?;
+    if !reuse {
+        let padding = allocation * SECTOR_SIZE as usize - length - 4;
+        file.write_all(&vec![0; padding])?;
+    }
+    file.seek(SeekFrom::Start(index * 4))?;
+    let location = ((offset as u32) << 8) | sectors as u32;
+    file.write_all(&location.to_be_bytes())?;
+    file.seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
+    file.write_all(&timestamp_seconds.to_be_bytes())?;
+    Ok(())
 }
 
 pub(crate) fn validate_chunk(chunk: &Tag, x: i32, z: i32) -> Result<()> {
@@ -754,6 +1056,64 @@ mod tests {
         output.finish().unwrap()
     }
 
+    fn store_record(
+        region: &mut [u8],
+        slot: usize,
+        sector: usize,
+        root: &NamedTag,
+        timestamp: u32,
+    ) {
+        let bytes = compressed(root);
+        assert!(bytes.len() + 5 <= SECTOR_SIZE as usize);
+        region[slot * 4..slot * 4 + 4].copy_from_slice(&(((sector as u32) << 8) | 1).to_be_bytes());
+        region[SECTOR_SIZE as usize + slot * 4..SECTOR_SIZE as usize + slot * 4 + 4]
+            .copy_from_slice(&timestamp.to_be_bytes());
+        let start = sector * SECTOR_SIZE as usize;
+        region[start..start + 4].copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+        region[start + 4] = 2;
+        region[start + 5..start + 5 + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    fn block_draft(
+        original: &NamedTag,
+        position: ChunkPos,
+        expected: &str,
+        replacement: &str,
+    ) -> crate::edit::ChunkDraft {
+        let change = BlockChange {
+            x: position.x * 16,
+            y: 0,
+            z: position.z * 16,
+            expected: block_state(expected),
+            replacement: block_state(replacement),
+        };
+        let mut draft = draft_chunk_blocks(original, position, &[change]).unwrap();
+        draft
+            .rebuild_heightmaps(
+                HeightBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                |state| match state.name.to_string_lossy().as_ref() {
+                    "minecraft:air" => Ok(BlockHeightFlags {
+                        is_air: true,
+                        blocks_motion: false,
+                        blocks_motion_no_leaves: false,
+                        has_fluid: false,
+                    }),
+                    "minecraft:stone" | "minecraft:dirt" => Ok(BlockHeightFlags {
+                        is_air: false,
+                        blocks_motion: true,
+                        blocks_motion_no_leaves: true,
+                        has_fluid: false,
+                    }),
+                    name => anyhow::bail!("unexpected block state {name}"),
+                },
+            )
+            .unwrap();
+        draft
+    }
+
     fn fixture(root: &Path) -> (PathBuf, Vec<u8>, Vec<u8>) {
         let level = NamedTag {
             name: "".into(),
@@ -1102,6 +1462,189 @@ mod tests {
             chunk(2, "external")
         );
         assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn world_save_plan_commits_multiple_chunks_across_regions_atomically() {
+        let world = test_world();
+        let (region_zero, original_zero, outside) = fixture(world.path());
+        let mut source_zero = original_zero;
+        let chunk_zero = editable_chunk(0);
+        let chunk_one = editable_chunk(1);
+        store_record(&mut source_zero, 0, 2, &chunk_zero, 1_000);
+        store_record(&mut source_zero, 1, 3, &chunk_one, 1_001);
+        fs::write(&region_zero, &source_zero).unwrap();
+
+        let region_directory = region_zero.parent().unwrap();
+        let region_one = region_directory.join("r.1.0.mca");
+        let mut source_one = vec![0; 3 * SECTOR_SIZE as usize];
+        let chunk_thirty_two = editable_chunk(32);
+        store_record(&mut source_one, 0, 2, &chunk_thirty_two, 1_002);
+        fs::write(&region_one, &source_one).unwrap();
+        let before_zero = fs::read(&region_zero).unwrap();
+
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &chunk_zero,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            7_000,
+        )
+        .unwrap();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &chunk_one,
+                ChunkPos { x: 1, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            7_001,
+        )
+        .unwrap();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &chunk_thirty_two,
+                ChunkPos { x: 32, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            7_002,
+        )
+        .unwrap();
+        assert_eq!(plan.chunk_count(), 3);
+
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard
+            .write_plan(plan, |target_dimension, change| {
+                anyhow::ensure!(target_dimension == &dimension);
+                anyhow::ensure!(
+                    change.expected == block_state("minecraft:stone")
+                        && change.replacement == block_state("minecraft:dirt")
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            result.region_paths,
+            vec![
+                region_zero.canonicalize().unwrap(),
+                region_one.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            before_zero
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-1/r.1.0.mca")).unwrap(),
+            source_one
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/c.2.0.mcc")).unwrap(),
+            outside
+        );
+
+        let mut reader = RegionReader::open(&region_zero).unwrap();
+        for x in [0, 1] {
+            let saved = reader.read_chunk(x, 0).unwrap().unwrap();
+            let section = palette::decode_sections(&saved.value).unwrap().remove(0);
+            assert!(
+                section
+                    .blocks
+                    .unwrap()
+                    .block(0, 0, 0)
+                    .unwrap()
+                    .name
+                    .matches("minecraft:dirt")
+            );
+        }
+        assert_eq!(
+            reader.read_chunk(2, 0).unwrap().unwrap(),
+            chunk(2, "external")
+        );
+        drop(reader);
+        let mut reader = RegionReader::open(&region_one).unwrap();
+        let saved = reader.read_chunk(32, 0).unwrap().unwrap();
+        assert!(
+            palette::decode_sections(&saved.value)
+                .unwrap()
+                .remove(0)
+                .blocks
+                .unwrap()
+                .block(0, 0, 0)
+                .unwrap()
+                .name
+                .matches("minecraft:dirt")
+        );
+
+        // A stale source in a later region aborts the entire plan before any
+        // region replacement, even after earlier regions were staged.
+        let current_zero = reader_chunk(&region_zero, 0);
+        let current_thirty_two = reader_chunk(&region_one, 32);
+        let mut stale_plan = WorldSavePlan::new();
+        stale_plan
+            .add_chunk(
+                dimension.clone(),
+                block_draft(
+                    &current_zero,
+                    ChunkPos { x: 0, z: 0 },
+                    "minecraft:dirt",
+                    "minecraft:stone",
+                ),
+                8_000,
+            )
+            .unwrap();
+        stale_plan
+            .add_chunk(
+                dimension,
+                block_draft(
+                    &current_thirty_two,
+                    ChunkPos { x: 32, z: 0 },
+                    "minecraft:dirt",
+                    "minecraft:stone",
+                ),
+                8_001,
+            )
+            .unwrap();
+        let mut stale_region = fs::read(&region_one).unwrap();
+        let mut stale_chunk = current_thirty_two;
+        let Tag::Compound(fields) = &mut stale_chunk.value else {
+            unreachable!()
+        };
+        let (_, unknown) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("unknown"))
+            .unwrap();
+        let Tag::Compound(fields) = unknown else {
+            unreachable!()
+        };
+        let (_, marker) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("value"))
+            .unwrap();
+        *marker = Tag::String("stale after draft".into());
+        store_record(&mut stale_region, 0, 2, &stale_chunk, 7_002);
+        fs::write(&region_one, &stale_region).unwrap();
+        let before_failed_plan_zero = fs::read(&region_zero).unwrap();
+        assert!(guard.write_plan(stale_plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_zero).unwrap(), before_failed_plan_zero);
+        assert_eq!(fs::read(&region_one).unwrap(), stale_region);
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    fn reader_chunk(path: &Path, x: i32) -> NamedTag {
+        RegionReader::open(path)
+            .unwrap()
+            .read_chunk(x, 0)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]

@@ -15,7 +15,7 @@ use native_persistence::{
     heightmap::{BlockHeightFlags, HeightBounds},
     nbt,
     palette::BlockState,
-    save::WorldWriteGuard,
+    save::{WorldSavePlan, WorldWriteGuard},
     world::{ChunkPos, DimensionId, WorldReader},
 };
 use serde_json::Value;
@@ -480,21 +480,20 @@ fn persisted_chunk_draft_is_readable_by_java_26_3() {
         )
         .unwrap();
 
+    let dimension = DimensionId::parse("overworld").unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_chunk(dimension.clone(), draft, 1_777_777).unwrap();
     let mut writer = WorldWriteGuard::acquire(&world).unwrap();
     writer
-        .write_chunk_draft(
-            &DimensionId::parse("overworld").unwrap(),
-            &draft,
-            1_777_777,
-            |change| {
-                anyhow::ensure!(
-                    change.expected == state("minecraft:stone")
-                        && change.replacement == state("minecraft:dirt"),
-                    "unexpected block edit"
-                );
-                Ok(())
-            },
-        )
+        .write_plan(plan, |planned_dimension, change| {
+            anyhow::ensure!(planned_dimension == &dimension);
+            anyhow::ensure!(
+                change.expected == state("minecraft:stone")
+                    && change.replacement == state("minecraft:dirt"),
+                "unexpected block edit"
+            );
+            Ok(())
+        })
         .unwrap();
     drop(writer);
 

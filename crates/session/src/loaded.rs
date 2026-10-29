@@ -200,12 +200,11 @@ pub struct LoadedSession {
     sand_deferred: BTreeMap<(i128, i32, i64, u64), SandTickKey>,
     sand_deferred_revision: Option<u64>,
     sand_pending: BTreeSet<SandTickKey>,
-    sand_sequence: u64,
     button_ticks: ButtonTickQueue,
     button_deferred: ButtonTickQueue,
     button_deferred_revision: Option<u64>,
     button_pending: BTreeSet<(i32, i32, i32)>,
-    button_sequence: u64,
+    block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     falling_sand: Vec<FallingSand>,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
@@ -669,16 +668,16 @@ impl LoadedSession {
         )
     }
 
-    /// Combine block edits and supported falling-block ticks in memory only.
+    /// Combine block edits and supported block ticks in memory only.
     /// The result is not yet safe to write as a playable chunk.
-    pub fn draft_changed_chunk_with_falling_ticks(
+    pub fn draft_changed_chunk_with_block_ticks(
         &self,
         position: ChunkPos,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
-        let ticks = self.draft_falling_block_ticks(position)?;
+        let ticks = self.draft_block_ticks(position)?;
         let mut draft = self.draft_changed_chunk(position, original)?;
-        draft.replace_falling_block_ticks(&ticks)?;
+        draft.replace_block_ticks(&ticks)?;
         Ok(draft)
     }
 
@@ -690,7 +689,7 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
         let fluids = self.draft_fluid_ticks(position)?;
-        let mut draft = self.draft_changed_chunk_with_falling_ticks(position, original)?;
+        let mut draft = self.draft_changed_chunk_with_block_ticks(position, original)?;
         draft.replace_fluid_ticks(&fluids)?;
         Ok(draft)
     }
@@ -731,8 +730,8 @@ impl LoadedSession {
     }
 
     /// Combine block edits, known heightmaps, and the simulated block/fluid
-    /// schedules into one chunk draft. Lighting, block entities, POI, button
-    /// ticks, and other unsupported world effects still require separate
+    /// schedules into one chunk draft. Lighting, block entities, POI, and other
+    /// unsupported world effects still require separate
     /// validation before a playable-world write is safe.
     pub fn draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
         &self,
@@ -747,7 +746,7 @@ impl LoadedSession {
             self.dirty_chunk_positions().contains(&position),
             "chunk has no recorded block or scheduled-tick changes"
         );
-        let block_ticks = self.draft_falling_block_ticks(position)?;
+        let block_ticks = self.draft_block_ticks(position)?;
         let fluid_ticks = self.draft_fluid_ticks(position)?;
         let has_block_edits = self
             .block_edits
@@ -758,7 +757,7 @@ impl LoadedSession {
         } else {
             self.draft_unchanged_chunk(position, original)?
         };
-        draft.replace_falling_block_ticks(&block_ticks)?;
+        draft.replace_block_ticks(&block_ticks)?;
         draft.replace_fluid_ticks(&fluid_ticks)?;
         Ok(draft)
     }
@@ -1071,12 +1070,11 @@ impl LoadedSession {
             sand_deferred: BTreeMap::new(),
             sand_deferred_revision: None,
             sand_pending: BTreeSet::new(),
-            sand_sequence: 0,
             button_ticks: BTreeMap::new(),
             button_deferred: BTreeMap::new(),
             button_deferred_revision: None,
             button_pending: BTreeSet::new(),
-            button_sequence: 0,
+            block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             falling_sand: Vec::new(),
             falling_fire_tag: None,
@@ -1760,10 +1758,9 @@ impl LoadedSession {
         )
     }
 
-    /// Collect the simulated falling-block ticks for a future coordinated save.
-    /// This is not sufficient to write a chunk: other ticks, lighting, entities,
-    /// and the source region must also be validated and committed together.
-    pub fn draft_falling_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
+    /// Collect supported sand, gravel, and stone-button ticks in Java's saved
+    /// sub-tick order. This alone does not authorize writing a chunk.
+    pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
         ensure!(
             self.commands.is_empty(),
@@ -1773,43 +1770,80 @@ impl LoadedSession {
             self.fluid_chunks_seen.contains(&pos),
             "chunk ticks have not been loaded"
         );
-        ensure!(
-            !self
-                .button_ticks
-                .values()
-                .chain(self.button_deferred.values())
-                .any(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z),
-            "button ticks require coordinated saving"
-        );
         if let Some(original) = self.world.saved_block_ticks.get(&pos) {
             ensure!(
-                original
-                    .iter()
-                    .all(|tick| FallingKind::from_id(&tick.block).is_some()),
+                original.iter().all(|tick| {
+                    FallingKind::from_id(&tick.block).is_some()
+                        || matches!(
+                            tick.block.as_str(),
+                            "minecraft:stone_button" | "stone_button"
+                        )
+                }),
                 "chunk contains block ticks that are not simulated"
             );
         }
-        let mut scheduled: Vec<_> = self
+        let mut scheduled = Vec::new();
+        for (order, tick) in self
             .sand_ticks
             .iter()
             .chain(&self.sand_deferred)
             .filter(|(_, tick)| tick.x.div_euclid(16) == pos.x && tick.z.div_euclid(16) == pos.z)
-            .collect();
-        // Java packs by sub-tick order, independently of time and priority.
-        scheduled.sort_unstable_by_key(|(order, _)| (order.2, order.3));
-        scheduled
-            .into_iter()
-            .map(|(order, tick)| {
-                let delay = i32::try_from(order.0 - i128::from(self.tick))
-                    .context("falling-block tick delay cannot be represented in NBT")?;
-                Ok(SavedBlockTick {
+        {
+            let delay = i32::try_from(order.0 - i128::from(self.tick))
+                .context("block tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
                     block: tick.kind.id().into(),
                     position: [tick.x, tick.y, tick.z],
                     delay,
                     priority: order.1,
-                })
-            })
-            .collect()
+                },
+            ));
+        }
+        let mut queued_buttons = BTreeSet::new();
+        for (order, &(x, y, z)) in self
+            .button_ticks
+            .iter()
+            .chain(&self.button_deferred)
+            .filter(|(_, (x, _, z))| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+        {
+            queued_buttons.insert((x, y, z));
+            let delay = i32::try_from(order.0 - i128::from(self.tick))
+                .context("button tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: "minecraft:stone_button".into(),
+                    position: [x, y, z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.button_pending
+                .iter()
+                .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+                .all(|key| queued_buttons.contains(key)),
+            "stone-button tick is missing its scheduled order"
+        );
+        // Java packs saved ticks by sub-tick order, independently of target
+        // time and priority. The shared sequence breaks new-tick ties.
+        scheduled.sort_unstable_by_key(|(subtick, sequence, _)| (*subtick, *sequence));
+        Ok(scheduled.into_iter().map(|(_, _, tick)| tick).collect())
+    }
+
+    /// Collect only falling-block ticks for callers that need that subset.
+    /// Use `draft_block_ticks` when replacing the chunk's full saved list.
+    pub fn draft_falling_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
+        Ok(self
+            .draft_block_ticks(pos)?
+            .into_iter()
+            .filter(|tick| FallingKind::from_id(&tick.block).is_some())
+            .collect())
     }
 
     /// Collect pending ordinary water and lava ticks in Java's saved ordering.
@@ -3623,13 +3657,14 @@ impl LoadedSession {
             let subtick = i64::try_from(index).unwrap_or(i64::MAX)
                 - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
             self.sand_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             let order = (
                 i128::from(self.tick) + i128::from(tick.delay),
                 tick.priority.clamp(-3, 3),
                 subtick,
-                self.sand_sequence,
+                sequence,
             );
-            self.sand_sequence = self.sand_sequence.wrapping_add(1);
             self.sand_ticks.insert(order, key);
         }
     }
@@ -3651,13 +3686,14 @@ impl LoadedSession {
             let subtick = i64::try_from(index).unwrap_or(i64::MAX)
                 - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
             self.button_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             let order = (
                 i128::from(self.tick) + i128::from(tick.delay),
                 tick.priority.clamp(-3, 3),
                 subtick,
-                self.button_sequence,
+                sequence,
             );
-            self.button_sequence = self.button_sequence.wrapping_add(1);
             self.button_ticks.insert(order, key);
         }
     }
@@ -3671,8 +3707,8 @@ impl LoadedSession {
             return;
         }
         self.mark_tick_chunk_dirty(key.0, key.2);
-        let sequence = self.button_sequence;
-        self.button_sequence = self.button_sequence.wrapping_add(1);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.button_ticks.insert(
             (
                 i128::from(self.tick) + 20,
@@ -3808,8 +3844,8 @@ impl LoadedSession {
             return;
         }
         self.mark_tick_chunk_dirty(key.x, key.z);
-        let sequence = self.sand_sequence;
-        self.sand_sequence = self.sand_sequence.wrapping_add(1);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.sand_ticks.insert(
             (
                 i128::from(self.tick) + 2,
@@ -11297,6 +11333,42 @@ mod tests {
     }
 
     #[test]
+    fn mixed_block_tick_draft_keeps_saved_subtick_order() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session.tick = 5;
+        let position = (session.origin + IVec3::new(8, 5, 8)).to_array();
+        let source_ticks = vec![
+            SavedBlockTick {
+                block: "minecraft:stone_button".into(),
+                position,
+                delay: 7,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position,
+                delay: 2,
+                priority: -1,
+            },
+            SavedBlockTick {
+                block: "minecraft:gravel".into(),
+                position,
+                delay: 3,
+                priority: 1,
+            },
+        ];
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, source_ticks.clone());
+        session.enqueue_saved_sand(&source_ticks);
+        session.enqueue_saved_buttons(&source_ticks);
+
+        let drafted = session.draft_block_ticks(home).unwrap();
+        assert_eq!(drafted, source_ticks);
+    }
+
+    #[test]
     fn falling_tick_draft_rejects_unloaded_chunks_and_unrepresentable_delays() {
         let mut session = session();
         let home = session.player_chunk().unwrap();
@@ -13358,7 +13430,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_button_ticks_wait_for_loaded_chunks_and_prevent_partial_draft() {
+    fn saved_button_ticks_wait_for_loaded_chunks_and_are_included_in_drafts() {
         let mut session = session();
         let home = session.player_chunk().unwrap();
         let remote = ChunkPos {
@@ -13377,12 +13449,21 @@ mod tests {
             delay: 2,
             priority: 0,
         }]);
-        assert!(session.draft_falling_block_ticks(home).is_err());
+        assert_eq!(
+            session.draft_block_ticks(home).unwrap(),
+            vec![SavedBlockTick {
+                block: "minecraft:stone_button".into(),
+                position: absolute.to_array(),
+                delay: 2,
+                priority: 0,
+            }]
+        );
         session.queue_chunk_window(remote, 0);
         for _ in 0..5 {
             session.update(TICK);
         }
         assert_eq!(session.button_deferred.len(), 1);
+        assert_eq!(session.draft_block_ticks(home).unwrap()[0].delay, -3);
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert_eq!(
@@ -13394,6 +13475,7 @@ mod tests {
             "false"
         );
         assert!(session.button_ticks.is_empty() && session.button_deferred.is_empty());
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
     }
 
     #[test]

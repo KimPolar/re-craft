@@ -77,13 +77,30 @@ impl ChunkDraft {
         Ok(crate::nbt::write(current)? == self.source_nbt)
     }
 
-    /// Replace only fully understood falling-block ticks in this in-memory draft.
-    /// Other chunk data, including lighting and entities, remains unvalidated.
+    /// Replace only fully understood falling-block ticks in this draft.
+    /// Refuses a source chunk containing other block-tick kinds.
     pub fn replace_falling_block_ticks(
         &mut self,
         ticks: &[native_world::loaded::SavedBlockTick],
     ) -> Result<()> {
-        fn supported(name: &str) -> bool {
+        self.replace_block_ticks_inner(ticks, false)
+    }
+
+    /// Replace the supported falling-block and stone-button tick list.
+    /// Other chunk data, including lighting and entities, remains unvalidated.
+    pub fn replace_block_ticks(
+        &mut self,
+        ticks: &[native_world::loaded::SavedBlockTick],
+    ) -> Result<()> {
+        self.replace_block_ticks_inner(ticks, true)
+    }
+
+    fn replace_block_ticks_inner(
+        &mut self,
+        ticks: &[native_world::loaded::SavedBlockTick],
+        include_buttons: bool,
+    ) -> Result<()> {
+        let supported = |name: &str| {
             matches!(
                 name,
                 "minecraft:sand"
@@ -92,8 +109,8 @@ impl ChunkDraft {
                     | "red_sand"
                     | "minecraft:gravel"
                     | "gravel"
-            )
-        }
+            ) || (include_buttons && matches!(name, "minecraft:stone_button" | "stone_button"))
+        };
         let source = crate::nbt::read(&self.source_nbt)?;
         if let Some(list) = unique_field(&source.value, "block_ticks")? {
             let Tag::List {
@@ -663,6 +680,48 @@ mod tests {
         };
         assert!(draft.replace_falling_block_ticks(&[bad]).is_err());
         assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn block_tick_draft_preserves_button_and_falling_order() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        let ticks = [
+            native_world::loaded::SavedBlockTick {
+                block: "minecraft:stone_button".into(),
+                position: [-14, -60, 33],
+                delay: 7,
+                priority: 0,
+            },
+            native_world::loaded::SavedBlockTick {
+                block: "minecraft:gravel".into(),
+                position: [-15, -60, 33],
+                delay: 3,
+                priority: -1,
+            },
+        ];
+        draft.replace_block_ticks(&ticks).unwrap();
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_ticks") else {
+            panic!("missing ticks")
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0].get("i"),
+            Some(&Tag::String("minecraft:stone_button".into()))
+        );
+        assert_eq!(values[0].get("t"), Some(&Tag::Int(7)));
+        assert_eq!(
+            values[1].get("i"),
+            Some(&Tag::String("minecraft:gravel".into()))
+        );
+        assert_eq!(values[1].get("p"), Some(&Tag::Int(-1)));
+
+        let source_with_button = draft.document().clone();
+        let mut falling_only = draft_chunk_blocks(&source_with_button, pos, &[]).unwrap();
+        let before = crate::nbt::write(falling_only.document()).unwrap();
+        assert!(falling_only.replace_falling_block_ticks(&[]).is_err());
+        assert_eq!(crate::nbt::write(falling_only.document()).unwrap(), before);
     }
 
     #[test]

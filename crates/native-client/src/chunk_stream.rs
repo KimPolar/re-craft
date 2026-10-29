@@ -65,6 +65,9 @@ pub struct ChunkStreamer {
     respawn: Option<Window>,
     radius: u32,
     targets: Vec<ChunkPos>,
+    settled_prefix: usize,
+    #[cfg(test)]
+    skipped_target_checks: u64,
     pending: BTreeSet<ChunkPos>,
     missing: BTreeSet<ChunkPos>,
     failed: BTreeSet<ChunkPos>,
@@ -196,6 +199,9 @@ impl ChunkStreamer {
             respawn: None,
             radius: radius.max(1),
             targets: Vec::new(),
+            settled_prefix: 0,
+            #[cfg(test)]
+            skipped_target_checks: 0,
             pending: BTreeSet::new(),
             missing,
             failed: BTreeSet::new(),
@@ -216,6 +222,7 @@ impl ChunkStreamer {
             respawn,
         };
         if windows_changed {
+            self.settled_prefix = 0;
             self.center = Some(center);
             self.respawn = respawn;
             *self
@@ -329,7 +336,23 @@ impl ChunkStreamer {
                 && !self.missing.contains(pos)
         });
         if windows_changed || received || retry_due {
-            for &pos in &self.targets {
+            while let Some(&pos) = self.targets.get(self.settled_prefix) {
+                if !self.missing.contains(&pos)
+                    && !self.failed.contains(&pos)
+                    && !session.has_resident_or_parked_chunk(pos)
+                {
+                    break;
+                }
+                self.settled_prefix += 1;
+            }
+            // Entity retries can become due for already settled chunks.
+            // Rescan in the original target order only when a retry is due.
+            let start = if retry_due { 0 } else { self.settled_prefix };
+            #[cfg(test)]
+            {
+                self.skipped_target_checks += start as u64;
+            }
+            for &pos in &self.targets[start..] {
                 let retry = self
                     .entity_retry
                     .get(&pos)
@@ -790,6 +813,69 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn settled_prefix_skips_completed_chunks_but_keeps_nearest_first_order() {
+        let home = ChunkPos { x: 0, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let (reads_tx, reads_rx) = mpsc::channel();
+        let (permit_tx, permit_rx) = mpsc::channel();
+        let mut streamer =
+            ChunkStreamer::with_entity_source(6, BTreeSet::new(), move |pos, entities_only| {
+                assert!(!entities_only);
+                permit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                reads_tx.send(pos).unwrap();
+                Ok(Some(ChunkPayload {
+                    world: Some(chunk_world(pos)),
+                    entities: SavedEntityData::Empty,
+                    heightmaps: None,
+                }))
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while session.snapshot().world.loaded().unwrap().chunks.len() < 169 {
+            streamer.service(&mut session).unwrap();
+            permit_tx.send(()).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "streamer did not fill the window"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let reads: Vec<_> = reads_rx.try_iter().collect();
+        let expected: Vec<_> = targets(home, 6)
+            .into_iter()
+            .filter(|&pos| pos != home)
+            .collect();
+        assert_eq!(reads, expected, "request order changed");
+        eprintln!(
+            "skipped {} settled target checks",
+            streamer.skipped_target_checks
+        );
+        assert!(
+            streamer.skipped_target_checks > 1_000,
+            "settled targets should not be rescanned on every response"
+        );
+        assert!(streamer.settled_prefix > 100);
     }
 
     #[test]

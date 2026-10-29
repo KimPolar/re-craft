@@ -1807,12 +1807,16 @@ impl LoadedSession {
     }
 
     pub fn has_chunk_or_pending(&self, pos: ChunkPos) -> bool {
-        self.world.chunks.contains_key(&pos)
-            || self.parked_chunks.contains_key(&pos)
+        self.has_resident_or_parked_chunk(pos)
             || self
                 .incoming
                 .iter()
                 .any(|pending| pending.pos == pos && pending.world.is_some())
+    }
+
+    /// A committed chunk cannot disappear without a chunk-window change.
+    pub fn has_resident_or_parked_chunk(&self, pos: ChunkPos) -> bool {
+        self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)
     }
 
     pub fn player_chunk(&self) -> Option<ChunkPos> {

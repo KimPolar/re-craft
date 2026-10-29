@@ -32,7 +32,14 @@ impl CameraMotion {
     }
 
     /// Advance once for every simulation tick, including ticks without a frame.
-    pub fn tick(&mut self, position: DVec3, target_eye_height: f32, sprinting: bool) {
+    pub fn tick(
+        &mut self,
+        position: DVec3,
+        target_eye_height: f32,
+        sprinting: bool,
+        flying: bool,
+        effect_scale: f32,
+    ) {
         self.previous_position = self.position;
         self.position = position;
         self.previous_eye_height = self.eye_height;
@@ -43,7 +50,9 @@ impl CameraMotion {
         } else {
             0.1_f32
         };
-        let target = (movement_speed / 0.1_f32 + 1.0) / 2.0;
+        let modifier = if flying { 1.1_f32 } else { 1.0_f32 };
+        let target =
+            1.0_f32 + effect_scale * (modifier * ((movement_speed / 0.1_f32 + 1.0) / 2.0) - 1.0);
         self.fov_modifier += (target - self.fov_modifier) * 0.5;
         self.fov_modifier = self.fov_modifier.clamp(0.1, 1.5);
     }
@@ -192,7 +201,7 @@ mod tests {
     fn rebasing_preserves_both_camera_endpoints() {
         let origin = DVec3::new(16_000_000.0, 0.0, -16_000_000.0);
         let mut camera = CameraMotion::new(DVec3::new(0.125, 60.0, 15.875), 1.62);
-        camera.tick(DVec3::new(0.2, 60.25, 16.025), 1.27, false);
+        camera.tick(DVec3::new(0.2, 60.25, 16.025), 1.27, false, false, 1.0);
         let before = [0.0, 0.25, 0.5, 1.0].map(|partial| camera.eye(partial) + origin);
         let offset = DVec3::new(-16.0, 0.0, 16.0);
         camera.rebase(offset);
@@ -222,6 +231,21 @@ mod tests {
             (eye_offset - f64::from(EYE_HEIGHT + (CROUCH_EYE_HEIGHT - EYE_HEIGHT) * 0.5)).abs()
                 < 1.0e-7
         );
+    }
+
+    #[test]
+    fn flight_fov_uses_previous_tick_state_and_applies_effect_setting() {
+        let mut session = LocalSession::demo();
+        session.set_game_mode(crate::GameMode::Spectator);
+        session.update(crate::TICK);
+        assert!((session.snapshot().camera.fov_modifier(1.0) - 1.05).abs() < 1e-6);
+        session.set_fov_effect_scale(0.0);
+        session.update(crate::TICK);
+        assert!((session.snapshot().camera.fov_modifier(1.0) - 1.025).abs() < 1e-6);
+        for _ in 0..20 {
+            session.update(crate::TICK);
+        }
+        assert!((session.snapshot().camera.fov_modifier(1.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]

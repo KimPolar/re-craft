@@ -115,6 +115,8 @@ public class CameraOracle {
                 entity.setPos(position.get(0).getAsDouble(), position.get(1).getAsDouble(), position.get(2).getAsDouble());
                 entityEye.setFloat(entity, step.get("eye").getAsFloat());
                 player.speed = step.get("sprinting").getAsBoolean() ? 0.1 * 1.3 : 0.1;
+                player.abilities.flying = step.get("flying").getAsBoolean();
+                field(OptionInstance.class, "value").set(effect, Double.valueOf(step.get("effect").getAsDouble()));
                 camera.tick();
                 for (var partial : step.getAsJsonArray("partials")) {
                     align.invoke(camera, partial.getAsFloat());
@@ -203,13 +205,15 @@ fn position_and_eye_height_match_vanilla_camera() {
                 _ => 0.4_f32,
             };
             let sprinting = (scenario + tick / 4) % 3 == 0;
-            camera.tick(position, target_eye, sprinting);
+            let flying = (scenario + tick / 6) % 2 == 0;
+            let effect = [0.0_f32, 0.5, 1.0][((scenario + tick / 5) % 3) as usize];
+            camera.tick(position, target_eye, sprinting, flying, effect);
             expected.extend(
                 partials
                     .iter()
                     .map(|&partial| (camera.eye(partial), camera.fov_modifier(partial))),
             );
-            steps.push(json!({ "position": position.to_array(), "eye": target_eye, "partials": partials, "sprinting": sprinting }));
+            steps.push(json!({ "position": position.to_array(), "eye": target_eye, "partials": partials, "sprinting": sprinting, "flying": flying, "effect": effect }));
         }
         scenarios.push(json!({ "start": start.to_array(), "eye": initial_eye, "steps": steps }));
     }

@@ -83,6 +83,7 @@ const ROWS: [(Label, Option<Label>); 13] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessibilityControl {
     ViewBobbing,
+    FovEffectScale,
     GlintSpeed,
     GlintStrength,
     PanoramaSpeed,
@@ -111,6 +112,7 @@ impl AccessibilityUi {
     pub fn control_rect(&self, width: i32, control: AccessibilityControl) -> Rect {
         let (row, column) = match control {
             AccessibilityControl::ViewBobbing => (5, 1),
+            AccessibilityControl::FovEffectScale => (6, 1),
             AccessibilityControl::GlintSpeed => (8, 0),
             AccessibilityControl::GlintStrength => (8, 1),
             AccessibilityControl::PanoramaSpeed => (10, 0),
@@ -145,6 +147,7 @@ impl AccessibilityUi {
             .then(|| {
                 [
                     AccessibilityControl::ViewBobbing,
+                    AccessibilityControl::FovEffectScale,
                     AccessibilityControl::GlintSpeed,
                     AccessibilityControl::GlintStrength,
                     AccessibilityControl::PanoramaSpeed,
@@ -236,6 +239,7 @@ impl AccessibilityUi {
         }
         let target = match control {
             AccessibilityControl::GlintSpeed => &mut video.glint_speed,
+            AccessibilityControl::FovEffectScale => &mut video.fov_effect_scale,
             AccessibilityControl::GlintStrength => &mut video.glint_strength,
             AccessibilityControl::PanoramaSpeed => &mut video.panorama_speed,
             AccessibilityControl::MenuBlur => unreachable!(),
@@ -276,6 +280,7 @@ impl AccessibilityUi {
         }
         let target = match control {
             AccessibilityControl::GlintSpeed => &mut video.glint_speed,
+            AccessibilityControl::FovEffectScale => &mut video.fov_effect_scale,
             AccessibilityControl::GlintStrength => &mut video.glint_strength,
             AccessibilityControl::PanoramaSpeed => &mut video.panorama_speed,
             AccessibilityControl::MenuBlur => unreachable!(),
@@ -320,6 +325,7 @@ impl AccessibilityUi {
                 };
                 let control = match key {
                     "options.viewBobbing" => Some(AccessibilityControl::ViewBobbing),
+                    "options.fovEffectScale" => Some(AccessibilityControl::FovEffectScale),
                     "options.glintSpeed" => Some(AccessibilityControl::GlintSpeed),
                     "options.glintStrength" => Some(AccessibilityControl::GlintStrength),
                     "options.accessibility.panorama_speed" => {
@@ -352,6 +358,7 @@ impl AccessibilityUi {
                     control,
                     Some(
                         AccessibilityControl::GlintSpeed
+                            | AccessibilityControl::FovEffectScale
                             | AccessibilityControl::GlintStrength
                             | AccessibilityControl::PanoramaSpeed
                     )
@@ -359,6 +366,7 @@ impl AccessibilityUi {
                     let control = control.unwrap();
                     let value = match control {
                         AccessibilityControl::GlintSpeed => settings.glint_speed.value(),
+                        AccessibilityControl::FovEffectScale => settings.fov_effect_scale.value(),
                         AccessibilityControl::GlintStrength => settings.glint_strength.value(),
                         AccessibilityControl::PanoramaSpeed => settings.panorama_speed.value(),
                         AccessibilityControl::MenuBlur => unreachable!(),
@@ -466,6 +474,31 @@ impl AccessibilityUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fov_effect_slider_uses_vanilla_row_and_handles_drag() {
+        let mut ui = AccessibilityUi::default();
+        let mut settings = VideoSettings::default();
+        let control = AccessibilityControl::FovEffectScale;
+        let rect = ui.control_rect(426, control);
+        assert_eq!((rect.x, rect.y), (218, 187));
+        assert_eq!(
+            ui.hit_control(426, 240, (rect.x + 4, rect.y + 4)),
+            Some(control)
+        );
+        assert!(ui.start_slider(426, rect.x + 4, control, &mut settings));
+        assert_eq!(settings.fov_effect_scale.value(), 0.0);
+        assert!(ui.arrow(control, true, &mut settings));
+        assert_eq!(
+            settings.fov_effect_scale.value(),
+            f64::from(1.0_f32 / 142.0)
+        );
+        assert!(
+            ui.pointer_move_with_settings(426, 240, (rect.x + 146, rect.y), &mut settings)
+                .1
+        );
+        assert_eq!(settings.fov_effect_scale.value(), 1.0);
+    }
 
     #[test]
     fn glint_sliders_follow_mouse_keyboard_and_scroll() {

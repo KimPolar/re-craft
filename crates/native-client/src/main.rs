@@ -1409,6 +1409,7 @@ impl App {
         let now = Instant::now();
         let _ = smoke_test;
         let mut session = LocalSession::demo();
+        session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
         if let Some(recipes) = &content.recipes {
             session.set_crafting_recipes(Arc::clone(recipes));
         }
@@ -1495,12 +1496,17 @@ impl App {
     }
 
     fn apply_video(&mut self) {
+        let old_fov_effect = self.video.fov_effect_scale;
         apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
             &mut self.frame_pacer,
             self.renderer.as_mut(),
         );
+        if self.video.fov_effect_scale != old_fov_effect {
+            self.session
+                .set_fov_effect_scale(self.video.fov_effect_scale.value() as f32);
+        }
     }
 
     fn pause_action(&mut self, action: PauseAction, event_loop: &ActiveEventLoop) {
@@ -1840,16 +1846,12 @@ impl ApplicationHandler for App {
                 } else {
                     let snapshot = self.session.snapshot();
                     if self.captured && snapshot.death.is_none() && !snapshot.inventory.is_open() {
-                        if snapshot.game_mode == native_session::GameMode::Spectator {
-                            if let Some(vertical) = self.hotbar_scroll.spectator(amount) {
-                                self.session
-                                    .submit_command(PlayerCommand::AdjustFlightSpeed(vertical));
-                            }
-                        } else if let Some(slot) = self
-                            .hotbar_scroll
-                            .select(amount, snapshot.inventory.selected())
-                        {
-                            self.session.submit_command(PlayerCommand::SelectSlot(slot));
+                        if let Some(command) = self.hotbar_scroll.game_command(
+                            amount,
+                            snapshot.game_mode,
+                            snapshot.inventory.selected(),
+                        ) {
+                            self.session.submit_command(command);
                         }
                     }
                 }

@@ -368,6 +368,7 @@ pub struct LocalSession {
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
     flight: physics::FlightState,
+    fov_effect_scale: f32,
     game_mode: GameMode,
     vitals: survival::PlayerVitals,
     experience: experience::Experience,
@@ -455,6 +456,7 @@ impl LocalSession {
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,
             flight: physics::FlightState::default(),
+            fov_effect_scale: 1.0,
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
             experience: experience::Experience::default(),
@@ -513,6 +515,13 @@ impl LocalSession {
             self.flight.flying = false;
         }
         Arc::make_mut(&mut self.snapshot).game_mode = mode;
+    }
+
+    /// Visual setting applied when the camera next advances.
+    pub fn set_fov_effect_scale(&mut self, scale: f32) {
+        if scale.is_finite() {
+            self.fov_effect_scale = scale.clamp(0.0, 1.0);
+        }
     }
 
     pub fn set_player_vitals(&mut self, vitals: survival::PlayerVitals) {
@@ -741,6 +750,7 @@ impl LocalSession {
         // Java ticks the camera before ticking the player entity.
         let camera_target_eye_height = self.player.pose.eye_height();
         let camera_sprinting = self.sprint.active;
+        let camera_flying = self.flight.flying;
         self.advance_soil_ticks();
         if self.death.is_some() {
             self.process_death();
@@ -756,8 +766,13 @@ impl LocalSession {
             self.mining.release();
             self.food_use.cancel();
             self.camera.begin_bob_tick(DVec3::ZERO, false);
-            self.camera
-                .tick(self.motion.position, self.player.pose.eye_height(), false);
+            self.camera.tick(
+                self.motion.position,
+                self.player.pose.eye_height(),
+                false,
+                camera_flying,
+                self.fov_effect_scale,
+            );
             self.dropped_items.tick(
                 IVec3::ZERO,
                 self.motion.position,
@@ -1265,6 +1280,8 @@ impl LocalSession {
             self.motion.position,
             camera_target_eye_height,
             camera_sprinting,
+            camera_flying,
+            self.fov_effect_scale,
         );
         if let Some(InventoryMenu::CraftingTable { position }) = self.inventory.menu()
             && (self.world.block(position) != Block::CraftingTable

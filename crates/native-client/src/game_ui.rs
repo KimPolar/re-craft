@@ -69,6 +69,7 @@ enum PauseButton {
     Inactivity,
     Accessibility,
     ViewBobbing,
+    FovEffectScale,
     GlintSpeed,
     GlintStrength,
     PanoramaSpeed,
@@ -91,6 +92,7 @@ impl PauseButton {
     fn accessibility_control(self) -> Option<AccessibilityControl> {
         match self {
             Self::ViewBobbing => Some(AccessibilityControl::ViewBobbing),
+            Self::FovEffectScale => Some(AccessibilityControl::FovEffectScale),
             Self::GlintSpeed => Some(AccessibilityControl::GlintSpeed),
             Self::GlintStrength => Some(AccessibilityControl::GlintStrength),
             Self::PanoramaSpeed => Some(AccessibilityControl::PanoramaSpeed),
@@ -614,6 +616,7 @@ impl GameUi {
                     self.accessibility_ui.hit_control(w, h, self.cursor).map(
                         |control| match control {
                             AccessibilityControl::ViewBobbing => PauseButton::ViewBobbing,
+                            AccessibilityControl::FovEffectScale => PauseButton::FovEffectScale,
                             AccessibilityControl::GlintSpeed => PauseButton::GlintSpeed,
                             AccessibilityControl::GlintStrength => PauseButton::GlintStrength,
                             AccessibilityControl::PanoramaSpeed => PauseButton::PanoramaSpeed,
@@ -723,7 +726,8 @@ impl GameUi {
                 self.video_dirty = true;
                 PauseAction::None
             }
-            PauseButton::GlintSpeed
+            PauseButton::FovEffectScale
+            | PauseButton::GlintSpeed
             | PauseButton::GlintStrength
             | PauseButton::PanoramaSpeed
             | PauseButton::MenuBlur => {
@@ -833,6 +837,7 @@ impl GameUi {
                 | PauseButton::VideoBlur
                 | PauseButton::VideoDistance
                 | PauseButton::GlintSpeed
+                | PauseButton::FovEffectScale
                 | PauseButton::GlintStrength
                 | PauseButton::PanoramaSpeed
                 | PauseButton::MenuBlur
@@ -1037,6 +1042,7 @@ impl GameUi {
                 PausePage::Accessibility => vec![
                     PauseButton::MenuBlur,
                     PauseButton::ViewBobbing,
+                    PauseButton::FovEffectScale,
                     PauseButton::GlintSpeed,
                     PauseButton::GlintStrength,
                     PauseButton::PanoramaSpeed,
@@ -1097,6 +1103,7 @@ impl GameUi {
                 self.pause_focus,
                 Some(
                     PauseButton::GlintSpeed
+                        | PauseButton::FovEffectScale
                         | PauseButton::GlintStrength
                         | PauseButton::PanoramaSpeed
                         | PauseButton::MenuBlur
@@ -1190,6 +1197,7 @@ impl GameUi {
                     | PauseButton::Framerate
                     | PauseButton::VideoBlur
                     | PauseButton::GlintSpeed
+                    | PauseButton::FovEffectScale
                     | PauseButton::GlintStrength
                     | PauseButton::PanoramaSpeed
                     | PauseButton::MenuBlur
@@ -3392,6 +3400,13 @@ mod inventory_tests {
         assert!(ui.accessibility_ui.visible(h));
         ui.pause_key(KeyCode::Enter, false);
         assert!(!ui.video_settings().view_bobbing);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::FovEffectScale));
+        ui.pause_key(KeyCode::ArrowLeft, false);
+        assert_eq!(
+            ui.video_settings().fov_effect_scale.value(),
+            1.0 + f64::from(-1.0_f32 / 142.0)
+        );
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::GlintSpeed));
         ui.pause_key(KeyCode::ArrowLeft, false);

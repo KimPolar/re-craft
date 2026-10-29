@@ -128,8 +128,8 @@ pub fn run_play(
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
 ) -> Result<crate::GameExit> {
-    #[cfg(debug_assertions)]
     let mut session = session;
+    session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
     let snapshot = session.snapshot();
     let camera = Camera {
         eye: eye_for_scene(&snapshot, scene.origin, session.partial_tick()),
@@ -319,12 +319,19 @@ impl Viewer {
             ui.advance_video_settings(Instant::now());
         }
         let old_distance = self.video.render_distance;
+        let old_fov_effect = self.video.fov_effect_scale;
         crate::apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
             &mut self.frame_pacer,
             self.renderer.as_mut(),
         );
+        if old_fov_effect != self.video.fov_effect_scale
+            && let Some(play) = &mut self.play
+        {
+            play.session
+                .set_fov_effect_scale(self.video.fov_effect_scale.value() as f32);
+        }
         if old_distance != self.video.render_distance
             && let Some(play) = &mut self.play
         {
@@ -912,11 +919,13 @@ impl ApplicationHandler for Viewer {
                     let snapshot = play.session.snapshot();
                     if snapshot.death.is_none()
                         && !snapshot.inventory.is_open()
-                        && let Some(slot) = self
-                            .hotbar_scroll
-                            .select(amount, snapshot.inventory.selected())
+                        && let Some(command) = self.hotbar_scroll.game_command(
+                            amount,
+                            snapshot.game_mode,
+                            snapshot.inventory.selected(),
+                        )
                     {
-                        play.session.submit_command(PlayerCommand::SelectSlot(slot));
+                        play.session.submit_command(command);
                     }
                 }
             }
@@ -2026,6 +2035,8 @@ mod tests {
             crouched.player.position.as_dvec3(),
             crouched.player.pose.eye_height(),
             false,
+            false,
+            1.0,
         );
         let eye = eye_for_scene(&crouched, glam::IVec3::new(16_000_000, 0, -16_000_000), 1.0);
         assert!(

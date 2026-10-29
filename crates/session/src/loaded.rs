@@ -157,6 +157,7 @@ pub struct LoadedSession {
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
     flight: crate::physics::FlightState,
+    fov_effect_scale: f32,
     food_use: crate::survival::FoodUse,
     mining: mining::Mining,
     first_person: crate::animation::FirstPersonState,
@@ -882,6 +883,13 @@ impl LoadedSession {
         Arc::make_mut(&mut self.snapshot).game_mode = mode;
     }
 
+    /// Visual setting applied when the camera next advances.
+    pub fn set_fov_effect_scale(&mut self, scale: f32) {
+        if scale.is_finite() {
+            self.fov_effect_scale = scale.clamp(0.0, 1.0);
+        }
+    }
+
     pub fn set_game_master_permission(&mut self, allowed: bool) {
         self.mining.release();
         self.game_master_permission = allowed;
@@ -1092,6 +1100,7 @@ impl LoadedSession {
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
             flight: crate::physics::FlightState::default(),
+            fov_effect_scale: 1.0,
             food_use: crate::survival::FoodUse::default(),
             mining: mining::Mining::default(),
             first_person: crate::animation::FirstPersonState::default(),
@@ -4790,6 +4799,7 @@ impl LoadedSession {
         // Java ticks the camera before ticking the player entity.
         let camera_target_eye_height = self.player.pose.eye_height();
         let camera_sprinting = self.sprint.active;
+        let camera_flying = self.flight.flying;
         self.apply_streaming();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
@@ -4828,8 +4838,13 @@ impl LoadedSession {
             self.mining.release();
             self.food_use.cancel();
             self.camera.begin_bob_tick(DVec3::ZERO, false);
-            self.camera
-                .tick(self.motion.position, self.player.pose.eye_height(), false);
+            self.camera.tick(
+                self.motion.position,
+                self.player.pose.eye_height(),
+                false,
+                camera_flying,
+                self.fov_effect_scale,
+            );
             let world = &self.world;
             let shapes = &self.shapes;
             let origin = self.origin;
@@ -5607,6 +5622,8 @@ impl LoadedSession {
             self.motion.position,
             camera_target_eye_height,
             camera_sprinting,
+            camera_flying,
+            self.fov_effect_scale,
         );
         if let Some(InventoryMenu::CraftingTable { position }) = self.inventory.menu() {
             let relative = subtract(position, self.origin);

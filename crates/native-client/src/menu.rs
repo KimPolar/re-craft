@@ -80,6 +80,7 @@ enum ButtonId {
     VideoDistance,
     Accessibility,
     ViewBobbing,
+    FovEffectScale,
     GlintSpeed,
     GlintStrength,
     PanoramaSpeed,
@@ -126,6 +127,7 @@ impl ButtonId {
     fn accessibility_control(self) -> Option<AccessibilityControl> {
         match self {
             Self::ViewBobbing => Some(AccessibilityControl::ViewBobbing),
+            Self::FovEffectScale => Some(AccessibilityControl::FovEffectScale),
             Self::GlintSpeed => Some(AccessibilityControl::GlintSpeed),
             Self::GlintStrength => Some(AccessibilityControl::GlintStrength),
             Self::PanoramaSpeed => Some(AccessibilityControl::PanoramaSpeed),
@@ -1569,6 +1571,7 @@ impl<'a> Menu<'a> {
                 for id in [
                     ButtonId::MenuBlur,
                     ButtonId::ViewBobbing,
+                    ButtonId::FovEffectScale,
                     ButtonId::GlintSpeed,
                     ButtonId::GlintStrength,
                     ButtonId::PanoramaSpeed,
@@ -1756,7 +1759,8 @@ impl<'a> Menu<'a> {
                 self.state.video.view_bobbing = !self.state.video.view_bobbing;
                 self.state.video_dirty = true;
             }
-            ButtonId::GlintSpeed
+            ButtonId::FovEffectScale
+            | ButtonId::GlintSpeed
             | ButtonId::GlintStrength
             | ButtonId::PanoramaSpeed
             | ButtonId::MenuBlur => {
@@ -1926,6 +1930,7 @@ impl<'a> Menu<'a> {
         #[cfg(not(debug_assertions))]
         let keep_focus = false;
         if !keep_focus
+            && id.accessibility_control().is_none()
             && !matches!(
                 id,
                 ButtonId::VideoFps
@@ -2800,6 +2805,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::OptionsFov
+                                | ButtonId::FovEffectScale
                                 | ButtonId::GlintSpeed
                                 | ButtonId::GlintStrength
                                 | ButtonId::PanoramaSpeed
@@ -2818,6 +2824,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
                                 | ButtonId::ViewBobbing
+                                | ButtonId::FovEffectScale
                                 | ButtonId::GlintSpeed
                                 | ButtonId::GlintStrength
                                 | ButtonId::PanoramaSpeed
@@ -3140,6 +3147,7 @@ impl ApplicationHandler for Menu<'_> {
                             self.focused,
                             Some(
                                 ButtonId::GlintSpeed
+                                    | ButtonId::FovEffectScale
                                     | ButtonId::GlintStrength
                                     | ButtonId::PanoramaSpeed
                                     | ButtonId::MenuBlur
@@ -3176,6 +3184,7 @@ impl ApplicationHandler for Menu<'_> {
                         } else if matches!(
                             id,
                             ButtonId::GlintSpeed
+                                | ButtonId::FovEffectScale
                                 | ButtonId::GlintStrength
                                 | ButtonId::PanoramaSpeed
                                 | ButtonId::MenuBlur
@@ -4379,6 +4388,11 @@ mod tests {
                 let (_, height) = self.menu.logical_size();
                 self.menu
                     .accessibility_ui
+                    .ensure_control_visible(height, AccessibilityControl::FovEffectScale);
+                click(&mut self.menu, event_loop, ButtonId::FovEffectScale, false);
+                assert_eq!(self.menu.state.video.fov_effect_scale.value(), 0.5);
+                self.menu
+                    .accessibility_ui
                     .ensure_control_visible(height, AccessibilityControl::MenuBlur);
                 click(&mut self.menu, event_loop, ButtonId::MenuBlur, false);
                 assert_eq!(self.menu.state.video.menu_blur, 5);
@@ -4400,6 +4414,7 @@ mod tests {
                 let saved: Settings =
                     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
                 assert!(!saved.video.view_bobbing);
+                assert_eq!(saved.video.fov_effect_scale.value(), 0.5);
                 assert_eq!(saved.video.glint_speed.value(), 1.0);
                 assert_eq!(saved.video.glint_strength.value(), 0.5);
                 assert_eq!(saved.video.panorama_speed.value(), 0.5);

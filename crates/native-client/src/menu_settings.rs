@@ -225,6 +225,7 @@ pub struct VideoSettings {
     pub fov: u16,
     /// Walking camera motion, controlled by the accessibility screen.
     pub view_bobbing: bool,
+    pub fov_effect_scale: UnitInterval,
     pub glint_speed: UnitInterval,
     pub glint_strength: UnitInterval,
     pub panorama_speed: UnitInterval,
@@ -263,6 +264,7 @@ impl Default for VideoSettings {
             max_fps: 120,
             fov: 70,
             view_bobbing: true,
+            fov_effect_scale: UnitInterval::new(1.0),
             glint_speed: UnitInterval::new(0.5),
             glint_strength: UnitInterval::new(0.75),
             panorama_speed: UnitInterval::new(1.0),
@@ -296,6 +298,7 @@ impl VideoSettings {
                 70
             },
             glint_speed: self.glint_speed.valid_or(0.5),
+            fov_effect_scale: self.fov_effect_scale.valid_or(1.0),
             glint_strength: self.glint_strength.valid_or(0.75),
             panorama_speed: self.panorama_speed.valid_or(1.0),
             mouse_sensitivity: self.mouse_sensitivity.valid_or(0.5),
@@ -643,6 +646,7 @@ mod tests {
             glint_speed: UnitInterval::new(37.0 / 142.0),
             glint_strength: UnitInterval::new(0.0),
             panorama_speed: UnitInterval::new(0.25),
+            fov_effect_scale: UnitInterval::new(0.4),
             ..VideoSettings::default()
         };
         let data = serde_json::to_vec(&video).unwrap();
@@ -652,13 +656,15 @@ mod tests {
         assert_eq!(value["glint_speed"].as_f64().unwrap(), 37.0 / 142.0);
         assert_eq!(value["glint_strength"], 0.0);
         assert_eq!(value["panorama_speed"], 0.25);
+        assert_eq!(value["fov_effect_scale"], 0.4);
         let invalid: VideoSettings = serde_json::from_str(
-            r#"{"glint_speed":1.5,"glint_strength":-1.0,"panorama_speed":2.0}"#,
+            r#"{"glint_speed":1.5,"glint_strength":-1.0,"panorama_speed":2.0,"fov_effect_scale":-1.0}"#,
         )
         .unwrap();
         assert_eq!(invalid.valid().glint_speed.value(), 0.5);
         assert_eq!(invalid.valid().glint_strength.value(), 0.75);
         assert_eq!(invalid.valid().panorama_speed.value(), 1.0);
+        assert_eq!(invalid.valid().fov_effect_scale.value(), 1.0);
     }
 
     #[test]

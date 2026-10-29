@@ -60,6 +60,21 @@ impl HotbarScroll {
         (x != 0 || y != 0).then_some(y)
     }
 
+    pub fn game_command(
+        &mut self,
+        delta: (f64, f64),
+        mode: native_session::GameMode,
+        selected: u8,
+    ) -> Option<native_session::PlayerCommand> {
+        if mode == native_session::GameMode::Spectator {
+            self.spectator(delta)
+                .map(native_session::PlayerCommand::AdjustFlightSpeed)
+        } else {
+            self.select(delta, selected)
+                .map(native_session::PlayerCommand::SelectSlot)
+        }
+    }
+
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.remainder_x = 0.0;
@@ -135,6 +150,23 @@ mod tests {
         assert_eq!(scroll.spectator((0.0, 0.7)), Some(1));
         assert_eq!(scroll.spectator((-0.4, -0.2)), None);
         assert_eq!(scroll.spectator((-0.7, -0.8)), Some(-1));
+    }
+
+    #[test]
+    fn shared_game_wheel_routes_spectator_and_hotbar_actions() {
+        let mut scroll = HotbarScroll::default();
+        assert!(matches!(
+            scroll.game_command((0.0, 1.0), native_session::GameMode::Spectator, 4),
+            Some(native_session::PlayerCommand::AdjustFlightSpeed(1))
+        ));
+        assert!(matches!(
+            scroll.game_command((1.0, 0.0), native_session::GameMode::Spectator, 4),
+            Some(native_session::PlayerCommand::AdjustFlightSpeed(0))
+        ));
+        assert!(matches!(
+            scroll.game_command((0.0, -1.0), native_session::GameMode::Creative, 4),
+            Some(native_session::PlayerCommand::SelectSlot(5))
+        ));
     }
 
     #[test]

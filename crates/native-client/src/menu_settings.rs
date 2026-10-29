@@ -268,30 +268,44 @@ pub fn save_sound(sound: SoundSettings) -> Result<()> {
 }
 
 fn save_sound_to(path: &Path, sound: SoundSettings) -> Result<()> {
-    let mut data: serde_json::Value = match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("Cannot read existing settings")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(error).context("Cannot read existing settings"),
-    };
-    data.as_object_mut()
-        .context("Settings must be a JSON object")?
-        .insert("sound".into(), serde_json::to_value(sound)?);
-    let parent = path.parent().context("settings path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    std::fs::write(path, serde_json::to_vec_pretty(&data)?)
-        .with_context(|| format!("Cannot save settings to {}", path.display()))
+    update_settings(path, serde_json::json!({ "sound": sound }))
 }
 
 fn save_video_to(path: &Path, video: VideoSettings) -> Result<()> {
+    update_settings(path, serde_json::json!({ "video": video }))
+}
+
+/// Preserve fields from newer versions, including fields inside settings groups.
+/// Do not replace a malformed or incompatible file with default settings.
+fn update_settings(path: &Path, patch: serde_json::Value) -> Result<()> {
     let mut data: serde_json::Value = match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("Cannot read existing settings")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(error) => return Err(error).context("Cannot read existing settings"),
     };
-    let object = data
-        .as_object_mut()
-        .context("Settings must be a JSON object")?;
-    object.insert("video".into(), serde_json::to_value(video)?);
+    // Refuse to save defaults over known fields whose type this version cannot
+    // read. Unknown fields are retained by the merge below.
+    serde_json::from_value::<Settings>(data.clone()).context("Cannot read existing settings")?;
+    fn merge(target: &mut serde_json::Value, patch: serde_json::Value) -> Result<()> {
+        let target = target
+            .as_object_mut()
+            .context("Settings group must be a JSON object")?;
+        let serde_json::Value::Object(patch) = patch else {
+            anyhow::bail!("Settings update must be a JSON object");
+        };
+        for (key, value) in patch {
+            if value.is_object()
+                && let Some(existing) = target.get_mut(&key)
+            {
+                merge(existing, value)
+                    .with_context(|| format!("Cannot update settings group {key}"))?;
+            } else {
+                target.insert(key, value);
+            }
+        }
+        Ok(())
+    }
+    merge(&mut data, patch)?;
     let parent = path.parent().context("settings path has no parent")?;
     std::fs::create_dir_all(parent)?;
     std::fs::write(path, serde_json::to_vec_pretty(&data)?)
@@ -299,16 +313,65 @@ fn save_video_to(path: &Path, video: VideoSettings) -> Result<()> {
 }
 
 pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
-    let parent = path.parent().context("settings path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let bytes = serde_json::to_vec_pretty(settings)?;
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Cannot save settings to {}", path.display()))
+    update_settings(path, serde_json::to_value(settings)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_save_paths_preserve_unknown_fields_and_reject_invalid_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.json");
+        let original = serde_json::json!({
+            "future_setting": {"nested": 42},
+            "video": {"future_video": {"mode": "new"}},
+            "sound": {"future_sound": true}
+        });
+        for method in 0..3 {
+            std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            match method {
+                0 => save_to(&path, &Settings::default()),
+                1 => save_video_to(&path, VideoSettings::default()),
+                _ => save_sound_to(&path, SoundSettings::default()),
+            }
+            .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["future_setting"], original["future_setting"]);
+            assert_eq!(
+                saved["video"]["future_video"],
+                original["video"]["future_video"]
+            );
+            assert_eq!(
+                saved["sound"]["future_sound"],
+                original["sound"]["future_sound"]
+            );
+        }
+        for method in 0..3 {
+            let wrong_group = if method == 2 {
+                br#"{"sound":7}"#.as_slice()
+            } else {
+                br#"{"video":7}"#.as_slice()
+            };
+            for bytes in [
+                b"{broken".as_slice(),
+                b"[]",
+                wrong_group,
+                br#"{"video":{"fov":"invalid"}}"#,
+            ] {
+                std::fs::write(&path, bytes).unwrap();
+                let result = match method {
+                    0 => save_to(&path, &Settings::default()),
+                    1 => save_video_to(&path, VideoSettings::default()),
+                    _ => save_sound_to(&path, SoundSettings::default()),
+                };
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
 
     #[test]
     fn selected_location_and_pack_paths_round_trip() {

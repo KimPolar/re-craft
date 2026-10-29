@@ -1735,8 +1735,8 @@ impl LoadedSession {
     }
 
     /// Prepare a group of known entity chunks including transfers into empty
-    /// chunks, including known non-merge removals of saved items. This does not
-    /// enable a world write: creation and other effects remain prerequisites.
+    /// chunks, including supported saved-item merges and removals. This does
+    /// not enable a world write: creation and other effects remain prerequisites.
     pub fn draft_existing_entity_chunks(
         &self,
         positions: &std::collections::BTreeSet<ChunkPos>,
@@ -7612,6 +7612,78 @@ mod tests {
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert!(session.snapshot().dropped_items.is_empty());
+    }
+
+    #[test]
+    fn saved_item_merge_is_reflected_in_the_entity_chunk_draft() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 2.0, 3.5);
+        let make_item = |uuid: [i32; 4], count: i32| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:item".into())),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                (
+                    "Pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: position.to_array().into_iter().map(Tag::Double).collect(),
+                    },
+                ),
+                ("NoGravity".into(), Tag::Byte(1)),
+                ("future".into(), Tag::Int(42)),
+                (
+                    "Item".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:stone".into())),
+                        ("count".into(), Tag::Int(count)),
+                    ]),
+                ),
+            ])
+        };
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![make_item([1, 2, 3, 4], 1), make_item([5, 6, 7, 8], 2)],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::clone(&document),
+                })),
+            )
+            .unwrap();
+        for _ in 0..40 {
+            session.update(TICK);
+        }
+        assert_eq!(session.snapshot().dropped_items.len(), 1);
+        assert_eq!(session.snapshot().dropped_items[0].stack.count(), 3);
+        let drafts = session
+            .draft_existing_entity_chunks(&BTreeSet::from([home]))
+            .unwrap();
+        let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        let saved = crate::saved_item::read(&values[0]).unwrap().unwrap();
+        assert_eq!(saved.stack.count(), 3);
+        assert_eq!(saved.source.get("future"), Some(&Tag::Int(42)));
+        assert!(drafts[&home].matches_source(&document).unwrap());
     }
 
     #[test]

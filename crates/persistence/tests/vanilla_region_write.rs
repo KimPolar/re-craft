@@ -139,6 +139,26 @@ public class RegionWriteOracle {
                     throw new AssertionError("Java could not read the rebuilt heightmap");
             }
             System.out.println("OK");
+        } else if (args[0].equals("seedItemMerge")) {
+            Files.createDirectories(dir);
+            Path entities=world.resolve("dimensions/minecraft/overworld/entities"); Files.createDirectories(entities);
+            var level=new CompoundTag(); var data=new CompoundTag(); data.putInt("DataVersion",5023); level.put("Data",data); NbtIo.writeCompressed(level,world.resolve("level.dat"));
+            var list=new ListTag();
+            for (int i=0;i<2;i++) {
+                var item=new CompoundTag(); item.putString("id","minecraft:item"); item.putIntArray("UUID", i==0 ? new int[]{1,2,3,4} : new int[]{5,6,7,8}); item.putLong("future",i+10);
+                var pos=new ListTag(); pos.add(DoubleTag.valueOf(1.5)); pos.add(DoubleTag.valueOf(2)); pos.add(DoubleTag.valueOf(3)); item.put("Pos",pos);
+                var stack=new CompoundTag(); stack.putString("id","minecraft:stone"); stack.putInt("count",i+1); item.put("Item",stack); list.add(item);
+            }
+            var chunk=new CompoundTag(); chunk.putInt("DataVersion",5023); chunk.putIntArray("Position",new int[]{0,0}); chunk.putLong("future_chunk",17); chunk.put("Entities",list);
+            try (var region=open(entities); var out=region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk,(DataOutput)out); }
+            System.out.println("OK");
+        } else if (args[0].equals("verifyItemMerge")) {
+            Path entities=world.resolve("dimensions/minecraft/overworld/entities");
+            try (var region=open(entities); var in=region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                var chunk=NbtIo.read((DataInput)in); var list=chunk.getListOrEmpty("Entities"); var item=list.getCompoundOrEmpty(0);
+                if (chunk.getLongOr("future_chunk",0)!=17 || list.size()!=1 || !Arrays.equals(item.getIntArray("UUID").orElseThrow(),new int[]{5,6,7,8}) || item.getLongOr("future",0)!=11 || item.getCompoundOrEmpty("Item").getIntOr("count",0)!=3) throw new AssertionError("item merge save");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("seedItemRemoval")) {
             Files.createDirectories(dir);
             Path entities=world.resolve("dimensions/minecraft/overworld/entities"); Files.createDirectories(entities);
@@ -426,6 +446,112 @@ fn removed_saved_item_is_absent_when_java_reads_entity_region() {
     guard.write_plan(plan, |_, _| Ok(())).unwrap();
     drop(guard);
     assert!(invoke("verifyItemRemoval").lines().any(|line| line == "OK"));
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn merged_saved_items_round_trip_through_java_region() {
+    use native_persistence::nbt::{NamedTag, Tag};
+    use native_session::{
+        inventory::ItemStack,
+        saved_falling_block::{self, EntityReplacement},
+        saved_item,
+    };
+    use native_world::loaded::ChunkPos as RuntimeChunkPos;
+    use std::collections::BTreeMap;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-item-merge-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seedItemMerge").lines().any(|line| line == "OK"));
+    let path = world.join("dimensions/minecraft/overworld/entities/r.0.0.mca");
+    let original = RegionReader::open(&path)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let Some(Tag::List { values, .. }) = original.value.get("Entities") else {
+        panic!()
+    };
+    let draft = |index: usize, count: u32| {
+        let entity = NamedTag {
+            name: "".into(),
+            value: values[index].clone(),
+        };
+        let saved = saved_item::read(&entity.value).unwrap().unwrap();
+        let stack = ItemStack::new(
+            saved.stack.id().into(),
+            count,
+            64,
+            saved.stack.components().clone(),
+        )
+        .unwrap();
+        saved_item::draft(
+            &entity,
+            saved_item::ItemSaveState {
+                position: saved.position,
+                velocity: saved.velocity,
+                on_ground: saved.on_ground,
+                no_gravity: saved.no_gravity,
+                age: saved.age,
+                pickup_delay: saved.pickup_delay,
+                health: saved.health,
+                fire_ticks: saved.fire_ticks,
+                invulnerable: saved.invulnerable,
+                invulnerable_time: saved.invulnerable_time,
+                stack: &stack,
+            },
+        )
+        .unwrap()
+    };
+    let removal = draft(0, 1);
+    let survivor = draft(1, 3);
+    let pos = RuntimeChunkPos { x: 0, z: 0 };
+    let drafts = saved_falling_block::draft_entity_chunks_with_removals(
+        &BTreeMap::from([(pos, Some(&original))]),
+        &[EntityReplacement::Item(&survivor)],
+        &[removal],
+    )
+    .unwrap();
+    let mut plan = WorldSavePlan::new();
+    drafts[&pos]
+        .add_to_save_plan(
+            &mut plan,
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&original),
+            101,
+        )
+        .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert!(invoke("verifyItemMerge").lines().any(|line| line == "OK"));
 }
 
 fn exercise_entity_chunk_drafts(new_region: bool) {

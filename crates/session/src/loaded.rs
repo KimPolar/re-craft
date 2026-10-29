@@ -169,6 +169,8 @@ pub struct LoadedSession {
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
+    tick_dirty_chunks: BTreeSet<ChunkPos>,
+    tick_chunks_needing_dirty: BTreeSet<ChunkPos>,
     block_edits: BTreeMap<ChunkPos, BTreeMap<(i32, i32, i32), RecordedBlockEdit>>,
     parked_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
     entity_chunks: BTreeMap<ChunkPos, SavedEntityData>,
@@ -728,6 +730,98 @@ impl LoadedSession {
         Ok(draft)
     }
 
+    /// Combine block edits, known heightmaps, and the simulated block/fluid
+    /// schedules into one chunk draft. Lighting, block entities, POI, button
+    /// ticks, and other unsupported world effects still require separate
+    /// validation before a playable-world write is safe.
+    pub fn draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        tags: &native_resources::heightmap_tags::HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        anyhow::ensure!(
+            self.dirty_chunk_positions().contains(&position),
+            "chunk has no recorded block or scheduled-tick changes"
+        );
+        let block_ticks = self.draft_falling_block_ticks(position)?;
+        let fluid_ticks = self.draft_fluid_ticks(position)?;
+        let has_block_edits = self
+            .block_edits
+            .get(&position)
+            .is_some_and(|edits| !edits.is_empty());
+        let mut draft = if has_block_edits {
+            self.draft_changed_chunk_with_heightmaps(position, original, tags, air_and_fluid)?
+        } else {
+            self.draft_unchanged_chunk(position, original)?
+        };
+        draft.replace_falling_block_ticks(&block_ticks)?;
+        draft.replace_fluid_ticks(&fluid_ticks)?;
+        Ok(draft)
+    }
+
+    fn draft_unchanged_chunk(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
+        );
+        let chunk = self
+            .world
+            .chunks
+            .get(&position)
+            .or_else(|| self.parked_chunks.get(&position))
+            .context("dirty chunk is no longer available")?;
+        ensure!(
+            chunk.position == position,
+            "dirty chunk position does not match its key"
+        );
+        native_persistence::edit::draft_chunk_blocks(
+            original,
+            native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            &[],
+        )
+    }
+
+    /// Chunks whose block or currently modeled scheduled-tick data changed.
+    /// The set is retained until a coordinated world save acknowledges it.
+    pub fn dirty_chunk_positions(&self) -> BTreeSet<ChunkPos> {
+        self.dirty_chunks
+            .union(&self.tick_dirty_chunks)
+            .copied()
+            .collect()
+    }
+
+    fn mark_tick_chunk_dirty(&mut self, x: i32, z: i32) {
+        self.tick_dirty_chunks.insert(ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        });
+    }
+
+    /// The first world tick changes the serialized delay of saved schedules.
+    /// Track only chunks whose original scheduled ticks have not advanced yet.
+    fn mark_advanced_saved_tick_chunks_dirty(&mut self) {
+        self.tick_dirty_chunks
+            .append(&mut self.tick_chunks_needing_dirty);
+    }
+
+    fn has_unsaved_chunk_changes(&self, position: ChunkPos) -> bool {
+        self.dirty_chunks.contains(&position)
+            || self.tick_dirty_chunks.contains(&position)
+            || self.tick_chunks_needing_dirty.contains(&position)
+    }
+
     pub fn set_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
@@ -946,6 +1040,8 @@ impl LoadedSession {
             snapshot,
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
+            tick_dirty_chunks: BTreeSet::new(),
+            tick_chunks_needing_dirty: BTreeSet::new(),
             block_edits: BTreeMap::new(),
             parked_chunks: BTreeMap::new(),
             entity_chunks: BTreeMap::new(),
@@ -2519,13 +2615,18 @@ impl LoadedSession {
                 .any(|pos| !within_window(*pos, window));
             if !outside.is_empty() || !restore.is_empty() || old_missing {
                 let mut restored_ticks = Vec::new();
+                let unsaved: BTreeSet<_> = outside
+                    .iter()
+                    .copied()
+                    .filter(|pos| self.has_unsaved_chunk_changes(*pos))
+                    .collect();
                 let world = Arc::make_mut(&mut self.world);
                 for pos in outside {
                     let chunk = world
                         .chunks
                         .remove(&pos)
                         .expect("resident chunk was checked");
-                    if self.dirty_chunks.contains(&pos)
+                    if unsaved.contains(&pos)
                         || self
                             .respawn_window
                             .is_some_and(|extra| within_window(pos, extra))
@@ -2583,7 +2684,7 @@ impl LoadedSession {
             .keys()
             .copied()
             .filter(|pos| {
-                !self.dirty_chunks.contains(pos)
+                !self.has_unsaved_chunk_changes(*pos)
                     && !self
                         .respawn_window
                         .is_some_and(|window| within_window(*pos, window))
@@ -3432,6 +3533,9 @@ impl LoadedSession {
             kind: state.kind,
             source: state.source,
         };
+        if !self.fluid_pending.contains(&key) {
+            self.mark_tick_chunk_dirty(key.x, key.z);
+        }
         let subtick = i64::try_from(self.fluid_sequence).unwrap_or(i64::MAX);
         self.insert_fluid_tick(key, i128::from(self.tick) + i128::from(delay), 0, subtick);
     }
@@ -3469,6 +3573,7 @@ impl LoadedSession {
                 }
             };
             let [x, y, z] = tick.position;
+            self.tick_chunks_needing_dirty.insert(chunk);
             let key = FluidTickKey {
                 x,
                 y,
@@ -3503,6 +3608,10 @@ impl LoadedSession {
             };
             let [x, y, z] = tick.position;
             let key = SandTickKey { x, y, z, kind };
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
             let subtick = i64::try_from(index).unwrap_or(i64::MAX)
                 - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
             self.sand_pending.insert(key);
@@ -3527,6 +3636,10 @@ impl LoadedSession {
             }
             let [x, y, z] = tick.position;
             let key = (x, y, z);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
             let subtick = i64::try_from(index).unwrap_or(i64::MAX)
                 - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
             self.button_pending.insert(key);
@@ -3549,6 +3662,7 @@ impl LoadedSession {
         if !self.button_pending.insert(key) {
             return;
         }
+        self.mark_tick_chunk_dirty(key.0, key.2);
         let sequence = self.button_sequence;
         self.button_sequence = self.button_sequence.wrapping_add(1);
         self.button_ticks.insert(
@@ -3661,6 +3775,7 @@ impl LoadedSession {
                 deferred.push((order, key));
                 continue;
             }
+            self.mark_tick_chunk_dirty(key.0, key.2);
             self.button_pending.remove(&key);
             executed += 1;
             if self.set_stone_button_power(relative, false) {
@@ -3684,6 +3799,7 @@ impl LoadedSession {
         if !self.sand_pending.insert(key) {
             return;
         }
+        self.mark_tick_chunk_dirty(key.x, key.z);
         let sequence = self.sand_sequence;
         self.sand_sequence = self.sand_sequence.wrapping_add(1);
         self.sand_ticks.insert(
@@ -3742,6 +3858,7 @@ impl LoadedSession {
                 deferred.push((order, key));
                 continue;
             };
+            self.mark_tick_chunk_dirty(key.x, key.z);
             let name = key.kind.id();
             if self.world.state(id).is_none_or(|state| state.name != name) {
                 self.sand_pending.remove(&key);
@@ -4295,6 +4412,7 @@ impl LoadedSession {
                 unloaded.push((order, scheduled));
                 continue;
             };
+            self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             self.fluid_pending.remove(&scheduled.key);
             executed += 1;
             let Some(fluid) = self.ordinary_fluid(id) else {
@@ -4373,6 +4491,7 @@ impl LoadedSession {
                 match self.respawn_at_saved_position() {
                     Ok(true) => {
                         self.tick += 1;
+                        self.mark_advanced_saved_tick_chunks_dirty();
                         return;
                     }
                     Ok(false) => {}
@@ -4437,6 +4556,7 @@ impl LoadedSession {
             );
             self.tick_experience_orbs(false);
             self.tick += 1;
+            self.mark_advanced_saved_tick_chunks_dirty();
             return;
         }
         while let Some(command) = self.commands.pop_front() {
@@ -5182,6 +5302,7 @@ impl LoadedSession {
             self.refresh_respawn_availability();
         }
         self.tick += 1;
+        self.mark_advanced_saved_tick_chunks_dirty();
     }
 
     fn tick_experience_orbs(&mut self, alive: bool) {
@@ -9090,7 +9211,9 @@ mod tests {
                     "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                         | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
                 ) {
-                    Ok(vec![br#"{"values":["minecraft:stone"]}"#.to_vec()])
+                    Ok(vec![
+                        br#"{"values":["minecraft:stone","minecraft:sand"]}"#.to_vec(),
+                    ])
                 } else {
                     Ok(Vec::new())
                 }
@@ -9098,6 +9221,7 @@ mod tests {
         }
         let registry = std::collections::BTreeSet::from([
             "minecraft:air".to_owned(),
+            "minecraft:sand".to_owned(),
             "minecraft:stone".to_owned(),
         ]);
         let tags = HeightmapTags::load(&mut Data, &registry).unwrap();
@@ -9105,19 +9229,34 @@ mod tests {
         let home = session.player_chunk().unwrap();
         let source = fixture_chunk_document(home);
         assert!(session.set(IVec3::new(8, 2, 6), session.states[0]));
-        assert!(session.set(IVec3::new(5, 2, 5), session.states[3]));
+        let sand = session.intern_block(state("minecraft:sand", &[]));
+        assert!(session.set(IVec3::new(5, 2, 5), sand));
+        session.schedule_sand(IVec3::new(5, 2, 5), FallingKind::Sand);
+        let fluid_position = session.origin + IVec3::new(6, 2, 5);
+        session.schedule_fluid(
+            IVec3::new(6, 2, 5),
+            FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            },
+            5,
+        );
         let behavior =
             |state: &native_persistence::palette::BlockState| -> anyhow::Result<(bool, bool)> {
                 if state.name.matches("minecraft:air") {
                     Ok((true, false))
-                } else if state.name.matches("minecraft:stone") {
+                } else if state.name.matches("minecraft:stone")
+                    || state.name.matches("minecraft:sand")
+                {
                     Ok((false, false))
                 } else {
                     anyhow::bail!("unsupported block state")
                 }
             };
         let draft = session
-            .draft_changed_chunk_with_heightmaps(home, &source, &tags, behavior)
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(home, &source, &tags, behavior)
             .unwrap();
         let maps = draft.document().value.get("Heightmaps").unwrap();
         for name in [
@@ -9136,16 +9275,100 @@ mod tests {
             assert_eq!(value(8, 6), 1);
             assert_eq!(value(5, 5), 3);
         }
+        let Tag::List {
+            values: block_ticks,
+            ..
+        } = draft.document().value.get("block_ticks").unwrap()
+        else {
+            panic!("missing block ticks")
+        };
+        assert_eq!(block_ticks.len(), 1);
+        assert_eq!(
+            block_ticks[0].get("i"),
+            Some(&Tag::String("minecraft:sand".into()))
+        );
+        let Tag::List {
+            values: fluid_ticks,
+            ..
+        } = draft.document().value.get("fluid_ticks").unwrap()
+        else {
+            panic!("missing fluid ticks")
+        };
+        assert_eq!(fluid_ticks.len(), 1);
+        assert_eq!(
+            fluid_ticks[0].get("i"),
+            Some(&Tag::String("minecraft:water".into()))
+        );
+        assert_eq!(fluid_ticks[0].get("x"), Some(&Tag::Int(fluid_position.x)));
         assert!(draft.matches_source(&source).unwrap());
         assert!(
             session
-                .draft_changed_chunk_with_heightmaps(home, &source, &tags, |state| {
-                    if state.name.matches("minecraft:stone") {
-                        anyhow::bail!("unsupported stone semantics")
-                    }
-                    behavior(state)
-                })
+                .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                    home,
+                    &source,
+                    &tags,
+                    |state| {
+                        if state.name.matches("minecraft:stone") {
+                            anyhow::bail!("unsupported stone semantics")
+                        }
+                        behavior(state)
+                    },
+                )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn advancing_a_saved_tick_marks_its_chunk_dirty_without_block_edits() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session.enqueue_saved_fluids(
+            home,
+            &[SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: [
+                    session.origin.x + 4,
+                    session.origin.y + 4,
+                    session.origin.z + 4,
+                ],
+                delay: 5,
+                priority: 0,
+            }],
+        );
+        assert!(!session.dirty_chunk_positions().contains(&home));
+        session.queue_chunk_window(
+            ChunkPos {
+                x: home.x + 3,
+                z: home.z,
+            },
+            0,
+        );
+
+        session.update(TICK);
+
+        assert!(session.dirty_chunk_positions().contains(&home));
+        assert!(!session.block_edits.contains_key(&home));
+        assert!(!session.world.chunks.contains_key(&home));
+        assert!(session.parked_chunks.contains_key(&home));
+        let source = fixture_chunk_document(home);
+        let draft = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                home,
+                &source,
+                &test_heightmap_tags(),
+                |_| anyhow::bail!("heightmap classification should not run for a tick-only edit"),
+            )
+            .unwrap();
+        assert!(draft.matches_source(&source).unwrap());
+        let native_persistence::nbt::Tag::List { values, .. } =
+            draft.document().value.get("fluid_ticks").unwrap()
+        else {
+            panic!("missing fluid ticks")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("t"),
+            Some(&native_persistence::nbt::Tag::Int(4))
         );
     }
 

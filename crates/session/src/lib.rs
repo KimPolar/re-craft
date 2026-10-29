@@ -363,6 +363,7 @@ pub struct LocalSession {
     dropped_items: items::ItemEntities,
     experience_orbs: orbs::Orbs,
     player_random: native_core::random::LegacyRandom,
+    level_random: native_core::random::LegacyRandom,
     game_mode: GameMode,
     vitals: survival::PlayerVitals,
     experience: experience::Experience,
@@ -447,6 +448,7 @@ impl LocalSession {
             dropped_items: items::ItemEntities::default(),
             experience_orbs: orbs::Orbs::default(),
             player_random: native_core::random::LegacyRandom::new(0),
+            level_random: native_core::random::LegacyRandom::new(0),
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
             experience: experience::Experience::default(),
@@ -1141,6 +1143,19 @@ impl LocalSession {
                 block_shape,
             );
             self.ground_without_support = support.is_none();
+            let landed_on = movement::legacy_on_block(self.motion.position, support, |_| false);
+            if self.game_mode != GameMode::Spectator
+                && self.fall_distance > 0.0
+                && matches!(self.world.block(landed_on), Block::Farmland(_))
+                && farmland_trampled_by_player(
+                    &mut self.level_random,
+                    self.fall_distance,
+                    self.player.height(),
+                )
+            {
+                self.push_entities_from_soil(landed_on);
+                self.set_block(landed_on, Block::Dirt);
+            }
             if let Err(error) = self.fall.land(
                 self.fall_distance,
                 None,
@@ -1171,6 +1186,7 @@ impl LocalSession {
         } else {
             self.ground_without_support = false;
         }
+        let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_crawling = movement::can_fit(self.motion.position, CRAWL_HEIGHT, block_shape);
@@ -1434,6 +1450,16 @@ impl SoilKind {
             Self::Farmland => "minecraft:farmland",
         }
     }
+}
+
+/// Farmland consumes the level random before checking the player's dimensions.
+fn farmland_trampled_by_player(
+    random: &mut native_core::random::LegacyRandom,
+    distance: f64,
+    height: f32,
+) -> bool {
+    let roll = random.next_float();
+    f64::from(roll) < distance - 0.5 && 0.6_f32 * 0.6_f32 * height > 0.512_f32
 }
 
 fn placed_soil(block: Block, blocked_above: bool) -> Block {
@@ -2260,6 +2286,22 @@ mod tests {
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }
         }
+    }
+
+    #[test]
+    fn demo_farmland_tramples_when_player_lands() {
+        let soil = IVec3::new(5, 3, 5);
+        let mut world = World::demo();
+        world.set_block(soil, Block::Farmland(7));
+        world.set_block(soil + IVec3::Y, Block::Air);
+        let mut session = LocalSession::new(world);
+        session.motion.position = soil.as_dvec3() + DVec3::new(0.5, 1.0, 0.5);
+        session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+        session.motion.on_ground = false;
+        session.fall_distance = 2.0;
+        session.update(TICK);
+        assert_eq!(session.world.block(soil), Block::Dirt);
+        assert_eq!(session.motion.position.y, f64::from(soil.y) + 1.0);
     }
 
     #[test]

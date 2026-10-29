@@ -154,6 +154,7 @@ pub struct LoadedSession {
     oxygen_inventory_revision: Option<u64>,
     oxygen_valid: bool,
     player_random: native_core::random::LegacyRandom,
+    level_random: native_core::random::LegacyRandom,
     food_use: crate::survival::FoodUse,
     mining: mining::Mining,
     first_person: crate::animation::FirstPersonState,
@@ -1058,6 +1059,7 @@ impl LoadedSession {
             oxygen_inventory_revision: None,
             oxygen_valid: true,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             food_use: crate::survival::FoodUse::default(),
             mining: mining::Mining::default(),
             first_person: crate::animation::FirstPersonState::default(),
@@ -5421,7 +5423,7 @@ impl LoadedSession {
                     Cell::Missing => false,
                 }
             });
-            let state = match cell(
+            let landing_state = match cell(
                 &self.world,
                 self.origin,
                 self.bounds,
@@ -5429,10 +5431,26 @@ impl LoadedSession {
                 self.states[0],
             ) {
                 Cell::State(id) if self.shapes.get(id.0 as usize).is_some_and(Option::is_some) => {
-                    self.world.state(id)
+                    Some(id)
                 }
                 _ => None,
             };
+            if self.game_mode != GameMode::Spectator
+                && self.fall_distance > 0.0
+                && landing_state
+                    .and_then(|id| self.world.state(id))
+                    .is_some_and(|state| state.name == "minecraft:farmland")
+                && crate::farmland_trampled_by_player(
+                    &mut self.level_random,
+                    self.fall_distance,
+                    player_height,
+                )
+                && let Some(absolute) = add(self.origin, legacy)
+            {
+                self.push_entities_from_soil(legacy, absolute);
+                self.set(legacy, self.states[2]);
+            }
+            let state = landing_state.and_then(|id| self.world.state(id));
             if let Some(state) = state
                 && let Err(error) = self.fall.land(
                     self.fall_distance,
@@ -5469,6 +5487,20 @@ impl LoadedSession {
         } else {
             self.ground_without_support = false;
         }
+        let block_shape = |cell_pos| match cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            cell_pos,
+            self.states[0],
+        ) {
+            Cell::Missing => unknown_barrier(),
+            Cell::State(id) => self
+                .shapes
+                .get(id.0 as usize)
+                .and_then(Option::as_deref)
+                .unwrap_or_else(|| unknown_barrier()),
+        };
         let fits_standing =
             crate::movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
         let fits_crouching =
@@ -9084,6 +9116,119 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("death inventory preserved"))
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn farmland_trampling_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FarmlandTrampleOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FarmlandTrampleOracle.java"),
+        )
+        .unwrap();
+        let output = temp.path().join("results.json");
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java farmland oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("FarmlandTrampleOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 64 * 3 * 6);
+        for row in &rows {
+            let mut rng = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            assert_eq!(
+                crate::farmland_trampled_by_player(
+                    &mut rng,
+                    row["distance"].as_f64().unwrap(),
+                    row["height"].as_f64().unwrap() as f32
+                ),
+                row["changed"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                i64::from(rng.next_int()),
+                row["next"].as_i64().unwrap(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn landing_on_farmland_tramples_and_lifts_player_at_a_fixed_tick() {
+        let prepare = |distance: f64| {
+            let mut session = session();
+            let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "7")]));
+            assert!(session.set(IVec3::new(8, 1, 8), farmland));
+            session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            session.motion.on_ground = false;
+            session.fall_distance = distance;
+            session.level_random = native_core::random::LegacyRandom::new(0);
+            session
+        };
+        let mut ordinary = prepare(2.0);
+        let mut varying = prepare(2.0);
+        let mut short = prepare(0.1);
+        let mut spectator = prepare(2.0);
+        spectator.set_game_mode(GameMode::Spectator);
+        ordinary.update(TICK);
+        for _ in 0..5 {
+            varying.update(Duration::from_millis(10));
+        }
+        short.update(TICK);
+        spectator.update(TICK);
+        let soil = |session: &LoadedSession| {
+            session
+                .world
+                .block(session.origin.x + 8, 1, session.origin.z + 8)
+                .unwrap()
+                .name
+                .clone()
+        };
+        assert_eq!(soil(&ordinary), "minecraft:dirt");
+        assert_eq!(soil(&varying), "minecraft:dirt");
+        assert_eq!(soil(&short), "minecraft:farmland");
+        assert_eq!(soil(&spectator), "minecraft:farmland");
+        assert_eq!(ordinary.motion.position, varying.motion.position);
+        assert_eq!(ordinary.motion.position.y, 2.0);
+        assert_eq!(ordinary.fall_distance, 0.0);
     }
 
     #[test]

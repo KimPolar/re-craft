@@ -645,12 +645,12 @@ fn prepare_existing_world(
         && let Some(saved) = &player
         && let Some(id) = &saved.dimension
     {
-        reader.dimension = DimensionId::parse(id)?;
+        reader.set_dimension(DimensionId::parse(id)?);
     }
     if chunk.is_none()
         && let Some(saved) = &player
         && let Some(saved_dimension) = &saved.dimension
-        && DimensionId::parse(saved_dimension)? != reader.dimension
+        && DimensionId::parse(saved_dimension)? != *reader.dimension()
     {
         #[cfg(debug_assertions)]
         bail!("saved player is in {saved_dimension}; pass --chunk X Z to view another dimension");
@@ -684,7 +684,7 @@ fn prepare_existing_world(
     } else {
         BTreeMap::new()
     };
-    let mut world = area.materialize_with_defaults(&reader.dimension, &defaults)?;
+    let mut world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
     let origin = IVec3::new(
         center
             .x
@@ -759,7 +759,7 @@ fn prepare_existing_world(
         .context("cannot read saved dimension mappings")?;
     world.dimension_type = preview_lighting::resolve_dimension_type(
         &mut resources,
-        &reader.dimension,
+        reader.dimension(),
         saved_dimensions.as_ref(),
     )
     .context("cannot resolve the world's dimension type")?;
@@ -987,7 +987,7 @@ fn prepare_existing_world(
                     else {
                         return Ok(Some(None));
                     };
-                    if config.data.dimension != reader.dimension {
+                    if config.data.dimension != *reader.dimension() {
                         return Ok(None);
                     }
                     let Some(dimension_type) = session
@@ -1028,7 +1028,7 @@ fn prepare_existing_world(
             let prepare_world_respawn =
                 || -> Result<Option<native_session::loaded::WorldRespawnSupport>> {
                     let spawn = reader.world_spawn()?;
-                    if spawn.dimension != reader.dimension
+                    if spawn.dimension != *reader.dimension()
                         || (default_mode != native_session::GameMode::Adventure
                             && profile.has_ceiling != Some(false))
                     {
@@ -1151,8 +1151,8 @@ fn prepare_existing_world(
         scene.warnings.extend(pack_warnings);
         println!(
             "Read-only preview: {}:{}; {} loaded chunks, {} missing; {} opaque vertices, {} translucent quads",
-            reader.dimension.namespace,
-            reader.dimension.path,
+            reader.dimension().namespace,
+            reader.dimension().path,
             area.chunks.len(),
             area.missing.len(),
             scene.opaque_len(),
@@ -1188,7 +1188,9 @@ fn inspect(
     let mut reader = WorldReader::open(world_dir, dimension)?;
     println!(
         "World data version: {} (Minecraft 26.3: 5023); dimension {}:{}",
-        reader.info.data_version, reader.dimension.namespace, reader.dimension.path
+        reader.info.data_version,
+        reader.dimension().namespace,
+        reader.dimension().path
     );
     if let Some((x, z)) = chunk {
         let area = reader.read_area(ChunkPos { x, z }, radius)?;
@@ -1206,7 +1208,7 @@ fn inspect(
             .map(|blocks| blocks.states.len())
             .sum();
         let full = area.chunks.values().filter(|chunk| chunk.is_full()).count();
-        let runtime_world = area.materialize(&reader.dimension)?;
+        let runtime_world = area.materialize(reader.dimension())?;
         println!(
             "Area centered at ({x}, {z}), radius {radius}: {} chunks ({full} full), {} missing; {block_sections} block sections, {palettes} palette entries; {} distinct states, {} biomes",
             area.chunks.len(),
@@ -2059,6 +2061,168 @@ impl ApplicationHandler for App {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod world_open_tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use native_persistence::nbt::{self, TagType};
+    use std::io::Write;
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn saved_player_dimension_selects_the_matching_world_data() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let parent = tempfile::tempdir().unwrap();
+        fn gzip(path: &std::path::Path, tag: &NamedTag) -> Vec<u8> {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(tag).unwrap()).unwrap();
+            let bytes = encoder.finish().unwrap();
+            std::fs::write(path, &bytes).unwrap();
+            bytes
+        }
+        for (index, name, expected_type) in [
+            (0, "minecraft:overworld", "minecraft:overworld"),
+            (1, "minecraft:the_nether", "minecraft:the_nether"),
+            (2, "minecraft:the_end", "minecraft:the_end"),
+            (3, "example:custom/nested", "minecraft:the_nether"),
+        ] {
+            let root = parent.path().join(format!("world-{index}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let level = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "Data".into(),
+                    Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        ("singleplayer_uuid".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+                    ]),
+                )]),
+            };
+            let level_path = root.join("level.dat");
+            let level_bytes = gzip(&level_path, &level);
+            let player = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Dimension".into(), Tag::String(name.into())),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: TagType::Double,
+                            values: vec![Tag::Double(8.5), Tag::Double(65.0), Tag::Double(8.5)],
+                        },
+                    ),
+                    (
+                        "Rotation".into(),
+                        Tag::List {
+                            element_type: TagType::Float,
+                            values: vec![Tag::Float(0.0), Tag::Float(0.0)],
+                        },
+                    ),
+                ]),
+            };
+            let player_path = root.join("players/data/00000000-0000-0000-0000-000000000001.dat");
+            let player_bytes = gzip(&player_path, &player);
+            let settings_path = root.join("data/minecraft/world_gen_settings.dat");
+            let settings = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![(
+                            "dimensions".into(),
+                            Tag::Compound(vec![(
+                                name.into(),
+                                Tag::Compound(vec![
+                                    ("type".into(), Tag::String(expected_type.into())),
+                                    ("generator".into(), Tag::Compound(vec![])),
+                                ]),
+                            )]),
+                        )]),
+                    ),
+                ]),
+            };
+            let settings_bytes = gzip(&settings_path, &settings);
+            let chunk = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("xPos".into(), Tag::Int(0)),
+                    ("zPos".into(), Tag::Int(0)),
+                    ("Status".into(), Tag::String("minecraft:full".into())),
+                    (
+                        "sections".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![Tag::Compound(vec![
+                                ("Y".into(), Tag::Byte(0)),
+                                (
+                                    "block_states".into(),
+                                    Tag::Compound(vec![(
+                                        "palette".into(),
+                                        Tag::List {
+                                            element_type: TagType::String,
+                                            values: vec![Tag::String("minecraft:stone".into())],
+                                        },
+                                    )]),
+                                ),
+                            ])],
+                        },
+                    ),
+                ]),
+            };
+            let encoded = nbt::write(&chunk).unwrap();
+            assert!(encoded.len() + 5 < 4096);
+            let dimension = DimensionId::parse(name).unwrap();
+            let region_path = root
+                .join("dimensions")
+                .join(&dimension.namespace)
+                .join(&dimension.path)
+                .join("region/r.0.0.mca");
+            std::fs::create_dir_all(region_path.parent().unwrap()).unwrap();
+            let mut region = vec![0u8; 3 * 4096];
+            region[0..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+            region[8192..8196].copy_from_slice(&((encoded.len() + 1) as u32).to_be_bytes());
+            region[8196] = 3;
+            region[8197..8197 + encoded.len()].copy_from_slice(&encoded);
+            std::fs::write(&region_path, &region).unwrap();
+            let prepared = prepare_existing_world(
+                &root,
+                &game,
+                &[],
+                ViewOptions {
+                    dimension: None,
+                    chunk: None,
+                    radius: 1,
+                    smoke_test: false,
+                    block_report: None,
+                    play: true,
+                    video: menu_settings::VideoSettings::default(),
+                },
+                None,
+            )
+            .unwrap();
+            let PreparedWorld::Play(prepared) = prepared else {
+                panic!("expected play session")
+            };
+            let snapshot = prepared.session.snapshot();
+            let loaded = snapshot.world.loaded().unwrap();
+            assert_eq!(loaded.dimension, name);
+            assert_eq!(loaded.dimension_type.as_deref(), Some(expected_type));
+            assert_eq!(loaded.block(0, 0, 0).unwrap().name, "minecraft:stone");
+            assert_eq!(snapshot.player.position.y, 65.0);
+            assert_eq!(std::fs::read(level_path).unwrap(), level_bytes);
+            assert_eq!(std::fs::read(player_path).unwrap(), player_bytes);
+            assert_eq!(std::fs::read(settings_path).unwrap(), settings_bytes);
+            assert_eq!(std::fs::read(region_path).unwrap(), region);
         }
     }
 }

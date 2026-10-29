@@ -818,7 +818,7 @@ fn java_and_rust_read_each_others_nbt() {
         chunk.document.value.get("fixture_unknown_tag"),
         Some(&Tag::String("preserved".into()))
     );
-    let runtime = area.materialize(&reader.dimension).unwrap();
+    let runtime = area.materialize(reader.dimension()).unwrap();
     let ticks = &runtime.saved_fluid_ticks[&native_world::loaded::ChunkPos { x: -1, z: -1 }];
     assert_eq!(ticks.len(), 3);
     let block_ticks = &runtime.saved_block_ticks[&native_world::loaded::ChunkPos { x: -1, z: -1 }];

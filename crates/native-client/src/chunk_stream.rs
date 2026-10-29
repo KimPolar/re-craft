@@ -117,7 +117,7 @@ impl ChunkStreamer {
                 chunks: BTreeMap::from([(saved, Arc::clone(&chunk))]),
                 missing: Vec::new(),
             };
-            let world = area.materialize_with_defaults(&reader.dimension, &defaults)?;
+            let world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
             let entities = read_entity_data(&mut reader, pos);
             let heightmaps = heightmap_context.as_ref().and_then(|(bounds, tags)| {
                 match native_session::spawn_heightmaps::prepare(&chunk, &world, *bounds, tags) {
@@ -1514,7 +1514,7 @@ mod tests {
         let dimension = DimensionId::parse("minecraft:overworld").unwrap();
         let mut reader = WorldReader::open(temp.path(), dimension).unwrap();
         let area = reader.read_area(SavedChunkPos { x: 0, z: 0 }, 0).unwrap();
-        let world = area.materialize(&reader.dimension).unwrap();
+        let world = area.materialize(reader.dimension()).unwrap();
         let player = PlayerState {
             position: Vec3::new(15.4, 1.0, 8.5),
             yaw: 0.0,

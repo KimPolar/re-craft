@@ -554,7 +554,7 @@ fn saved_fluid_ticks(
 pub struct WorldReader {
     pub info: LevelInfo,
     pub level: Arc<NamedTag>,
-    pub dimension: DimensionId,
+    dimension: DimensionId,
     root: PathBuf,
     session_guard: Option<crate::save::WorldSessionGuard>,
     regions: BTreeMap<(i32, i32), RegionReader>,
@@ -692,6 +692,20 @@ fn string_list(tag: &Tag, name: &str) -> Result<Vec<String>> {
 }
 
 impl WorldReader {
+    pub fn dimension(&self) -> &DimensionId {
+        &self.dimension
+    }
+
+    /// Region handles are specific to a dimension, even when region coordinates match.
+    pub fn set_dimension(&mut self, dimension: DimensionId) {
+        if self.dimension != dimension {
+            self.dimension = dimension;
+            self.regions.clear();
+            self.region_usage.clear();
+            self.entity_regions.clear();
+            self.entity_region_usage.clear();
+        }
+    }
     /// Inspect a world without acquiring the Java session lock. This is only
     /// suitable for callers that already control concurrent access.
     pub fn open(world_dir: &Path, dimension: DimensionId) -> Result<Self> {
@@ -1951,6 +1965,102 @@ mod tests {
         assert_eq!(reader.regions.len(), MAX_OPEN_REGIONS);
         assert!(reader.regions.contains_key(&(0, 0)));
         assert!(!reader.regions.contains_key(&(1, 0)));
+    }
+
+    #[test]
+    fn dimension_switch_reopens_block_and_entity_regions_at_the_same_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let dimensions = [
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+            "example:custom/nested",
+        ];
+        let write_region = |directory: &Path, marker: i32, entity: bool| {
+            std::fs::create_dir_all(directory).unwrap();
+            let mut fields = vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("marker".into(), Tag::Int(marker)),
+            ];
+            if entity {
+                fields.push(("Position".into(), Tag::IntArray(vec![0, 0])));
+                fields.push((
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: Vec::new(),
+                    },
+                ));
+            } else {
+                fields.push(("xPos".into(), Tag::Int(0)));
+                fields.push(("zPos".into(), Tag::Int(0)));
+            }
+            let bytes = nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::Compound(fields),
+            })
+            .unwrap();
+            assert!(bytes.len() + 5 <= 4096);
+            let mut region = vec![0u8; 3 * 4096];
+            region[0..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+            region[8192..8196].copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+            region[8196] = 3;
+            region[8197..8197 + bytes.len()].copy_from_slice(&bytes);
+            let path = directory.join("r.0.0.mca");
+            std::fs::write(&path, &region).unwrap();
+            (path, region)
+        };
+        let mut files = Vec::new();
+        for (marker, name) in dimensions.iter().enumerate() {
+            let dimension = DimensionId::parse(name).unwrap();
+            files.push(write_region(
+                &dimension.region_dir(dir.path()),
+                marker as i32,
+                false,
+            ));
+            files.push(write_region(
+                &dimension.entity_region_dir(dir.path()),
+                marker as i32 + 10,
+                true,
+            ));
+        }
+        let mut reader =
+            WorldReader::open_for_session(dir.path(), DimensionId::parse(dimensions[0]).unwrap())
+                .unwrap();
+        for name in dimensions.into_iter().chain(dimensions.into_iter().rev()) {
+            let index = dimensions.iter().position(|item| *item == name).unwrap() as i32;
+            reader.set_dimension(DimensionId::parse(name).unwrap());
+            assert_eq!(reader.dimension(), &DimensionId::parse(name).unwrap());
+            assert_eq!(
+                reader
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+                    .document
+                    .value
+                    .get("marker"),
+                Some(&Tag::Int(index))
+            );
+            assert_eq!(
+                reader
+                    .read_entity_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+                    .document
+                    .value
+                    .get("marker"),
+                Some(&Tag::Int(index + 10))
+            );
+            assert_eq!(reader.regions.len(), 1);
+            assert_eq!(reader.entity_regions.len(), 1);
+            reader.set_dimension(DimensionId::parse(name).unwrap());
+            assert_eq!(reader.regions.len(), 1);
+            assert_eq!(reader.entity_regions.len(), 1);
+        }
+        for (path, bytes) in files {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     #[test]

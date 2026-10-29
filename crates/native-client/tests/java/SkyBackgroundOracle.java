@@ -22,6 +22,9 @@ public class SkyBackgroundOracle {
             .parse(JsonOps.INSTANCE, input.get("track")).getOrThrow();
         var clock = new ServerClockManager.ServerClockInstance(); ClockManager manager = ignored -> clock;
         var sampler = track.bakeSampler(EnvironmentAttributes.SKY_COLOR, Holder.direct(new WorldClock()), Optional.of(24000), manager);
+        var fogTrack = AttributeTrack.createCodec(EnvironmentAttributes.FOG_END_DISTANCE)
+            .parse(JsonOps.INSTANCE, input.get("fogTrack")).getOrThrow();
+        var fogSampler = fogTrack.bakeSampler(EnvironmentAttributes.FOG_END_DISTANCE, Holder.direct(new WorldClock()), Optional.of(24000), manager);
         var output = new JsonArray(); int tickId = 0;
         for (var item : input.getAsJsonArray("cases")) {
             var c = item.getAsJsonObject(); var p = c.getAsJsonArray("position");
@@ -35,6 +38,16 @@ public class SkyBackgroundOracle {
             var row = new JsonArray(); row.add(result.x()); row.add(result.y()); row.add(result.z()); output.add(row);
             var fog = interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_COLOR, new Vector3f());
             row.add(fog.x()); row.add(fog.y()); row.add(fog.z());
+            var fogStart = interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_START_DISTANCE, 10f);
+            var fogEnd = interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_END_DISTANCE, 96f);
+            row.add(fogStart); row.add(fogSampler.applyTimeBased(fogEnd, tickId));
+        }
+        for (String operation : List.of("override", "add", "subtract", "multiply", "minimum", "maximum")) {
+            var object = JsonParser.parseString("{\"minecraft:visual/fog_start_distance\":{\"modifier\":\"" + operation + "\",\"argument\":3.0}}");
+            var map = EnvironmentAttributeMap.CODEC.parse(JsonOps.INSTANCE, object).getOrThrow();
+            var interpolator = new SpatialAttributeInterpolator();
+            interpolator.accumulate(1.0, map);
+            var row = new JsonArray(); row.add(interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_START_DISTANCE, 10f)); output.add(row);
         }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }

@@ -51,7 +51,14 @@ fn terrain_fragment(input: WorldOutput) -> @location(0) vec4<f32> {
     let color = textureSample(atlas, atlas_sampler, input.uv);
     if color.a < 0.1 { discard; }
     let source = color.rgb * input.shade * input.tint;
-    let amount = select(0.0, clamp((input.fog_distance - fog.range.x) / (fog.range.y - fog.range.x), 0.0, 1.0), fog.range.z > 0.5);
+    var amount = 0.0;
+    if fog.range.z > 0.5 && input.fog_distance > fog.range.x {
+        if input.fog_distance >= fog.range.y {
+            amount = 1.0;
+        } else {
+            amount = (input.fog_distance - fog.range.x) / (fog.range.y - fog.range.x);
+        }
+    }
     return vec4<f32>(mix(source, fog.color.rgb, amount), color.a);
 }
 

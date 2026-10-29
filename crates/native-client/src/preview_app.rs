@@ -148,6 +148,8 @@ pub fn run_play(
             sky_background_revision: None,
             sky_background_previous: None,
             sky_background_current: None,
+            sky_fog_previous: None,
+            sky_fog_current: None,
             sky_tick: None,
             sky_base: None,
             sky_lightmap: None,
@@ -245,6 +247,8 @@ struct PlayState {
     sky_background_revision: Option<u64>,
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
+    sky_fog_previous: Option<[f32; 2]>,
+    sky_fog_current: Option<[f32; 2]>,
     sky_tick: Option<u64>,
     sky_base: Option<Arc<native_world::lighting::LightmapSettings>>,
     sky_lightmap: Option<Arc<[[[f32; 3]; 16]; 16]>>,
@@ -542,7 +546,6 @@ impl Viewer {
                     })
                 });
                 if let Some((value, fog_range)) = value {
-                    renderer.set_fog_range(fog_range);
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_background_previous.is_none()
                     {
@@ -550,6 +553,13 @@ impl Viewer {
                             Some(play.sky_background_current.unwrap_or(value));
                     }
                     play.sky_background_current = Some(value);
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.sky_fog_previous.is_none()
+                        || play.sky_fog_current.is_none()
+                    {
+                        play.sky_fog_previous = play.sky_fog_current.or(fog_range);
+                    }
+                    play.sky_fog_current = fog_range;
                 }
                 play.sky_background_tick = Some(snapshot.tick);
                 play.sky_background_revision = Some(snapshot.world_revision);
@@ -561,6 +571,12 @@ impl Viewer {
                 renderer.set_sky_color(std::array::from_fn(|i| {
                     previous[i] + partial * (current[i] - previous[i])
                 }));
+                renderer.set_fog_range(match (play.sky_fog_previous, play.sky_fog_current) {
+                    (Some(previous), Some(current)) => Some(std::array::from_fn(|i| {
+                        previous[i] + partial * (current[i] - previous[i])
+                    })),
+                    _ => None,
+                });
             }
         }
         if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer)
@@ -1558,6 +1574,14 @@ mod tests {
                                             })
                                     }),
                                 "distant terrain must be fogged toward the background color"
+                            );
+                            renderer.set_fog_range(Some([0.0, 0.0]));
+                            let step_fog = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert_eq!(
+                                step_fog, fogged,
+                                "equal fog distances must produce a defined step"
                             );
                             renderer.set_fog_range(None);
                             assert_eq!(

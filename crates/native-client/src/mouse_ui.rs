@@ -8,6 +8,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseControl {
     Sensitivity,
+    WheelSensitivity,
+    DiscreteScrolling,
     InvertX,
     InvertY,
 }
@@ -52,6 +54,8 @@ pub fn draw_controls_placeholders(canvas: &mut Canvas, assets: &MenuAssets) {
 pub fn mouse_control_rect(width: i32, control: MouseControl) -> Rect {
     let (column, row) = match control {
         MouseControl::Sensitivity => (0, 0),
+        MouseControl::WheelSensitivity => (1, 0),
+        MouseControl::DiscreteScrolling => (0, 1),
         MouseControl::InvertX => (1, 1),
         MouseControl::InvertY => (0, 2),
     };
@@ -65,7 +69,7 @@ pub fn mouse_control_rect(width: i32, control: MouseControl) -> Rect {
 
 #[derive(Default)]
 pub struct MouseUi {
-    dragging: bool,
+    dragging: Option<MouseControl>,
     pub keyboard_adjust: bool,
 }
 
@@ -73,6 +77,8 @@ impl MouseUi {
     pub fn hit(width: i32, cursor: (i32, i32)) -> Option<MouseControl> {
         [
             MouseControl::Sensitivity,
+            MouseControl::WheelSensitivity,
+            MouseControl::DiscreteScrolling,
             MouseControl::InvertX,
             MouseControl::InvertY,
         ]
@@ -80,37 +86,86 @@ impl MouseUi {
         .find(|control| mouse_control_rect(width, *control).contains(cursor.0, cursor.1))
     }
     pub fn start(&mut self, width: i32, x: i32, settings: &mut VideoSettings) -> bool {
-        self.dragging = true;
-        self.keyboard_adjust = true;
-        self.move_to(width, x, settings)
+        self.start_control(width, x, MouseControl::Sensitivity, settings)
     }
-    fn move_to(&self, width: i32, x: i32, settings: &mut VideoSettings) -> bool {
-        let rect = mouse_control_rect(width, MouseControl::Sensitivity);
-        let value = UnitInterval::new(f64::from(x - rect.x - 4) / f64::from(rect.w - 8));
-        let changed = value != settings.mouse_sensitivity;
-        settings.mouse_sensitivity = value;
-        changed
+    pub fn start_control(
+        &mut self,
+        width: i32,
+        x: i32,
+        control: MouseControl,
+        settings: &mut VideoSettings,
+    ) -> bool {
+        self.dragging = Some(control);
+        self.keyboard_adjust = true;
+        self.move_to(width, x, control, settings)
+    }
+    fn move_to(
+        &self,
+        width: i32,
+        x: i32,
+        control: MouseControl,
+        settings: &mut VideoSettings,
+    ) -> bool {
+        let rect = mouse_control_rect(width, control);
+        let fraction = (f64::from(x - rect.x - 4) / f64::from(rect.w - 8)).clamp(0.0, 1.0);
+        match control {
+            MouseControl::Sensitivity => {
+                let value = UnitInterval::new(fraction);
+                let changed = value != settings.mouse_sensitivity;
+                settings.mouse_sensitivity = value;
+                changed
+            }
+            MouseControl::WheelSensitivity => {
+                let value =
+                    crate::menu_settings::MouseWheelSensitivity::from_slider_fraction(fraction);
+                let changed = value != settings.mouse_wheel_sensitivity;
+                settings.mouse_wheel_sensitivity = value;
+                changed
+            }
+            MouseControl::DiscreteScrolling | MouseControl::InvertX | MouseControl::InvertY => {
+                false
+            }
+        }
     }
     pub fn pointer_move(&self, width: i32, x: i32, settings: &mut VideoSettings) -> (bool, bool) {
-        if self.dragging {
-            (true, self.move_to(width, x, settings))
-        } else {
-            (false, false)
+        match self.dragging {
+            Some(control) => (true, self.move_to(width, x, control, settings)),
+            None => (false, false),
         }
     }
     pub fn release(&mut self) {
-        self.dragging = false;
+        self.dragging = None;
     }
-    pub fn arrow(&self, right: bool, settings: &mut VideoSettings) -> bool {
-        let step = f64::from(if right {
-            1.0_f32 / 142.0
-        } else {
-            -1.0_f32 / 142.0
-        });
-        let next = UnitInterval::new(settings.mouse_sensitivity.value() + step);
-        let changed = next != settings.mouse_sensitivity;
-        settings.mouse_sensitivity = next;
-        changed
+    pub fn arrow(&self, control: MouseControl, right: bool, settings: &mut VideoSettings) -> bool {
+        match control {
+            MouseControl::Sensitivity => {
+                let step = f64::from(if right {
+                    1.0_f32 / 142.0
+                } else {
+                    -1.0_f32 / 142.0
+                });
+                let next = UnitInterval::new(settings.mouse_sensitivity.value() + step);
+                let changed = next != settings.mouse_sensitivity;
+                settings.mouse_sensitivity = next;
+                changed
+            }
+            MouseControl::WheelSensitivity => {
+                let step = f64::from(if right {
+                    1.0_f32 / 142.0
+                } else {
+                    -1.0_f32 / 142.0
+                });
+                let next = crate::menu_settings::MouseWheelSensitivity::from_slider_fraction(
+                    settings.mouse_wheel_sensitivity.slider_fraction() + step,
+                );
+                let changed = next != settings.mouse_wheel_sensitivity;
+                settings.mouse_wheel_sensitivity = next;
+                changed
+            }
+            MouseControl::DiscreteScrolling | MouseControl::InvertX | MouseControl::InvertY => {
+                false
+            }
+        }
     }
     pub fn draw(
         &self,
@@ -175,7 +230,61 @@ impl MouseUi {
             &sensitivity_caption,
             [255, 255, 255],
         );
+        let wheel_control = MouseControl::WheelSensitivity;
+        let wheel_rect = mouse_control_rect(width, wheel_control);
+        let wheel_hovered = wheel_rect.contains(cursor.0, cursor.1);
+        let wheel_focused = focus == Some(wheel_control);
+        let wheel_background = if wheel_focused && !self.keyboard_adjust {
+            &assets.slider_highlighted
+        } else {
+            &assets.slider
+        };
+        let wheel_handle = if wheel_hovered || wheel_focused && self.keyboard_adjust {
+            &assets.slider_handle_highlighted
+        } else {
+            &assets.slider_handle
+        };
+        canvas.gui_sprite(
+            &wheel_background.image,
+            wheel_rect,
+            wheel_background.scaling,
+        );
+        canvas.gui_sprite(
+            &wheel_handle.image,
+            Rect {
+                x: wheel_rect.x
+                    + (settings.mouse_wheel_sensitivity.slider_fraction()
+                        * f64::from(wheel_rect.w - 8)) as i32,
+                y: wheel_rect.y,
+                w: 8,
+                h: 20,
+            },
+            wheel_handle.scaling,
+        );
+        let wheel_label =
+            assets.translate("options.mouseWheelSensitivity", "Mouse Wheel Sensitivity");
+        let wheel_value =
+            ((settings.mouse_wheel_sensitivity.value() * 100.0).round() as i32).to_string();
+        let wheel_caption = format_pair(
+            assets.translate("options.percent_value", "%s: %s%%"),
+            wheel_label,
+            &wheel_value,
+        )
+        .replace("%%", "%");
+        canvas.text_centered(
+            Some(assets),
+            wheel_rect.x + wheel_rect.w / 2,
+            wheel_rect.y + 6,
+            &wheel_caption,
+            [255, 255, 255],
+        );
         for (control, key, fallback, on) in [
+            (
+                MouseControl::DiscreteScrolling,
+                "options.discrete_mouse_scroll",
+                "Discrete Scrolling",
+                settings.discrete_mouse_scroll,
+            ),
             (
                 MouseControl::InvertX,
                 "options.invertMouseX",
@@ -204,16 +313,9 @@ impl MouseUi {
                 &caption(assets, label, value),
             );
         }
-        for (column, row, key, fallback) in [
-            (
-                1,
-                0,
-                "options.mouseWheelSensitivity",
-                "Mouse Wheel Sensitivity",
-            ),
-            (0, 1, "options.discrete_mouse_scroll", "Discrete Scrolling"),
-            (1, 2, "options.allowCursorChanges", "Allow Cursor Changes"),
-        ] {
+        for (column, row, key, fallback) in
+            [(1, 2, "options.allowCursorChanges", "Allow Cursor Changes")]
+        {
             canvas.button(
                 Some(assets),
                 Rect {
@@ -267,17 +369,33 @@ mod tests {
             (true, true)
         );
         assert_eq!(settings.mouse_sensitivity.value(), 1.0);
-        assert!(ui.arrow(false, &mut settings));
+        assert!(ui.arrow(MouseControl::Sensitivity, false, &mut settings));
         assert_eq!(
             settings.mouse_sensitivity.value(),
             1.0 + f64::from(-1.0_f32 / 142.0)
         );
+        let wheel = mouse_control_rect(width, MouseControl::WheelSensitivity);
+        assert!(ui.start_control(
+            width,
+            wheel.x + wheel.w - 4,
+            MouseControl::WheelSensitivity,
+            &mut settings
+        ));
+        assert_eq!(settings.mouse_wheel_sensitivity.value(), 10.0);
+        ui.release();
+        assert!(ui.arrow(MouseControl::WheelSensitivity, false, &mut settings));
+        assert!(settings.mouse_wheel_sensitivity.value() < 10.0);
         ui.release();
         assert_eq!(
             ui.pointer_move(width, slider.x + 4, &mut settings),
             (false, false)
         );
-        for control in [MouseControl::InvertX, MouseControl::InvertY] {
+        for control in [
+            MouseControl::WheelSensitivity,
+            MouseControl::DiscreteScrolling,
+            MouseControl::InvertX,
+            MouseControl::InvertY,
+        ] {
             let rect = mouse_control_rect(width, control);
             assert_eq!(MouseUi::hit(width, (rect.x + 3, rect.y + 3)), Some(control));
         }

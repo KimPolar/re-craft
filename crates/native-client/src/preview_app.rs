@@ -222,6 +222,7 @@ fn run_inner(
         window: None,
         renderer: None,
         input: Input::default(),
+        hotbar_scroll: crate::mouse_scroll::HotbarScroll::default(),
         captured: false,
         occluded: false,
         last_update: now,
@@ -293,6 +294,7 @@ struct Viewer {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     input: Input,
+    hotbar_scroll: crate::mouse_scroll::HotbarScroll,
     captured: bool,
     occluded: bool,
     last_update: Instant,
@@ -896,8 +898,26 @@ impl ApplicationHandler for Viewer {
                 self.apply_video();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(ui) = &mut self.ui {
-                    ui.pause_scroll(crate::scroll_lines(delta));
+                let amount = crate::mouse_scroll::scaled_axes(
+                    crate::mouse_scroll::event_axes(delta),
+                    self.video,
+                );
+                if self.ui.as_ref().is_some_and(GameUi::paused) {
+                    if let Some(ui) = &mut self.ui {
+                        ui.pause_scroll(amount.1);
+                    }
+                } else if self.captured
+                    && let Some(play) = &mut self.play
+                {
+                    let snapshot = play.session.snapshot();
+                    if snapshot.death.is_none()
+                        && !snapshot.inventory.is_open()
+                        && let Some(slot) = self
+                            .hotbar_scroll
+                            .select(amount, snapshot.inventory.selected())
+                    {
+                        play.session.submit_command(PlayerCommand::SelectSlot(slot));
+                    }
                 }
             }
             WindowEvent::Focused(focused) => {

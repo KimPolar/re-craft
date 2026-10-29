@@ -14,7 +14,7 @@ use native_persistence::{anvil, nbt::Tag};
 use native_resources::{default_minecraft_dir, load_atlas_with_packs};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     platform::run_on_demand::EventLoopExtRunOnDemand,
@@ -65,6 +65,8 @@ enum ButtonId {
     Controls,
     MouseSettings,
     MouseSensitivity,
+    MouseWheelSensitivity,
+    MouseDiscreteScroll,
     MouseInvertX,
     MouseInvertY,
     SoundSettings,
@@ -114,6 +116,8 @@ impl ButtonId {
     fn mouse_control(self) -> Option<MouseControl> {
         match self {
             Self::MouseSensitivity => Some(MouseControl::Sensitivity),
+            Self::MouseWheelSensitivity => Some(MouseControl::WheelSensitivity),
+            Self::MouseDiscreteScroll => Some(MouseControl::DiscreteScrolling),
             Self::MouseInvertX => Some(MouseControl::InvertX),
             Self::MouseInvertY => Some(MouseControl::InvertY),
             _ => None,
@@ -180,6 +184,16 @@ fn spawn_launch(
     Ok(result)
 }
 
+fn take_scroll_steps(remainder: &mut f64, amount: f64) -> i32 {
+    if !amount.is_finite() {
+        return 0;
+    }
+    *remainder += amount;
+    let steps = remainder.trunc() as i32;
+    *remainder -= f64::from(steps);
+    steps
+}
+
 struct State {
     minecraft_dir: PathBuf,
     audio: Option<crate::audio::Audio>,
@@ -195,10 +209,13 @@ struct State {
     selected_pack: Option<usize>,
     available_pack_scroll: usize,
     selected_pack_scroll: usize,
+    available_pack_scroll_remainder: f64,
+    selected_pack_scroll_remainder: f64,
     screen: Screen,
     worlds: Vec<WorldEntry>,
     selected_world: Option<usize>,
     world_scroll: usize,
+    world_scroll_remainder: f64,
     error: Option<String>,
     asset_load: Option<PendingAssetLoad>,
     world_load: Option<PendingWorldLoad>,
@@ -316,10 +333,13 @@ impl State {
             selected_pack: None,
             available_pack_scroll: 0,
             selected_pack_scroll: 0,
+            available_pack_scroll_remainder: 0.0,
+            selected_pack_scroll_remainder: 0.0,
             screen: Screen::Loading,
             worlds: Vec::new(),
             selected_world: None,
             world_scroll: 0,
+            world_scroll_remainder: 0.0,
             error: None,
             asset_load: None,
             world_load: None,
@@ -1494,6 +1514,14 @@ impl<'a> Menu<'a> {
             Screen::Mouse => {
                 for (id, control) in [
                     (ButtonId::MouseSensitivity, MouseControl::Sensitivity),
+                    (
+                        ButtonId::MouseWheelSensitivity,
+                        MouseControl::WheelSensitivity,
+                    ),
+                    (
+                        ButtonId::MouseDiscreteScroll,
+                        MouseControl::DiscreteScrolling,
+                    ),
                     (ButtonId::MouseInvertX, MouseControl::InvertX),
                     (ButtonId::MouseInvertY, MouseControl::InvertY),
                 ] {
@@ -1694,6 +1722,19 @@ impl<'a> Menu<'a> {
                 self.state.video_dirty |=
                     self.mouse_ui
                         .start(width, self.cursor.0, &mut self.state.video);
+            }
+            ButtonId::MouseWheelSensitivity => {
+                let (width, _) = self.logical_size();
+                self.state.video_dirty |= self.mouse_ui.start_control(
+                    width,
+                    self.cursor.0,
+                    MouseControl::WheelSensitivity,
+                    &mut self.state.video,
+                );
+            }
+            ButtonId::MouseDiscreteScroll => {
+                self.state.video.discrete_mouse_scroll = !self.state.video.discrete_mouse_scroll;
+                self.state.video_dirty = true;
             }
             ButtonId::MouseInvertX => {
                 self.state.video.invert_mouse_x = !self.state.video.invert_mouse_x;
@@ -2755,6 +2796,7 @@ impl ApplicationHandler for Menu<'_> {
                             button.id,
                             ButtonId::VideoFps
                                 | ButtonId::MouseSensitivity
+                                | ButtonId::MouseWheelSensitivity
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::OptionsFov
@@ -2859,10 +2901,8 @@ impl ApplicationHandler for Menu<'_> {
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Sound && self.state.asset_load.is_none() =>
             {
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
                 let (_, h) = self.logical_size();
                 self.sound_ui.scroll_by(amount, h);
             }
@@ -2870,46 +2910,49 @@ impl ApplicationHandler for Menu<'_> {
                 if self.state.screen == Screen::Accessibility
                     && self.state.asset_load.is_none() =>
             {
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
                 let (_, h) = self.logical_size();
                 self.accessibility_ui.scroll_by(amount, h);
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Video && self.state.asset_load.is_none() =>
             {
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
                 let (_, h) = self.logical_size();
                 self.video_ui.scroll_by(amount, h);
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Worlds && self.state.asset_load.is_none() =>
             {
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
-                };
-                if amount > 0.0 {
-                    self.state.world_scroll = self.state.world_scroll.saturating_sub(1);
-                } else if amount < 0.0 {
-                    self.state.world_scroll = (self.state.world_scroll + 1)
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
+                let steps = take_scroll_steps(&mut self.state.world_scroll_remainder, amount);
+                if steps > 0 {
+                    self.state.world_scroll =
+                        self.state.world_scroll.saturating_sub(steps as usize);
+                } else if steps < 0 {
+                    self.state.world_scroll = self
+                        .state
+                        .world_scroll
+                        .saturating_add(steps.unsigned_abs() as usize)
                         .min(self.state.worlds.len().saturating_sub(1));
                 }
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Packs && self.state.asset_load.is_none() =>
             {
-                let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
-                };
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
                 let (w, _) = self.logical_size();
-                let (scroll, max) = if self.cursor.0 < w / 2 {
+                let available = self.cursor.0 < w / 2;
+                let steps = if available {
+                    take_scroll_steps(&mut self.state.available_pack_scroll_remainder, amount)
+                } else {
+                    take_scroll_steps(&mut self.state.selected_pack_scroll_remainder, amount)
+                };
+                let (scroll, max) = if available {
                     (
                         &mut self.state.available_pack_scroll,
                         self.state.available_packs.len().saturating_sub(1),
@@ -2917,10 +2960,12 @@ impl ApplicationHandler for Menu<'_> {
                 } else {
                     (&mut self.state.selected_pack_scroll, self.state.packs.len())
                 };
-                if amount > 0.0 {
-                    *scroll = scroll.saturating_sub(1);
-                } else if amount < 0.0 {
-                    *scroll = (*scroll + 1).min(max);
+                if steps > 0 {
+                    *scroll = scroll.saturating_sub(steps as usize);
+                } else if steps < 0 {
+                    *scroll = scroll
+                        .saturating_add(steps.unsigned_abs() as usize)
+                        .min(max);
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -2961,13 +3006,23 @@ impl ApplicationHandler for Menu<'_> {
                         self.state.world_scroll = next + 1 - visible;
                     }
                 } else if self.state.screen == Screen::Mouse
-                    && self.focused == Some(ButtonId::MouseSensitivity)
+                    && self
+                        .focused
+                        .and_then(ButtonId::mouse_control)
+                        .is_some_and(|control| {
+                            matches!(
+                                control,
+                                MouseControl::Sensitivity | MouseControl::WheelSensitivity
+                            )
+                        })
                     && self.mouse_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
                 {
-                    self.state.video_dirty |= self
-                        .mouse_ui
-                        .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
+                    self.state.video_dirty |= self.mouse_ui.arrow(
+                        self.focused.and_then(ButtonId::mouse_control).unwrap(),
+                        code == Some(KeyCode::ArrowRight),
+                        &mut self.state.video,
+                    );
                 } else if self.state.screen == Screen::Sound
                     && self.sound_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -3075,8 +3130,12 @@ impl ApplicationHandler for Menu<'_> {
                             )
                         );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
-                        self.mouse_ui.keyboard_adjust =
-                            self.focused == Some(ButtonId::MouseSensitivity);
+                        self.mouse_ui.keyboard_adjust = self.focused.is_some_and(|id| {
+                            matches!(
+                                id.mouse_control(),
+                                Some(MouseControl::Sensitivity | MouseControl::WheelSensitivity)
+                            )
+                        });
                         self.accessibility_ui.keyboard_adjust = matches!(
                             self.focused,
                             Some(
@@ -3100,7 +3159,10 @@ impl ApplicationHandler for Menu<'_> {
                     if let Some(id) = self.focused
                         && self.buttons().iter().any(|b| b.id == id && b.active)
                     {
-                        if id == ButtonId::MouseSensitivity {
+                        if matches!(
+                            id,
+                            ButtonId::MouseSensitivity | ButtonId::MouseWheelSensitivity
+                        ) {
                             self.mouse_ui.keyboard_adjust = !self.mouse_ui.keyboard_adjust;
                         } else if matches!(id, ButtonId::SoundSlider(_)) {
                             self.sound_ui.keyboard_adjust = !self.sound_ui.keyboard_adjust;
@@ -4374,9 +4436,23 @@ mod tests {
                 assert_eq!(self.menu.state.screen, Screen::Mouse);
                 self.menu.redraw().unwrap();
                 click(&mut self.menu, event_loop, ButtonId::MouseSensitivity, true);
+                click(
+                    &mut self.menu,
+                    event_loop,
+                    ButtonId::MouseWheelSensitivity,
+                    true,
+                );
+                click(
+                    &mut self.menu,
+                    event_loop,
+                    ButtonId::MouseDiscreteScroll,
+                    false,
+                );
                 click(&mut self.menu, event_loop, ButtonId::MouseInvertX, false);
                 click(&mut self.menu, event_loop, ButtonId::MouseInvertY, false);
                 assert_eq!(self.menu.state.video.mouse_sensitivity.value(), 1.0);
+                assert_eq!(self.menu.state.video.mouse_wheel_sensitivity.value(), 10.0);
+                assert!(self.menu.state.video.discrete_mouse_scroll);
                 assert!(
                     self.menu.state.video.invert_mouse_x && self.menu.state.video.invert_mouse_y
                 );
@@ -4387,6 +4463,8 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(saved.video.mouse_sensitivity.value(), 1.0);
+                assert_eq!(saved.video.mouse_wheel_sensitivity.value(), 10.0);
+                assert!(saved.video.discrete_mouse_scroll);
                 assert!(saved.video.invert_mouse_x && saved.video.invert_mouse_y);
                 event_loop.exit();
             }

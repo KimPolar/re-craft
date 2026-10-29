@@ -30,6 +30,7 @@ mod menu_software_worker;
 mod mesh;
 mod mesh_worker;
 mod mouse_look;
+mod mouse_scroll;
 mod mouse_ui;
 mod orb_render;
 mod player_inventory;
@@ -1344,6 +1345,7 @@ struct App {
     session: LocalSession,
     visual_look: visual_look::VisualLook,
     input: InputState,
+    hotbar_scroll: mouse_scroll::HotbarScroll,
     captured: bool,
     ui: Option<GameUi>,
     inventory_wait: Option<u64>,
@@ -1408,6 +1410,7 @@ impl App {
             session,
             visual_look: visual_look::VisualLook::default(),
             input: InputState::default(),
+            hotbar_scroll: mouse_scroll::HotbarScroll::default(),
             captured: false,
             ui,
             inventory_wait: None,
@@ -1804,8 +1807,22 @@ impl ApplicationHandler for App {
                 self.apply_video();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(ui) = &mut self.ui {
-                    ui.pause_scroll(scroll_lines(delta));
+                let amount = mouse_scroll::scaled_axes(mouse_scroll::event_axes(delta), self.video);
+                if self.ui.as_ref().is_some_and(GameUi::paused) {
+                    if let Some(ui) = &mut self.ui {
+                        ui.pause_scroll(amount.1);
+                    }
+                } else {
+                    let snapshot = self.session.snapshot();
+                    if self.captured
+                        && snapshot.death.is_none()
+                        && !snapshot.inventory.is_open()
+                        && let Some(slot) = self
+                            .hotbar_scroll
+                            .select(amount, snapshot.inventory.selected())
+                    {
+                        self.session.submit_command(PlayerCommand::SelectSlot(slot));
+                    }
                 }
             }
             WindowEvent::Focused(focused) => {

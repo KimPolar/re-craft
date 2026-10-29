@@ -34,6 +34,78 @@ impl UnitInterval {
     }
 }
 
+/// Minecraft maps an integer range of -200..=100 through 10^(value / 100).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseWheelSensitivity(i16);
+
+impl MouseWheelSensitivity {
+    pub fn new(value: f64) -> Self {
+        let value = if value.is_finite() {
+            value.clamp(0.01, 10.0)
+        } else {
+            1.0
+        };
+        let step = (value.log10() * 100.0).floor().clamp(-200.0, 100.0);
+        Self(step as i16)
+    }
+
+    pub fn from_slider_fraction(fraction: f64) -> Self {
+        let fraction = if fraction.is_finite() {
+            fraction.clamp(0.0, 0.999_989_986_419_677_7)
+        } else {
+            0.0
+        };
+        let step = (-200.0 + fraction * 301.0).floor().clamp(-200.0, 100.0);
+        Self(step as i16)
+    }
+
+    pub fn slider_fraction(self) -> f64 {
+        if self.0 <= -200 {
+            0.0
+        } else if self.0 >= 100 {
+            1.0
+        } else {
+            (f64::from(self.0 + 200) + 0.5) / 301.0
+        }
+    }
+
+    pub fn value(self) -> f64 {
+        10.0_f64.powf(f64::from(self.0) / 100.0)
+    }
+
+    fn valid_or(self, fallback: f64) -> Self {
+        if (-200..=100).contains(&self.0) {
+            self
+        } else {
+            Self::new(fallback)
+        }
+    }
+}
+
+impl Default for MouseWheelSensitivity {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl Serialize for MouseWheelSensitivity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.value())
+    }
+}
+
+impl<'de> Deserialize<'de> for MouseWheelSensitivity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        if value.is_finite() && (0.01..=10.0).contains(&value) {
+            let step = (value.log10() * 100.0).round().clamp(-200.0, 100.0);
+            Ok(Self(step as i16))
+        } else {
+            Ok(Self::default())
+        }
+    }
+}
+
 impl Serialize for UnitInterval {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_f64(self.value())
@@ -158,6 +230,8 @@ pub struct VideoSettings {
     pub panorama_speed: UnitInterval,
     pub menu_blur: u8,
     pub mouse_sensitivity: UnitInterval,
+    pub mouse_wheel_sensitivity: MouseWheelSensitivity,
+    pub discrete_mouse_scroll: bool,
     pub invert_mouse_x: bool,
     pub invert_mouse_y: bool,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
@@ -194,6 +268,8 @@ impl Default for VideoSettings {
             panorama_speed: UnitInterval::new(1.0),
             menu_blur: 5,
             mouse_sensitivity: UnitInterval::new(0.5),
+            mouse_wheel_sensitivity: MouseWheelSensitivity::default(),
+            discrete_mouse_scroll: false,
             invert_mouse_x: false,
             invert_mouse_y: false,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
@@ -223,6 +299,7 @@ impl VideoSettings {
             glint_strength: self.glint_strength.valid_or(0.75),
             panorama_speed: self.panorama_speed.valid_or(1.0),
             mouse_sensitivity: self.mouse_sensitivity.valid_or(0.5),
+            mouse_wheel_sensitivity: self.mouse_wheel_sensitivity.valid_or(1.0),
             menu_blur: if self.menu_blur <= 10 {
                 self.menu_blur
             } else {
@@ -478,6 +555,8 @@ mod tests {
         .unwrap();
         let video = VideoSettings {
             mouse_sensitivity: UnitInterval::new(0.77),
+            mouse_wheel_sensitivity: MouseWheelSensitivity::new(3.4),
+            discrete_mouse_scroll: true,
             invert_mouse_x: true,
             invert_mouse_y: true,
             ..VideoSettings::default()
@@ -489,8 +568,44 @@ mod tests {
         assert_eq!(saved["video"]["future_video"], true);
         let parsed: Settings = serde_json::from_value(saved).unwrap();
         assert_eq!(parsed.video, video);
-        let invalid: VideoSettings = serde_json::from_str(r#"{"mouse_sensitivity":1.5}"#).unwrap();
+        let invalid: VideoSettings =
+            serde_json::from_str(r#"{"mouse_sensitivity":1.5,"mouse_wheel_sensitivity":12.0}"#)
+                .unwrap();
         assert_eq!(invalid.valid().mouse_sensitivity.value(), 0.5);
+        assert_eq!(invalid.valid().mouse_wheel_sensitivity.value(), 1.0);
+    }
+
+    #[test]
+    fn mouse_wheel_slider_matches_the_301_logarithmic_java_steps() {
+        assert_eq!(
+            MouseWheelSensitivity::from_slider_fraction(0.0).value(),
+            0.01
+        );
+        assert_eq!(MouseWheelSensitivity::default().value(), 1.0);
+        assert_eq!(
+            MouseWheelSensitivity::from_slider_fraction(1.0).value(),
+            10.0
+        );
+        for step in -200_i16..=100 {
+            let fraction = if step <= -200 {
+                0.0
+            } else if step >= 100 {
+                1.0
+            } else {
+                (f64::from(step + 200) + 0.5) / 301.0
+            };
+            let setting = MouseWheelSensitivity::from_slider_fraction(fraction);
+            assert_eq!(setting.0, step, "Java wheel slider exponent {step}");
+            let slider = setting.slider_fraction();
+            assert_eq!(
+                MouseWheelSensitivity::from_slider_fraction(slider),
+                setting,
+                "slider fraction {slider} for exponent {step}"
+            );
+            let bytes = serde_json::to_vec(&setting).unwrap();
+            let decoded: MouseWheelSensitivity = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, setting, "serialized exponent {step}");
+        }
     }
 
     #[test]

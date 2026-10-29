@@ -54,6 +54,8 @@ enum PauseButton {
     Controls,
     MouseSettings,
     MouseSensitivity,
+    MouseWheelSensitivity,
+    MouseDiscreteScroll,
     MouseInvertX,
     MouseInvertY,
     Sound,
@@ -79,6 +81,8 @@ impl PauseButton {
     fn mouse_control(self) -> Option<MouseControl> {
         match self {
             Self::MouseSensitivity => Some(MouseControl::Sensitivity),
+            Self::MouseWheelSensitivity => Some(MouseControl::WheelSensitivity),
+            Self::MouseDiscreteScroll => Some(MouseControl::DiscreteScrolling),
             Self::MouseInvertX => Some(MouseControl::InvertX),
             Self::MouseInvertY => Some(MouseControl::InvertY),
             _ => None,
@@ -557,6 +561,8 @@ impl GameUi {
                 } else {
                     MouseUi::hit(w, self.cursor).map(|control| match control {
                         MouseControl::Sensitivity => PauseButton::MouseSensitivity,
+                        MouseControl::WheelSensitivity => PauseButton::MouseWheelSensitivity,
+                        MouseControl::DiscreteScrolling => PauseButton::MouseDiscreteScroll,
                         MouseControl::InvertX => PauseButton::MouseInvertX,
                         MouseControl::InvertY => PauseButton::MouseInvertY,
                     })
@@ -648,6 +654,25 @@ impl GameUi {
                 } else {
                     self.mouse_ui.keyboard_adjust = !self.mouse_ui.keyboard_adjust;
                 }
+                PauseAction::None
+            }
+            PauseButton::MouseWheelSensitivity => {
+                if mouse {
+                    let (w, _) = self.logical_size();
+                    self.video_dirty |= self.mouse_ui.start_control(
+                        w,
+                        self.cursor.0,
+                        MouseControl::WheelSensitivity,
+                        &mut self.video,
+                    );
+                } else {
+                    self.mouse_ui.keyboard_adjust = !self.mouse_ui.keyboard_adjust;
+                }
+                PauseAction::None
+            }
+            PauseButton::MouseDiscreteScroll => {
+                self.video.discrete_mouse_scroll = !self.video.discrete_mouse_scroll;
+                self.video_dirty = true;
                 PauseAction::None
             }
             PauseButton::MouseInvertX => {
@@ -803,6 +828,7 @@ impl GameUi {
             button,
             PauseButton::Fov
                 | PauseButton::MouseSensitivity
+                | PauseButton::MouseWheelSensitivity
                 | PauseButton::Framerate
                 | PauseButton::VideoBlur
                 | PauseButton::VideoDistance
@@ -974,6 +1000,8 @@ impl GameUi {
                 PausePage::Controls => vec![PauseButton::MouseSettings, PauseButton::Done],
                 PausePage::Mouse => vec![
                     PauseButton::MouseSensitivity,
+                    PauseButton::MouseWheelSensitivity,
+                    PauseButton::MouseDiscreteScroll,
                     PauseButton::MouseInvertX,
                     PauseButton::MouseInvertY,
                     PauseButton::Done,
@@ -1057,7 +1085,12 @@ impl GameUi {
             }
             self.video_ui.keyboard_adjust = false;
             self.fov_ui.keyboard_adjust = self.pause_focus == Some(PauseButton::Fov);
-            self.mouse_ui.keyboard_adjust = self.pause_focus == Some(PauseButton::MouseSensitivity);
+            self.mouse_ui.keyboard_adjust = self.pause_focus.is_some_and(|button| {
+                matches!(
+                    button.mouse_control(),
+                    Some(MouseControl::Sensitivity | MouseControl::WheelSensitivity)
+                )
+            });
             self.sound_ui.keyboard_adjust =
                 matches!(self.pause_focus, Some(PauseButton::SoundSlider(_)));
             self.accessibility_ui.keyboard_adjust = matches!(
@@ -1072,12 +1105,24 @@ impl GameUi {
             self.last_draw = None;
         } else if self.pause_page == PausePage::Mouse
             && self.mouse_ui.keyboard_adjust
-            && self.pause_focus == Some(PauseButton::MouseSensitivity)
+            && self
+                .pause_focus
+                .and_then(PauseButton::mouse_control)
+                .is_some_and(|control| {
+                    matches!(
+                        control,
+                        MouseControl::Sensitivity | MouseControl::WheelSensitivity
+                    )
+                })
             && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
         {
-            self.video_dirty |= self
-                .mouse_ui
-                .arrow(key == KeyCode::ArrowRight, &mut self.video);
+            self.video_dirty |= self.mouse_ui.arrow(
+                self.pause_focus
+                    .and_then(PauseButton::mouse_control)
+                    .unwrap(),
+                key == KeyCode::ArrowRight,
+                &mut self.video,
+            );
             self.last_draw = None;
         } else if self.pause_page == PausePage::Sound
             && self.sound_ui.keyboard_adjust
@@ -1141,6 +1186,7 @@ impl GameUi {
                 button,
                 PauseButton::Fov
                     | PauseButton::MouseSensitivity
+                    | PauseButton::MouseWheelSensitivity
                     | PauseButton::Framerate
                     | PauseButton::VideoBlur
                     | PauseButton::GlintSpeed
@@ -3174,6 +3220,21 @@ mod inventory_tests {
         ui.click();
         ui.pause_release();
         assert_eq!(ui.video.mouse_sensitivity.value(), 1.0);
+        let wheel = mouse_ui::mouse_control_rect(w, MouseControl::WheelSensitivity);
+        ui.cursor_moved(
+            f64::from(wheel.x + wheel.w - 4) * scale,
+            f64::from(wheel.y + 10) * scale,
+        );
+        ui.click();
+        ui.pause_release();
+        assert_eq!(ui.video.mouse_wheel_sensitivity.value(), 10.0);
+        let discrete = mouse_ui::mouse_control_rect(w, MouseControl::DiscreteScrolling);
+        ui.cursor_moved(
+            f64::from(discrete.x + 10) * scale,
+            f64::from(discrete.y + 10) * scale,
+        );
+        ui.click();
+        assert!(ui.video.discrete_mouse_scroll);
         for control in [MouseControl::InvertX, MouseControl::InvertY] {
             let rect = mouse_ui::mouse_control_rect(w, control);
             ui.cursor_moved(

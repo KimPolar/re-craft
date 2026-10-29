@@ -303,6 +303,31 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     None
 }
 
+/// Java's cached `isSolid` for verified vanilla slab and stair states.
+/// The caller must confirm the block ID belongs to the installed registry.
+pub fn slab_stair_solid(state: &BlockState) -> Option<bool> {
+    let name = state.name.strip_prefix("minecraft:")?;
+    let property = |key: &str| state.properties.get(key).map(String::as_str);
+    if !matches!(property("waterlogged"), Some("true" | "false")) {
+        return None;
+    }
+    if name.ends_with("_slab") && state.properties.len() == 2 {
+        return matches!(property("type"), Some("bottom" | "top" | "double")).then_some(true);
+    }
+    if name.ends_with("_stairs") && state.properties.len() == 4 {
+        return (matches!(
+            property("facing"),
+            Some("north" | "south" | "west" | "east")
+        ) && matches!(property("half"), Some("top" | "bottom"))
+            && matches!(
+                property("shape"),
+                Some("straight" | "inner_left" | "inner_right" | "outer_left" | "outer_right")
+            ))
+        .then_some(true);
+    }
+    None
+}
+
 /// CollisionContext.emptyWithFluidCollisions, used by Java's shared-spawn
 /// search. LiquidBlock treats every water and lava level as a full cube in
 /// this context; waterlogged blocks keep their own block collision shape.

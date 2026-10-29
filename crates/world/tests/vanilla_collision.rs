@@ -8,7 +8,7 @@ use std::{
 };
 
 use native_world::{
-    collision::{Aabb, block_outline, block_shape, spawn_collision_shape},
+    collision::{Aabb, block_outline, block_shape, slab_stair_solid, spawn_collision_shape},
     loaded::BlockState,
 };
 
@@ -25,6 +25,8 @@ import net.minecraft.world.item.context.DirectionalPlaceContext;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.world.phys.shapes.CollisionContext;
@@ -43,6 +45,8 @@ public class CollisionOracle {
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             JsonObject record = new JsonObject();
             record.addProperty("id", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+            record.addProperty("solid", state.isSolid());
+            record.addProperty("slab_stair", state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock);
             record.addProperty("replaceable", state.canBeReplaced());
             record.addProperty("fallingFree", FallingBlock.isFree(state));
             world.state = state;
@@ -191,7 +195,8 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
-    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let registry = verified.vanilla_block_ids().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("CollisionOracle.java");
     let output = temp.path().join("collision.json");
@@ -218,6 +223,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
     let mut liquid_checked = 0usize;
+    let mut soil_cover_checked = 0usize;
     let mut failures = Vec::new();
     for entry in records.as_array().unwrap() {
         let id = entry["id"].as_str().unwrap();
@@ -247,6 +253,19 @@ fn implemented_collision_shapes_match_vanilla_states() {
             name: id.to_owned(),
             properties,
         };
+        if id.ends_with("_slab") || id.ends_with("_stairs") {
+            assert!(
+                registry.contains(id),
+                "slab or stair missing from local registry: {id}"
+            );
+            assert_eq!(entry["slab_stair"].as_bool(), Some(true), "{id}");
+            assert_eq!(
+                slab_stair_solid(&state),
+                entry["solid"].as_bool(),
+                "{state:?}"
+            );
+            soil_cover_checked += 1;
+        }
         let Some(actual) = block_shape(&state) else {
             continue;
         };
@@ -329,6 +348,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     }
     assert!(checked > 1000, "only {checked} states were checked");
     assert!(
+        soil_cover_checked > 1000,
+        "only {soil_cover_checked} slab and stair states"
+    );
+    assert!(
         sturdy_checked > 1000,
         "slab and stair support states missing"
     );
@@ -348,6 +371,6 @@ fn implemented_collision_shapes_match_vanilla_states() {
         failures.join("\n")
     );
     println!(
-        "Compared {checked} collision and {outlines_checked} targeting shapes, including {button_states_checked} button states and {sturdy_checked} support faces, against Minecraft 26.3"
+        "Compared {checked} collision and {outlines_checked} targeting shapes, including {button_states_checked} button states, {sturdy_checked} support faces and {soil_cover_checked} slab/stair solidity states, against Minecraft 26.3"
     );
 }

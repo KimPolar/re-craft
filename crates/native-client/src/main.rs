@@ -923,6 +923,7 @@ fn prepare_existing_world(
         session.set_game_master_permission(reader.allow_commands()?);
         match resources.vanilla_block_ids() {
             Ok(registry) => {
+                session.set_vanilla_block_ids(Arc::new(registry.clone()));
                 match native_resources::respawn_tags::load_fire_tag(&mut resources, &registry) {
                     Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),

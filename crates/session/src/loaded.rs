@@ -120,6 +120,7 @@ pub struct LoadedSession {
     soil_deferred_revision: Option<u64>,
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
+    vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     block_drops: bool,
@@ -845,6 +846,11 @@ impl LoadedSession {
         self.soil_deferred_revision = None;
     }
 
+    pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
+        self.vanilla_block_ids = Some(ids);
+        self.soil_deferred_revision = None;
+    }
+
     pub fn set_crafting_recipes(&mut self, recipes: Arc<CraftingRecipes>) {
         self.recipes = Some(recipes);
     }
@@ -1000,6 +1006,7 @@ impl LoadedSession {
             soil_deferred_revision: None,
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
+            vanilla_block_ids: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             block_drops: true,
@@ -3217,6 +3224,20 @@ impl LoadedSession {
         Some(solid)
     }
 
+    fn soil_cover_state(&self, soil: SoilKind, state: &BlockState) -> Option<bool> {
+        if let Some(result) = self.soil_cover(soil, &state.name) {
+            return Some(result);
+        }
+        if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
+            return None;
+        }
+        let solid = native_world::collision::slab_stair_solid(state)?;
+        if solid && soil == SoilKind::Farmland && self.farmland_maintainers.is_none() {
+            return None;
+        }
+        Some(solid)
+    }
+
     fn placement_block(&self, relative: IVec3, block: Block) -> Option<Block> {
         let Some(kind) = SoilKind::from_block(block) else {
             return Some(block);
@@ -3227,7 +3248,7 @@ impl LoadedSession {
             return None;
         };
         let state = self.world.state(id)?;
-        let blocked = self.soil_cover(kind, &state.name)?;
+        let blocked = self.soil_cover_state(kind, state)?;
         Some(placed_soil(block, blocked))
     }
 
@@ -3454,7 +3475,7 @@ impl LoadedSession {
                     return true;
                 };
                 if self.world.state(above).and_then(|state| {
-                    self.soil_cover(SoilKind::from_block(block).unwrap(), &state.name)
+                    self.soil_cover_state(SoilKind::from_block(block).unwrap(), state)
                 }) != Some(false)
                 {
                     return true;
@@ -4056,7 +4077,7 @@ impl LoadedSession {
                     let Some(blocked) = self
                         .world
                         .state(above)
-                        .and_then(|state| self.soil_cover(SoilKind::Farmland, &state.name))
+                        .and_then(|state| self.soil_cover_state(SoilKind::Farmland, state))
                     else {
                         deferred_soil.push((order, (absolute, soil)));
                         continue;
@@ -4420,7 +4441,7 @@ impl LoadedSession {
             let blocked = self
                 .world
                 .state(new)
-                .and_then(|state| self.soil_cover(kind, &state.name));
+                .and_then(|state| self.soil_cover_state(kind, state));
             if blocked == Some(false) || (blocked.is_none() && kind != SoilKind::Farmland) {
                 return;
             }
@@ -10443,6 +10464,68 @@ mod tests {
         assert!(session.soil_deferred.is_empty());
         assert!(
             matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == session.states[2])
+        );
+    }
+
+    #[test]
+    fn verified_slabs_and_stairs_cover_soil_and_unknown_states_are_withheld() {
+        let cases = [
+            state(
+                "minecraft:oak_slab",
+                &[("type", "bottom"), ("waterlogged", "false")],
+            ),
+            state(
+                "minecraft:oak_stairs",
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("shape", "outer_left"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        ];
+        for cover in cases {
+            for (kind, soil) in [
+                (SoilKind::Path, Block::DirtPath),
+                (SoilKind::Farmland, Block::Farmland(0)),
+            ] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(BTreeSet::from([cover.name.clone()])));
+                let relative = IVec3::new(8, 2, 6);
+                let cover_id = session.intern_block(cover.clone());
+                assert!(session.set(relative + IVec3::Y, cover_id));
+                assert_eq!(session.placement_block(relative, soil), Some(Block::Dirt));
+                let soil_id = session.placement_id(soil);
+                assert!(session.set(relative, soil_id));
+                assert!(session.set(relative + IVec3::Y, session.states[0]));
+                assert!(session.set(relative + IVec3::Y, cover_id));
+                assert_eq!(session.soil_ticks.len(), 1, "{kind:?} {cover:?}");
+                session.update(TICK * 2);
+                assert!(
+                    matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == session.states[2])
+                );
+            }
+        }
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_slab".into()])));
+        let invalid = state(
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "invalid")],
+        );
+        let fake = state(
+            "minecraft:unknown_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        );
+        assert_eq!(session.soil_cover_state(SoilKind::Path, &invalid), None);
+        assert_eq!(session.soil_cover_state(SoilKind::Path, &fake), None);
+        let valid = state(
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        );
+        session.set_farmland_maintainers(Arc::new(BTreeSet::from([valid.name.clone()])));
+        assert_eq!(
+            session.soil_cover_state(SoilKind::Farmland, &valid),
+            Some(false)
         );
     }
 

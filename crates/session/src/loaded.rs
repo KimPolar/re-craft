@@ -3790,44 +3790,142 @@ impl LoadedSession {
         self.button_sounds.drain(..).collect()
     }
 
-    fn advance_button_ticks(&mut self) {
+    fn advance_block_ticks(&mut self) {
+        self.advance_scheduled_block_ticks(true, true);
+    }
+
+    #[cfg(test)]
+    fn advance_sand_ticks(&mut self) {
+        self.advance_scheduled_block_ticks(true, false);
+    }
+
+    fn advance_scheduled_block_ticks(&mut self, process_sand: bool, process_buttons: bool) {
         let revision = self.revision;
-        if self.button_deferred_revision != Some(revision) {
+        if process_sand && self.sand_deferred_revision != Some(revision) {
+            self.sand_ticks.append(&mut self.sand_deferred);
+        }
+        if process_buttons && self.button_deferred_revision != Some(revision) {
             self.button_ticks.append(&mut self.button_deferred);
         }
-        let mut deferred = Vec::new();
+        let mut deferred_sand = Vec::new();
+        let mut deferred_buttons = Vec::new();
         let mut executed = 0;
-        while let Some((&order, &key)) = self.button_ticks.first_key_value() {
-            if order.0 > i128::from(self.tick) || executed >= 65_536 {
+        while executed < 65_536 {
+            let sand_order = process_sand
+                .then(|| self.sand_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
+            let button_order = process_buttons
+                .then(|| self.button_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
+            let process_sand_next = match (sand_order, button_order) {
+                (Some(sand), Some(button)) => sand <= button,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let order = if process_sand_next {
+                sand_order.expect("selected sand tick has an order")
+            } else {
+                button_order.expect("selected button tick has an order")
+            };
+            if order.0 > i128::from(self.tick) {
                 break;
             }
-            self.button_ticks.pop_first();
-            let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
-                deferred.push((order, key));
-                continue;
-            };
-            if matches!(
-                cell(
+            if process_sand_next {
+                let (order, key) = self
+                    .sand_ticks
+                    .pop_first()
+                    .expect("selected sand tick remains queued");
+                let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    deferred_sand.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
                     &self.world,
                     self.origin,
                     self.bounds,
                     relative,
-                    self.states[0]
-                ),
-                Cell::Missing
-            ) {
-                deferred.push((order, key));
-                continue;
-            }
-            self.mark_tick_chunk_dirty(key.0, key.2);
-            self.button_pending.remove(&key);
-            executed += 1;
-            if self.set_stone_button_power(relative, false) {
-                self.push_button_sound(relative, false);
+                    self.states[0],
+                ) else {
+                    deferred_sand.push((order, key));
+                    continue;
+                };
+                self.mark_tick_chunk_dirty(key.x, key.z);
+                if self
+                    .world
+                    .state(id)
+                    .is_none_or(|state| state.name != key.kind.id())
+                {
+                    self.sand_pending.remove(&key);
+                    executed += 1;
+                    continue;
+                }
+                let Some(below) = add(relative, IVec3::NEG_Y) else {
+                    deferred_sand.push((order, key));
+                    continue;
+                };
+                let Some(free) = self.falling_support_is_free(below) else {
+                    deferred_sand.push((order, key));
+                    continue;
+                };
+                self.sand_pending.remove(&key);
+                executed += 1;
+                if free && key.y >= self.bounds.min_y {
+                    let motion = crate::falling_block::AirborneMotion::from_block(IVec3::new(
+                        key.x, key.y, key.z,
+                    ));
+                    if self.set(relative, self.states[0]) {
+                        self.falling_sand.push(FallingSand {
+                            previous: motion.position,
+                            motion,
+                            kind: key.kind,
+                            drop_item: true,
+                            cancel_drop: false,
+                            on_ground: false,
+                            source: None,
+                        });
+                    }
+                }
+            } else {
+                let (order, key) = self
+                    .button_ticks
+                    .pop_first()
+                    .expect("selected button tick remains queued");
+                let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    deferred_buttons.push((order, key));
+                    continue;
+                };
+                if matches!(
+                    cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        relative,
+                        self.states[0]
+                    ),
+                    Cell::Missing
+                ) {
+                    deferred_buttons.push((order, key));
+                    continue;
+                }
+                self.mark_tick_chunk_dirty(key.0, key.2);
+                self.button_pending.remove(&key);
+                executed += 1;
+                if self.set_stone_button_power(relative, false) {
+                    self.push_button_sound(relative, false);
+                }
             }
         }
-        self.button_deferred.extend(deferred);
-        self.button_deferred_revision = Some(revision);
+        if process_sand {
+            self.sand_deferred.extend(deferred_sand);
+            // Block edits during this pass may have resolved an earlier deferred
+            // tick. Compare against the revision at entry again on the next tick.
+            self.sand_deferred_revision = Some(revision);
+        }
+        if process_buttons {
+            self.button_deferred.extend(deferred_buttons);
+            self.button_deferred_revision = Some(revision);
+        }
     }
 
     fn schedule_sand(&mut self, relative: IVec3, kind: FallingKind) {
@@ -3874,72 +3972,6 @@ impl LoadedSession {
             })
             .collect::<Vec<_>>()
             .into()
-    }
-
-    fn advance_sand_ticks(&mut self) {
-        let revision = self.revision;
-        if self.sand_deferred_revision != Some(revision) {
-            self.sand_ticks.append(&mut self.sand_deferred);
-        }
-        let mut deferred = Vec::new();
-        let mut executed = 0;
-        while let Some((&order, &key)) = self.sand_ticks.first_key_value() {
-            if order.0 > i128::from(self.tick) || executed >= 65_536 {
-                break;
-            }
-            self.sand_ticks.pop_first();
-            let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
-                deferred.push((order, key));
-                continue;
-            };
-            let Cell::State(id) = cell(
-                &self.world,
-                self.origin,
-                self.bounds,
-                relative,
-                self.states[0],
-            ) else {
-                deferred.push((order, key));
-                continue;
-            };
-            self.mark_tick_chunk_dirty(key.x, key.z);
-            let name = key.kind.id();
-            if self.world.state(id).is_none_or(|state| state.name != name) {
-                self.sand_pending.remove(&key);
-                executed += 1;
-                continue;
-            }
-            let Some(below) = add(relative, IVec3::NEG_Y) else {
-                deferred.push((order, key));
-                continue;
-            };
-            let Some(free) = self.falling_support_is_free(below) else {
-                deferred.push((order, key));
-                continue;
-            };
-            self.sand_pending.remove(&key);
-            executed += 1;
-            if free && key.y >= self.bounds.min_y {
-                let motion = crate::falling_block::AirborneMotion::from_block(IVec3::new(
-                    key.x, key.y, key.z,
-                ));
-                if self.set(relative, self.states[0]) {
-                    self.falling_sand.push(FallingSand {
-                        previous: motion.position,
-                        motion,
-                        kind: key.kind,
-                        drop_item: true,
-                        cancel_drop: false,
-                        on_ground: false,
-                        source: None,
-                    });
-                }
-            }
-        }
-        self.sand_deferred.extend(deferred);
-        // Block edits during this pass may have resolved an earlier deferred
-        // tick. Compare against the revision at entry again on the next tick.
-        self.sand_deferred_revision = Some(revision);
     }
 
     fn falling_support_is_free(&self, relative: IVec3) -> Option<bool> {
@@ -4511,8 +4543,7 @@ impl LoadedSession {
         self.apply_streaming();
         self.advance_soil_ticks();
         self.advance_fluid_ticks();
-        self.advance_sand_ticks();
-        self.advance_button_ticks();
+        self.advance_block_ticks();
         self.advance_falling_sand();
         if self.death.is_some() {
             let requested = self
@@ -11366,6 +11397,61 @@ mod tests {
 
         let drafted = session.draft_block_ticks(home).unwrap();
         assert_eq!(drafted, source_ticks);
+    }
+
+    #[test]
+    fn falling_and_button_ticks_share_the_per_tick_work_limit() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let button_relative = IVec3::new(8, 2, 7);
+        let button_absolute = session.origin + button_relative;
+        let mut button = stone_button_state(IVec3::Z, 0.0).unwrap();
+        button.properties.insert("powered".into(), "true".into());
+        let button_id = session.intern_block(button);
+        assert!(session.set(button_relative, button_id));
+
+        let saved_sand = SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: (session.origin + IVec3::new(9, 2, 7)).to_array(),
+            delay: 0,
+            priority: 0,
+        };
+        session.enqueue_saved_sand(&vec![saved_sand; 65_536]);
+        session.enqueue_saved_buttons(&[SavedBlockTick {
+            block: "minecraft:stone_button".into(),
+            position: button_absolute.to_array(),
+            delay: 0,
+            priority: 0,
+        }]);
+
+        session.advance_block_ticks();
+        assert_eq!(session.sand_ticks.len(), 0);
+        assert_eq!(session.button_ticks.len(), 1);
+        assert!(session.button_pending.contains(&(
+            button_absolute.x,
+            button_absolute.y,
+            button_absolute.z
+        )));
+        assert_eq!(
+            session
+                .world
+                .block(button_absolute.x, button_absolute.y, button_absolute.z)
+                .unwrap()
+                .properties["powered"],
+            "true"
+        );
+
+        session.advance_block_ticks();
+        assert!(session.button_ticks.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(button_absolute.x, button_absolute.y, button_absolute.z)
+                .unwrap()
+                .properties["powered"],
+            "false"
+        );
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
     }
 
     #[test]

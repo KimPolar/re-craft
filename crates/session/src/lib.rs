@@ -148,6 +148,8 @@ pub enum PlayerCommand {
     DropCursor {
         button: ClickButton,
     },
+    /// Pick the targeted supported block into the hotbar.
+    PickBlock,
     /// Begin holding the attack button; `StopBreak` ends the hold.
     Break,
     StopBreak,
@@ -973,6 +975,24 @@ impl LocalSession {
                 PlayerCommand::DropSelected { .. }
                 | PlayerCommand::InventoryThrow { .. }
                 | PlayerCommand::DropCursor { .. } => {}
+                PlayerCommand::PickBlock
+                    if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
+                {
+                    let reach = if self.game_mode == GameMode::Creative {
+                        5.0
+                    } else {
+                        4.5
+                    };
+                    if let Some(hit) =
+                        self.world
+                            .raycast(self.player.eye(), self.player.direction(), reach)
+                        && let Some(item) = picked_block_item(self.world.block(hit.position))
+                    {
+                        Arc::make_mut(&mut self.inventory)
+                            .pick_item(item, self.game_mode == GameMode::Creative);
+                    }
+                }
+                PlayerCommand::PickBlock => {}
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
@@ -1890,6 +1910,15 @@ fn select_block(inventory: &mut Arc<PlayerInventory>, block: Block) {
     }) {
         Arc::make_mut(inventory).select(slot);
     }
+}
+
+fn picked_block_item(block: Block) -> Option<inventory::ItemStack> {
+    inventory::ItemStack::new(
+        block.item_id()?.into(),
+        1,
+        64,
+        native_persistence::nbt::Tag::Compound(vec![]),
+    )
 }
 
 fn player_intersects_block(player: PlayerState, position: IVec3, block: Block) -> bool {
@@ -2902,6 +2931,65 @@ mod tests {
         assert_eq!(old.game_mode, GameMode::Survival);
         assert_eq!(new.game_mode, GameMode::Spectator);
         assert!(Arc::ptr_eq(&old.inventory, &new.inventory));
+    }
+
+    #[test]
+    fn pick_block_obeys_game_mode() {
+        use inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+        for mode in [GameMode::Creative, GameMode::Survival, GameMode::Spectator] {
+            let mut world = World::demo();
+            world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+            let mut session = LocalSession::new(world);
+            session.set_game_mode(mode);
+            let mut inventory = PlayerInventory::default();
+            if mode != GameMode::Creative {
+                inventory.set_slot(
+                    PlayerSlot::Storage(12),
+                    ItemStack::new("minecraft:stone".into(), 10, 64, Tag::Compound(vec![])),
+                );
+            }
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::PickBlock);
+            session.update(TICK);
+            let snapshot = session.snapshot();
+            let selected = snapshot
+                .inventory
+                .slot(PlayerSlot::Storage(snapshot.inventory.selected()));
+            match mode {
+                GameMode::Creative => assert_eq!(selected.unwrap().count(), 1),
+                GameMode::Survival => assert_eq!(selected.unwrap().count(), 10),
+                GameMode::Spectator => assert!(selected.is_none()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn pick_block_uses_the_mode_reach() {
+        use inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            let mut world = World::default();
+            world.set_block(IVec3::new(0, 4, 0), Block::Stone);
+            let mut session = LocalSession::new(world);
+            session.player.position.z = 5.75;
+            session.motion.position.z = 5.75;
+            session.set_game_mode(mode);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(12),
+                ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::PickBlock);
+            session.update(TICK);
+            let snapshot = session.snapshot();
+            assert_eq!(
+                snapshot.inventory.slot(PlayerSlot::Storage(0)).is_some(),
+                mode == GameMode::Creative
+            );
+        }
     }
 
     #[test]

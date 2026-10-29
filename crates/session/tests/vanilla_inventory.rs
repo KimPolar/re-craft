@@ -133,6 +133,30 @@ public class InventoryOracle {
         JsonArray results = new JsonArray();
         for (var value : cases) {
             JsonObject input = value.getAsJsonObject();
+            if (input.has("pick")) {
+                var spec=input.getAsJsonObject("pick");
+                player.testInventory=new Inventory(player,new EntityEquipment());
+                for(int i=0;i<36;i++) player.testInventory.setItem(i,stack(spec.getAsJsonArray("slots").get(i).getAsJsonArray()));
+                player.testInventory.setSelectedSlot(spec.get("selected").getAsInt());
+                ItemStack item=stack(spec.getAsJsonArray("item"));
+                int index=player.testInventory.findSlotMatchingItem(item);
+                if (Inventory.isHotbarSlot(index)) player.testInventory.setSelectedSlot(index);
+                else if (index != -1) player.testInventory.pickSlot(index);
+                else if (spec.get("creative").getAsBoolean()) player.testInventory.addAndPickItem(item);
+                JsonArray result=new JsonArray(), slots=new JsonArray();
+                for(int i=0;i<36;i++) slots.add(output(player.testInventory.getItem(i)));
+                result.add(player.testInventory.getSelectedSlot()); result.add(slots); results.add(result); continue;
+            }
+            if (input.has("cloneBlock")) {
+                var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(Identifier.parse(input.get("cloneBlock").getAsString()));
+                block.asItem().builtInRegistryHolder().bindComponents(DataComponentMap.builder().set(DataComponents.MAX_STACK_SIZE,64).build());
+                JsonArray result=new JsonArray();
+                for(var state : block.getStateDefinition().getPossibleStates()) {
+                    var item=state.getCloneItemStack(null, net.minecraft.core.BlockPos.ZERO, false);
+                    result.add(item.isEmpty() ? "minecraft:air" : net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(item.getItem()).toString());
+                }
+                results.add(result); continue;
+            }
             if (input.has("drag")) {
                 var spec=input.getAsJsonObject("drag"); boolean table=spec.get("table").getAsBoolean();
                 player.testAbilities.instabuild=false;
@@ -470,6 +494,139 @@ fn output(stack: &Option<ItemStack>) -> Value {
         _ => unreachable!(),
     };
     json!([id, stack.count()])
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn pick_block_and_hotbar_selection_match_vanilla() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let mut cases = Vec::new();
+    for seed in 0..270_u32 {
+        let slots: Vec<Value> = (0..36_u32)
+            .map(|index| {
+                let code = (seed
+                    .wrapping_mul(101)
+                    .wrapping_add(index * 67)
+                    .wrapping_add(seed * index * 7))
+                    % 19;
+                if code < seed % 8 {
+                    json!([0, 0])
+                } else {
+                    json!([
+                        match code % 5 {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            3 => 5,
+                            _ => 9,
+                        },
+                        1 + code % 12
+                    ])
+                }
+            })
+            .collect();
+        cases.push(json!({"pick": {"slots": slots, "selected": seed % 9, "creative": seed % 2 == 0, "item": [if seed % 3 == 0 { 1 } else { 5 }, 1]}}));
+    }
+    for selected in 0..9 {
+        for creative in [false, true] {
+            for scenario in 0..5 {
+                let mut slots = vec![json!([2, 17]); 36];
+                match scenario {
+                    0 => slots[selected] = json!([0, 0]),
+                    1 => slots[25] = json!([0, 0]),
+                    2 => slots[15] = json!([1, 23]),
+                    3 => {
+                        slots[2] = json!([1, 5]);
+                        slots[15] = json!([1, 23]);
+                    }
+                    _ => {}
+                }
+                cases.push(json!({"pick": {"slots": slots, "selected": selected, "creative": creative, "item": [1, 1]}}));
+            }
+        }
+    }
+    let mut block_ids: Vec<&str> = vec![
+        "minecraft:grass_block",
+        "minecraft:dirt",
+        "minecraft:sand",
+        "minecraft:red_sand",
+        "minecraft:gravel",
+        "minecraft:coarse_dirt",
+        "minecraft:rooted_dirt",
+        "minecraft:podzol",
+        "minecraft:mycelium",
+        "minecraft:dirt_path",
+        "minecraft:farmland",
+        "minecraft:stone",
+        "minecraft:stone_bricks",
+        "minecraft:cobblestone",
+        "minecraft:crafting_table",
+    ];
+    block_ids.extend(
+        native_core::wood::Planks::ALL
+            .into_iter()
+            .map(|block| block.id()),
+    );
+    block_ids.extend(native_core::wood::Wood::all().map(|block| block.id()));
+    for id in &block_ids {
+        cases.push(json!({"cloneBlock": id}));
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("InventoryOracle.java");
+    let input = temp.path().join("input.json");
+    let output_file = temp.path().join("output.json");
+    std::fs::write(&source, ORACLE).unwrap();
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .args(["-encoding", "UTF-8", "-classpath"])
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("InventoryOracle")
+        .arg(&input)
+        .arg(&output_file));
+    let expected: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(output_file).unwrap()).unwrap();
+    assert_eq!(expected.len(), cases.len());
+    for (case, expected) in cases.iter().zip(expected) {
+        if let Some(spec) = case.get("pick") {
+            let mut inventory = PlayerInventory::default();
+            for (index, value) in spec["slots"].as_array().unwrap().iter().enumerate() {
+                let pair = [
+                    value[0].as_u64().unwrap() as u32,
+                    value[1].as_u64().unwrap() as u32,
+                ];
+                inventory.set_slot(PlayerSlot::Storage(index as u8), stack(pair));
+            }
+            inventory.select(spec["selected"].as_u64().unwrap() as u8);
+            let item = &spec["item"];
+            inventory.pick_item(
+                stack([item[0].as_u64().unwrap() as u32, 1]).unwrap(),
+                spec["creative"].as_bool().unwrap(),
+            );
+            let slots: Vec<Value> = (0..36)
+                .map(|index| output(&inventory.slot(PlayerSlot::Storage(index)).cloned()))
+                .collect();
+            assert_eq!(
+                json!([inventory.selected(), slots]),
+                expected,
+                "case {case}"
+            );
+        } else {
+            let id = case["cloneBlock"].as_str().unwrap();
+            let expected_id = id;
+            for value in expected.as_array().unwrap() {
+                assert_eq!(value.as_str().unwrap(), expected_id, "{id}");
+            }
+        }
+    }
 }
 
 #[test]

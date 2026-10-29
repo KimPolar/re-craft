@@ -2057,6 +2057,9 @@ impl ApplicationHandler for App {
                 } else {
                     match button {
                         MouseButton::Left => self.session.submit_command(PlayerCommand::Break),
+                        MouseButton::Middle => {
+                            self.session.submit_command(PlayerCommand::PickBlock)
+                        }
                         MouseButton::Right => {
                             self.session.submit_command(PlayerCommand::UseHeld(true));
                             self.session.submit_command(PlayerCommand::Place);

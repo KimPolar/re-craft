@@ -870,6 +870,70 @@ impl PlayerInventory {
         true
     }
 
+    /// Select a matching stack, or create the picked stack in creative mode.
+    /// Unknown saved components are left untouched when they could affect the choice.
+    pub fn pick_item(&mut self, item: ItemStack, creative: bool) -> bool {
+        if self.is_open() || item.max_count.is_none() {
+            return false;
+        }
+        let mut found = None;
+        for (index, stack) in self.storage.iter().enumerate() {
+            if let Some(stack) = stack
+                && stack.id == item.id
+            {
+                if stack.max_count.is_none() {
+                    return false;
+                }
+                if stack.same_item_and_components(&item) {
+                    found = Some(index);
+                    break;
+                }
+            }
+        }
+        if let Some(index) = found
+            && index < 9
+        {
+            return self.select(index as u8);
+        }
+        if found.is_none() && !creative {
+            return false;
+        }
+        let indices = (0..9).map(|offset| (self.selected as usize + offset) % 9);
+        let target = if let Some(empty) = indices.clone().find(|&i| self.storage[i].is_none()) {
+            empty
+        } else {
+            let mut target = self.selected as usize;
+            for index in indices {
+                let stack = self.storage[index].as_ref().unwrap();
+                if stack.max_count.is_none() {
+                    return false;
+                }
+                match item_enchantments(stack) {
+                    Ok(enchantments) if enchantments.is_empty() => {
+                        target = index;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            target
+        };
+        self.selected = target as u8;
+        if let Some(index) = found {
+            self.storage.swap(target, index);
+        } else {
+            if self.storage[target].is_some()
+                && let Some(free) = self.storage.iter().position(Option::is_none)
+            {
+                self.storage[free] = self.storage[target].take();
+            }
+            self.storage[target] = Some(item);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
     /// Exchange the selected hotbar stack and offhand outside a container.
     /// No item components need to be interpreted for this operation.
     pub fn swap_hands(&mut self) -> bool {
@@ -2320,6 +2384,48 @@ fn equal_tag(a: &Tag, b: &Tag) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_item_preserves_enchanted_slots_and_unresolved_items() {
+        let stack = |id: &str, components| ItemStack::new(id.into(), 1, 64, components).unwrap();
+        let plain = || Tag::Compound(vec![]);
+        let enchanted = || {
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:unbreaking".into(), Tag::Int(1))]),
+            )])
+        };
+        let mut inventory = PlayerInventory::default();
+        for i in 0..9 {
+            inventory.set_slot(
+                PlayerSlot::Storage(i),
+                Some(stack("minecraft:dirt", enchanted())),
+            );
+        }
+        inventory.set_slot(
+            PlayerSlot::Storage(5),
+            Some(stack("minecraft:dirt", plain())),
+        );
+        inventory.select(3);
+        assert!(inventory.pick_item(stack("minecraft:stone", plain()), true));
+        assert_eq!(inventory.selected(), 5);
+        assert_eq!(
+            inventory.slot(PlayerSlot::Storage(9)).unwrap().id(),
+            "minecraft:dirt"
+        );
+        assert_eq!(
+            inventory.slot(PlayerSlot::Storage(5)).unwrap().id(),
+            "minecraft:stone"
+        );
+
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::unresolved("minecraft:stone".into(), 1, plain()),
+        );
+        let before = inventory.clone();
+        assert!(!inventory.pick_item(stack("minecraft:stone", plain()), true));
+        assert_eq!(inventory, before);
+    }
 
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

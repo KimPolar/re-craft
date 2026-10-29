@@ -5086,6 +5086,35 @@ impl LoadedSession {
                 PlayerCommand::DropSelected { .. }
                 | PlayerCommand::InventoryThrow { .. }
                 | PlayerCommand::DropCursor { .. } => {}
+                PlayerCommand::PickBlock
+                    if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
+                {
+                    let reach = if self.game_mode == GameMode::Creative {
+                        5.0
+                    } else {
+                        4.5
+                    };
+                    if let Some(hit) = self.ray_hit()
+                        && hit.location.distance_squared(self.player.eye().as_dvec3())
+                            <= reach * reach
+                        && let Cell::State(id) = cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            hit.position,
+                            self.states[0],
+                        )
+                        && let Some(block) = self
+                            .world
+                            .state(id)
+                            .and_then(|state| Block::from_item_id(&state.name))
+                        && let Some(item) = crate::picked_block_item(block)
+                    {
+                        Arc::make_mut(&mut self.inventory)
+                            .pick_item(item, self.game_mode == GameMode::Creative);
+                    }
+                }
+                PlayerCommand::PickBlock => {}
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
@@ -6725,6 +6754,24 @@ mod tests {
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn pick_block_selects_the_target_in_loaded_worlds() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        session.set_player_inventory(PlayerInventory::default());
+        assert_eq!(session.ray_hit().unwrap().position, IVec3::new(8, 2, 6));
+        session.submit_command(PlayerCommand::PickBlock);
+        session.update(TICK);
+        let inventory = &session.snapshot().inventory;
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(inventory.selected()))
+                .unwrap()
+                .id(),
+            "minecraft:stone"
+        );
     }
 
     #[test]

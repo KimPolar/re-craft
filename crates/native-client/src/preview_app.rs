@@ -1271,6 +1271,9 @@ impl ApplicationHandler for Viewer {
                 } else if let Some(play) = &mut self.play {
                     match button {
                         MouseButton::Left => play.session.submit_command(PlayerCommand::Break),
+                        MouseButton::Middle => {
+                            play.session.submit_command(PlayerCommand::PickBlock)
+                        }
                         MouseButton::Right => {
                             play.session.submit_command(PlayerCommand::UseHeld(true));
                             play.session.submit_command(PlayerCommand::Place);

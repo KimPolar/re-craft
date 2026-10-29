@@ -3199,6 +3199,9 @@ impl LoadedSession {
     }
 
     fn soil_cover(&self, soil: SoilKind, name: &str) -> Option<bool> {
+        if soil == SoilKind::Path && is_vanilla_fence_gate(name) {
+            return Some(false);
+        }
         if soil == SoilKind::Farmland
             && self
                 .farmland_maintainers
@@ -6065,7 +6068,9 @@ impl crate::respawn::DismountWorld for LoadedDismountView<'_> {
 
 /// Only classify solidness for blocks whose ordinary behavior is known.
 fn known_soil_cover(name: &str) -> Option<bool> {
-    if matches!(
+    if is_vanilla_fence_gate(name) {
+        Some(true)
+    } else if matches!(
         name,
         "minecraft:air"
             | "minecraft:cave_air"
@@ -6077,6 +6082,21 @@ fn known_soil_cover(name: &str) -> Option<bool> {
     } else {
         Block::from_item_id(name).map(Block::is_solid)
     }
+}
+
+fn is_vanilla_fence_gate(name: &str) -> bool {
+    let Some(family) = name
+        .strip_prefix("minecraft:")
+        .and_then(|id| id.strip_suffix("_fence_gate"))
+    else {
+        return false;
+    };
+    native_core::wood::Planks::ALL.into_iter().any(|wood| {
+        wood.id()
+            .strip_prefix("minecraft:")
+            .and_then(|id| id.strip_suffix("_planks"))
+            == Some(family)
+    })
 }
 
 fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
@@ -10277,6 +10297,133 @@ mod tests {
                 .unwrap()
                 .name,
             "minecraft:dirt"
+        );
+    }
+
+    #[test]
+    fn vanilla_fence_gates_allow_dirt_path_underneath() {
+        for wood in native_core::wood::Planks::ALL {
+            let family = wood.id().strip_suffix("_planks").unwrap();
+            let gate = format!("{family}_fence_gate");
+            let mut session = session();
+            let relative = IVec3::new(8, 2, 6);
+            let gate_id = session.intern_block(state(&gate, &[]));
+            assert!(session.set(relative + IVec3::Y, gate_id));
+            assert_eq!(
+                session.placement_block(relative, Block::DirtPath),
+                Some(Block::DirtPath)
+            );
+            assert_eq!(
+                session.placement_block(relative, Block::Farmland(0)),
+                Some(Block::Dirt)
+            );
+            session.set_farmland_maintainers(Arc::new(BTreeSet::from([gate.clone()])));
+            assert_eq!(
+                session.placement_block(relative, Block::Farmland(0)),
+                Some(Block::Farmland(0))
+            );
+            let path = session.intern_block(state("minecraft:dirt_path", &[]));
+            assert!(session.set(relative, path));
+            assert!(session.set(relative + IVec3::Y, session.states[0]));
+            assert!(session.set(relative + IVec3::Y, gate_id));
+            assert!(session.soil_ticks.is_empty());
+            session.update(TICK * 3);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == path)
+            );
+            let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+            assert!(session.set(relative, farmland));
+            assert!(session.set(relative + IVec3::Y, session.states[0]));
+            assert!(session.set(relative + IVec3::Y, gate_id));
+            assert!(session.soil_ticks.is_empty());
+            session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
+            assert!(session.set(relative + IVec3::Y, session.states[0]));
+            assert!(session.set(relative + IVec3::Y, gate_id));
+            assert_eq!(session.soil_ticks.len(), 1);
+            session.update(TICK * 2);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == session.states[2])
+            );
+        }
+        assert!(!is_vanilla_fence_gate("custom:oak_fence_gate"));
+        assert!(!is_vanilla_fence_gate("minecraft:unknown_fence_gate"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn dirt_path_fence_gate_survival_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SoilGateOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/SoilGateOracle.java")).unwrap();
+        let output = temp.path().join("results.json");
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java soil oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SoilGateOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let mut ids = BTreeSet::new();
+        let session = session();
+        let mut solid_values = BTreeSet::new();
+        for row in &rows {
+            let id = row["id"].as_str().unwrap();
+            ids.insert(id.to_owned());
+            solid_values.insert(row["solid"].as_bool().unwrap());
+            assert_eq!(
+                session.soil_cover(SoilKind::Path, id),
+                Some(!row["path_survives"].as_bool().unwrap()),
+                "{row}"
+            );
+            assert_eq!(
+                session.soil_cover(SoilKind::Farmland, id),
+                Some(row["solid"].as_bool().unwrap()),
+                "{row}"
+            );
+        }
+        let expected: BTreeSet<_> = native_core::wood::Planks::ALL
+            .into_iter()
+            .map(|wood| format!("{}_fence_gate", wood.id().strip_suffix("_planks").unwrap()))
+            .collect();
+        assert_eq!(ids, expected);
+        println!(
+            "Compared {} gate states; solid values: {:?}",
+            rows.len(),
+            solid_values
         );
     }
 

@@ -1,0 +1,132 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: write
+
+# Do not let two pushes to the release branch choose the same version.
+# A bounded queue retains up to 100 pending runs per branch.
+concurrency:
+  group: recraft-${{ github.ref }}
+  queue: max
+
+jobs:
+  windows:
+    if: ${{ !github.event.deleted }}
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Check out the pushed commit and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain selection failed' }
+          rustup target add x86_64-pc-windows-msvc --toolchain stable
+          if ($LASTEXITCODE -ne 0) { throw 'Windows x64 target installation failed' }
+
+      - name: Test versioning
+        run: python -m unittest discover -s scripts -p test_release_version.py -v
+
+      - name: Validate new commit subjects
+        shell: pwsh
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: python scripts/release_version.py validate --before "$env:PUSH_BEFORE" --head "$env:PUSH_HEAD"
+
+      - name: Determine Re-Craft version
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          git fetch --tags origin
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to refresh release tags' }
+          $published = gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to list published releases' }
+          $tagsFile = Join-Path $env:RUNNER_TEMP 'published-tags.txt'
+          [IO.File]::WriteAllLines($tagsFile, [string[]]@($published), [Text.UTF8Encoding]::new($false))
+          $result = (python scripts/release_version.py plan --before "$env:PUSH_BEFORE" --head "$env:PUSH_HEAD" --published-tags-file "$tagsFile")
+          if ($LASTEXITCODE -ne 0) { throw 'Version calculation failed' }
+          $parts = $result.Trim() -split ' '
+          if ($parts.Count -ne 2) { throw "Unexpected version result: $result" }
+          "version=$($parts[0])" >> $env:GITHUB_OUTPUT
+          "kind=$($parts[1])" >> $env:GITHUB_OUTPUT
+          Write-Host "Re-Craft $($parts[0]) ($($parts[1])); Minecraft base 26.3"
+
+      - name: Stamp workspace version
+        run: python scripts/release_version.py stamp ${{ steps.version.outputs.version }}
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows x64 release EXE
+        run: cargo build --release --locked -p native-client --target x86_64-pc-windows-msvc
+
+      - name: Prepare executable
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/native-client.exe' "dist/Re-Craft-$env:VERSION-windows-x64.exe"
+
+      - name: Upload branch build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Re-Craft-${{ steps.version.outputs.version }}-${{ github.sha }}-windows-x64
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Create or resume release
+        if: ${{ github.ref_name == github.event.repository.default_branch && steps.version.outputs.kind != 'superseded' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $tag = "v$env:VERSION"
+          $asset = "dist/Re-Craft-$env:VERSION-windows-x64.exe"
+          git show-ref --verify --quiet "refs/tags/$tag"
+          if ($LASTEXITCODE -eq 0) {
+            $target = (git rev-list -n 1 $tag).Trim()
+            if ($LASTEXITCODE -ne 0 -or $target -ne $env:GITHUB_SHA) { throw "Tag $tag points to a different commit" }
+          } else {
+            git tag $tag $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create release tag' }
+            git push origin "refs/tags/$tag"
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to publish release tag' }
+          }
+          $draft = gh release view $tag --json isDraft --jq '.isDraft' 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if ($draft -eq 'true') {
+              gh release upload $tag $asset --clobber
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to upload release executable' }
+              gh release edit $tag --draft=false
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to publish draft release' }
+            } else {
+              Write-Host "Release $tag already exists; leaving it unchanged."
+            }
+          } else {
+            gh release create $tag $asset --verify-tag --title "Re-Craft $env:VERSION" --notes "Re-Craft $env:VERSION for Windows x64. Requires an installed Minecraft Java Edition 26.3. This is an incomplete experimental build; existing worlds are not saved."
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create GitHub Release' }
+          }

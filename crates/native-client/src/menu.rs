@@ -2063,7 +2063,13 @@ impl<'a> Menu<'a> {
                             h: 16,
                         },
                     );
-                    canvas.text(assets, 2, lh - 10, "Minecraft 26.3", [255, 255, 255]);
+                    canvas.text(
+                        assets,
+                        2,
+                        lh - 10,
+                        concat!("Minecraft 26.3 (Re-Craft ", env!("CARGO_PKG_VERSION"), ")"),
+                        [255, 255, 255],
+                    );
                 }
             }
             Screen::Missing => {

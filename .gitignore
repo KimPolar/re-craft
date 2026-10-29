@@ -3,4 +3,5 @@
 /worlds/
 logs/
 *.log
+__pycache__/
 

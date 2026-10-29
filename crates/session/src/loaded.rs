@@ -11455,6 +11455,56 @@ mod tests {
     }
 
     #[test]
+    fn saved_cross_kind_order_controls_falling_support_and_button_release() {
+        fn run(button_first: bool) -> Vec<ButtonSoundEvent> {
+            let mut session = session();
+            let button_relative = IVec3::new(8, 2, 7);
+            let sand_relative = IVec3::new(9, 2, 7);
+            let mut button = stone_button_state(IVec3::NEG_X, 0.0).unwrap();
+            button.properties.insert("powered".into(), "true".into());
+            let button_id = session.intern_block(button);
+            let sand_id = session.intern_block(state("minecraft:sand", &[]));
+            assert!(session.set(sand_relative, sand_id));
+            assert!(session.set(button_relative, button_id));
+            session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+
+            // Remove schedules caused by placing the support and button. The
+            // source list below models their saved order in one Java chunk.
+            session.sand_ticks.clear();
+            session.sand_pending.clear();
+            session.button_ticks.clear();
+            session.button_pending.clear();
+            let button_tick = SavedBlockTick {
+                block: "minecraft:stone_button".into(),
+                position: (session.origin + button_relative).to_array(),
+                delay: 0,
+                priority: 0,
+            };
+            let sand_tick = SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position: (session.origin + sand_relative).to_array(),
+                delay: 0,
+                priority: 0,
+            };
+            let saved = if button_first {
+                vec![button_tick, sand_tick]
+            } else {
+                vec![sand_tick, button_tick]
+            };
+            session.enqueue_saved_sand(&saved);
+            session.enqueue_saved_buttons(&saved);
+            session.advance_block_ticks();
+            session.take_button_sounds()
+        }
+
+        let button_first = run(true);
+        assert_eq!(button_first.len(), 1);
+        assert!(!button_first[0].powered);
+        assert_eq!(button_first[0].tick, 0);
+        assert!(run(false).is_empty());
+    }
+
+    #[test]
     fn falling_tick_draft_rejects_unloaded_chunks_and_unrepresentable_delays() {
         let mut session = session();
         let home = session.player_chunk().unwrap();

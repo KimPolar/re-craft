@@ -121,6 +121,16 @@ public class SavedTickOrderOracle {
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var pos=new BlockPos(1,2,3);
+    for(var names:List.of(List.of("button","sand"),List.of("sand","button"))) {
+      var mixed=new LevelChunkTicks<String>(List.of(
+        new SavedTick<String>(names.get(0),pos,0,TickPriority.NORMAL),
+        new SavedTick<String>(names.get(1),pos.offset(1,0,0),0,TickPriority.NORMAL)));
+      mixed.unpack(0L);
+      var firstMixed=mixed.poll(); var secondMixed=mixed.poll();
+      if(firstMixed==null || secondMixed==null || !firstMixed.type().equals(names.get(0)) ||
+         !secondMixed.type().equals(names.get(1)) || mixed.poll()!=null)
+        throw new AssertionError("mixed block tick order differs from saved sub-tick order");
+    }
     var saved=new SavedTick<String>("water",pos,3,TickPriority.NORMAL);
     var ticks=new LevelChunkTicks<String>(List.of(saved,saved));
     ticks.unpack(0L);

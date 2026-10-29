@@ -29,9 +29,9 @@ pub(crate) struct Replacement {
     pub original_hash: Option<[u8; 32]>,
 }
 
-pub(crate) struct Dependency {
-    pub target: PathBuf,
-    pub backup: PathBuf,
+pub(crate) enum Dependency {
+    Present { target: PathBuf, backup: PathBuf },
+    Absent { target: PathBuf },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +40,8 @@ struct Manifest {
     version: u32,
     files: Vec<FileRecord>,
     dependencies: Vec<DependencyRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    absent_dependencies: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,6 +196,24 @@ fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn relative_path_key(value: &str) -> Result<String> {
+    let components: Option<Vec<_>> = Path::new(value)
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let components = components.context("invalid transaction path")?;
+    ensure!(!components.is_empty(), "empty transaction path");
+    let normalized = components.join(std::path::MAIN_SEPARATOR_STR);
+    ensure!(
+        normalized == value.replace('/', std::path::MAIN_SEPARATOR_STR),
+        "non-normalized transaction path"
+    );
+    Ok(normalized.to_lowercase())
+}
+
 /// New targets are limited to vanilla entity region files. A corrupt recovery
 /// record must not turn rollback into deletion of an arbitrary world file.
 fn valid_created_entity_region(value: &str) -> bool {
@@ -207,6 +227,11 @@ fn valid_created_entity_region(value: &str) -> bool {
     let Some(parts) = components else {
         return false;
     };
+    if parts.join(std::path::MAIN_SEPARATOR_STR)
+        != value.replace('/', std::path::MAIN_SEPARATOR_STR)
+    {
+        return false;
+    }
     if parts.len() < 5 || parts[0] != "dimensions" || parts[parts.len() - 2] != "entities" {
         return false;
     }
@@ -232,14 +257,18 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         "unsupported transaction version"
     );
     ensure!(
-        !manifest.files.is_empty() && manifest.files.len() + manifest.dependencies.len() <= 4096,
+        (!manifest.files.is_empty() || !manifest.absent_dependencies.is_empty())
+            && manifest.files.len()
+                + manifest.dependencies.len()
+                + manifest.absent_dependencies.len()
+                <= 4096,
         "invalid transaction file count"
     );
     let mut targets = BTreeSet::new();
     let mut backups = BTreeSet::new();
     for record in &manifest.files {
         ensure!(
-            targets.insert(record.target.to_lowercase()),
+            targets.insert(relative_path_key(&record.target)?),
             "duplicate transaction target"
         );
         ensure!(
@@ -249,7 +278,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         match (&record.backup, &record.original) {
             (Some(backup), Some(original)) => {
                 ensure!(
-                    backups.insert(backup.to_lowercase()),
+                    backups.insert(relative_path_key(backup)?),
                     "duplicate transaction backup"
                 );
                 ensure!(valid_digest(original), "invalid transaction hash");
@@ -263,14 +292,28 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     }
     for record in &manifest.dependencies {
         ensure!(
-            targets.insert(record.target.to_lowercase()),
+            targets.insert(relative_path_key(&record.target)?),
             "duplicate transaction target"
         );
         ensure!(
-            backups.insert(record.backup.to_lowercase()),
+            backups.insert(relative_path_key(&record.backup)?),
             "duplicate transaction backup"
         );
         ensure!(valid_digest(&record.original), "invalid transaction hash");
+    }
+    ensure!(
+        manifest.version == 2 || manifest.absent_dependencies.is_empty(),
+        "invalid transaction version for absent dependencies"
+    );
+    for target in &manifest.absent_dependencies {
+        ensure!(
+            valid_created_entity_region(target),
+            "invalid absent entity region path"
+        );
+        ensure!(
+            targets.insert(relative_path_key(target)?),
+            "duplicate transaction target"
+        );
     }
     let mut stages = BTreeSet::new();
     for record in &manifest.files {
@@ -290,7 +333,8 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             "invalid staged filename"
         );
         ensure!(
-            stages.insert(stage.to_lowercase()) && !targets.contains(&stage.to_lowercase()),
+            stages.insert(relative_path_key(stage)?)
+                && !targets.contains(&relative_path_key(stage)?),
             "duplicate staged file"
         );
     }
@@ -388,28 +432,48 @@ fn prepare(
         });
     }
     let mut dependency_records = Vec::with_capacity(dependencies.len());
+    let mut absent_dependencies = Vec::new();
     for dependency in &dependencies {
-        let target = relative(root, &dependency.target)?;
-        let backup = relative(&backup_dir, &dependency.backup)?;
-        let original = digest(&checked_file(&backup_dir, &backup, false)?)?;
-        ensure!(
-            digest(&checked_file(root, &target, true)?)? == original,
-            "world dependency changed during staging"
-        );
-        dependency_records.push(DependencyRecord {
-            target,
-            backup,
-            original,
-        });
+        match dependency {
+            Dependency::Present { target, backup } => {
+                let target = relative(root, target)?;
+                let backup = relative(&backup_dir, backup)?;
+                let original = digest(&checked_file(&backup_dir, &backup, false)?)?;
+                ensure!(
+                    digest(&checked_file(root, &target, true)?)? == original,
+                    "world dependency changed during staging"
+                );
+                dependency_records.push(DependencyRecord {
+                    target,
+                    backup,
+                    original,
+                });
+            }
+            Dependency::Absent { target } => {
+                let target = relative(root, target)?;
+                ensure!(
+                    valid_created_entity_region(&target),
+                    "invalid absent entity region path"
+                );
+                ensure!(
+                    !checked_target(root, &target)?.1,
+                    "absent world dependency appeared during staging"
+                );
+                absent_dependencies.push(target);
+            }
+        }
     }
     let manifest = Manifest {
-        version: if records.iter().any(|record| record.original.is_none()) {
+        version: if !absent_dependencies.is_empty()
+            || records.iter().any(|record| record.original.is_none())
+        {
             2
         } else {
             1
         },
         files: records,
         dependencies: dependency_records,
+        absent_dependencies,
     };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
@@ -445,6 +509,14 @@ fn check_dependencies(root: &Path, manifest: &Manifest) -> Result<()> {
         ensure!(
             digest(&path)? == dependency.original,
             "world dependency changed: {}",
+            path.display()
+        );
+    }
+    for relative in &manifest.absent_dependencies {
+        let (path, exists) = checked_target(root, relative)?;
+        ensure!(
+            !exists,
+            "absent world dependency appeared: {}",
             path.display()
         );
     }
@@ -776,7 +848,7 @@ mod tests {
                 }
             })
             .collect();
-        let deps = vec![Dependency {
+        let deps = vec![Dependency::Present {
             target: root.join("dimensions/minecraft/overworld/region/c.2.0.mcc"),
             backup: backup.join("external-original"),
         }];
@@ -855,10 +927,115 @@ mod tests {
             "dimensions/minecraft/overworld/region/r.0.0.mca",
             "dimensions/minecraft/overworld/entities/r.01.0.mca",
             "dimensions/minecraft/../entities/r.0.0.mca",
+            "dimensions/minecraft/./overworld/entities/r.0.0.mca",
             "dimensions/minecraft/overworld/entities/session.lock",
         ] {
             assert!(!valid_created_entity_region(invalid), "{invalid}");
         }
+        assert!(relative_path_key("dimensions/minecraft/./overworld/entities/r.0.0.mca").is_err());
+        assert_eq!(
+            relative_path_key("dimensions/minecraft/overworld/entities/r.0.0.mca").unwrap(),
+            relative_path_key("dimensions\\minecraft\\overworld\\entities\\r.0.0.mca").unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_region_dependency_is_checked_at_commit_and_recovery() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let missing = root.join("dimensions/minecraft/overworld/entities/r.1.0.mca");
+        let (files, mut deps) = replacements(&root);
+        deps.push(Dependency::Absent {
+            target: missing.clone(),
+        });
+        let mut prepared = prepare(&root, &backup, files, deps).unwrap();
+        assert_eq!(prepared.manifest.version, 2);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::write(&missing, b"created by another writer").unwrap();
+        assert!(format!("{:#}", recover(&root).unwrap_err()).contains("dependency appeared"));
+        assert_eq!(fs::read(&missing).unwrap(), b"created by another writer");
+        let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
+        fs::remove_file(&missing).unwrap();
+        assert!(recover(&root).unwrap());
+        assert_eq!(fs::read(region).unwrap(), OLD_REGION);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn absent_region_dependency_is_not_allowed_to_alias_a_replacement() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let new = created_region(&root);
+        let path = new.target.clone();
+        assert!(
+            prepare(
+                &root,
+                &backup,
+                vec![new],
+                vec![Dependency::Absent {
+                    target: path.clone()
+                }]
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        assert!(ensure_no_pending(&root).is_ok());
+    }
+
+    #[test]
+    fn absent_dependency_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_ABSENT_DEPENDENCY_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let (files, mut deps) = replacements(&root);
+        deps.push(Dependency::Absent {
+            target: root.join("dimensions/minecraft/overworld/entities/r.1.0.mca"),
+        });
+        let mut prepared = prepare(
+            &root,
+            &root.join(".minecraft-native-backups/transaction-fixture"),
+            files,
+            deps,
+        )
+        .unwrap();
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        std::process::exit(25);
+    }
+
+    #[test]
+    fn interrupted_save_rechecks_absent_region_before_rollback() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "save_transaction::tests::absent_dependency_crash_helper",
+                "--nocapture",
+            ])
+            .env("NATIVE_ABSENT_DEPENDENCY_CRASH_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(25),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let missing = root.join("dimensions/minecraft/overworld/entities/r.1.0.mca");
+        let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
+        fs::write(&missing, b"outside").unwrap();
+        assert!(WorldWriteGuard::recover_interrupted(&root).is_err());
+        assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
+        assert_eq!(fs::read(&missing).unwrap(), b"outside");
+        fs::remove_file(missing).unwrap();
+        assert!(WorldWriteGuard::recover_interrupted(&root).unwrap());
+        assert_eq!(fs::read(region).unwrap(), OLD_REGION);
     }
 
     #[test]

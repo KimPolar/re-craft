@@ -313,8 +313,9 @@ fn exercise_entity_chunk_drafts(new_region: bool) {
         x: if new_region { 32 } else { 1 },
         z: 0,
     };
+    let empty = RuntimeChunkPos { x: 64, z: 0 };
     let drafts = saved_falling_block::draft_entity_chunks_with_optional_sources(
-        &BTreeMap::from([(left, Some(&original)), (right, None)]),
+        &BTreeMap::from([(left, Some(&original)), (right, None), (empty, None)]),
         &[EntityReplacement::Falling(&falling)],
     )
     .unwrap();
@@ -349,9 +350,23 @@ fn exercise_entity_chunk_drafts(new_region: bool) {
             101,
         )
         .unwrap();
+    drafts[&empty]
+        .add_to_save_plan(
+            &mut plan,
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 64, z: 0 },
+            None,
+            102,
+        )
+        .unwrap();
     let mut guard = WorldWriteGuard::acquire(&world).unwrap();
     guard.write_plan(plan, |_, _| Ok(())).unwrap();
     drop(guard);
+    assert!(
+        !world
+            .join("dimensions/minecraft/overworld/entities/r.2.0.mca")
+            .exists()
+    );
     assert!(
         invoke(if new_region {
             "verifyEntityNewRegion"

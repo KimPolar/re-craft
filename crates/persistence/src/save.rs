@@ -204,7 +204,7 @@ impl WorldSavePlan {
                 .iter()
                 .any(|key| name.matches(key))
         });
-        let preserve_empty = source.is_some() && (!document.name.0.is_empty() || has_extra_fields);
+        let preserve_empty = !document.name.0.is_empty() || has_extra_fields;
         self.entity_chunks.push(PlannedEntityChunk {
             dimension,
             position,
@@ -564,6 +564,7 @@ impl WorldWriteGuard {
             groups.len() + plan.players.len() + plan.world_clocks.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
+        let mut absent_dependencies = Vec::new();
         let mut region_paths = Vec::with_capacity(groups.len());
         let mut entity_region_paths = Vec::new();
         let mut player_paths = Vec::with_capacity(plan.players.len());
@@ -609,10 +610,16 @@ impl WorldWriteGuard {
                     });
                 }
             };
-            ensure!(
-                existing.is_some() || chunks.iter().any(|chunk| chunk.replacement.is_some()),
-                "a wholly absent entity region cannot yet be tracked as an unchanged dependency"
-            );
+            if existing.is_none() && chunks.iter().all(|chunk| chunk.replacement.is_none()) {
+                ensure!(
+                    chunks.iter().all(|chunk| chunk.source_nbt.is_none()),
+                    "entity region changed after its draft was created"
+                );
+                absent_dependencies.push(crate::save_transaction::Dependency::Absent {
+                    target: region_path,
+                });
+                continue;
+            }
             let target = existing.clone().unwrap_or_else(|| region_path.clone());
 
             let mut stage = tempfile::Builder::new()
@@ -878,20 +885,22 @@ impl WorldWriteGuard {
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\nplayers={}\nworld_clocks={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\nabsent_entity_regions={}\nplayers={}\nworld_clocks={}",
             region_paths.len(),
             plan.chunks.len(),
             entity_region_paths.len(),
             plan.entity_chunks.len(),
+            absent_dependencies.len(),
             plan.players.len(),
             plan.world_clocks.is_some() as usize
         )?;
         note.sync_all()?;
         let backup_directory = backup.keep();
-        let dependencies = dependencies
+        let mut dependencies: Vec<_> = dependencies
             .into_iter()
-            .map(|(target, backup)| crate::save_transaction::Dependency { target, backup })
+            .map(|(target, backup)| crate::save_transaction::Dependency::Present { target, backup })
             .collect();
+        dependencies.extend(absent_dependencies);
         crate::save_transaction::commit(&self.root, &backup_directory, replacements, dependencies)
             .with_context(|| {
                 format!(
@@ -1070,7 +1079,7 @@ impl WorldWriteGuard {
             .iter()
             .map(|path| {
                 let name = path.file_name().context("external chunk has no filename")?;
-                Ok(crate::save_transaction::Dependency {
+                Ok(crate::save_transaction::Dependency::Present {
                     target: path.clone(),
                     backup: backup_directory.join(name),
                 })
@@ -1742,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_empty_region_is_not_silently_ignored_or_created() {
+    fn missing_empty_region_is_checked_without_creating_it() {
         let world = test_world();
         let (block_path, original_blocks, _) = fixture(world.path());
         let directory = world.path().join("dimensions/minecraft/overworld/entities");
@@ -1758,10 +1767,46 @@ mod tests {
         )
         .unwrap();
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
-        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
         assert!(!directory.join("r.1.0.mca").exists());
         assert_eq!(fs::read(block_path).unwrap(), original_blocks);
         assert!(!world.path().join(".minecraft-native-pending").exists());
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(result.backup_directory.join("transaction.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["absent_dependencies"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_empty_entity_chunk_with_extra_data_is_not_discarded() {
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir_all(&directory).unwrap();
+        let mut document = entity_chunk(32, vec![]);
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::String("kept".into())));
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 32, z: 0 },
+            None,
+            &document,
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let saved = RegionReader::open_for_region(&directory.join("r.1.0.mca"), 1, 0)
+            .unwrap()
+            .read_chunk(32, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, document);
     }
 
     #[test]

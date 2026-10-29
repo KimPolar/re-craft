@@ -105,6 +105,23 @@ fn same_shared_slice<T>(a: &Arc<[T]>, b: &Arc<[T]>) -> bool {
     (a.is_empty() && b.is_empty()) || Arc::ptr_eq(a, b)
 }
 
+fn translucent_buffer_size(quad_count: usize, limit: usize) -> Result<(u32, usize)> {
+    let vertices = quad_count
+        .checked_mul(6)
+        .context("translucent vertex count overflow")?;
+    let bytes = vertices
+        .checked_mul(std::mem::size_of::<Vertex>())
+        .context("translucent buffer size overflow")?;
+    ensure!(
+        bytes <= limit,
+        "translucent terrain buffer exceeds GPU limits"
+    );
+    Ok((
+        u32::try_from(vertices).context("too many translucent vertices")?,
+        bytes,
+    ))
+}
+
 impl PreviewChunkGpu {
     fn update(
         &mut self,
@@ -1596,15 +1613,28 @@ impl Renderer {
             let unchanged =
                 !self.translucent_dirty && strictly_far_to_near(&self.translucent_centers, eye);
             if !unchanged {
+                let quad_count = scene
+                    .chunks
+                    .values()
+                    .try_fold(0usize, |count, mesh| {
+                        count.checked_add(mesh.translucent.len())
+                    })
+                    .context("translucent quad count overflow")?;
+                let limit =
+                    usize::try_from(self.device.limits().max_buffer_size).unwrap_or(usize::MAX);
+                let (vertex_count, _) = translucent_buffer_size(quad_count, limit)?;
                 let quads = scene.sorted_translucent_quads(eye);
                 self.translucent_centers = quads.iter().map(|quad| quad.center).collect();
                 let vertices: Vec<_> = quads.iter().flat_map(|quad| quad.vertices).collect();
-                self.translucent_count =
-                    u32::try_from(vertices.len()).context("too many translucent vertices")?;
+                self.translucent_count = vertex_count;
                 let contents = bytemuck::cast_slice(&vertices);
                 if !contents.is_empty() {
                     if self.translucent_capacity < contents.len() {
-                        self.translucent_capacity = contents.len().next_power_of_two();
+                        self.translucent_capacity = contents
+                            .len()
+                            .checked_next_power_of_two()
+                            .unwrap_or(contents.len())
+                            .min(limit);
                         self.translucent_buffer =
                             Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some("translucent terrain vertices"),
@@ -2073,6 +2103,16 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translucent_buffer_checks_gpu_limit_and_integer_overflow() {
+        let quad_bytes = 6 * std::mem::size_of::<crate::mesh::Vertex>();
+        assert_eq!(
+            super::translucent_buffer_size(2, quad_bytes * 2).unwrap(),
+            (12, quad_bytes * 2)
+        );
+        assert!(super::translucent_buffer_size(2, quad_bytes * 2 - 1).is_err());
+        assert!(super::translucent_buffer_size(usize::MAX, usize::MAX).is_err());
+    }
     use std::{sync::mpsc, time::Duration};
 
     #[test]

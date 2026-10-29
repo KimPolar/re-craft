@@ -29,7 +29,7 @@ use crate::{
 };
 
 const MISSING_TEXTURE: &str = "assets/native/textures/block/missing.png";
-const MAX_VERTICES: usize = 6_000_000;
+const MAX_VERTICES_PER_CHUNK: usize = 6_000_000;
 
 #[derive(Clone)]
 pub struct TransparentQuad {
@@ -460,8 +460,8 @@ impl PreviewMaterials {
                             opaque.extend_from_slice(&vertices);
                         }
                         ensure!(
-                            opaque.len() + translucent.len() * 6 <= MAX_VERTICES,
-                            "world area exceeds the {MAX_VERTICES} vertex rendering limit"
+                            opaque.len() + translucent.len() * 6 <= MAX_VERTICES_PER_CHUNK,
+                            "chunk exceeds the {MAX_VERTICES_PER_CHUNK} vertex rendering limit"
                         );
                     }
                 }
@@ -534,8 +534,8 @@ impl PreviewMaterials {
                             opaque.extend_from_slice(&vertices);
                         }
                         ensure!(
-                            opaque.len() + translucent.len() * 6 <= MAX_VERTICES,
-                            "world area exceeds the {MAX_VERTICES} vertex rendering limit"
+                            opaque.len() + translucent.len() * 6 <= MAX_VERTICES_PER_CHUNK,
+                            "chunk exceeds the {MAX_VERTICES_PER_CHUNK} vertex rendering limit"
                         );
                     }
                 }
@@ -564,22 +564,8 @@ impl PreviewScene {
         }
         let materials = PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes)?;
         let mut chunks = BTreeMap::new();
-        let mut vertices = 0usize;
         for (&position, chunk) in &world.chunks {
             let mesh = materials.mesh_chunk(world, chunk, origin)?;
-            vertices = vertices
-                .checked_add(mesh.opaque.len())
-                .and_then(|count| {
-                    mesh.translucent
-                        .len()
-                        .checked_mul(6)
-                        .and_then(|extra| count.checked_add(extra))
-                })
-                .context("preview mesh size overflow")?;
-            ensure!(
-                vertices <= MAX_VERTICES,
-                "world area exceeds the {MAX_VERTICES} vertex rendering limit"
-            );
             chunks.insert(position, Arc::new(mesh));
         }
         Ok(Self {
@@ -871,26 +857,6 @@ impl IncrementalPreview {
                 }
             }
         }
-        let (opaque_count, translucent_count) = self
-            .chunks
-            .values()
-            .try_fold((0usize, 0usize), |(opaque, translucent), chunk| {
-                Some((
-                    opaque.checked_add(chunk.mesh.opaque.len())?,
-                    translucent.checked_add(chunk.mesh.translucent.len())?,
-                ))
-            })
-            .context("preview mesh size overflow")?;
-        ensure!(
-            opaque_count
-                .checked_add(
-                    translucent_count
-                        .checked_mul(6)
-                        .context("preview mesh size overflow")?
-                )
-                .is_some_and(|count| count <= MAX_VERTICES),
-            "world area exceeds the {MAX_VERTICES} vertex rendering limit"
-        );
         Ok(PreviewScene {
             atlas: Arc::clone(&materials.atlas),
             chunks: self
@@ -1341,6 +1307,44 @@ mod tests {
         assert_eq!(cache.generation, initial + 1);
         cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
         assert_eq!(cache.generation, initial + 1);
+    }
+
+    #[test]
+    fn incremental_scene_accepts_more_than_six_million_vertices_across_chunks() {
+        let mut world = World::new("minecraft:overworld");
+        for x in -12..=12 {
+            for z in -12..=12 {
+                let position = ChunkPos { x, z };
+                world.chunks.insert(
+                    position,
+                    Arc::new(Chunk {
+                        position,
+                        status: Some("minecraft:full".into()),
+                        sections: BTreeMap::new(),
+                    }),
+                );
+            }
+        }
+        let mut cache = IncrementalPreview::default();
+        cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
+        let vertex = Vertex {
+            position: [0.0; 3],
+            uv: [0.0; 2],
+            shade: 1.0,
+            tint: [1.0; 3],
+            light: u32::MAX,
+        };
+        let mesh = Arc::new(ChunkMesh {
+            opaque: vec![vertex; 10_000].into(),
+            translucent: Arc::from([]),
+        });
+        for cached in cache.chunks.values_mut() {
+            cached.mesh = Arc::clone(&mesh);
+        }
+        let scene = cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
+        assert_eq!(scene.chunks.len(), 625);
+        assert_eq!(scene.opaque_len(), 6_250_000);
+        assert_eq!(cache.last_rebuilt, 0);
     }
 
     fn assert_same_mesh(incremental: &PreviewScene, full: &PreviewScene) {

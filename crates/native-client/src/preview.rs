@@ -768,45 +768,93 @@ impl IncrementalPreview {
                 );
             }
         }
-        let states: BTreeSet<_> = self
+        let current_states: BTreeSet<_> = self
             .usage
             .values()
             .flat_map(|usage| usage.states.iter().copied())
             .collect();
-        let biomes: BTreeSet<_> = self
+        let current_biomes: BTreeSet<_> = self
             .usage
             .values()
             .flat_map(|usage| usage.biomes.iter().copied())
             .collect();
-        let key = MaterialsKey {
-            dimension: world.dimension.clone(),
-            dimension_type: world.dimension_type.clone(),
-            max_atlas_side,
-            states: states
+        let mut states = current_states.clone();
+        let mut biomes = current_biomes.clone();
+        if let Some((old, _)) = &self.materials
+            && old.dimension == world.dimension
+            && old.dimension_type == world.dimension_type
+            && old.max_atlas_side == max_atlas_side
+            && old
+                .states
                 .iter()
-                .map(|id| {
-                    Ok((
-                        *id,
-                        world.state(*id).context("invalid block state ID")?.clone(),
-                    ))
-                })
-                .collect::<Result<_>>()?,
-            biomes: biomes
+                .all(|(id, state)| world.state(*id) == Some(state))
+            && old
+                .biomes
                 .iter()
-                .map(|id| {
-                    Ok((
-                        *id,
-                        world
-                            .biome_by_id(*id)
-                            .context("invalid biome ID")?
-                            .to_owned(),
-                    ))
+                .all(|(id, biome)| world.biome_by_id(*id) == Some(biome.as_str()))
+        {
+            states.extend(old.states.iter().map(|(id, _)| *id));
+            biomes.extend(old.biomes.iter().map(|(id, _)| *id));
+            // Bound historical registry retention; the current world can still
+            // contain more states or biomes than these cache thresholds.
+            if states.len() > 8192 || biomes.len() > 1024 {
+                states = current_states.clone();
+                biomes = current_biomes.clone();
+            }
+        }
+        let make_key =
+            |states: &BTreeSet<BlockStateId>, biomes: &BTreeSet<BiomeId>| -> Result<MaterialsKey> {
+                Ok(MaterialsKey {
+                    dimension: world.dimension.clone(),
+                    dimension_type: world.dimension_type.clone(),
+                    max_atlas_side,
+                    states: states
+                        .iter()
+                        .map(|id| {
+                            Ok((
+                                *id,
+                                world.state(*id).context("invalid block state ID")?.clone(),
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
+                    biomes: biomes
+                        .iter()
+                        .map(|id| {
+                            Ok((
+                                *id,
+                                world
+                                    .biome_by_id(*id)
+                                    .context("invalid biome ID")?
+                                    .to_owned(),
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
                 })
-                .collect::<Result<_>>()?,
-        };
+            };
+        let mut key = make_key(&states, &biomes)?;
         if self.materials.as_ref().is_none_or(|(old, _)| *old != key) {
             let materials =
-                PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes)?;
+                match PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes) {
+                    Ok(materials) => materials,
+                    Err(error)
+                        if key.states.len() != current_states.len()
+                            || key.biomes.len() != current_biomes.len() =>
+                    {
+                        // Retained textures may no longer fit. Retry with only
+                        // resources used by the currently loaded chunks.
+                        let materials = PreviewMaterials::prepare(
+                            world,
+                            source,
+                            max_atlas_side,
+                            current_states.clone(),
+                            current_biomes.clone(),
+                        )
+                        .with_context(|| format!("material cache fallback after: {error:#}"))?;
+                        key = make_key(&current_states, &current_biomes)?;
+                        materials
+                    }
+                    Err(error) => return Err(error),
+                };
             self.materials = Some((key, materials));
             self.chunks.clear();
             self.generation = self.generation.wrapping_add(1);
@@ -1307,6 +1355,221 @@ mod tests {
         assert_eq!(cache.generation, initial + 1);
         cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
         assert_eq!(cache.generation, initial + 1);
+    }
+
+    #[test]
+    fn unloaded_unique_block_reuses_materials_and_reloads_after_registry_changes() {
+        struct Counting(usize);
+        impl ResourceProvider for Counting {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0 += 1;
+                Empty.read_asset(path)
+            }
+            fn read_builtin_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0 += 1;
+                Empty.read_builtin_data(path)
+            }
+        }
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let a = world.intern_state(BlockState {
+            name: "example:a".into(),
+            properties: BTreeMap::new(),
+        });
+        let b = world.intern_state(BlockState {
+            name: "example:b".into(),
+            properties: BTreeMap::new(),
+        });
+        let home = ChunkPos { x: 0, z: 0 };
+        let far = ChunkPos { x: 3, z: 0 };
+        for (position, state) in [(home, a), (far, b)] {
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            blocks[0] = state;
+            world.chunks.insert(
+                position,
+                Arc::new(Chunk {
+                    position,
+                    status: Some("minecraft:full".into()),
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+        }
+        let mut source = Counting(0);
+        let mut cache = IncrementalPreview::default();
+        let first = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        let reads = source.0;
+        let removed = world.chunks.remove(&far).unwrap();
+        let scene = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 0);
+        assert_eq!(scene.material_generation, first.material_generation);
+        assert!(Arc::ptr_eq(&scene.atlas, &first.atlas));
+        assert_eq!(source.0, reads);
+        assert_same_mesh(
+            &scene,
+            &PreviewScene::prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap(),
+        );
+        world.chunks.insert(far, removed);
+        let scene = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 1);
+        assert_eq!(source.0, reads);
+        assert_same_mesh(
+            &scene,
+            &PreviewScene::prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap(),
+        );
+
+        let mut replaced = World::new("minecraft:overworld");
+        let changed = replaced.intern_state(BlockState {
+            name: "example:changed".into(),
+            properties: BTreeMap::new(),
+        });
+        let mut blocks = Box::new([changed; BLOCK_COUNT]);
+        blocks[0] = changed;
+        replaced.chunks.insert(
+            home,
+            Arc::new(Chunk {
+                position: home,
+                status: Some("minecraft:full".into()),
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let generation = scene.material_generation;
+        let changed_scene = cache
+            .prepare(&replaced, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_ne!(changed_scene.material_generation, generation);
+        assert!(source.0 > reads);
+        assert_same_mesh(
+            &changed_scene,
+            &PreviewScene::prepare(&replaced, &mut Empty, IVec3::ZERO, 128).unwrap(),
+        );
+    }
+
+    #[test]
+    fn retained_texture_failure_falls_back_to_current_resources() {
+        struct Source {
+            fail_old: bool,
+            png: Vec<u8>,
+        }
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let asset = match path {
+                    "assets/example/blockstates/old.json" => {
+                        Some(br#"{"variants":{"":{"model":"example:block/old"}}}"#.to_vec())
+                    }
+                    "assets/example/blockstates/new.json" => {
+                        Some(br#"{"variants":{"":{"model":"example:block/new"}}}"#.to_vec())
+                    }
+                    "assets/example/models/block/old.json"
+                    | "assets/example/models/block/new.json" => {
+                        let name = if path.contains("old.json") {
+                            "old"
+                        } else {
+                            "new"
+                        };
+                        Some(format!(r##"{{"textures":{{"all":"example:block/{name}"}},"elements":[{{"from":[0,0,0],"to":[16,16,16],"faces":{{"up":{{"texture":"#all"}}}}}}]}}"##).into_bytes())
+                    }
+                    "assets/example/textures/block/old.png" if self.fail_old => {
+                        anyhow::bail!("old texture is unavailable")
+                    }
+                    "assets/example/textures/block/old.png"
+                    | "assets/example/textures/block/new.png" => Some(self.png.clone()),
+                    _ => None,
+                };
+                Ok(asset)
+            }
+            fn read_builtin_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(fixture_dimension(path))
+            }
+        }
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(16, 16, Rgba([10, 20, 30, 255])))
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let mut source = Source {
+            fail_old: false,
+            png: png.into_inner(),
+        };
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let old = world.intern_state(BlockState {
+            name: "example:old".into(),
+            properties: BTreeMap::new(),
+        });
+        let new = world.intern_state(BlockState {
+            name: "example:new".into(),
+            properties: BTreeMap::new(),
+        });
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[0] = old;
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let mut cache = IncrementalPreview::default();
+        let initial = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        world.set_block_id(0, 0, 0, new).unwrap();
+        source.fail_old = true;
+        let result = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_ne!(result.material_generation, initial.material_generation);
+        assert!(
+            !cache
+                .materials
+                .as_ref()
+                .unwrap()
+                .0
+                .states
+                .iter()
+                .any(|(id, _)| *id == old)
+        );
+        assert_same_mesh(
+            &result,
+            &PreviewScene::prepare(&world, &mut source, IVec3::ZERO, 128).unwrap(),
+        );
     }
 
     #[test]

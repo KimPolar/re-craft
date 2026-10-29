@@ -1400,7 +1400,7 @@ mod tests {
                             std::slice::from_ref(&self.item),
                         )
                         .unwrap();
-                    if self.revision == 6 {
+                    if self.revision == 7 {
                         self.rendered_final = true;
                         event_loop.exit();
                     }
@@ -1421,7 +1421,7 @@ mod tests {
                         1 => assert_eq!(self.scene.material_generation, None),
                         2 => assert_eq!(Some(generation), self.last_generation),
                         3 => assert_ne!(Some(generation), self.last_generation),
-                        4..=6 => assert_eq!(Some(generation), self.last_generation),
+                        4..=7 => assert_eq!(Some(generation), self.last_generation),
                         _ => unreachable!(),
                     }
                     replace_scene(self.renderer.as_mut().unwrap(), &mut self.scene, next).unwrap();
@@ -1445,9 +1445,17 @@ mod tests {
                         4 => assert_eq!((after.0 - before.0, after.1 - before.1), (0, 0)),
                         5 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
                         6 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
+                        7 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
                         _ => unreachable!(),
                     }
-                    assert_eq!(after.2 - before.2, if result.revision == 6 { 0 } else { 1 });
+                    assert_eq!(
+                        after.2 - before.2,
+                        if matches!(result.revision, 6 | 7) {
+                            0
+                        } else {
+                            1
+                        }
+                    );
                     renderer
                         .render_preview(
                             &mut self.scene,
@@ -1463,7 +1471,7 @@ mod tests {
                         renderer.preview_chunk_count(),
                         if result.revision == 4 { 8 } else { 9 }
                     );
-                    if matches!(result.revision, 2 | 4 | 6) {
+                    if matches!(result.revision, 2 | 4 | 6 | 7) {
                         let chunked = renderer
                             .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
                             .unwrap();
@@ -1776,14 +1784,14 @@ mod tests {
                             )
                             .unwrap();
                     }
-                    if matches!(result.revision, 2 | 4..=6) {
+                    if matches!(result.revision, 2 | 4..=7) {
                         assert!(Arc::ptr_eq(&previous_atlas, &self.scene.atlas));
                     } else if result.revision == 3 {
                         assert!(!Arc::ptr_eq(&previous_atlas, &self.scene.atlas));
                     }
                     self.last_generation = Some(generation);
                     self.revision = result.revision;
-                    if self.revision < 6 {
+                    if self.revision < 7 {
                         match self.revision {
                             1 => {
                                 self.world.set_block_id(10, 1, 8, self.stone).unwrap();
@@ -1801,6 +1809,11 @@ mod tests {
                             }
                             5 => {
                                 self.world.set_block_id(10, 1, 8, self.stone).unwrap();
+                            }
+                            6 => {
+                                // The last dirt block disappears; retained materials
+                                // must not force every other chunk to re-upload.
+                                self.world.set_block_id(7, 1, 8, self.stone).unwrap();
                             }
                             _ => unreachable!(),
                         }

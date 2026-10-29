@@ -2,8 +2,8 @@
 //!
 //! A draft preserves the source NBT outside the edited block-state storage, but
 //! does not automatically update lighting, heightmaps, entities, scheduled ticks
-//! or neighbors. Known heightmaps can be rebuilt separately with trusted predicates.
-//! It is deliberately not connected to the on-disk save path yet.
+//! or neighbors. Heightmaps can be rebuilt separately; callers must verify other
+//! dependent data before passing a draft to the guarded persistence API.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +31,7 @@ pub struct ChunkDraft {
     document: NamedTag,
     position: ChunkPos,
     heightmaps_rebuilt: bool,
+    changed_block_states: Vec<BlockChange>,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
 }
@@ -39,6 +40,36 @@ impl ChunkDraft {
     /// This is an incomplete draft and must not yet be saved as a playable chunk.
     pub fn document(&self) -> &NamedTag {
         &self.document
+    }
+
+    pub(crate) fn source_nbt(&self) -> &[u8] {
+        &self.source_nbt
+    }
+
+    pub(crate) fn position(&self) -> ChunkPos {
+        self.position
+    }
+
+    /// Check the invariants that persistence can verify, then require the
+    /// active game registry to approve every changed block state. That check
+    /// must reject any light, block-entity, fluid, neighbor, tick, or POI effect
+    /// that this draft does not also represent.
+    pub(crate) fn validate_for_write(
+        &self,
+        mut validate_change: impl FnMut(&BlockChange) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.changed_blocks == self.changed_block_states.len(),
+            "chunk draft change count is inconsistent"
+        );
+        ensure!(
+            self.changed_blocks == 0 || self.heightmaps_rebuilt,
+            "changed chunk blocks require rebuilt heightmaps"
+        );
+        for change in &self.changed_block_states {
+            validate_change(change)?;
+        }
+        Ok(())
     }
 
     /// Any eventual coordinated write must also compare the raw file bytes.
@@ -433,12 +464,14 @@ pub fn draft_chunk_blocks(
     let mut document = original.clone();
     let mut changed_blocks = 0;
     let mut changed_sections = BTreeSet::new();
+    let mut changed_block_states = Vec::new();
     if grouped.is_empty() {
         return Ok(ChunkDraft {
             source_nbt,
             document,
             position,
             heightmaps_rebuilt: false,
+            changed_block_states,
             changed_blocks,
             changed_sections,
         });
@@ -514,6 +547,10 @@ pub fn draft_chunk_blocks(
             if key(&decoded_blocks.states[current])? == replacement {
                 continue;
             }
+            changed_block_states.push(BlockChange {
+                expected: decoded_blocks.states[current].clone(),
+                ..change.clone()
+            });
             let next = if let Some(index) = lookup.get(&replacement) {
                 *index
             } else {
@@ -574,6 +611,7 @@ pub fn draft_chunk_blocks(
         document,
         position,
         heightmaps_rebuilt: false,
+        changed_block_states,
         changed_blocks,
         changed_sections,
     })

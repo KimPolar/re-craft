@@ -11,9 +11,12 @@ use std::{
 
 use native_persistence::{
     anvil::RegionReader,
+    edit::{BlockChange, draft_chunk_blocks},
+    heightmap::{BlockHeightFlags, HeightBounds},
     nbt,
+    palette::BlockState,
     save::WorldWriteGuard,
-    world::{DimensionId, WorldReader},
+    world::{ChunkPos, DimensionId, WorldReader},
 };
 use serde_json::Value;
 
@@ -40,7 +43,18 @@ public class RegionWriteOracle {
         chunk.putInt("xPos", x);
         chunk.putInt("zPos", 0);
         chunk.putString("Status", "minecraft:full");
-        chunk.put("sections", new ListTag());
+        var sections = new ListTag();
+        if (x == 0) {
+            var palette = new ListTag();
+            palette.add(StringTag.valueOf("minecraft:stone"));
+            var blockStates = new CompoundTag();
+            blockStates.put("palette", palette);
+            var section = new CompoundTag();
+            section.putByte("Y", (byte)0);
+            section.put("block_states", blockStates);
+            sections.add(section);
+        }
+        chunk.put("sections", sections);
         var extra = new CompoundTag();
         extra.putString("marker", "unknown-" + x);
         extra.putLongArray("longs", new long[]{Long.MIN_VALUE, 42, Long.MAX_VALUE});
@@ -92,6 +106,37 @@ public class RegionWriteOracle {
                      var in = region.getChunkDataInputStream(new ChunkPos(x, 0))) {
                     if (in == null || !NbtIo.read((DataInput)in).equals(chunk(x))) throw new AssertionError("chunk mismatch " + x);
                 }
+            }
+            System.out.println("OK");
+        } else if (args[0].equals("verifyEdit")) {
+            try (var region = open(dir);
+                 var in = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
+                if (in == null) throw new AssertionError("edited chunk is missing");
+                var saved = NbtIo.read((DataInput)in);
+                var sections = saved.getListOrEmpty("sections");
+                var blockStates = sections.getCompoundOrEmpty(0).getCompoundOrEmpty("block_states");
+                var palette = blockStates.getListOrEmpty("palette");
+                var words = blockStates.getLongArray("data").orElseThrow();
+                int stateIndex = (int)(words[0] & 15L);
+                var entry = palette.get(stateIndex);
+                String id;
+                if (entry instanceof StringTag text) {
+                    id = text.value();
+                } else {
+                    var state = ((CompoundTag)entry).get("");
+                    if (state == null) state = entry;
+                    id = state instanceof StringTag text
+                        ? text.value()
+                        : ((CompoundTag)state).getString("id").orElseThrow();
+                }
+                if (!id.equals("minecraft:dirt")) throw new AssertionError("Java read " + id);
+                if (palette.size() != 2 || words.length != 256) throw new AssertionError("invalid edited palette");
+                if (!saved.getCompoundOrEmpty("fixture_unknown").getStringOr("marker", "").equals("unknown-0"))
+                    throw new AssertionError("unknown chunk data was lost");
+                var heights = saved.getCompoundOrEmpty("Heightmaps");
+                var surface = heights.getLongArray("WORLD_SURFACE").orElseThrow();
+                if (surface.length != 22 || (surface[0] & 31L) != 16L)
+                    throw new AssertionError("Java could not read the rebuilt heightmap");
             }
             System.out.println("OK");
         } else if (args[0].equals("locked")) {
@@ -148,6 +193,13 @@ fn run(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn state(name: &str) -> BlockState {
+    BlockState {
+        name: name.into(),
+        properties: Vec::new(),
+    }
 }
 
 #[test]
@@ -355,5 +407,106 @@ fn lossless_regions_and_session_lock_match_java() {
     assert!(WorldWriteGuard::acquire(&world).is_ok());
     assert!(
         WorldReader::open_for_session(&world, DimensionId::parse("overworld").unwrap()).is_ok()
+    );
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn persisted_chunk_draft_is_readable_by_java_26_3() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-chunk-edit-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .current_dir(temp.path())
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    assert!(
+        run(Command::new(java.join("java.exe"))
+            .current_dir(temp.path())
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg("seed")
+            .arg(&world))
+        .lines()
+        .any(|line| line == "OK")
+    );
+
+    let region_path = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let original = RegionReader::open(&region_path)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let change = BlockChange {
+        x: 0,
+        y: 0,
+        z: 0,
+        expected: state("minecraft:stone"),
+        replacement: state("minecraft:dirt"),
+    };
+    let mut draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[change]).unwrap();
+    draft
+        .rebuild_heightmaps(
+            HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            |state| {
+                let air = state.name.matches("minecraft:air");
+                Ok(BlockHeightFlags {
+                    is_air: air,
+                    blocks_motion: !air,
+                    blocks_motion_no_leaves: !air,
+                    has_fluid: false,
+                })
+            },
+        )
+        .unwrap();
+
+    let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+    writer
+        .write_chunk_draft(
+            &DimensionId::parse("overworld").unwrap(),
+            &draft,
+            1_777_777,
+            |change| {
+                anyhow::ensure!(
+                    change.expected == state("minecraft:stone")
+                        && change.replacement == state("minecraft:dirt"),
+                    "unexpected block edit"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    drop(writer);
+
+    assert!(
+        run(Command::new(java.join("java.exe"))
+            .current_dir(temp.path())
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg("verifyEdit")
+            .arg(&world))
+        .lines()
+        .any(|line| line == "OK")
     );
 }

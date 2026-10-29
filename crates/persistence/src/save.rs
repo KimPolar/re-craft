@@ -1,10 +1,12 @@
-//! Experimental, lossless region rewrites. This does not yet save gameplay changes.
+//! Experimental, recoverable region rewrites. Gameplay changes remain gated on
+//! the caller proving that all dependent world data is included.
 //!
 //! A whole region is copied to a same-directory staging file, checked, backed up,
 //! and atomically replaced while holding the vanilla world lock. Other chunks are
-//! copied byte for byte. The only exposed operation rewrites an existing chunk's
-//! unchanged NBT; gameplay editing must not be enabled until the simulation and
-//! dependent world data can also be preserved.
+//! copied byte for byte. A chunk draft can be committed only after heightmaps
+//! are rebuilt and the active game registry approves every edit's external
+//! effects. The game session does not use this API until its other changed
+//! world data can be committed in the same transaction.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -159,6 +161,47 @@ impl WorldWriteGuard {
         chunk_x: i32,
         chunk_z: i32,
     ) -> Result<RewriteResult> {
+        self.rewrite_chunk_data(dimension, chunk_x, chunk_z, None, None, None)
+    }
+
+    /// Persist one validated chunk draft inside a recoverable region rewrite.
+    ///
+    /// `validate_change` must use the active block registry and world state to
+    /// reject every edit whose lighting, block entities, fluids, neighbor
+    /// updates, scheduled ticks, POI data, or other chunk dependencies are not
+    /// represented by the draft. The game session must additionally coordinate
+    /// all other changed chunks and player/world files before enabling saves.
+    /// `region_timestamp_seconds` is the Java-compatible region timestamp to
+    /// store for this chunk.
+    pub fn write_chunk_draft(
+        &mut self,
+        dimension: &DimensionId,
+        draft: &crate::edit::ChunkDraft,
+        region_timestamp_seconds: u32,
+        validate_change: impl FnMut(&crate::edit::BlockChange) -> Result<()>,
+    ) -> Result<RewriteResult> {
+        draft.validate_for_write(validate_change)?;
+        let position = draft.position();
+        let replacement = nbt::write(draft.document())?;
+        self.rewrite_chunk_data(
+            dimension,
+            position.x,
+            position.z,
+            Some(draft.source_nbt()),
+            Some(&replacement),
+            Some(region_timestamp_seconds),
+        )
+    }
+
+    fn rewrite_chunk_data(
+        &mut self,
+        dimension: &DimensionId,
+        chunk_x: i32,
+        chunk_z: i32,
+        expected_nbt: Option<&[u8]>,
+        replacement_nbt: Option<&[u8]>,
+        timestamp_seconds: Option<u32>,
+    ) -> Result<RewriteResult> {
         let region_x = chunk_x.div_euclid(REGION_SIDE);
         let region_z = chunk_z.div_euclid(REGION_SIDE);
         let region_dir = dimension
@@ -206,11 +249,30 @@ impl WorldWriteGuard {
             .context("cannot rewrite a missing chunk")?;
         let chunk = nbt::read(&original_nbt)?;
         validate_chunk(&chunk.value, chunk_x, chunk_z)?;
-        let encoded = nbt::write(&chunk)?;
-        ensure!(
-            encoded == original_nbt,
-            "chunk NBT cannot be reserialized without changing its bytes"
-        );
+        let encoded = match (expected_nbt, replacement_nbt) {
+            (None, None) => {
+                let encoded = nbt::write(&chunk)?;
+                ensure!(
+                    encoded == original_nbt,
+                    "chunk NBT cannot be reserialized without changing its bytes"
+                );
+                encoded
+            }
+            (Some(expected), Some(replacement)) => {
+                ensure!(
+                    expected == original_nbt,
+                    "chunk changed after its draft was created"
+                );
+                let draft = nbt::read(replacement).context("invalid chunk draft NBT")?;
+                validate_chunk(&draft.value, chunk_x, chunk_z)?;
+                ensure!(
+                    nbt::write(&draft)? == replacement,
+                    "chunk draft cannot be reserialized without changing its bytes"
+                );
+                replacement.to_vec()
+            }
+            _ => anyhow::bail!("chunk rewrite requires both source and replacement NBT"),
+        };
         let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
         compressor.write_all(&encoded)?;
         let compressed = compressor.finish()?;
@@ -267,6 +329,12 @@ impl WorldWriteGuard {
         stage.as_file_mut().seek(SeekFrom::Start(index * 4))?;
         let location = ((offset as u32) << 8) | sectors as u32;
         stage.as_file_mut().write_all(&location.to_be_bytes())?;
+        if let Some(timestamp) = timestamp_seconds {
+            stage
+                .as_file_mut()
+                .seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
+            stage.as_file_mut().write_all(&timestamp.to_be_bytes())?;
+        }
         stage.as_file_mut().flush()?;
         stage
             .as_file()
@@ -583,7 +651,13 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::nbt::{NamedTag, TagType};
+    use crate::{
+        edit::{BlockChange, draft_chunk_blocks},
+        heightmap::{BlockHeightFlags, HeightBounds, SpawnHeightmapKind, SpawnHeightmaps},
+        nbt::{NamedTag, TagType},
+        palette::{self, BlockState},
+        world::ChunkPos,
+    };
     use flate2::write::{GzEncoder, ZlibEncoder};
 
     fn test_world() -> tempfile::TempDir {
@@ -616,6 +690,42 @@ mod tests {
                     Tag::Compound(vec![("value".into(), Tag::String(marker.into()))]),
                 ),
             ]),
+        }
+    }
+
+    fn editable_chunk(x: i32) -> NamedTag {
+        let mut chunk = chunk(x, "target");
+        let Tag::Compound(fields) = &mut chunk.value else {
+            unreachable!()
+        };
+        let (_, sections) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("sections"))
+            .unwrap();
+        *sections = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("Y".into(), Tag::Byte(0)),
+                (
+                    "block_states".into(),
+                    Tag::Compound(vec![(
+                        "palette".into(),
+                        Tag::List {
+                            element_type: TagType::String,
+                            values: vec![Tag::String("minecraft:stone".into())],
+                        },
+                    )]),
+                ),
+                ("unknown_section".into(), Tag::String("keep".into())),
+            ])],
+        };
+        chunk
+    }
+
+    fn block_state(name: &str) -> BlockState {
+        BlockState {
+            name: name.into(),
+            properties: Vec::new(),
         }
     }
 
@@ -786,6 +896,212 @@ mod tests {
         }
         drop(guard);
         assert!(WorldWriteGuard::acquire(world.path()).is_ok());
+    }
+
+    #[test]
+    fn validated_chunk_draft_is_backed_up_written_and_reopened() {
+        let world = test_world();
+        let (region_path, old_region, outside) = fixture(world.path());
+        let original = editable_chunk(0);
+        let mut region = old_region;
+        let encoded = compressed(&original);
+        assert!(encoded.len() + 5 <= SECTOR_SIZE as usize);
+        let start = 2 * SECTOR_SIZE as usize;
+        region[start..start + 4].copy_from_slice(&((encoded.len() + 1) as u32).to_be_bytes());
+        region[start + 4] = 2;
+        region[start + 5..start + 5 + encoded.len()].copy_from_slice(&encoded);
+        fs::write(&region_path, &region).unwrap();
+        let source_region = fs::read(&region_path).unwrap();
+
+        let position = ChunkPos { x: 0, z: 0 };
+        let change = BlockChange {
+            x: 0,
+            y: 0,
+            z: 0,
+            expected: block_state("minecraft:stone"),
+            replacement: block_state("minecraft:dirt"),
+        };
+        let mut draft = draft_chunk_blocks(&original, position, &[change]).unwrap();
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 16,
+        };
+        let classify = |state: &BlockState| {
+            if state.name.matches("minecraft:air") {
+                Ok(BlockHeightFlags {
+                    is_air: true,
+                    blocks_motion: false,
+                    blocks_motion_no_leaves: false,
+                    has_fluid: false,
+                })
+            } else if state.name.matches("minecraft:stone") || state.name.matches("minecraft:dirt")
+            {
+                Ok(BlockHeightFlags {
+                    is_air: false,
+                    blocks_motion: true,
+                    blocks_motion_no_leaves: true,
+                    has_fluid: false,
+                })
+            } else {
+                anyhow::bail!("unexpected block state {}", state.name.to_string_lossy())
+            }
+        };
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(
+            guard
+                .write_chunk_draft(
+                    &DimensionId::parse("overworld").unwrap(),
+                    &draft,
+                    7_777,
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), source_region);
+
+        draft.rebuild_heightmaps(bounds, classify).unwrap();
+        assert!(
+            guard
+                .write_chunk_draft(
+                    &DimensionId::parse("overworld").unwrap(),
+                    &draft,
+                    7_777,
+                    |_| anyhow::bail!("registry rejected the edit"),
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), source_region);
+
+        let mut changed_source = original.clone();
+        let Tag::Compound(fields) = &mut changed_source.value else {
+            unreachable!()
+        };
+        let (_, unknown) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("unknown"))
+            .unwrap();
+        let Tag::Compound(fields) = unknown else {
+            unreachable!()
+        };
+        let (_, marker) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("value"))
+            .unwrap();
+        *marker = Tag::String("changed outside draft".into());
+        let changed_bytes = compressed(&changed_source);
+        let mut stale_region = source_region.clone();
+        stale_region[start..start + 4]
+            .copy_from_slice(&((changed_bytes.len() + 1) as u32).to_be_bytes());
+        stale_region[start + 5..start + 5 + changed_bytes.len()].copy_from_slice(&changed_bytes);
+        fs::write(&region_path, &stale_region).unwrap();
+        assert!(
+            guard
+                .write_chunk_draft(
+                    &DimensionId::parse("overworld").unwrap(),
+                    &draft,
+                    7_777,
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), stale_region);
+        fs::write(&region_path, &source_region).unwrap();
+
+        let result = guard
+            .write_chunk_draft(
+                &DimensionId::parse("overworld").unwrap(),
+                &draft,
+                7_777,
+                |change| {
+                    anyhow::ensure!(
+                        change.expected == block_state("minecraft:stone")
+                            && change.replacement == block_state("minecraft:dirt"),
+                        "unexpected edit reached the validator"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(result.backup_directory.join("r.0.0.mca")).unwrap(),
+            source_region
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("c.2.0.mcc")).unwrap(),
+            outside
+        );
+
+        let bytes = fs::read(&region_path).unwrap();
+        assert_eq!(bytes.len(), source_region.len());
+        assert_eq!(
+            &bytes[..SECTOR_SIZE as usize],
+            &source_region[..SECTOR_SIZE as usize]
+        );
+        assert_eq!(
+            &bytes[SECTOR_SIZE as usize + 4..HEADER_SIZE as usize],
+            &source_region[SECTOR_SIZE as usize + 4..HEADER_SIZE as usize]
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                bytes[SECTOR_SIZE as usize..SECTOR_SIZE as usize + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            7_777
+        );
+
+        let mut reader = RegionReader::open(&region_path).unwrap();
+        let saved = reader.read_chunk(0, 0).unwrap().unwrap();
+        assert_eq!(saved.value.get("unknown"), original.value.get("unknown"));
+        let Tag::List {
+            values: saved_sections,
+            ..
+        } = saved.value.get("sections").unwrap()
+        else {
+            panic!("saved chunk has no sections")
+        };
+        let Tag::List {
+            values: original_sections,
+            ..
+        } = original.value.get("sections").unwrap()
+        else {
+            panic!("original chunk has no sections")
+        };
+        assert_eq!(
+            saved_sections[0].get("unknown_section"),
+            original_sections[0].get("unknown_section")
+        );
+        let sections = palette::decode_sections(&saved.value).unwrap();
+        let blocks = sections[0].blocks.as_ref().unwrap();
+        assert!(
+            blocks
+                .block(0, 0, 0)
+                .unwrap()
+                .name
+                .matches("minecraft:dirt")
+        );
+        assert!(
+            blocks
+                .block(1, 0, 0)
+                .unwrap()
+                .name
+                .matches("minecraft:stone")
+        );
+        let maps = SpawnHeightmaps::read(&saved, bounds).unwrap();
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(15)
+        );
+
+        assert_eq!(
+            reader.read_chunk(1, 0).unwrap().unwrap(),
+            chunk(1, "neighbor")
+        );
+        assert_eq!(
+            reader.read_chunk(2, 0).unwrap().unwrap(),
+            chunk(2, "external")
+        );
+        assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 
     #[test]

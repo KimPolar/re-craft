@@ -165,6 +165,7 @@ public class SavedTickOrderOracle {
       throw new AssertionError("Rust NBT fluid tick draft differs from Java codec");
   }
 }
+
 "#).unwrap();
     let java = java_bin();
     let cp = classpath(&game, temp.path());
@@ -248,6 +249,28 @@ public class SavedTickOrderOracle {
         .arg(&cp)
         .arg("SavedTickOrderOracle")
         .arg(nbt_path));
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn soil_placement_push_and_spectator_filter_match_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SoilPlacementOracle.java");
+    std::fs::write(&source, include_str!("java/SoilPlacementOracle.java")).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SoilPlacementOracle"));
 }
 
 #[test]

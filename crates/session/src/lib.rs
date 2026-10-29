@@ -696,18 +696,32 @@ impl LocalSession {
                     || checked_add(position, IVec3::Y)
                         .is_some_and(|above| self.world.block(above).is_solid()))
             {
-                let bounds =
-                    movement::player_bounds(self.motion.position, self.player.pose.height());
-                if let Some(delta) = native_world::movement::soil_expansion_push(bounds, position) {
-                    self.motion.position.y += delta;
-                    self.player.position = self.motion.position.as_vec3();
-                    self.camera.snap_position(self.motion.position);
-                }
-                self.dropped_items.push_from_soil_expansion(position);
-                self.experience_orbs.push_from_soil_expansion(position);
+                self.push_entities_from_soil(position);
                 self.set_block(position, Block::Dirt);
             }
         }
+    }
+
+    fn push_entities_from_soil(&mut self, position: IVec3) {
+        let bounds = movement::player_bounds(self.motion.position, self.player.pose.height());
+        if self.game_mode != GameMode::Spectator
+            && let Some(delta) = native_world::movement::soil_expansion_push(bounds, position)
+        {
+            self.motion.position.y += delta;
+            self.player.position = self.motion.position.as_vec3();
+            self.camera.snap_position(self.motion.position);
+        }
+        self.dropped_items.push_from_soil_expansion(position);
+        self.experience_orbs.push_from_soil_expansion(position);
+    }
+
+    fn placement_block(&mut self, position: IVec3, block: Block) -> Option<Block> {
+        let above = checked_add(position, IVec3::Y)?;
+        let blocked = self.world.block(above).is_solid();
+        if block == Block::DirtPath && blocked {
+            self.push_entities_from_soil(position);
+        }
+        Some(placed_soil(block, blocked))
     }
 
     fn advance_tick(&mut self) {
@@ -986,8 +1000,8 @@ impl LocalSession {
                         } else if self.game_mode.allows_basic_building()
                             && let Some((hand, block)) = placement_hand(&self.inventory)
                             && let Some(pos) = hit.adjacent
-                            && let Some(block) = checked_add(pos, IVec3::Y)
-                                .map(|above| placed_soil(block, self.world.block(above).is_solid()))
+                            && self.world.block(pos) == Block::Air
+                            && let Some(block) = self.placement_block(pos, block)
                             && !player_intersects_block(self.player, pos, block)
                             && self.set_block(pos, block.orient_for_face(pos - hit.position))
                         {
@@ -2261,6 +2275,21 @@ mod tests {
         session.advance_soil_ticks();
         assert_eq!(session.motion.position.y, f64::from(soil.y) + 1.0);
         assert_eq!(session.world.block(soil), Block::Dirt);
+    }
+
+    #[test]
+    fn demo_covered_path_placement_pushes_before_collision_check() {
+        let target = IVec3::new(5, 3, 5);
+        let mut world = World::demo();
+        world.set_block(target + IVec3::Y, Block::Stone);
+        let mut session = LocalSession::new(world);
+        let feet = target.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+        session.motion.position = feet;
+        session.player.position = feet.as_vec3();
+        let block = session.placement_block(target, Block::DirtPath).unwrap();
+        assert_eq!(block, Block::Dirt);
+        assert_eq!(session.motion.position.y, f64::from(target.y) + 1.0);
+        assert!(!player_intersects_block(session.player, target, block));
     }
 
     #[test]

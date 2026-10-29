@@ -3238,7 +3238,7 @@ impl LoadedSession {
         Some(solid)
     }
 
-    fn placement_block(&self, relative: IVec3, block: Block) -> Option<Block> {
+    fn placement_block(&mut self, relative: IVec3, block: Block) -> Option<Block> {
         let Some(kind) = SoilKind::from_block(block) else {
             return Some(block);
         };
@@ -3249,6 +3249,10 @@ impl LoadedSession {
         };
         let state = self.world.state(id)?;
         let blocked = self.soil_cover_state(kind, state)?;
+        if kind == SoilKind::Path && blocked {
+            let absolute = add(self.origin, relative)?;
+            self.push_entities_from_soil(relative, absolute);
+        }
         Some(placed_soil(block, blocked))
     }
 
@@ -4115,7 +4119,9 @@ impl LoadedSession {
     fn push_entities_from_soil(&mut self, relative: IVec3, absolute: IVec3) {
         let bounds =
             crate::movement::player_bounds(self.motion.position, self.player.pose.height());
-        if let Some(delta) = native_world::movement::soil_expansion_push(bounds, relative) {
+        if self.game_mode != GameMode::Spectator
+            && let Some(delta) = native_world::movement::soil_expansion_push(bounds, relative)
+        {
             self.motion.position.y += delta;
             self.player.position = self.motion.position.as_vec3();
             self.camera.snap_position(self.motion.position);
@@ -5064,9 +5070,9 @@ impl LoadedSession {
                         } else if self.game_mode.allows_basic_building()
                             && let Some((hand, block)) = placement_hand(&self.inventory)
                             && let Some(target) = add(hit.position, hit.face)
+                            && matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")))
                             && let Some(block) = self.placement_block(target, block)
                             && !player_intersects_block(self.player, target, block)
-                            && matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")))
                             && {
                                 let id = self.placement_id(block.orient_for_face(hit.face));
                                 self.set(target, id)
@@ -10258,6 +10264,142 @@ mod tests {
         assert!(
             matches!(cell(&session.world, session.origin, session.bounds, soil, session.states[0]), Cell::State(id) if id == farmland)
         );
+    }
+
+    #[test]
+    fn soil_placement_pushes_before_collision_check_only_for_covered_path() {
+        for (block, covered, mode, lifted) in [
+            (Block::DirtPath, true, GameMode::Survival, true),
+            (Block::DirtPath, false, GameMode::Survival, false),
+            (Block::Farmland(0), true, GameMode::Survival, false),
+            (Block::DirtPath, true, GameMode::Spectator, false),
+        ] {
+            let mut session = session();
+            session.set_game_mode(mode);
+            let target = IVec3::new(8, 2, 7);
+            if covered {
+                assert!(session.set(target + IVec3::Y, session.states[3]));
+            }
+            let position = target.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+            session.motion.position = position;
+            session.player.position = position.as_vec3();
+            let result = session.placement_block(target, block).unwrap();
+            assert_eq!(result, if covered { Block::Dirt } else { block });
+            assert_eq!(
+                session.motion.position.y,
+                position.y + if lifted { 1.0 / 16.0 } else { 0.0 }
+            );
+            if covered {
+                assert_eq!(
+                    player_intersects_block(session.player, target, result),
+                    !lifted
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_soil_tick_does_not_push_spectator_but_pushes_item() {
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        let soil = IVec3::new(8, 2, 7);
+        let path = session.intern_block(state("minecraft:dirt_path", &[]));
+        assert!(session.set(soil, path));
+        assert!(session.set(soil + IVec3::Y, session.states[3]));
+        let relative = soil.as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+        let absolute = session.origin.as_dvec3() + relative;
+        session.motion.position = relative;
+        session.player.position = relative.as_vec3();
+        session
+            .dropped_items
+            .spawn_saved(crate::saved_item::SavedItemState {
+                source: Arc::new(Tag::Compound(vec![])),
+                uuid: None,
+                position: absolute,
+                velocity: DVec3::ZERO,
+                on_ground: false,
+                no_gravity: true,
+                age: 0,
+                pickup_delay: i16::MAX,
+                health: 5,
+                fire_ticks: 0,
+                invulnerable: false,
+                invulnerable_time: 0,
+                owner: None,
+                thrower: None,
+                stack: ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]))
+                    .unwrap(),
+            });
+        session.tick = 1;
+        session.advance_block_ticks();
+        assert_eq!(session.motion.position, relative);
+        assert_eq!(
+            session.dropped_items.snapshot()[0].position.y,
+            absolute.y + 1.0 / 16.0
+        );
+    }
+
+    #[test]
+    fn placing_covered_soil_moves_items_only_for_dirt_path() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for (block, moved) in [("minecraft:dirt_path", true), ("minecraft:farmland", false)] {
+            let mut session = session();
+            let target = IVec3::new(8, 2, 7);
+            assert!(session.set(target + IVec3::Y, session.states[3]));
+            let absolute = (session.origin + target).as_dvec3() + DVec3::new(0.5, 15.0 / 16.0, 0.5);
+            session
+                .dropped_items
+                .spawn_saved(crate::saved_item::SavedItemState {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position: absolute,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    pickup_delay: i16::MAX,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]))
+                        .unwrap(),
+                });
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(block.into(), 2, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            assert_eq!(
+                session.dropped_items.snapshot()[0].position.y,
+                absolute.y + if moved { 1.0 / 16.0 } else { 0.0 },
+                "{block}"
+            );
+            let absolute_block = session.origin + target;
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute_block.x, absolute_block.y, absolute_block.z)
+                    .unwrap()
+                    .name,
+                "minecraft:dirt"
+            );
+            assert_eq!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

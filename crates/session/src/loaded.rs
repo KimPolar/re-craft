@@ -1093,6 +1093,7 @@ impl LoadedSession {
         for (_, ticks) in saved_sand_ticks {
             session.enqueue_saved_sand(&ticks);
             session.enqueue_saved_buttons(&ticks);
+            session.enqueue_saved_soil(&ticks);
         }
         Ok(session)
     }
@@ -1758,7 +1759,7 @@ impl LoadedSession {
         )
     }
 
-    /// Collect supported sand, gravel, and stone-button ticks in Java's saved
+    /// Collect supported falling-block, button, and soil ticks in Java's saved
     /// sub-tick order. This alone does not authorize writing a chunk.
     pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
@@ -1770,16 +1771,11 @@ impl LoadedSession {
             self.fluid_chunks_seen.contains(&pos),
             "chunk ticks have not been loaded"
         );
-        ensure!(
-            !self.soil_ticks.values().any(|(absolute, _)| {
-                absolute.x.div_euclid(16) == pos.x && absolute.z.div_euclid(16) == pos.z
-            }),
-            "chunk contains pending soil ticks that cannot be saved yet"
-        );
         if let Some(original) = self.world.saved_block_ticks.get(&pos) {
             ensure!(
                 original.iter().all(|tick| {
                     FallingKind::from_id(&tick.block).is_some()
+                        || SoilKind::from_name(&tick.block).is_some()
                         || matches!(
                             tick.block.as_str(),
                             "minecraft:stone_button" | "stone_button"
@@ -1835,6 +1831,31 @@ impl LoadedSession {
                 .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
                 .all(|key| queued_buttons.contains(key)),
             "stone-button tick is missing its scheduled order"
+        );
+        let mut queued_soil = BTreeSet::new();
+        for (order, &(absolute, soil)) in self.soil_ticks.iter().filter(|(_, (absolute, _))| {
+            absolute.x.div_euclid(16) == pos.x && absolute.z.div_euclid(16) == pos.z
+        }) {
+            queued_soil.insert((absolute.x, absolute.y, absolute.z, soil));
+            let delay = i32::try_from(order.0 - i128::from(self.tick))
+                .context("soil tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: soil.id().into(),
+                    position: absolute.to_array(),
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.soil_pending
+                .iter()
+                .filter(|(x, _, z, _)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+                .all(|key| queued_soil.contains(key)),
+            "soil tick is missing its scheduled order"
         );
         // Java packs saved ticks by sub-tick order, independently of target
         // time and priority. The shared sequence breaks new-tick ties.
@@ -2724,6 +2745,7 @@ impl LoadedSession {
                     self.enqueue_saved_fluids(pos, &ticks);
                     self.enqueue_saved_sand(&sand_ticks);
                     self.enqueue_saved_buttons(&sand_ticks);
+                    self.enqueue_saved_soil(&sand_ticks);
                 }
             }
         }
@@ -2883,6 +2905,7 @@ impl LoadedSession {
                                     self.enqueue_saved_fluids(pos, &saved_ticks);
                                     self.enqueue_saved_sand(&saved_sand_ticks);
                                     self.enqueue_saved_buttons(&saved_sand_ticks);
+                                    self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
                                 changed = true;
                             } else {
@@ -3704,6 +3727,33 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_soil(&mut self, ticks: &[SavedBlockTick]) {
+        for (index, tick) in ticks.iter().enumerate() {
+            let Some(soil) = SoilKind::from_name(&tick.block) else {
+                continue;
+            };
+            let [x, y, z] = tick.position;
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            self.soil_pending.insert((x, y, z, soil));
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.soil_ticks.insert(
+                (
+                    i128::from(self.tick) + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                (IVec3::new(x, y, z), soil),
+            );
+        }
+    }
+
     fn schedule_stone_button(&mut self, relative: IVec3) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -3967,10 +4017,15 @@ impl LoadedSession {
                         deferred_soil.push((order, (absolute, soil)));
                         continue;
                     };
-                    self.world
+                    let Some(blocked) = self
+                        .world
                         .state(above)
                         .and_then(|state| known_soil_cover(&state.name))
-                        == Some(true)
+                    else {
+                        deferred_soil.push((order, (absolute, soil)));
+                        continue;
+                    };
+                    blocked
                 } else {
                     false
                 };
@@ -9954,7 +10009,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_soil_tick_marks_its_chunk_and_blocks_tick_drafting() {
+    fn pending_soil_tick_marks_its_chunk_and_is_included_in_tick_draft() {
         for (name, properties) in [
             ("minecraft:dirt_path", &[][..]),
             ("minecraft:farmland", &[("moisture", "7")][..]),
@@ -9967,7 +10022,15 @@ mod tests {
             let chunk = session.player_chunk().unwrap();
             session.dirty_chunks.clear();
             assert!(session.dirty_chunk_positions().contains(&chunk));
-            assert!(session.draft_block_ticks(chunk).is_err());
+            assert_eq!(
+                session.draft_block_ticks(chunk).unwrap(),
+                vec![SavedBlockTick {
+                    block: name.into(),
+                    position: (session.origin + relative).to_array(),
+                    delay: 1,
+                    priority: 0,
+                }]
+            );
 
             session.tick = 1;
             session.advance_soil_ticks();
@@ -10026,7 +10089,7 @@ mod tests {
             session.update(TICK);
         }
         assert_eq!(session.soil_ticks.len(), 1);
-        assert!(session.draft_block_ticks(home).is_err());
+        assert!(session.draft_block_ticks(home).unwrap()[0].delay < 0);
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert!(session.soil_ticks.is_empty());
@@ -10038,6 +10101,77 @@ mod tests {
                 .unwrap()
                 .name,
             "minecraft:dirt"
+        );
+    }
+
+    #[test]
+    fn saved_soil_ticks_restore_duplicates_and_keep_their_delay() {
+        let (mut world, origin, player) = fixture();
+        let absolute = origin + IVec3::new(8, 2, 6);
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        let path = world.intern_state(state("minecraft:dirt_path", &[]));
+        world
+            .set_block_id(absolute.x, absolute.y, absolute.z, path)
+            .unwrap();
+        let tick = |delay| SavedBlockTick {
+            block: "minecraft:dirt_path".into(),
+            position: absolute.to_array(),
+            delay,
+            priority: 0,
+        };
+        let source = vec![tick(0), tick(4)];
+        world.saved_block_ticks.insert(chunk, source.clone());
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert_eq!(session.draft_block_ticks(chunk).unwrap(), source);
+        assert_eq!(session.soil_ticks.len(), 2);
+        assert_eq!(session.soil_pending.len(), 1);
+        session.advance_block_ticks();
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:dirt"
+        );
+        assert!(session.soil_pending.is_empty());
+        assert_eq!(session.draft_block_ticks(chunk).unwrap(), vec![tick(4)]);
+    }
+
+    #[test]
+    fn farmland_tick_is_preserved_when_its_cover_is_unknown() {
+        let mut session = session();
+        let relative = IVec3::new(8, 2, 6);
+        let absolute = session.origin + relative;
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+        let unknown = session.intern_block(state("custom:unknown", &[]));
+        assert!(session.set(relative, farmland));
+        assert!(session.set(relative + IVec3::Y, unknown));
+        let tick = SavedBlockTick {
+            block: "minecraft:farmland".into(),
+            position: absolute.to_array(),
+            delay: 0,
+            priority: 0,
+        };
+        session.enqueue_saved_soil(std::slice::from_ref(&tick));
+        session.advance_block_ticks();
+        assert_eq!(
+            session
+                .draft_block_ticks(session.player_chunk().unwrap())
+                .unwrap(),
+            vec![tick]
         );
     }
 
@@ -11535,6 +11669,18 @@ mod tests {
                 priority: -1,
             },
             SavedBlockTick {
+                block: "minecraft:dirt_path".into(),
+                position,
+                delay: -1,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:farmland".into(),
+                position,
+                delay: 5,
+                priority: 1,
+            },
+            SavedBlockTick {
                 block: "minecraft:gravel".into(),
                 position,
                 delay: 3,
@@ -11546,6 +11692,7 @@ mod tests {
             .insert(home, source_ticks.clone());
         session.enqueue_saved_sand(&source_ticks);
         session.enqueue_saved_buttons(&source_ticks);
+        session.enqueue_saved_soil(&source_ticks);
 
         let drafted = session.draft_block_ticks(home).unwrap();
         assert_eq!(drafted, source_ticks);

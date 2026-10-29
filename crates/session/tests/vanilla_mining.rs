@@ -153,9 +153,11 @@ public class SavedTickOrderOracle {
     var input=new DataInputStream(Files.newInputStream(Path.of(args[0])));
     var root=NbtIo.read((DataInput)input); input.close();
     var actual=SavedTick.codec(BuiltInRegistries.BLOCK.byNameCodec()).listOf().parse(NbtOps.INSTANCE,root.get("block_ticks")).getOrThrow();
-    if(actual.size()!=3 || actual.get(0).type()!=Blocks.GRAVEL || actual.get(0).delay()!=3 || actual.get(0).priority()!=TickPriority.HIGH || !actual.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
+    if(actual.size()!=5 || actual.get(0).type()!=Blocks.GRAVEL || actual.get(0).delay()!=3 || actual.get(0).priority()!=TickPriority.HIGH || !actual.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
        actual.get(1).type()!=Blocks.STONE_BUTTON || actual.get(1).delay()!=7 || actual.get(1).priority()!=TickPriority.NORMAL || !actual.get(1).pos().equals(new BlockPos(-14,-60,33)) ||
-       actual.get(2).type()!=Blocks.SAND || actual.get(2).delay()!=-2 || actual.get(2).priority()!=TickPriority.NORMAL || !actual.get(2).pos().equals(new BlockPos(-14,-61,33)))
+       actual.get(2).type()!=Blocks.SAND || actual.get(2).delay()!=-2 || actual.get(2).priority()!=TickPriority.NORMAL || !actual.get(2).pos().equals(new BlockPos(-14,-61,33)) ||
+       actual.get(3).type()!=Blocks.DIRT_PATH || actual.get(3).delay()!=-3 || actual.get(3).priority()!=TickPriority.NORMAL || !actual.get(3).pos().equals(new BlockPos(-13,-61,33)) ||
+       actual.get(4).type()!=Blocks.FARMLAND || actual.get(4).delay()!=5 || actual.get(4).priority()!=TickPriority.HIGH || !actual.get(4).pos().equals(new BlockPos(-12,-61,33)))
       throw new AssertionError("Rust NBT tick draft differs from Java codec");
     var fluid=SavedTick.codec(BuiltInRegistries.FLUID.byNameCodec()).listOf().parse(NbtOps.INSTANCE,root.get("fluid_ticks")).getOrThrow();
     if(fluid.size()!=2 || fluid.get(0).type()!=Fluids.FLOWING_LAVA || fluid.get(0).delay()!=3 || fluid.get(0).priority()!=TickPriority.HIGH || !fluid.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
@@ -200,6 +202,18 @@ public class SavedTickOrderOracle {
                 position: [-14, -61, 33],
                 delay: -2,
                 priority: 0,
+            },
+            native_world::loaded::SavedBlockTick {
+                block: "minecraft:dirt_path".into(),
+                position: [-13, -61, 33],
+                delay: -3,
+                priority: 0,
+            },
+            native_world::loaded::SavedBlockTick {
+                block: "minecraft:farmland".into(),
+                position: [-12, -61, 33],
+                delay: 5,
+                priority: -1,
             },
         ])
         .unwrap();

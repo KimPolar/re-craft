@@ -1399,9 +1399,16 @@ impl SoilKind {
 
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "minecraft:dirt_path" => Some(Self::Path),
-            "minecraft:farmland" => Some(Self::Farmland),
+            "minecraft:dirt_path" | "dirt_path" => Some(Self::Path),
+            "minecraft:farmland" | "farmland" => Some(Self::Farmland),
             _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Path => "minecraft:dirt_path",
+            Self::Farmland => "minecraft:farmland",
         }
     }
 }

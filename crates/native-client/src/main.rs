@@ -30,6 +30,7 @@ mod menu_software_worker;
 mod mesh;
 mod mesh_worker;
 mod mouse_look;
+mod mouse_ui;
 mod orb_render;
 mod player_inventory;
 mod player_preview;
@@ -2034,7 +2035,7 @@ impl ApplicationHandler for App {
             if self.inactivity.input(now, self.video.inactivity_fps_limit) {
                 self.frame_pacer.set_limit(self.video.max_fps, now);
             }
-            let (yaw, pitch) = mouse_look::look_delta(delta);
+            let (yaw, pitch) = mouse_look::look_delta(delta, self.video);
             self.visual_look.turn(&self.session.snapshot(), yaw, pitch);
             self.session
                 .submit_command(PlayerCommand::Look { yaw, pitch });

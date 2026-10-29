@@ -1,19 +1,30 @@
-//! Default Java 26.3 mouse sensitivity for ordinary first-person movement.
+//! Java 26.3 mouse sensitivity for ordinary first-person movement.
 
-const DEFAULT_SENSITIVITY: f64 = 0.5;
+use crate::menu_settings::VideoSettings;
 
-fn degrees(delta: f64) -> f32 {
+fn degrees(delta: f64, sensitivity: f64) -> f32 {
     // MouseHandler promotes these float literals to double before computing
     // the gain; Entity.turn then converts the result to float and multiplies.
-    let value = DEFAULT_SENSITIVITY * f64::from(0.6_f32) + f64::from(0.2_f32);
+    let value = sensitivity * f64::from(0.6_f32) + f64::from(0.2_f32);
     let gain = value * value * value * 8.0;
     (delta * gain) as f32 * 0.15_f32
 }
 
-pub(crate) fn look_delta(delta: (f64, f64)) -> (f32, f32) {
+pub(crate) fn look_delta(delta: (f64, f64), settings: VideoSettings) -> (f32, f32) {
+    let sensitivity = settings.mouse_sensitivity.value();
+    let x = if settings.invert_mouse_x {
+        -delta.0
+    } else {
+        delta.0
+    };
+    let y = if settings.invert_mouse_y {
+        -delta.1
+    } else {
+        delta.1
+    };
     (
-        degrees(delta.0).to_radians(),
-        -degrees(delta.1).to_radians(),
+        degrees(x, sensitivity).to_radians(),
+        -degrees(y, sensitivity).to_radians(),
     )
 }
 
@@ -23,15 +34,16 @@ mod tests {
 
     #[test]
     fn default_mouse_motion_has_expected_signs_and_scale() {
-        let (yaw, pitch) = look_delta((10.0, 10.0));
+        let settings = VideoSettings::default();
+        let (yaw, pitch) = look_delta((10.0, 10.0), settings);
         assert!((yaw.to_degrees() - 1.5).abs() < 1e-5);
         assert!((pitch.to_degrees() + 1.5).abs() < 1e-5);
-        assert_eq!(look_delta((0.0, 0.0)), (0.0, -0.0));
+        assert_eq!(look_delta((0.0, 0.0), settings), (0.0, -0.0));
     }
 
     #[test]
     #[ignore = "requires the installed Minecraft 26.3 and Java 25 JDK"]
-    fn default_mouse_turn_matches_installed_java() {
+    fn sensitivity_and_inversion_match_installed_java() {
         use std::{ffi::OsString, path::PathBuf, process::Command};
         const JAVA: &str = r#"
 import java.lang.reflect.*;
@@ -60,9 +72,11 @@ public class MouseOracle {
         var client = (Minecraft) unsafe.allocateInstance(Minecraft.class);
         var options = (Options) unsafe.allocateInstance(Options.class);
         options.setCameraType(CameraType.FIRST_PERSON);
-        set(Options.class, options, "sensitivity", option(Double.valueOf(0.5)));
-        set(Options.class, options, "invertXMouse", option(Boolean.FALSE));
-        set(Options.class, options, "invertYMouse", option(Boolean.FALSE));
+        var sensitivity = option(Double.valueOf(0.5));
+        var invertX = option(Boolean.FALSE); var invertY = option(Boolean.FALSE);
+        set(Options.class, options, "sensitivity", sensitivity);
+        set(Options.class, options, "invertXMouse", invertX);
+        set(Options.class, options, "invertYMouse", invertY);
         set(Minecraft.class, client, "options", options);
         set(Minecraft.class, client, "tutorial", unsafe.allocateInstance(Tutorial.class));
         var player = (TestPlayer) unsafe.allocateInstance(TestPlayer.class);
@@ -71,13 +85,19 @@ public class MouseOracle {
         var turn = MouseHandler.class.getDeclaredMethod("turnPlayer", double.class); turn.setAccessible(true);
         double[] values = {-128, -10, -0.01, 0, 0.125, 1, 3.5, 17.5, 100, 2048};
         var out = new StringBuilder();
-        for (double x : values) for (double y : values) {
+        for (double s : new double[]{0.0, 0.25, 0.5, 0.75, 1.0})
+          for (boolean ix : new boolean[]{false,true}) for (boolean iy : new boolean[]{false,true}) {
+          set(OptionInstance.class, sensitivity, "value", Double.valueOf(s));
+          set(OptionInstance.class, invertX, "value", Boolean.valueOf(ix));
+          set(OptionInstance.class, invertY, "value", Boolean.valueOf(iy));
+          for (double x : values) for (double y : values) {
             player.setYRot(0); player.setXRot(0);
             set(MouseHandler.class, mouse, "accumulatedDX", x);
             set(MouseHandler.class, mouse, "accumulatedDY", y);
             turn.invoke(mouse, 0.05);
             out.append(Float.floatToIntBits(player.getYRot())).append(' ')
                .append(Float.floatToIntBits(player.getXRot())).append('\n');
+        }
         }
         Files.writeString(Path.of(args[0]), out);
     }
@@ -131,26 +151,49 @@ public class MouseOracle {
             -128.0, -10.0, -0.01, 0.0, 0.125, 1.0, 3.5, 17.5, 100.0, 2048.0,
         ];
         let mut lines = data.lines();
-        for x in values {
-            for y in values {
-                let bits: Vec<i32> = lines
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .map(|v| v.parse().unwrap())
-                    .collect();
-                assert_eq!(degrees(x).to_bits(), bits[0] as u32, "yaw {x}");
-                assert_eq!(
-                    degrees(y).clamp(-90.0, 90.0).to_bits(),
-                    bits[1] as u32,
-                    "pitch {y}"
-                );
-                let (yaw, pitch) = look_delta((x, y));
-                assert_eq!(yaw, f32::from_bits(bits[0] as u32).to_radians());
-                assert_eq!(
-                    pitch.clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH),
-                    -f32::from_bits(bits[1] as u32).to_radians()
-                );
+        for sensitivity in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for invert_x in [false, true] {
+                for invert_y in [false, true] {
+                    let settings = VideoSettings {
+                        mouse_sensitivity: crate::menu_settings::UnitInterval::new(sensitivity),
+                        invert_mouse_x: invert_x,
+                        invert_mouse_y: invert_y,
+                        ..VideoSettings::default()
+                    };
+                    for x in values {
+                        for y in values {
+                            let bits: Vec<i32> = lines
+                                .next()
+                                .unwrap()
+                                .split_whitespace()
+                                .map(|v| v.parse().unwrap())
+                                .collect();
+                            let x = if invert_x { -x } else { x };
+                            let y = if invert_y { -y } else { y };
+                            assert_eq!(
+                                (0.0_f32 + degrees(x, sensitivity)).to_bits(),
+                                bits[0] as u32,
+                                "yaw {x}"
+                            );
+                            assert_eq!(
+                                (0.0_f32 + degrees(y, sensitivity))
+                                    .clamp(-90.0, 90.0)
+                                    .to_bits(),
+                                bits[1] as u32,
+                                "pitch {y}"
+                            );
+                            let (yaw, pitch) = look_delta(
+                                (if invert_x { -x } else { x }, if invert_y { -y } else { y }),
+                                settings,
+                            );
+                            assert_eq!(yaw, f32::from_bits(bits[0] as u32).to_radians());
+                            assert_eq!(
+                                pitch.clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH),
+                                -f32::from_bits(bits[1] as u32).to_radians()
+                            );
+                        }
+                    }
+                }
             }
         }
         assert!(lines.next().is_none());

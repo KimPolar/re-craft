@@ -157,6 +157,9 @@ pub struct VideoSettings {
     pub glint_strength: UnitInterval,
     pub panorama_speed: UnitInterval,
     pub menu_blur: u8,
+    pub mouse_sensitivity: UnitInterval,
+    pub invert_mouse_x: bool,
+    pub invert_mouse_y: bool,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
     pub inactivity_fps_limit: InactivityFpsLimit,
 }
@@ -190,6 +193,9 @@ impl Default for VideoSettings {
             glint_strength: UnitInterval::new(0.75),
             panorama_speed: UnitInterval::new(1.0),
             menu_blur: 5,
+            mouse_sensitivity: UnitInterval::new(0.5),
+            invert_mouse_x: false,
+            invert_mouse_y: false,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }
@@ -216,6 +222,7 @@ impl VideoSettings {
             glint_speed: self.glint_speed.valid_or(0.5),
             glint_strength: self.glint_strength.valid_or(0.75),
             panorama_speed: self.panorama_speed.valid_or(1.0),
+            mouse_sensitivity: self.mouse_sensitivity.valid_or(0.5),
             menu_blur: if self.menu_blur <= 10 {
                 self.menu_blur
             } else {
@@ -458,6 +465,32 @@ mod tests {
                 ..VideoSettings::default()
             }
         );
+    }
+
+    #[test]
+    fn mouse_settings_survive_video_save_and_validate_old_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.json");
+        std::fs::write(
+            &path,
+            br#"{"future":{"value":42},"video":{"future_video":true}}"#,
+        )
+        .unwrap();
+        let video = VideoSettings {
+            mouse_sensitivity: UnitInterval::new(0.77),
+            invert_mouse_x: true,
+            invert_mouse_y: true,
+            ..VideoSettings::default()
+        };
+        save_video_to(&path, video).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["future"]["value"], 42);
+        assert_eq!(saved["video"]["future_video"], true);
+        let parsed: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(parsed.video, video);
+        let invalid: VideoSettings = serde_json::from_str(r#"{"mouse_sensitivity":1.5}"#).unwrap();
+        assert_eq!(invalid.valid().mouse_sensitivity.value(), 0.5);
     }
 
     #[test]

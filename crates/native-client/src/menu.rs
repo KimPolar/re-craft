@@ -30,6 +30,7 @@ use crate::{
     menu_gpu_worker::{MenuFrame, MenuGpuWorker, MenuOverlay},
     menu_settings::{self, Settings, SoundCategory, SoundSettings, VideoSettings},
     menu_software_worker::{MenuSoftwareWorker, SoftwareFrame},
+    mouse_ui::{self, MouseControl, MouseUi},
     sound_ui::SoundUi,
     video_ui::{VideoControl, VideoUi},
 };
@@ -44,6 +45,8 @@ enum Screen {
     Title,
     Worlds,
     Options,
+    Controls,
+    Mouse,
     Sound,
     Video,
     Accessibility,
@@ -59,6 +62,11 @@ enum ButtonId {
     Multiplayer,
     Realms,
     Options,
+    Controls,
+    MouseSettings,
+    MouseSensitivity,
+    MouseInvertX,
+    MouseInvertY,
     SoundSettings,
     SoundSlider(SoundCategory),
     OptionsFov,
@@ -103,6 +111,14 @@ enum ButtonId {
 }
 
 impl ButtonId {
+    fn mouse_control(self) -> Option<MouseControl> {
+        match self {
+            Self::MouseSensitivity => Some(MouseControl::Sensitivity),
+            Self::MouseInvertX => Some(MouseControl::InvertX),
+            Self::MouseInvertY => Some(MouseControl::InvertY),
+            _ => None,
+        }
+    }
     fn accessibility_control(self) -> Option<AccessibilityControl> {
         match self {
             Self::ViewBobbing => Some(AccessibilityControl::ViewBobbing),
@@ -860,6 +876,7 @@ struct Menu<'a> {
     scale: u32,
     video_ui: VideoUi,
     sound_ui: SoundUi,
+    mouse_ui: MouseUi,
     accessibility_ui: crate::accessibility_ui::AccessibilityUi,
     fov_ui: FovSlider,
     slider_mouse_pressed: bool,
@@ -906,6 +923,7 @@ impl<'a> Menu<'a> {
             scale: 1,
             video_ui,
             sound_ui: SoundUi::default(),
+            mouse_ui: MouseUi::default(),
             accessibility_ui: crate::accessibility_ui::AccessibilityUi::default(),
             fov_ui,
             slider_mouse_pressed: false,
@@ -1439,6 +1457,7 @@ impl<'a> Menu<'a> {
                     let right_id = match right.0 {
                         "options.accessibility.title" => ButtonId::Accessibility,
                         "options.sounds" => ButtonId::SoundSettings,
+                        "options.controls" => ButtonId::Controls,
                         _ => ButtonId::Unavailable,
                     };
                     add(
@@ -1459,6 +1478,29 @@ impl<'a> Menu<'a> {
                     true,
                 );
                 add(ButtonId::Done, x, h - 28, 200, tr("gui.done", "Done"), true);
+            }
+            Screen::Controls => {
+                let rect = mouse_ui::controls_mouse_button(w);
+                add(
+                    ButtonId::MouseSettings,
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    tr("options.mouse_settings", "Mouse Settings..."),
+                    true,
+                );
+                add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
+            }
+            Screen::Mouse => {
+                for (id, control) in [
+                    (ButtonId::MouseSensitivity, MouseControl::Sensitivity),
+                    (ButtonId::MouseInvertX, MouseControl::InvertX),
+                    (ButtonId::MouseInvertY, MouseControl::InvertY),
+                ] {
+                    let rect = mouse_ui::mouse_control_rect(w, control);
+                    add(id, rect.x, rect.y, rect.w, String::new(), true);
+                }
+                add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
             }
             Screen::Sound => {
                 for category in SoundCategory::ALL {
@@ -1642,6 +1684,25 @@ impl<'a> Menu<'a> {
                     self.fov_ui
                         .start(width, self.cursor.0, &mut self.state.video);
             }
+            ButtonId::Controls => self.state.screen = Screen::Controls,
+            ButtonId::MouseSettings => {
+                self.mouse_ui = MouseUi::default();
+                self.state.screen = Screen::Mouse;
+            }
+            ButtonId::MouseSensitivity => {
+                let (width, _) = self.logical_size();
+                self.state.video_dirty |=
+                    self.mouse_ui
+                        .start(width, self.cursor.0, &mut self.state.video);
+            }
+            ButtonId::MouseInvertX => {
+                self.state.video.invert_mouse_x = !self.state.video.invert_mouse_x;
+                self.state.video_dirty = true;
+            }
+            ButtonId::MouseInvertY => {
+                self.state.video.invert_mouse_y = !self.state.video.invert_mouse_y;
+                self.state.video_dirty = true;
+            }
             ButtonId::VideoSettings => {
                 self.video_ui = VideoUi::new(self.state.video);
                 self.state.screen = Screen::Video;
@@ -1718,7 +1779,12 @@ impl<'a> Menu<'a> {
                 }
                 if matches!(
                     self.state.screen,
-                    Screen::Video | Screen::Options | Screen::Accessibility | Screen::Sound
+                    Screen::Video
+                        | Screen::Options
+                        | Screen::Accessibility
+                        | Screen::Sound
+                        | Screen::Mouse
+                        | Screen::Controls
                 ) && self.state.video_dirty
                 {
                     self.state.save_settings();
@@ -1727,6 +1793,7 @@ impl<'a> Menu<'a> {
                 self.accessibility_ui.release();
                 self.fov_ui.release(self.state.video);
                 self.sound_ui.release();
+                self.mouse_ui.release();
                 self.fov_ui.keyboard_adjust = false;
                 self.state.screen = match self.state.screen {
                     Screen::Worlds | Screen::Options => Screen::Title,
@@ -1734,9 +1801,12 @@ impl<'a> Menu<'a> {
                         self.recovery_world = None;
                         self.recovery_return_screen
                     }
-                    Screen::Packs | Screen::Video | Screen::Accessibility | Screen::Sound => {
-                        Screen::Options
-                    }
+                    Screen::Mouse => Screen::Controls,
+                    Screen::Packs
+                    | Screen::Video
+                    | Screen::Accessibility
+                    | Screen::Sound
+                    | Screen::Controls => Screen::Options,
                     #[cfg(debug_assertions)]
                     Screen::WorldSettings => Screen::Worlds,
                     screen => screen,
@@ -2215,6 +2285,38 @@ impl<'a> Menu<'a> {
                         .draw(&mut canvas, assets, self.state.sound, self.cursor, focused);
                 }
             }
+            Screen::Controls => {
+                canvas.text_centered(
+                    assets,
+                    lw / 2,
+                    12,
+                    assets.map_or("Controls", |a| a.translate("controls.title", "Controls")),
+                    [255, 255, 255],
+                );
+                if let Some(assets) = assets {
+                    mouse_ui::draw_controls_placeholders(&mut canvas, assets);
+                }
+            }
+            Screen::Mouse => {
+                canvas.text_centered(
+                    assets,
+                    lw / 2,
+                    12,
+                    assets.map_or("Mouse Settings", |a| {
+                        a.translate("options.mouse_settings.title", "Mouse Settings")
+                    }),
+                    [255, 255, 255],
+                );
+                if let Some(assets) = assets {
+                    self.mouse_ui.draw(
+                        &mut canvas,
+                        assets,
+                        self.state.video,
+                        self.cursor,
+                        self.focused.and_then(ButtonId::mouse_control),
+                    );
+                }
+            }
             Screen::Video => {
                 canvas.text_centered(
                     assets,
@@ -2377,6 +2479,7 @@ impl<'a> Menu<'a> {
         }
         for button in self.buttons() {
             if matches!(button.id, ButtonId::SoundSlider(_))
+                || button.id.mouse_control().is_some()
                 || button.id.accessibility_control().is_some()
                 || matches!(
                     button.id,
@@ -2576,7 +2679,11 @@ impl ApplicationHandler for Menu<'_> {
                     (position.x / self.scale as f64) as i32,
                     (position.y / self.scale as f64) as i32,
                 );
-                let (dragged, changed) = if self.state.screen == Screen::Video {
+                let (dragged, changed) = if self.state.screen == Screen::Mouse {
+                    let (w, _) = self.logical_size();
+                    self.mouse_ui
+                        .pointer_move(w, self.cursor.0, &mut self.state.video)
+                } else if self.state.screen == Screen::Video {
                     let (w, h) = self.logical_size();
                     self.video_ui
                         .pointer_move(w, h, self.cursor, &mut self.state.video)
@@ -2647,6 +2754,7 @@ impl ApplicationHandler for Menu<'_> {
                         || matches!(
                             button.id,
                             ButtonId::VideoFps
+                                | ButtonId::MouseSensitivity
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::OptionsFov
@@ -2738,6 +2846,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.accessibility_ui.release();
                 self.fov_ui.release(self.state.video);
                 self.sound_ui.release();
+                self.mouse_ui.release();
             }
             WindowEvent::Focused(false) => {
                 self.slider_mouse_pressed = false;
@@ -2745,6 +2854,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.accessibility_ui.release();
                 self.fov_ui.release(self.state.video);
                 self.sound_ui.release();
+                self.mouse_ui.release();
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Sound && self.state.asset_load.is_none() =>
@@ -2850,6 +2960,14 @@ impl ApplicationHandler for Menu<'_> {
                     if next >= self.state.world_scroll + visible {
                         self.state.world_scroll = next + 1 - visible;
                     }
+                } else if self.state.screen == Screen::Mouse
+                    && self.focused == Some(ButtonId::MouseSensitivity)
+                    && self.mouse_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.state.video_dirty |= self
+                        .mouse_ui
+                        .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Sound
                     && self.sound_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -2957,6 +3075,8 @@ impl ApplicationHandler for Menu<'_> {
                             )
                         );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
+                        self.mouse_ui.keyboard_adjust =
+                            self.focused == Some(ButtonId::MouseSensitivity);
                         self.accessibility_ui.keyboard_adjust = matches!(
                             self.focused,
                             Some(
@@ -2980,7 +3100,9 @@ impl ApplicationHandler for Menu<'_> {
                     if let Some(id) = self.focused
                         && self.buttons().iter().any(|b| b.id == id && b.active)
                     {
-                        if matches!(id, ButtonId::SoundSlider(_)) {
+                        if id == ButtonId::MouseSensitivity {
+                            self.mouse_ui.keyboard_adjust = !self.mouse_ui.keyboard_adjust;
+                        } else if matches!(id, ButtonId::SoundSlider(_)) {
                             self.sound_ui.keyboard_adjust = !self.sound_ui.keyboard_adjust;
                         } else if id == ButtonId::OptionsFov {
                             self.fov_ui.keyboard_adjust = !self.fov_ui.keyboard_adjust;
@@ -4246,6 +4368,26 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(saved.sound.ui_gain(), 0.25);
+                click(&mut self.menu, event_loop, ButtonId::Controls, false);
+                assert_eq!(self.menu.state.screen, Screen::Controls);
+                click(&mut self.menu, event_loop, ButtonId::MouseSettings, false);
+                assert_eq!(self.menu.state.screen, Screen::Mouse);
+                self.menu.redraw().unwrap();
+                click(&mut self.menu, event_loop, ButtonId::MouseSensitivity, true);
+                click(&mut self.menu, event_loop, ButtonId::MouseInvertX, false);
+                click(&mut self.menu, event_loop, ButtonId::MouseInvertY, false);
+                assert_eq!(self.menu.state.video.mouse_sensitivity.value(), 1.0);
+                assert!(
+                    self.menu.state.video.invert_mouse_x && self.menu.state.video.invert_mouse_y
+                );
+                click(&mut self.menu, event_loop, ButtonId::Done, false);
+                assert_eq!(self.menu.state.screen, Screen::Controls);
+                let saved: Settings = serde_json::from_slice(
+                    &std::fs::read(self.menu.state.settings_path.as_ref().unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved.video.mouse_sensitivity.value(), 1.0);
+                assert!(saved.video.invert_mouse_x && saved.video.invert_mouse_y);
                 event_loop.exit();
             }
         }

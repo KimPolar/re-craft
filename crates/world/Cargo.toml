@@ -1,0 +1,15 @@
+[package]
+name = "native-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true
+native-core = { path = "../core" }
+
+[dev-dependencies]
+native-resources = { path = "../resources" }
+serde_json.workspace = true
+tempfile = "3.27"
+

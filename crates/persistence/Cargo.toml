@@ -1,0 +1,25 @@
+[package]
+name = "native-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+lz4-java-wrc = "0.2"
+native-world = { path = "../world" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tempfile = "3.27"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+base64 = "0.22"
+glam.workspace = true
+native-core = { path = "../core" }
+native-session = { path = "../session" }
+serde_json.workspace = true

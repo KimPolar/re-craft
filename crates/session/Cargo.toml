@@ -1,0 +1,18 @@
+[package]
+name = "native-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+native-core = { path = "../core" }
+native-persistence = { path = "../persistence" }
+native-resources = { path = "../resources" }
+native-world = { path = "../world" }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+tempfile = "3.27"
+

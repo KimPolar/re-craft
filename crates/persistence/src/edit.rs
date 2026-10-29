@@ -1,0 +1,1011 @@
+//! In-memory block-state drafts for existing 26.3 chunks.
+//!
+//! A draft preserves the source NBT outside the edited block-state storage, but
+//! does not automatically update lighting, heightmaps, entities, scheduled ticks
+//! or neighbors. Known heightmaps can be rebuilt separately with trusted predicates.
+//! It is deliberately not connected to the on-disk save path yet.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{Context, Result, bail, ensure};
+
+use crate::{
+    nbt::{JavaString, NamedTag, Tag, TagType},
+    palette::{self, BLOCKS_PER_SECTION, BlockState},
+    world::ChunkPos,
+};
+
+#[derive(Clone, Debug)]
+pub struct BlockChange {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Prevent a stale edit from silently replacing a different block.
+    pub expected: BlockState,
+    pub replacement: BlockState,
+}
+
+#[derive(Debug)]
+pub struct ChunkDraft {
+    source_nbt: Vec<u8>,
+    document: NamedTag,
+    position: ChunkPos,
+    heightmaps_rebuilt: bool,
+    pub changed_blocks: usize,
+    pub changed_sections: BTreeSet<i8>,
+}
+
+impl ChunkDraft {
+    /// This is an incomplete draft and must not yet be saved as a playable chunk.
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+
+    /// Any eventual coordinated write must also compare the raw file bytes.
+    pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
+        Ok(crate::nbt::write(current)? == self.source_nbt)
+    }
+
+    /// Replace only fully understood falling-block ticks in this in-memory draft.
+    /// Other chunk data, including lighting and entities, remains unvalidated.
+    pub fn replace_falling_block_ticks(
+        &mut self,
+        ticks: &[native_world::loaded::SavedBlockTick],
+    ) -> Result<()> {
+        fn supported(name: &str) -> bool {
+            matches!(
+                name,
+                "minecraft:sand"
+                    | "sand"
+                    | "minecraft:red_sand"
+                    | "red_sand"
+                    | "minecraft:gravel"
+                    | "gravel"
+            )
+        }
+        let source = crate::nbt::read(&self.source_nbt)?;
+        if let Some(list) = unique_field(&source.value, "block_ticks")? {
+            let Tag::List {
+                element_type,
+                values,
+            } = list
+            else {
+                bail!("block_ticks must be a list")
+            };
+            ensure!(
+                *element_type == TagType::Compound || values.is_empty(),
+                "unsupported block tick list type"
+            );
+            for entry in values {
+                let Tag::Compound(fields) = entry else {
+                    bail!("block tick must be a compound")
+                };
+                ensure!(
+                    fields.len() == 6,
+                    "block tick has unsupported or missing fields"
+                );
+                for field in ["i", "x", "y", "z", "t", "p"] {
+                    ensure!(
+                        unique_field(entry, field)?.is_some(),
+                        "block tick is missing {field}"
+                    );
+                }
+                let Some(Tag::String(id)) = unique_field(entry, "i")? else {
+                    bail!("block tick id must be a string")
+                };
+                let id = String::from_utf16(&id.0).context("invalid block tick id")?;
+                ensure!(supported(&id), "unsupported saved block tick {id}");
+                for field in ["x", "y", "z", "t", "p"] {
+                    ensure!(
+                        unique_field(entry, field)?
+                            .and_then(Tag::as_java_int)
+                            .is_some(),
+                        "block tick {field} must be numeric"
+                    );
+                }
+                let x = unique_field(entry, "x")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                let z = unique_field(entry, "z")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                ensure!(
+                    x.div_euclid(16) == self.position.x && z.div_euclid(16) == self.position.z,
+                    "saved block tick is outside its chunk"
+                );
+                let priority = unique_field(entry, "p")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                ensure!(
+                    (-3..=3).contains(&priority),
+                    "saved block tick priority is out of range"
+                );
+            }
+        }
+        let mut entries = Vec::with_capacity(ticks.len());
+        for tick in ticks {
+            ensure!(
+                supported(&tick.block),
+                "unsupported block tick {}",
+                tick.block
+            );
+            ensure!(
+                tick.position[0].div_euclid(16) == self.position.x
+                    && tick.position[2].div_euclid(16) == self.position.z,
+                "block tick is outside its chunk"
+            );
+            ensure!(
+                (-3..=3).contains(&tick.priority),
+                "block tick priority is out of range"
+            );
+            entries.push(Tag::Compound(vec![
+                ("i".into(), Tag::String(tick.block.as_str().into())),
+                ("x".into(), Tag::Int(tick.position[0])),
+                ("y".into(), Tag::Int(tick.position[1])),
+                ("z".into(), Tag::Int(tick.position[2])),
+                ("t".into(), Tag::Int(tick.delay)),
+                ("p".into(), Tag::Int(tick.priority)),
+            ]));
+        }
+        let replacement = Tag::List {
+            element_type: TagType::Compound,
+            values: entries,
+        };
+        match unique_field_mut(&mut self.document.value, "block_ticks")? {
+            Some(field) => *field = replacement,
+            None => {
+                let Tag::Compound(fields) = &mut self.document.value else {
+                    bail!("chunk must be a compound")
+                };
+                fields.push(("block_ticks".into(), replacement));
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace understood fluid ticks in memory; this does not authorize a save.
+    pub fn replace_fluid_ticks(
+        &mut self,
+        ticks: &[native_world::loaded::SavedFluidTick],
+    ) -> Result<()> {
+        fn supported(name: &str) -> bool {
+            matches!(
+                name,
+                "minecraft:water"
+                    | "water"
+                    | "minecraft:flowing_water"
+                    | "flowing_water"
+                    | "minecraft:lava"
+                    | "lava"
+                    | "minecraft:flowing_lava"
+                    | "flowing_lava"
+            )
+        }
+        let source = crate::nbt::read(&self.source_nbt)?;
+        if let Some(list) = unique_field(&source.value, "fluid_ticks")? {
+            let Tag::List {
+                element_type,
+                values,
+            } = list
+            else {
+                bail!("fluid_ticks must be a list")
+            };
+            ensure!(
+                *element_type == TagType::Compound || values.is_empty(),
+                "unsupported fluid tick list type"
+            );
+            for entry in values {
+                let Tag::Compound(fields) = entry else {
+                    bail!("fluid tick must be a compound")
+                };
+                ensure!(
+                    fields.len() == 6,
+                    "fluid tick has unsupported or missing fields"
+                );
+                for field in ["i", "x", "y", "z", "t", "p"] {
+                    ensure!(
+                        unique_field(entry, field)?.is_some(),
+                        "fluid tick is missing {field}"
+                    );
+                }
+                let Some(Tag::String(id)) = unique_field(entry, "i")? else {
+                    bail!("fluid tick id must be a string")
+                };
+                let id = String::from_utf16(&id.0).context("invalid fluid tick id")?;
+                ensure!(supported(&id), "unsupported saved fluid tick {id}");
+                for field in ["x", "y", "z", "t", "p"] {
+                    ensure!(
+                        unique_field(entry, field)?
+                            .and_then(Tag::as_java_int)
+                            .is_some(),
+                        "fluid tick {field} must be numeric"
+                    );
+                }
+                let x = unique_field(entry, "x")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                let z = unique_field(entry, "z")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                let priority = unique_field(entry, "p")?
+                    .and_then(Tag::as_java_int)
+                    .unwrap();
+                ensure!(
+                    x.div_euclid(16) == self.position.x && z.div_euclid(16) == self.position.z,
+                    "saved fluid tick is outside its chunk"
+                );
+                ensure!(
+                    (-3..=3).contains(&priority),
+                    "saved fluid tick priority is out of range"
+                );
+            }
+        }
+        let mut entries = Vec::with_capacity(ticks.len());
+        for tick in ticks {
+            ensure!(
+                supported(&tick.fluid),
+                "unsupported fluid tick {}",
+                tick.fluid
+            );
+            ensure!(
+                tick.position[0].div_euclid(16) == self.position.x
+                    && tick.position[2].div_euclid(16) == self.position.z,
+                "fluid tick is outside its chunk"
+            );
+            ensure!(
+                (-3..=3).contains(&tick.priority),
+                "fluid tick priority is out of range"
+            );
+            entries.push(Tag::Compound(vec![
+                ("i".into(), Tag::String(tick.fluid.as_str().into())),
+                ("x".into(), Tag::Int(tick.position[0])),
+                ("y".into(), Tag::Int(tick.position[1])),
+                ("z".into(), Tag::Int(tick.position[2])),
+                ("t".into(), Tag::Int(tick.delay)),
+                ("p".into(), Tag::Int(tick.priority)),
+            ]));
+        }
+        let replacement = Tag::List {
+            element_type: TagType::Compound,
+            values: entries,
+        };
+        match unique_field_mut(&mut self.document.value, "fluid_ticks")? {
+            Some(field) => *field = replacement,
+            None => {
+                let Tag::Compound(fields) = &mut self.document.value else {
+                    bail!("chunk must be a compound")
+                };
+                fields.push(("fluid_ticks".into(), replacement));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild known heightmaps after validating the source against its blocks.
+    /// This does not update lighting, entities, ticks or authorize a file write.
+    pub fn rebuild_heightmaps(
+        &mut self,
+        bounds: crate::heightmap::HeightBounds,
+        classify: impl FnMut(&BlockState) -> Result<crate::heightmap::BlockHeightFlags>,
+    ) -> Result<()> {
+        let original = crate::nbt::read(&self.source_nbt)?;
+        self.document = crate::heightmap::rebuild(
+            &original,
+            &self.document,
+            bounds,
+            self.heightmaps_rebuilt,
+            classify,
+        )?;
+        self.heightmaps_rebuilt = true;
+        Ok(())
+    }
+}
+
+type StateKey = (Vec<u16>, Vec<(Vec<u16>, Vec<u16>)>);
+
+fn key(state: &BlockState) -> Result<StateKey> {
+    ensure!(!state.name.0.is_empty(), "block state name is empty");
+    let mut properties: Vec<_> = state
+        .properties
+        .iter()
+        .map(|(name, value)| (name.0.clone(), value.0.clone()))
+        .collect();
+    properties.sort();
+    ensure!(
+        properties.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "block state has duplicate properties"
+    );
+    Ok((state.name.0.clone(), properties))
+}
+
+fn state_tag(state: &BlockState) -> Tag {
+    if state.properties.is_empty() {
+        return Tag::String(state.name.clone());
+    }
+    Tag::Compound(vec![
+        ("id".into(), Tag::String(state.name.clone())),
+        (
+            "properties".into(),
+            Tag::Compound(
+                state
+                    .properties
+                    .iter()
+                    .map(|(name, value)| (name.clone(), Tag::String(value.clone())))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn append_palette_entry(
+    element_type: &mut TagType,
+    values: &mut Vec<Tag>,
+    value: Tag,
+) -> Result<()> {
+    match (*element_type, value) {
+        (TagType::String, value @ Tag::String(_)) => values.push(value),
+        (TagType::String, value @ Tag::Compound(_)) => {
+            for entry in values.iter_mut() {
+                let original = std::mem::replace(entry, Tag::Compound(Vec::new()));
+                *entry = Tag::Compound(vec![("".into(), original)]);
+            }
+            *element_type = TagType::Compound;
+            values.push(value);
+        }
+        (TagType::Compound, value @ Tag::String(_)) => {
+            values.push(Tag::Compound(vec![("".into(), value)]))
+        }
+        (TagType::Compound, value @ Tag::Compound(_)) => values.push(value),
+        _ => bail!("unsupported palette element type"),
+    }
+    Ok(())
+}
+
+fn unique_field<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
+    let Tag::Compound(entries) = tag else {
+        bail!("{name} parent is not a compound")
+    };
+    let mut matches = entries.iter().filter(|(key, _)| key.matches(name));
+    let value = matches.next().map(|(_, value)| value);
+    ensure!(
+        matches.next().is_none(),
+        "duplicate {name} tags are not supported for editing"
+    );
+    Ok(value)
+}
+
+fn unique_field_mut<'a>(tag: &'a mut Tag, name: &str) -> Result<Option<&'a mut Tag>> {
+    let Tag::Compound(entries) = tag else {
+        bail!("{name} parent is not a compound")
+    };
+    ensure!(
+        entries.iter().filter(|(key, _)| key.matches(name)).count() <= 1,
+        "duplicate {name} tags are not supported for editing"
+    );
+    Ok(entries
+        .iter_mut()
+        .find(|(key, _)| key.matches(name))
+        .map(|(_, value)| value))
+}
+
+fn bits(palette_len: usize) -> u32 {
+    (usize::BITS - (palette_len - 1).leading_zeros()).max(4)
+}
+
+fn unused_bits_are_zero(words: &[i64], bits: u32) -> bool {
+    let per_word = 64 / bits as usize;
+    words.iter().enumerate().all(|(word_index, value)| {
+        let remaining = BLOCKS_PER_SECTION.saturating_sub(word_index * per_word);
+        let used_bits = remaining.min(per_word) * bits as usize;
+        let mask = if used_bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << used_bits) - 1
+        };
+        (*value as u64 & !mask) == 0
+    })
+}
+
+/// Apply a batch atomically in memory; missing data and stale expected states are errors.
+pub fn draft_chunk_blocks(
+    original: &NamedTag,
+    position: ChunkPos,
+    changes: &[BlockChange],
+) -> Result<ChunkDraft> {
+    for field in ["DataVersion", "xPos", "zPos", "Status", "sections"] {
+        unique_field(&original.value, field)?;
+    }
+    crate::save::validate_chunk(&original.value, position.x, position.z)?;
+    let source_nbt = crate::nbt::write(original).context("cannot encode source chunk")?;
+    let decoded = palette::decode_sections(&original.value)?;
+    let mut grouped: BTreeMap<i8, Vec<&BlockChange>> = BTreeMap::new();
+    for change in changes {
+        ensure!(
+            change.x.div_euclid(16) == position.x && change.z.div_euclid(16) == position.z,
+            "block position is outside the chunk"
+        );
+        let section =
+            i8::try_from(change.y.div_euclid(16)).context("block Y is outside section range")?;
+        key(&change.expected)?;
+        key(&change.replacement)?;
+        grouped.entry(section).or_default().push(change);
+    }
+    let mut document = original.clone();
+    let mut changed_blocks = 0;
+    let mut changed_sections = BTreeSet::new();
+    if grouped.is_empty() {
+        return Ok(ChunkDraft {
+            source_nbt,
+            document,
+            position,
+            heightmaps_rebuilt: false,
+            changed_blocks,
+            changed_sections,
+        });
+    }
+    let sections = match unique_field_mut(&mut document.value, "sections")? {
+        Some(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        }) => values,
+        _ => bail!("chunk has no editable sections"),
+    };
+    for (section_y, changes) in grouped {
+        let mut decoded_blocks = decoded
+            .iter()
+            .find(|section| section.y == section_y)
+            .and_then(|section| section.blocks.clone())
+            .with_context(|| format!("section {section_y} has no block-state data"))?;
+        let section = sections
+            .iter_mut()
+            .find(|section| matches!(section.get("Y"), Some(Tag::Byte(y)) if *y == section_y))
+            .with_context(|| format!("missing section {section_y}"))?;
+        unique_field(section, "Y")?;
+        let state_storage = unique_field_mut(section, "block_states")?
+            .context("section is missing block_states")?;
+        let raw_data = match unique_field(state_storage, "data")? {
+            Some(Tag::LongArray(words)) => Some(words.clone()),
+            None => None,
+            _ => bail!("block-state data is not a long array"),
+        };
+        let original_bits = bits(decoded_blocks.states.len());
+        let (element_type, values) = match unique_field_mut(state_storage, "palette")? {
+            Some(Tag::List {
+                element_type,
+                values,
+            }) if matches!(*element_type, TagType::Compound | TagType::String) => {
+                (element_type, values)
+            }
+            _ => bail!("block-state palette is not a supported list"),
+        };
+        for value in values.iter() {
+            let value = palette::unwrap_palette_entry(value);
+            match value {
+                Tag::String(_) => {}
+                Tag::Compound(_) => {
+                    ensure!(
+                        value.get("Name").is_none() && value.get("Properties").is_none(),
+                        "legacy block-state format cannot be edited as 26.3"
+                    );
+                    unique_field(value, "id")?;
+                    unique_field(value, "properties")?;
+                }
+                _ => bail!("invalid block-state palette entry"),
+            }
+        }
+        let mut lookup = BTreeMap::new();
+        for (index, state) in decoded_blocks.states.iter().enumerate() {
+            lookup.entry(key(state)?).or_insert(index as u32);
+        }
+        let mut section_changes = 0usize;
+        for change in changes {
+            let index = change.x.rem_euclid(16) as usize
+                + change.z.rem_euclid(16) as usize * 16
+                + change.y.rem_euclid(16) as usize * 256;
+            let current = decoded_blocks.indices[index] as usize;
+            ensure!(
+                key(&decoded_blocks.states[current])? == key(&change.expected)?,
+                "block state changed before edit at ({}, {}, {})",
+                change.x,
+                change.y,
+                change.z
+            );
+            let replacement = key(&change.replacement)?;
+            if key(&decoded_blocks.states[current])? == replacement {
+                continue;
+            }
+            let next = if let Some(index) = lookup.get(&replacement) {
+                *index
+            } else {
+                ensure!(
+                    values.len() < BLOCKS_PER_SECTION,
+                    "block palette has no room for another entry without discarding existing data"
+                );
+                let index = values.len() as u32;
+                append_palette_entry(element_type, values, state_tag(&change.replacement))?;
+                decoded_blocks.states.push(change.replacement.clone());
+                lookup.insert(replacement, index);
+                index
+            };
+            decoded_blocks.indices[index] = next;
+            section_changes += 1;
+        }
+        if section_changes == 0 {
+            continue;
+        }
+        let new_bits = bits(decoded_blocks.states.len());
+        let data = if let Some(mut old) = raw_data {
+            if original_bits == new_bits {
+                let per_word = 64usize / original_bits as usize;
+                let mask = (1u64 << original_bits) - 1;
+                for (index, value) in decoded_blocks.indices.iter().enumerate() {
+                    let shift = (index % per_word) * original_bits as usize;
+                    let word = old[index / per_word] as u64;
+                    old[index / per_word] =
+                        ((word & !(mask << shift)) | (u64::from(*value) << shift)) as i64;
+                }
+                old
+            } else {
+                ensure!(
+                    unused_bits_are_zero(&old, original_bits),
+                    "cannot repack a section with nonzero unused palette bits"
+                );
+                palette::encode_indices(decoded_blocks.states.len(), &decoded_blocks.indices, 4)?
+                    .context("missing packed block data")?
+            }
+        } else {
+            palette::encode_indices(decoded_blocks.states.len(), &decoded_blocks.indices, 4)?
+                .context("missing packed block data")?
+        };
+        match unique_field_mut(state_storage, "data")? {
+            Some(value) => *value = Tag::LongArray(data),
+            None => {
+                let Tag::Compound(entries) = state_storage else {
+                    unreachable!()
+                };
+                entries.push((JavaString::from("data"), Tag::LongArray(data)));
+            }
+        }
+        changed_blocks += section_changes;
+        changed_sections.insert(section_y);
+    }
+    Ok(ChunkDraft {
+        source_nbt,
+        document,
+        position,
+        heightmaps_rebuilt: false,
+        changed_blocks,
+        changed_sections,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(name: &str) -> BlockState {
+        BlockState {
+            name: name.into(),
+            properties: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn falling_tick_draft_is_atomic_and_preserves_other_chunk_fields() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        let tick = native_world::loaded::SavedBlockTick {
+            block: "minecraft:gravel".into(),
+            position: [-15, -60, 33],
+            delay: -2,
+            priority: -1,
+        };
+        draft
+            .replace_falling_block_ticks(std::slice::from_ref(&tick))
+            .unwrap();
+        assert!(draft.matches_source(&original).unwrap());
+        assert_eq!(
+            draft.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_ticks") else {
+            panic!("missing ticks")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("i"),
+            Some(&Tag::String("minecraft:gravel".into()))
+        );
+        assert_eq!(values[0].get("t"), Some(&Tag::Int(-2)));
+        let before = crate::nbt::write(draft.document()).unwrap();
+        let bad = native_world::loaded::SavedBlockTick {
+            position: [0, 0, 0],
+            ..tick
+        };
+        assert!(draft.replace_falling_block_ticks(&[bad]).is_err());
+        assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn falling_tick_draft_rejects_unknown_source_fields_and_ticks() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        for unknown in [false, true] {
+            let mut original = fixture(1, false);
+            let Tag::Compound(fields) = &mut original.value else {
+                unreachable!()
+            };
+            let mut tick = vec![
+                (
+                    "i".into(),
+                    Tag::String(
+                        if unknown {
+                            "minecraft:observer"
+                        } else {
+                            "minecraft:sand"
+                        }
+                        .into(),
+                    ),
+                ),
+                ("x".into(), Tag::Int(-15)),
+                ("y".into(), Tag::Int(0)),
+                ("z".into(), Tag::Int(33)),
+                ("t".into(), Tag::Int(2)),
+                ("p".into(), Tag::Int(0)),
+            ];
+            if !unknown {
+                tick.push(("extra".into(), Tag::Int(1)));
+            }
+            fields.push((
+                "block_ticks".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(tick)],
+                },
+            ));
+            let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+            let before = crate::nbt::write(draft.document()).unwrap();
+            assert!(draft.replace_falling_block_ticks(&[]).is_err());
+            assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn fluid_tick_draft_preserves_other_data_and_rejects_unknown_fields_atomically() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push((
+            "fluid_ticks".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("i".into(), Tag::String("minecraft:water".into())),
+                    ("x".into(), Tag::Int(-15)),
+                    ("y".into(), Tag::Int(-60)),
+                    ("z".into(), Tag::Int(33)),
+                    ("t".into(), Tag::Int(4)),
+                    ("p".into(), Tag::Int(0)),
+                ])],
+            },
+        ));
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        let tick = native_world::loaded::SavedFluidTick {
+            fluid: "minecraft:flowing_lava".into(),
+            position: [-15, -60, 33],
+            delay: -2,
+            priority: -1,
+        };
+        draft
+            .replace_fluid_ticks(std::slice::from_ref(&tick))
+            .unwrap();
+        assert!(draft.matches_source(&original).unwrap());
+        assert_eq!(
+            draft.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        let Some(Tag::List { values, .. }) = draft.document().value.get("fluid_ticks") else {
+            panic!("missing ticks")
+        };
+        assert_eq!(
+            values[0].get("i"),
+            Some(&Tag::String("minecraft:flowing_lava".into()))
+        );
+        let before = crate::nbt::write(draft.document()).unwrap();
+        let bad = native_world::loaded::SavedFluidTick {
+            fluid: "example:unknown".into(),
+            ..tick
+        };
+        assert!(draft.replace_fluid_ticks(&[bad]).is_err());
+        assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("fluid_ticks"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(entry) = &mut values[0] else {
+            unreachable!()
+        };
+        entry.push(("unknown".into(), Tag::Int(1)));
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        assert!(draft.replace_fluid_ticks(&[]).is_err());
+    }
+
+    fn fixture(palette_size: usize, padding_bit: bool) -> NamedTag {
+        let mut entries = vec![Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:stone".into())),
+            ("unknown_palette_field".into(), Tag::Int(99)),
+        ])];
+        for index in 1..palette_size {
+            entries.push(Tag::Compound(vec![(
+                "".into(),
+                state_tag(&state(&format!("fixture:block_{index}"))),
+            )]));
+        }
+        let mut block_states = vec![
+            (
+                "palette".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: entries,
+                },
+            ),
+            ("unknown_storage_field".into(), Tag::Long(123)),
+        ];
+        if palette_size > 1 {
+            let mut data = palette::encode_indices(palette_size, &vec![0; BLOCKS_PER_SECTION], 4)
+                .unwrap()
+                .unwrap();
+            if padding_bit {
+                data[0] |= i64::MIN;
+            }
+            block_states.push(("data".into(), Tag::LongArray(data)));
+        }
+        NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("xPos".into(), Tag::Int(-1)),
+                ("zPos".into(), Tag::Int(2)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                (
+                    "sections".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![
+                                ("Y".into(), Tag::Byte(-4)),
+                                ("block_states".into(), Tag::Compound(block_states)),
+                                ("unknown_section".into(), Tag::String("keep".into())),
+                            ]),
+                            Tag::Compound(vec![
+                                ("Y".into(), Tag::Byte(-3)),
+                                ("SkyLight".into(), Tag::ByteArray(vec![255; 2048])),
+                            ]),
+                        ],
+                    },
+                ),
+                (
+                    "unknown_chunk".into(),
+                    Tag::Compound(vec![("keep".into(), Tag::Int(42))]),
+                ),
+            ]),
+        }
+    }
+
+    fn edit(x: i32, replacement: &str) -> BlockChange {
+        BlockChange {
+            x,
+            y: -64,
+            z: 32,
+            expected: state("minecraft:stone"),
+            replacement: state(replacement),
+        }
+    }
+
+    fn section(chunk: &NamedTag) -> &Tag {
+        let Tag::List { values, .. } = chunk.value.get("sections").unwrap() else {
+            unreachable!()
+        };
+        &values[0]
+    }
+
+    #[test]
+    fn grows_palette_and_preserves_unrelated_and_unknown_nbt() {
+        let original = fixture(1, false);
+        let changes: Vec<_> = (0..16)
+            .map(|i| edit(-16 + i, &format!("fixture:new_{i}")))
+            .collect();
+        let draft = draft_chunk_blocks(&original, ChunkPos { x: -1, z: 2 }, &changes).unwrap();
+        assert_eq!(draft.changed_blocks, 16);
+        assert_eq!(draft.changed_sections, BTreeSet::from([-4]));
+        assert_eq!(
+            draft.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        assert_eq!(
+            section(draft.document()).get("unknown_section"),
+            section(&original).get("unknown_section")
+        );
+        let Tag::List {
+            values: old_sections,
+            ..
+        } = original.value.get("sections").unwrap()
+        else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: new_sections,
+            ..
+        } = draft.document().value.get("sections").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_sections[1], new_sections[1]);
+        let old_states = section(&original).get("block_states").unwrap();
+        let new_states = section(draft.document()).get("block_states").unwrap();
+        assert_eq!(
+            old_states.get("unknown_storage_field"),
+            new_states.get("unknown_storage_field")
+        );
+        let Tag::List {
+            values: old_palette,
+            ..
+        } = old_states.get("palette").unwrap()
+        else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: new_palette,
+            ..
+        } = new_states.get("palette").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(new_palette.len(), 17);
+        assert_eq!(new_palette[0], old_palette[0]);
+        let decoded = palette::decode_sections(&draft.document().value).unwrap();
+        let blocks = decoded[0].blocks.as_ref().unwrap();
+        for i in 0..16 {
+            assert_eq!(
+                blocks.block(i, 0, 0).unwrap().name,
+                state(&format!("fixture:new_{i}")).name
+            );
+        }
+        assert_eq!(
+            blocks.block(0, 0, 1).unwrap().name,
+            state("minecraft:stone").name
+        );
+        let Tag::LongArray(data) = new_states.get("data").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(data.len(), BLOCKS_PER_SECTION.div_ceil(12));
+    }
+
+    #[test]
+    fn stale_missing_and_ambiguous_edits_do_not_change_the_original() {
+        let original = fixture(1, false);
+        let before = original.clone();
+        let mut stale = edit(-15, "minecraft:dirt");
+        stale.expected = state("minecraft:air");
+        assert!(
+            draft_chunk_blocks(
+                &original,
+                ChunkPos { x: -1, z: 2 },
+                &[edit(-16, "minecraft:dirt"), stale]
+            )
+            .is_err()
+        );
+        assert!(
+            draft_chunk_blocks(
+                &original,
+                ChunkPos { x: -1, z: 2 },
+                &[edit(0, "minecraft:dirt")]
+            )
+            .is_err()
+        );
+        let mut missing = edit(-16, "minecraft:dirt");
+        missing.y = -48;
+        assert!(draft_chunk_blocks(&original, ChunkPos { x: -1, z: 2 }, &[missing]).is_err());
+        assert_eq!(original, before);
+        let noop = draft_chunk_blocks(
+            &original,
+            ChunkPos { x: -1, z: 2 },
+            &[edit(-16, "minecraft:stone")],
+        )
+        .unwrap();
+        assert_eq!(noop.changed_blocks, 0);
+        assert_eq!(noop.document(), &original);
+    }
+
+    #[test]
+    fn preserves_unused_bits_or_refuses_to_repack_them() {
+        let original = fixture(17, true);
+        let draft = draft_chunk_blocks(
+            &original,
+            ChunkPos { x: -1, z: 2 },
+            &[edit(-16, "fixture:block_1")],
+        )
+        .unwrap();
+        let Tag::LongArray(data) = section(draft.document())
+            .get("block_states")
+            .unwrap()
+            .get("data")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_ne!(data[0] & i64::MIN, 0);
+        let cannot_repack = fixture(32, true);
+        let error = draft_chunk_blocks(
+            &cannot_repack,
+            ChunkPos { x: -1, z: 2 },
+            &[edit(-16, "fixture:new")],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("nonzero unused palette bits"));
+    }
+
+    #[test]
+    fn mixed_default_and_property_states_use_heterogeneous_nbt_wrappers() {
+        let mut original = fixture(1, false);
+        let sections = unique_field_mut(&mut original.value, "sections")
+            .unwrap()
+            .unwrap();
+        let Tag::List { values, .. } = sections else {
+            unreachable!()
+        };
+        let storage = unique_field_mut(&mut values[0], "block_states")
+            .unwrap()
+            .unwrap();
+        *unique_field_mut(storage, "palette").unwrap().unwrap() = Tag::List {
+            element_type: TagType::String,
+            values: vec![Tag::String("minecraft:stone".into())],
+        };
+        let mut replacement = state("minecraft:oak_log");
+        replacement.properties.push(("axis".into(), "x".into()));
+        let change = BlockChange {
+            replacement,
+            ..edit(-16, "minecraft:stone")
+        };
+        let draft = draft_chunk_blocks(&original, ChunkPos { x: -1, z: 2 }, &[change]).unwrap();
+        let Tag::List {
+            element_type,
+            values,
+        } = section(draft.document())
+            .get("block_states")
+            .unwrap()
+            .get("palette")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*element_type, TagType::Compound);
+        assert_eq!(
+            values[0],
+            Tag::Compound(vec![("".into(), Tag::String("minecraft:stone".into()))])
+        );
+        assert!(
+            matches!(values[1].get("id"), Some(Tag::String(name)) if name.matches("minecraft:oak_log"))
+        );
+        let blocks = palette::decode_sections(&draft.document().value).unwrap();
+        assert_eq!(
+            blocks[0]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .block(0, 0, 0)
+                .unwrap()
+                .properties,
+            vec![("axis".into(), "x".into())]
+        );
+    }
+}

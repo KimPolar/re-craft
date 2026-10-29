@@ -1,0 +1,1909 @@
+//! Viewer and experimental unsaved play for a bounded area of an existing world.
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use glam::Vec3;
+use native_resources::packs::ResourceStack;
+use native_session::{
+    GameSession, PlayerCommand, WorldSnapshot,
+    inventory::{ClickButton, InventoryPointerEvent},
+    loaded::LoadedSession,
+};
+use winit::{
+    application::ApplicationHandler,
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    platform::run_on_demand::EventLoopExtRunOnDemand,
+    window::{CursorGrabMode, Window, WindowId},
+};
+
+use crate::{
+    chunk_stream::ChunkStreamer,
+    frame_pacer::FramePacer,
+    game_ui::{GameUi, PauseAction, hotbar_key, inventory_swap_key},
+    menu_assets::MenuAssets,
+    menu_settings::VideoSettings,
+    mesh_worker::{MeshJob, MeshWorker},
+    preview::PreviewScene,
+    recipe_book_ui::BookAction,
+    renderer::Renderer,
+};
+
+pub struct Camera {
+    pub eye: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl Camera {
+    fn direction(&self) -> Vec3 {
+        let horizontal = self.pitch.cos();
+        Vec3::new(
+            self.yaw.sin() * horizontal,
+            self.pitch.sin(),
+            -self.yaw.cos() * horizontal,
+        )
+    }
+
+    fn advance(&mut self, input: &Input, elapsed: Duration) {
+        let forward = Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos());
+        let right = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
+        let axis = |positive: bool, negative: bool| {
+            i32::from(positive) as f32 - i32::from(negative) as f32
+        };
+        let movement = forward * axis(input.forward, input.back)
+            + right * axis(input.right, input.left)
+            + Vec3::Y * axis(input.up, input.down());
+        let speed = if input.fast() { 40.0 } else { 10.0 };
+        self.eye += movement.clamp_length_max(1.0) * speed * elapsed.as_secs_f32().min(0.1);
+    }
+}
+
+#[derive(Default)]
+struct Input {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down_left: bool,
+    down_right: bool,
+    fast_left: bool,
+    fast_right: bool,
+}
+
+impl Input {
+    fn down(&self) -> bool {
+        self.down_left || self.down_right
+    }
+    fn fast(&self) -> bool {
+        self.fast_left || self.fast_right
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn run(
+    event_loop: &mut EventLoop<()>,
+    scene: PreviewScene,
+    camera: Camera,
+    smoke_test: bool,
+    video: VideoSettings,
+) -> Result<crate::GameExit> {
+    run_inner(
+        event_loop, scene, camera, smoke_test, None, None, None, video, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_play(
+    event_loop: &mut EventLoop<()>,
+    scene: PreviewScene,
+    session: LoadedSession,
+    resources: ResourceStack,
+    streamer: ChunkStreamer,
+    smoke_test: bool,
+    assets: Option<Arc<MenuAssets>>,
+    skin: Option<Arc<crate::player_skin::PlayerSkin>>,
+    trims: Arc<crate::equipment_visual::TrimRegistry>,
+    sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
+    sky_background: Option<crate::sky_background::SkyBackground>,
+    video: VideoSettings,
+    audio: Option<crate::audio::UiAudio>,
+) -> Result<crate::GameExit> {
+    #[cfg(debug_assertions)]
+    let mut session = session;
+    let snapshot = session.snapshot();
+    let camera = Camera {
+        eye: eye_for_scene(&snapshot, scene.origin, session.partial_tick()),
+        yaw: snapshot.player.yaw,
+        pitch: snapshot.player.pitch,
+    };
+    #[cfg(debug_assertions)]
+    if smoke_test {
+        session.submit_command(PlayerCommand::Break);
+        session.submit_command(PlayerCommand::Place);
+        session.update(Duration::from_millis(50));
+    }
+    let mesher = MeshWorker::start(resources)?;
+    run_inner(
+        event_loop,
+        scene,
+        camera,
+        smoke_test,
+        assets,
+        skin,
+        Some(PlayState {
+            session,
+            streamer,
+            mesher,
+            trims,
+            sky_timeline,
+            sky_background,
+            sky_background_tick: None,
+            sky_background_revision: None,
+            sky_background_previous: None,
+            sky_background_current: None,
+            sky_tick: None,
+            sky_base: None,
+            sky_lightmap: None,
+            sky_settings: None,
+            requested_revision: 0,
+            scene_revision: 0,
+        }),
+        video,
+        audio,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    event_loop: &mut EventLoop<()>,
+    scene: PreviewScene,
+    camera: Camera,
+    smoke_test: bool,
+    assets: Option<Arc<MenuAssets>>,
+    skin: Option<Arc<crate::player_skin::PlayerSkin>>,
+    play: Option<PlayState>,
+    video: VideoSettings,
+    audio: Option<crate::audio::UiAudio>,
+) -> Result<crate::GameExit> {
+    let _ = smoke_test;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let now = Instant::now();
+    let mut ui = assets.map(GameUi::new);
+    if let Some(ui) = &mut ui {
+        ui.set_video_settings(video);
+        ui.set_audio(audio.clone());
+    }
+    if let (Some(ui), Some(play)) = (&mut ui, &play) {
+        ui.set_crafting_recipes(play.session.crafting_recipes());
+        ui.set_trim_registry(Arc::clone(&play.trims));
+    }
+    if let (Some(ui), Some(skin)) = (&mut ui, skin) {
+        ui.set_player_skin(skin);
+    }
+    let mut app = Viewer {
+        scene,
+        camera,
+        visual_look: crate::visual_look::VisualLook::default(),
+        play,
+        ui,
+        audio,
+        audio_listener: None,
+        inventory_wait: None,
+        menu_open: false,
+        death_visible: false,
+        inventory_shift: false,
+        inventory_control: false,
+        #[cfg(debug_assertions)]
+        smoke_test,
+        window: None,
+        renderer: None,
+        input: Input::default(),
+        captured: false,
+        occluded: false,
+        last_update: now,
+        started: now,
+        video,
+        quit_application: false,
+        frame_pacer: FramePacer::new(video.max_fps, now),
+        inactivity: crate::frame_pacer::InactivityTracker::new(now),
+        #[cfg(debug_assertions)]
+        stats_since: now,
+        #[cfg(debug_assertions)]
+        frames: 0,
+        #[cfg(debug_assertions)]
+        total_frames: 0,
+        error: None,
+    };
+    event_loop
+        .run_app_on_demand(&mut app)
+        .context("world viewer event loop failed")?;
+    if let Some(error) = app.error {
+        return Err(error);
+    }
+    Ok(if app.quit_application {
+        crate::GameExit::Quit
+    } else {
+        crate::GameExit::ReturnToTitle(app.video)
+    })
+}
+
+struct PlayState {
+    session: LoadedSession,
+    streamer: ChunkStreamer,
+    mesher: MeshWorker,
+    trims: Arc<crate::equipment_visual::TrimRegistry>,
+    sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
+    sky_background: Option<crate::sky_background::SkyBackground>,
+    sky_background_tick: Option<u64>,
+    sky_background_revision: Option<u64>,
+    sky_background_previous: Option<[f32; 3]>,
+    sky_background_current: Option<[f32; 3]>,
+    sky_tick: Option<u64>,
+    sky_base: Option<Arc<native_world::lighting::LightmapSettings>>,
+    sky_lightmap: Option<Arc<[[[f32; 3]; 16]; 16]>>,
+    sky_settings: Option<native_world::lighting::LightmapSettings>,
+    requested_revision: u64,
+    scene_revision: u64,
+}
+
+struct Viewer {
+    scene: PreviewScene,
+    camera: Camera,
+    visual_look: crate::visual_look::VisualLook,
+    play: Option<PlayState>,
+    ui: Option<GameUi>,
+    audio: Option<crate::audio::UiAudio>,
+    audio_listener: Option<(glam::DVec3, f32)>,
+    inventory_wait: Option<u64>,
+    menu_open: bool,
+    death_visible: bool,
+    inventory_shift: bool,
+    inventory_control: bool,
+    #[cfg(debug_assertions)]
+    smoke_test: bool,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    input: Input,
+    captured: bool,
+    occluded: bool,
+    last_update: Instant,
+    started: Instant,
+    video: VideoSettings,
+    quit_application: bool,
+    frame_pacer: FramePacer,
+    inactivity: crate::frame_pacer::InactivityTracker,
+    #[cfg(debug_assertions)]
+    stats_since: Instant,
+    #[cfg(debug_assertions)]
+    frames: u64,
+    #[cfg(debug_assertions)]
+    total_frames: u64,
+    error: Option<anyhow::Error>,
+}
+
+impl Viewer {
+    fn apply_video(&mut self) {
+        crate::apply_game_video(
+            self.ui.as_ref(),
+            &mut self.video,
+            &mut self.frame_pacer,
+            self.renderer.as_mut(),
+        );
+    }
+
+    fn pause_action(&mut self, action: PauseAction, event_loop: &ActiveEventLoop) {
+        self.apply_video();
+        match action {
+            PauseAction::SaveVideo => {
+                crate::save_game_video(self.ui.as_mut());
+            }
+            PauseAction::SaveSound => {
+                crate::save_game_sound(self.ui.as_mut());
+            }
+            PauseAction::Resume => {
+                crate::save_game_video(self.ui.as_mut());
+                crate::save_game_sound(self.ui.as_mut());
+                if let Some(ui) = &mut self.ui {
+                    ui.resume();
+                }
+                self.last_update = Instant::now();
+                self.capture(true);
+            }
+            PauseAction::QuitToTitle => {
+                crate::finish_game_video(self.ui.as_mut());
+                event_loop.exit();
+            }
+            PauseAction::None => {}
+        }
+    }
+
+    fn death_action(&mut self, action: crate::death_ui::DeathAction, event_loop: &ActiveEventLoop) {
+        match action {
+            crate::death_ui::DeathAction::Respawn => {
+                if let Some(play) = &mut self.play {
+                    play.session.submit_command(PlayerCommand::Respawn);
+                }
+            }
+            crate::death_ui::DeathAction::QuitToTitle => {
+                self.pause_action(PauseAction::QuitToTitle, event_loop)
+            }
+            crate::death_ui::DeathAction::None => {}
+        }
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.error = Some(error);
+        event_loop.exit();
+    }
+
+    fn capture(&mut self, enabled: bool) {
+        if !enabled && let Some(play) = &mut self.play {
+            play.session.submit_command(PlayerCommand::StopBreak);
+            play.session.submit_command(PlayerCommand::StopUse);
+        }
+        if let Some(window) = &self.window {
+            if enabled {
+                match window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+                {
+                    Ok(()) => {
+                        window.set_cursor_visible(false);
+                        self.captured = true;
+                    }
+                    Err(error) => eprintln!("Could not capture the mouse: {error}"),
+                }
+            } else {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+                self.captured = false;
+            }
+        }
+    }
+
+    fn update(&mut self, elapsed: Duration) -> Result<()> {
+        if let Some(play) = &mut self.play {
+            play.streamer.service(&mut play.session)?;
+            play.session.update(elapsed);
+            play.streamer.service(&mut play.session)?;
+            let snapshot = play.session.snapshot();
+            self.camera.eye =
+                eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());
+            (self.camera.yaw, self.camera.pitch) = self.visual_look.angles(&snapshot);
+            let eye = snapshot.camera.eye(play.session.partial_tick()) + snapshot.origin.as_dvec3();
+            if let Some(audio) = &self.audio
+                && self.audio_listener != Some((eye, self.camera.yaw))
+            {
+                audio.set_listener(eye, self.camera.yaw);
+                self.audio_listener = Some((eye, self.camera.yaw));
+            }
+            for sound in play.session.take_button_sounds() {
+                if let Some(audio) = &self.audio {
+                    audio.button(sound);
+                }
+            }
+        } else {
+            self.camera.advance(&self.input, elapsed);
+        }
+        Ok(())
+    }
+
+    fn submit_movement(&mut self) {
+        if let Some(play) = &mut self.play {
+            play.session.submit_command(PlayerCommand::Move {
+                forward: i8::from(self.input.forward) as f32 - i8::from(self.input.back) as f32,
+                strafe: i8::from(self.input.right) as f32 - i8::from(self.input.left) as f32,
+                jump: self.input.up,
+            });
+            play.session.submit_command(PlayerCommand::Sprint {
+                pressed: self.input.fast(),
+                backward_pressed: self.input.back,
+            });
+            play.session
+                .submit_command(PlayerCommand::Sneak(self.input.down()));
+        }
+    }
+
+    fn request_inventory_toggle(&mut self) {
+        if self.inventory_wait.is_some() {
+            return;
+        }
+        let Some(play) = &mut self.play else {
+            return;
+        };
+        self.inventory_wait = Some(play.session.snapshot().tick);
+        if self
+            .ui
+            .as_mut()
+            .is_some_and(GameUi::inventory_pointer_cancel)
+        {
+            play.session.submit_command(PlayerCommand::InventoryPointer(
+                InventoryPointerEvent::Cancel,
+            ));
+        }
+        play.session.submit_command(PlayerCommand::ToggleInventory);
+        self.input = Input::default();
+        self.submit_movement();
+        self.capture(false);
+    }
+
+    fn refresh_scene(&mut self) -> Result<()> {
+        let Some(play) = &mut self.play else {
+            return Ok(());
+        };
+        let snapshot = play.session.snapshot();
+        if snapshot.world_revision != play.requested_revision {
+            let world = snapshot
+                .world
+                .loaded()
+                .context("play session returned the wrong world type")?;
+            play.mesher.submit(MeshJob {
+                revision: snapshot.world_revision,
+                origin: snapshot.origin,
+                world: Arc::clone(world),
+            });
+            play.requested_revision = snapshot.world_revision;
+        }
+        while let Some(result) = play.mesher.try_result()? {
+            if result.revision <= play.scene_revision {
+                continue;
+            }
+            let scene = match result.scene {
+                Ok(scene) => scene,
+                Err(error) if result.revision != snapshot.world_revision => {
+                    eprintln!(
+                        "Outdated world mesh revision {} failed: {error:#}",
+                        result.revision
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let renderer = self
+                .renderer
+                .as_mut()
+                .context("renderer is not initialized")?;
+            replace_scene(renderer, &mut self.scene, scene)?;
+            self.camera.eye =
+                eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());
+            play.scene_revision = result.revision;
+            println!("World play mesh updated: revision {}", result.revision);
+        }
+        Ok(())
+    }
+
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if let Some(play) = &self.play {
+            let snapshot = play.session.snapshot();
+            if self.death_visible != snapshot.death.is_some() {
+                self.death_visible = snapshot.death.is_some();
+                self.inventory_wait = None;
+                if self.death_visible {
+                    self.input = Input::default();
+                    self.capture(false);
+                } else if !snapshot.inventory.is_open()
+                    && !self.ui.as_ref().is_some_and(GameUi::paused)
+                {
+                    self.capture(true);
+                }
+            }
+            if let Some(ui) = &mut self.ui {
+                ui.sync_death(&snapshot);
+            }
+            if self.inventory_wait.is_some_and(|tick| snapshot.tick > tick) {
+                self.inventory_wait = None;
+            }
+            if self.ui.is_some() && self.menu_open != snapshot.inventory.is_open() {
+                self.menu_open = snapshot.inventory.is_open();
+                if self.menu_open {
+                    self.input = Input::default();
+                    self.submit_movement();
+                    self.capture(false);
+                } else if snapshot.death.is_none() && !self.ui.as_ref().is_some_and(GameUi::paused)
+                {
+                    self.capture(true);
+                }
+            }
+        }
+        let tick = self
+            .play
+            .as_mut()
+            .map(|play| u128::from(play.session.snapshot().tick))
+            .unwrap_or_else(|| now.saturating_duration_since(self.started).as_millis() / 50);
+        if let Err(error) = self.refresh_scene() {
+            self.fail(event_loop, error);
+            return;
+        }
+        if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer)
+            && let Some(background) = &play.sky_background
+        {
+            let snapshot = play.session.snapshot();
+            if play.sky_background_tick != Some(snapshot.tick)
+                || play.sky_background_revision != Some(snapshot.world_revision)
+            {
+                let position = snapshot.origin.as_dvec3() + snapshot.camera.eye(1.0);
+                let value = snapshot.world.loaded().and_then(|world| {
+                    background.sample(world, position, |id| {
+                        let clock = native_persistence::world::DimensionId {
+                            namespace: id.namespace.clone(),
+                            path: id.path.clone(),
+                        };
+                        play.session
+                            .world_clock(&clock)
+                            .map(|state| state.total_ticks)
+                    })
+                });
+                if let Some((value, fog_range)) = value {
+                    renderer.set_fog_range(fog_range);
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.sky_background_previous.is_none()
+                    {
+                        play.sky_background_previous =
+                            Some(play.sky_background_current.unwrap_or(value));
+                    }
+                    play.sky_background_current = Some(value);
+                }
+                play.sky_background_tick = Some(snapshot.tick);
+                play.sky_background_revision = Some(snapshot.world_revision);
+            }
+            if let (Some(previous), Some(current)) =
+                (play.sky_background_previous, play.sky_background_current)
+            {
+                let partial = play.session.partial_tick().clamp(0.0, 1.0);
+                renderer.set_sky_color(std::array::from_fn(|i| {
+                    previous[i] + partial * (current[i] - previous[i])
+                }));
+            }
+        }
+        if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer)
+            && let Some(timeline) = &play.sky_timeline
+        {
+            let tick = play.session.snapshot().tick;
+            let base_changed = play
+                .sky_base
+                .as_ref()
+                .is_none_or(|base| !Arc::ptr_eq(base, &self.scene.base_lightmap));
+            if play.sky_tick != Some(tick) || base_changed {
+                let sample = timeline.sample(&self.scene.base_lightmap, |id| {
+                    let clock = native_persistence::world::DimensionId {
+                        namespace: id.namespace.clone(),
+                        path: id.path.clone(),
+                    };
+                    play.session
+                        .world_clock(&clock)
+                        .map(|state| state.total_ticks)
+                });
+                if let Some(settings) = sample {
+                    if play.sky_settings.as_ref() != Some(&settings) {
+                        play.sky_lightmap = Some(Arc::new(settings.table()));
+                        play.sky_settings = Some(settings);
+                    }
+                    play.sky_tick = Some(tick);
+                    play.sky_base = Some(Arc::clone(&self.scene.base_lightmap));
+                } else {
+                    eprintln!("Sky light timeline clock is unavailable");
+                    play.sky_timeline = None;
+                    play.sky_lightmap = None;
+                }
+            }
+            if let Some(table) = &play.sky_lightmap
+                && !Arc::ptr_eq(table, &self.scene.lightmap)
+            {
+                self.scene.lightmap = Arc::clone(table);
+                renderer.set_preview_lightmap(table);
+            }
+        }
+        if let (Some(ui), Some(renderer), Some(window), Some(play)) = (
+            &mut self.ui,
+            &mut self.renderer,
+            &self.window,
+            &mut self.play,
+        ) {
+            let size = window.inner_size();
+            let snapshot = play.session.snapshot();
+            if let Err(error) = ui.draw(
+                renderer,
+                (size.width, size.height),
+                &snapshot,
+                play.session.partial_tick(),
+            ) {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+        let render_snapshot = self.play.as_ref().map(|play| play.session.snapshot());
+        if let (Some(renderer), Some(play), Some(snapshot)) =
+            (&mut self.renderer, &self.play, &render_snapshot)
+        {
+            renderer.set_fov_modifier(snapshot.camera.fov_modifier(play.session.partial_tick()));
+            renderer.set_camera_bob(&snapshot.camera, play.session.partial_tick());
+            if let Err(error) = renderer.update_experience_orbs(
+                &snapshot.experience_orbs,
+                self.scene.origin,
+                self.camera.direction(),
+                play.session.partial_tick(),
+            ) {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+        if let Some(renderer) = &mut self.renderer
+            && let Err(error) = renderer.render_preview(
+                &mut self.scene,
+                self.camera.eye,
+                self.camera.direction(),
+                tick as u64,
+                render_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.breaking),
+                render_snapshot
+                    .as_ref()
+                    .map_or(&[], |snapshot| snapshot.dropped_items.as_ref()),
+            )
+        {
+            self.fail(event_loop, error);
+            #[cfg(debug_assertions)]
+            return;
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.frames += 1;
+            self.total_frames += 1;
+            if self.smoke_test && self.total_frames >= 3 {
+                if let Some(play) = &self.play {
+                    if play.scene_revision != play.session.snapshot().world_revision {
+                        if now.saturating_duration_since(self.started) > Duration::from_secs(30) {
+                            self.fail(
+                                event_loop,
+                                anyhow::anyhow!("world play mesh did not finish within 30 seconds"),
+                            );
+                        }
+                        return;
+                    }
+                    println!(
+                        "World play smoke test passed: {} frames, revision {}",
+                        self.total_frames,
+                        play.session.snapshot().world_revision
+                    );
+                } else {
+                    println!(
+                        "World viewer smoke test passed: {} frames",
+                        self.total_frames
+                    );
+                }
+                event_loop.exit();
+                return;
+            }
+            let elapsed = now.saturating_duration_since(self.stats_since);
+            if elapsed >= Duration::from_secs(1) {
+                if let (Some(window), Some(renderer)) = (&self.window, &self.renderer) {
+                    if let Some(play) = &self.play {
+                        let snapshot = play.session.snapshot();
+                        window.set_title(&format!("Minecraft Native | experimental play, unsaved | {} | {:.0} FPS | tick {} | {:?} [1-9]", renderer.backend_name, self.frames as f64 / elapsed.as_secs_f64(), snapshot.tick, snapshot.selected_block));
+                    } else {
+                        window.set_title(&format!("Minecraft Native | read-only viewer | {} | {:.0} FPS | {:.1}, {:.1}, {:.1} | WASD fly, Space/Shift altitude, Ctrl fast, Esc releases mouse", renderer.backend_name, self.frames as f64 / elapsed.as_secs_f64(), f64::from(self.camera.eye.x) + f64::from(self.scene.origin.x), f64::from(self.camera.eye.y) + f64::from(self.scene.origin.y), f64::from(self.camera.eye.z) + f64::from(self.scene.origin.z)));
+                    }
+                }
+                self.frames = 0;
+                self.stats_since = now;
+            }
+        }
+    }
+}
+
+fn replace_scene(
+    renderer: &mut Renderer,
+    current: &mut PreviewScene,
+    mut next: PreviewScene,
+) -> Result<()> {
+    if next.material_generation.is_some() && next.material_generation == current.material_generation
+    {
+        std::mem::swap(&mut next.atlas, &mut current.atlas);
+        renderer.replace_preview_mesh();
+    } else {
+        renderer.replace_preview(&next)?;
+    }
+    *current = next;
+    Ok(())
+}
+
+fn eye_for_scene(snapshot: &WorldSnapshot, scene_origin: glam::IVec3, partial_tick: f32) -> Vec3 {
+    let shift = glam::DVec3::new(
+        f64::from(snapshot.origin.x) - f64::from(scene_origin.x),
+        f64::from(snapshot.origin.y) - f64::from(scene_origin.y),
+        f64::from(snapshot.origin.z) - f64::from(scene_origin.z),
+    );
+    (snapshot.camera.eye(partial_tick) + shift).as_vec3()
+}
+
+impl ApplicationHandler for Viewer {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("Minecraft 26.3")
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.fail(event_loop, error.into());
+                return;
+            }
+        };
+        let mut renderer = match Renderer::new(
+            Arc::clone(&window),
+            &self.scene.atlas.texture,
+            self.ui.as_ref().map(GameUi::breaking_textures),
+            self.ui.as_ref().map(GameUi::item_textures),
+            self.ui.as_ref().map(GameUi::experience_orb_texture),
+            self.ui.as_ref().map(GameUi::item_glint_texture),
+            self.video.vsync,
+        ) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        renderer.set_fov(self.video.fov);
+        renderer.set_view_bobbing(self.video.view_bobbing);
+        #[cfg(debug_assertions)]
+        println!("World viewer graphics backend: {}", renderer.backend_name);
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.last_update = Instant::now();
+        self.started = self.last_update;
+        self.frame_pacer = FramePacer::new(self.video.max_fps, self.last_update);
+        self.inactivity = crate::frame_pacer::InactivityTracker::new(self.last_update);
+        #[cfg(debug_assertions)]
+        {
+            self.stats_since = self.last_update;
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if self
+            .window
+            .as_ref()
+            .is_none_or(|window| window.id() != window_id)
+        {
+            return;
+        }
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorMoved { .. }
+        ) {
+            let now = Instant::now();
+            if self.inactivity.input(now, self.video.inactivity_fps_limit) {
+                self.frame_pacer.set_limit(self.video.max_fps, now);
+            }
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                crate::finish_game_video(self.ui.as_mut());
+                self.quit_application = true;
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(size);
+                }
+            }
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.inventory_shift = modifiers.state().shift_key();
+                self.inventory_control = modifiers.state().control_key();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(ui) = &mut self.ui {
+                    ui.cursor_moved(position.x, position.y);
+                    if let Some(slot) = ui.inventory_pointer_move()
+                        && let Some(play) = &mut self.play
+                    {
+                        play.session.submit_command(PlayerCommand::InventoryPointer(
+                            InventoryPointerEvent::Move { slot },
+                        ));
+                    }
+                }
+                self.apply_video();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(ui) = &mut self.ui {
+                    ui.pause_scroll(crate::scroll_lines(delta));
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.inventory_shift = false;
+                self.inventory_control = false;
+                self.input = Input::default();
+                self.submit_movement();
+                self.capture(false);
+                if let Some(ui) = &mut self.ui {
+                    if ui.inventory_pointer_cancel()
+                        && let Some(play) = &mut self.play
+                    {
+                        play.session.submit_command(PlayerCommand::InventoryPointer(
+                            InventoryPointerEvent::Cancel,
+                        ));
+                    }
+                    ui.recipe_book_unfocus();
+                    ui.pause_cancel();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(snapshot) = self.play.as_ref().map(|play| play.session.snapshot())
+                    && snapshot.death.is_some()
+                {
+                    if let Some(ui) = &mut self.ui {
+                        ui.sync_death(&snapshot);
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && let PhysicalKey::Code(code) = event.physical_key
+                        {
+                            let action = ui.death_key(code, self.inventory_shift);
+                            self.death_action(action, event_loop);
+                        }
+                    }
+                    return;
+                }
+                let inventory_open = self
+                    .play
+                    .as_ref()
+                    .is_some_and(|play| play.session.snapshot().inventory.is_open());
+                if inventory_open
+                    && event.state == ElementState::Pressed
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
+                    if code == KeyCode::Escape
+                        && let Some(BookAction::Settings { open, filtering }) =
+                            self.ui.as_mut().and_then(GameUi::recipe_book_escape)
+                    {
+                        if let Some(play) = &mut self.play {
+                            play.session
+                                .submit_command(PlayerCommand::RecipeBookSettings {
+                                    open,
+                                    filtering,
+                                });
+                        }
+                        return;
+                    }
+                    if let Some(ui) = &mut self.ui
+                        && ui.recipe_book_captures_text()
+                        && code != KeyCode::Escape
+                    {
+                        if code == KeyCode::Backspace {
+                            ui.recipe_book_backspace();
+                        } else if !self.inventory_control
+                            && let Some(text) = &event.text
+                        {
+                            ui.recipe_book_input(text);
+                        }
+                        return;
+                    }
+                }
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    let inventory_open = self
+                        .play
+                        .as_ref()
+                        .is_some_and(|play| play.session.snapshot().inventory.is_open());
+                    if pressed
+                        && !event.repeat
+                        && self.ui.is_some()
+                        && self.play.is_some()
+                        && ((code == KeyCode::KeyE
+                            && !self.ui.as_ref().is_some_and(GameUi::paused))
+                            || (code == KeyCode::Escape && inventory_open))
+                    {
+                        self.request_inventory_toggle();
+                        return;
+                    }
+                    if self.inventory_wait.is_some() {
+                        return;
+                    }
+                    if inventory_open {
+                        if pressed
+                            && let Some(target) = inventory_swap_key(code)
+                            && let (Some(play), Some(slot)) = (
+                                &mut self.play,
+                                self.ui.as_ref().and_then(GameUi::inventory_slot),
+                            )
+                        {
+                            play.session
+                                .submit_command(PlayerCommand::InventorySwap { slot, target });
+                            return;
+                        }
+                        if pressed
+                            && code == KeyCode::KeyQ
+                            && let (Some(play), Some(slot)) = (
+                                &mut self.play,
+                                self.ui.as_ref().and_then(GameUi::inventory_slot),
+                            )
+                        {
+                            play.session.submit_command(PlayerCommand::InventoryThrow {
+                                slot,
+                                all: self.inventory_control,
+                            });
+                        }
+                        return;
+                    }
+                    if self.ui.as_ref().is_some_and(GameUi::paused) {
+                        if pressed
+                            && (!event.repeat
+                                || matches!(code, KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                        {
+                            let action = self
+                                .ui
+                                .as_mut()
+                                .unwrap()
+                                .pause_key(code, self.inventory_shift);
+                            self.pause_action(action, event_loop);
+                        }
+                        return;
+                    }
+                    if code == KeyCode::Escape && pressed && !event.repeat {
+                        if let Some(ui) = &mut self.ui {
+                            let paused = ui.toggle_pause();
+                            self.input = Input::default();
+                            self.submit_movement();
+                            self.capture(!paused);
+                            self.last_update = Instant::now();
+                        } else {
+                            self.capture(false);
+                        }
+                        return;
+                    }
+                    if pressed && code == KeyCode::KeyQ && self.captured {
+                        if let Some(play) = &mut self.play {
+                            play.session.submit_command(PlayerCommand::DropSelected {
+                                all: self.inventory_control,
+                            });
+                        }
+                        return;
+                    }
+                    if pressed && !event.repeat && code == KeyCode::KeyF && self.captured {
+                        if let Some(play) = &mut self.play {
+                            play.session.submit_command(PlayerCommand::SwapHands);
+                        }
+                        return;
+                    }
+                    match code {
+                        KeyCode::KeyW => self.input.forward = pressed,
+                        KeyCode::KeyS => self.input.back = pressed,
+                        KeyCode::KeyA => self.input.left = pressed,
+                        KeyCode::KeyD => self.input.right = pressed,
+                        KeyCode::Space => self.input.up = pressed,
+                        KeyCode::ShiftLeft => self.input.down_left = pressed,
+                        KeyCode::ShiftRight => self.input.down_right = pressed,
+                        KeyCode::ControlLeft => self.input.fast_left = pressed,
+                        KeyCode::ControlRight => self.input.fast_right = pressed,
+                        code if pressed && !event.repeat && hotbar_key(code).is_some() => {
+                            if let Some(play) = &mut self.play {
+                                play.session.submit_command(PlayerCommand::SelectSlot(
+                                    hotbar_key(code).unwrap(),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.submit_movement();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => {
+                if self
+                    .play
+                    .as_ref()
+                    .is_some_and(|play| play.session.snapshot().death.is_some())
+                {
+                    return;
+                }
+                let inventory_open = self
+                    .play
+                    .as_ref()
+                    .is_some_and(|play| play.session.snapshot().inventory.is_open());
+                if button == MouseButton::Left && self.ui.as_ref().is_some_and(GameUi::paused) {
+                    if let Some(ui) = &mut self.ui {
+                        ui.pause_release();
+                    }
+                } else if inventory_open {
+                    let button = match button {
+                        MouseButton::Left => Some(ClickButton::Primary),
+                        MouseButton::Right => Some(ClickButton::Secondary),
+                        _ => None,
+                    };
+                    if let Some(button) = button
+                        && let Some(target) =
+                            self.ui.as_mut().and_then(GameUi::inventory_pointer_release)
+                        && let Some(play) = &mut self.play
+                    {
+                        play.session.submit_command(PlayerCommand::InventoryPointer(
+                            InventoryPointerEvent::Release {
+                                target,
+                                button,
+                                shift: self.inventory_shift,
+                            },
+                        ));
+                    }
+                } else if let Some(play) = &mut self.play {
+                    match button {
+                        MouseButton::Left => play.session.submit_command(PlayerCommand::StopBreak),
+                        MouseButton::Right => play.session.submit_command(PlayerCommand::StopUse),
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                if let Some(snapshot) = self.play.as_ref().map(|play| play.session.snapshot())
+                    && snapshot.death.is_some()
+                {
+                    if button == MouseButton::Left
+                        && let Some(ui) = &mut self.ui
+                    {
+                        ui.sync_death(&snapshot);
+                        let action = ui.death_click();
+                        self.death_action(action, event_loop);
+                    }
+                    return;
+                }
+                if self.inventory_wait.is_some() {
+                    return;
+                }
+                let inventory_open = self
+                    .play
+                    .as_ref()
+                    .is_some_and(|play| play.session.snapshot().inventory.is_open());
+                if inventory_open {
+                    if self
+                        .ui
+                        .as_ref()
+                        .is_some_and(GameUi::inventory_pointer_active)
+                    {
+                        return;
+                    }
+                    if let (Some(play), Some(button)) = (
+                        &mut self.play,
+                        match button {
+                            MouseButton::Left => Some(ClickButton::Primary),
+                            MouseButton::Right => Some(ClickButton::Secondary),
+                            _ => None,
+                        },
+                    ) {
+                        let snapshot = play.session.snapshot();
+                        let action = self
+                            .ui
+                            .as_mut()
+                            .map(|ui| {
+                                ui.recipe_book_click(
+                                    button,
+                                    self.inventory_shift,
+                                    &snapshot.inventory,
+                                )
+                            })
+                            .unwrap_or(BookAction::None);
+                        match action {
+                            BookAction::None => {}
+                            BookAction::Consumed => return,
+                            BookAction::Settings { open, filtering } => {
+                                play.session
+                                    .submit_command(PlayerCommand::RecipeBookSettings {
+                                        open,
+                                        filtering,
+                                    });
+                                return;
+                            }
+                            BookAction::Place {
+                                recipe,
+                                use_max,
+                                close,
+                                filtering,
+                            } => {
+                                play.session.submit_command(PlayerCommand::RecipeBookPlace {
+                                    recipe,
+                                    use_max,
+                                });
+                                if close {
+                                    play.session.submit_command(
+                                        PlayerCommand::RecipeBookSettings {
+                                            open: false,
+                                            filtering,
+                                        },
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        if let Some(target) = self
+                            .ui
+                            .as_mut()
+                            .and_then(|ui| ui.inventory_pointer_press(button))
+                        {
+                            play.session.submit_command(PlayerCommand::InventoryPointer(
+                                InventoryPointerEvent::Press {
+                                    target,
+                                    button,
+                                    shift: self.inventory_shift,
+                                },
+                            ));
+                        }
+                    }
+                } else if self.ui.as_ref().is_some_and(GameUi::paused) {
+                    if button == MouseButton::Left {
+                        let action = self
+                            .ui
+                            .as_mut()
+                            .map(GameUi::click)
+                            .unwrap_or(PauseAction::None);
+                        self.pause_action(action, event_loop);
+                    }
+                } else if !self.captured {
+                    if button == MouseButton::Left {
+                        self.capture(true);
+                    }
+                } else if let Some(play) = &mut self.play {
+                    match button {
+                        MouseButton::Left => play.session.submit_command(PlayerCommand::Break),
+                        MouseButton::Right => {
+                            play.session.submit_command(PlayerCommand::UseHeld(true));
+                            play.session.submit_command(PlayerCommand::Place);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.captured
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            let now = Instant::now();
+            if self.inactivity.input(now, self.video.inactivity_fps_limit) {
+                self.frame_pacer.set_limit(self.video.max_fps, now);
+            }
+            if let Some(play) = &mut self.play {
+                let yaw = delta.0 as f32 * 0.0025;
+                let pitch = -delta.1 as f32 * 0.0025;
+                let snapshot = play.session.snapshot();
+                self.visual_look.turn(&snapshot, yaw, pitch);
+                (self.camera.yaw, self.camera.pitch) = self.visual_look.angles(&snapshot);
+                play.session
+                    .submit_command(PlayerCommand::Look { yaw, pitch });
+            } else {
+                self.camera.yaw += delta.0 as f32 * 0.0025;
+                self.camera.pitch =
+                    (self.camera.pitch - delta.1 as f32 * 0.0025).clamp(-1.54, 1.54);
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if !self.ui.as_ref().is_some_and(GameUi::paused)
+            && let Err(error) = self.update(now.saturating_duration_since(self.last_update))
+        {
+            self.fail(event_loop, error);
+            return;
+        }
+        self.last_update = now;
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            if self.occluded || size.width == 0 || size.height == 0 {
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(50)));
+            } else {
+                let fps = self.inactivity.limit(
+                    now,
+                    self.video.inactivity_fps_limit,
+                    self.video.max_fps,
+                    false,
+                    false,
+                );
+                self.frame_pacer.set_limit(fps, now);
+                if self.frame_pacer.due(now) {
+                    window.request_redraw();
+                }
+                if let Some(deadline) = self.frame_pacer.deadline() {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        deadline.min(now + Duration::from_millis(50)),
+                    ));
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 assets and a Windows GPU window"]
+    fn incremental_worker_updates_the_real_renderer_and_rebuilds_changed_atlas() {
+        if !crate::window_test::isolated(
+            "preview_app::tests::incremental_worker_updates_the_real_renderer_and_rebuilds_changed_atlas",
+        ) {
+            return;
+        }
+        use native_world::loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, Section, World};
+        use std::collections::BTreeMap;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Harness {
+            world: World,
+            stone: native_world::loaded::BlockStateId,
+            dirt: native_world::loaded::BlockStateId,
+            item: native_session::items::DroppedItem,
+            scene: PreviewScene,
+            worker: MeshWorker,
+            window: Option<Arc<Window>>,
+            renderer: Option<Renderer>,
+            last_generation: Option<u64>,
+            removed: Option<Arc<Chunk>>,
+            revision: u64,
+            started: Instant,
+            rendered_final: bool,
+        }
+        impl ApplicationHandler for Harness {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let window = Arc::new(
+                    event_loop
+                        .create_window(
+                            Window::default_attributes()
+                                .with_title("Minecraft mesh test")
+                                .with_inner_size(winit::dpi::LogicalSize::new(320, 240)),
+                        )
+                        .unwrap(),
+                );
+                let item_texture =
+                    image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255]));
+                self.renderer = Some(
+                    Renderer::new(
+                        Arc::clone(&window),
+                        &self.scene.atlas.texture,
+                        None,
+                        Some(vec![
+                            &item_texture;
+                            crate::mesh::DROPPED_TEXTURE_COUNT as usize
+                        ]),
+                        None,
+                        None,
+                        false,
+                    )
+                    .unwrap(),
+                );
+                self.window = Some(window);
+                self.world.set_block_id(9, 1, 8, self.stone).unwrap();
+                self.worker.submit(MeshJob {
+                    revision: 1,
+                    origin: glam::IVec3::ZERO,
+                    world: Arc::new(self.world.clone()),
+                });
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                _id: WindowId,
+                event: WindowEvent,
+            ) {
+                if matches!(event, WindowEvent::RedrawRequested) {
+                    self.renderer
+                        .as_mut()
+                        .unwrap()
+                        .render_preview(
+                            &mut self.scene,
+                            Vec3::new(8.0, 5.0, 15.0),
+                            Vec3::NEG_Z,
+                            30,
+                            None,
+                            std::slice::from_ref(&self.item),
+                        )
+                        .unwrap();
+                    if self.revision == 6 {
+                        self.rendered_final = true;
+                        event_loop.exit();
+                    }
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                assert!(
+                    self.started.elapsed() < Duration::from_secs(30),
+                    "mesh worker timed out"
+                );
+                if let Some(result) = self.worker.try_result().unwrap() {
+                    assert_eq!(result.revision, self.revision + 1);
+                    let next = result.scene.unwrap();
+                    let generation = next.material_generation.unwrap();
+                    let previous_atlas = Arc::clone(&self.scene.atlas);
+                    let before = self.renderer.as_ref().unwrap().preview_upload_counts();
+                    match result.revision {
+                        1 => assert_eq!(self.scene.material_generation, None),
+                        2 => assert_eq!(Some(generation), self.last_generation),
+                        3 => assert_ne!(Some(generation), self.last_generation),
+                        4..=6 => assert_eq!(Some(generation), self.last_generation),
+                        _ => unreachable!(),
+                    }
+                    replace_scene(self.renderer.as_mut().unwrap(), &mut self.scene, next).unwrap();
+                    let renderer = self.renderer.as_mut().unwrap();
+                    let eye = Vec3::new(8.0, 5.0, 15.0);
+                    renderer
+                        .render_preview(
+                            &mut self.scene,
+                            eye,
+                            Vec3::NEG_Z,
+                            30,
+                            None,
+                            std::slice::from_ref(&self.item),
+                        )
+                        .unwrap();
+                    let after = renderer.preview_upload_counts();
+                    match result.revision {
+                        1 => assert_eq!((after.0 - before.0, after.1 - before.1), (9, 1)),
+                        2 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
+                        3 => assert_eq!((after.0 - before.0, after.1 - before.1), (9, 1)),
+                        4 => assert_eq!((after.0 - before.0, after.1 - before.1), (0, 0)),
+                        5 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
+                        6 => assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0)),
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(after.2 - before.2, if result.revision == 6 { 0 } else { 1 });
+                    renderer
+                        .render_preview(
+                            &mut self.scene,
+                            eye,
+                            Vec3::NEG_Z,
+                            30,
+                            None,
+                            std::slice::from_ref(&self.item),
+                        )
+                        .unwrap();
+                    assert_eq!(renderer.preview_upload_counts(), after);
+                    assert_eq!(
+                        renderer.preview_chunk_count(),
+                        if result.revision == 4 { 8 } else { 9 }
+                    );
+                    if matches!(result.revision, 2 | 4 | 6) {
+                        let chunked = renderer
+                            .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                            .unwrap();
+                        let flat = renderer
+                            .preview_readback(&self.scene, eye, Vec3::NEG_Z, false)
+                            .unwrap();
+                        assert!(
+                            chunked == flat,
+                            "chunked and flat terrain must produce identical pixels"
+                        );
+                        let pixels = chunked.as_chunks::<4>().0;
+                        assert!(pixels.iter().any(|pixel| pixel != &pixels[0]));
+                        if result.revision == 2 {
+                            let original_lightmap = Arc::clone(&self.scene.lightmap);
+                            let bake = |vertex: &mut crate::mesh::Vertex| {
+                                if vertex.light < 256 {
+                                    let light = original_lightmap[(vertex.light / 16) as usize]
+                                        [(vertex.light % 16) as usize];
+                                    for (tint, value) in vertex.tint.iter_mut().zip(light) {
+                                        *tint *= value;
+                                    }
+                                    vertex.light = u32::MAX;
+                                }
+                            };
+                            let chunks = self
+                                .scene
+                                .chunks
+                                .iter()
+                                .map(|(pos, mesh)| {
+                                    let mut opaque = mesh.opaque.to_vec();
+                                    for vertex in &mut opaque {
+                                        bake(vertex);
+                                    }
+                                    let mut translucent = mesh.translucent.to_vec();
+                                    for quad in &mut translucent {
+                                        for vertex in &mut quad.vertices {
+                                            bake(vertex);
+                                        }
+                                    }
+                                    (
+                                        *pos,
+                                        Arc::new(crate::preview::ChunkMesh {
+                                            opaque: opaque.into(),
+                                            translucent: translucent.into(),
+                                        }),
+                                    )
+                                })
+                                .collect();
+                            let baked = PreviewScene {
+                                atlas: Arc::clone(&self.scene.atlas),
+                                chunks,
+                                origin: self.scene.origin,
+                                warnings: Vec::new(),
+                                material_generation: self.scene.material_generation,
+                                lightmap: Arc::clone(&original_lightmap),
+                                base_lightmap: Arc::clone(&self.scene.base_lightmap),
+                            };
+                            let old_path = renderer
+                                .preview_readback(&baked, eye, Vec3::NEG_Z, false)
+                                .unwrap();
+                            assert!(
+                                old_path == flat,
+                                "GPU lightmap must match the previous CPU-baked pixels"
+                            );
+                            self.scene.lightmap = Arc::new([[[0.0; 3]; 16]; 16]);
+                            renderer.set_preview_lightmap(&self.scene.lightmap);
+                            let dark = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                dark != chunked,
+                                "lightmap changes must affect terrain pixels"
+                            );
+                            assert_eq!(
+                                renderer.preview_upload_counts(),
+                                after,
+                                "changing light must not upload geometry"
+                            );
+                            self.scene.lightmap = original_lightmap;
+                            renderer.set_preview_lightmap(&self.scene.lightmap);
+                            assert!(
+                                renderer
+                                    .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                    .unwrap()
+                                    == chunked
+                            );
+                            let game = native_resources::default_minecraft_dir().unwrap();
+                            let mut resources = ResourceStack::open(&game).unwrap();
+                            let daylight = crate::preview_lighting::SkyTimeline::load(
+                                &mut resources,
+                                "minecraft:overworld",
+                            )
+                            .unwrap();
+                            let noon = daylight
+                                .sample(&self.scene.base_lightmap, |_| Some(6000))
+                                .unwrap()
+                                .table();
+                            let night = daylight
+                                .sample(&self.scene.base_lightmap, |_| Some(18000))
+                                .unwrap()
+                                .table();
+                            renderer.set_preview_lightmap(&noon);
+                            let noon_pixels = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            renderer.set_preview_lightmap(&night);
+                            let night_pixels = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                noon_pixels != night_pixels,
+                                "installed day timeline must change terrain lighting"
+                            );
+                            assert_eq!(
+                                renderer.preview_upload_counts(),
+                                after,
+                                "daylight must not upload terrain geometry"
+                            );
+                            renderer.set_preview_lightmap(&self.scene.lightmap);
+                            renderer.set_sky_color([0.0, 0.0, 0.0]);
+                            let dark_sky = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            renderer.set_sky_color([0.2, 0.4, 0.8]);
+                            let blue_sky = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                dark_sky[..4] != blue_sky[..4],
+                                "sky background color must reach the GPU"
+                            );
+                            let expected: [u8; 3] = match renderer.configured_color_format() {
+                                wgpu::TextureFormat::Bgra8Unorm
+                                | wgpu::TextureFormat::Bgra8UnormSrgb => [204, 102, 51],
+                                _ => [51, 102, 204],
+                            };
+                            for (actual, expected) in blue_sky[..3].iter().zip(expected) {
+                                assert!(
+                                    (i16::from(*actual) - i16::from(expected)).abs() <= 1,
+                                    "sky clear color must preserve RGB values"
+                                );
+                            }
+                            renderer.set_fog_range(Some([0.0, 1.0]));
+                            let fogged = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                blue_sky
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .zip(fogged.as_chunks::<4>().0)
+                                    .any(|(before, after)| {
+                                        before[..3] != blue_sky[..3]
+                                            && after[..3].iter().zip(expected).all(|(a, b)| {
+                                                (i16::from(*a) - i16::from(b)).abs() <= 1
+                                            })
+                                    }),
+                                "distant terrain must be fogged toward the background color"
+                            );
+                            renderer.set_fog_range(None);
+                            assert_eq!(
+                                renderer
+                                    .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                    .unwrap(),
+                                blue_sky,
+                                "disabling fog restores terrain"
+                            );
+                            assert_eq!(
+                                renderer.preview_upload_counts(),
+                                after,
+                                "sky color must not upload terrain geometry"
+                            );
+                            renderer.reset_sky_color();
+                            renderer.set_fov(30);
+                            let narrow = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            renderer.set_fov(110);
+                            let wide = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(narrow != wide, "FOV must affect rendered world pixels");
+                            renderer.set_fov(70);
+                            let mut bob =
+                                native_session::camera::CameraMotion::new(glam::DVec3::ZERO, 1.62);
+                            for _ in 0..10 {
+                                bob.begin_bob_tick(glam::DVec3::new(0.1, 0.0, 0.1), true);
+                                bob.finish_bob_tick(glam::DVec3::new(0.1, 0.0, 0.1));
+                            }
+                            renderer.set_camera_bob(&bob, 0.5);
+                            let moving = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                moving != chunked,
+                                "walking bob must change rendered world pixels"
+                            );
+                            renderer.set_view_bobbing(false);
+                            let disabled = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                disabled == chunked,
+                                "disabling bob must restore the original view"
+                            );
+                            renderer.set_camera_bob(
+                                &native_session::camera::CameraMotion::new(glam::DVec3::ZERO, 1.62),
+                                0.0,
+                            );
+                            renderer.set_view_bobbing(true);
+                            renderer
+                                .render_preview(&mut self.scene, eye, Vec3::NEG_Z, 30, None, &[])
+                                .unwrap();
+                            let without_item = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(chunked != without_item, "the dropped item must be visible");
+                        }
+                    }
+                    if result.revision == 2 {
+                        renderer
+                            .render_preview(
+                                &mut self.scene,
+                                eye + Vec3::X,
+                                Vec3::NEG_Z,
+                                30,
+                                None,
+                                &[],
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            renderer.preview_upload_counts(),
+                            after,
+                            "unchanged translucent ordering must reuse its GPU buffer"
+                        );
+                        let reused = renderer
+                            .preview_readback(&self.scene, eye + Vec3::X, Vec3::NEG_Z, true)
+                            .unwrap();
+                        let repeated = renderer
+                            .preview_readback(&self.scene, eye + Vec3::X, Vec3::NEG_Z, true)
+                            .unwrap();
+                        assert!(
+                            reused == repeated,
+                            "unchanged render must preserve every pixel: {:?}",
+                            reused
+                                .chunks_exact(4)
+                                .zip(repeated.chunks_exact(4))
+                                .enumerate()
+                                .filter(|(_, (a, b))| a != b)
+                                .take(8)
+                                .collect::<Vec<_>>()
+                        );
+                        let previous_vertices = renderer.translucent_upload_bytes().to_vec();
+                        let previous_atlas_pixels = self.scene.atlas.texture.rgba.clone();
+                        renderer.force_translucent_resort();
+                        renderer
+                            .render_preview(
+                                &mut self.scene,
+                                eye + Vec3::X,
+                                Vec3::NEG_Z,
+                                30,
+                                None,
+                                &[],
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            renderer.preview_upload_counts(),
+                            (after.0, after.1 + 1, after.2),
+                            "the forced rebuild must upload translucent geometry"
+                        );
+                        assert!(
+                            previous_vertices == renderer.translucent_upload_bytes(),
+                            "reused and freshly sorted translucent vertices differ"
+                        );
+                        assert!(
+                            previous_atlas_pixels == self.scene.atlas.texture.rgba,
+                            "atlas changed during identical-tick resort"
+                        );
+                        let resorted = renderer
+                            .preview_readback(&self.scene, eye + Vec3::X, Vec3::NEG_Z, true)
+                            .unwrap();
+                        assert!(
+                            reused == resorted,
+                            "reusing the sort must preserve every pixel: {:?}",
+                            reused
+                                .chunks_exact(4)
+                                .zip(resorted.chunks_exact(4))
+                                .enumerate()
+                                .filter(|(_, (a, b))| a != b)
+                                .take(8)
+                                .collect::<Vec<_>>()
+                        );
+                        renderer
+                            .render_preview(
+                                &mut self.scene,
+                                eye,
+                                Vec3::NEG_Z,
+                                30,
+                                None,
+                                std::slice::from_ref(&self.item),
+                            )
+                            .unwrap();
+                    }
+                    if matches!(result.revision, 2 | 4..=6) {
+                        assert!(Arc::ptr_eq(&previous_atlas, &self.scene.atlas));
+                    } else if result.revision == 3 {
+                        assert!(!Arc::ptr_eq(&previous_atlas, &self.scene.atlas));
+                    }
+                    self.last_generation = Some(generation);
+                    self.revision = result.revision;
+                    if self.revision < 6 {
+                        match self.revision {
+                            1 => {
+                                self.world.set_block_id(10, 1, 8, self.stone).unwrap();
+                            }
+                            2 => {
+                                self.world.set_block_id(10, 1, 8, self.dirt).unwrap();
+                                self.world.set_block_id(7, 1, 8, self.dirt).unwrap();
+                            }
+                            3 => {
+                                self.removed = self.world.chunks.remove(&ChunkPos { x: 1, z: 1 });
+                            }
+                            4 => {
+                                let chunk = self.removed.take().unwrap();
+                                self.world.chunks.insert(chunk.position, chunk);
+                            }
+                            5 => {
+                                self.world.set_block_id(10, 1, 8, self.stone).unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        self.worker.submit(MeshJob {
+                            revision: self.revision + 1,
+                            origin: glam::IVec3::ZERO,
+                            world: Arc::new(self.world.clone()),
+                        });
+                    }
+                }
+                self.window.as_ref().unwrap().request_redraw();
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(10),
+                ));
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let stone = world.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        });
+        let dirt = world.intern_state(BlockState {
+            name: "minecraft:dirt".into(),
+            properties: BTreeMap::new(),
+        });
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        for x in -1..=1 {
+            for z in -1..=1 {
+                let mut blocks = Box::new([air; BLOCK_COUNT]);
+                blocks[8 + 8 * 16] = stone;
+                if x == 0 && z == 0 {
+                    blocks[2 + 2 * 16 + 256] = water;
+                }
+                let pos = ChunkPos { x, z };
+                world.chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        sections: BTreeMap::from([(
+                            0,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )]),
+                    }),
+                );
+            }
+        }
+        let scene = PreviewScene::prepare(&world, &mut resources, glam::IVec3::ZERO, 4096).unwrap();
+        let worker = MeshWorker::start(resources).unwrap();
+        let mut harness = Harness {
+            world,
+            stone,
+            dirt,
+            item: native_session::items::DroppedItem {
+                position: glam::DVec3::new(8.0, 4.8, 11.0),
+                previous_position: glam::DVec3::new(8.0, 4.8, 11.0),
+                stack: native_session::inventory::ItemStack::new(
+                    "minecraft:stone".into(),
+                    1,
+                    64,
+                    native_persistence::nbt::Tag::Compound(vec![]),
+                )
+                .unwrap(),
+                age: 0,
+                bob_offset: 0.0,
+            },
+            scene,
+            worker,
+            window: None,
+            renderer: None,
+            last_generation: None,
+            removed: None,
+            revision: 0,
+            started: Instant::now(),
+            rendered_final: false,
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(harness.rendered_final);
+    }
+
+    #[test]
+    fn camera_remains_in_the_old_mesh_frame_during_origin_changes() {
+        let previous = native_session::LocalSession::demo().snapshot();
+        let mut player = previous.player;
+        player.position = Vec3::new(0.5, 2.0, 8.5);
+        let snapshot = WorldSnapshot {
+            world: previous.world.clone(),
+            player,
+            camera: native_session::camera::CameraMotion::new(
+                player.position.as_dvec3(),
+                player.pose.eye_height(),
+            ),
+            game_mode: previous.game_mode,
+            vitals: previous.vitals,
+            experience: previous.experience,
+            death: previous.death,
+            armor: previous.armor,
+            eyes_in_water: previous.eyes_in_water,
+            sprinting: previous.sprinting,
+            selected_block: previous.selected_block,
+            inventory: Arc::clone(&previous.inventory),
+            first_person: previous.first_person.clone(),
+            breaking: previous.breaking,
+            dropped_items: Arc::clone(&previous.dropped_items),
+            falling_blocks: Arc::clone(&previous.falling_blocks),
+            experience_orbs: Arc::clone(&previous.experience_orbs),
+            system_messages: Arc::clone(&previous.system_messages),
+            tick: previous.tick,
+            origin: glam::IVec3::new(16_000_016, 0, -16_000_000),
+            world_revision: previous.world_revision,
+        };
+        let eye = eye_for_scene(&snapshot, glam::IVec3::new(16_000_000, 0, -16_000_000), 1.0);
+        assert!((eye - Vec3::new(16.5, 2.0 + native_session::EYE_HEIGHT, 8.5)).length() < 1.0e-6);
+        let mut crouched = snapshot;
+        crouched.player.pose = native_session::PlayerPose::Crouching;
+        crouched.camera.tick(
+            crouched.player.position.as_dvec3(),
+            crouched.player.pose.eye_height(),
+            false,
+        );
+        let eye = eye_for_scene(&crouched, glam::IVec3::new(16_000_000, 0, -16_000_000), 1.0);
+        assert!(
+            (eye - Vec3::new(
+                16.5,
+                2.0 + (native_session::EYE_HEIGHT + native_session::CROUCH_EYE_HEIGHT) * 0.5,
+                8.5
+            ))
+            .length()
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn free_camera_moves_in_view_direction_and_normalizes_diagonals() {
+        let mut camera = Camera {
+            eye: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut input = Input {
+            forward: true,
+            ..Input::default()
+        };
+        camera.advance(&input, Duration::from_millis(50));
+        assert!((camera.eye - Vec3::new(0.0, 0.0, -0.5)).length() < 1e-6);
+        input.right = true;
+        input.up = true;
+        let before = camera.eye;
+        camera.advance(&input, Duration::from_millis(50));
+        assert!(((camera.eye - before).length() - 0.5).abs() < 1e-6);
+        camera.yaw = std::f32::consts::FRAC_PI_2;
+        input = Input {
+            forward: true,
+            fast_left: true,
+            ..Input::default()
+        };
+        let before = camera.eye;
+        camera.advance(&input, Duration::from_millis(50));
+        assert!((camera.eye - before - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-6);
+    }
+}

@@ -1,0 +1,532 @@
+//! Default player movement in air, on ordinary solid blocks, and in fluids.
+//! Status effects, block speed factors and custom attributes are separate work.
+
+use glam::DVec3;
+use native_world::fluid::FluidKind;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MovementInput {
+    pub forward: f32,
+    /// Positive values move to the player's right.
+    pub right: f32,
+    /// Java yaw in degrees (0 faces positive Z).
+    pub yaw_degrees: f32,
+    pub jump: bool,
+    pub sprinting: bool,
+    pub using_item: bool,
+    /// The client applies the sneaking-speed attribute to input before movement.
+    pub moving_slowly: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MotionState {
+    pub position: DVec3,
+    /// Blocks per 20 TPS tick.
+    pub velocity: DVec3,
+    pub on_ground: bool,
+    pub jump_delay: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FluidMovement {
+    pub kind: FluidKind,
+    pub depth: f64,
+    pub descend: bool,
+    pub swimming: bool,
+    pub look_y: f64,
+    pub fluid_above: bool,
+}
+
+/// The modified friction returned by 26.3 for the supported vanilla blocks.
+pub fn ground_friction(block: &str) -> f32 {
+    match block {
+        "minecraft:ice" | "minecraft:packed_ice" | "minecraft:frosted_ice" => 0.98,
+        "minecraft:blue_ice" => 0.989,
+        "minecraft:slime_block" => 0.8,
+        _ => 0.6,
+    }
+}
+
+impl MotionState {
+    /// Advance one 20 TPS tick. `collide` resolves the requested movement and
+    /// returns the movement that is actually possible from the given position.
+    /// Returns whether a non-minor horizontal collision occurred.
+    pub fn tick(
+        &mut self,
+        input: MovementInput,
+        block_friction: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> DVec3,
+    ) -> bool {
+        self.tick_resolved(input, block_friction, |position, requested, on_ground| {
+            (requested, collide(position, requested, on_ground))
+        })
+        .0
+    }
+
+    /// Resolves movement after optional edge restraint. The first returned vector
+    /// is the adjusted request, the second is the collision-clipped movement.
+    pub fn tick_resolved(
+        &mut self,
+        input: MovementInput,
+        block_friction: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
+        let radians = input.yaw_degrees * 0.017453292_f32;
+        let sine = f64::from(java_sin(f64::from(radians), false));
+        let cosine = f64::from(java_sin(f64::from(radians), true));
+        self.jump_delay = self.jump_delay.saturating_sub(1);
+        if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
+            self.velocity.x = 0.0;
+            self.velocity.z = 0.0;
+        }
+        if self.velocity.y.abs() < 0.003 {
+            self.velocity.y = 0.0;
+        }
+        if input.jump {
+            if self.on_ground && self.jump_delay == 0 {
+                self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
+                if input.sprinting {
+                    self.velocity.x -= sine * 0.2;
+                    self.velocity.z += cosine * 0.2;
+                }
+                self.jump_delay = 10;
+            }
+        } else {
+            self.jump_delay = 0;
+        }
+
+        let friction = if self.on_ground {
+            modified_friction(block_friction, 1.0)
+        } else {
+            1.0
+        };
+        let ground_speed = if input.sprinting {
+            (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32
+        } else {
+            0.1_f32
+        };
+        let speed = if self.on_ground {
+            if f64::from(friction) > 0.6 {
+                ground_speed * (0.21600002_f32 / (friction * friction * friction))
+            } else {
+                ground_speed
+            }
+        } else if input.sprinting {
+            0.026_f32
+        } else {
+            0.02_f32
+        };
+        let (left, forward) = keyboard_input(
+            -input.right,
+            input.forward,
+            input.moving_slowly,
+            input.using_item,
+        );
+        let x = f64::from(left) * f64::from(speed);
+        let z = f64::from(forward) * f64::from(speed);
+        self.velocity.x += x * cosine - z * sine;
+        self.velocity.z += z * cosine + x * sine;
+
+        let (requested, actual) = collide(self.position, self.velocity, self.on_ground);
+        self.position += actual;
+        let horizontal_epsilon = f64::from(1.0e-5_f32);
+        let blocked_x = (requested.x - actual.x).abs() >= horizontal_epsilon;
+        let blocked_z = (requested.z - actual.z).abs() >= horizontal_epsilon;
+        if blocked_x {
+            self.velocity.x = 0.0;
+        }
+        if blocked_z {
+            self.velocity.z = 0.0;
+        }
+        let vertical_collision = requested.y != actual.y;
+        self.on_ground = vertical_collision && requested.y < 0.0;
+        if vertical_collision {
+            self.velocity.y = 0.0;
+        }
+        let horizontal_drag = friction * modified_friction(0.91, 1.0);
+        let vertical_drag = modified_friction(0.98, 1.0);
+        self.velocity.x *= f64::from(horizontal_drag);
+        self.velocity.y = (self.velocity.y - 0.08) * f64::from(vertical_drag);
+        self.velocity.z *= f64::from(horizontal_drag);
+        let horizontal_collision = blocked_x || blocked_z;
+        (
+            horizontal_collision && !minor_collision(left, forward, sine, cosine, actual),
+            actual,
+        )
+    }
+
+    /// Advance default player movement in water or lava after currents are applied.
+    pub fn tick_fluid(
+        &mut self,
+        input: MovementInput,
+        fluid: FluidMovement,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+        can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
+    ) -> (bool, DVec3) {
+        if fluid.kind == FluidKind::Water && fluid.descend {
+            self.velocity.y -= f64::from(0.04_f32);
+        }
+        self.jump_delay = self.jump_delay.saturating_sub(1);
+        if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
+            self.velocity.x = 0.0;
+            self.velocity.z = 0.0;
+        }
+        if self.velocity.y.abs() < 0.003 {
+            self.velocity.y = 0.0;
+        }
+        let radians = input.yaw_degrees * 0.017453292_f32;
+        let sine = f64::from(java_sin(f64::from(radians), false));
+        let cosine = f64::from(java_sin(f64::from(radians), true));
+        if input.jump {
+            if fluid.depth > 0.0 && (!self.on_ground || fluid.depth > 0.4) {
+                self.velocity.y += f64::from(0.04_f32);
+            } else if self.on_ground && self.jump_delay == 0 {
+                self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
+                if input.sprinting {
+                    self.velocity.x -= sine * 0.2;
+                    self.velocity.z += cosine * 0.2;
+                }
+                self.jump_delay = 10;
+            }
+        } else {
+            self.jump_delay = 0;
+        }
+        if fluid.kind == FluidKind::Water && fluid.swimming {
+            let factor = if fluid.look_y < -0.2 { 0.085 } else { 0.06 };
+            if fluid.look_y <= 0.0 || input.jump || fluid.fluid_above {
+                self.velocity.y += (fluid.look_y - self.velocity.y) * factor;
+            }
+        }
+        let falling = self.velocity.y <= 0.0;
+        let (left, forward) = keyboard_input(
+            -input.right,
+            input.forward,
+            input.moving_slowly,
+            input.using_item,
+        );
+        let x = f64::from(left) * f64::from(0.02_f32);
+        let z = f64::from(forward) * f64::from(0.02_f32);
+        self.velocity.x += x * cosine - z * sine;
+        self.velocity.z += z * cosine + x * sine;
+        let previous_y = self.position.y;
+        let (requested, actual) = collide(self.position, self.velocity, self.on_ground);
+        self.position += actual;
+        let epsilon = f64::from(1.0e-5_f32);
+        let blocked_x = (requested.x - actual.x).abs() >= epsilon;
+        let blocked_z = (requested.z - actual.z).abs() >= epsilon;
+        if blocked_x {
+            self.velocity.x = 0.0;
+        }
+        if blocked_z {
+            self.velocity.z = 0.0;
+        }
+        let vertical_collision = requested.y != actual.y;
+        self.on_ground = vertical_collision && requested.y < 0.0;
+        if vertical_collision {
+            self.velocity.y = 0.0;
+        }
+        match fluid.kind {
+            FluidKind::Water => {
+                let drag = if input.sprinting { 0.9_f32 } else { 0.8_f32 };
+                self.velocity *= DVec3::new(f64::from(drag), f64::from(0.8_f32), f64::from(drag));
+                self.velocity = fluid_gravity(self.velocity, falling, input.sprinting);
+            }
+            FluidKind::Lava => {
+                if fluid.depth <= 0.4 {
+                    self.velocity *= DVec3::new(0.5, f64::from(0.8_f32), 0.5);
+                    self.velocity = fluid_gravity(self.velocity, falling, input.sprinting);
+                } else {
+                    self.velocity *= 0.5;
+                }
+                self.velocity.y -= 0.08 / 4.0;
+            }
+        }
+        let horizontal_collision = blocked_x || blocked_z;
+        if horizontal_collision {
+            let offset = DVec3::new(
+                self.velocity.x,
+                self.velocity.y + f64::from(0.6_f32) - self.position.y + previous_y,
+                self.velocity.z,
+            );
+            if can_jump_out(self.position, offset) {
+                self.velocity.y = f64::from(0.3_f32);
+            }
+        }
+        (
+            horizontal_collision && !minor_collision(left, forward, sine, cosine, actual),
+            actual,
+        )
+    }
+}
+
+fn fluid_gravity(mut velocity: DVec3, falling: bool, sprinting: bool) -> DVec3 {
+    if !sprinting {
+        velocity.y = if falling
+            && (velocity.y - 0.005).abs() >= 0.003
+            && (velocity.y - 0.08 / 16.0).abs() < 0.003
+        {
+            -0.003
+        } else {
+            velocity.y - 0.08 / 16.0
+        };
+    }
+    velocity
+}
+
+/// Player look height using the same sine table as 26.3.
+pub fn look_vertical(pitch_radians: f32) -> f64 {
+    let java_pitch = -pitch_radians.to_degrees();
+    -f64::from(java_sin(f64::from(java_pitch * 0.017453292_f32), false))
+}
+
+fn minor_collision(left: f32, forward: f32, sine: f64, cosine: f64, actual: DVec3) -> bool {
+    let x = f64::from(left) * cosine - f64::from(forward) * sine;
+    let z = f64::from(forward) * cosine + f64::from(left) * sine;
+    let input_length = x * x + z * z;
+    let actual_length = actual.x * actual.x + actual.z * actual.z;
+    if input_length < f64::from(1.0e-5_f32) || actual_length < f64::from(1.0e-5_f32) {
+        return false;
+    }
+    let angle = ((x * actual.x + z * actual.z) / (input_length * actual_length).sqrt()).acos();
+    angle < f64::from(0.13962634_f32)
+}
+
+/// Client sprint controls for the supported ordinary item-use behavior.
+#[derive(Default)]
+pub struct SprintState {
+    /// Current sprint-key state; releasing it does not itself end a run.
+    pub pressed: bool,
+    /// Raw backward key state, even if forward and backward cancel out.
+    pub backward_pressed: bool,
+    /// The previous input sample's sneak key.
+    pub previous_sneak: bool,
+    /// Whether the client considers the current pose slow-moving.
+    pub moving_slowly: bool,
+    pub in_water: bool,
+    pub under_water: bool,
+    pub swimming: bool,
+    pub on_ground: bool,
+    pub current_sneak: bool,
+    /// The player cannot sprint when food is insufficient and flight is unavailable.
+    pub insufficient_food: bool,
+    pub using_item: bool,
+    /// Sprinting state after the last input update.
+    pub active: bool,
+    last_forward: bool,
+    trigger_time: u8,
+    major_collision: bool,
+}
+
+impl SprintState {
+    /// Process the current input before physics, using the previous move's collision.
+    pub fn update(&mut self, forward: f32) -> bool {
+        self.trigger_time = self.trigger_time.saturating_sub(1);
+        let forward_now = forward > 1.0e-5_f32;
+        if self.backward_pressed || self.previous_sneak || self.using_item || forward < 0.0 {
+            self.trigger_time = 0;
+        }
+        let sprint_possible = !self.insufficient_food && (!self.in_water || self.under_water);
+        if !self.active
+            && forward_now
+            && sprint_possible
+            && !self.using_item
+            && (!self.moving_slowly || self.under_water)
+        {
+            if !self.last_forward {
+                if self.trigger_time > 0 {
+                    self.active = true;
+                } else {
+                    // Vanilla's default sprintWindow is seven ticks.
+                    self.trigger_time = 7;
+                }
+            }
+            if self.pressed {
+                self.active = true;
+            }
+        }
+        if self.active {
+            let stop = if self.swimming {
+                self.insufficient_food
+                    || !self.in_water
+                    || (!forward_now && !self.on_ground && !self.current_sneak)
+            } else {
+                !sprint_possible || !forward_now || self.major_collision
+            };
+            if stop {
+                self.active = false;
+            }
+        }
+        self.last_forward = forward_now;
+        self.active
+    }
+
+    /// Supply the collision result for the next tick's input update.
+    pub fn after_move(&mut self, major_collision: bool) {
+        self.major_collision = major_collision;
+    }
+}
+
+fn modified_friction(friction: f32, modifier: f32) -> f32 {
+    (1.0 - (1.0 - friction) * modifier).clamp(0.0, 1.0)
+}
+
+/// 26.3 normalizes the keyboard vector, scales it, then maps it to a unit square.
+fn keyboard_input(left: f32, forward: f32, moving_slowly: bool, using_item: bool) -> (f32, f32) {
+    let len = (left * left + forward * forward).sqrt();
+    if len < 1.0e-4 {
+        return (0.0, 0.0);
+    }
+    let mut left = (left / len) * 0.98_f32;
+    let mut forward = (forward / len) * 0.98_f32;
+    if using_item {
+        left *= 0.2_f32;
+        forward *= 0.2_f32;
+    }
+    if moving_slowly {
+        left *= 0.3_f32;
+        forward *= 0.3_f32;
+    }
+    let len = (left * left + forward * forward).sqrt();
+    let left = left * (1.0 / len);
+    let forward = forward * (1.0 / len);
+    let a = left.abs();
+    let b = forward.abs();
+    let ratio = if b > a { a / b } else { b / a };
+    let magnitude = (len * (1.0 + ratio * ratio).sqrt()).min(1.0);
+    (left * magnitude, forward * magnitude)
+}
+
+pub fn java_sin(radians: f64, cosine: bool) -> f32 {
+    const SINE_SCALE: f64 = 10430.378350470453;
+    let index = ((radians * SINE_SCALE + if cosine { 16384.0 } else { 0.0 }) as i64) & 65535;
+    ((index as f64) / SINE_SCALE).sin() as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn velocity_persists_when_input_is_released_and_ice_reduces_drag() {
+        let initial = MotionState {
+            position: DVec3::ZERO,
+            velocity: DVec3::new(0.0, 0.0, 0.2),
+            on_ground: true,
+            jump_delay: 0,
+        };
+        let input = MovementInput {
+            forward: 0.0,
+            right: 0.0,
+            yaw_degrees: 0.0,
+            jump: false,
+            sprinting: false,
+            using_item: false,
+            moving_slowly: false,
+        };
+        let mut stone = initial;
+        let mut ice = initial;
+        stone.tick(input, 0.6, |_, displacement, _| displacement);
+        ice.tick(input, 0.98, |_, displacement, _| displacement);
+        assert!(ice.velocity.z > stone.velocity.z);
+        let previous = stone.position.z;
+        stone.tick(
+            MovementInput {
+                forward: 0.0,
+                ..input
+            },
+            0.6,
+            |_, displacement, _| displacement,
+        );
+        assert!(stone.position.z > previous);
+    }
+
+    #[test]
+    fn sprint_starts_with_key_or_double_tap_and_stops_when_blocked() {
+        let mut sprint = SprintState {
+            pressed: true,
+            ..SprintState::default()
+        };
+        assert!(!sprint.update(0.0));
+        assert!(sprint.update(1.0));
+        sprint.pressed = false;
+        assert!(sprint.update(1.0));
+        sprint.after_move(true);
+        assert!(!sprint.update(1.0));
+        sprint.after_move(false);
+        assert!(!sprint.update(1.0));
+        sprint.pressed = true;
+        assert!(sprint.update(1.0));
+        assert!(!sprint.update(0.0));
+
+        let mut double_tap = SprintState::default();
+        assert!(!double_tap.update(1.0));
+        assert!(!double_tap.update(0.0));
+        assert!(double_tap.update(1.0));
+        assert!(!double_tap.update(-1.0));
+        assert!(!double_tap.update(1.0));
+
+        let mut expired = SprintState::default();
+        assert!(!expired.update(1.0));
+        for _ in 0..7 {
+            assert!(!expired.update(0.0));
+        }
+        assert!(!expired.update(1.0));
+    }
+
+    #[test]
+    fn glancing_collision_does_not_stop_sprint_but_head_on_collision_does() {
+        let state = MotionState {
+            position: DVec3::ZERO,
+            velocity: DVec3::new(0.1, 0.0, 0.0),
+            on_ground: true,
+            jump_delay: 0,
+        };
+        let input = MovementInput {
+            forward: 1.0,
+            right: 0.0,
+            yaw_degrees: 0.0,
+            jump: false,
+            sprinting: true,
+            using_item: false,
+            moving_slowly: false,
+        };
+        let mut glancing = state;
+        assert!(!glancing.tick(input, 0.6, |_, requested, _| DVec3::new(
+            0.0,
+            requested.y,
+            requested.z
+        )));
+        let mut head_on = state;
+        assert!(head_on.tick(input, 0.6, |_, requested, _| DVec3::new(
+            0.0,
+            requested.y,
+            0.0
+        )));
+    }
+
+    #[test]
+    fn edge_restraint_does_not_masquerade_as_a_wall_collision() {
+        let mut state = MotionState {
+            position: DVec3::ZERO,
+            velocity: DVec3::new(0.0, 0.0, 0.2),
+            on_ground: true,
+            jump_delay: 0,
+        };
+        let input = MovementInput {
+            forward: 1.0,
+            right: 0.0,
+            yaw_degrees: 0.0,
+            jump: false,
+            sprinting: false,
+            using_item: false,
+            moving_slowly: true,
+        };
+        let (collision, actual) = state.tick_resolved(input, 0.6, |_, requested, _| {
+            let adjusted = DVec3::new(requested.x, requested.y, 0.0);
+            (adjusted, adjusted)
+        });
+        assert!(!collision);
+        assert_eq!(actual.z, 0.0);
+        assert!(state.velocity.z > 0.0);
+    }
+}

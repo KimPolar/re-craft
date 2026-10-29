@@ -1,0 +1,6 @@
+/target/
+/.local/
+/worlds/
+logs/
+*.log
+

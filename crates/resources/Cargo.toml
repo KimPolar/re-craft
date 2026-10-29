@@ -1,0 +1,20 @@
+[package]
+name = "native-resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+image.workspace = true
+native-core = { path = "../core" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"
+

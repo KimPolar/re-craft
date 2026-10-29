@@ -4542,8 +4542,9 @@ impl LoadedSession {
         let camera_sprinting = self.sprint.active;
         self.apply_streaming();
         self.advance_soil_ticks();
-        self.advance_fluid_ticks();
+        // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
+        self.advance_fluid_ticks();
         self.advance_falling_sand();
         if self.death.is_some() {
             let requested = self
@@ -11106,6 +11107,38 @@ mod tests {
         assert!(
             matches!(session.simulation_cell(IVec3::new(9, 1, 8)), fluid_sim::Cell::Fluid(f) if f.falling)
         );
+    }
+
+    #[test]
+    fn falling_block_tick_precedes_fluid_tick_in_the_same_game_tick() {
+        let mut session = fluid_flow_session(FluidKind::Water, false);
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        let sand_pos = IVec3::new(9, 2, 8);
+        let water_pos = IVec3::new(8, 2, 8);
+        let sand = session.intern_block(state("minecraft:sand", &[]));
+        assert!(session.set(sand_pos, sand));
+        let fluid_sim::Cell::Fluid(water) = session.simulation_cell(water_pos) else {
+            panic!("missing water source");
+        };
+        session.sand_ticks.clear();
+        session.sand_pending.clear();
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.enqueue_saved_sand(&[SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: (session.origin + sand_pos).to_array(),
+            delay: 0,
+            priority: 0,
+        }]);
+        session.schedule_fluid(water_pos, water, 0);
+
+        session.update(TICK);
+
+        assert_eq!(session.falling_sand.len(), 1);
+        assert!(matches!(
+            session.simulation_cell(sand_pos),
+            fluid_sim::Cell::Fluid(fluid) if fluid.kind == FluidKind::Water
+        ));
     }
 
     #[test]

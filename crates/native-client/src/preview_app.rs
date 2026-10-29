@@ -1269,16 +1269,16 @@ impl ApplicationHandler for Viewer {
                 self.frame_pacer.set_limit(self.video.max_fps, now);
             }
             if let Some(play) = &mut self.play {
-                let yaw = delta.0 as f32 * 0.0025;
-                let pitch = -delta.1 as f32 * 0.0025;
+                let (yaw, pitch) = crate::mouse_look::look_delta(delta);
                 let snapshot = play.session.snapshot();
                 self.visual_look.turn(&snapshot, yaw, pitch);
                 (self.camera.yaw, self.camera.pitch) = self.visual_look.angles(&snapshot);
                 play.session
                     .submit_command(PlayerCommand::Look { yaw, pitch });
             } else {
-                self.camera.yaw += delta.0 as f32 * 0.0025;
-                self.camera.pitch = (self.camera.pitch - delta.1 as f32 * 0.0025)
+                let (yaw, pitch) = crate::mouse_look::look_delta(delta);
+                self.camera.yaw += yaw;
+                self.camera.pitch = (self.camera.pitch + pitch)
                     .clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH);
             }
         }

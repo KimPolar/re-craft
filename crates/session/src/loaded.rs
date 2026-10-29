@@ -29,8 +29,8 @@ use native_world::{
     fluid::{self, FluidKind, FluidState},
     fluid_sim,
     loaded::{
-        BLOCK_COUNT, BlockState, BlockStateId, ChunkPos, SavedBlockTick, SavedFluidTick, Section,
-        World,
+        BLOCK_COUNT, BlockPosition, BlockState, BlockStateId, ChunkPos, SavedBlockTick,
+        SavedFluidTick, Section, World,
     },
     movement::BoundingBox,
     raycast::{ShapeRayHit, raycast_shapes},
@@ -3328,6 +3328,10 @@ impl LoadedSession {
         if old == id {
             return false;
         }
+        let original_state = original.and_then(|old| self.world.state(old).cloned());
+        let Some(replacement_state) = self.world.state(id).cloned() else {
+            return false;
+        };
         let world = Arc::make_mut(&mut self.world);
         let chunk = world.chunks.get_mut(&chunk_pos).expect("chunk was checked");
         let chunk = Arc::make_mut(chunk);
@@ -3344,6 +3348,15 @@ impl LoadedSession {
             .blocks
             .get_or_insert_with(|| Box::new([self.states[0]; BLOCK_COUNT]));
         blocks[index] = id;
+        world.record_block_edit(
+            BlockPosition {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            },
+            original_state,
+            replacement_state,
+        );
         if let Some(mut maps) = self.spawn_heightmaps.remove(&chunk_pos) {
             let update = (|| -> anyhow::Result<()> {
                 use anyhow::Context;
@@ -8880,6 +8893,15 @@ mod tests {
         assert!(session.set(reverted, air));
         let draft = session.draft_changed_chunk(home, &source).unwrap();
         assert_eq!(draft.changed_blocks, 2);
+        assert_eq!(session.world.block_edits_in_chunk(home).count(), 2);
+        assert!(!session.world.block_edits().any(|edit| {
+            edit.position
+                == BlockPosition {
+                    x: session.origin.x + reverted.x,
+                    y: session.origin.y + reverted.y,
+                    z: session.origin.z + reverted.z,
+                }
+        }));
         assert!(draft.matches_source(&source).unwrap());
         assert_eq!(
             draft.document().value.get("unknown_chunk_data"),

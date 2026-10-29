@@ -128,7 +128,8 @@ impl BlockPosition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockEdit {
     pub position: BlockPosition,
-    pub original: BlockState,
+    /// None means the source section had no known block data.
+    pub original: Option<BlockState>,
     pub replacement: BlockState,
 }
 
@@ -225,6 +226,33 @@ impl World {
             .filter(move |edit| edit.position.chunk() == pos)
     }
 
+    /// Record a block mutation performed by a session that also updates chunk
+    /// data directly. The first source state remains authoritative across edits.
+    pub fn record_block_edit(
+        &mut self,
+        position: BlockPosition,
+        original: Option<BlockState>,
+        replacement: BlockState,
+    ) {
+        let block_edits = Arc::make_mut(&mut self.block_edits);
+        let original = block_edits
+            .get(&position)
+            .map(|edit| edit.original.clone())
+            .unwrap_or(original);
+        if original.as_ref() == Some(&replacement) {
+            block_edits.remove(&position);
+        } else {
+            block_edits.insert(
+                position,
+                BlockEdit {
+                    position,
+                    original,
+                    replacement,
+                },
+            );
+        }
+    }
+
     pub fn dirty_chunk_positions(&self) -> BTreeSet<ChunkPos> {
         self.block_edits
             .values()
@@ -273,7 +301,7 @@ impl World {
             let Some(source_state) = blocks.get(index).and_then(|id| source.state(*id)) else {
                 return Err(ChunkImportError::UnknownBlockState);
             };
-            if source_state != &edit.original && source_state != &edit.replacement {
+            if source_state != &edit.replacement && edit.original.as_ref() != Some(source_state) {
                 return Err(ChunkImportError::StaleBlockEdit);
             }
         }
@@ -419,7 +447,7 @@ impl World {
             .block_edits
             .get(&block_position)
             .map(|edit| edit.original.clone())
-            .unwrap_or(current);
+            .unwrap_or(Some(current));
         let chunk = Arc::make_mut(self.chunks.get_mut(&position).expect("chunk was checked"));
         let section = Arc::make_mut(
             chunk
@@ -428,19 +456,7 @@ impl World {
                 .expect("section was checked"),
         );
         section.blocks.as_mut().expect("block data was checked")[index] = state;
-        let block_edits = Arc::make_mut(&mut self.block_edits);
-        if replacement == original {
-            block_edits.remove(&block_position);
-        } else {
-            block_edits.insert(
-                block_position,
-                BlockEdit {
-                    position: block_position,
-                    original,
-                    replacement,
-                },
-            );
-        }
+        self.record_block_edit(block_position, original, replacement);
         Ok(true)
     }
 
@@ -695,7 +711,7 @@ mod tests {
         ));
         let edit = world.block_edits().next().unwrap();
         assert_eq!(edit.position, BlockPosition { x: -1, y: -1, z: 0 });
-        assert_eq!(edit.original, *world.state(air).unwrap());
+        assert_eq!(edit.original, Some(world.state(air).unwrap().clone()));
         assert_eq!(edit.replacement, *world.state(stone).unwrap());
         assert_eq!(world.dirty_chunk_positions(), BTreeSet::from([pos]));
         let edited_snapshot = world.clone();

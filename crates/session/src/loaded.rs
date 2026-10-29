@@ -1770,6 +1770,12 @@ impl LoadedSession {
             self.fluid_chunks_seen.contains(&pos),
             "chunk ticks have not been loaded"
         );
+        ensure!(
+            !self.soil_ticks.values().any(|(absolute, _)| {
+                absolute.x.div_euclid(16) == pos.x && absolute.z.div_euclid(16) == pos.z
+            }),
+            "chunk contains pending soil ticks that cannot be saved yet"
+        );
         if let Some(original) = self.world.saved_block_ticks.get(&pos) {
             ensure!(
                 original.iter().all(|tick| {
@@ -4264,6 +4270,7 @@ impl LoadedSession {
             let key = (self.tick.saturating_add(1), self.soil_tick_sequence);
             self.soil_tick_sequence = self.soil_tick_sequence.wrapping_add(1);
             self.soil_ticks.insert(key, (absolute, kind));
+            self.mark_tick_chunk_dirty(absolute.x, absolute.z);
         }
     }
 
@@ -9927,6 +9934,28 @@ mod tests {
                 );
                 assert_eq!(name_at(&old), name);
             }
+        }
+    }
+
+    #[test]
+    fn pending_soil_tick_marks_its_chunk_and_blocks_tick_drafting() {
+        for (name, properties) in [
+            ("minecraft:dirt_path", &[][..]),
+            ("minecraft:farmland", &[("moisture", "7")][..]),
+        ] {
+            let mut session = session();
+            let relative = IVec3::new(8, 2, 6);
+            let id = session.intern_block(state(name, properties));
+            assert!(session.set(relative, id));
+            assert!(session.set(relative + IVec3::Y, session.states[3]));
+            let chunk = session.player_chunk().unwrap();
+            session.dirty_chunks.clear();
+            assert!(session.dirty_chunk_positions().contains(&chunk));
+            assert!(session.draft_block_ticks(chunk).is_err());
+
+            session.tick = 1;
+            session.advance_soil_ticks();
+            assert!(session.draft_block_ticks(chunk).unwrap().is_empty());
         }
     }
 

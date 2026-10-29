@@ -194,6 +194,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     base_fov: f32,
     fov_modifier: f32,
+    view_yaw: f32,
     view_bobbing: bool,
     bob_transform: Mat4,
     depth: wgpu::TextureView,
@@ -337,6 +338,10 @@ impl Renderer {
         self.fov_modifier = modifier;
     }
 
+    pub fn set_view_yaw(&mut self, yaw: f32) {
+        self.view_yaw = yaw;
+    }
+
     pub fn set_view_bobbing(&mut self, enabled: bool) {
         self.view_bobbing = enabled;
     }
@@ -429,7 +434,7 @@ impl Renderer {
         let camera = CameraUniform {
             view_projection: (projection
                 * self.effective_bob()
-                * Mat4::look_to_rh(eye, direction, Vec3::Y))
+                * Mat4::look_to_rh(eye, direction, camera_up(direction, self.view_yaw)))
             .to_cols_array_2d(),
             viewport: [width as f32, height as f32],
             padding: [0.0; 2],
@@ -1154,6 +1159,7 @@ impl Renderer {
             config,
             base_fov: 70.0,
             fov_modifier: 1.0,
+            view_yaw: 0.0,
             view_bobbing: true,
             bob_transform: Mat4::IDENTITY,
             depth,
@@ -1560,7 +1566,15 @@ impl Renderer {
         partial: f32,
     ) -> Result<()> {
         if let Some(renderer) = &mut self.orb_renderer {
-            renderer.update(&self.device, &self.queue, orbs, origin, direction, partial)?;
+            renderer.update(
+                &self.device,
+                &self.queue,
+                orbs,
+                origin,
+                direction,
+                camera_up(direction, self.view_yaw),
+                partial,
+            )?;
         }
         Ok(())
     }
@@ -1885,7 +1899,7 @@ impl Renderer {
         let projection = perspective(self.base_fov * self.fov_modifier, aspect);
         // Java uses its separate 70-degree HUD FOV for the player's hands.
         let hand_projection = perspective(70.0, aspect);
-        let view = Mat4::look_to_rh(eye, direction, Vec3::Y);
+        let view = Mat4::look_to_rh(eye, direction, camera_up(direction, self.view_yaw));
         let camera = CameraUniform {
             view_projection: (projection * self.effective_bob() * view).to_cols_array_2d(),
             viewport: [self.config.width as f32, self.config.height as f32],
@@ -2068,6 +2082,18 @@ impl Renderer {
     }
 }
 
+/// At vertical pitch, world-up is parallel to the view direction. Use the
+/// player's horizontal heading to retain a stable right/up basis instead.
+pub(crate) fn camera_up(direction: Vec3, yaw: f32) -> Vec3 {
+    if direction.x * direction.x + direction.z * direction.z < 1.0e-8 {
+        Vec3::new(yaw.cos(), 0.0, yaw.sin())
+            .cross(direction)
+            .normalize_or_zero()
+    } else {
+        Vec3::Y
+    }
+}
+
 fn perspective(fov: f32, aspect: f32) -> Mat4 {
     // A 32-chunk square extends beyond 512 blocks along the diagonal.
     Mat4::perspective_rh(fov.to_radians(), aspect, 0.05, 1024.0)
@@ -2103,6 +2129,26 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vertical_view_keeps_a_finite_yaw_aligned_camera_basis() {
+        use glam::{Mat4, Vec3};
+        for yaw in [0.0_f32, 0.37, 1.57, 3.14, -1.25] {
+            for pitch in [-native_session::MAX_PITCH, native_session::MAX_PITCH] {
+                let direction = Vec3::new(
+                    yaw.sin() * pitch.cos(),
+                    pitch.sin(),
+                    -yaw.cos() * pitch.cos(),
+                );
+                let up = super::camera_up(direction, yaw);
+                let view = Mat4::look_to_rh(Vec3::ZERO, direction, up);
+                assert!(view.is_finite());
+                let right = direction.cross(up).normalize();
+                assert!(right.dot(Vec3::new(yaw.cos(), 0.0, yaw.sin())) > 0.99999);
+                assert!(up.dot(direction).abs() < 1.0e-6);
+            }
+        }
+        assert_eq!(super::camera_up(Vec3::NEG_Z, 0.0), Vec3::Y);
+    }
     #[test]
     fn translucent_buffer_checks_gpu_limit_and_integer_overflow() {
         let quad_bytes = 6 * std::mem::size_of::<crate::mesh::Vertex>();

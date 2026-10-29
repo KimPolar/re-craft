@@ -687,6 +687,9 @@ impl Viewer {
             }
         }
         let render_snapshot = self.play.as_ref().map(|play| play.session.snapshot());
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_view_yaw(self.camera.yaw);
+        }
         if let (Some(renderer), Some(play), Some(snapshot)) =
             (&mut self.renderer, &self.play, &render_snapshot)
         {
@@ -1275,8 +1278,8 @@ impl ApplicationHandler for Viewer {
                     .submit_command(PlayerCommand::Look { yaw, pitch });
             } else {
                 self.camera.yaw += delta.0 as f32 * 0.0025;
-                self.camera.pitch =
-                    (self.camera.pitch - delta.1 as f32 * 0.0025).clamp(-1.54, 1.54);
+                self.camera.pitch = (self.camera.pitch - delta.1 as f32 * 0.0025)
+                    .clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH);
             }
         }
     }
@@ -1505,6 +1508,38 @@ mod tests {
                         let pixels = chunked.as_chunks::<4>().0;
                         assert!(pixels.iter().any(|pixel| pixel != &pixels[0]));
                         if result.revision == 2 {
+                            // Looking vertically down must still render the block
+                            // under the camera, for every horizontal heading.
+                            for yaw in [0.0_f32, 1.1] {
+                                renderer.set_view_yaw(yaw);
+                                let direction = |pitch: f32| {
+                                    Vec3::new(
+                                        yaw.sin() * pitch.cos(),
+                                        pitch.sin(),
+                                        -yaw.cos() * pitch.cos(),
+                                    )
+                                };
+                                let eye = Vec3::new(8.5, 5.0, 8.5);
+                                let down = renderer
+                                    .preview_readback(
+                                        &self.scene,
+                                        eye,
+                                        direction(-native_session::MAX_PITCH),
+                                        true,
+                                    )
+                                    .unwrap();
+                                let up = renderer
+                                    .preview_readback(
+                                        &self.scene,
+                                        eye,
+                                        direction(native_session::MAX_PITCH),
+                                        true,
+                                    )
+                                    .unwrap();
+                                let center = (120 * 320 + 160) * 4;
+                                assert_ne!(&down[center..center + 4], &up[center..center + 4]);
+                            }
+                            renderer.set_view_yaw(0.0);
                             let original_lightmap = Arc::clone(&self.scene.lightmap);
                             let bake = |vertex: &mut crate::mesh::Vertex| {
                                 if vertex.light < 256 {

@@ -7,9 +7,15 @@ use native_session::{orbs::ExperienceOrb, physics::java_sin};
 
 use crate::{mesh::Vertex, renderer::VERTEX_ATTRIBUTES};
 
-fn vertices(orbs: &[ExperienceOrb], origin: IVec3, direction: Vec3, partial: f32) -> Vec<Vertex> {
+fn vertices(
+    orbs: &[ExperienceOrb],
+    origin: IVec3,
+    direction: Vec3,
+    camera_up: Vec3,
+    partial: f32,
+) -> Vec<Vertex> {
     let direction = direction.normalize_or_zero();
-    let right = direction.cross(Vec3::Y).normalize_or_zero();
+    let right = direction.cross(camera_up).normalize_or_zero();
     let up = right.cross(direction).normalize_or_zero();
     let mut vertices = Vec::with_capacity(orbs.len().saturating_mul(6));
     for orb in orbs {
@@ -175,9 +181,10 @@ impl OrbRenderer {
         orbs: &[ExperienceOrb],
         origin: IVec3,
         direction: Vec3,
+        camera_up: Vec3,
         partial: f32,
     ) -> Result<()> {
-        let vertices = vertices(orbs, origin, direction, partial);
+        let vertices = vertices(orbs, origin, direction, camera_up, partial);
         self.count = u32::try_from(vertices.len())?;
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.is_empty() {
@@ -231,11 +238,29 @@ mod tests {
             value: 73,
             age: 0,
         };
-        let vertices = vertices(&[orb], IVec3::ZERO, Vec3::NEG_Z, 0.5);
+        let vertices = vertices(&[orb], IVec3::ZERO, Vec3::NEG_Z, Vec3::Y, 0.5);
         assert_eq!(vertices.len(), 6);
         assert_eq!(vertices[0].uv, [0.25, 0.5]);
         assert!((vertices[0].position[0] - 2.85).abs() < 1e-6);
         assert!((vertices[0].position[1] - 4.025).abs() < 1e-6);
         assert_eq!(vertices[0].tint[1], 1.0);
+    }
+
+    #[test]
+    fn vertical_billboard_keeps_its_size_and_orientation() {
+        let orb = ExperienceOrb {
+            previous_position: glam::DVec3::ZERO,
+            position: glam::DVec3::ZERO,
+            value: 1,
+            age: 0,
+        };
+        for direction in [Vec3::Y, Vec3::NEG_Y] {
+            let yaw = 0.8_f32;
+            let up = crate::renderer::camera_up(direction, yaw);
+            let result = vertices(&[orb], IVec3::ZERO, direction, up, 0.0);
+            let edge = Vec3::from_array(result[1].position) - Vec3::from_array(result[0].position);
+            assert!((edge.length() - 0.3).abs() < 1e-6);
+            assert!(edge.normalize().dot(Vec3::new(yaw.cos(), 0.0, yaw.sin())) > 0.99999);
+        }
     }
 }

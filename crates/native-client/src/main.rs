@@ -708,7 +708,9 @@ fn prepare_existing_world(
                 (player.position[2] - f64::from(origin.z)) as f32,
             ),
             yaw: (player.yaw + 180.0).to_radians(),
-            pitch: (-player.pitch).to_radians().clamp(-1.54, 1.54),
+            pitch: (-player.pitch)
+                .to_radians()
+                .clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH),
         }
     } else {
         let mut surface = None;
@@ -1667,6 +1669,9 @@ impl App {
             }
         }
         let direction = self.visual_look.direction(&snapshot);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_view_yaw(self.visual_look.angles(&snapshot).0);
+        }
         if let Some(renderer) = &mut self.renderer
             && let Err(error) = renderer.render(&snapshot, self.session.partial_tick(), direction)
         {

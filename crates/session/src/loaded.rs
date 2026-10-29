@@ -563,7 +563,11 @@ impl LoadedSession {
             if self.player.yaw == (*source_yaw + 180.0).to_radians() {
                 yaw = *source_yaw;
             }
-            if self.player.pitch == (-*source_pitch).to_radians().clamp(-1.54, 1.54) {
+            if self.player.pitch
+                == (-*source_pitch)
+                    .to_radians()
+                    .clamp(-crate::MAX_PITCH, crate::MAX_PITCH)
+            {
                 pitch = *source_pitch;
             }
         }
@@ -2337,7 +2341,9 @@ impl LoadedSession {
         self.player = PlayerState {
             position: position.as_vec3(),
             yaw: (target.yaw + 180.0).to_radians(),
-            pitch: (-target.pitch).to_radians().clamp(-1.54, 1.54),
+            pitch: (-target.pitch)
+                .to_radians()
+                .clamp(-crate::MAX_PITCH, crate::MAX_PITCH),
             vertical_velocity: 0.0,
             on_ground: false,
             pose: PlayerPose::Standing,
@@ -4453,7 +4459,8 @@ impl LoadedSession {
                 PlayerCommand::Sneak(pressed) => self.sneak = pressed,
                 PlayerCommand::Look { yaw, pitch } if yaw.is_finite() && pitch.is_finite() => {
                     self.player.yaw += yaw;
-                    self.player.pitch = (self.player.pitch + pitch).clamp(-1.54, 1.54);
+                    self.player.pitch =
+                        (self.player.pitch + pitch).clamp(-crate::MAX_PITCH, crate::MAX_PITCH);
                 }
                 PlayerCommand::Look { .. } => {}
                 PlayerCommand::Select(block) => select_block(&mut self.inventory, block),
@@ -6143,6 +6150,23 @@ mod tests {
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn player_look_reaches_both_vertical_limits_and_recovers() {
+        let mut session = session();
+        for (delta, expected) in [
+            (2.0, crate::MAX_PITCH),
+            (-4.0, -crate::MAX_PITCH),
+            (0.1, -crate::MAX_PITCH + 0.1),
+        ] {
+            session.submit_command(PlayerCommand::Look {
+                yaw: 0.0,
+                pitch: delta,
+            });
+            session.update(TICK);
+            assert_eq!(session.snapshot().player.pitch, expected);
+        }
     }
 
     #[test]

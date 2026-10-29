@@ -273,6 +273,9 @@ pub struct SystemMessage {
     pub tick: u64,
 }
 
+/// Java clamps player pitch to 90 degrees in each direction.
+pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2;
+
 impl PlayerState {
     pub fn eye(self) -> Vec3 {
         self.position + Vec3::Y * self.pose.eye_height()
@@ -765,7 +768,8 @@ impl LocalSession {
                 PlayerCommand::Look { yaw, pitch } => {
                     if yaw.is_finite() && pitch.is_finite() {
                         self.player.yaw += yaw;
-                        self.player.pitch = (self.player.pitch + pitch).clamp(-1.54, 1.54);
+                        self.player.pitch =
+                            (self.player.pitch + pitch).clamp(-MAX_PITCH, MAX_PITCH);
                     }
                 }
                 PlayerCommand::Select(block) => select_block(&mut self.inventory, block),

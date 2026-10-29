@@ -427,8 +427,16 @@ mod tests {
                 value: 7,
                 age: 0,
             };
-            orbs.update(&device, &queue, &[orb], IVec3::ZERO, glam::Vec3::NEG_Z, 0.0)
-                .unwrap();
+            orbs.update(
+                &device,
+                &queue,
+                &[orb],
+                IVec3::ZERO,
+                glam::Vec3::NEG_Z,
+                glam::Vec3::Y,
+                0.0,
+            )
+            .unwrap();
             let glint_texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {

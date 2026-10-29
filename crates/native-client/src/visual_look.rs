@@ -23,7 +23,8 @@ impl VisualLook {
         self.synchronize(snapshot);
         if yaw.is_finite() && pitch.is_finite() {
             self.yaw += yaw;
-            self.pitch = (self.pitch + pitch).clamp(-1.54, 1.54);
+            self.pitch =
+                (self.pitch + pitch).clamp(-native_session::MAX_PITCH, native_session::MAX_PITCH);
         }
     }
 
@@ -65,5 +66,26 @@ mod tests {
         assert_eq!(look.direction(&after), after.player.direction());
         look.turn(&after, 0.3, f32::NAN);
         assert_eq!(look.angles(&after), predicted);
+    }
+
+    #[test]
+    fn vertical_look_is_visible_immediately_and_matches_the_demo_tick() {
+        let mut session = LocalSession::demo();
+        let mut look = VisualLook::default();
+        for (delta, expected) in [
+            (2.0, native_session::MAX_PITCH),
+            (-4.0, -native_session::MAX_PITCH),
+        ] {
+            let before = session.snapshot();
+            look.turn(&before, 0.0, delta);
+            session.submit_command(PlayerCommand::Look {
+                yaw: 0.0,
+                pitch: delta,
+            });
+            assert_eq!(look.angles(&before).1, expected);
+            session.update(Duration::from_millis(50));
+            assert_eq!(session.snapshot().player.pitch, expected);
+            assert_eq!(look.angles(&session.snapshot()).1, expected);
+        }
     }
 }

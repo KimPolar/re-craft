@@ -77,6 +77,16 @@ impl ChunkStreamer {
         self.radius
     }
 
+    pub fn set_radius(&mut self, radius: u32) {
+        let radius = radius.max(1);
+        if self.radius != radius {
+            self.radius = radius;
+            // Force the next service call to rebuild the worker window and
+            // update the session even when the player has not moved.
+            self.center = None;
+        }
+    }
+
     pub fn start(
         mut reader: WorldReader,
         defaults: Defaults,
@@ -693,6 +703,93 @@ mod tests {
             }),
         );
         world
+    }
+
+    #[test]
+    fn changing_radius_without_moving_loads_and_unloads_chunks() {
+        let home = ChunkPos { x: 0, z: 0 };
+        let far = ChunkPos { x: 2, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let mut streamer = ChunkStreamer::with_source(1, BTreeSet::new(), move |pos| {
+            Ok((pos == far).then(|| chunk_world(pos)))
+        })
+        .unwrap();
+        streamer.service(&mut session).unwrap();
+        session.update(Duration::from_millis(50));
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .chunks
+                .contains_key(&far)
+        );
+        streamer.set_radius(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session
+            .snapshot()
+            .world
+            .loaded()
+            .unwrap()
+            .chunks
+            .contains_key(&far)
+        {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "expanded window did not load the distant chunk"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        streamer.set_radius(1);
+        streamer.service(&mut session).unwrap();
+        session.update(Duration::from_millis(50));
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .chunks
+                .contains_key(&far)
+        );
+        streamer.set_radius(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session
+            .snapshot()
+            .world
+            .loaded()
+            .unwrap()
+            .chunks
+            .contains_key(&far)
+        {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "expanded window did not reload the distant chunk"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]

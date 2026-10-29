@@ -2039,7 +2039,8 @@ impl Renderer {
 }
 
 fn perspective(fov: f32, aspect: f32) -> Mat4 {
-    Mat4::perspective_rh(fov.to_radians(), aspect, 0.05, 512.0)
+    // A 32-chunk square extends beyond 512 blocks along the diagonal.
+    Mat4::perspective_rh(fov.to_radians(), aspect, 0.05, 1024.0)
 }
 
 fn strictly_far_to_near(centers: &[Vec3], eye: Vec3) -> bool {

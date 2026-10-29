@@ -144,6 +144,8 @@ impl SoundSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VideoSettings {
+    /// Render distance in chunks; Java's default is 12.
+    pub render_distance: u8,
     pub vsync: bool,
     /// 260 is the vanilla unlimited setting; lower values are frames per second.
     pub max_fps: u16,
@@ -179,6 +181,7 @@ impl InactivityFpsLimit {
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
+            render_distance: 12,
             vsync: true,
             max_fps: 120,
             fov: 70,
@@ -195,6 +198,11 @@ impl Default for VideoSettings {
 impl VideoSettings {
     fn valid(self) -> Self {
         Self {
+            render_distance: if (2..=32).contains(&self.render_distance) {
+                self.render_distance
+            } else {
+                12
+            },
             max_fps: if (10..=260).contains(&self.max_fps) {
                 self.max_fps
             } else {
@@ -310,6 +318,7 @@ mod tests {
             minecraft_dir: Some(PathBuf::from("game-folder")),
             resource_packs: vec![PathBuf::from("pack.zip")],
             video: VideoSettings {
+                render_distance: 24,
                 vsync: false,
                 max_fps: 260,
                 fov: 95,
@@ -368,6 +377,7 @@ mod tests {
         assert_eq!(old.sound, SoundSettings::default());
         assert_eq!(
             VideoSettings {
+                render_distance: 1,
                 vsync: false,
                 max_fps: 0,
                 fov: 111,

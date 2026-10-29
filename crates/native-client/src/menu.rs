@@ -67,6 +67,7 @@ enum ButtonId {
     VideoVsync,
     VideoInactivity,
     VideoBlur,
+    VideoDistance,
     Accessibility,
     ViewBobbing,
     GlintSpeed,
@@ -568,7 +569,11 @@ impl State {
         Ok(ViewOptions {
             dimension: (!self.dimension.trim().is_empty()).then_some(self.dimension.trim()),
             chunk,
-            radius,
+            radius: if play {
+                u32::from(self.video.render_distance)
+            } else {
+                radius
+            },
             smoke_test: false,
             block_report: None,
             play,
@@ -581,7 +586,7 @@ impl State {
         ViewOptions {
             dimension: None,
             chunk: None,
-            radius: 1,
+            radius: u32::from(self.video.render_distance),
             smoke_test: false,
             block_report: None,
             play,
@@ -1193,6 +1198,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoVsync => Some(VideoControl::Vsync),
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
+            ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -1473,6 +1479,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoFps, VideoControl::Framerate),
                     (ButtonId::VideoVsync, VideoControl::Vsync),
                     (ButtonId::VideoInactivity, VideoControl::Inactivity),
+                    (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
                 ] {
                     let rect = self.video_ui.control_rect(w, control);
@@ -1482,7 +1489,8 @@ impl<'a> Menu<'a> {
                         rect.y,
                         rect.w,
                         String::new(),
-                        id == ButtonId::VideoBlur || self.video_ui.visible(h, rect),
+                        matches!(id, ButtonId::VideoBlur | ButtonId::VideoDistance)
+                            || self.video_ui.visible(h, rect),
                     );
                 }
                 add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
@@ -1685,6 +1693,15 @@ impl<'a> Menu<'a> {
                     &mut self.state.video,
                 );
             }
+            ButtonId::VideoDistance => {
+                let (width, _) = self.logical_size();
+                self.video_ui.start_control_slider(
+                    width,
+                    self.cursor.0,
+                    VideoControl::RenderDistance,
+                    &mut self.state.video,
+                );
+            }
             ButtonId::Packs => {
                 self.state.refresh_packs();
                 self.state.screen = Screen::Packs;
@@ -1692,6 +1709,13 @@ impl<'a> Menu<'a> {
             #[cfg(debug_assertions)]
             ButtonId::WorldSettings => self.state.screen = Screen::WorldSettings,
             ButtonId::Done => {
+                if self.state.screen == Screen::Video {
+                    self.state.video_dirty |= self.video_ui.apply_pending_distance(
+                        &mut self.state.video,
+                        Instant::now(),
+                        true,
+                    );
+                }
                 if matches!(
                     self.state.screen,
                     Screen::Video | Screen::Options | Screen::Accessibility | Screen::Sound
@@ -1795,6 +1819,7 @@ impl<'a> Menu<'a> {
                 id,
                 ButtonId::VideoFps
                     | ButtonId::VideoBlur
+                    | ButtonId::VideoDistance
                     | ButtonId::VideoVsync
                     | ButtonId::VideoInactivity
                     | ButtonId::OptionsFov
@@ -2200,6 +2225,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoVsync) => Some(VideoControl::Vsync),
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
+                        Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
                         _ => None,
                     };
                     self.video_ui
@@ -2352,6 +2378,7 @@ impl<'a> Menu<'a> {
                         | ButtonId::VideoVsync
                         | ButtonId::VideoInactivity
                         | ButtonId::VideoBlur
+                        | ButtonId::VideoDistance
                         | ButtonId::ViewBobbing
                 )
             {
@@ -2615,6 +2642,7 @@ impl ApplicationHandler for Menu<'_> {
                             button.id,
                             ButtonId::VideoFps
                                 | ButtonId::VideoBlur
+                                | ButtonId::VideoDistance
                                 | ButtonId::OptionsFov
                                 | ButtonId::GlintSpeed
                                 | ButtonId::GlintStrength
@@ -2629,6 +2657,7 @@ impl ApplicationHandler for Menu<'_> {
                             button.id,
                             ButtonId::VideoFps
                                 | ButtonId::VideoBlur
+                                | ButtonId::VideoDistance
                                 | ButtonId::VideoVsync
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
@@ -2838,6 +2867,13 @@ impl ApplicationHandler for Menu<'_> {
                         .fov_ui
                         .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Video
+                    && self.focused == Some(ButtonId::VideoDistance)
+                    && self.video_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.video_ui
+                        .distance_arrow(code == Some(KeyCode::ArrowRight));
+                } else if self.state.screen == Screen::Video
                     && self.focused == Some(ButtonId::VideoBlur)
                     && self.video_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -2880,11 +2916,20 @@ impl ApplicationHandler for Menu<'_> {
                             .map_or(0, |i| (i + 1) % buttons.len());
                         self.focused = Some(buttons[next]);
                         if self.state.screen == Screen::Video
-                            && self.focused == Some(ButtonId::VideoBlur)
+                            && matches!(
+                                self.focused,
+                                Some(ButtonId::VideoBlur | ButtonId::VideoDistance)
+                            )
                         {
                             let (_, h) = self.logical_size();
-                            self.video_ui
-                                .ensure_control_visible(h, VideoControl::MenuBlur);
+                            self.video_ui.ensure_control_visible(
+                                h,
+                                if self.focused == Some(ButtonId::VideoBlur) {
+                                    VideoControl::MenuBlur
+                                } else {
+                                    VideoControl::RenderDistance
+                                },
+                            );
                         }
                         if self.state.screen == Screen::Accessibility
                             && let Some(control) =
@@ -2899,8 +2944,12 @@ impl ApplicationHandler for Menu<'_> {
                             let (_, h) = self.logical_size();
                             self.sound_ui.ensure_visible(h, category);
                         }
-                        self.video_ui.keyboard_adjust =
-                            matches!(self.focused, Some(ButtonId::VideoFps | ButtonId::VideoBlur));
+                        self.video_ui.keyboard_adjust = matches!(
+                            self.focused,
+                            Some(
+                                ButtonId::VideoFps | ButtonId::VideoBlur | ButtonId::VideoDistance
+                            )
+                        );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
                         self.accessibility_ui.keyboard_adjust = matches!(
                             self.focused,
@@ -2929,7 +2978,10 @@ impl ApplicationHandler for Menu<'_> {
                             self.sound_ui.keyboard_adjust = !self.sound_ui.keyboard_adjust;
                         } else if id == ButtonId::OptionsFov {
                             self.fov_ui.keyboard_adjust = !self.fov_ui.keyboard_adjust;
-                        } else if matches!(id, ButtonId::VideoFps | ButtonId::VideoBlur) {
+                        } else if matches!(
+                            id,
+                            ButtonId::VideoFps | ButtonId::VideoBlur | ButtonId::VideoDistance
+                        ) {
                             self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
                         } else if matches!(
                             id,
@@ -3007,6 +3059,11 @@ impl ApplicationHandler for Menu<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.screen == Screen::Video {
+            self.state.video_dirty |=
+                self.video_ui
+                    .apply_pending_distance(&mut self.state.video, Instant::now(), false);
+        }
         // An already requested close must win over a concurrently completed load.
         if self.action.is_some() {
             return;
@@ -4108,11 +4165,17 @@ mod tests {
                 let (_, height) = self.menu.logical_size();
                 self.menu
                     .video_ui
+                    .ensure_control_visible(height, VideoControl::RenderDistance);
+                click(&mut self.menu, event_loop, ButtonId::VideoDistance, true);
+                assert_eq!(self.menu.state.video.render_distance, 12);
+                self.menu
+                    .video_ui
                     .ensure_control_visible(height, VideoControl::MenuBlur);
                 click(&mut self.menu, event_loop, ButtonId::VideoBlur, true);
                 assert_eq!(self.menu.state.video.menu_blur, 10);
                 click(&mut self.menu, event_loop, ButtonId::Done, false);
                 assert_eq!(self.menu.state.screen, Screen::Options);
+                assert_eq!(self.menu.state.video.render_distance, 32);
                 assert!(!self.menu.state.video_dirty);
                 let path = self.menu.state.settings_path.as_ref().unwrap();
                 let loaded: Settings =

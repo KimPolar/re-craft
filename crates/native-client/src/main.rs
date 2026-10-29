@@ -670,7 +670,9 @@ fn prepare_existing_world(
             bail!("world has no saved player position and cannot yet be opened");
         }
     };
-    let area = reader.read_area(center, radius)?;
+    // Load only the immediate playable area before opening the window; the
+    // streamer fills the configured render distance in the background.
+    let area = reader.read_area(center, if play { radius.min(1) } else { radius })?;
     if area.chunks.is_empty() {
         bail!("no saved chunks found in the selected area");
     }
@@ -1611,6 +1613,10 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(ui) = &mut self.ui {
+            ui.advance_video_settings(Instant::now());
+        }
+        self.apply_video();
         #[cfg(debug_assertions)]
         let now = Instant::now();
         let snapshot = self.session.snapshot();

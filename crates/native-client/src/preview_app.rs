@@ -311,12 +311,22 @@ struct Viewer {
 
 impl Viewer {
     fn apply_video(&mut self) {
+        if let Some(ui) = &mut self.ui {
+            ui.advance_video_settings(Instant::now());
+        }
+        let old_distance = self.video.render_distance;
         crate::apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
             &mut self.frame_pacer,
             self.renderer.as_mut(),
         );
+        if old_distance != self.video.render_distance
+            && let Some(play) = &mut self.play
+        {
+            play.streamer
+                .set_radius(u32::from(self.video.render_distance));
+        }
     }
 
     fn pause_action(&mut self, action: PauseAction, event_loop: &ActiveEventLoop) {
@@ -501,6 +511,7 @@ impl Viewer {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        self.apply_video();
         let now = Instant::now();
         if let Some(play) = &self.play {
             let snapshot = play.session.snapshot();

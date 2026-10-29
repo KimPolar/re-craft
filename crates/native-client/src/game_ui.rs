@@ -64,6 +64,7 @@ enum PauseButton {
     PanoramaSpeed,
     MenuBlur,
     VideoBlur,
+    VideoDistance,
 }
 
 impl PauseButton {
@@ -250,6 +251,17 @@ impl GameUi {
 
     pub fn video_settings(&self) -> VideoSettings {
         self.video
+    }
+
+    pub fn advance_video_settings(&mut self, now: std::time::Instant) {
+        if self.pause_page == PausePage::Video
+            && self
+                .video_ui
+                .apply_pending_distance(&mut self.video, now, false)
+        {
+            self.video_dirty = true;
+            self.last_draw = None;
+        }
     }
 
     pub fn sound_settings(&self) -> SoundSettings {
@@ -516,6 +528,7 @@ impl GameUi {
                             VideoControl::Vsync => PauseButton::Vsync,
                             VideoControl::Inactivity => PauseButton::Inactivity,
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
+                            VideoControl::RenderDistance => PauseButton::VideoDistance,
                         })
                 }
             }
@@ -644,6 +657,20 @@ impl GameUi {
                 }
                 PauseAction::None
             }
+            PauseButton::VideoDistance => {
+                if mouse {
+                    let (width, _) = self.logical_size();
+                    self.video_ui.start_control_slider(
+                        width,
+                        self.cursor.0,
+                        VideoControl::RenderDistance,
+                        &mut self.video,
+                    );
+                } else {
+                    self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
+                }
+                PauseAction::None
+            }
             PauseButton::Fov => {
                 if mouse {
                     let (w, _) = self.logical_size();
@@ -683,6 +710,7 @@ impl GameUi {
             PauseButton::Fov
                 | PauseButton::Framerate
                 | PauseButton::VideoBlur
+                | PauseButton::VideoDistance
                 | PauseButton::GlintSpeed
                 | PauseButton::GlintStrength
                 | PauseButton::PanoramaSpeed
@@ -747,6 +775,7 @@ impl GameUi {
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
+                    Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     _ => None,
                 };
                 if focused_control.is_some_and(|control| {
@@ -787,6 +816,11 @@ impl GameUi {
                 }
             }
             PausePage::Video => {
+                self.video_dirty |= self.video_ui.apply_pending_distance(
+                    &mut self.video,
+                    std::time::Instant::now(),
+                    true,
+                );
                 self.video_ui.release(self.video);
                 self.video_ui.keyboard_adjust = false;
                 self.pause_page = PausePage::Options;
@@ -847,6 +881,7 @@ impl GameUi {
                     {
                         buttons.push(PauseButton::Inactivity);
                     }
+                    buttons.push(PauseButton::VideoDistance);
                     buttons.push(PauseButton::VideoBlur);
                     buttons.push(PauseButton::Done);
                     buttons
@@ -871,11 +906,20 @@ impl GameUi {
             };
             self.pause_focus = Some(buttons[index]);
             if self.pause_page == PausePage::Video
-                && self.pause_focus == Some(PauseButton::VideoBlur)
+                && matches!(
+                    self.pause_focus,
+                    Some(PauseButton::VideoBlur | PauseButton::VideoDistance)
+                )
             {
                 let (_, h) = self.logical_size();
-                self.video_ui
-                    .ensure_control_visible(h, VideoControl::MenuBlur);
+                self.video_ui.ensure_control_visible(
+                    h,
+                    if self.pause_focus == Some(PauseButton::VideoBlur) {
+                        VideoControl::MenuBlur
+                    } else {
+                        VideoControl::RenderDistance
+                    },
+                );
             }
             if self.pause_page == PausePage::Accessibility
                 && let Some(control) = self
@@ -923,6 +967,13 @@ impl GameUi {
             self.video_dirty |= self
                 .fov_ui
                 .arrow(key == KeyCode::ArrowRight, &mut self.video);
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Video
+            && self.pause_focus == Some(PauseButton::VideoDistance)
+            && self.video_ui.keyboard_adjust
+            && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
+        {
+            self.video_ui.distance_arrow(key == KeyCode::ArrowRight);
             self.last_draw = None;
         } else if self.pause_page == PausePage::Video
             && self.pause_focus == Some(PauseButton::VideoBlur)
@@ -1867,6 +1918,7 @@ impl GameUi {
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
+                    Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     _ => None,
                 };
                 self.video_ui
@@ -2994,6 +3046,20 @@ mod inventory_tests {
         ui.pause_release();
         assert_eq!(ui.video_settings().max_fps, 260);
         assert!(ui.video_needs_save());
+        ui.video_ui
+            .ensure_control_visible(h, VideoControl::RenderDistance);
+        let rect = ui.video_ui.control_rect(w, VideoControl::RenderDistance);
+        ui.cursor_moved(
+            f64::from(rect.x + rect.w - 4) * scale,
+            f64::from(rect.y + 10) * scale,
+        );
+        ui.click();
+        ui.pause_release();
+        assert_eq!(ui.video_settings().render_distance, 12);
+        ui.advance_video_settings(
+            std::time::Instant::now() + std::time::Duration::from_millis(601),
+        );
+        assert_eq!(ui.video_settings().render_distance, 32);
 
         assert_eq!(ui.pause_key(KeyCode::Escape, false), PauseAction::SaveVideo);
         assert!(ui.paused());
@@ -3065,6 +3131,14 @@ mod inventory_tests {
         assert_eq!(ui.video_settings().max_fps, 250);
         ui.pause_scroll(-100.0);
         assert_eq!(ui.pause_focus, None);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::VideoDistance));
+        ui.pause_key(KeyCode::Enter, false);
+        ui.pause_key(KeyCode::ArrowLeft, false);
+        ui.advance_video_settings(
+            std::time::Instant::now() + std::time::Duration::from_millis(601),
+        );
+        assert_eq!(ui.video_settings().render_distance, 31);
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::VideoBlur));
         ui.pause_key(KeyCode::Enter, false);

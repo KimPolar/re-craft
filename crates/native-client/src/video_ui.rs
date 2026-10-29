@@ -4,6 +4,7 @@ use crate::{
     menu_draw::{Canvas, Rect},
     menu_settings::{InactivityFpsLimit, VideoSettings},
 };
+use std::time::{Duration, Instant};
 
 const TOP: i32 = 33;
 const FOOTER: i32 = 33;
@@ -15,6 +16,7 @@ pub enum VideoControl {
     Vsync,
     Inactivity,
     MenuBlur,
+    RenderDistance,
 }
 
 #[derive(Clone, Copy)]
@@ -133,11 +135,31 @@ pub fn slider_from_fps(fps: u16) -> f64 {
     }
 }
 
+pub fn distance_from_slider(value: f64) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let value = if value >= 1.0 {
+        f64::from(0.99999_f32)
+    } else {
+        value
+    };
+    2 + (value * 31.0).floor() as u8
+}
+
+pub fn slider_from_distance(value: u8) -> f64 {
+    match value.clamp(2, 32) {
+        2 => 0.0,
+        32 => 1.0,
+        value => (f64::from(value - 2) + 0.5) / 31.0,
+    }
+}
+
 pub struct VideoUi {
     scroll: f64,
     slider: f64,
     dragging_slider: Option<VideoControl>,
     blur_slider: f64,
+    distance_slider: f64,
+    distance_pending: Option<Instant>,
     dragging_scrollbar: Option<i32>,
     pub keyboard_adjust: bool,
 }
@@ -149,6 +171,8 @@ impl VideoUi {
             slider: slider_from_fps(video.max_fps),
             dragging_slider: None,
             blur_slider: crate::blur_ui::to_slider(video.menu_blur),
+            distance_slider: slider_from_distance(video.render_distance),
+            distance_pending: None,
             dragging_scrollbar: None,
             keyboard_adjust: false,
         }
@@ -163,7 +187,7 @@ impl VideoUi {
     pub fn control_rect(&self, width: i32, control: VideoControl) -> Rect {
         Rect {
             x: width / 2
-                + if control == VideoControl::Vsync {
+                + if matches!(control, VideoControl::Vsync | VideoControl::RenderDistance) {
                     5
                 } else {
                     -155
@@ -171,6 +195,7 @@ impl VideoUi {
             y: match control {
                 VideoControl::Inactivity => 105,
                 VideoControl::MenuBlur => 366,
+                VideoControl::RenderDistance => 241,
                 _ => 80,
             } - self.scroll as i32,
             w: 150,
@@ -189,6 +214,7 @@ impl VideoUi {
             VideoControl::Vsync,
             VideoControl::Inactivity,
             VideoControl::MenuBlur,
+            VideoControl::RenderDistance,
         ]
         .into_iter()
         .find(|control| {
@@ -227,6 +253,11 @@ impl VideoUi {
     ) -> bool {
         let rect = self.control_rect(width, control);
         let value = (f64::from(x - rect.x - 4) / f64::from(rect.w - 8)).clamp(0.0, 1.0);
+        if control == VideoControl::RenderDistance {
+            self.distance_slider = value;
+            self.distance_pending = Some(Instant::now() + Duration::from_millis(600));
+            return false;
+        }
         if control == VideoControl::MenuBlur {
             self.blur_slider = value;
             let next = crate::blur_ui::from_slider(value);
@@ -250,6 +281,36 @@ impl VideoUi {
         video.menu_blur = next;
         self.blur_slider = crate::blur_ui::to_slider(next);
         changed
+    }
+
+    pub fn distance_arrow(&mut self, right: bool) {
+        let current = distance_from_slider(self.distance_slider);
+        let next = if right {
+            current.saturating_add(1).min(32)
+        } else {
+            current.saturating_sub(1).max(2)
+        };
+        self.distance_slider = slider_from_distance(next);
+        self.distance_pending = Some(Instant::now() + Duration::from_millis(600));
+    }
+
+    pub fn apply_pending_distance(
+        &mut self,
+        video: &mut VideoSettings,
+        now: Instant,
+        force: bool,
+    ) -> bool {
+        if self
+            .distance_pending
+            .is_some_and(|deadline| force || now >= deadline)
+        {
+            self.distance_pending = None;
+            let next = distance_from_slider(self.distance_slider);
+            let changed = video.render_distance != next;
+            video.render_distance = next;
+            return changed;
+        }
+        false
     }
 
     pub fn ensure_control_visible(&mut self, height: i32, control: VideoControl) {
@@ -401,6 +462,51 @@ impl VideoUi {
                                 slider,
                                 hovered || focused == Some(VideoControl::MenuBlur),
                             );
+                        } else if label.key == "options.renderDistance" {
+                            let highlighted =
+                                hovered || focused == Some(VideoControl::RenderDistance);
+                            let background = if highlighted {
+                                &assets.slider_highlighted
+                            } else {
+                                &assets.slider
+                            };
+                            let handle = if highlighted {
+                                &assets.slider_handle_highlighted
+                            } else {
+                                &assets.slider_handle
+                            };
+                            list.gui_sprite(&background.image, rect, background.scaling);
+                            list.gui_sprite(
+                                &handle.image,
+                                Rect {
+                                    x: rect.x
+                                        + (self.distance_slider * f64::from(rect.w - 8)) as i32,
+                                    y: rect.y,
+                                    w: 8,
+                                    h: 20,
+                                },
+                                handle.scaling,
+                            );
+                            let value = assets.translate("options.chunks", "%s Chunks").replacen(
+                                "%s",
+                                &distance_from_slider(self.distance_slider).to_string(),
+                                1,
+                            );
+                            let format = assets.translate("options.generic_value", "%s: %s");
+                            let text = if format.contains("%1$s") || format.contains("%2$s") {
+                                format.replace("%1$s", tr(label)).replace("%2$s", &value)
+                            } else {
+                                format
+                                    .replacen("%s", tr(label), 1)
+                                    .replacen("%s", &value, 1)
+                            };
+                            list.text_centered(
+                                Some(assets),
+                                rect.x + rect.w / 2,
+                                rect.y + 6,
+                                &text,
+                                [255, 255, 255],
+                            );
                         } else if label.key == "options.framerateLimit" {
                             let highlighted = hovered || focused == Some(VideoControl::Framerate);
                             let background = if highlighted {
@@ -523,6 +629,36 @@ impl VideoUi {
 mod tests {
     use super::*;
     #[test]
+    fn render_distance_slider_delays_application_and_preserves_keyboard_steps() {
+        let mut video = VideoSettings::default();
+        let mut ui = VideoUi::new(video);
+        assert_eq!(
+            ui.control_rect(426, VideoControl::RenderDistance),
+            Rect {
+                x: 218,
+                y: 241,
+                w: 150,
+                h: 20
+            }
+        );
+        for distance in 2..=32 {
+            assert_eq!(
+                distance_from_slider(slider_from_distance(distance)),
+                distance
+            );
+        }
+        assert!(!ui.start_control_slider(426, 364, VideoControl::RenderDistance, &mut video));
+        assert_eq!(video.render_distance, 12);
+        let deadline = ui.distance_pending.unwrap();
+        assert!(!ui.apply_pending_distance(&mut video, deadline - Duration::from_millis(1), false));
+        assert!(ui.apply_pending_distance(&mut video, deadline, false));
+        assert_eq!(video.render_distance, 32);
+        ui.release(video);
+        ui.distance_arrow(false);
+        assert!(ui.apply_pending_distance(&mut video, Instant::now(), true));
+        assert_eq!(video.render_distance, 31);
+    }
+    #[test]
     fn slider_endpoints_and_quantized_values_follow_java_range() {
         assert_eq!(fps_from_slider(0.0), 10);
         assert_eq!(fps_from_slider(1.0), 260);
@@ -643,6 +779,9 @@ public class VideoSliderOracle {
         var blur = new OptionInstance.IntRange(0, 10);
         for (int i=0; i<=10000; i++) System.out.println(blur.fromSliderValue(i/10000.0));
         for (int i=0; i<=10; i++) System.out.println(blur.toSliderValue(i));
+        var distance = new OptionInstance.IntRange(2, 32, false);
+        for (int i=0; i<=10000; i++) System.out.println(distance.fromSliderValue(i/10000.0));
+        for (int i=2; i<=32; i++) System.out.println(distance.toSliderValue(i));
         try {
             var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
             var unsafe=(sun.misc.Unsafe)unsafeField.get(null);
@@ -812,6 +951,22 @@ public class VideoSliderOracle {
                 crate::blur_ui::to_slider(value),
                 expected,
                 "blur value {value}"
+            );
+        }
+        for i in 0..=10000 {
+            let expected: u8 = lines.next().unwrap().parse().unwrap();
+            assert_eq!(
+                distance_from_slider(f64::from(i) / 10000.0),
+                expected,
+                "render distance sample {i}"
+            );
+        }
+        for value in 2..=32 {
+            let expected: f64 = lines.next().unwrap().parse().unwrap();
+            assert_eq!(
+                slider_from_distance(value),
+                expected,
+                "render distance {value}"
             );
         }
         for width in [320, 426, 640] {

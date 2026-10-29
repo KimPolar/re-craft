@@ -1825,14 +1825,19 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     let snapshot = self.session.snapshot();
-                    if self.captured
-                        && snapshot.death.is_none()
-                        && !snapshot.inventory.is_open()
-                        && let Some(slot) = self
+                    if self.captured && snapshot.death.is_none() && !snapshot.inventory.is_open() {
+                        if snapshot.game_mode == native_session::GameMode::Spectator {
+                            let (_, vertical) = self.hotbar_scroll.steps(amount);
+                            if vertical != 0 {
+                                self.session
+                                    .submit_command(PlayerCommand::AdjustFlightSpeed(vertical));
+                            }
+                        } else if let Some(slot) = self
                             .hotbar_scroll
                             .select(amount, snapshot.inventory.selected())
-                    {
-                        self.session.submit_command(PlayerCommand::SelectSlot(slot));
+                        {
+                            self.session.submit_command(PlayerCommand::SelectSlot(slot));
+                        }
                     }
                 }
             }

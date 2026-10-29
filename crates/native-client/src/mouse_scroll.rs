@@ -35,17 +35,23 @@ impl HotbarScroll {
     /// opposite-direction fractions are discarded and positive scroll moves
     /// toward the preceding slot.
     pub fn select(&mut self, delta: (f64, f64), selected: u8) -> Option<u8> {
+        let (steps_x, steps_y) = self.steps(delta);
+        let steps = if steps_y != 0 { steps_y } else { -steps_x };
+        if steps == 0 {
+            return None;
+        }
+        Some((i32::from(selected) - steps).rem_euclid(9) as u8)
+    }
+
+    /// Consume both accumulated axes, including horizontal spectator input.
+    pub fn steps(&mut self, delta: (f64, f64)) -> (i32, i32) {
         self.remainder_x = accumulate_axis(self.remainder_x, delta.0);
         self.remainder_y = accumulate_axis(self.remainder_y, delta.1);
         let steps_x = self.remainder_x.trunc() as i32;
         let steps_y = self.remainder_y.trunc() as i32;
         self.remainder_x -= f64::from(steps_x);
         self.remainder_y -= f64::from(steps_y);
-        let steps = if steps_y != 0 { steps_y } else { -steps_x };
-        if steps == 0 {
-            return None;
-        }
-        Some((i32::from(selected) - steps).rem_euclid(9) as u8)
+        (steps_x, steps_y)
     }
 
     #[cfg(test)]
@@ -117,6 +123,15 @@ mod tests {
     }
 
     #[test]
+    fn spectator_wheel_uses_only_vertical_steps_and_consumes_horizontal() {
+        let mut scroll = HotbarScroll::default();
+        assert_eq!(scroll.steps((1.2, 0.4)), (1, 0));
+        assert_eq!(scroll.steps((0.0, 0.7)), (0, 1));
+        assert_eq!(scroll.steps((-0.4, -0.2)), (0, 0));
+        assert_eq!(scroll.steps((-0.7, -0.8)), (-1, -1));
+    }
+
+    #[test]
     fn opposite_direction_resets_the_pending_fraction_and_horizontal_scroll_works() {
         let mut scroll = HotbarScroll::default();
         assert_eq!(scroll.select((0.7, 0.0), 4), None);
@@ -133,15 +148,19 @@ mod tests {
         const JAVA: &str = r#"
 import java.nio.file.*;
 import net.minecraft.client.ScrollWheelHandler;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Abilities;
 import org.joml.Vector2i;
 public class ScrollWheelOracle {
   public static void main(String[] args) throws Exception {
     var handler = new ScrollWheelHandler();
+    var abilities = new Abilities();
     var result = new StringBuilder();
     for (String line : Files.readAllLines(Path.of(args[0]))) {
       String[] parts = line.split(" ");
       Vector2i step = handler.onMouseScroll(Double.parseDouble(parts[0]), Double.parseDouble(parts[1]));
-      result.append(step.x).append(' ').append(step.y).append('\n');
+      if (step.x != 0 || step.y != 0) abilities.setFlyingSpeed(Mth.clamp(abilities.getFlyingSpeed() + (float)step.y * 0.005f, 0.0f, 0.2f));
+      result.append(step.x).append(' ').append(step.y).append(' ').append(Float.floatToRawIntBits(abilities.getFlyingSpeed())).append('\n');
     }
     Files.writeString(Path.of(args[1]), result);
   }
@@ -227,18 +246,31 @@ public class ScrollWheelOracle {
             .arg("ScrollWheelOracle")
             .arg(&input)
             .arg(&output));
-        let java_steps: Vec<(i32, i32)> = std::fs::read_to_string(output)
+        let java_steps: Vec<(i32, i32, i32)> = std::fs::read_to_string(output)
             .unwrap()
             .lines()
             .map(|line| {
                 let mut values = line.split_whitespace().map(|v| v.parse::<i32>().unwrap());
-                (values.next().unwrap(), values.next().unwrap())
+                (
+                    values.next().unwrap(),
+                    values.next().unwrap(),
+                    values.next().unwrap(),
+                )
             })
             .collect();
         assert_eq!(java_steps.len(), deltas.len());
         let mut selected = 4_u8;
         let mut scroll = HotbarScroll::default();
-        for ((delta_x, delta_y), (steps_x, steps_y)) in deltas.into_iter().zip(java_steps) {
+        let mut flight_scroll = HotbarScroll::default();
+        let mut flight_speed = 0.05_f32;
+        for ((delta_x, delta_y), (steps_x, steps_y, speed_bits)) in
+            deltas.into_iter().zip(java_steps)
+        {
+            assert_eq!(flight_scroll.steps((delta_x, delta_y)), (steps_x, steps_y));
+            if steps_y != 0 {
+                flight_speed = native_session::physics::adjust_flight_speed(flight_speed, steps_y);
+            }
+            assert_eq!(flight_speed.to_bits(), speed_bits as u32);
             let expected_steps = if steps_y != 0 { steps_y } else { -steps_x };
             let expected = (expected_steps != 0)
                 .then(|| (i32::from(selected) - expected_steps).rem_euclid(9) as u8);

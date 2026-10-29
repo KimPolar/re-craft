@@ -37,6 +37,11 @@ pub struct FluidMovement {
     pub fluid_above: bool,
 }
 
+/// Minecraft applies the accumulated vertical wheel count in float precision.
+pub fn adjust_flight_speed(speed: f32, steps: i32) -> f32 {
+    (speed + steps as f32 * 0.005_f32).clamp(0.0, 0.2)
+}
+
 /// The modified friction returned by 26.3 for the supported vanilla blocks.
 pub fn ground_friction(block: &str) -> f32 {
     match block {
@@ -49,9 +54,14 @@ pub fn ground_friction(block: &str) -> f32 {
 
 impl MotionState {
     /// Default spectator flight in air, with the player's no-physics movement.
-    pub fn tick_spectator(&mut self, input: MovementInput, descend: bool) -> DVec3 {
+    pub fn tick_spectator(
+        &mut self,
+        input: MovementInput,
+        descend: bool,
+        flight_speed: f32,
+    ) -> DVec3 {
         let vertical = i32::from(input.jump) - i32::from(descend);
-        self.velocity.y += f64::from(vertical as f32 * 0.05_f32 * 3.0_f32);
+        self.velocity.y += f64::from(vertical as f32 * flight_speed * 3.0_f32);
         if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
             self.velocity.x = 0.0;
             self.velocity.z = 0.0;
@@ -63,9 +73,9 @@ impl MotionState {
         let sine = f64::from(java_sin(f64::from(radians), false));
         let cosine = f64::from(java_sin(f64::from(radians), true));
         let speed = if input.sprinting {
-            0.05_f32 * 2.0
+            flight_speed * 2.0
         } else {
-            0.05_f32
+            flight_speed
         };
         let (left, forward) = keyboard_input(-input.right, input.forward, false, input.using_item);
         let x = f64::from(left) * f64::from(speed);

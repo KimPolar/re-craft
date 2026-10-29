@@ -251,6 +251,7 @@ fn spectator_flight_matches_vanilla_air_movement() {
                 moving_slowly: false,
             },
             row["down"].as_bool().unwrap(),
+            row["speed"].as_f64().unwrap() as f32,
         );
         let expected_position = vec(&row["position"]);
         let expected_velocity = vec(&row["velocity"]);

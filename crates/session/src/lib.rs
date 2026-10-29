@@ -109,6 +109,8 @@ pub enum PlayerCommand {
     },
     Select(Block),
     SelectSlot(u8),
+    /// Apply accumulated vertical wheel steps to spectator flight speed.
+    AdjustFlightSpeed(i32),
     ToggleInventory,
     InventoryClick {
         slot: PlayerSlot,
@@ -364,6 +366,7 @@ pub struct LocalSession {
     experience_orbs: orbs::Orbs,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
+    flight_speed: f32,
     game_mode: GameMode,
     vitals: survival::PlayerVitals,
     experience: experience::Experience,
@@ -449,6 +452,7 @@ impl LocalSession {
             experience_orbs: orbs::Orbs::default(),
             player_random: native_core::random::LegacyRandom::new(0),
             level_random: native_core::random::LegacyRandom::new(0),
+            flight_speed: 0.05,
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
             experience: experience::Experience::default(),
@@ -802,6 +806,11 @@ impl LocalSession {
                 PlayerCommand::SelectSlot(slot) => {
                     Arc::make_mut(&mut self.inventory).select(slot);
                 }
+                PlayerCommand::AdjustFlightSpeed(steps) => {
+                    if self.game_mode == GameMode::Spectator {
+                        self.flight_speed = physics::adjust_flight_speed(self.flight_speed, steps);
+                    }
+                }
                 PlayerCommand::ToggleInventory => {
                     self.mining.release();
                     self.food_use.cancel();
@@ -1103,7 +1112,11 @@ impl LocalSession {
         }
         let before_move = self.motion.position;
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
-            (false, self.motion.tick_spectator(input, self.sneak))
+            (
+                false,
+                self.motion
+                    .tick_spectator(input, self.sneak, self.flight_speed),
+            )
         } else {
             self.motion
                 .tick_resolved(input, 0.6, |position, requested, on_ground| {
@@ -2298,6 +2311,35 @@ mod tests {
                 assert_eq!(before.world.demo().unwrap().block(position), soil);
             }
         }
+    }
+
+    #[test]
+    fn demo_spectator_wheel_changes_flight_on_the_next_tick() {
+        let mut session = LocalSession::demo();
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(10));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.05);
+        session.set_game_mode(GameMode::Spectator);
+        session.motion.position = DVec3::new(0.0, 10.0, 0.0);
+        session.motion.velocity = DVec3::ZERO;
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(10));
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        session.update(TICK);
+        let expected_speed = 0.05_f32 + 10.0_f32 * 0.005_f32;
+        assert_eq!(session.flight_speed, expected_speed);
+        assert!(
+            (session.motion.position.y - (10.0 + f64::from(expected_speed * 3.0))).abs() < 1e-12
+        );
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(-100));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.0);
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(100));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.2);
     }
 
     #[test]

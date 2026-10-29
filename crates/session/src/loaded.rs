@@ -155,6 +155,7 @@ pub struct LoadedSession {
     oxygen_valid: bool,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
+    flight_speed: f32,
     food_use: crate::survival::FoodUse,
     mining: mining::Mining,
     first_person: crate::animation::FirstPersonState,
@@ -1060,6 +1061,7 @@ impl LoadedSession {
             oxygen_valid: true,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            flight_speed: 0.05,
             food_use: crate::survival::FoodUse::default(),
             mining: mining::Mining::default(),
             first_person: crate::animation::FirstPersonState::default(),
@@ -4891,6 +4893,12 @@ impl LoadedSession {
                 PlayerCommand::SelectSlot(slot) => {
                     Arc::make_mut(&mut self.inventory).select(slot);
                 }
+                PlayerCommand::AdjustFlightSpeed(steps) => {
+                    if self.game_mode == GameMode::Spectator {
+                        self.flight_speed =
+                            crate::physics::adjust_flight_speed(self.flight_speed, steps);
+                    }
+                }
                 PlayerCommand::ToggleInventory => {
                     self.mining.release();
                     self.food_use.cancel();
@@ -5355,7 +5363,11 @@ impl LoadedSession {
         }
         let before_move = self.motion.position;
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
-            (false, self.motion.tick_spectator(input, self.sneak))
+            (
+                false,
+                self.motion
+                    .tick_spectator(input, self.sneak, self.flight_speed),
+            )
         } else if let Some((kind, depth)) = liquid {
             let above = (self.motion.position + DVec3::Y * 0.9).floor().as_ivec3();
             let movement = crate::physics::FluidMovement {
@@ -9198,6 +9210,32 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn spectator_wheel_changes_flight_speed_before_movement() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(10));
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        session.update(TICK);
+        let expected_speed = 0.05_f32 + 10.0_f32 * 0.005_f32;
+        assert_eq!(session.flight_speed, expected_speed);
+        assert!(
+            (session.motion.position.y - (10.0 + f64::from(expected_speed * 3.0))).abs() < 1e-12
+        );
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(-100));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.0);
+        session.submit_command(PlayerCommand::AdjustFlightSpeed(100));
+        session.update(TICK);
+        assert_eq!(session.flight_speed, 0.2);
     }
 
     #[test]

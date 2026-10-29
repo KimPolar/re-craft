@@ -68,6 +68,7 @@ public class SpectatorFlightOracle {
         Method modify = LocalPlayer.class.getDeclaredMethod("modifyInput", Vec2.class); modify.setAccessible(true);
         var rows = new JsonArray();
         for (int seed = 0; seed < 16; seed++) {
+            fly.setFlyingSpeed(new float[]{0.0f, 0.01f, 0.05f, 0.1f, 0.2f}[seed % 5]);
             player.position = Vec3.ZERO;
             player.velocity = new Vec3(seed * 0.001, -0.02, 0.03);
             for (int tick = 0; tick < 64; tick++) {
@@ -90,6 +91,7 @@ public class SpectatorFlightOracle {
                 row.addProperty("forward", forward); row.addProperty("right", right);
                 row.addProperty("jump", jump); row.addProperty("down", down);
                 row.addProperty("sprint", player.sprint); row.addProperty("yaw", player.yaw);
+                row.addProperty("speed", fly.getFlyingSpeed());
                 row.add("position", vec(player.position)); row.add("velocity", vec(player.velocity));
                 rows.add(row);
             }

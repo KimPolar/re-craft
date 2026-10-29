@@ -11,6 +11,7 @@ mod equipment_visual;
 mod experience_hud;
 mod first_person;
 mod fluid_mesh;
+mod focus_pause;
 mod fov_ui;
 mod frame_pacer;
 mod game_ui;
@@ -1352,6 +1353,7 @@ struct App {
     quit_application: bool,
     frame_pacer: frame_pacer::FramePacer,
     inactivity: frame_pacer::InactivityTracker,
+    focus_pause: focus_pause::FocusPause,
     #[cfg(debug_assertions)]
     stats_since: Instant,
     #[cfg(debug_assertions)]
@@ -1415,6 +1417,7 @@ impl App {
             quit_application: false,
             frame_pacer: frame_pacer::FramePacer::new(video.max_fps, now),
             inactivity: frame_pacer::InactivityTracker::new(now),
+            focus_pause: focus_pause::FocusPause::default(),
             #[cfg(debug_assertions)]
             stats_since: now,
             #[cfg(debug_assertions)]
@@ -1798,7 +1801,11 @@ impl ApplicationHandler for App {
                     ui.pause_scroll(scroll_lines(delta));
                 }
             }
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(focused) => {
+                self.focus_pause.focus_changed(focused, Instant::now());
+                if focused {
+                    return;
+                }
                 self.inventory_shift = false;
                 self.inventory_control = false;
                 self.input = InputState::default();
@@ -2030,8 +2037,19 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if self.ui.is_some() && self.focus_pause.should_pause(now, false) {
+            let snapshot = self.session.snapshot();
+            let screen_open = self.ui.as_ref().is_some_and(GameUi::paused)
+                || snapshot.inventory.is_open()
+                || snapshot.death.is_some()
+                || self.inventory_wait.is_some();
+            if self.focus_pause.should_pause(now, screen_open) {
+                self.ui.as_mut().unwrap().toggle_pause();
+                self.capture(false);
+            }
+        }
         if let Some(window) = &self.window {
-            let now = Instant::now();
             if !self.ui.as_ref().is_some_and(GameUi::paused) {
                 self.session
                     .update(now.saturating_duration_since(self.last_update));
@@ -2231,6 +2249,76 @@ mod world_open_tests {
 mod video_window_tests {
     use super::*;
     use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]
+    fn focus_loss_opens_pause_screen_and_stops_ticks() {
+        if !crate::window_test::isolated(
+            "video_window_tests::focus_loss_opens_pause_screen_and_stops_ticks",
+        ) {
+            return;
+        }
+        struct Harness {
+            app: App,
+            lost_at: Option<Instant>,
+            paused_tick: Option<u64>,
+            checked_delay: bool,
+        }
+        impl ApplicationHandler for Harness {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                let redraw = matches!(event, WindowEvent::RedrawRequested);
+                self.app.window_event(event_loop, id, event);
+                if redraw && self.lost_at.is_none() {
+                    self.app
+                        .window_event(event_loop, id, WindowEvent::Focused(false));
+                    self.lost_at = Some(Instant::now());
+                    assert!(!self.app.ui.as_ref().unwrap().paused());
+                    self.checked_delay = true;
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.about_to_wait(event_loop);
+                let Some(lost) = self.lost_at else { return };
+                if self.app.ui.as_ref().unwrap().paused() && self.paused_tick.is_none() {
+                    assert!(lost.elapsed() >= Duration::from_millis(490));
+                    self.paused_tick = Some(self.app.session.snapshot().tick);
+                }
+                if lost.elapsed() >= Duration::from_millis(1100) {
+                    assert!(self.checked_delay);
+                    assert_eq!(self.app.session.snapshot().tick, self.paused_tick.unwrap());
+                    event_loop.exit();
+                }
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut harness = Harness {
+            app: App::new(
+                native_resources::load_atlas(&game).unwrap(),
+                false,
+                Some(Arc::new(MenuAssets::load(&game, &[]).unwrap())),
+                SessionContent::default(),
+                menu_settings::VideoSettings::default(),
+            ),
+            lost_at: None,
+            paused_tick: None,
+            checked_delay: false,
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+        assert!(harness.paused_tick.is_some());
+    }
 
     #[test]
     #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]

@@ -230,6 +230,7 @@ fn run_inner(
         quit_application: false,
         frame_pacer: FramePacer::new(video.max_fps, now),
         inactivity: crate::frame_pacer::InactivityTracker::new(now),
+        focus_pause: crate::focus_pause::FocusPause::default(),
         #[cfg(debug_assertions)]
         stats_since: now,
         #[cfg(debug_assertions)]
@@ -300,6 +301,7 @@ struct Viewer {
     quit_application: bool,
     frame_pacer: FramePacer,
     inactivity: crate::frame_pacer::InactivityTracker,
+    focus_pause: crate::focus_pause::FocusPause,
     #[cfg(debug_assertions)]
     stats_since: Instant,
     #[cfg(debug_assertions)]
@@ -895,7 +897,11 @@ impl ApplicationHandler for Viewer {
                     ui.pause_scroll(crate::scroll_lines(delta));
                 }
             }
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(focused) => {
+                self.focus_pause.focus_changed(focused, Instant::now());
+                if focused {
+                    return;
+                }
                 self.inventory_shift = false;
                 self.inventory_control = false;
                 self.input = Input::default();
@@ -1277,6 +1283,20 @@ impl ApplicationHandler for Viewer {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if self.ui.is_some()
+            && self.focus_pause.should_pause(now, false)
+            && let Some(play) = &self.play
+        {
+            let screen_open =
+                self.ui.as_ref().is_some_and(GameUi::paused) || self.inventory_wait.is_some() || {
+                    let snapshot = play.session.snapshot();
+                    snapshot.inventory.is_open() || snapshot.death.is_some()
+                };
+            if self.focus_pause.should_pause(now, screen_open) {
+                self.ui.as_mut().unwrap().toggle_pause();
+                self.capture(false);
+            }
+        }
         if !self.ui.as_ref().is_some_and(GameUi::paused)
             && let Err(error) = self.update(now.saturating_duration_since(self.last_update))
         {

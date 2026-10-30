@@ -510,18 +510,18 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
 }
 
 #[derive(Clone)]
-struct LightProperties {
-    opacity: u8,
+pub(crate) struct LightProperties {
+    pub(crate) opacity: u8,
     emission: u8,
-    faces: [[u16; 16]; 6],
-    has_faces: bool,
+    pub(crate) faces: [[u16; 16]; 6],
+    pub(crate) has_faces: bool,
 }
 
-fn faces_occlude(from: &[u16; 16], to: &[u16; 16]) -> bool {
+pub(crate) fn faces_occlude(from: &[u16; 16], to: &[u16; 16]) -> bool {
     from.iter().zip(to).all(|(a, b)| *a | *b == u16::MAX)
 }
 
-fn light_properties(state: &BlockState) -> Option<LightProperties> {
+pub(crate) fn light_properties(state: &BlockState) -> Option<LightProperties> {
     let (opacity, emission) = properties(state)?;
     let faces = face_masks(state)?;
     Some(LightProperties {
@@ -530,6 +530,15 @@ fn light_properties(state: &BlockState) -> Option<LightProperties> {
         has_faces: faces.iter().flatten().any(|&row| row != 0),
         faces,
     })
+}
+
+pub(crate) fn transparent_light_properties() -> LightProperties {
+    LightProperties {
+        opacity: 0,
+        emission: 0,
+        faces: [[0; 16]; 6],
+        has_faces: false,
+    }
 }
 
 fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
@@ -541,7 +550,7 @@ fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
 }
 
 /// Java keeps one extra light section above and below the build range.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LightBounds {
     min_y: i32,
     max_y: i32,
@@ -568,6 +577,10 @@ impl LightBounds {
 
     fn is_padding(self, y: i32) -> bool {
         (self.min_light_y..self.max_light_y).contains(&y) && !(self.min_y..self.max_y).contains(&y)
+    }
+
+    pub(crate) fn build_range(self) -> std::ops::Range<i32> {
+        self.min_y..self.max_y
     }
 }
 

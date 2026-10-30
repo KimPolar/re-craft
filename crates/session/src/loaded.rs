@@ -4995,12 +4995,12 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
-                            crate::items::PlayerDropOrigin::Unknown,
+                            crate::items::PlayerDropOrigin::ContainerReturn,
                         );
                     }
                 }
                 PlayerCommand::InventoryPointer(event) if self.game_mode != GameMode::Spectator => {
-                    for stack in inventory_pointer(
+                    for (stack, drop_origin) in inventory_pointer(
                         &mut self.inventory,
                         self.recipes.as_deref(),
                         event,
@@ -5011,7 +5011,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
-                            crate::items::PlayerDropOrigin::Unknown,
+                            drop_origin,
                         );
                     }
                 }
@@ -5051,7 +5051,7 @@ impl LoadedSession {
                                 self.origin,
                                 self.motion.position,
                                 self.player,
-                                crate::items::PlayerDropOrigin::Unknown,
+                                crate::items::PlayerDropOrigin::Direct,
                             );
                         }
                     }

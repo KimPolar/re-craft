@@ -47,6 +47,7 @@ public class DeathInventoryOracle {
     }
     static class TestPlayer extends ServerPlayer {
         TestInventory inventory; TestLevel fakeLevel; List<ItemStack> drops,overflow;
+        boolean expectedTrace;
         TestPlayer() { super(null,null,null,null); }
         @Override public Inventory getInventory() { return inventory; }
         @Override public ServerLevel level() { return fakeLevel; }
@@ -59,6 +60,7 @@ public class DeathInventoryOracle {
             return null;
         }
         @Override public ItemEntity drop(ItemStack stack,boolean trace,Prediction prediction) {
+            if (trace != expectedTrace) throw new AssertionError("unexpected thrower attribution");
             if (!stack.isEmpty()) overflow.add(stack.copy());
             return null;
         }
@@ -106,6 +108,7 @@ public class DeathInventoryOracle {
             playerInventory.set(player,player.inventory);
             player.inventory.setSelectedSlot(spec.get("selected").getAsInt());
             player.drops=new ArrayList<>(); player.overflow=new ArrayList<>();
+            player.expectedTrace=false;
             for (int i=0;i<36;i++) player.inventory.setItem(i,stack(spec.getAsJsonArray("slots").get(i).getAsJsonArray()));
             var armor=spec.getAsJsonArray("armor");
             for (int i=0;i<4;i++) player.inventory.setItem(39-i,stack(armor.get(i).getAsJsonArray()));
@@ -127,6 +130,20 @@ public class DeathInventoryOracle {
             row.add("armor",equipment); row.add("offhand",describe(player.inventory.getItem(40)));
             results.add(row);
         }
+        var menu = new InventoryMenu(player.inventory,false,player);
+        player.expectedTrace=true;
+        player.overflow.clear();
+        menu.setCarried(new ItemStack(Items.DIRT, 2));
+        menu.clicked(-999,0,net.minecraft.world.inventory.ContainerInput.PICKUP,player);
+        if (player.overflow.size() != 1 || player.overflow.get(0).getCount() != 2)
+            throw new AssertionError("outside inventory click did not drop the carried stack");
+        for (int i=0;i<36;i++) player.inventory.setItem(i,new ItemStack(Items.STONE,64));
+        player.inventory.setItem(0,new ItemStack(Items.STONE,70));
+        player.inventory.setItem(10,new ItemStack(Items.DIRT,50));
+        player.overflow.clear();
+        menu.clicked(10,0,net.minecraft.world.inventory.ContainerInput.SWAP,player);
+        if (player.overflow.size() != 1 || player.overflow.get(0).getCount() != 50 || !player.overflow.get(0).is(Items.DIRT))
+            throw new AssertionError("inventory shortcut did not drop the displaced stack");
         Files.writeString(Path.of(args[1]),new Gson().toJson(results));
     }
 }

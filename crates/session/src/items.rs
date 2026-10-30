@@ -206,11 +206,10 @@ enum CreatedThrower {
 }
 
 /// Whether Java attributes this drop to the player when creating the entity.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlayerDropOrigin {
     Direct,
     ContainerReturn,
-    Unknown,
 }
 
 impl CreatedItemIdentity {
@@ -1014,7 +1013,6 @@ impl ItemEntities {
                         })
                     }
                     PlayerDropOrigin::ContainerReturn => CreatedThrower::Known(None),
-                    PlayerDropOrigin::Unknown => CreatedThrower::Unknown,
                 },
             )),
             id: self.next_id,
@@ -3242,7 +3240,7 @@ mod tests {
             IVec3::ZERO,
             player.position.as_dvec3(),
             player,
-            PlayerDropOrigin::Unknown,
+            PlayerDropOrigin::ContainerReturn,
         );
         items.entities[0].item.position = DVec3::new(0.5, 0.0, 0.5);
         items.entities[0].velocity = DVec3::ZERO;
@@ -3293,14 +3291,14 @@ mod tests {
             IVec3::ZERO,
             DVec3::ZERO,
             player,
-            PlayerDropOrigin::Unknown,
+            PlayerDropOrigin::ContainerReturn,
         );
         items.drop_player(
             stack,
             IVec3::ZERO,
             DVec3::ZERO,
             player,
-            PlayerDropOrigin::Unknown,
+            PlayerDropOrigin::ContainerReturn,
         );
         let initial = items.snapshot();
         assert_eq!(initial[0].previous_position, initial[0].position);

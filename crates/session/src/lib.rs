@@ -875,12 +875,12 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
-                            crate::items::PlayerDropOrigin::Unknown,
+                            crate::items::PlayerDropOrigin::ContainerReturn,
                         );
                     }
                 }
                 PlayerCommand::InventoryPointer(event) if self.game_mode != GameMode::Spectator => {
-                    for stack in inventory_pointer(
+                    for (stack, drop_origin) in inventory_pointer(
                         &mut self.inventory,
                         self.recipes.as_deref(),
                         event,
@@ -891,7 +891,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
-                            crate::items::PlayerDropOrigin::Unknown,
+                            drop_origin,
                         );
                     }
                 }
@@ -931,7 +931,7 @@ impl LocalSession {
                                 IVec3::ZERO,
                                 self.motion.position,
                                 self.player,
-                                crate::items::PlayerDropOrigin::Unknown,
+                                crate::items::PlayerDropOrigin::Direct,
                             );
                         }
                     }
@@ -1771,7 +1771,7 @@ fn inventory_pointer(
     recipes: Option<&CraftingRecipes>,
     event: InventoryPointerEvent,
     creative: bool,
-) -> Vec<inventory::ItemStack> {
+) -> Vec<(inventory::ItemStack, items::PlayerDropOrigin)> {
     fn click_target(
         inventory: &mut Arc<PlayerInventory>,
         recipes: Option<&CraftingRecipes>,
@@ -1779,10 +1779,13 @@ fn inventory_pointer(
         button: ClickButton,
         shift: bool,
         creative: bool,
-    ) -> Vec<inventory::ItemStack> {
+    ) -> Vec<(inventory::ItemStack, items::PlayerDropOrigin)> {
         match target {
             InventoryPointerTarget::Slot(slot) if shift => {
                 inventory_quick_move(inventory, recipes, slot, creative)
+                    .into_iter()
+                    .map(|stack| (stack, items::PlayerDropOrigin::ContainerReturn))
+                    .collect()
             }
             InventoryPointerTarget::Slot(slot) => {
                 inventory_click(inventory, recipes, slot, button, creative);
@@ -1791,6 +1794,7 @@ fn inventory_pointer(
             InventoryPointerTarget::Outside => Arc::make_mut(inventory)
                 .drop_cursor(button)
                 .into_iter()
+                .map(|stack| (stack, items::PlayerDropOrigin::Direct))
                 .collect(),
             InventoryPointerTarget::Background => Vec::new(),
         }
@@ -3140,6 +3144,7 @@ mod tests {
             ItemStack::new("minecraft:dirt".into(), 50, 64, Tag::Compound(vec![])),
         );
         let mut session = LocalSession::demo();
+        session.dropped_items.set_player_uuid(Some([1, 2, 3, 4]));
         session.set_player_inventory(inventory);
         session.submit_command(PlayerCommand::ToggleInventory);
         session.submit_command(PlayerCommand::InventorySwap {
@@ -3167,6 +3172,51 @@ mod tests {
         assert_eq!(after.dropped_items.len(), 1);
         assert_eq!(after.dropped_items[0].stack.id(), "minecraft:dirt");
         assert_eq!(after.dropped_items[0].stack.count(), 50);
+        assert_eq!(
+            session.dropped_items.debug_created_throwers(),
+            vec![Some(Some([1, 2, 3, 4]))]
+        );
+    }
+
+    #[test]
+    fn outside_pointer_drop_preserves_player_thrower() {
+        use inventory::{
+            InventoryPointerEvent as Event, InventoryPointerTarget as Target, ItemStack,
+        };
+        use native_persistence::nbt::Tag;
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:dirt".into(), 3, 64, Tag::Compound(vec![])),
+        );
+        inventory.toggle();
+        let mut session = LocalSession::demo();
+        session.set_player_inventory(inventory);
+        session.dropped_items.set_player_uuid(Some([1, 2, 3, 4]));
+        let press = |target| Event::Press {
+            target,
+            button: ClickButton::Primary,
+            shift: false,
+        };
+        let release = |target| Event::Release {
+            target,
+            button: ClickButton::Primary,
+            shift: false,
+        };
+        for event in [
+            press(Target::Slot(PlayerSlot::Storage(0))),
+            release(Target::Slot(PlayerSlot::Storage(0))),
+            press(Target::Outside),
+            release(Target::Outside),
+        ] {
+            session.submit_command(PlayerCommand::InventoryPointer(event));
+        }
+        session.update(TICK);
+        assert_eq!(session.snapshot().dropped_items[0].stack.count(), 3);
+        assert_eq!(
+            session.dropped_items.debug_created_throwers(),
+            vec![Some(Some([1, 2, 3, 4]))]
+        );
     }
 
     #[test]
@@ -3537,6 +3587,20 @@ mod tests {
             inventory.set_slot(PlayerSlot::Crafting(index), stack("minecraft:stone", 2));
         }
         inventory.refresh_crafting(&recipes);
+        let mut pointer_inventory = Arc::new(inventory.clone());
+        let pointer_drops = inventory_pointer(
+            &mut pointer_inventory,
+            Some(&recipes),
+            inventory::InventoryPointerEvent::Press {
+                target: inventory::InventoryPointerTarget::Slot(PlayerSlot::CraftResult),
+                button: ClickButton::Primary,
+                shift: true,
+            },
+            false,
+        );
+        assert_eq!(pointer_drops.len(), 1);
+        assert_eq!(pointer_drops[0].0.count(), 2);
+        assert_eq!(pointer_drops[0].1, items::PlayerDropOrigin::ContainerReturn);
         let dropped = inventory.quick_crafting_result(&recipes).unwrap();
         assert_eq!(inventory.slot(PlayerSlot::Storage(8)).unwrap().count(), 64);
         assert_eq!(

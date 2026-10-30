@@ -34,22 +34,25 @@ public class BlockLightStatesOracle {
                 entry.addProperty("shaped", state.useShapeForLightOcclusion());
                 var faces = new JsonArray();
                 for (var direction : new Direction[]{Direction.EAST, Direction.WEST, Direction.UP, Direction.DOWN, Direction.SOUTH, Direction.NORTH}) {
-                    int mask = 0;
+                    int[] mask = new int[16];
                     if (state.canOcclude() && state.useShapeForLightOcclusion()) {
                         var shape = state.getFaceOcclusionShape(direction);
                         int axis = direction.getAxis().ordinal();
                         int a = (axis == 0) ? 1 : 0;
                         int b = (axis == 2) ? 1 : 2;
-                        for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
-                            double x = 0.25 + i * 0.5, y = 0.25 + j * 0.5;
-                            for (var box : shape.toAabbs()) {
-                                double[] min = {box.minX,box.minY,box.minZ};
-                                double[] max = {box.maxX,box.maxY,box.maxZ};
-                                if (min[a] <= x && max[a] >= x && min[b] <= y && max[b] >= y) { mask |= 1 << (i * 2 + j); break; }
-                            }
+                        for (var box : shape.toAabbs()) {
+                            double[] min = {box.minX,box.minY,box.minZ};
+                            double[] max = {box.maxX,box.maxY,box.maxZ};
+                            int a0 = (int)Math.round(min[a] * 16), a1 = (int)Math.round(max[a] * 16);
+                            int b0 = (int)Math.round(min[b] * 16), b1 = (int)Math.round(max[b] * 16);
+                            if (a0 != min[a] * 16 || a1 != max[a] * 16 || b0 != min[b] * 16 || b1 != max[b] * 16)
+                                throw new AssertionError("non-grid face for " + state);
+                            for (int i = a0; i < a1; i++) for (int j = b0; j < b1; j++) mask[i] |= 1 << j;
                         }
                     }
-                    faces.add(mask);
+                    var rows = new JsonArray();
+                    for (int row : mask) rows.add(row);
+                    faces.add(rows);
                 }
                 entry.add("faces", faces);
                 result.add(entry);

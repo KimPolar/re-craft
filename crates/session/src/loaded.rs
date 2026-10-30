@@ -7918,6 +7918,23 @@ mod tests {
                 .light(absolute.x + 1, absolute.y, absolute.z, false),
             Some(10)
         );
+        assert!(session.set(relative, top));
+        let snow_1 = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+        let snow_7 = session.intern_block(state("minecraft:snow", &[("layers", "7")]));
+        assert!(session.set(relative + IVec3::X, snow_1));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(12)
+        );
+        assert!(session.set(relative + IVec3::X, snow_7));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(10)
+        );
     }
 
     #[test]

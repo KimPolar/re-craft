@@ -45,6 +45,11 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
             case "slab_top" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP);
             case "stair_bottom" -> Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.NORTH).setValue(StairBlock.HALF, Half.BOTTOM).setValue(StairBlock.SHAPE, StairsShape.STRAIGHT);
             case "stair_top" -> Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.EAST).setValue(StairBlock.HALF, Half.TOP).setValue(StairBlock.SHAPE, StairsShape.INNER_LEFT);
+            case "snow_1" -> Blocks.SNOW.defaultBlockState().setValue(SnowLayerBlock.LAYERS, 1);
+            case "snow_7" -> Blocks.SNOW.defaultBlockState().setValue(SnowLayerBlock.LAYERS, 7);
+            case "snow_8" -> Blocks.SNOW.defaultBlockState().setValue(SnowLayerBlock.LAYERS, 8);
+            case "farmland" -> Blocks.FARMLAND.defaultBlockState();
+            case "dirt_path" -> Blocks.DIRT_PATH.defaultBlockState();
             case "unlit" -> Blocks.REDSTONE_ORE.defaultBlockState().setValue(RedStoneOreBlock.LIT, false);
             case "lit" -> Blocks.REDSTONE_ORE.defaultBlockState().setValue(RedStoneOreBlock.LIT, true);
             default -> throw new IllegalArgumentException(name);

@@ -161,6 +161,26 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 (u8::from(boolean("waterlogged")?), 0)
             }
         }
+        "minecraft:dirt_path" if state.properties.is_empty() => (0, 0),
+        "minecraft:farmland" if state.properties.len() == 1 => {
+            if !matches!(
+                state.properties.get("moisture").map(String::as_str),
+                Some("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
+            ) {
+                return None;
+            }
+            (0, 0)
+        }
+        "minecraft:snow" if state.properties.len() == 1 => {
+            let layers = state.properties.get("layers")?;
+            if !matches!(
+                layers.as_str(),
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"
+            ) {
+                return None;
+            }
+            (if layers == "8" { 15 } else { 0 }, 0)
+        }
         "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
             if state.properties.len() == 1 =>
         {
@@ -311,18 +331,32 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
     Some(pair)
 }
 
-/// Masks use a 2×2 grid on each boundary face. The verified slab and stair
-/// occlusion shapes have edges on the half-block grid.
-fn face_masks(state: &BlockState) -> Option<[u8; 6]> {
-    if !shape_family(&state.name) {
-        return Some([0; 6]);
-    }
-    crate::collision::slab_stair_solid(state)?;
-    if state.properties.get("type").is_some_and(|v| v == "double") {
-        return Some([0; 6]);
-    }
-    let boxes = crate::collision::block_shape(state)?;
-    let mut masks = [0; 6];
+/// Each face uses a 16×16 grid. All supported occlusion boxes have edges on
+/// this grid; refuse a shape if its geometry cannot be represented exactly.
+fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
+    let boxes = if shape_family(&state.name) {
+        crate::collision::slab_stair_solid(state)?;
+        if state.properties.get("type").is_some_and(|v| v == "double") {
+            return Some([[0; 16]; 6]);
+        }
+        crate::collision::block_shape(state)?
+    } else if matches!(
+        state.name.as_str(),
+        "minecraft:dirt_path" | "minecraft:farmland"
+    ) {
+        properties(state)?;
+        crate::collision::block_shape(state)?
+    } else if state.name == "minecraft:snow" {
+        properties(state)?;
+        let height = state.properties.get("layers")?.parse::<f32>().ok()? / 8.0;
+        vec![crate::collision::Aabb {
+            min: glam::Vec3::ZERO,
+            max: glam::Vec3::new(1.0, height, 1.0),
+        }]
+    } else {
+        return Some([[0; 16]; 6]);
+    };
+    let mut masks = [[0; 16]; 6];
     for (index, (dx, dy, dz)) in DIRECTIONS.into_iter().enumerate() {
         let axis = if dx != 0 {
             0
@@ -334,41 +368,56 @@ fn face_masks(state: &BlockState) -> Option<[u8; 6]> {
         let high = dx + dy + dz > 0;
         let a = if axis == 0 { 1 } else { 0 };
         let b = if axis == 2 { 1 } else { 2 };
-        for i in 0..2 {
-            for j in 0..2 {
-                let x = 0.25 + i as f32 * 0.5;
-                let y = 0.25 + j as f32 * 0.5;
-                if boxes.iter().any(|bb| {
-                    (if high {
-                        bb.max[axis] >= 1.0
-                    } else {
-                        bb.min[axis] <= 0.0
-                    }) && bb.min[a] <= x
-                        && bb.max[a] >= x
-                        && bb.min[b] <= y
-                        && bb.max[b] >= y
-                }) {
-                    masks[index] |= 1 << (i * 2 + j);
-                }
+        let grid = |value: f32| -> Option<usize> {
+            let scaled = value * 16.0;
+            (scaled >= 0.0 && scaled <= 16.0 && scaled.fract() == 0.0).then_some(scaled as usize)
+        };
+        for bb in &boxes {
+            if !(if high {
+                bb.max[axis] >= 1.0
+            } else {
+                bb.min[axis] <= 0.0
+            }) {
+                continue;
+            }
+            let (a0, a1, b0, b1) = (
+                grid(bb.min[a])?,
+                grid(bb.max[a])?,
+                grid(bb.min[b])?,
+                grid(bb.max[b])?,
+            );
+            if b1 < b0 || a1 < a0 {
+                return None;
+            }
+            let bits = (((1u32 << (b1 - b0)) - 1) << b0) as u16;
+            for i in a0..a1 {
+                masks[index][i] |= bits;
             }
         }
     }
     Some(masks)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LightProperties {
     opacity: u8,
     emission: u8,
-    faces: [u8; 6],
+    faces: [[u16; 16]; 6],
+    has_faces: bool,
+}
+
+fn faces_occlude(from: &[u16; 16], to: &[u16; 16]) -> bool {
+    from.iter().zip(to).all(|(a, b)| *a | *b == u16::MAX)
 }
 
 fn light_properties(state: &BlockState) -> Option<LightProperties> {
     let (opacity, emission) = properties(state)?;
+    let faces = face_masks(state)?;
     Some(LightProperties {
         opacity,
         emission,
-        faces: face_masks(state)?,
+        has_faces: faces.iter().flatten().any(|&row| row != 0),
+        faces,
     })
 }
 
@@ -437,15 +486,19 @@ pub fn relight_block(
     let radius = i32::from(change.radius);
     let mut cells = BTreeMap::new();
     let mut cache = BTreeMap::new();
-    let behavior = |p: BlockPosition, cache: &mut BTreeMap<_, LightProperties>| {
-        let id = world.block_id(p.x, p.y, p.z)?;
-        if let Some(value) = cache.get(&id) {
-            return Some(*value);
-        }
-        let value = light_properties(world.state(id)?)?;
-        cache.insert(id, value);
-        Some(value)
-    };
+    let mut behaviors: Vec<LightProperties> = Vec::new();
+    let behavior =
+        |p: BlockPosition, cache: &mut BTreeMap<_, usize>, behaviors: &mut Vec<LightProperties>| {
+            let id = world.block_id(p.x, p.y, p.z)?;
+            if let Some(&index) = cache.get(&id) {
+                return Some(index);
+            }
+            let value = light_properties(world.state(id)?)?;
+            let index = behaviors.len();
+            behaviors.push(value);
+            cache.insert(id, index);
+            Some(index)
+        };
     for dx in -radius..=radius {
         for dy in -radius..=radius {
             for dz in -radius..=radius {
@@ -457,9 +510,9 @@ pub fn relight_block(
                 if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                     return None;
                 }
-                let value = behavior(p, &mut cache)?;
+                let value = behavior(p, &mut cache, &mut behaviors)?;
                 let previous = world.light(p.x, p.y, p.z, false)?;
-                cells.insert(p, (value, previous, value.emission));
+                cells.insert(p, (value, previous, behaviors[value].emission));
             }
         }
     }
@@ -476,12 +529,19 @@ pub fn relight_block(
             if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
-            let other = behavior(next, &mut cache)?;
-            if (cell.0.faces[direction_index] | other.faces[direction_index ^ 1]) == 15 {
+            let other = behavior(next, &mut cache, &mut behaviors)?;
+            if (behaviors[cell.0].has_faces || behaviors[other].has_faces)
+                && faces_occlude(
+                    &behaviors[cell.0].faces[direction_index],
+                    &behaviors[other].faces[direction_index ^ 1],
+                )
+            {
                 continue;
             }
             let boundary = world.light(next.x, next.y, next.z, false)?;
-            cell.2 = cell.2.max(boundary.saturating_sub(cell.0.opacity.max(1)));
+            cell.2 = cell
+                .2
+                .max(boundary.saturating_sub(behaviors[cell.0].opacity.max(1)));
         }
         if cell.2 > 0 {
             queue.push((cell.2, p));
@@ -497,10 +557,15 @@ pub fn relight_block(
             let Some(cell) = cells.get_mut(&next) else {
                 continue;
             };
-            if (from.faces[direction_index] | cell.0.faces[direction_index ^ 1]) == 15 {
+            if (behaviors[from].has_faces || behaviors[cell.0].has_faces)
+                && faces_occlude(
+                    &behaviors[from].faces[direction_index],
+                    &behaviors[cell.0].faces[direction_index ^ 1],
+                )
+            {
                 continue;
             }
-            let value = level.saturating_sub(cell.0.opacity.max(1));
+            let value = level.saturating_sub(behaviors[cell.0].opacity.max(1));
             if value > cell.2 {
                 cell.2 = value;
                 queue.push((value, next));
@@ -766,10 +831,39 @@ mod tests {
         let top = slab("top");
         let bottom_faces = face_masks(&bottom).unwrap();
         let top_faces = face_masks(&top).unwrap();
-        assert_eq!(bottom_faces[0] | top_faces[1], 15);
-        assert_ne!(bottom_faces[0] | bottom_faces[1], 15);
+        assert!(faces_occlude(&bottom_faces[0], &top_faces[1]));
+        assert!(!faces_occlude(&bottom_faces[0], &bottom_faces[1]));
         assert!(light_change(&bottom, &top).is_some());
         assert!(light_change(&bottom, &bottom).is_none());
+    }
+
+    #[test]
+    fn thin_snow_and_path_edges_keep_their_sixteenth_block_gap() {
+        let top = BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), "top".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        };
+        let snow = |layers: &str| BlockState {
+            name: "minecraft:snow".into(),
+            properties: [("layers".into(), layers.into())].into(),
+        };
+        let path = BlockState {
+            name: "minecraft:dirt_path".into(),
+            properties: BTreeMap::new(),
+        };
+        let slab = face_masks(&top).unwrap();
+        let thin = face_masks(&snow("1")).unwrap();
+        let deep = face_masks(&snow("7")).unwrap();
+        let path = face_masks(&path).unwrap();
+        assert!(!faces_occlude(&thin[0], &slab[1]));
+        assert!(faces_occlude(&deep[0], &slab[1]));
+        assert!(faces_occlude(&path[0], &slab[1]));
+        assert!(!faces_occlude(&path[0], &[0; 16]));
+        assert!(light_change(&snow("1"), &snow("7")).is_some());
     }
 
     #[test]
@@ -850,6 +944,9 @@ mod tests {
             .arg(&cp)
             .arg(&source));
         let names = [
+            "dirt_path",
+            "farmland",
+            "snow",
             "torch",
             "wall_torch",
             "soul_torch",
@@ -932,8 +1029,12 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
-            let shaped =
-                shape_family(&s.name) && s.properties.get("type").is_none_or(|v| v != "double");
+            let shaped = (shape_family(&s.name)
+                && s.properties.get("type").is_none_or(|v| v != "double"))
+                || matches!(
+                    s.name.as_str(),
+                    "minecraft:dirt_path" | "minecraft:farmland" | "minecraft:snow"
+                );
             assert_eq!(row["shaped"], shaped, "{s:?}");
             assert_eq!(
                 row["faces"],
@@ -1003,6 +1104,8 @@ mod tests {
             (13, 15, 15, "slab_bottom"),
             (13, 15, 16, "slab_top"),
             (13, 15, 14, "stair_bottom"),
+            (12, 15, 15, "snow_1"),
+            (12, 15, 14, "dirt_path"),
         ];
         let actions = [
             (20, 15, 15, "lit"),
@@ -1014,6 +1117,11 @@ mod tests {
             (15, 15, 15, "slab_top"),
             (15, 15, 15, "stair_bottom"),
             (15, 15, 15, "stair_top"),
+            (15, 15, 15, "snow_1"),
+            (15, 15, 15, "snow_7"),
+            (15, 15, 15, "snow_8"),
+            (15, 15, 15, "farmland"),
+            (15, 15, 15, "dirt_path"),
             (15, 15, 15, "air"),
             (15, 15, 15, "torch"),
             (15, 15, 15, "air"),
@@ -1083,6 +1191,18 @@ mod tests {
         };
         let stair_bottom = world.intern_state(stairs("north", "bottom", "straight"));
         let stair_top = world.intern_state(stairs("east", "top", "inner_left"));
+        let snow = |layers: &str| BlockState {
+            name: "minecraft:snow".into(),
+            properties: [("layers".into(), layers.into())].into(),
+        };
+        let snow_1 = world.intern_state(snow("1"));
+        let snow_7 = world.intern_state(snow("7"));
+        let snow_8 = world.intern_state(snow("8"));
+        let farmland = world.intern_state(BlockState {
+            name: "minecraft:farmland".into(),
+            properties: [("moisture".into(), "0".into())].into(),
+        });
+        let dirt_path = world.intern_state(state("dirt_path", None));
         let water = world.intern_state(BlockState {
             name: "minecraft:water".into(),
             properties: [("level".into(), "0".into())].into(),
@@ -1110,6 +1230,11 @@ mod tests {
             "slab_top" => slab_top,
             "stair_bottom" => stair_bottom,
             "stair_top" => stair_top,
+            "snow_1" => snow_1,
+            "snow_7" => snow_7,
+            "snow_8" => snow_8,
+            "farmland" => farmland,
+            "dirt_path" => dirt_path,
             _ => unreachable!(),
         };
         for (x, y, z, name) in initial {

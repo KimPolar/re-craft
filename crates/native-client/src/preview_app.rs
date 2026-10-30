@@ -84,18 +84,31 @@ struct Input {
     left: bool,
     right: bool,
     up: bool,
-    down_left: bool,
-    down_right: bool,
-    fast_left: bool,
-    fast_right: bool,
+    down: crate::toggle_key::ToggleKey,
+    fast: crate::toggle_key::ToggleKey,
 }
 
 impl Input {
     fn down(&self) -> bool {
-        self.down_left || self.down_right
+        self.down.down()
     }
     fn fast(&self) -> bool {
-        self.fast_left || self.fast_right
+        self.fast.down()
+    }
+
+    fn release_for_screen(&mut self, settings: VideoSettings) {
+        self.forward = false;
+        self.back = false;
+        self.left = false;
+        self.right = false;
+        self.up = false;
+        self.down.release_for_screen(settings.toggle_sneak);
+        self.fast.release_for_screen(settings.toggle_sprint);
+    }
+
+    fn restore_after_screen(&mut self, settings: VideoSettings) {
+        self.down.restore_after_screen(settings.toggle_sneak);
+        self.fast.restore_after_screen(settings.toggle_sprint);
     }
 }
 
@@ -362,6 +375,8 @@ impl Viewer {
                 if let Some(ui) = &mut self.ui {
                     ui.resume();
                 }
+                self.input.restore_after_screen(self.video);
+                self.submit_movement();
                 self.last_update = Instant::now();
                 self.capture(true);
             }
@@ -478,7 +493,7 @@ impl Viewer {
             ));
         }
         play.session.submit_command(PlayerCommand::ToggleInventory);
-        self.input = Input::default();
+        self.input.release_for_screen(self.video);
         self.submit_movement();
         self.capture(false);
     }
@@ -554,11 +569,13 @@ impl Viewer {
             if self.ui.is_some() && self.menu_open != snapshot.inventory.is_open() {
                 self.menu_open = snapshot.inventory.is_open();
                 if self.menu_open {
-                    self.input = Input::default();
+                    self.input.release_for_screen(self.video);
                     self.submit_movement();
                     self.capture(false);
                 } else if snapshot.death.is_none() && !self.ui.as_ref().is_some_and(GameUi::paused)
                 {
+                    self.input.restore_after_screen(self.video);
+                    self.submit_movement();
                     self.capture(true);
                 }
             }
@@ -939,11 +956,21 @@ impl ApplicationHandler for Viewer {
             WindowEvent::Focused(focused) => {
                 self.focus_pause.focus_changed(focused, Instant::now());
                 if focused {
+                    if self.inventory_wait.is_none()
+                        && !self
+                            .play
+                            .as_ref()
+                            .is_some_and(|play| play.session.snapshot().inventory.is_open())
+                        && !self.ui.as_ref().is_some_and(GameUi::paused)
+                    {
+                        self.input.restore_after_screen(self.video);
+                        self.submit_movement();
+                    }
                     return;
                 }
                 self.inventory_shift = false;
                 self.inventory_control = false;
-                self.input = Input::default();
+                self.input.release_for_screen(self.video);
                 self.submit_movement();
                 self.capture(false);
                 if let Some(ui) = &mut self.ui {
@@ -1072,7 +1099,7 @@ impl ApplicationHandler for Viewer {
                     if code == KeyCode::Escape && pressed && !event.repeat {
                         if let Some(ui) = &mut self.ui {
                             let paused = ui.toggle_pause();
-                            self.input = Input::default();
+                            self.input.release_for_screen(self.video);
                             self.submit_movement();
                             self.capture(!paused);
                             self.last_update = Instant::now();
@@ -1101,10 +1128,30 @@ impl ApplicationHandler for Viewer {
                         KeyCode::KeyA => self.input.left = pressed,
                         KeyCode::KeyD => self.input.right = pressed,
                         KeyCode::Space => self.input.up = pressed,
-                        KeyCode::ShiftLeft => self.input.down_left = pressed,
-                        KeyCode::ShiftRight => self.input.down_right = pressed,
-                        KeyCode::ControlLeft => self.input.fast_left = pressed,
-                        KeyCode::ControlRight => self.input.fast_right = pressed,
+                        KeyCode::ShiftLeft => self.input.down.set(
+                            true,
+                            pressed,
+                            event.repeat,
+                            self.play.is_some() && self.video.toggle_sneak,
+                        ),
+                        KeyCode::ShiftRight => self.input.down.set(
+                            false,
+                            pressed,
+                            event.repeat,
+                            self.play.is_some() && self.video.toggle_sneak,
+                        ),
+                        KeyCode::ControlLeft => self.input.fast.set(
+                            true,
+                            pressed,
+                            event.repeat,
+                            self.play.is_some() && self.video.toggle_sprint,
+                        ),
+                        KeyCode::ControlRight => self.input.fast.set(
+                            false,
+                            pressed,
+                            event.repeat,
+                            self.play.is_some() && self.video.toggle_sprint,
+                        ),
                         code if pressed && !event.repeat && hotbar_key(code).is_some() => {
                             if let Some(play) = &mut self.play {
                                 play.session.submit_command(PlayerCommand::SelectSlot(
@@ -2081,9 +2128,9 @@ mod tests {
         camera.yaw = std::f32::consts::FRAC_PI_2;
         input = Input {
             forward: true,
-            fast_left: true,
             ..Input::default()
         };
+        input.fast.set(true, true, false, false);
         let before = camera.eye;
         camera.advance(&input, Duration::from_millis(50));
         assert!((camera.eye - before - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-6);

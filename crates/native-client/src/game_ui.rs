@@ -19,7 +19,7 @@ use crate::{
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
     menu_settings::{SoundCategory, SoundSettings, VideoSettings},
-    mouse_ui::{self, MouseControl, MouseUi, SprintWindowUi},
+    mouse_ui::{self, MouseControl, MouseUi, MovementToggle, SprintWindowUi},
     recipe_book_ui::{BookAction, RecipeBookUi, inventory_origin},
     renderer::Renderer,
     sound_ui::SoundUi,
@@ -54,6 +54,8 @@ enum PauseButton {
     Controls,
     MouseSettings,
     SprintWindow,
+    ToggleSneak,
+    ToggleSprint,
     MouseSensitivity,
     MouseWheelSensitivity,
     MouseDiscreteScroll,
@@ -553,6 +555,10 @@ impl GameUi {
             PausePage::Controls => {
                 if hit(mouse_ui::controls_mouse_button(w)) {
                     Some(PauseButton::MouseSettings)
+                } else if hit(mouse_ui::movement_toggle_rect(w, MovementToggle::Sneak)) {
+                    Some(PauseButton::ToggleSneak)
+                } else if hit(mouse_ui::movement_toggle_rect(w, MovementToggle::Sprint)) {
+                    Some(PauseButton::ToggleSprint)
                 } else if hit(SprintWindowUi::rect(w)) {
                     Some(PauseButton::SprintWindow)
                 } else if hit(Rect {
@@ -673,6 +679,16 @@ impl GameUi {
                 } else {
                     self.sprint_window_ui.keyboard_adjust = !self.sprint_window_ui.keyboard_adjust;
                 }
+                PauseAction::None
+            }
+            PauseButton::ToggleSneak => {
+                self.video.toggle_sneak = !self.video.toggle_sneak;
+                self.video_dirty = true;
+                PauseAction::None
+            }
+            PauseButton::ToggleSprint => {
+                self.video.toggle_sprint = !self.video.toggle_sprint;
+                self.video_dirty = true;
                 PauseAction::None
             }
             PauseButton::MouseSensitivity => {
@@ -1033,6 +1049,8 @@ impl GameUi {
                 ],
                 PausePage::Controls => vec![
                     PauseButton::MouseSettings,
+                    PauseButton::ToggleSneak,
+                    PauseButton::ToggleSprint,
                     PauseButton::SprintWindow,
                     PauseButton::Done,
                 ],
@@ -2081,6 +2099,18 @@ impl GameUi {
                     [255, 255, 255],
                 );
                 mouse_ui::draw_controls_placeholders(&mut canvas, assets);
+                for (toggle, button) in [
+                    (MovementToggle::Sneak, PauseButton::ToggleSneak),
+                    (MovementToggle::Sprint, PauseButton::ToggleSprint),
+                ] {
+                    canvas.button(
+                        Some(assets),
+                        mouse_ui::movement_toggle_rect(w, toggle),
+                        true,
+                        hover == Some(button) || self.pause_focus == Some(button),
+                        &mouse_ui::movement_toggle_label(assets, toggle, self.video),
+                    );
+                }
                 self.sprint_window_ui.draw(
                     &mut canvas,
                     assets,
@@ -3268,6 +3298,21 @@ mod inventory_tests {
         ui.cursor_moved(f64::from(w / 2 + 10) * scale, 90.0 * scale);
         assert_eq!(ui.click(), PauseAction::None);
         assert_eq!(ui.pause_page, PausePage::Controls);
+        for (toggle, button) in [
+            (MovementToggle::Sneak, PauseButton::ToggleSneak),
+            (MovementToggle::Sprint, PauseButton::ToggleSprint),
+        ] {
+            let rect = mouse_ui::movement_toggle_rect(w, toggle);
+            ui.cursor_moved(
+                f64::from(rect.x + 10) * scale,
+                f64::from(rect.y + 10) * scale,
+            );
+            assert_eq!(ui.click(), PauseAction::None);
+            assert_eq!(ui.pause_focus, Some(button));
+        }
+        assert!(ui.video.toggle_sneak && ui.video.toggle_sprint);
+        ui.pause_key(KeyCode::Space, false);
+        assert!(!ui.video.toggle_sprint);
         let sprint = SprintWindowUi::rect(w);
         ui.cursor_moved(
             f64::from(sprint.x + sprint.w - 4) * scale,

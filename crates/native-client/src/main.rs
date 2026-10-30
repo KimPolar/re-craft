@@ -45,6 +45,7 @@ mod screen_blur;
 mod sky_background;
 mod sound_ui;
 mod survival_hud;
+mod toggle_key;
 mod video_ui;
 mod visual_look;
 #[cfg(all(test, target_os = "windows"))]
@@ -1271,10 +1272,8 @@ struct InputState {
     left: bool,
     right: bool,
     jump: bool,
-    sprint_left: bool,
-    sprint_right: bool,
-    sneak_left: bool,
-    sneak_right: bool,
+    sprint: toggle_key::ToggleKey,
+    sneak: toggle_key::ToggleKey,
 }
 
 impl InputState {
@@ -1285,10 +1284,25 @@ impl InputState {
             jump: self.jump,
         });
         session.submit_command(PlayerCommand::Sprint {
-            pressed: self.sprint_left || self.sprint_right,
+            pressed: self.sprint.down(),
             backward_pressed: self.back,
         });
-        session.submit_command(PlayerCommand::Sneak(self.sneak_left || self.sneak_right));
+        session.submit_command(PlayerCommand::Sneak(self.sneak.down()));
+    }
+
+    fn release_for_screen(&mut self, settings: menu_settings::VideoSettings) {
+        self.forward = false;
+        self.back = false;
+        self.left = false;
+        self.right = false;
+        self.jump = false;
+        self.sprint.release_for_screen(settings.toggle_sprint);
+        self.sneak.release_for_screen(settings.toggle_sneak);
+    }
+
+    fn restore_after_screen(&mut self, settings: menu_settings::VideoSettings) {
+        self.sprint.restore_after_screen(settings.toggle_sprint);
+        self.sneak.restore_after_screen(settings.toggle_sneak);
     }
 }
 
@@ -1542,6 +1556,8 @@ impl App {
                 if let Some(ui) = &mut self.ui {
                     ui.resume();
                 }
+                self.input.restore_after_screen(self.video);
+                self.input.submit(&mut self.session);
                 self.last_update = Instant::now();
                 self.capture(true);
             }
@@ -1593,7 +1609,7 @@ impl App {
                     ));
                 }
                 self.session.submit_command(PlayerCommand::ToggleInventory);
-                self.input = InputState::default();
+                self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
                 self.capture(false);
             }
@@ -1636,7 +1652,7 @@ impl App {
         if code == KeyCode::Escape && pressed && !repeat {
             if let Some(ui) = &mut self.ui {
                 let paused = ui.toggle_pause();
-                self.input = InputState::default();
+                self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
                 self.capture(!paused);
                 self.last_update = Instant::now();
@@ -1661,10 +1677,26 @@ impl App {
             KeyCode::KeyA => self.input.left = pressed,
             KeyCode::KeyD => self.input.right = pressed,
             KeyCode::Space => self.input.jump = pressed,
-            KeyCode::ControlLeft => self.input.sprint_left = pressed,
-            KeyCode::ControlRight => self.input.sprint_right = pressed,
-            KeyCode::ShiftLeft => self.input.sneak_left = pressed,
-            KeyCode::ShiftRight => self.input.sneak_right = pressed,
+            KeyCode::ControlLeft => {
+                self.input
+                    .sprint
+                    .set(true, pressed, repeat, self.video.toggle_sprint)
+            }
+            KeyCode::ControlRight => {
+                self.input
+                    .sprint
+                    .set(false, pressed, repeat, self.video.toggle_sprint)
+            }
+            KeyCode::ShiftLeft => {
+                self.input
+                    .sneak
+                    .set(true, pressed, repeat, self.video.toggle_sneak)
+            }
+            KeyCode::ShiftRight => {
+                self.input
+                    .sneak
+                    .set(false, pressed, repeat, self.video.toggle_sneak)
+            }
             code if pressed && !repeat && hotbar_key(code).is_some() => self
                 .session
                 .submit_command(PlayerCommand::SelectSlot(hotbar_key(code).unwrap())),
@@ -1701,10 +1733,12 @@ impl App {
         if self.ui.is_some() && self.menu_open != snapshot.inventory.is_open() {
             self.menu_open = snapshot.inventory.is_open();
             if self.menu_open {
-                self.input = InputState::default();
+                self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
                 self.capture(false);
             } else if snapshot.death.is_none() && !self.ui.as_ref().is_some_and(GameUi::paused) {
+                self.input.restore_after_screen(self.video);
+                self.input.submit(&mut self.session);
                 self.capture(true);
             }
         }
@@ -1877,11 +1911,18 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(focused) => {
                 self.focus_pause.focus_changed(focused, Instant::now());
                 if focused {
+                    if self.inventory_wait.is_none()
+                        && !self.session.snapshot().inventory.is_open()
+                        && !self.ui.as_ref().is_some_and(GameUi::paused)
+                    {
+                        self.input.restore_after_screen(self.video);
+                        self.input.submit(&mut self.session);
+                    }
                     return;
                 }
                 self.inventory_shift = false;
                 self.inventory_control = false;
-                self.input = InputState::default();
+                self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
                 self.capture(false);
                 if let Some(ui) = &mut self.ui {

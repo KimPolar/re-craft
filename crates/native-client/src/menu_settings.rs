@@ -237,6 +237,8 @@ pub struct VideoSettings {
     pub invert_mouse_y: bool,
     /// Ticks allowed between forward taps, from 0 through 10.
     pub sprint_window: u8,
+    pub toggle_sneak: bool,
+    pub toggle_sprint: bool,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
     pub inactivity_fps_limit: InactivityFpsLimit,
 }
@@ -277,6 +279,8 @@ impl Default for VideoSettings {
             invert_mouse_x: false,
             invert_mouse_y: false,
             sprint_window: 7,
+            toggle_sneak: false,
+            toggle_sprint: false,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }

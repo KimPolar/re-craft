@@ -15,7 +15,11 @@ use std::{
 };
 
 type SkySources = BTreeMap<(i32, i32), SkyColumn>;
-type AppliedLighting = (BTreeSet<ChunkPos>, SkySources);
+type AppliedLighting = (
+    BTreeSet<ChunkPos>,
+    SkySources,
+    BTreeMap<ChunkPos, Arc<Chunk>>,
+);
 
 #[derive(Clone, Copy)]
 struct Edit {
@@ -47,6 +51,7 @@ pub(crate) struct SkyLighting {
     // source scan for columns first encountered after another column changed.
     originals: BTreeMap<ChunkPos, Arc<Chunk>>,
     sources: SkySources,
+    applied_originals: BTreeMap<ChunkPos, Arc<Chunk>>,
 }
 
 impl SkyLighting {
@@ -125,11 +130,12 @@ impl SkyLighting {
                     self.worker = None;
                     if self.enabled && reply.generation == self.generation {
                         match reply.result.and_then(|result| apply(world, result)) {
-                            Some((updated, sources)) => {
+                            Some((updated, sources, originals)) => {
                                 self.pending.clear();
                                 self.sources = sources;
                                 self.failed_generation = None;
                                 self.retry_delay = 0;
+                                self.applied_originals.extend(originals);
                                 changed = updated;
                             }
                             None => {
@@ -181,6 +187,14 @@ impl SkyLighting {
             self.retry_delay = 20;
         }
         changed
+    }
+
+    pub(crate) fn settled(&self) -> bool {
+        self.pending.is_empty() && self.worker.is_none()
+    }
+
+    pub(crate) fn take_applied_originals(&mut self) -> BTreeMap<ChunkPos, Arc<Chunk>> {
+        std::mem::take(&mut self.applied_originals)
     }
 
     #[cfg(test)]
@@ -301,8 +315,10 @@ fn compute(
 
 fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> {
     let mut updates = Vec::new();
+    let mut originals = BTreeMap::new();
     for pos in &computed.changed {
         let current = world.chunks.get(pos)?;
+        originals.insert(*pos, Arc::clone(current));
         let calculated = computed.world.chunks.get(pos)?;
         for (&y, section) in &calculated.sections {
             match current.sections.get(&y) {
@@ -337,7 +353,7 @@ fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> 
         section.sky_light = light;
         changed.insert(pos);
     }
-    Some((changed, computed.sources))
+    Some((changed, computed.sources, originals))
 }
 
 #[cfg(test)]
@@ -425,6 +441,17 @@ mod tests {
         let before = Arc::clone(&world);
         let changed = finish(&mut sky, &mut world, bounds);
         assert!(sky.pending.is_empty());
+        assert!(sky.settled());
+        let originals = sky.take_applied_originals();
+        assert!(changed.iter().all(|pos| originals.contains_key(pos)));
+        assert_eq!(
+            originals[&ChunkPos { x: 0, z: 0 }].sections[&0]
+                .sky_light
+                .as_ref()
+                .unwrap()[0],
+            0xff
+        );
+        assert!(sky.take_applied_originals().is_empty());
         assert!(changed.contains(&ChunkPos { x: 0, z: 0 }));
         assert_eq!(world.light(15, 14, 15, true), Some(14));
         assert_eq!(world.light(15, 14, 15, false), Some(0));

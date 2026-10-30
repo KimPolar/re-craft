@@ -25,6 +25,20 @@ pub struct BlockChange {
     pub replacement: BlockState,
 }
 
+/// One saved light layer, with an exact pre-edit source for stale-data checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LightLayerChange {
+    pub expected: Option<Box<[u8; native_world::loaded::LIGHT_BYTES]>>,
+    pub replacement: Option<Box<[u8; native_world::loaded::LIGHT_BYTES]>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionLightChange {
+    pub y: i8,
+    pub block: Option<LightLayerChange>,
+    pub sky: Option<LightLayerChange>,
+}
+
 #[derive(Debug)]
 pub struct ChunkDraft {
     source_nbt: Vec<u8>,
@@ -75,6 +89,104 @@ impl ChunkDraft {
     /// Any eventual coordinated write must also compare the raw file bytes.
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         Ok(crate::nbt::write(current)? == self.source_nbt)
+    }
+
+    /// Apply known layer changes atomically while preserving all other NBT.
+    /// The caller must prove that relighting has completed across chunk borders;
+    /// this partial draft alone does not authorize a gameplay save.
+    pub fn replace_section_lights(&mut self, changes: &[SectionLightChange]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let source = crate::nbt::read(&self.source_nbt)?;
+        ensure!(
+            matches!(
+                unique_field(&source.value, "isLightOn")?,
+                Some(Tag::Byte(1))
+            ),
+            "source light is not known complete"
+        );
+        let decoded = palette::decode_sections(&source.value)?;
+        let mut ys = BTreeSet::new();
+        for change in changes {
+            ensure!(ys.insert(change.y), "duplicate light section");
+            ensure!(
+                change.block.is_some() || change.sky.is_some(),
+                "empty light section change"
+            );
+            let old = decoded.iter().find(|section| section.y == change.y);
+            for (layer, expected) in [
+                (&change.block, old.and_then(|s| s.block_light.as_deref())),
+                (&change.sky, old.and_then(|s| s.sky_light.as_deref())),
+            ] {
+                if let Some(layer) = layer {
+                    ensure!(
+                        layer.expected.as_deref().map(|data| data.as_slice()) == expected,
+                        "source light layer differs"
+                    );
+                }
+            }
+        }
+        let mut document = self.document.clone();
+        if unique_field(&document.value, "sections")?.is_none() {
+            let Tag::Compound(fields) = &mut document.value else {
+                bail!("chunk must be a compound")
+            };
+            fields.push((
+                "sections".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: Vec::new(),
+                },
+            ));
+        }
+        let Some(Tag::List {
+            element_type,
+            values,
+        }) = unique_field_mut(&mut document.value, "sections")?
+        else {
+            bail!("chunk sections must be a list")
+        };
+        if values.is_empty() {
+            *element_type = TagType::Compound;
+        }
+        ensure!(
+            *element_type == TagType::Compound,
+            "chunk sections must be a compound list"
+        );
+        for change in changes {
+            let index = match values.iter().position(
+                |section| matches!(section.get("Y"), Some(Tag::Byte(y)) if *y == change.y),
+            ) {
+                Some(index) => index,
+                None => {
+                    values.push(Tag::Compound(vec![("Y".into(), Tag::Byte(change.y))]));
+                    values.len() - 1
+                }
+            };
+            for (name, layer) in [("BlockLight", &change.block), ("SkyLight", &change.sky)] {
+                let Some(layer) = layer else { continue };
+                let Tag::Compound(fields) = &mut values[index] else {
+                    bail!("section must be a compound")
+                };
+                ensure!(
+                    fields.iter().filter(|(key, _)| key.matches(name)).count() <= 1,
+                    "duplicate light layer"
+                );
+                if let Some(field) = fields.iter().position(|(key, _)| key.matches(name)) {
+                    if let Some(value) = &layer.replacement {
+                        fields[field].1 = Tag::ByteArray(value.to_vec());
+                    } else {
+                        fields.remove(field);
+                    }
+                } else if let Some(value) = &layer.replacement {
+                    fields.push((name.into(), Tag::ByteArray(value.to_vec())));
+                }
+            }
+        }
+        crate::nbt::write(&document).context("cannot encode light draft")?;
+        self.document = document;
+        Ok(())
     }
 
     /// Replace only fully understood falling-block ticks in this draft.
@@ -736,6 +848,99 @@ mod tests {
         assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
         assert!(next.replace_falling_block_ticks(&[]).is_err());
         assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn light_layer_draft_preserves_other_data_and_rejects_stale_or_ambiguous_sources() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push(("isLightOn".into(), Tag::Byte(1)));
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        let changes = [
+            SectionLightChange {
+                y: -4,
+                block: Some(LightLayerChange {
+                    expected: None,
+                    replacement: Some(Box::new([0x34; 2048])),
+                }),
+                sky: None,
+            },
+            SectionLightChange {
+                y: -3,
+                block: None,
+                sky: Some(LightLayerChange {
+                    expected: Some(Box::new([0xff; 2048])),
+                    replacement: None,
+                }),
+            },
+            SectionLightChange {
+                y: -5,
+                block: Some(LightLayerChange {
+                    expected: None,
+                    replacement: Some(Box::new([0x12; 2048])),
+                }),
+                sky: Some(LightLayerChange {
+                    expected: None,
+                    replacement: Some(Box::new([0xab; 2048])),
+                }),
+            },
+        ];
+        draft.replace_section_lights(&changes).unwrap();
+        assert!(draft.matches_source(&original).unwrap());
+        assert_eq!(
+            draft.document().value.get("unknown_chunk"),
+            original.value.get("unknown_chunk")
+        );
+        assert_eq!(
+            section(draft.document()).get("unknown_section"),
+            section(&original).get("unknown_section")
+        );
+        let decoded = palette::decode_sections(&draft.document().value).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .find(|s| s.y == -4)
+                .unwrap()
+                .block_light
+                .as_deref(),
+            Some(&[0x34; 2048][..])
+        );
+        assert!(
+            decoded
+                .iter()
+                .find(|s| s.y == -3)
+                .unwrap()
+                .sky_light
+                .is_none()
+        );
+        let new = decoded.iter().find(|s| s.y == -5).unwrap();
+        assert_eq!(new.block_light.as_deref(), Some(&[0x12; 2048][..]));
+        assert_eq!(new.sky_light.as_deref(), Some(&[0xab; 2048][..]));
+        let before = crate::nbt::write(draft.document()).unwrap();
+        let mut stale = changes.clone();
+        stale[1].sky.as_mut().unwrap().expected = Some(Box::new([0; 2048]));
+        assert!(draft.replace_section_lights(&stale).is_err());
+        assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+        assert!(
+            draft
+                .replace_section_lights(&[changes[0].clone(), changes[0].clone()])
+                .is_err()
+        );
+        assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+        for marker in [None, Some(Tag::Byte(0)), Some(Tag::Int(1))] {
+            let mut source = fixture(1, false);
+            if let Some(marker) = marker {
+                let Tag::Compound(fields) = &mut source.value else {
+                    unreachable!()
+                };
+                fields.push(("isLightOn".into(), marker));
+            }
+            let mut invalid = draft_chunk_blocks(&source, pos, &[]).unwrap();
+            assert!(invalid.replace_section_lights(&changes).is_err());
+        }
     }
 
     #[test]

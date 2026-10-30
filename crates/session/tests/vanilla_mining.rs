@@ -591,6 +591,101 @@ public class FallingRenderOracle {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn light_draft_arrays_are_read_by_vanilla_data_layer() {
+    use native_persistence::{
+        edit::{LightLayerChange, SectionLightChange, draft_chunk_blocks},
+        nbt::{NamedTag, Tag, TagType},
+        world::ChunkPos,
+    };
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let java_source = temp.path().join("LightDraftOracle.java");
+    std::fs::write(&java_source, r#"
+import java.nio.file.*;
+import net.minecraft.nbt.*;
+import net.minecraft.world.level.chunk.DataLayer;
+public class LightDraftOracle {
+  public static void main(String[] args) throws Exception {
+    var root=NbtIo.read(Path.of(args[0]));
+    var sections=root.getListOrEmpty("sections");
+    if(sections.size()!=2 || root.getByteOr("isLightOn",(byte)0)!=1) throw new AssertionError("chunk light metadata");
+    for(var entry:sections) {
+      var section=(CompoundTag)entry; int y=section.getByteOr("Y",(byte)-99);
+      if(y!=0 && y!=-1) throw new AssertionError("section Y");
+      var block=new DataLayer(section.getByteArray("BlockLight").orElseThrow());
+      var sky=new DataLayer(section.getByteArray("SkyLight").orElseThrow());
+      for(int x=0;x<16;x++) for(int y0=0;y0<16;y0++) for(int z=0;z<16;z++) {
+        int index=(y0<<8)|(z<<4)|x; int seed=y==0?0:3;
+        if(block.get(x,y0,z)!=((index*7+5+seed)&15) || sky.get(x,y0,z)!=((index*11+2+seed)&15))
+          throw new AssertionError("wrong light at "+x+","+y0+","+z+" section="+y);
+      }
+    }
+  }
+}
+"#).unwrap();
+    let original = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            ("xPos".into(), Tag::Int(0)),
+            ("zPos".into(), Tag::Int(0)),
+            ("Status".into(), Tag::String("minecraft:full".into())),
+            ("isLightOn".into(), Tag::Byte(1)),
+            (
+                "sections".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![("Y".into(), Tag::Byte(0))])],
+                },
+            ),
+        ]),
+    };
+    let make = |factor: usize, base: usize| -> Box<[u8; 2048]> {
+        let mut bytes = Box::new([0; 2048]);
+        for index in 0..4096 {
+            bytes[index / 2] |= (((index * factor + base) & 15) as u8) << ((index % 2) * 4);
+        }
+        bytes
+    };
+    let mut draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[]).unwrap();
+    let changes: Vec<_> = [(0, 0), (-1, 3)]
+        .into_iter()
+        .map(|(y, seed)| SectionLightChange {
+            y,
+            block: Some(LightLayerChange {
+                expected: None,
+                replacement: Some(make(7, 5 + seed)),
+            }),
+            sky: Some(LightLayerChange {
+                expected: None,
+                replacement: Some(make(11, 2 + seed)),
+            }),
+        })
+        .collect();
+    draft.replace_section_lights(&changes).unwrap();
+    let file = temp.path().join("light.nbt");
+    std::fs::write(
+        &file,
+        native_persistence::nbt::write(draft.document()).unwrap(),
+    )
+    .unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(java_source));
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LightDraftOracle")
+        .arg(file));
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn java_saved_tick_duplicates_and_new_schedule_order() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

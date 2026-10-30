@@ -221,6 +221,7 @@ pub struct LoadedSession {
     pending_light: BTreeMap<BlockPosition, PendingLight>,
     light_generation: u64,
     sky_lighting: crate::sky_lighting::SkyLighting,
+    original_light_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
@@ -1328,6 +1329,108 @@ impl LoadedSession {
         Ok(draft)
     }
 
+    /// Extend a dirty-chunk draft with completed light-array changes. Pending
+    /// relights, entities and other world effects still prevent a safe save.
+    pub fn draft_dirty_chunk_with_lighting(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        tags: &native_resources::heightmap_tags::HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        use anyhow::{Context, ensure};
+        use native_persistence::edit::{LightLayerChange, SectionLightChange};
+        ensure!(
+            self.pending_light.is_empty() && self.sky_lighting.settled(),
+            "lighting updates are not complete"
+        );
+        let mut draft = self.draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+            position,
+            original,
+            tags,
+            air_and_fluid,
+        )?;
+        let Some(before) = self.original_light_chunks.get(&position) else {
+            return Ok(draft);
+        };
+        let current = self
+            .world
+            .chunks
+            .get(&position)
+            .or_else(|| self.parked_chunks.get(&position))
+            .context("light-dirty chunk is unavailable")?;
+        ensure!(
+            before.block_light_correct && current.block_light_correct,
+            "chunk light source is incomplete"
+        );
+        let native_persistence::nbt::Tag::Compound(fields) = &original.value else {
+            anyhow::bail!("chunk must be a compound")
+        };
+        let markers: Vec<_> = fields
+            .iter()
+            .filter(|(name, _)| name.matches("isLightOn"))
+            .collect();
+        ensure!(
+            matches!(
+                markers.as_slice(),
+                [(_, native_persistence::nbt::Tag::Byte(1))]
+            ),
+            "source light is not known complete"
+        );
+        let source_sections = native_persistence::palette::decode_sections(&original.value)?;
+        let source_ys: BTreeSet<_> = before
+            .sections
+            .keys()
+            .copied()
+            .chain(source_sections.iter().map(|section| section.y))
+            .collect();
+        for y in source_ys {
+            let before_section = before.sections.get(&y);
+            let source = source_sections.iter().find(|section| section.y == y);
+            ensure!(
+                before_section
+                    .and_then(|section| section.block_light.as_deref())
+                    .map(|layer| layer.as_slice())
+                    == source.and_then(|section| section.block_light.as_deref())
+                    && before_section
+                        .and_then(|section| section.sky_light.as_deref())
+                        .map(|layer| layer.as_slice())
+                        == source.and_then(|section| section.sky_light.as_deref()),
+                "original chunk light differs from session source"
+            );
+        }
+        let sections: BTreeSet<i8> = before
+            .sections
+            .keys()
+            .chain(current.sections.keys())
+            .copied()
+            .collect();
+        let mut changes = Vec::new();
+        for y in sections {
+            let old = before.sections.get(&y);
+            let new = current.sections.get(&y);
+            let block_before = old.and_then(|section| section.block_light.as_ref());
+            let block_after = new.and_then(|section| section.block_light.as_ref());
+            let sky_before = old.and_then(|section| section.sky_light.as_ref());
+            let sky_after = new.and_then(|section| section.sky_light.as_ref());
+            let block = (block_before != block_after).then(|| LightLayerChange {
+                expected: block_before.cloned(),
+                replacement: block_after.cloned(),
+            });
+            let sky = (sky_before != sky_after).then(|| LightLayerChange {
+                expected: sky_before.cloned(),
+                replacement: sky_after.cloned(),
+            });
+            if block.is_some() || sky.is_some() {
+                changes.push(SectionLightChange { y, block, sky });
+            }
+        }
+        draft.replace_section_lights(&changes)?;
+        Ok(draft)
+    }
+
     fn draft_unchanged_chunk(
         &self,
         position: ChunkPos,
@@ -1705,6 +1808,7 @@ impl LoadedSession {
             pending_light: BTreeMap::new(),
             light_generation: 0,
             sky_lighting: crate::sky_lighting::SkyLighting::default(),
+            original_light_chunks: BTreeMap::new(),
             snapshot,
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
@@ -4595,6 +4699,26 @@ impl LoadedSession {
             .iter()
             .map(|&position| (position, self.pending_light[&position].change))
             .collect();
+        let mut before = BTreeMap::new();
+        for (position, change) in &changes {
+            let radius = change.radius();
+            let (min_x, max_x) = (
+                position.x.saturating_sub(radius).div_euclid(16),
+                position.x.saturating_add(radius).div_euclid(16),
+            );
+            let (min_z, max_z) = (
+                position.z.saturating_sub(radius).div_euclid(16),
+                position.z.saturating_add(radius).div_euclid(16),
+            );
+            for x in min_x..=max_x {
+                for z in min_z..=max_z {
+                    let pos = ChunkPos { x, z };
+                    if let Some(chunk) = self.world.chunks.get(&pos) {
+                        before.entry(pos).or_insert_with(|| Arc::clone(chunk));
+                    }
+                }
+            }
+        }
         let bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
         let result = match bounds {
@@ -4613,6 +4737,12 @@ impl LoadedSession {
                     self.pending_light.remove(&position);
                 }
                 if !changed.is_empty() {
+                    for pos in &changed {
+                        let original = before
+                            .remove(pos)
+                            .expect("relighting must stay within the captured chunk range");
+                        self.original_light_chunks.entry(*pos).or_insert(original);
+                    }
                     self.dirty_chunks.extend(changed);
                     self.revision += 1;
                 }
@@ -6131,6 +6261,12 @@ impl LoadedSession {
         let sky_bounds =
             native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
         let sky_changed = self.sky_lighting.advance(&mut self.world, sky_bounds);
+        let sky_originals = self.sky_lighting.take_applied_originals();
+        for (pos, chunk) in sky_originals {
+            if sky_changed.contains(&pos) {
+                self.original_light_chunks.entry(pos).or_insert(chunk);
+            }
+        }
         if !sky_changed.is_empty() {
             self.dirty_chunks.extend(sky_changed);
             self.revision += 1;
@@ -9186,6 +9322,148 @@ mod tests {
     }
 
     #[test]
+    fn cross_chunk_block_light_is_drafted_and_rejects_stale_or_pending_data() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let air = session.states[0];
+        let home = session.player_chunk().unwrap();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                let pos = ChunkPos {
+                    x: home.x + x,
+                    z: home.z + z,
+                };
+                let sections = (0..=1)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                                sky_light: None,
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+                session.fluid_chunks_seen.insert(pos);
+            }
+        }
+        let lamp = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "true")]));
+        assert!(session.set(IVec3::new(14, 15, 8), lamp));
+        assert!(session.pending_light.is_empty());
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        assert!(session.dirty_chunk_positions().contains(&neighbor));
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("xPos".into(), Tag::Int(neighbor.x)),
+                ("zPos".into(), Tag::Int(neighbor.z)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                ("isLightOn".into(), Tag::Byte(1)),
+                (
+                    "sections".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: (0..=1)
+                            .map(|y| {
+                                Tag::Compound(vec![
+                                    ("Y".into(), Tag::Byte(y)),
+                                    ("BlockLight".into(), Tag::ByteArray(vec![0; LIGHT_BYTES])),
+                                    ("opaque".into(), Tag::Int(17)),
+                                ])
+                            })
+                            .collect(),
+                    },
+                ),
+            ]),
+        };
+        let draft = session
+            .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |_| {
+                anyhow::bail!("light-only chunk must not rebuild heightmaps")
+            })
+            .unwrap();
+        let decoded =
+            native_persistence::palette::decode_sections(&draft.document().value).unwrap();
+        let current = &session.world.chunks[&neighbor];
+        for section in decoded {
+            assert_eq!(
+                section.block_light.as_deref(),
+                current.sections[&section.y]
+                    .block_light
+                    .as_deref()
+                    .map(|a| a.as_slice())
+            );
+        }
+        let Tag::List { values, .. } = draft.document().value.get("sections").unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            values
+                .iter()
+                .all(|section| section.get("opaque") == Some(&Tag::Int(17)))
+        );
+        let mut stale = source.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("BlockLight"))
+            .unwrap()
+            .1 = Tag::ByteArray(vec![1; LIGHT_BYTES]);
+        assert!(
+            session
+                .draft_dirty_chunk_with_lighting(neighbor, &stale, &test_heightmap_tags(), |_| Ok(
+                    (true, false)
+                ))
+                .is_err()
+        );
+        session.pending_light.insert(
+            BlockPosition {
+                x: session.origin.x,
+                y: 4,
+                z: session.origin.z,
+            },
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(
+            session
+                .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |_| Ok(
+                    (true, false)
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn powered_lamp_updates_block_light_and_preserves_old_snapshot() {
         let mut session = session();
         let air = session.states[0];
@@ -9286,6 +9564,7 @@ mod tests {
 
     #[test]
     fn loaded_session_applies_background_sky_updates_to_snapshots() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
         let mut session = session();
         session.set_has_skylight(true).unwrap();
         session.set_random_tick_speed(0);
@@ -9332,6 +9611,54 @@ mod tests {
         let absolute = session.origin + relative;
         session.update(TICK);
         let old_snapshot = session.snapshot();
+        let neighbor = origin_chunk;
+        session.fluid_chunks_seen.insert(neighbor);
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("xPos".into(), Tag::Int(neighbor.x)),
+                ("zPos".into(), Tag::Int(neighbor.z)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                ("isLightOn".into(), Tag::Byte(1)),
+                (
+                    "sections".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: (-1..=2)
+                            .map(|y| {
+                                let mut fields = vec![
+                                    ("Y".into(), Tag::Byte(y)),
+                                    ("BlockLight".into(), Tag::ByteArray(vec![0; LIGHT_BYTES])),
+                                    ("SkyLight".into(), Tag::ByteArray(vec![0xff; LIGHT_BYTES])),
+                                    ("opaque".into(), Tag::Int(17)),
+                                ];
+                                if (0..=1).contains(&y) {
+                                    fields.push((
+                                        "block_states".into(),
+                                        Tag::Compound(vec![(
+                                            "palette".into(),
+                                            Tag::List {
+                                                element_type: TagType::String,
+                                                values: vec![Tag::String("minecraft:air".into())],
+                                            },
+                                        )]),
+                                    ));
+                                }
+                                Tag::Compound(fields)
+                            })
+                            .collect(),
+                    },
+                ),
+            ]),
+        };
+        assert!(
+            session
+                .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |_| Ok(
+                    (true, false)
+                ))
+                .is_err()
+        );
         session.sky_lighting.wait_for_worker();
         session.update(TICK);
         let new_snapshot = session.snapshot();
@@ -9344,6 +9671,28 @@ mod tests {
         assert_eq!(old.light(absolute.x, 14, absolute.z, true), Some(15));
         assert_eq!(new.light(absolute.x, 14, absolute.z, true), Some(14));
         assert!(new_snapshot.world_revision > old_snapshot.world_revision);
+        let draft = session
+            .draft_dirty_chunk_with_lighting(neighbor, &source, &test_heightmap_tags(), |state| {
+                Ok((state.name.matches("minecraft:air"), false))
+            })
+            .unwrap();
+        let sections =
+            native_persistence::palette::decode_sections(&draft.document().value).unwrap();
+        assert!(sections.iter().any(|section| {
+            section
+                .sky_light
+                .as_ref()
+                .is_some_and(|data| data.iter().any(|&byte| byte != 0xff))
+        }));
+        for section in sections {
+            assert_eq!(
+                section.sky_light.as_deref(),
+                new.chunks[&neighbor].sections[&section.y]
+                    .sky_light
+                    .as_deref()
+                    .map(|a| a.as_slice())
+            );
+        }
     }
 
     #[test]

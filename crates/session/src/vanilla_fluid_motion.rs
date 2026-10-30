@@ -1,7 +1,7 @@
 //! Compare default fluid movement against the locally installed 26.3 player.
 
+use crate::physics::{FluidMovement, MotionState, MovementInput};
 use glam::DVec3;
-use native_session::physics::{FluidMovement, MotionState, MovementInput};
 use native_world::fluid::FluidKind;
 use serde_json::{Value, json};
 use std::{
@@ -24,19 +24,24 @@ import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.ai.attributes.*;
 import net.minecraft.world.entity.player.*;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.*;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.phys.*;
 
 public class FluidMotionOracle {
     static Field positionField;
+    static Method restitute;
     static class TestLevel extends ClientLevel {
-        boolean above;
+        boolean above; BlockState floor;
         TestLevel(){super(null,null,null,null,0,0,null,false,0L,0);}
         @Override public FluidState getFluidState(BlockPos p){ return above ? Fluids.WATER.defaultFluidState() : Fluids.EMPTY.defaultFluidState(); }
+        @Override public BlockState getBlockState(BlockPos p){return floor;}
+        @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
     }
     static class TestPlayer extends Player {
-        Vec3 p,v; boolean ground,sprint,water,swim,free; float yaw; double look,depth,wall; int delay; AttributeInstance speed;
+        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress; float yaw; double look,depth,wall,ceiling,bounce; int delay; AttributeInstance speed;
         TestPlayer(){super(null,null);}
         void setup(TestLevel level,Vec3 pos,Vec3 velocity,boolean grounded,double wallX) throws Exception {setLevel(level);p=pos;v=velocity;ground=grounded;wall=wallX;delay=0;positionField.set(this,p);}
         @Override public GameType gameMode(){return GameType.SURVIVAL;}
@@ -60,6 +65,11 @@ public class FluidMotionOracle {
         @Override public float getYRot(){return yaw;}
         @Override protected float getJumpPower(){return 0.42f;}
         @Override protected double getEffectiveGravity(){return 0.08;}
+        @Override protected double getEntityBounciness(){return bounce;}
+        @Override protected float getAirDrag(){return 0.98f;}
+        @Override public boolean isSuppressingBounce(){return suppress;}
+        @Override public BlockPos getBlockPosBelowThatAffectsMyMovement(){return BlockPos.ZERO;}
+        @Override public void gameEvent(Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
         @Override public double getAttributeValue(Holder<Attribute> a){return a==Attributes.MOVEMENT_SPEED?speed.getValue():a==Attributes.WATER_MOVEMENT_EFFICIENCY?0.0:1.0;}
         @Override public MobEffectInstance getEffect(Holder<MobEffect> e){return null;}
         @Override public HumanoidArm getMainArm(){return HumanoidArm.RIGHT;}
@@ -68,11 +78,13 @@ public class FluidMotionOracle {
         @Override public void move(MoverType type,Vec3 requested){
             double x=requested.x,y=requested.y,z=requested.z;
             if(y<0.0 && p.y+y<0.0)y=-p.y;
+            if(y>0.0 && p.y+y>ceiling)y=Math.max(0.0,ceiling-p.y);
             if(x>0.0 && p.x+0.30000001192092896+x>wall)x=Math.max(0.0,wall-p.x-0.30000001192092896);
             p=p.add(x,y,z);try{positionField.set(this,p);}catch(Exception e){throw new RuntimeException(e);}
             boolean bx=Math.abs(x-requested.x)>=(double)1.0e-5f, bz=Math.abs(z-requested.z)>=(double)1.0e-5f, by=y!=requested.y;
             horizontalCollision=bx||bz; ground=by&&requested.y<0.0;
-            v=new Vec3(bx?0.0:v.x,by?0.0:v.y,bz?0.0:v.z);
+            verticalCollision=by;verticalCollisionBelow=ground;
+            if(bx||by||bz)try{restitute.invoke(this,((TestLevel)level()).floor,bx,bz,new Vec3(x,y,z));}catch(Exception e){throw new RuntimeException(e);}
         }
     }
     static Vec3 vec(JsonArray a){return new Vec3(a.get(0).getAsDouble(),a.get(1).getAsDouble(),a.get(2).getAsDouble());}
@@ -83,6 +95,7 @@ public class FluidMotionOracle {
         TestLevel level=(TestLevel)unsafe.allocateInstance(TestLevel.class);TestPlayer entity=(TestPlayer)unsafe.allocateInstance(TestPlayer.class);
         Field abilities=Player.class.getDeclaredField("abilities");abilities.setAccessible(true);abilities.set(entity,new Abilities());
         positionField=Entity.class.getDeclaredField("position");positionField.setAccessible(true);
+        restitute=Entity.class.getDeclaredMethod("restituteMovementAfterCollisions",BlockState.class,boolean.class,boolean.class,Vec3.class);restitute.setAccessible(true);
         Field eyeHeight=Entity.class.getDeclaredField("eyeHeight");eyeHeight.setAccessible(true);eyeHeight.setFloat(entity,1.62f);
         Field blockPos=Entity.class.getDeclaredField("blockPosition");blockPos.setAccessible(true);blockPos.set(entity,BlockPos.ZERO);
         entity.speed=new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.MOVEMENT_SPEED);
@@ -90,7 +103,7 @@ public class FluidMotionOracle {
         Method square=LocalPlayer.class.getDeclaredMethod("modifyInputSpeedForSquareMovement",Vec2.class);square.setAccessible(true);
         Field jumping=LivingEntity.class.getDeclaredField("jumping");jumping.setAccessible(true);
         JsonArray scenarios=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray(), results=new JsonArray();
-        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());JsonArray ticks=new JsonArray();
+        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
           for(var raw:s.getAsJsonArray("inputs")){var i=raw.getAsJsonObject();entity.water=i.get("water").getAsBoolean();entity.swim=i.get("swim").getAsBoolean();entity.sprint=i.get("sprint").getAsBoolean();entity.look=i.get("look").getAsDouble();entity.depth=i.get("depth").getAsDouble();entity.free=i.get("free").getAsBoolean();entity.yaw=i.get("yaw").getAsFloat();level.above=i.get("above").getAsBoolean();
             entity.speed.removeModifier(modifier.id());if(entity.sprint)entity.speed.addTransientModifier(modifier);
             if(entity.water&&i.get("descend").getAsBoolean())entity.down();
@@ -172,6 +185,25 @@ fn water_and_lava_motion_match_vanilla_player() {
         }
         scenarios.push(json!({"position":[0.0,if s%2==0{0.0}else{2.0},0.0],"velocity":[if s%3==0{0.005}else{0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"inputs":inputs}));
     }
+    for water in [false, true] {
+        for bounce in [0.0, 0.25, 0.8] {
+            for block in 0..4 {
+                for suppress in [false, true] {
+                    for axis in 0..3 {
+                        for speed in [0.04, 0.15, 0.5] {
+                            let (position, velocity, wall, ceiling) = match axis {
+                                0 => ([0.0, 1.0, 0.0], [speed, -0.01, 0.02], 0.35, 10000.0),
+                                1 => ([0.0, 0.05, 0.0], [0.02, -speed, 0.0], 10000.0, 10000.0),
+                                _ => ([0.0, 1.0, 0.0], [0.02, speed, 0.0], 10000.0, 1.05),
+                            };
+                            let input = json!({"forward":0.0,"right":0.0,"yaw":0.0,"jump":false,"sprint":false,"slow":false,"water":water,"swim":false,"descend":false,"look":0.0,"depth":1.0,"free":false,"above":true});
+                            scenarios.push(json!({"position":position,"velocity":velocity,"ground":false,"wall":wall,"ceiling":ceiling,"bounce":bounce,"block":block,"suppress":suppress,"inputs":[input]}));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("FluidMotionOracle.java");
     let input = temp.path().join("input.json");
@@ -231,13 +263,35 @@ fn water_and_lava_motion_match_vanilla_player() {
                 look_y: input["look"].as_f64().unwrap(),
                 fluid_above: b("above"),
             };
-            state.tick_fluid(
+            let entity_bounce = if scenario["suppress"].as_bool().unwrap_or(false) {
+                0.0
+            } else {
+                scenario["bounce"].as_f64().unwrap_or(0.0)
+            };
+            let block_bounce = match scenario["block"].as_u64().unwrap_or(0) {
+                1 => "minecraft:slime_block",
+                2 => "minecraft:red_bed",
+                3 => "minecraft:shelf_mushroom",
+                _ => "minecraft:stone",
+            };
+            let block_bounce = if scenario["suppress"].as_bool().unwrap_or(false) {
+                0.0
+            } else {
+                entity_bounce.max(f64::from(crate::items::block_bounce_restitution(
+                    block_bounce,
+                )))
+            };
+            state.tick_fluid_with_restitution(
                 command,
                 fluid,
                 |position, requested, _| {
                     let mut actual = requested;
                     if actual.y < 0.0 && position.y + actual.y < 0.0 {
                         actual.y = -position.y;
+                    }
+                    let ceiling = scenario["ceiling"].as_f64().unwrap_or(10000.0);
+                    if actual.y > 0.0 && position.y + actual.y > ceiling {
+                        actual.y = (ceiling - position.y).max(0.0);
                     }
                     let wall = scenario["wall"].as_f64().unwrap();
                     if actual.x > 0.0 && position.x + f64::from(0.3_f32) + actual.x > wall {
@@ -246,6 +300,24 @@ fn water_and_lava_motion_match_vanilla_player() {
                     (requested, actual)
                 },
                 |_, _| b("free"),
+                |_, requested, actual| {
+                    let y = if requested.y < 0.0 {
+                        crate::items::vertical_restitution(
+                            requested.y,
+                            actual.y,
+                            block_bounce,
+                            0.08,
+                        )
+                    } else {
+                        crate::items::collision_restitution(
+                            requested.y,
+                            actual.y,
+                            entity_bounce,
+                            0.08,
+                        )
+                    };
+                    (entity_bounce, y)
+                },
             );
             if ((state.position - vec3(&result["position"]))
                 .abs()
@@ -272,6 +344,6 @@ fn water_and_lava_motion_match_vanilla_player() {
     );
     println!(
         "Compared {} fluid movement ticks with Minecraft 26.3",
-        64 * 80
+        64 * 80 + 2 * 3 * 4 * 2 * 3 * 3
     );
 }

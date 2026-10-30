@@ -41,6 +41,9 @@ pub mod spawn_heightmaps;
 pub mod survival;
 pub mod world_spawn;
 
+#[cfg(test)]
+mod vanilla_fluid_motion;
+
 const TICK: Duration = Duration::from_millis(50);
 const MAX_TICKS_PER_UPDATE: usize = 5;
 const PLAYER_HALF_WIDTH: f32 = 0.3;

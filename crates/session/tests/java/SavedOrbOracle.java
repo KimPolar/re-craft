@@ -7,11 +7,38 @@ import net.minecraft.nbt.*;
 import net.minecraft.util.ExtraCodecs;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.level.storage.TagValueInput;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.world.entity.ExperienceOrb;
 
 public class SavedOrbOracle {
+  static class TestLevel extends ClientLevel {
+    TestLevel() { super(null,null,null,null,0,0,null,false,0L,0); }
+    @Override public int getNextEntityId() { return 1; }
+    @Override public boolean noCollision(net.minecraft.world.phys.AABB box) { return true; }
+  }
+  static class TestOrb extends ExperienceOrb {
+    TestOrb(TestLevel level) { super(level,0,0,0,7); }
+    void loadExtra(ValueInput input) { super.readAdditionalSaveData(input); }
+  }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var registry = VanillaRegistries.createWorldLookup();
+    if (args.length > 2 && args[2].equals("--live")) {
+      var tag = NbtIo.read(Path.of(args[1]));
+      var input=TagValueInput.create(ProblemReporter.DISCARDING,registry,tag);
+      var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
+      var level=(TestLevel)((sun.misc.Unsafe)unsafeField.get(null)).allocateInstance(TestLevel.class);
+      var orb=new TestOrb(level); orb.loadExtra(input);
+      var count=ExperienceOrb.class.getDeclaredField("count"); count.setAccessible(true);
+      var age=ExperienceOrb.class.getDeclaredField("age"); age.setAccessible(true);
+      if (orb.getValue()!=7 || count.getInt(orb)!=1 || age.getInt(orb)!=4 ||
+          net.minecraft.core.UUIDUtil.CODEC.parse(NbtOps.INSTANCE,tag.get("UUID")).result().isEmpty() ||
+          input.read("Pos",net.minecraft.world.phys.Vec3.CODEC).isEmpty() ||
+          input.read("Motion",net.minecraft.world.phys.Vec3.CODEC).isEmpty())
+        throw new AssertionError("live Rust orb draft differs from Java entity load");
+      return;
+    }
     Tag[] values = {ShortTag.valueOf((short)-32768), ShortTag.valueOf((short)32767),
       IntTag.valueOf(65535), LongTag.valueOf(65538), FloatTag.valueOf(-1.25f),
       DoubleTag.valueOf(8.75), StringTag.valueOf("invalid"), IntTag.valueOf(0),
@@ -57,6 +84,26 @@ public class SavedOrbOracle {
       var after=(ListTag)removed.get("Entities");
       if (after.size()!=1 || !StringTag.valueOf("minecraft:pig").equals(((CompoundTag)after.get(0)).get("id")))
         throw new AssertionError("removed orb or unrelated entity");
+      var created=NbtIo.read(Path.of(args[0], "created-orb.nbt"));
+      var createdInput=TagValueInput.create(ProblemReporter.DISCARDING,registry,created);
+      if (!StringTag.valueOf("minecraft:experience_orb").equals(created.get("id")) ||
+          createdInput.getShortOr("Value",(short)-1)!=7 ||
+          createdInput.read("Count",ExtraCodecs.POSITIVE_INT).orElse(-1)!=2 ||
+          createdInput.getShortOr("Age",(short)-1)!=42 ||
+          createdInput.getShortOr("Air",(short)-1)!=300 ||
+          !createdInput.read("Pos",net.minecraft.world.phys.Vec3.CODEC).orElseThrow().equals(new net.minecraft.world.phys.Vec3(2,63,-2)) ||
+          !DoubleTag.valueOf(0.75).equals(created.get("fall_distance")) ||
+          !FloatTag.valueOf(123.5f).equals(((ListTag)created.get("Rotation")).get(0)) ||
+          !new IntArrayTag(new int[]{9,8,7,6}).equals(created.get("UUID")))
+        throw new AssertionError("created orb contents");
+      var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
+      var level=(TestLevel)((sun.misc.Unsafe)unsafeField.get(null)).allocateInstance(TestLevel.class);
+      var createdOrb=new TestOrb(level); createdOrb.loadExtra(createdInput);
+      var count=ExperienceOrb.class.getDeclaredField("count"); count.setAccessible(true);
+      var age=ExperienceOrb.class.getDeclaredField("age"); age.setAccessible(true);
+      var health=ExperienceOrb.class.getDeclaredField("health"); health.setAccessible(true);
+      if (createdOrb.getValue()!=7 || count.getInt(createdOrb)!=2 || age.getInt(createdOrb)!=42 || health.getInt(createdOrb)!=1)
+        throw new AssertionError("created orb Java entity load");
     }
   }
 }

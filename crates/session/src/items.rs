@@ -335,7 +335,7 @@ impl CreatedItemIdentity {
     }
 }
 
-fn uuid_v4(mut bytes: [u8; 16]) -> [i32; 4] {
+pub(crate) fn uuid_v4(mut bytes: [u8; 16]) -> [i32; 4] {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     std::array::from_fn(|i| i32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))

@@ -44,6 +44,90 @@ pub struct OrbDraft {
     document: NamedTag,
 }
 
+/// A new orb has no source entity; its creation and related world effects
+/// must be included in the same coordinated save.
+pub struct CreatedOrbDraft {
+    document: NamedTag,
+}
+
+impl CreatedOrbDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+}
+
+pub fn draft_created(
+    uuid: [i32; 4],
+    yaw: f32,
+    fall_distance: f64,
+    state: OrbSaveState,
+) -> Result<CreatedOrbDraft> {
+    ensure!(
+        state.position.is_finite()
+            && state.position.x.abs() <= 30_000_512.0
+            && state.position.z.abs() <= 30_000_512.0
+            && state.position.y.abs() <= 20_000_000.0,
+        "position would be clamped"
+    );
+    ensure!(
+        state.velocity.is_finite() && state.velocity.abs().max_element() <= 10.0,
+        "velocity would be discarded"
+    );
+    ensure!(
+        yaw.is_finite()
+            && fall_distance.is_finite()
+            && fall_distance >= 0.0
+            && state.invulnerable_time >= 0,
+        "invalid orb base state"
+    );
+    let age = i16::try_from(state.age).context("orb age cannot be saved")?;
+    let value = i16::try_from(state.value).context("orb value cannot be saved")?;
+    let health = i16::try_from(state.health).context("orb health cannot be saved")?;
+    let fire = i16::try_from(state.fire_ticks).context("orb fire cannot be saved")?;
+    ensure!(value > 0 && state.count > 0, "invalid orb count or value");
+    let vector = |v: DVec3| Tag::List {
+        element_type: TagType::Double,
+        values: v.to_array().into_iter().map(Tag::Double).collect(),
+    };
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:experience_orb".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ("Pos".into(), vector(state.position)),
+            ("Motion".into(), vector(state.velocity)),
+            (
+                "Rotation".into(),
+                Tag::List {
+                    element_type: TagType::Float,
+                    values: vec![Tag::Float(yaw), Tag::Float(0.0)],
+                },
+            ),
+            ("fall_distance".into(), Tag::Double(fall_distance)),
+            ("Air".into(), Tag::Short(300)),
+            ("PortalCooldown".into(), Tag::Int(0)),
+            ("OnGround".into(), Tag::Byte(i8::from(state.on_ground))),
+            ("NoGravity".into(), Tag::Byte(i8::from(state.no_gravity))),
+            ("Age".into(), Tag::Short(age)),
+            ("Value".into(), Tag::Short(value)),
+            ("Count".into(), Tag::Int(state.count)),
+            ("Health".into(), Tag::Short(health)),
+            ("Fire".into(), Tag::Short(fire)),
+            (
+                "Invulnerable".into(),
+                Tag::Byte(i8::from(state.invulnerable)),
+            ),
+            (
+                "invulnerable_time".into(),
+                Tag::Int(state.invulnerable_time),
+            ),
+        ]),
+    };
+    ensure!(read(&document.value)?.is_some(), "cannot decode new orb");
+    native_persistence::nbt::write(&document)?;
+    Ok(CreatedOrbDraft { document })
+}
+
 impl OrbDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -474,6 +558,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn created_orb_rejects_duplicate_uuid_and_missing_destination() {
+        use crate::saved_falling_block::draft_entity_chunks_with_created_orbs;
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeMap;
+        let home = ChunkPos { x: 0, z: -1 };
+        let target = ChunkPos { x: 1, z: -1 };
+        let id = [9, 8, 7, 6];
+        let make = || {
+            draft_created(
+                id,
+                45.0,
+                0.0,
+                OrbSaveState {
+                    position: DVec3::new(17.0, 63.0, -2.0),
+                    ..state()
+                },
+            )
+            .unwrap()
+        };
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![original().value],
+                    },
+                ),
+            ]),
+        };
+        let created = [make()];
+        assert!(
+            draft_entity_chunks_with_created_orbs(
+                &BTreeMap::from([(home, Some(&source))]),
+                &[],
+                &[],
+                &[],
+                &[],
+                &created
+            )
+            .is_err()
+        );
+        let sources = BTreeMap::from([(home, Some(&source)), (target, None)]);
+        let drafts =
+            draft_entity_chunks_with_created_orbs(&sources, &[], &[], &[], &[], &created).unwrap();
+        let Tag::List { values, .. } = drafts[&target].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(read(&values[0]).unwrap().unwrap().uuid, Some(id));
+        assert!(
+            draft_entity_chunks_with_created_orbs(&sources, &[], &[], &[], &[], &[make(), make()])
+                .is_err()
+        );
+        let collision = draft_created(
+            [1, 2, 3, 4],
+            45.0,
+            0.0,
+            OrbSaveState {
+                position: DVec3::new(17.0, 63.0, -2.0),
+                ..state()
+            },
+        )
+        .unwrap();
+        assert!(
+            draft_entity_chunks_with_created_orbs(&sources, &[], &[], &[], &[], &[collision])
+                .is_err()
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -578,6 +736,21 @@ mod tests {
             )
             .unwrap();
         }
+        let created = super::draft_created(
+            [9, 8, 7, 6],
+            123.5,
+            0.75,
+            OrbSaveState {
+                count: 2,
+                ..state()
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("created-orb.nbt"),
+            native_persistence::nbt::write(created.document()).unwrap(),
+        )
+        .unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)

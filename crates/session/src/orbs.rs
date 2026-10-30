@@ -47,8 +47,61 @@ struct Orb {
     count: i32,
     random: LegacyRandom,
     source: Option<Arc<native_persistence::nbt::Tag>>,
+    created: Option<CreatedOrb>,
     save_unresolved: bool,
     damage: OrbDamageState,
+}
+
+#[derive(Clone)]
+struct CreatedOrb {
+    uuid: Option<[i32; 4]>,
+    origin: DVec3,
+    yaw: f32,
+    fall_distance: f64,
+    verified_position: DVec3,
+    visited: BTreeSet<native_world::loaded::ChunkPos>,
+    valid: bool,
+    checked: bool,
+}
+
+impl CreatedOrb {
+    fn new(origin: DVec3, yaw: f32) -> Self {
+        let mut bytes = [0_u8; 16];
+        let uuid = getrandom::fill(&mut bytes)
+            .ok()
+            .map(|_| crate::items::uuid_v4(bytes));
+        let chunk = orb_chunk(origin).ok();
+        Self {
+            uuid,
+            origin,
+            yaw,
+            fall_distance: 0.0,
+            verified_position: origin,
+            visited: chunk.into_iter().collect(),
+            valid: chunk.is_some(),
+            checked: false,
+        }
+    }
+    fn verify(&mut self, start: DVec3, end: DVec3, safe: bool) {
+        self.checked = true;
+        self.valid &= safe && self.verified_position == start;
+        let (Ok(a), Ok(b)) = (orb_chunk(start), orb_chunk(end)) else {
+            self.valid = false;
+            return;
+        };
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (z0, z1) = (a.z.min(b.z), a.z.max(b.z));
+        if (i64::from(x1) - i64::from(x0) + 1) * (i64::from(z1) - i64::from(z0) + 1) > 64 {
+            self.valid = false;
+            return;
+        }
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                self.visited.insert(native_world::loaded::ChunkPos { x, z });
+            }
+        }
+        self.verified_position = end;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +146,7 @@ pub(crate) struct Orbs {
     saved_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
     saved_merges: Vec<SavedOrbMerge>,
     removed_saved: Vec<Orb>,
+    player_uuid: Option<[i32; 4]>,
 }
 
 impl Default for Orbs {
@@ -113,6 +167,7 @@ impl Default for Orbs {
             saved_pickups: BTreeMap::new(),
             saved_merges: Vec::new(),
             removed_saved: Vec::new(),
+            player_uuid: None,
         }
     }
 }
@@ -141,6 +196,9 @@ impl Orbs {
                 x: (position.x.floor() as i32).div_euclid(16),
                 z: (position.z.floor() as i32).div_euclid(16),
             });
+            if let Some(created) = &orb.created {
+                chunks.extend(created.visited.iter().copied());
+            }
         }
         chunks.extend(
             self.saved_pickups
@@ -271,6 +329,7 @@ impl Orbs {
             count: saved.count,
             random: LegacyRandom::new(self.entity_seeder.next_long()),
             source: Some(saved.source),
+            created: None,
             save_unresolved: false,
             damage: OrbDamageState {
                 health: saved.health,
@@ -288,6 +347,18 @@ impl Orbs {
         self.entities
             .iter()
             .any(|entity| crate::items::ItemEntities::active_in(&chunk, entity.visual.position))
+    }
+
+    pub(crate) fn has_created_in_chunk(&self, pos: native_world::loaded::ChunkPos) -> bool {
+        self.entities.iter().any(|orb| {
+            orb.created.as_ref().is_some_and(|created| {
+                created.visited.contains(&pos) || orb_chunk(orb.visual.position).ok() == Some(pos)
+            })
+        })
+    }
+
+    pub(crate) fn set_player_uuid(&mut self, uuid: Option<[i32; 4]>) {
+        self.player_uuid = uuid;
     }
 
     pub fn draft_saved(
@@ -355,6 +426,32 @@ impl Orbs {
                 .transpose()?
                 .flatten();
             let source = uuid.and_then(|uuid| saved_uuids.get(&uuid).copied());
+            if let Some(created) = &orb.created {
+                if !positions.contains(&destination) && created.visited.is_disjoint(positions) {
+                    continue;
+                }
+                ensure!(orb.source.is_none(), "created orb has a saved source");
+                let uuid = created.uuid.context("created orb UUID is unavailable")?;
+                ensure!(seen.insert(uuid), "duplicate orb UUID");
+                ensure!(
+                    !saved_uuids.contains_key(&uuid) && self.player_uuid != Some(uuid),
+                    "created orb UUID conflicts with existing identity"
+                );
+                ensure!(
+                    positions.contains(&orb_chunk(created.origin)?)
+                        && positions.contains(&destination)
+                        && created.visited.is_subset(positions),
+                    "created orb path chunk is unavailable"
+                );
+                ensure!(
+                    created.checked
+                        && created.valid
+                        && created.verified_position == position
+                        && !orb.save_unresolved,
+                    "created orb base state is not verified"
+                );
+                continue;
+            }
             if !positions.contains(&destination)
                 && !source.is_some_and(|pos| positions.contains(&pos))
             {
@@ -432,6 +529,38 @@ impl Orbs {
         Ok(())
     }
 
+    pub(crate) fn draft_created_in_chunks(
+        &self,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> anyhow::Result<Vec<crate::saved_orb::CreatedOrbDraft>> {
+        use anyhow::{Context, ensure};
+        let mut result = Vec::new();
+        for orb in &self.entities {
+            let Some(created) = &orb.created else {
+                continue;
+            };
+            let destination = orb_chunk(orb.visual.position)?;
+            if !positions.contains(&destination) && created.visited.is_disjoint(positions) {
+                continue;
+            }
+            ensure!(
+                created.checked
+                    && created.valid
+                    && created.verified_position == orb.visual.position
+                    && !orb.save_unresolved,
+                "created orb base state is not verified"
+            );
+            let state = orb_state(orb);
+            result.push(crate::saved_orb::draft_created(
+                created.uuid.context("created orb UUID is unavailable")?,
+                created.yaw,
+                created.fall_distance,
+                state,
+            )?);
+        }
+        Ok(result)
+    }
+
     pub fn drop_player_experience(
         &mut self,
         position: DVec3,
@@ -447,9 +576,6 @@ impl Orbs {
 
     /// Split and merge newly awarded experience using Java's orb value tiers.
     pub(crate) fn award(&mut self, position: DVec3, mut amount: i32) {
-        if amount > 0 {
-            self.uncoordinated_lifecycle = true;
-        }
         while amount > 0 {
             let value = VALUES
                 .iter()
@@ -465,11 +591,12 @@ impl Orbs {
                 value,
                 &mut self.award_random,
             ) {
+                self.uncoordinated_lifecycle = true;
                 continue;
             }
             // The Java constructor also consumes a random yaw before its
             // three velocity components. This session has its own RNG.
-            self.random.next_float();
+            let yaw = self.random.next_float() * 360.0_f32;
             let velocity = DVec3::new(
                 (self.random.next_double() * 0.2 - 0.1) * 2.0,
                 self.random.next_double() * 0.2 * 2.0,
@@ -496,6 +623,7 @@ impl Orbs {
                 count: 1,
                 random: LegacyRandom::new(self.entity_seeder.next_long()),
                 source: None,
+                created: Some(CreatedOrb::new(position, yaw)),
                 save_unresolved: false,
                 damage: OrbDamageState::default(),
             });
@@ -551,12 +679,52 @@ impl Orbs {
         player_random: &mut LegacyRandom,
         xp: &mut Experience,
         score: &mut i32,
+        shape: impl FnMut(IVec3) -> &'a [Aabb],
+        friction: impl FnMut(IVec3) -> f32,
+        keep_support_height: impl FnMut(IVec3) -> bool,
+        fluid: impl FnMut(BoundingBox, DVec3) -> (native_world::fluid::FluidContacts, bool),
+        fast_lava: bool,
+        path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+    ) {
+        self.tick_with_fluid_and_proof(
+            origin,
+            player,
+            pose,
+            mode,
+            alive,
+            inventory,
+            player_random,
+            xp,
+            score,
+            shape,
+            friction,
+            keep_support_height,
+            fluid,
+            fast_lava,
+            path,
+            |_, _| false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_with_fluid_and_proof<'a>(
+        &mut self,
+        origin: IVec3,
+        player: DVec3,
+        pose: PlayerPose,
+        mode: GameMode,
+        alive: bool,
+        inventory: &mut Arc<PlayerInventory>,
+        player_random: &mut LegacyRandom,
+        xp: &mut Experience,
+        score: &mut i32,
         mut shape: impl FnMut(IVec3) -> &'a [Aabb],
         mut friction: impl FnMut(IVec3) -> f32,
         mut keep_support_height: impl FnMut(IVec3) -> bool,
         mut fluid: impl FnMut(BoundingBox, DVec3) -> (native_world::fluid::FluidContacts, bool),
         fast_lava: bool,
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+        mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
     ) {
         self.pickup_delay = self.pickup_delay.saturating_sub(1);
         if self.entities.is_empty() {
@@ -729,6 +897,24 @@ impl Orbs {
             }
             let hit_y = requested.y != actual.y;
             entity.on_ground = hit_y && requested.y < 0.0;
+            if let Some(created) = &mut entity.created {
+                if entity.on_ground {
+                    created.fall_distance = 0.0;
+                } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
+                    created.fall_distance -= f64::from(actual.y as f32);
+                }
+                let supported = contacts.water.depth <= 0.0
+                    && contacts.lava.depth <= 0.0
+                    && !lava_at_position
+                    && entity.damage.fire_ticks == 0
+                    && !entity.save_unresolved
+                    && safe(bounds, actual);
+                created.verify(
+                    entity.visual.previous_position,
+                    entity.visual.position,
+                    supported,
+                );
+            }
             let relative_position = entity.visual.position - origin.as_dvec3();
             let support = if entity.on_ground {
                 let found = movement::supporting_box(
@@ -868,7 +1054,11 @@ fn draft_orb(orb: &Orb) -> anyhow::Result<crate::saved_orb::OrbDraft> {
         name: "".into(),
         value: (**source).clone(),
     };
-    let state = crate::saved_orb::OrbSaveState {
+    crate::saved_orb::draft(&original, orb_state(orb))
+}
+
+fn orb_state(orb: &Orb) -> crate::saved_orb::OrbSaveState {
+    crate::saved_orb::OrbSaveState {
         position: orb.visual.position,
         velocity: orb.velocity,
         on_ground: orb.on_ground,
@@ -880,8 +1070,7 @@ fn draft_orb(orb: &Orb) -> anyhow::Result<crate::saved_orb::OrbDraft> {
         fire_ticks: orb.damage.fire_ticks,
         invulnerable: orb.damage.invulnerable,
         invulnerable_time: orb.damage.invulnerable_time,
-    };
-    crate::saved_orb::draft(&original, state)
+    }
 }
 
 fn orb_hurt(
@@ -1270,6 +1459,7 @@ mod tests {
             count,
             random: LegacyRandom::new(0),
             source: None,
+            created: None,
             save_unresolved: false,
             damage: OrbDamageState::default(),
         }
@@ -1491,8 +1681,83 @@ mod tests {
         let mut orbs = Orbs::default();
         orbs.award(DVec3::ZERO, 1);
         assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
-        orbs.entities.clear();
+        let mut xp = Experience::default();
+        orbs.tick(
+            IVec3::ZERO,
+            DVec3::ZERO,
+            PlayerPose::Standing,
+            GameMode::Survival,
+            true,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(0),
+            &mut xp,
+            &mut 0,
+            |_| &[],
+            |_| 0.6,
+        );
+        assert_eq!(xp.total, 1);
+        assert!(orbs.entities.is_empty());
         assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
+    }
+
+    #[test]
+    fn created_orb_requires_its_visited_chunks_and_unique_uuid() {
+        use native_world::loaded::ChunkPos;
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let mut orbs = Orbs::default();
+        orbs.award(DVec3::new(15.9, 5.0, 0.5), 7);
+        orbs.entities[0].velocity = DVec3::new(0.5, 0.0, 0.0);
+        orbs.entities[0].no_gravity = true;
+        let mut inventory = Arc::new(PlayerInventory::default());
+        let mut random = LegacyRandom::new(0);
+        let mut xp = Experience::default();
+        let mut score = 0;
+        let mut tick = |orbs: &mut Orbs, safe| {
+            orbs.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Survival,
+                true,
+                &mut inventory,
+                &mut random,
+                &mut xp,
+                &mut score,
+                |_| &[],
+                |_| 0.6,
+                |_| false,
+                |_, _| (Default::default(), false),
+                false,
+                |_, _, _| Some(Vec::new()),
+                move |_, _| safe,
+            )
+        };
+        tick(&mut orbs, true);
+        let owners = BTreeMap::new();
+        let both = BTreeSet::from([left, right]);
+        assert_eq!(orbs.affected_orb_chunks(&owners).unwrap(), both);
+        assert!(
+            orbs.validate_chunk_group(&BTreeSet::from([left]), &owners)
+                .is_err()
+        );
+        assert!(
+            orbs.validate_chunk_group(&BTreeSet::from([right]), &owners)
+                .is_err()
+        );
+        let uuid = orbs.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        assert_eq!(orbs.draft_created_in_chunks(&both).unwrap().len(), 1);
+        orbs.set_player_uuid(Some(uuid));
+        assert!(orbs.validate_chunk_group(&both, &owners).is_err());
+        orbs.set_player_uuid(None);
+        assert!(
+            orbs.validate_chunk_group(&both, &BTreeMap::from([(uuid, left)]))
+                .is_err()
+        );
+        tick(&mut orbs, false);
+        assert!(orbs.affected_orb_chunks(&owners).is_err());
+        tick(&mut orbs, true);
+        assert!(orbs.affected_orb_chunks(&owners).is_err());
     }
 
     #[test]

@@ -308,6 +308,24 @@ pub fn draft_entity_chunks_with_item_and_orb_changes(
     removed_orbs: &[saved_orb::OrbDraft],
     created_items: &[saved_item::CreatedItemDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_created_orbs(
+        originals,
+        replacements,
+        removed_items,
+        removed_orbs,
+        created_items,
+        &[],
+    )
+}
+
+pub fn draft_entity_chunks_with_created_orbs(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
+    replacements: &[EntityReplacement<'_>],
+    removed_items: &[saved_item::ItemDraft],
+    removed_orbs: &[saved_orb::OrbDraft],
+    created_items: &[saved_item::CreatedItemDraft],
+    created_orbs: &[saved_orb::CreatedOrbDraft],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     let empty: BTreeMap<_, _> = originals
         .iter()
         .filter(|(_, source)| source.is_none())
@@ -343,12 +361,13 @@ pub fn draft_entity_chunks_with_item_and_orb_changes(
         .map(EntityReplacement::Item)
         .chain(removed_orbs.iter().map(EntityReplacement::Orb))
         .collect();
-    let mut drafts = draft_entity_chunks_with_moves_and_removals(
-        &complete,
-        replacements,
-        &removals,
-        created_items,
-    )?;
+    let created: Vec<_> = created_items
+        .iter()
+        .map(CreatedEntity::Item)
+        .chain(created_orbs.iter().map(CreatedEntity::Orb))
+        .collect();
+    let mut drafts =
+        draft_entity_chunks_with_moves_and_removals(&complete, replacements, &removals, &created)?;
     for pos in empty.keys() {
         drafts
             .get_mut(pos)
@@ -368,11 +387,35 @@ pub fn draft_entity_chunks_with_moves(
     draft_entity_chunks_with_moves_and_removals(originals, replacements, &[], &[])
 }
 
+enum CreatedEntity<'a> {
+    Item(&'a saved_item::CreatedItemDraft),
+    Orb(&'a saved_orb::CreatedOrbDraft),
+}
+
+impl CreatedEntity<'_> {
+    fn document(&self) -> &NamedTag {
+        match self {
+            Self::Item(value) => value.document(),
+            Self::Orb(value) => value.document(),
+        }
+    }
+    fn position(&self) -> Result<DVec3> {
+        match self {
+            Self::Item(value) => Ok(saved_item::read(&value.document().value)?
+                .context("created entity is not an item")?
+                .position),
+            Self::Orb(value) => Ok(saved_orb::read(&value.document().value)?
+                .context("created entity is not an orb")?
+                .position),
+        }
+    }
+}
+
 fn draft_entity_chunks_with_moves_and_removals(
     originals: &BTreeMap<native_world::loaded::ChunkPos, &NamedTag>,
     replacements: &[EntityReplacement<'_>],
     removed_entities: &[EntityReplacement<'_>],
-    created_items: &[saved_item::CreatedItemDraft],
+    created_entities: &[CreatedEntity<'_>],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     use std::collections::BTreeSet;
 
@@ -390,7 +433,10 @@ fn draft_entity_chunks_with_moves_and_removals(
                     "duplicate entity UUID across chunks"
                 );
             } else {
-                ensure!(created_items.is_empty(), "source entity has no stable UUID");
+                ensure!(
+                    created_entities.is_empty(),
+                    "source entity has no stable UUID"
+                );
             }
         }
         drafts.insert(position, draft);
@@ -444,7 +490,7 @@ fn draft_entity_chunks_with_moves_and_removals(
     let mut matched_removals = BTreeSet::new();
     let mut incoming: BTreeMap<_, Vec<Tag>> = BTreeMap::new();
     let mut created = BTreeSet::new();
-    for item in created_items {
+    for item in created_entities {
         let entity = &item.document().value;
         let uuid =
             saved_item::optional_uuid(entity, "UUID")?.context("created item has no UUID")?;
@@ -452,9 +498,7 @@ fn draft_entity_chunks_with_moves_and_removals(
             !owners.contains_key(&uuid) && created.insert(uuid),
             "created item UUID conflicts with another entity"
         );
-        let position = saved_item::read(entity)?
-            .context("created entity is not an item")?
-            .position;
+        let position = item.position()?;
         let destination = native_world::loaded::ChunkPos {
             x: (position.x.floor() as i32).div_euclid(16),
             z: (position.z.floor() as i32).div_euclid(16),

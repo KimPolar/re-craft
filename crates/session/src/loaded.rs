@@ -2619,6 +2619,7 @@ impl LoadedSession {
     /// grants pickup of an item restricted to an owner.
     pub fn set_player_uuid(&mut self, uuid: Option<[i32; 4]>) {
         self.dropped_items.set_player_uuid(uuid);
+        self.experience_orbs.set_player_uuid(uuid);
     }
 
     pub fn set_item_damage_rules(
@@ -3242,6 +3243,10 @@ impl LoadedSession {
         let Some(SavedEntityData::Present(chunk)) = self.entity_chunks.get(&pos) else {
             anyhow::bail!("saved entity chunk is unavailable");
         };
+        anyhow::ensure!(
+            !self.experience_orbs.has_created_in_chunk(pos),
+            "new experience orb requires coordinated entity chunk drafts"
+        );
         let falling = self.collect_existing_falling_drafts(pos, chunk)?;
         let mut items = Vec::new();
         let mut orbs = Vec::new();
@@ -3443,13 +3448,18 @@ impl LoadedSession {
         let created_items = self
             .dropped_items
             .draft_created_items_in_chunks(positions)?;
+        let created_orbs = self.experience_orbs.draft_created_in_chunks(positions)?;
         let created_removals = self.dropped_items.created_removal_effects(positions);
-        if !created_items.is_empty() || !created_removals.is_empty() {
+        if !created_items.is_empty() || !created_orbs.is_empty() || !created_removals.is_empty() {
             let mut created_uuids = BTreeSet::new();
-            for item in &created_items {
-                let uuid = crate::saved_item::optional_uuid(&item.document().value, "UUID")?
-                    .context("created item has no stable UUID")?;
-                ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
+            for document in created_items
+                .iter()
+                .map(|item| item.document())
+                .chain(created_orbs.iter().map(|orb| orb.document()))
+            {
+                let uuid = crate::saved_item::optional_uuid(&document.value, "UUID")?
+                    .context("created entity has no stable UUID")?;
+                ensure!(created_uuids.insert(uuid), "duplicate created entity UUID");
             }
             for (uuid, _) in created_removals {
                 ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
@@ -3477,12 +3487,13 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_item_and_orb_changes(
+        crate::saved_falling_block::draft_entity_chunks_with_created_orbs(
             &originals,
             &replacements,
             &removed_items,
             &removed_orbs,
             &created_items,
+            &created_orbs,
         )
     }
 
@@ -8786,7 +8797,8 @@ impl LoadedSession {
             bounds,
             air,
         };
-        self.experience_orbs.tick_with_fluid(
+        let mut orb_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+        self.experience_orbs.tick_with_fluid_and_proof(
             origin,
             self.motion.position,
             self.player.pose,
@@ -8828,6 +8840,7 @@ impl LoadedSession {
             },
             self.fast_lava,
             |bounds, actual, requested| fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos)),
+            |bounds, actual| orb_path_proof.safe(bounds, actual),
         );
     }
 
@@ -15958,6 +15971,139 @@ mod tests {
                 .is_err(),
             "unknown path effects must reject the draft"
         );
+    }
+
+    #[test]
+    fn created_orb_drafts_require_a_verified_path_and_known_entity_chunk() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::new(NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![
+                            ("DataVersion".into(), Tag::Int(5023)),
+                            ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                            (
+                                "Entities".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                    }),
+                })),
+            )
+            .unwrap();
+        let origin = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        session.experience_orbs.award(origin, 7);
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        for _ in 0..4 {
+            session.update(TICK);
+        }
+        let drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        let orb = crate::saved_orb::read(&values[0]).unwrap().unwrap();
+        assert_eq!((orb.value, orb.count, orb.age), (7, 1, 4));
+        assert_ne!(orb.position, origin);
+        assert!(orb.uuid.is_some());
+        assert!(session.draft_existing_entity_chunk(home).is_err());
+        assert!(
+            matches!(values[0].get("Rotation"), Some(Tag::List { values, .. }) if matches!(values.as_slice(), [Tag::Float(_), Tag::Float(0.0)]))
+        );
+        let portal = session.intern_block(state("minecraft:nether_portal", &[("axis", "x")]));
+        assert!(session.set(IVec3::new(3, 3, 3), portal));
+        session.update(TICK);
+        assert!(session.draft_tracked_entity_chunks().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn created_session_orb_is_decoded_by_java() {
+        use native_persistence::nbt::{self, NamedTag, Tag};
+        use std::{path::PathBuf, process::Command};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        session
+            .experience_orbs
+            .award(session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5), 7);
+        for _ in 0..4 {
+            session.update(TICK);
+        }
+        let drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let entity_path = temp.path().join("live-orb.nbt");
+        std::fs::write(
+            &entity_path,
+            nbt::write(&NamedTag {
+                name: "".into(),
+                value: values[0].clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SavedOrbOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/SavedOrbOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SavedOrbOracle")
+                .arg(temp.path())
+                .arg(&entity_path)
+                .arg("--live"),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java orb oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

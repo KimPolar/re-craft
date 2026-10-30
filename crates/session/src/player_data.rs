@@ -79,7 +79,7 @@ pub(crate) fn text(tag: &Tag) -> Option<String> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavedAttribute {
     base: f64,
     modifiers: std::collections::BTreeMap<ResourceId, AttributeModifier>,
@@ -107,6 +107,10 @@ impl SavedAttribute {
 
     pub(crate) fn remove_modifier(&mut self, id: &ResourceId) {
         self.modifiers.remove(id);
+    }
+
+    pub(crate) fn modifier(&self, id: &ResourceId) -> Option<&AttributeModifier> {
+        self.modifiers.get(id)
     }
 
     pub(crate) fn value(&self, minimum: f64, maximum: f64) -> Result<f64> {
@@ -729,6 +733,170 @@ impl PlayerStateDraft {
         Ok(())
     }
 
+    /// Update only the persistent status-effect modifiers on movement speed.
+    /// Other attribute and modifier data remain byte-for-byte equivalent as NBT.
+    pub(crate) fn set_movement_effect_modifiers(
+        &mut self,
+        original: &NamedTag,
+        initial: &SavedAttribute,
+        current: &SavedAttribute,
+    ) -> Result<()> {
+        let ids = [
+            ResourceId::parse("minecraft:effect.speed")?,
+            ResourceId::parse("minecraft:effect.slowness")?,
+        ];
+        let mut unchanged_initial = initial.clone();
+        let mut unchanged_current = current.clone();
+        for id in &ids {
+            unchanged_initial.remove_modifier(id);
+            unchanged_current.remove_modifier(id);
+        }
+        ensure!(
+            unchanged_initial == unchanged_current,
+            "untracked movement attribute change"
+        );
+        let changed = ids
+            .iter()
+            .any(|id| initial.modifier(id) != current.modifier(id));
+        if !changed {
+            return Ok(());
+        }
+        let mut attributes = match unique_field(&original.value, "attributes")? {
+            Some(Tag::List {
+                element_type,
+                values,
+            }) => {
+                ensure!(
+                    *element_type == TagType::Compound || values.is_empty(),
+                    "attributes are not a compound list"
+                );
+                values.clone()
+            }
+            None => Vec::new(),
+            Some(_) => bail!("attributes are not a list"),
+        };
+        let mut movement_index = None;
+        let mut attribute_ids = std::collections::BTreeSet::new();
+        for (index, attribute) in attributes.iter().enumerate() {
+            let id = unique_field(attribute, "id")?
+                .and_then(text)
+                .context("attribute has no valid id")?;
+            let id = ResourceId::parse(&id)?;
+            ensure!(attribute_ids.insert(id.clone()), "duplicate attribute id");
+            if id.namespace == "minecraft" && id.path == "movement_speed" {
+                movement_index = Some(index);
+            }
+        }
+        if movement_index.is_none() {
+            ensure!(
+                initial == &SavedAttribute::with_base(f64::from(0.1_f32)),
+                "missing original movement attribute"
+            );
+            attributes.push(Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                ("base".into(), Tag::Double(f64::from(0.1_f32))),
+            ]));
+            movement_index = Some(attributes.len() - 1);
+        }
+        let attribute = &mut attributes[movement_index.unwrap()];
+        let base = unique_field(attribute, "base")?
+            .and_then(numeric_double)
+            .context("movement attribute has no numeric base")?;
+        ensure!(base.is_finite(), "movement attribute base is not finite");
+        let source_modifiers = unique_field(attribute, "modifiers")?;
+        let mut modifiers = match source_modifiers {
+            None => Vec::new(),
+            Some(Tag::List {
+                element_type,
+                values,
+            }) => {
+                ensure!(
+                    *element_type == TagType::Compound || values.is_empty(),
+                    "movement modifiers are not a compound list"
+                );
+                values.clone()
+            }
+            Some(_) => bail!("movement modifiers are not a list"),
+        };
+        let mut modifier_ids = std::collections::BTreeSet::new();
+        for modifier in &modifiers {
+            let id = unique_field(modifier, "id")?
+                .and_then(text)
+                .context("movement modifier has no valid id")?;
+            let id = ResourceId::parse(&id)?;
+            ensure!(modifier_ids.insert(id), "duplicate movement modifier id");
+            let amount = unique_field(modifier, "amount")?
+                .and_then(numeric_double)
+                .context("movement modifier has no amount")?;
+            ensure!(amount.is_finite(), "movement modifier amount is not finite");
+            let operation = unique_field(modifier, "operation")?
+                .and_then(text)
+                .context("movement modifier has no operation")?;
+            AttributeOperation::parse(&operation)?;
+        }
+        for id in &ids {
+            if initial.modifier(id) == current.modifier(id) {
+                continue;
+            }
+            let index = modifiers.iter().position(|tag| {
+                tag.get("id")
+                    .and_then(text)
+                    .and_then(|value| ResourceId::parse(&value).ok())
+                    .as_ref()
+                    == Some(id)
+            });
+            if let Some(index) = index {
+                let Tag::Compound(entries) = &modifiers[index] else {
+                    unreachable!()
+                };
+                ensure!(
+                    entries.iter().all(|(name, _)| ["id", "amount", "operation"]
+                        .iter()
+                        .any(|field| name.matches(field))),
+                    "changed movement modifier contains unsupported fields"
+                );
+                modifiers.remove(index);
+            }
+            if let Some(modifier) = current.modifier(id) {
+                ensure!(
+                    modifier.operation == AttributeOperation::AddMultipliedTotal
+                        && modifier.amount.is_finite(),
+                    "unsupported effect movement modifier"
+                );
+                modifiers.push(Tag::Compound(vec![
+                    (
+                        "id".into(),
+                        Tag::String(format!("{}:{}", id.namespace, id.path).as_str().into()),
+                    ),
+                    ("amount".into(), Tag::Double(modifier.amount)),
+                    (
+                        "operation".into(),
+                        Tag::String("add_multiplied_total".into()),
+                    ),
+                ]));
+            }
+        }
+        set_field(
+            attribute,
+            "modifiers",
+            Some(Tag::List {
+                element_type: TagType::Compound,
+                values: modifiers,
+            }),
+        )?;
+        set_field(
+            &mut self.0.document.value,
+            "attributes",
+            Some(Tag::List {
+                element_type: TagType::Compound,
+                values: attributes,
+            }),
+        )?;
+        native_persistence::nbt::write(&self.0.document)
+            .context("movement attribute draft cannot be encoded")?;
+        Ok(())
+    }
+
     pub(crate) fn set_flying(&mut self, original: &NamedTag, flying: bool) -> Result<()> {
         let source = unique_field(&original.value, "abilities")?;
         if let Some(value @ Tag::Compound(_)) = source {
@@ -914,6 +1082,8 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "resistance"
                         | "slow_falling"
                         | "levitation"
+                        | "speed"
+                        | "slowness"
                         | "water_breathing"
                         | "conduit_power"
                         | "breath_of_the_nautilus"

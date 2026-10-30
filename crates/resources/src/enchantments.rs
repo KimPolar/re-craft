@@ -75,7 +75,7 @@ impl EquipmentSlot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AttributeModifier {
     pub id: ResourceId,
     pub operation: AttributeOperation,

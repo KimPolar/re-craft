@@ -245,6 +245,7 @@ pub struct LoadedSession {
 struct EffectSaveTracking {
     breathing: crate::survival::BreathingEffects,
     fall: crate::survival::FallEffects,
+    movement_speed: crate::player_data::SavedAttribute,
     ticks: u64,
 }
 
@@ -581,6 +582,7 @@ impl LoadedSession {
         attribute: crate::player_data::SavedAttribute,
     ) -> anyhow::Result<()> {
         attribute.value(0.0, 1024.0)?;
+        self.effect_save_invalid |= self.tick != 0;
         self.movement_speed_attribute = attribute;
         self.movement_speed_cache = None;
         Ok(())
@@ -796,6 +798,21 @@ impl LoadedSession {
                     && crate::player_data::read_saved_fall_effects(original)? == *initial_fall,
                 "saved player effects do not match the initial session state"
             );
+            let movement = if initial_fall.speed.is_some() || initial_fall.slowness.is_some() {
+                let initial = self
+                    .effect_save_tracking
+                    .as_ref()
+                    .map_or(&self.movement_speed_attribute, |tracking| {
+                        &tracking.movement_speed
+                    });
+                anyhow::ensure!(
+                    crate::player_data::read_saved_movement_speed_attribute(original)? == *initial,
+                    "saved movement speed does not match the initial session state"
+                );
+                Some(initial)
+            } else {
+                None
+            };
             let effects = crate::player_data::advance_saved_effects(original, effect_ticks)?;
             let advanced = native_persistence::nbt::NamedTag {
                 name: "".into(),
@@ -814,7 +831,7 @@ impl LoadedSession {
                         == *self.fall.effects(),
                 "saved effect draft does not match the current session state"
             );
-            Some(effects)
+            Some((effects, movement))
         } else {
             None
         };
@@ -857,8 +874,15 @@ impl LoadedSession {
         };
         let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
         draft.set_flying(original, self.flight.flying)?;
-        if let Some(effects) = effect_draft {
+        if let Some((effects, movement)) = effect_draft {
             draft.set_effects(effects)?;
+            if let Some(initial) = movement {
+                draft.set_movement_effect_modifiers(
+                    original,
+                    initial,
+                    &self.movement_speed_attribute,
+                )?;
+            }
         }
         Ok(draft)
     }
@@ -5715,6 +5739,7 @@ impl LoadedSession {
             .get_or_insert_with(|| EffectSaveTracking {
                 breathing: self.breathing_effects.clone(),
                 fall: self.fall.effects().clone(),
+                movement_speed: self.movement_speed_attribute.clone(),
                 ticks: 0,
             });
         tracking.ticks = tracking.ticks.saturating_add(1);
@@ -7544,6 +7569,332 @@ mod tests {
         );
         absent.refresh_movement_speed();
         assert_eq!(absent.movement_speed(false), 0.1_f32);
+    }
+
+    #[test]
+    fn player_draft_updates_promoted_and_expired_speed_modifiers() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let modifier = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:effect.speed".into())),
+            ("amount".into(), Tag::Double(f64::from(0.2_f32) * 2.0)),
+            (
+                "operation".into(),
+                Tag::String("add_multiplied_total".into()),
+            ),
+        ]);
+        let unrelated = Tag::Compound(vec![
+            ("id".into(), Tag::String("example:keep".into())),
+            ("amount".into(), Tag::Double(0.25)),
+            ("operation".into(), Tag::String("add_value".into())),
+            ("extra".into(), Tag::Int(37)),
+        ]);
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:speed".into())),
+                            ("duration".into(), Tag::Int(1)),
+                            ("amplifier".into(), Tag::Byte(1)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(4))]),
+                            ),
+                        ])],
+                    },
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                            ("custom".into(), Tag::Int(12)),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![modifier, unrelated.clone()],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let before = native_persistence::nbt::write(&original).unwrap();
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session
+            .set_saved_movement_speed(
+                crate::player_data::read_saved_movement_speed_attribute(&original).unwrap(),
+            )
+            .unwrap();
+        session.update(TICK);
+        let draft = session.draft_player_state(&original).unwrap();
+        let Tag::List { values, .. } = draft.document().value.get("attributes").unwrap() else {
+            panic!()
+        };
+        assert_eq!(values[0].get("custom"), Some(&Tag::Int(12)));
+        let Tag::List {
+            values: modifiers, ..
+        } = values[0].get("modifiers").unwrap()
+        else {
+            panic!()
+        };
+        assert!(modifiers.contains(&unrelated));
+        assert!(
+            modifiers
+                .iter()
+                .any(|m| m.get("amount") == Some(&Tag::Double(f64::from(0.2_f32))))
+        );
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), before);
+        for _ in 0..3 {
+            session.update(TICK);
+        }
+        let expired = session.draft_player_state(&original).unwrap();
+        let Tag::List { values, .. } = expired.document().value.get("attributes").unwrap() else {
+            panic!()
+        };
+        let Tag::List {
+            values: modifiers, ..
+        } = values[0].get("modifiers").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(modifiers, &[unrelated]);
+
+        let mut changed = original.clone();
+        if let Tag::Compound(fields) = &mut changed.value {
+            if let Tag::List { values, .. } = &mut fields
+                .iter_mut()
+                .find(|(n, _)| n.matches("attributes"))
+                .unwrap()
+                .1
+            {
+                if let Tag::Compound(entries) = &mut values[0] {
+                    if let Tag::List { values, .. } = &mut entries
+                        .iter_mut()
+                        .find(|(n, _)| n.matches("modifiers"))
+                        .unwrap()
+                        .1
+                    {
+                        if let Tag::Compound(fields) = &mut values[0] {
+                            fields.push(("unknown".into(), Tag::Int(1)));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(session.draft_player_state(&changed).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn movement_effect_drafts_match_vanilla_attribute_transitions() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use native_resources::packs::ResourceId;
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(|path| PathBuf::from(path).join("bin"))
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon/bin"));
+        let temp = tempfile::tempdir().unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(game.join("versions/26.3/26.3.json")).unwrap())
+                .unwrap();
+        let mut paths = vec![
+            game.join("versions/26.3/26.3.jar"),
+            temp.path().to_path_buf(),
+        ];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let effect = |id: &str, duration, amplifier, hidden| {
+            let mut fields = vec![
+                ("id".into(), Tag::String(id.into())),
+                ("duration".into(), Tag::Int(duration)),
+                ("amplifier".into(), Tag::Byte(amplifier)),
+            ];
+            if let Some(duration) = hidden {
+                fields.push((
+                    "hidden_effect".into(),
+                    Tag::Compound(vec![("duration".into(), Tag::Int(duration))]),
+                ));
+            }
+            Tag::Compound(fields)
+        };
+        let modifier = |id: &str, amount| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("amount".into(), Tag::Double(amount)),
+                (
+                    "operation".into(),
+                    Tag::String("add_multiplied_total".into()),
+                ),
+            ])
+        };
+        let scenarios = vec![
+            (
+                vec![effect("minecraft:speed", 1, 1, Some(4))],
+                Some(vec![modifier(
+                    "minecraft:effect.speed",
+                    f64::from(0.2_f32) * 2.0,
+                )]),
+            ),
+            (vec![effect("minecraft:speed", 1, 1, Some(4))], None),
+            (
+                vec![effect("minecraft:slowness", 2, 0, None)],
+                Some(vec![modifier(
+                    "minecraft:effect.slowness",
+                    f64::from(-0.15_f32),
+                )]),
+            ),
+            (
+                vec![
+                    effect("minecraft:speed", -1, 1, None),
+                    effect("minecraft:slowness", 3, 0, None),
+                ],
+                Some(vec![
+                    modifier("minecraft:effect.speed", f64::from(0.2_f32) * 2.0),
+                    modifier("minecraft:effect.slowness", f64::from(-0.15_f32)),
+                ]),
+            ),
+            (vec![effect("minecraft:speed", 0, 0, None)], None),
+        ];
+        let mut documents = Vec::new();
+        for (index, (effects, modifiers)) in scenarios.into_iter().enumerate() {
+            let mut fields = vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: effects,
+                    },
+                ),
+            ];
+            if let Some(modifiers) = modifiers {
+                fields.push((
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: modifiers,
+                                },
+                            ),
+                        ])],
+                    },
+                ));
+            }
+            let doc = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(fields),
+            };
+            std::fs::write(
+                temp.path().join(format!("{index}.nbt")),
+                native_persistence::nbt::write(&doc).unwrap(),
+            )
+            .unwrap();
+            documents.push(doc);
+        }
+        let source = temp.path().join("MovementEffectSaveOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/MovementEffectSaveOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = temp.path().join("results.json");
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MovementEffectSaveOracle")
+            .arg(temp.path())
+            .arg(documents.len().to_string())
+            .arg(&output));
+        let results: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for (index, original) in documents.iter().enumerate() {
+            let mut session = session();
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::player_data::read_saved_fall_effects(original).unwrap(),
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session
+                .set_saved_movement_speed(
+                    crate::player_data::read_saved_movement_speed_attribute(original).unwrap(),
+                )
+                .unwrap();
+            for tick in 0..6 {
+                session.update(TICK);
+                let draft = session.draft_player_state(original).unwrap();
+                let attribute =
+                    crate::player_data::read_saved_movement_speed_attribute(draft.document())
+                        .unwrap();
+                let java = &results[index][tick];
+                assert_eq!(
+                    attribute
+                        .movement_speed(None, None, false)
+                        .unwrap()
+                        .to_bits(),
+                    (java["value"].as_f64().unwrap() as f32).to_bits(),
+                    "case {index} tick {tick}"
+                );
+                for name in ["speed", "slowness"] {
+                    let id = ResourceId::parse(&format!("minecraft:effect.{name}")).unwrap();
+                    assert_eq!(
+                        attribute.modifier(&id).map(|modifier| modifier.amount),
+                        java[name].as_f64(),
+                        "case {index} tick {tick}, {name}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

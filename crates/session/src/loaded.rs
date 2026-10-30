@@ -270,6 +270,8 @@ pub struct LoadedSession {
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
+    chest_sounds: VecDeque<ChestSoundEvent>,
+    sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
@@ -328,6 +330,7 @@ pub struct ButtonSoundEvent {
     pub powered: bool,
     pub tick: u64,
     pub kind: native_core::button::Button,
+    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +338,16 @@ pub struct LeverSoundEvent {
     pub position: IVec3,
     pub powered: bool,
     pub tick: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChestSoundEvent {
+    pub position: DVec3,
+    pub opening: bool,
+    pub pitch: f32,
+    pub tick: u64,
+    pub sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1868,6 +1881,8 @@ impl LoadedSession {
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
+            chest_sounds: VecDeque::new(),
+            sound_sequence: 0,
             falling_sand: Vec::new(),
             falling_fire_tag: None,
             bounce_suppression_tag: None,
@@ -2333,6 +2348,7 @@ impl LoadedSession {
         else {
             return;
         };
+        self.push_chest_sound(position, other, false);
         for (index, position) in [Some(position), other].into_iter().flatten().enumerate() {
             let key = (position.x, position.y, position.z);
             let chest = self
@@ -2439,13 +2455,61 @@ impl LoadedSession {
             }
             self.chest_contents.insert(key(right_position), right);
             self.chest_contents.insert(key(left_position), left);
+            self.push_chest_sound(right_position, Some(left_position), true);
         } else {
             if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
                 return false;
             }
             self.chest_contents.insert(key(position), chest);
+            self.push_chest_sound(position, None, true);
         }
         true
+    }
+
+    fn next_sound_sequence(&mut self) -> u64 {
+        let sequence = self.sound_sequence;
+        self.sound_sequence = self.sound_sequence.wrapping_add(1);
+        sequence
+    }
+
+    fn push_chest_sound(&mut self, position: IVec3, other: Option<IVec3>, opening: bool) {
+        if self.game_mode == GameMode::Spectator {
+            return;
+        }
+        let Some(state) = self.world.block(position.x, position.y, position.z) else {
+            return;
+        };
+        if !matches!(
+            state.name.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest"
+        ) {
+            return;
+        }
+        let expected = if other.is_some() { "right" } else { "single" };
+        if state.properties.get("type").map(String::as_str) != Some(expected) {
+            return;
+        }
+        let location = position.as_dvec3()
+            + DVec3::splat(0.5)
+            + other.map_or(DVec3::ZERO, |other| {
+                (other.as_dvec3() - position.as_dvec3()) * 0.5
+            });
+        let pitch = self.level_random.next_float() * 0.1 + 0.9;
+        let sequence = self.next_sound_sequence();
+        if self.chest_sounds.len() == 4096 {
+            self.chest_sounds.pop_front();
+        }
+        self.chest_sounds.push_back(ChestSoundEvent {
+            position: location,
+            opening,
+            pitch,
+            tick: self.tick,
+            sequence,
+        });
+    }
+
+    pub fn take_chest_sounds(&mut self) -> Vec<ChestSoundEvent> {
+        self.chest_sounds.drain(..).collect()
     }
 
     /// Draft an existing saved item; this does not authorize a world write.
@@ -5526,10 +5590,12 @@ impl LoadedSession {
                 if self.lever_sounds.len() == 4096 {
                     self.lever_sounds.pop_front();
                 }
+                let sequence = self.next_sound_sequence();
                 self.lever_sounds.push_back(LeverSoundEvent {
                     position,
                     powered: !powered,
                     tick: self.tick,
+                    sequence,
                 });
             }
         }
@@ -5550,11 +5616,13 @@ impl LoadedSession {
             if self.button_sounds.len() == 4096 {
                 self.button_sounds.pop_front();
             }
+            let sequence = self.next_sound_sequence();
             self.button_sounds.push_back(ButtonSoundEvent {
                 position,
                 powered,
                 tick: self.tick,
                 kind,
+                sequence,
             });
         }
     }
@@ -11299,6 +11367,112 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn chest_sound_position_pitch_and_kind_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChestSoundOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(&source, include_str!("../tests/java/ChestSoundOracle.java")).unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("ChestSoundOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let mut session = session();
+        session.level_random = native_core::random::LegacyRandom::new(123);
+        let relative = IVec3::new(8, 2, 6);
+        let position = session.origin + relative;
+        let mut actual = Vec::new();
+        for name in ["minecraft:chest", "minecraft:trapped_chest"] {
+            for kind in ["single", "left", "right"] {
+                for facing in ["north", "south", "west", "east"] {
+                    let block = state(
+                        name,
+                        &[("type", kind), ("facing", facing), ("waterlogged", "false")],
+                    );
+                    let other = native_world::collision::chest_connection(&block)
+                        .map(|direction| position + direction);
+                    let id = session.intern_block(block);
+                    if session
+                        .world
+                        .block(position.x, position.y, position.z)
+                        .is_none_or(|state| {
+                            state.name != name
+                                || state.properties.get("type").map(String::as_str) != Some(kind)
+                                || state.properties.get("facing").map(String::as_str)
+                                    != Some(facing)
+                        })
+                    {
+                        assert!(session.set(relative, id));
+                    }
+                    for opening in [true, false] {
+                        session.push_chest_sound(position, other, opening);
+                    }
+                    actual.extend(session.take_chest_sounds());
+                }
+            }
+        }
+        assert_eq!(rows.len(), 32);
+        assert_eq!(actual.len(), rows.len());
+        for (event, row) in actual.iter().zip(&rows) {
+            for (actual, expected) in event
+                .position
+                .to_array()
+                .into_iter()
+                .zip(row.as_array().unwrap().iter().take(3))
+            {
+                assert_eq!(actual, expected.as_f64().unwrap());
+            }
+            assert_eq!(
+                row[3].as_str(),
+                Some(if event.opening {
+                    "minecraft:block.chest.open"
+                } else {
+                    "minecraft:block.chest.close"
+                })
+            );
+            assert_eq!(row[4].as_str(), Some("block"));
+            assert_eq!(row[5].as_f64(), Some(0.5));
+            assert_eq!(event.pitch, row[6].as_f64().unwrap() as f32);
+        }
+    }
+
+    #[test]
     fn saved_single_chest_follows_chunk_unload_and_reload() {
         let (mut session, source, position, home) = saved_chest_fixture();
         let read = |session: &LoadedSession| {
@@ -11418,6 +11592,50 @@ mod tests {
             run(Duration::from_millis(50), 8),
             run(Duration::from_millis(10), 40)
         );
+    }
+
+    #[test]
+    fn chest_open_and_close_emit_one_ordered_sound_each() {
+        let (mut session, _, position, _) = saved_chest_fixture();
+        session.submit_command(PlayerCommand::Place);
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        let sounds = session.take_chest_sounds();
+        assert_eq!(sounds.len(), 2);
+        assert_eq!((sounds[0].opening, sounds[1].opening), (true, false));
+        assert_eq!((sounds[0].tick, sounds[1].tick), (0, 0));
+        assert_eq!((sounds[0].sequence, sounds[1].sequence), (0, 1));
+        assert!(sounds.iter().all(|sound| sound.position
+            == position.as_dvec3() + DVec3::splat(0.5)
+            && (0.9..1.0).contains(&sound.pitch)));
+        assert!(session.take_chest_sounds().is_empty());
+        let (mut spectator, _, _, _) = saved_chest_fixture();
+        spectator.set_game_mode(GameMode::Spectator);
+        spectator.submit_command(PlayerCommand::Place);
+        spectator.submit_command(PlayerCommand::ToggleInventory);
+        spectator.update(TICK);
+        assert!(spectator.take_chest_sounds().is_empty());
+    }
+
+    #[test]
+    fn chest_lever_and_button_sounds_keep_their_shared_order() {
+        let (mut session, _, position, _) = saved_chest_fixture();
+        let relative_lever = IVec3::new(7, 2, 6);
+        let lever = session.intern_block(state(
+            "minecraft:lever",
+            &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+        ));
+        assert!(session.set(relative_lever, lever));
+        session.push_chest_sound(position, None, true);
+        assert!(session.use_lever(relative_lever));
+        session.push_button_sound(
+            IVec3::new(8, 2, 7),
+            native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+            true,
+        );
+        assert_eq!(session.take_chest_sounds()[0].sequence, 0);
+        assert_eq!(session.take_lever_sounds()[0].sequence, 1);
+        assert_eq!(session.take_button_sounds()[0].sequence, 2);
     }
 
     #[test]
@@ -11548,6 +11766,13 @@ mod tests {
                 other: Some(left)
             })
         );
+        let sounds = session.take_chest_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert!(sounds[0].opening);
+        assert_eq!(
+            sounds[0].position,
+            (right.as_dvec3() + left.as_dvec3()) * 0.5 + DVec3::splat(0.5)
+        );
         assert_eq!(
             session
                 .inventory
@@ -11572,6 +11797,13 @@ mod tests {
         });
         session.submit_command(PlayerCommand::ToggleInventory);
         session.update(TICK);
+        let sounds = session.take_chest_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert!(!sounds[0].opening);
+        assert_eq!(
+            sounds[0].position,
+            (right.as_dvec3() + left.as_dvec3()) * 0.5 + DVec3::splat(0.5)
+        );
         assert_eq!(
             session
                 .inventory
@@ -22520,6 +22752,7 @@ mod tests {
                     powered: true,
                     tick: 0,
                     kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+                    sequence: 0,
                 }]
             );
             for _ in 0..18 {
@@ -22540,6 +22773,7 @@ mod tests {
                     powered: false,
                     tick: 20,
                     kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+                    sequence: 1,
                 }]
             );
             assert!(session.take_button_sounds().is_empty());

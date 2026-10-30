@@ -455,22 +455,35 @@ impl Viewer {
             }
             let mut buttons = play.session.take_button_sounds().into_iter().peekable();
             let mut levers = play.session.take_lever_sounds().into_iter().peekable();
-            while buttons.peek().is_some() || levers.peek().is_some() {
-                let button_first = match (buttons.peek(), levers.peek()) {
-                    (Some(button), Some(lever)) => button.tick <= lever.tick,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if button_first {
-                    if let Some(audio) = &self.audio {
-                        audio.button(buttons.next().unwrap());
-                    } else {
-                        buttons.next();
+            let mut chests = play.session.take_chest_sounds().into_iter().peekable();
+            while let Some((_, kind)) = [
+                buttons.peek().map(|event| (event.sequence, 0)),
+                levers.peek().map(|event| (event.sequence, 1)),
+                chests.peek().map(|event| (event.sequence, 2)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            {
+                match kind {
+                    0 => {
+                        let event = buttons.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.button(event);
+                        }
                     }
-                } else if let Some(audio) = &self.audio {
-                    audio.lever(levers.next().unwrap());
-                } else {
-                    levers.next();
+                    1 => {
+                        let event = levers.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.lever(event);
+                        }
+                    }
+                    _ => {
+                        let event = chests.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.chest(event);
+                        }
+                    }
                 }
             }
             for sound in play.session.take_pickup_sounds() {

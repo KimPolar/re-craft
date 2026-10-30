@@ -145,6 +145,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn chest(&self, event: native_session::loaded::ChestSoundEvent) {
+        let _ = self.audio.commands.try_send(Command::Chest(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     pub fn item_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Item);
     }
@@ -180,6 +189,7 @@ enum Command {
     Click(Resources),
     Button(Resources, native_session::loaded::ButtonSoundEvent),
     Lever(Resources, native_session::loaded::LeverSoundEvent),
+    Chest(Resources, native_session::loaded::ChestSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
 }
 
@@ -495,6 +505,26 @@ impl Catalog {
         self.resolve("ui.button.click", 0.25, 1.0, None, random, output_rate)
     }
 
+    fn chest(
+        &mut self,
+        event: native_session::loaded::ChestSoundEvent,
+        random: &mut LegacyRandom,
+        output_rate: u32,
+    ) -> Result<Option<Voice>> {
+        self.resolve(
+            if event.opening {
+                "block.chest.open"
+            } else {
+                "block.chest.close"
+            },
+            0.5,
+            event.pitch,
+            Some(event.position),
+            random,
+            output_rate,
+        )
+    }
+
     #[cfg(test)]
     fn item_pickup(
         &mut self,
@@ -644,13 +674,14 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, button, lever, pickup) = match command {
-            Command::Prepare(resources) => (resources, false, None, None, None),
-            Command::Click(resources) => (resources, true, None, None, None),
-            Command::Button(resources, event) => (resources, true, Some(event), None, None),
-            Command::Lever(resources, event) => (resources, true, None, Some(event), None),
+        let (resources, play, button, lever, chest, pickup) = match command {
+            Command::Prepare(resources) => (resources, false, None, None, None, None),
+            Command::Click(resources) => (resources, true, None, None, None, None),
+            Command::Button(resources, event) => (resources, true, Some(event), None, None, None),
+            Command::Lever(resources, event) => (resources, true, None, Some(event), None, None),
+            Command::Chest(resources, event) => (resources, true, None, None, Some(event), None),
             Command::Pickup(resources, position, kind) => {
-                (resources, true, None, None, Some((position, kind)))
+                (resources, true, None, None, None, Some((position, kind)))
             }
         };
         if catalog
@@ -674,6 +705,8 @@ fn run(
             };
             let resolved = if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
+            } else if let Some(event) = chest {
+                catalog.chest(event, chosen_random, config.sample_rate.0)
             } else if let Some(event) = lever {
                 catalog.resolve(
                     "block.lever.click",
@@ -728,6 +761,77 @@ mod tests {
             matches!(probe.receiver.try_recv(), Ok(Command::Pickup(_, position, PickupSound::Item)) if position == b)
         );
         assert!(probe.receiver.try_recv().is_err());
+    }
+    #[test]
+    fn chest_sound_is_queued_with_its_position_and_pitch() {
+        let (audio, probe) = Audio::test_channel();
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        let event = native_session::loaded::ChestSoundEvent {
+            position: glam::DVec3::new(1.0, 2.0, 3.5),
+            opening: true,
+            pitch: 0.93,
+            tick: 4,
+            sequence: 7,
+        };
+        ui.chest(event);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Chest(_, actual)) if actual == event)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn chest_sounds_use_block_volume_and_resource_pack_overrides() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let position = glam::DVec3::new(17.5, 64.5, -3.0);
+        let mut vanilla = Catalog::load(Resources {
+            root: root.clone(),
+            packs: Vec::new(),
+        })
+        .unwrap();
+        for opening in [true, false] {
+            let event = native_session::loaded::ChestSoundEvent {
+                position,
+                opening,
+                pitch: 0.94,
+                tick: 0,
+                sequence: 0,
+            };
+            let voice = vanilla
+                .chest(event, &mut LegacyRandom::new(3), 48000)
+                .unwrap()
+                .unwrap();
+            assert!(voice.clip.samples.iter().any(|sample| *sample != 0));
+            assert_eq!(voice.spatial.unwrap().position, position);
+            assert!(!voice.player_sound);
+        }
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"block.chest.open":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let event = native_session::loaded::ChestSoundEvent {
+            position,
+            opening: true,
+            pitch: 0.94,
+            tick: 0,
+            sequence: 0,
+        };
+        let voice = catalog
+            .chest(event, &mut LegacyRandom::new(1), 48000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(voice.volume, 0.5 * 0.4);
+        assert_eq!(
+            voice.step,
+            f64::from(voice.clip.rate) / 48000.0 * f64::from(0.94_f32 * 1.5)
+        );
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert!(!voice.player_sound);
     }
     #[test]
     fn mixer_resamples_and_finishes_multiple_voices() {
@@ -1344,6 +1448,7 @@ mod tests {
             powered: true,
             tick: 1,
             kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+            sequence: 0,
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !test_rendered() && std::time::Instant::now() < deadline {
@@ -1352,6 +1457,35 @@ mod tests {
         assert!(
             test_rendered(),
             "block sound did not reach the output callback with UI muted"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an available Windows audio output and installed 26.3 assets"]
+    fn chest_sound_reaches_output_device() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let audio = Audio::new().unwrap();
+        audio.prepare(&root, &[]);
+        let ui = UiAudio::new(audio, root, Vec::new());
+        ui.set_gain(0.0);
+        ui.set_block_gain(1.0);
+        reset_test_rendered();
+        let position = glam::DVec3::new(1234.5, 64.5, -900.5);
+        ui.set_listener(position, 0.0);
+        ui.chest(native_session::loaded::ChestSoundEvent {
+            position,
+            opening: true,
+            pitch: 0.95,
+            tick: 1,
+            sequence: 0,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !test_rendered() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            test_rendered(),
+            "chest sound did not reach the output callback with UI muted"
         );
     }
 }

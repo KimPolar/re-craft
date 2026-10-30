@@ -149,6 +149,8 @@ pub struct LoadedSession {
     armor: crate::equipment_attributes::ArmorTracker,
     survival_rules: crate::survival::SurvivalRules,
     breathing_effects: crate::survival::BreathingEffects,
+    effect_save_tracking: Option<EffectSaveTracking>,
+    effect_save_invalid: bool,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
@@ -233,6 +235,12 @@ pub struct LoadedSession {
     lava_source_conversion: bool,
     block_notifications: VecDeque<(IVec3, BlockStateId, BlockStateId)>,
     notifying_blocks: bool,
+}
+
+struct EffectSaveTracking {
+    breathing: crate::survival::BreathingEffects,
+    fall: crate::survival::FallEffects,
+    ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -430,6 +438,7 @@ impl LoadedSession {
         if !oxygen_bonus.is_finite() || !(0.0..=1024.0).contains(&oxygen_bonus) {
             return Err("invalid oxygen bonus");
         }
+        self.effect_save_invalid |= self.tick != 0;
         self.breathing_effects = effects;
         self.oxygen_bonus = oxygen_bonus;
         self.oxygen_equipment = None;
@@ -449,6 +458,7 @@ impl LoadedSession {
         // Java applies transient equipment attributes after its first base tick.
         // Check the saved equipment now, but keep the persistent value for that tick.
         crate::equipment_attributes::oxygen_bonus(&attribute, &self.inventory, &enchantments)?;
+        self.effect_save_invalid |= self.tick != 0;
         self.breathing_effects = effects;
         self.oxygen_bonus = attribute.value(0.0, 1024.0)?;
         self.oxygen_inventory_revision = None;
@@ -532,6 +542,7 @@ impl LoadedSession {
             .as_ref()
             .map(|(_, registry)| Arc::clone(registry))
             .ok_or_else(|| anyhow::anyhow!("active enchantment registry is unavailable"))?;
+        self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
         Ok(())
     }
@@ -623,11 +634,42 @@ impl LoadedSession {
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
         );
-        anyhow::ensure!(
-            self.tick == 0
-                || !matches!(original.value.get("active_effects"), Some(native_persistence::nbt::Tag::List { values, .. }) if !values.is_empty()),
-            "ticked player effects cannot yet be saved safely"
-        );
+        let effect_draft = if self.tick != 0 {
+            anyhow::ensure!(
+                !self.effect_save_invalid,
+                "player effects changed outside the tracked tick sequence"
+            );
+            let (initial_breathing, initial_fall, effect_ticks) = match &self.effect_save_tracking {
+                Some(tracking) => (&tracking.breathing, &tracking.fall, tracking.ticks),
+                None => (&self.breathing_effects, self.fall.effects(), 0),
+            };
+            anyhow::ensure!(
+                crate::player_data::read_saved_breathing_effects(original)? == *initial_breathing
+                    && crate::player_data::read_saved_fall_effects(original)? == *initial_fall,
+                "saved player effects do not match the initial session state"
+            );
+            let effects = crate::player_data::advance_saved_effects(original, effect_ticks)?;
+            let advanced = native_persistence::nbt::NamedTag {
+                name: "".into(),
+                value: native_persistence::nbt::Tag::Compound(
+                    effects
+                        .clone()
+                        .map(|tag| ("active_effects".into(), tag))
+                        .into_iter()
+                        .collect(),
+                ),
+            };
+            anyhow::ensure!(
+                crate::player_data::read_saved_breathing_effects(&advanced)?
+                    == self.breathing_effects
+                    && crate::player_data::read_saved_fall_effects(&advanced)?
+                        == *self.fall.effects(),
+                "saved effect draft does not match the current session state"
+            );
+            Some(effects)
+        } else {
+            None
+        };
         let mut yaw = self.player.yaw.to_degrees() - 180.0;
         let mut pitch = -self.player.pitch.to_degrees();
         // Preserve the exact source angles when the player's view has not moved;
@@ -667,6 +709,9 @@ impl LoadedSession {
         };
         let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
         draft.set_flying(original, self.flight.flying)?;
+        if let Some(effects) = effect_draft {
+            draft.set_effects(effects)?;
+        }
         Ok(draft)
     }
 
@@ -1150,6 +1195,8 @@ impl LoadedSession {
             armor: crate::equipment_attributes::ArmorTracker::default(),
             survival_rules: crate::survival::SurvivalRules::default(),
             breathing_effects: crate::survival::BreathingEffects::default(),
+            effect_save_tracking: None,
+            effect_save_invalid: false,
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
@@ -2725,6 +2772,7 @@ impl LoadedSession {
         self.bounciness = self.bounciness_attribute.value(0.0, 1.0).ok();
         self.fall.reset_after_death();
         self.breathing_effects = crate::survival::BreathingEffects::default();
+        self.effect_save_invalid = true;
         if let Some((attribute, _)) = &mut self.oxygen_equipment {
             attribute.clear_modifiers();
             self.oxygen_bonus = oxygen_bonus;
@@ -5490,6 +5538,14 @@ impl LoadedSession {
                 self.sprint = crate::physics::SprintState::default();
             }
         }
+        let tracking = self
+            .effect_save_tracking
+            .get_or_insert_with(|| EffectSaveTracking {
+                breathing: self.breathing_effects.clone(),
+                fall: self.fall.effects().clone(),
+                ticks: 0,
+            });
+        tracking.ticks = tracking.ticks.saturating_add(1);
         self.breathing_effects.tick();
         self.fall.tick_effects();
         self.swimming = if self.flight.flying {
@@ -10273,13 +10329,61 @@ mod tests {
                 },
             )]),
         };
-        assert!(
-            powered
-                .draft_player_state(&original)
-                .unwrap_err()
-                .to_string()
-                .contains("effects cannot yet be saved")
-        );
+        assert!(powered.draft_player_state(&original).is_err());
+    }
+
+    #[test]
+    fn player_effect_draft_tracks_ticks_and_rejects_untracked_changes() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:water_breathing".into())),
+                            ("duration".into(), Tag::Int(2)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![
+                                    ("duration".into(), Tag::Int(5)),
+                                    ("show_particles".into(), Tag::Byte(0)),
+                                ]),
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let before = native_persistence::nbt::write(&original).unwrap();
+        let mut session = session();
+        session
+            .set_player_breathing(
+                crate::player_data::read_saved_breathing_effects(&original).unwrap(),
+                0.0,
+            )
+            .unwrap();
+        session.update(TICK);
+        session.update(TICK);
+        let draft = session.draft_player_state(&original).unwrap();
+        let Tag::List { values, .. } = draft.document().value.get("active_effects").unwrap() else {
+            panic!()
+        };
+        assert_eq!(values[0].get("duration"), Some(&Tag::Int(3)));
+        assert_eq!(values[0].get("show_particles"), Some(&Tag::Byte(0)));
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), before);
+        let other = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert!(session.draft_player_state(&other).is_err());
+        session
+            .set_player_breathing(crate::survival::BreathingEffects::default(), 0.0)
+            .unwrap();
+        assert!(session.draft_player_state(&original).is_err());
     }
 
     #[test]

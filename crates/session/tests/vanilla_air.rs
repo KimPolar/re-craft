@@ -137,6 +137,15 @@ public class AirOracle {
                 JsonArray tick = new JsonArray(); tick.add(player.air); tick.add(player.health); tick.add(player.absorption);
                 for (var effect : List.of(MobEffects.WATER_BREATHING, MobEffects.CONDUIT_POWER, MobEffects.BREATH_OF_THE_NAUTILUS))
                     tick.add(player.effects.containsKey(effect) ? player.effects.get(effect).getDuration() : -99999);
+                for (var effect : List.of(MobEffects.WATER_BREATHING, MobEffects.CONDUIT_POWER, MobEffects.BREATH_OF_THE_NAUTILUS)) {
+                    var active = player.effects.get(effect);
+                    JsonArray details = new JsonArray();
+                    if (active != null) {
+                        details.add(active.getAmplifier()); details.add(active.isAmbient());
+                        details.add(active.isVisible()); details.add(active.showIcon());
+                    }
+                    tick.add(details);
+                }
                 ticks.add(tick);
             }
             result.add(ticks);
@@ -285,7 +294,9 @@ fn saved_effect(name: &str, durations: &[i32]) -> native_persistence::nbt::Tag {
 fn saved_effects_and_oxygen_bonus_match_vanilla_ticks() {
     use native_core::random::LegacyRandom;
     use native_persistence::nbt::{NamedTag, Tag, TagType};
-    use native_session::player_data::{read_saved_breathing_effects, read_saved_oxygen_bonus};
+    use native_session::player_data::{
+        advance_saved_effects, read_saved_breathing_effects, read_saved_oxygen_bonus,
+    };
 
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
@@ -301,6 +312,21 @@ fn saved_effects_and_oxygen_bonus_match_vanilla_ticks() {
             saved_effect("minecraft:water_breathing", &[40]),
         ],
         vec![saved_effect("minecraft:water_breathing", &[2, 12])],
+        vec![Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:water_breathing".into())),
+            ("duration".into(), Tag::Int(2)),
+            ("amplifier".into(), Tag::Byte(2)),
+            ("show_particles".into(), Tag::Byte(1)),
+            (
+                "hidden_effect".into(),
+                Tag::Compound(vec![
+                    ("duration".into(), Tag::Int(12)),
+                    ("amplifier".into(), Tag::Byte(1)),
+                    ("ambient".into(), Tag::Byte(1)),
+                    ("show_particles".into(), Tag::Byte(0)),
+                ]),
+            ),
+        ])],
         vec![saved_effect("minecraft:conduit_power", &[0])],
         vec![{
             let Tag::Compound(mut effect) = saved_effect("minecraft:water_breathing", &[20]) else {
@@ -420,6 +446,20 @@ fn saved_effects_and_oxygen_bonus_match_vanilla_ticks() {
             });
             effects.tick();
             let expected = &expected[index][tick];
+            let draft = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "active_effects".into(),
+                    advance_saved_effects(&players[index], tick as u64 + 1)
+                        .unwrap()
+                        .unwrap(),
+                )]),
+            };
+            assert_eq!(
+                read_saved_breathing_effects(&draft).unwrap(),
+                effects,
+                "draft case {index} tick {tick}"
+            );
             assert_eq!(
                 vitals.air,
                 expected[0].as_i64().unwrap() as i32,
@@ -445,6 +485,35 @@ fn saved_effects_and_oxygen_bonus_match_vanilla_ticks() {
                     expected[position].as_i64().unwrap() as i32,
                     "case {index} tick {tick}"
                 );
+            }
+            if let Some(Tag::List { values, .. }) = draft.value.get("active_effects") {
+                for (offset, name) in [
+                    "minecraft:water_breathing",
+                    "minecraft:conduit_power",
+                    "minecraft:breath_of_the_nautilus",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let saved = values.iter().find(|value| matches!(value.get("id"), Some(Tag::String(id)) if id.matches(name)));
+                    let details = expected[6 + offset].as_array().unwrap();
+                    assert_eq!(saved.is_some(), !details.is_empty());
+                    if let Some(saved) = saved {
+                        let amplifier = match saved.get("amplifier") {
+                            Some(Tag::Byte(v)) => *v as u8,
+                            _ => 0,
+                        };
+                        let flag = |key: &str, default| match saved.get(key) {
+                            Some(Tag::Byte(v)) => *v != 0,
+                            _ => default,
+                        };
+                        let visible = flag("show_particles", true);
+                        assert_eq!(u64::from(amplifier), details[0].as_u64().unwrap());
+                        assert_eq!(flag("ambient", false), details[1].as_bool().unwrap());
+                        assert_eq!(visible, details[2].as_bool().unwrap());
+                        assert_eq!(flag("show_icon", visible), details[3].as_bool().unwrap());
+                    }
+                }
             }
         }
     }

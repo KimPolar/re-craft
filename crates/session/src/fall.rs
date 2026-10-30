@@ -110,6 +110,10 @@ impl Default for FallTracker {
 }
 
 impl FallTracker {
+    pub(crate) fn effects(&self) -> &FallEffects {
+        &self.effects
+    }
+
     pub fn reset_after_death(&mut self) {
         self.safe.clear_modifiers();
         self.multiplier.clear_modifiers();

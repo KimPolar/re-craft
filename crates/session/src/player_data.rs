@@ -675,6 +675,13 @@ impl PlayerStateDraft {
         self.0.matches_source(current)
     }
 
+    pub(crate) fn set_effects(&mut self, effects: Option<Tag>) -> Result<()> {
+        set_field(&mut self.0.document.value, "active_effects", effects)?;
+        native_persistence::nbt::write(&self.0.document)
+            .context("player effects draft cannot be encoded")?;
+        Ok(())
+    }
+
     pub(crate) fn set_flying(&mut self, original: &NamedTag, flying: bool) -> Result<()> {
         let source = unique_field(&original.value, "abilities")?;
         if let Some(value @ Tag::Compound(_)) = source {
@@ -737,6 +744,176 @@ fn set_field(parent: &mut Tag, field: &str, replacement: Option<Tag>) -> Result<
         entries.push((field.into(), value));
     }
     Ok(())
+}
+
+/// Prepare the saved representation of the effects currently simulated by the
+/// player session. This is an in-memory draft, not authorization to save a world.
+/// Unknown effects and fields are rejected because their behavior or promotion
+/// cannot yet be preserved. All hidden effects age while the visible one runs.
+pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag>> {
+    let Some(saved) = unique_field(&player.value, "active_effects")? else {
+        return Ok(None);
+    };
+    let Tag::List {
+        element_type,
+        values,
+    } = saved
+    else {
+        bail!("active effects are not a list");
+    };
+    ensure!(
+        *element_type == TagType::Compound || values.is_empty(),
+        "active effects are not a compound list"
+    );
+
+    fn validate(tag: &Tag, root: bool, depth: usize) -> Result<i32> {
+        ensure!(depth <= 256, "status effect nesting is too deep");
+        let Tag::Compound(entries) = tag else {
+            bail!("status effect is not a compound");
+        };
+        for (name, _) in entries {
+            ensure!(
+                [
+                    "amplifier",
+                    "duration",
+                    "ambient",
+                    "show_particles",
+                    "show_icon",
+                    "hidden_effect"
+                ]
+                .iter()
+                .any(|field| name.matches(field))
+                    || (root && name.matches("id")),
+                "unknown status effect data cannot be preserved safely"
+            );
+        }
+        for field in [
+            "id",
+            "amplifier",
+            "duration",
+            "ambient",
+            "show_particles",
+            "show_icon",
+            "hidden_effect",
+        ] {
+            unique_field(tag, field)?;
+        }
+        if let Some(value) = tag.get("amplifier") {
+            ensure!(
+                matches!(value, Tag::Byte(_)),
+                "invalid status effect amplifier"
+            );
+        }
+        for field in ["ambient", "show_particles", "show_icon"] {
+            if let Some(value) = tag.get(field) {
+                ensure!(
+                    matches!(value, Tag::Byte(0 | 1)),
+                    "invalid status effect {field}"
+                );
+            }
+        }
+        let duration = match tag.get("duration") {
+            None => 0,
+            Some(Tag::Int(value)) => *value,
+            Some(_) => bail!("invalid status effect duration"),
+        };
+        ensure!(
+            duration >= -1,
+            "unsupported negative status effect duration"
+        );
+        if let Some(hidden) = tag.get("hidden_effect") {
+            validate(hidden, false, depth + 1)?;
+        }
+        Ok(duration)
+    }
+
+    fn age(tag: &mut Tag, ticks: u64) -> Result<()> {
+        let duration = match tag.get("duration") {
+            Some(Tag::Int(value)) => *value,
+            None => 0,
+            _ => unreachable!(),
+        };
+        if duration > 0 {
+            let remaining = (u64::from(duration as u32)).saturating_sub(ticks) as i32;
+            if remaining != duration {
+                set_field(tag, "duration", Some(Tag::Int(remaining)))?;
+            }
+        }
+        let Tag::Compound(entries) = tag else {
+            unreachable!()
+        };
+        if let Some((_, hidden)) = entries
+            .iter_mut()
+            .find(|(name, _)| name.matches("hidden_effect"))
+        {
+            age(hidden, ticks)?;
+        }
+        Ok(())
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut advanced = Vec::with_capacity(values.len());
+    for source in values {
+        validate(source, true, 0)?;
+        let id = unique_field(source, "id")?
+            .and_then(text)
+            .context("status effect has no valid id")?;
+        let resource = ResourceId::parse(&id)?;
+        ensure!(
+            resource.namespace == "minecraft"
+                && matches!(
+                    resource.path.as_str(),
+                    "jump_boost"
+                        | "resistance"
+                        | "water_breathing"
+                        | "conduit_power"
+                        | "breath_of_the_nautilus"
+                ),
+            "unsupported status effect {id}"
+        );
+        ensure!(
+            seen.insert(resource.path),
+            "duplicate status effects cannot be saved safely"
+        );
+        let source_id = source.get("id").unwrap().clone();
+        let mut effect = source.clone();
+        let mut remaining = ticks;
+        let mut expired = false;
+        while remaining > 0 {
+            let duration = validate(&effect, true, 0)?;
+            if duration == 0 {
+                expired = true;
+                break;
+            }
+            let step = if duration == -1 {
+                remaining
+            } else {
+                remaining.min(duration as u64)
+            };
+            age(&mut effect, step)?;
+            remaining -= step;
+            if duration != -1 && step == duration as u64 {
+                if let Some(hidden) = effect.get("hidden_effect").cloned() {
+                    effect = hidden;
+                    set_field(&mut effect, "id", Some(source_id.clone()))?;
+                    if validate(&effect, true, 0)? == 0 {
+                        expired = true;
+                        break;
+                    }
+                } else {
+                    expired = true;
+                    break;
+                }
+            }
+        }
+        if !expired {
+            advanced.push(effect);
+        }
+    }
+    Ok(Some(Tag::List {
+        element_type: *element_type,
+        values: advanced,
+    }))
 }
 
 fn validate_max_health_for_draft(player: &NamedTag) -> Result<f32> {
@@ -1343,6 +1520,102 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_draft_ages_hidden_effects_and_preserves_promoted_display_settings() {
+        let effect = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:water_breathing".into())),
+            ("duration".into(), Tag::Int(2)),
+            ("amplifier".into(), Tag::Byte(2)),
+            ("show_particles".into(), Tag::Byte(1)),
+            (
+                "hidden_effect".into(),
+                Tag::Compound(vec![
+                    ("duration".into(), Tag::Int(8)),
+                    ("amplifier".into(), Tag::Byte(1)),
+                    ("ambient".into(), Tag::Byte(1)),
+                    ("show_particles".into(), Tag::Byte(0)),
+                    ("show_icon".into(), Tag::Byte(0)),
+                    (
+                        "hidden_effect".into(),
+                        Tag::Compound(vec![("duration".into(), Tag::Int(-1))]),
+                    ),
+                ]),
+            ),
+        ]);
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![effect],
+                },
+            )]),
+        };
+        let source = native_persistence::nbt::write(&original).unwrap();
+        let advanced = advance_saved_effects(&original, 2).unwrap().unwrap();
+        let Tag::List { values, .. } = advanced else {
+            panic!()
+        };
+        let promoted = &values[0];
+        assert_eq!(promoted.get("duration"), Some(&Tag::Int(6)));
+        assert_eq!(promoted.get("amplifier"), Some(&Tag::Byte(1)));
+        assert_eq!(promoted.get("ambient"), Some(&Tag::Byte(1)));
+        assert_eq!(promoted.get("show_particles"), Some(&Tag::Byte(0)));
+        assert_eq!(promoted.get("show_icon"), Some(&Tag::Byte(0)));
+        assert_eq!(
+            promoted.get("id"),
+            Some(&Tag::String("minecraft:water_breathing".into()))
+        );
+        let Tag::List { values, .. } = advance_saved_effects(&original, u64::MAX).unwrap().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values[0].get("duration"), Some(&Tag::Int(-1)));
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), source);
+    }
+
+    #[test]
+    fn effect_draft_rejects_unsupported_or_ambiguous_data() {
+        let player = |effects| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: effects,
+                },
+            )]),
+        };
+        let effect = |name: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(name.into())),
+                ("duration".into(), Tag::Int(5)),
+            ])
+        };
+        assert!(advance_saved_effects(&player(vec![effect("minecraft:speed")]), 1).is_err());
+        assert!(
+            advance_saved_effects(
+                &player(vec![effect("minecraft:resistance"), effect("resistance")]),
+                1
+            )
+            .is_err()
+        );
+        let mut unknown = effect("minecraft:resistance");
+        set_field(&mut unknown, "future_data", Some(Tag::Int(1))).unwrap();
+        assert!(advance_saved_effects(&player(vec![unknown]), 1).is_err());
+        let mut duplicate = effect("minecraft:resistance");
+        if let Tag::Compound(entries) = &mut duplicate {
+            entries.push(("duration".into(), Tag::Int(3)));
+        }
+        assert!(advance_saved_effects(&player(vec![duplicate]), 1).is_err());
+        let malformed = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("active_effects".into(), Tag::Int(0))]),
+        };
+        assert!(advance_saved_effects(&malformed, 1).is_err());
+    }
 
     #[test]
     fn flight_draft_preserves_other_abilities_and_rejects_ambiguous_data() {

@@ -5,6 +5,7 @@ mod audio;
 mod blur_ui;
 mod breaking_render;
 mod chat_hud;
+mod chest_model;
 mod chunk_stream;
 mod death_ui;
 mod equipment_visual;

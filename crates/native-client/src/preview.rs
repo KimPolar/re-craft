@@ -269,14 +269,40 @@ impl PreviewMaterials {
             {
                 continue;
             }
-            let baked =
-                match geometry::bake_blockstate(&mut provider, &state.name, &state.properties) {
-                    Ok(model) => model,
-                    Err(error) => {
-                        warnings.push(format!("{} {:?}: {error:#}", state.name, state.properties));
-                        fallback.clone()
+            let baked = match crate::chest_model::bake(state) {
+                Ok(Some(mut entity)) => {
+                    // Chest blockstates may also supply ordinary geometry in a resource pack.
+                    match geometry::bake_blockstate(&mut provider, &state.name, &state.properties) {
+                        Ok(mut block) => {
+                            block
+                                .definition
+                                .groups
+                                .append(&mut entity.definition.groups);
+                            block.groups.append(&mut entity.groups);
+                            block
+                        }
+                        Err(error) => {
+                            warnings
+                                .push(format!("{} {:?}: {error:#}", state.name, state.properties));
+                            entity
+                        }
                     }
-                };
+                }
+                Ok(None) => {
+                    match geometry::bake_blockstate(&mut provider, &state.name, &state.properties) {
+                        Ok(model) => model,
+                        Err(error) => {
+                            warnings
+                                .push(format!("{} {:?}: {error:#}", state.name, state.properties));
+                            fallback.clone()
+                        }
+                    }
+                }
+                Err(error) => {
+                    warnings.push(format!("{} {:?}: {error:#}", state.name, state.properties));
+                    fallback.clone()
+                }
+            };
             models.insert(
                 id,
                 BlockModel {
@@ -1270,6 +1296,89 @@ mod tests {
     fn fixture_dimension(path: &str) -> Option<Vec<u8>> {
         (path == "data/minecraft/dimension_type/overworld.json")
             .then(|| br##"{"has_skylight":true,"attributes":{"minecraft:visual/ambient_light_color":"#0a0a0a"}}"##.to_vec())
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn chest_mesh_uses_vanilla_entity_textures() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        for (index, name) in ["minecraft:chest", "minecraft:trapped_chest"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = world.intern_state(BlockState {
+                name: name.into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            });
+            blocks[3 + index * 3 + 2 * 16 + 2 * 256] = id;
+        }
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                block_light_correct: false,
+                position: pos,
+                status: Some("minecraft:full".into()),
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let scene = PreviewScene::prepare(&world, &mut resources, IVec3::ZERO, 1024).unwrap();
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert_eq!(scene.opaque_len(), 2 * 18 * 6);
+        assert_eq!(scene.translucent_len(), 0);
+        for name in ["normal", "trapped"] {
+            let id = ResourceId::parse(&format!("minecraft:entity/chest/{name}")).unwrap();
+            let rect = scene.atlas.rectangle(&id).unwrap();
+            assert_eq!((rect.width, rect.height), (64, 64));
+            let original = image::load_from_memory(
+                &resources
+                    .read_asset(&id.asset_path("textures", "png"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+            .to_rgba8();
+            let offset = ((rect.y * scene.atlas.texture.width + rect.x) * 4) as usize;
+            assert_eq!(
+                &scene.atlas.texture.rgba[offset..offset + 4],
+                &original.get_pixel(0, 0).0
+            );
+        }
+        struct Override<'a>(&'a mut native_resources::packs::ResourceStack);
+        impl ResourceProvider for Override<'_> {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "assets/minecraft/models/block/chest.json" {
+                    return Ok(Some(br##"{"textures":{"all":"minecraft:block/stone"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"down":{"texture":"#all"},"up":{"texture":"#all"},"north":{"texture":"#all"},"south":{"texture":"#all"},"west":{"texture":"#all"},"east":{"texture":"#all"}}}]}"##.to_vec()));
+                }
+                self.0.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> { self.0.read_data(path) }
+        }
+        let pack_scene = PreviewScene::prepare(&world, &mut Override(&mut resources), IVec3::ZERO, 1024).unwrap();
+        assert!(pack_scene.warnings.is_empty(), "{:?}", pack_scene.warnings);
+        assert_eq!(pack_scene.opaque_len(), 2 * 18 * 6 + 36);
+        assert!(pack_scene.atlas.rectangle(&ResourceId::parse("minecraft:block/stone").unwrap()).is_some());
     }
 
     #[test]

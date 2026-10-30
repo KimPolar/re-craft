@@ -25,6 +25,13 @@ pub struct BlockChange {
     pub replacement: BlockState,
 }
 
+/// In-memory block-entity edit with an exact original value for stale checks.
+#[derive(Clone, Debug)]
+pub struct BlockEntityChange {
+    pub expected: Tag,
+    pub replacement: Tag,
+}
+
 /// One saved light layer, with an exact pre-edit source for stale-data checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightLayerChange {
@@ -46,6 +53,7 @@ pub struct ChunkDraft {
     position: ChunkPos,
     heightmaps_rebuilt: bool,
     changed_block_states: Vec<BlockChange>,
+    uncoordinated_block_entities: bool,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
 }
@@ -75,6 +83,10 @@ impl ChunkDraft {
         ensure!(
             self.changed_blocks == self.changed_block_states.len(),
             "chunk draft change count is inconsistent"
+        );
+        ensure!(
+            !self.uncoordinated_block_entities,
+            "block entity edits require a coordinated world save"
         );
         ensure!(
             self.changed_blocks == 0 || self.heightmaps_rebuilt,
@@ -142,6 +154,83 @@ impl ChunkDraft {
     /// Any eventual coordinated write must also compare the raw file bytes.
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         Ok(crate::nbt::write(current)? == self.source_nbt)
+    }
+
+    /// Stage existing block-entity changes atomically. This does not authorize
+    /// a durable write: player inventories and other side effects must be
+    /// committed in the same transaction first.
+    pub fn replace_block_entities(&mut self, changes: &[BlockEntityChange]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let position = |entity: &Tag| -> Result<(i32, i32, i32)> {
+            let coordinate = |name| match unique_field(entity, name)? {
+                Some(Tag::Int(value)) => Ok(*value),
+                _ => bail!("block entity has an invalid {name} coordinate"),
+            };
+            Ok((coordinate("x")?, coordinate("y")?, coordinate("z")?))
+        };
+        let mut replacements = BTreeMap::new();
+        for change in changes {
+            let pos = position(&change.expected)?;
+            ensure!(
+                position(&change.replacement)? == pos,
+                "block entity coordinates changed"
+            );
+            ensure!(
+                pos.0.div_euclid(16) == self.position.x && pos.2.div_euclid(16) == self.position.z,
+                "block entity is outside its chunk"
+            );
+            let id = unique_field(&change.expected, "id")?.context("missing block entity id")?;
+            ensure!(
+                matches!(id, Tag::String(_))
+                    && unique_field(&change.replacement, "id")? == Some(id),
+                "block entity id changed"
+            );
+            ensure!(
+                !self
+                    .changed_block_states
+                    .iter()
+                    .any(|block| (block.x, block.y, block.z) == pos),
+                "block entity block changed"
+            );
+            ensure!(
+                replacements.insert(pos, change).is_none(),
+                "duplicate block entity edit"
+            );
+        }
+        let mut document = self.document.clone();
+        let Some(Tag::List {
+            element_type,
+            values,
+        }) = unique_field_mut(&mut document.value, "block_entities")?
+        else {
+            bail!("chunk block entities are unavailable")
+        };
+        ensure!(
+            *element_type == TagType::Compound,
+            "block entities must be a compound list"
+        );
+        let mut positions = BTreeSet::new();
+        for entity in values.iter_mut() {
+            let pos = position(entity)?;
+            ensure!(
+                pos.0.div_euclid(16) == self.position.x && pos.2.div_euclid(16) == self.position.z,
+                "block entity is outside its chunk"
+            );
+            ensure!(positions.insert(pos), "duplicate block entity position");
+            if let Some(change) = replacements.remove(&pos) {
+                ensure!(
+                    *entity == change.expected,
+                    "block entity changed before edit"
+                );
+                *entity = change.replacement.clone();
+            }
+        }
+        ensure!(replacements.is_empty(), "edited block entity is missing");
+        self.document = document;
+        self.uncoordinated_block_entities = true;
+        Ok(())
     }
 
     /// Apply known layer changes atomically while preserving all other NBT.
@@ -664,6 +753,7 @@ pub fn draft_chunk_blocks(
             position,
             heightmaps_rebuilt: false,
             changed_block_states,
+            uncoordinated_block_entities: false,
             changed_blocks,
             changed_sections,
         });
@@ -804,6 +894,7 @@ pub fn draft_chunk_blocks(
         position,
         heightmaps_rebuilt: false,
         changed_block_states,
+        uncoordinated_block_entities: false,
         changed_blocks,
         changed_sections,
     })
@@ -1334,6 +1425,71 @@ mod tests {
             .push(("example".into(), "different".into()));
         let mut draft = draft_chunk_blocks(&source, pos, &[change]).unwrap();
         draft.heightmaps_rebuilt = true;
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn staged_block_entities_are_atomic_and_cannot_be_written() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let entity = |x| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(x)),
+                ("y".into(), Tag::Int(-64)),
+                ("z".into(), Tag::Int(32)),
+                ("Items".into(), Tag::Int(1)),
+                ("future".into(), Tag::Int(42)),
+            ])
+        };
+        let first = entity(-16);
+        let other = entity(-15);
+        let mut original = fixture(1, false);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push((
+            "block_entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![first.clone(), other.clone()],
+            },
+        ));
+        let mut replacement = first.clone();
+        let Tag::Compound(fields) = &mut replacement else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Items"))
+            .unwrap()
+            .1 = Tag::Int(2);
+        let valid = BlockEntityChange {
+            expected: first.clone(),
+            replacement: replacement.clone(),
+        };
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        let before = draft.document().clone();
+        let missing = BlockEntityChange {
+            expected: entity(-14),
+            replacement: entity(-14),
+        };
+        assert!(
+            draft
+                .replace_block_entities(&[valid.clone(), missing])
+                .is_err()
+        );
+        assert_eq!(draft.document(), &before);
+        let stale = BlockEntityChange {
+            expected: entity(-15),
+            replacement: replacement.clone(),
+        };
+        assert!(draft.replace_block_entities(&[stale]).is_err());
+        draft.replace_block_entities(&[valid]).unwrap();
+        assert!(draft.matches_source(&original).unwrap());
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!("missing entities")
+        };
+        assert_eq!(values, &[replacement, other]);
         assert!(draft.validate_for_write(|_| Ok(())).is_err());
     }
 

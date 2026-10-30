@@ -1,5 +1,5 @@
-//! Read saved single-chest inventories while retaining the original NBT.
-//! Container interaction and loot-table generation are not implemented here.
+//! Read saved chest halves and stage inventory changes while retaining NBT.
+//! Loot-table generation and coordinated world saving are not implemented here.
 
 use crate::inventory::ItemStack;
 use anyhow::{Context, Result, bail, ensure};

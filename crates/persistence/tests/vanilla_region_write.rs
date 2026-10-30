@@ -11,7 +11,7 @@ use std::{
 
 use native_persistence::{
     anvil::RegionReader,
-    edit::{BlockChange, draft_chunk_blocks},
+    edit::{BlockChange, BlockEntityChange, draft_chunk_blocks},
     heightmap::{BlockHeightFlags, HeightBounds},
     nbt,
     palette::BlockState,
@@ -411,12 +411,34 @@ fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
     let mut slots = chest.slots.clone();
     slots[26] = slots[0].take();
     let entity = chest.draft_inventory(&slots).unwrap();
+    let mut chunk_draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[]).unwrap();
+    chunk_draft
+        .replace_block_entities(&[BlockEntityChange {
+            expected: chest.source().clone(),
+            replacement: entity,
+        }])
+        .unwrap();
+    let Some(nbt::Tag::List { values, .. }) = chunk_draft.document().value.get("block_entities")
+    else {
+        panic!("missing block entities")
+    };
     let draft = nbt::NamedTag {
         name: "".into(),
-        value: entity,
+        value: values[0].clone(),
     };
     std::fs::write(world.join("chest-draft.nbt"), nbt::write(&draft).unwrap()).unwrap();
     invoke("verifyChestDraft");
+    let mut staged_plan = WorldSavePlan::new();
+    staged_plan
+        .add_chunk(DimensionId::parse("overworld").unwrap(), chunk_draft, 1)
+        .unwrap();
+    let mut staged_writer = WorldWriteGuard::acquire(&world).unwrap();
+    let error = staged_writer
+        .write_plan(staged_plan, |_, _| Ok(()))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("block entity edits require a coordinated world save"));
+    drop(staged_writer);
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
     let prepare = |x, expected, replacement| {
         let change = BlockChange {
             x,

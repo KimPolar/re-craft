@@ -1497,6 +1497,118 @@ impl LoadedSession {
         )
     }
 
+    /// Chunks containing chest inventories awaiting a coordinated save.
+    pub fn dirty_chest_chunk_positions(&self) -> &BTreeSet<ChunkPos> {
+        &self.chest_dirty_chunks
+    }
+
+    /// Stage closed chest inventories in a source-checked chunk draft. This is
+    /// only one part of a save: player, block and entity changes remain separate.
+    pub fn draft_chest_inventory_chunk(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        use anyhow::{Context, ensure};
+        use native_persistence::edit::BlockEntityChange;
+        ensure!(
+            self.chest_dirty_chunks.contains(&position),
+            "chunk has no changed chest inventories"
+        );
+        ensure!(
+            !matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)),
+            "chest inventory is still open"
+        );
+        let mut draft = self.draft_unchanged_chunk(position, original)?;
+        let chunk = self
+            .world
+            .chunks
+            .get(&position)
+            .or_else(|| self.parked_chunks.get(&position))
+            .context("chest chunk is unavailable")?;
+        let sections = native_persistence::palette::decode_sections(&original.value)?;
+        let mut changes = Vec::new();
+        for chest in self.chest_contents.values().filter(|chest| {
+            chest.position.x.div_euclid(16) == position.x
+                && chest.position.z.div_euclid(16) == position.z
+        }) {
+            let edited = chest.draft_inventory(&chest.slots)?;
+            if &edited == chest.source() {
+                continue;
+            }
+            let p = chest.position;
+            ensure!(
+                !self
+                    .block_edits
+                    .get(&position)
+                    .is_some_and(|edits| edits.contains_key(&(p.x, p.y, p.z))),
+                "chest block was changed"
+            );
+            let section_y =
+                i8::try_from(p.y.div_euclid(16)).context("chest section out of range")?;
+            let index = p.x.rem_euclid(16) as usize
+                + p.z.rem_euclid(16) as usize * 16
+                + p.y.rem_euclid(16) as usize * 256;
+            let current = chunk
+                .sections
+                .get(&section_y)
+                .and_then(|s| s.blocks.as_ref())
+                .and_then(|b| b.get(index))
+                .and_then(|id| self.world.state(*id))
+                .context("chest block is unavailable")?;
+            let source = sections
+                .iter()
+                .find(|s| s.y == section_y)
+                .and_then(|s| s.blocks.as_ref())
+                .and_then(|blocks| {
+                    blocks.block(
+                        p.x.rem_euclid(16) as usize,
+                        p.y.rem_euclid(16) as usize,
+                        p.z.rem_euclid(16) as usize,
+                    )
+                })
+                .context("source chest block is unavailable")?;
+            ensure!(
+                source.name.matches(&current.name),
+                "source chest block differs"
+            );
+            if source.properties.is_empty() {
+                ensure!(
+                    current.properties.len() == 3
+                        && current
+                            .properties
+                            .get("facing")
+                            .is_some_and(|v| v == "north")
+                        && current
+                            .properties
+                            .get("type")
+                            .is_some_and(|v| v == "single")
+                        && current
+                            .properties
+                            .get("waterlogged")
+                            .is_some_and(|v| v == "false"),
+                    "source default chest state differs"
+                );
+            } else {
+                ensure!(
+                    source.properties.len() == current.properties.len()
+                        && source.properties.iter().all(|(key, value)| current
+                            .properties
+                            .iter()
+                            .any(|(k, v)| key.matches(k) && value.matches(v))),
+                    "source chest state differs"
+                );
+            }
+            changes.push(BlockEntityChange {
+                expected: chest.source().clone(),
+                replacement: edited,
+            });
+        }
+        ensure!(!changes.is_empty(), "no chest inventory changes remain");
+        draft.replace_block_entities(&changes)?;
+        Ok(draft)
+    }
+
     /// Chunks whose block or currently modeled scheduled-tick data changed.
     /// The set is retained until a coordinated world save acknowledges it.
     pub fn dirty_chunk_positions(&self) -> BTreeSet<ChunkPos> {
@@ -11933,6 +12045,112 @@ mod tests {
                 .unwrap()
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn closed_chest_inventory_draft_checks_source_and_survives_eviction() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{self, Tag},
+            palette::BlockState,
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, source_world, position, chunk) = saved_chest_fixture();
+        let base = fixture_chunk_document(chunk);
+        let state = |name: &str, properties: &[(&str, &str)]| BlockState {
+            name: name.into(),
+            properties: properties
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        };
+        let change = BlockChange {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            expected: state("minecraft:stone", &[]),
+            replacement: state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "single"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        };
+        let mut source = draft_chunk_blocks(
+            &base,
+            native_persistence::world::ChunkPos {
+                x: chunk.x,
+                z: chunk.z,
+            },
+            &[change],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let SavedBlockEntities::Encoded(bytes) = &source_world.saved_block_entities[&chunk] else {
+            panic!("expected entities")
+        };
+        let entities = nbt::read(bytes).unwrap().value;
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), entities));
+        assert!(session.try_open_saved_chest(position - session.origin));
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(3),
+        });
+        session.update(TICK);
+        assert!(session.draft_chest_inventory_chunk(chunk, &source).is_err());
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        let draft = session.draft_chest_inventory_chunk(chunk, &source).unwrap();
+        assert!(draft.matches_source(&source).unwrap());
+        assert_eq!(
+            draft.document().value.get("unknown_chunk_data"),
+            source.value.get("unknown_chunk_data")
+        );
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!("missing entities")
+        };
+        assert!(
+            matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        let mut stale = source.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(k, _)| k.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        assert!(session.draft_chest_inventory_chunk(chunk, &stale).is_err());
+        session.queue_chunk_window(
+            ChunkPos {
+                x: chunk.x + 3,
+                z: chunk.z,
+            },
+            0,
+        );
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&chunk));
+        assert_eq!(
+            session
+                .draft_chest_inventory_chunk(chunk, &source)
+                .unwrap()
+                .document(),
+            draft.document()
         );
     }
 

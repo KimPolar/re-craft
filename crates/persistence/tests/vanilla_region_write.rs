@@ -139,6 +139,29 @@ public class RegionWriteOracle {
                     throw new AssertionError("Java could not read the rebuilt heightmap");
             }
             System.out.println("OK");
+        } else if (args[0].equals("seedBlockEntity")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            var lookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
+            var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(lookup);
+            for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+            Files.createDirectories(dir); var level=new CompoundTag(); var data=new CompoundTag(); data.putInt("DataVersion",5023); level.put("Data",data); NbtIo.writeCompressed(level,world.resolve("level.dat"));
+            var chunk=chunk(0); var section=chunk.getListOrEmpty("sections").getCompoundOrEmpty(0); var states=section.getCompoundOrEmpty("block_states");
+            states.getListOrEmpty("palette").add(StringTag.valueOf("minecraft:chest")); long[] words=new long[256]; words[0]=1; states.putLongArray("data",words);
+            var chest=new net.minecraft.world.level.block.entity.ChestBlockEntity(new net.minecraft.core.BlockPos(0,0,0),net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState());
+            chest.setItem(0,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND,3));
+            var blockEntity=chest.saveWithFullMetadata(registries); blockEntity.putLong("future_data",123); var list=new ListTag(); list.add(blockEntity); chunk.put("block_entities",list);
+            try(var region=open(dir); var out=region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk,(DataOutput)out); }
+            System.out.println("OK");
+        } else if (args[0].equals("verifyBlockEntity")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            var lookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup(); var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(lookup);
+            for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+            try(var region=open(dir); var in=region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                var chunk=NbtIo.read((DataInput)in); var list=chunk.getListOrEmpty("block_entities"); if(list.size()!=1) throw new AssertionError("block entity count");
+                var tag=list.getCompoundOrEmpty(0); var block=net.minecraft.world.level.block.entity.BlockEntity.loadStatic(new net.minecraft.core.BlockPos(0,0,0),net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState(),tag,registries);
+                if(!(block instanceof net.minecraft.world.level.block.entity.ChestBlockEntity chest) || !chest.getItem(0).is(net.minecraft.world.item.Items.DIAMOND) || chest.getItem(0).getCount()!=3 || tag.getLongOr("future_data",0)!=123) throw new AssertionError("chest contents");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("seedItemMerge")) {
             Files.createDirectories(dir);
             Path entities=world.resolve("dimensions/minecraft/overworld/entities"); Files.createDirectories(entities);
@@ -288,6 +311,98 @@ fn state(name: &str) -> BlockState {
         name: name.into(),
         properties: Vec::new(),
     }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-block-entity-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    invoke("seedBlockEntity");
+    let path = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let original_bytes = std::fs::read(&path).unwrap();
+    let original = RegionReader::open(&path)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let prepare = |x, expected, replacement| {
+        let change = BlockChange {
+            x,
+            y: 0,
+            z: 0,
+            expected: state(expected),
+            replacement: state(replacement),
+        };
+        let mut draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[change]).unwrap();
+        draft
+            .rebuild_heightmaps(
+                HeightBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                |state| {
+                    let air = state.name.matches("minecraft:air");
+                    Ok(BlockHeightFlags {
+                        is_air: air,
+                        blocks_motion: !air,
+                        blocks_motion_no_leaves: !air,
+                        has_fluid: false,
+                    })
+                },
+            )
+            .unwrap();
+        draft
+    };
+    let dim = DimensionId::parse("overworld").unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_chunk(
+        dim.clone(),
+        prepare(0, "minecraft:chest", "minecraft:air"),
+        1,
+    )
+    .unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+    let error = writer.write_plan(plan, |_, _| Ok(())).unwrap_err();
+    assert!(format!("{error:#}").contains("uncoordinated block entity"));
+    drop(writer);
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    assert!(!world.join(".minecraft-native-pending").exists());
+    let mut plan = WorldSavePlan::new();
+    plan.add_chunk(dim, prepare(1, "minecraft:stone", "minecraft:dirt"), 2)
+        .unwrap();
+    WorldWriteGuard::acquire(&world)
+        .unwrap()
+        .write_plan(plan, |_, _| Ok(()))
+        .unwrap();
+    invoke("verifyBlockEntity");
 }
 
 #[test]

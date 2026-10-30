@@ -80,8 +80,61 @@ impl ChunkDraft {
             self.changed_blocks == 0 || self.heightmaps_rebuilt,
             "changed chunk blocks require rebuilt heightmaps"
         );
+        self.validate_block_entity_dependencies()?;
         for change in &self.changed_block_states {
             validate_change(change)?;
+        }
+        Ok(())
+    }
+
+    /// Changes at a saved block entity require coordinated state, removal and
+    /// drop handling, which the session does not yet provide.
+    fn validate_block_entity_dependencies(&self) -> Result<()> {
+        let changed: BTreeSet<_> = self
+            .changed_block_states
+            .iter()
+            .map(|change| (change.x, change.y, change.z))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let source = crate::nbt::read(&self.source_nbt)?;
+        let Some(list) = unique_field(&source.value, "block_entities")? else {
+            return Ok(());
+        };
+        let Tag::List {
+            element_type,
+            values,
+        } = list
+        else {
+            bail!("block_entities must be a list")
+        };
+        ensure!(
+            *element_type == TagType::Compound || values.is_empty(),
+            "block_entities must be a compound list"
+        );
+        let mut positions = BTreeSet::new();
+        for entity in values {
+            let coordinate = |name: &str| -> Result<i32> {
+                match unique_field(entity, name)? {
+                    Some(Tag::Int(value)) => Ok(*value),
+                    _ => bail!("block entity has an invalid {name} coordinate"),
+                }
+            };
+            let position = (coordinate("x")?, coordinate("y")?, coordinate("z")?);
+            ensure!(
+                position.0.div_euclid(16) == self.position.x
+                    && position.2.div_euclid(16) == self.position.z,
+                "block entity is outside its chunk"
+            );
+            ensure!(
+                positions.insert(position),
+                "duplicate block entity position"
+            );
+            ensure!(
+                !changed.contains(&position),
+                "changed block has an uncoordinated block entity"
+            );
         }
         Ok(())
     }
@@ -1204,6 +1257,84 @@ mod tests {
             unreachable!()
         };
         &values[0]
+    }
+
+    #[test]
+    fn block_entity_dependencies_reject_removal_and_ambiguous_positions() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let entity = |x: Tag, y: Tag, z: Tag| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), x),
+                ("y".into(), y),
+                ("z".into(), z),
+                (
+                    "future".into(),
+                    Tag::Compound(vec![("keep".into(), Tag::Int(42))]),
+                ),
+            ])
+        };
+        let target = entity(Tag::Int(-16), Tag::Int(-64), Tag::Int(32));
+        let elsewhere = entity(Tag::Int(-15), Tag::Int(-64), Tag::Int(32));
+        let with_entities = |list: Tag| {
+            let mut original = fixture(1, false);
+            let Tag::Compound(fields) = &mut original.value else {
+                unreachable!()
+            };
+            fields.push(("block_entities".into(), list));
+            original
+        };
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        for (entries, allowed) in [
+            (list(vec![target.clone()]), false),
+            (list(vec![elsewhere.clone()]), true),
+            (list(vec![]), true),
+            (list(vec![elsewhere.clone(), elsewhere.clone()]), false),
+            (
+                list(vec![entity(Tag::Int(0), Tag::Int(-64), Tag::Int(32))]),
+                false,
+            ),
+            (
+                list(vec![entity(Tag::Byte(-15), Tag::Int(-64), Tag::Int(32))]),
+                false,
+            ),
+            (Tag::String("bad".into()), false),
+        ] {
+            let source = with_entities(entries);
+            let mut draft =
+                draft_chunk_blocks(&source, pos, &[edit(-16, "minecraft:dirt")]).unwrap();
+            draft.heightmaps_rebuilt = true;
+            assert_eq!(
+                draft.validate_for_write(|_| Ok(())).is_ok(),
+                allowed,
+                "{source:?}"
+            );
+            assert_eq!(
+                draft.document().value.get("block_entities"),
+                source.value.get("block_entities")
+            );
+        }
+        let mut duplicate = with_entities(list(vec![elsewhere]));
+        let Tag::Compound(fields) = &mut duplicate.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), list(vec![])));
+        let mut draft =
+            draft_chunk_blocks(&duplicate, pos, &[edit(-16, "minecraft:dirt")]).unwrap();
+        draft.heightmaps_rebuilt = true;
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+        let source = with_entities(list(vec![target]));
+        let mut change = edit(-16, "minecraft:stone");
+        change
+            .replacement
+            .properties
+            .push(("example".into(), "different".into()));
+        let mut draft = draft_chunk_blocks(&source, pos, &[change]).unwrap();
+        draft.heightmaps_rebuilt = true;
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
     }
 
     #[test]

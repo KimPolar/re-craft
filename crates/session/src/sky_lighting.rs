@@ -1,9 +1,10 @@
 //! Background sky-light work over immutable session snapshots.
 use native_world::{
     block_light::LightBounds,
-    loaded::{BlockPosition, BlockStateId, Chunk, ChunkPos, World},
-    sky_light::{SkyColumn, sky_change_for_edit},
+    loaded::{BlockPosition, BlockStateId, Chunk, ChunkPos, Section, World},
+    sky_light::{SkyColumn, SkySourceScanner, sky_change_for_edit},
     sky_propagation::{SkyChange, relight_changes},
+    sky_storage::restore_missing_for_changes,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -196,15 +197,14 @@ impl SkyLighting {
 
 fn source_for(
     sources: &mut SkySources,
-    historical: &World,
-    bounds: LightBounds,
+    scanner: &mut SkySourceScanner<'_>,
     x: i32,
     z: i32,
 ) -> Option<SkyColumn> {
     if let Some(column) = sources.get(&(x, z)) {
         return Some(*column);
     }
-    let column = SkyColumn::load(historical, bounds, x, z)?;
+    let column = scanner.load(x, z)?;
     sources.insert((x, z), column);
     Some(column)
 }
@@ -232,12 +232,15 @@ fn compute(
         }
         work.set_block_id(p.x, p.y, p.z, old).ok()?;
     }
+    let mut baseline = work.clone();
+    let mut baseline_sources = sources.clone();
     let mut historical = work.clone();
     for (position, original) in originals {
         if let Some(chunk) = historical.chunks.get_mut(position) {
             *chunk = Arc::clone(original);
         }
     }
+    let mut scanner = SkySourceScanner::new(&historical, bounds);
     let mut changes = Vec::new();
     for edit in edits {
         let p = edit.position;
@@ -246,7 +249,7 @@ fn compute(
             return None;
         }
         let affects_sky = sky_change_for_edit(work.state(old), work.state(edit.new)?);
-        let mut column = source_for(&mut sources, &historical, bounds, p.x, p.z)?;
+        let mut column = source_for(&mut sources, &mut scanner, p.x, p.z)?;
         let previous_source = column.lowest_source_y();
         work.set_block_id(p.x, p.y, p.z, edit.new).ok()?;
         column.update(&work, p.y)?;
@@ -260,9 +263,34 @@ fn compute(
             });
         }
     }
-    let changed = relight_changes(&mut work, bounds, &changes, |x, z| {
-        source_for(&mut sources, &historical, bounds, x, z).map(SkyColumn::lowest_source_y)
+    let restored =
+        restore_missing_for_changes(&mut baseline, &historical, bounds, &changes, |x, z| {
+            source_for(&mut baseline_sources, &mut scanner, x, z).map(SkyColumn::lowest_source_y)
+        });
+    for pos in &restored {
+        let original = baseline.chunks.get(pos)?;
+        let target = Arc::make_mut(work.chunks.get_mut(pos)?);
+        for (&y, section) in &original.sections {
+            let Some(light) = section.sky_light.as_ref() else {
+                continue;
+            };
+            let target = target.sections.entry(y).or_insert_with(|| {
+                Arc::new(Section {
+                    blocks: None,
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                })
+            });
+            if target.sky_light.is_none() {
+                Arc::make_mut(target).sky_light = Some(light.clone());
+            }
+        }
+    }
+    let mut changed = relight_changes(&mut work, bounds, &changes, |x, z| {
+        source_for(&mut sources, &mut scanner, x, z).map(SkyColumn::lowest_source_y)
     })?;
+    changed.extend(restored);
     sources.retain(|position, _| edited_columns.contains(position));
     Some(Computed {
         world: work,
@@ -277,9 +305,19 @@ fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> 
         let current = world.chunks.get(pos)?;
         let calculated = computed.world.chunks.get(pos)?;
         for (&y, section) in &calculated.sections {
-            let destination = current.sections.get(&y)?;
-            if destination.sky_light != section.sky_light {
-                updates.push((*pos, y, section.sky_light.clone()));
+            match current.sections.get(&y) {
+                Some(destination) if destination.sky_light != section.sky_light => {
+                    updates.push((*pos, y, section.sky_light.clone()))
+                }
+                Some(_) => {}
+                None if section.blocks.is_none()
+                    && section.biomes.is_none()
+                    && section.block_light.is_none()
+                    && section.sky_light.is_some() =>
+                {
+                    updates.push((*pos, y, section.sky_light.clone()))
+                }
+                None => return None,
             }
         }
     }
@@ -287,7 +325,15 @@ fn apply(world: &mut Arc<World>, computed: Computed) -> Option<AppliedLighting> 
     let mut changed = BTreeSet::new();
     for (pos, y, light) in updates {
         let chunk = Arc::make_mut(world.chunks.get_mut(&pos)?);
-        let section = Arc::make_mut(chunk.sections.get_mut(&y)?);
+        let section = chunk.sections.entry(y).or_insert_with(|| {
+            Arc::new(Section {
+                blocks: None,
+                biomes: None,
+                block_light: None,
+                sky_light: None,
+            })
+        });
+        let section = Arc::make_mut(section);
         section.sky_light = light;
         changed.insert(pos);
     }
@@ -383,6 +429,42 @@ mod tests {
         assert_eq!(world.light(15, 14, 15, true), Some(14));
         assert_eq!(world.light(15, 14, 15, false), Some(0));
         assert_eq!(before.light(15, 14, 15, true), Some(15));
+    }
+    #[test]
+    fn worker_restores_proven_absent_padding_before_relighting() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let chunk = Arc::make_mut(
+                    Arc::make_mut(&mut world)
+                        .chunks
+                        .get_mut(&ChunkPos { x, z })
+                        .unwrap(),
+                );
+                chunk.sections.remove(&-1);
+                chunk.sections.remove(&2);
+            }
+        }
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        edit(
+            &mut sky,
+            &mut world,
+            BlockPosition {
+                x: 15,
+                y: 31,
+                z: 15,
+            },
+            state("stone", &[]),
+        );
+        let before = Arc::clone(&world);
+        let changed = finish(&mut sky, &mut world, bounds);
+        assert!(!changed.is_empty());
+        assert!(sky.pending.is_empty());
+        assert_eq!(before.light(15, -1, 15, true), None);
+        assert_eq!(world.light(15, -1, 15, true), Some(14));
+        assert_eq!(world.light(15, 32, 15, true), Some(15));
     }
     #[test]
     fn skyless_dimensions_do_not_enqueue_work() {
@@ -496,6 +578,7 @@ mod tests {
                 .get_mut(&ChunkPos { x: 0, z: 0 })
                 .unwrap(),
         );
+        chunk.block_light_correct = false;
         Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light = None;
         edit(
             &mut sky,
@@ -532,8 +615,7 @@ mod tests {
                 .get_mut(&ChunkPos { x: 0, z: 0 })
                 .unwrap(),
         );
-        Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light =
-            Some(Box::new([0xff; LIGHT_BYTES]));
+        chunk.block_light_correct = true;
         sky.streaming_changed();
         assert!(!finish(&mut sky, &mut world, bounds).is_empty());
         assert_eq!(world.light(15, 14, 15, true), Some(14));
@@ -688,5 +770,160 @@ mod tests {
             }
         }
         assert!(expected.next().is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn worker_restores_java_omitted_layers_before_edit() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SkyStorageOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../world/tests/java/SkyStorageOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = temp.path().join("storage.json");
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyStorageOracle")
+            .arg(&output));
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(cases.len(), 2);
+        for (roof, case) in [false, true].into_iter().zip(cases) {
+            let mut world = World::new("minecraft:overworld");
+            let air = world.intern_state(state("air", &[]));
+            let stone = world.intern_state(state("stone", &[]));
+            for x in -2..=2 {
+                for z in -2..=2 {
+                    let pos = ChunkPos { x, z };
+                    let sections = (0..=3)
+                        .map(|y| {
+                            let mut blocks = Box::new([air; BLOCK_COUNT]);
+                            if roof && y == 1 && (-1..=1).contains(&x) && (-1..=1).contains(&z) {
+                                for x in 0..16 {
+                                    for z in 0..16 {
+                                        blocks[x + z * 16 + 15 * 256] = stone;
+                                    }
+                                }
+                            }
+                            (
+                                y,
+                                Arc::new(Section {
+                                    blocks: Some(blocks),
+                                    biomes: None,
+                                    block_light: None,
+                                    sky_light: None,
+                                }),
+                            )
+                        })
+                        .collect();
+                    world.chunks.insert(
+                        pos,
+                        Arc::new(Chunk {
+                            position: pos,
+                            status: Some("minecraft:full".into()),
+                            block_light_correct: true,
+                            sections,
+                        }),
+                    );
+                }
+            }
+            for row in case["layers"].as_array().unwrap() {
+                let pos = ChunkPos {
+                    x: row["x"].as_i64().unwrap() as i32,
+                    z: row["z"].as_i64().unwrap() as i32,
+                };
+                let sy = row["y"].as_i64().unwrap() as i8;
+                let Some(values) = row["saved"].as_array() else {
+                    continue;
+                };
+                let bytes: Vec<u8> = values.iter().map(|v| v.as_u64().unwrap() as u8).collect();
+                let data: Box<[u8; LIGHT_BYTES]> = bytes.into_boxed_slice().try_into().unwrap();
+                let chunk = Arc::make_mut(world.chunks.get_mut(&pos).unwrap());
+                let section = chunk.sections.entry(sy).or_insert_with(|| {
+                    Arc::new(Section {
+                        blocks: None,
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    })
+                });
+                Arc::make_mut(section).sky_light = Some(data);
+            }
+            let mut world = Arc::new(world);
+            let before = Arc::clone(&world);
+            let mut sky = SkyLighting::default();
+            sky.set_enabled(true);
+            edit(
+                &mut sky,
+                &mut world,
+                BlockPosition { x: 8, y: 63, z: 8 },
+                state("stone", &[]),
+            );
+            finish(&mut sky, &mut world, LightBounds::new(0, 64).unwrap());
+            assert!(sky.pending.is_empty(), "roof={roof}");
+            let after = case["after"].as_array().unwrap();
+            let mut compared = 0;
+            for y in -16..80 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        if let Some(value) = world.light(x, y, z, true) {
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                u64::from(value),
+                                after[index].as_u64().unwrap(),
+                                "roof={roof} at {x},{y},{z}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                compared >= 16 * 16 * 62,
+                "insufficient reconstructed sample for roof={roof}"
+            );
+            assert_eq!(before.block(8, 63, 8).unwrap().name, "minecraft:air");
+        }
     }
 }

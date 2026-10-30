@@ -276,7 +276,14 @@ pub struct UnicodeGlyph {
 /// The default non-Latin bitmap provider precedes unifont in vanilla's font stack.
 pub struct BitmapFont {
     pub image: RgbaImage,
-    pub cells: HashMap<char, (u32, u32)>,
+    pub cells: HashMap<char, BitmapGlyph>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BitmapGlyph {
+    pub x: u32,
+    pub y: u32,
+    pub advance: i32,
 }
 
 fn nonlatin_bitmap_font(definition: &[u8], image: RgbaImage) -> Result<BitmapFont> {
@@ -308,19 +315,6 @@ fn nonlatin_bitmap_font(definition: &[u8], image: RgbaImage) -> Result<BitmapFon
         provider["ascent"].as_i64() == Some(7),
         "Unsupported font ascent"
     );
-    let mut cells = HashMap::new();
-    for (y, row) in rows.iter().enumerate() {
-        let row = row.as_str().context("Invalid font row")?;
-        ensure!(
-            row.chars().count() == columns,
-            "Inconsistent font row length"
-        );
-        for (x, ch) in row.chars().enumerate() {
-            if ch != '\0' {
-                cells.entry(ch).or_insert((x as u32 * 8, y as u32 * 8));
-            }
-        }
-    }
     let width = columns as u32 * 8;
     let height = rows.len() as u32 * 8;
     ensure!(
@@ -331,6 +325,39 @@ fn nonlatin_bitmap_font(definition: &[u8], image: RgbaImage) -> Result<BitmapFon
             && image.width() / width == image.height() / height,
         "Invalid font texture dimensions"
     );
+    let factor = image.height() / height;
+    let cell_size = 8 * factor;
+    let mut cells = HashMap::new();
+    for (y, row) in rows.iter().enumerate() {
+        let row = row.as_str().context("Invalid font row")?;
+        ensure!(
+            row.chars().count() == columns,
+            "Inconsistent font row length"
+        );
+        for (x, ch) in row.chars().enumerate() {
+            if ch != '\0' {
+                let sx = x as u32 * cell_size;
+                let sy = y as u32 * cell_size;
+                let actual_width = (0..cell_size)
+                    .rev()
+                    .find(|&column| {
+                        (0..cell_size).any(|row| image.get_pixel(sx + column, sy + row).0[3] != 0)
+                    })
+                    .map_or(0, |column| column + 1);
+                // BitmapProvider rounds the scaled occupied width, then adds one.
+                let scale = 8.0_f32 / cell_size as f32;
+                let advance = ((f64::from(actual_width as f32 * scale) + 0.5) as i32) + 1;
+                cells.insert(
+                    ch,
+                    BitmapGlyph {
+                        x: x as u32 * 8,
+                        y: y as u32 * 8,
+                        advance,
+                    },
+                );
+            }
+        }
+    }
     let image = if image.width() == width && image.height() == height {
         image
     } else {
@@ -791,12 +818,44 @@ mod tests {
     fn parses_nonlatin_bitmap_grid_and_rejects_inconsistent_rows() {
         let definition = br#"{"providers":[{"type":"bitmap","file":"minecraft:font/nonlatin_european.png","ascent":7,"chars":["\u03b1\u03b2","\u0000\u03b3"]}]}"#;
         let font = nonlatin_bitmap_font(definition, RgbaImage::new(16, 16)).unwrap();
-        assert_eq!(font.cells.get(&'α'), Some(&(0, 0)));
-        assert_eq!(font.cells.get(&'β'), Some(&(8, 0)));
-        assert_eq!(font.cells.get(&'γ'), Some(&(8, 8)));
+        assert_eq!(
+            font.cells[&'α'],
+            BitmapGlyph {
+                x: 0,
+                y: 0,
+                advance: 1
+            }
+        );
+        assert_eq!(
+            font.cells[&'β'],
+            BitmapGlyph {
+                x: 8,
+                y: 0,
+                advance: 1
+            }
+        );
+        assert_eq!(
+            font.cells[&'γ'],
+            BitmapGlyph {
+                x: 8,
+                y: 8,
+                advance: 1
+            }
+        );
         assert!(!font.cells.contains_key(&'\0'));
         let invalid = br#"{"providers":[{"type":"bitmap","file":"minecraft:font/nonlatin_european.png","ascent":7,"chars":["ab","c"]}]}"#;
         assert!(nonlatin_bitmap_font(invalid, RgbaImage::new(16, 16)).is_err());
+    }
+
+    #[test]
+    fn bitmap_advance_uses_all_original_high_resolution_pixels() {
+        let definition = br#"{"providers":[{"type":"bitmap","file":"minecraft:font/nonlatin_european.png","ascent":7,"chars":["\u03b1\u03b2"]}]}"#;
+        let mut image = RgbaImage::new(32, 16);
+        image.put_pixel(2, 0, image::Rgba([255, 255, 255, 1]));
+        image.put_pixel(16 + 15, 0, image::Rgba([255, 255, 255, 255]));
+        let font = nonlatin_bitmap_font(definition, image).unwrap();
+        assert_eq!(font.cells[&'α'].advance, 3);
+        assert_eq!(font.cells[&'β'].advance, 9);
     }
 
     #[test]

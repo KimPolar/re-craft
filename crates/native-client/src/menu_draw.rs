@@ -929,6 +929,9 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
         return 4;
     }
     if let Some(assets) = assets {
+        if let Some(glyph) = assets.nonlatin_font.cells.get(&ch) {
+            return glyph.advance;
+        }
         if let Some((image, sx, sy)) = bitmap_glyph(assets, ch) {
             for x in (0..8).rev() {
                 if (0..8).any(|y| image.get_pixel(sx + x, sy + y).0[3] != 0) {
@@ -945,8 +948,8 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
 }
 
 fn bitmap_glyph(assets: &MenuAssets, ch: char) -> Option<(&RgbaImage, u32, u32)> {
-    if let Some(&(x, y)) = assets.nonlatin_font.cells.get(&ch) {
-        return Some((&assets.nonlatin_font.image, x, y));
+    if let Some(glyph) = assets.nonlatin_font.cells.get(&ch) {
+        return Some((&assets.nonlatin_font.image, glyph.x, glyph.y));
     }
     if ch.is_ascii() {
         let c = ch as u32;
@@ -1013,7 +1016,8 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let mut assets = MenuAssets::load(&directory, &[]).unwrap();
-        let (sx, sy) = assets.nonlatin_font.cells[&'α'];
+        let glyph = &assets.nonlatin_font.cells[&'α'];
+        let (sx, sy) = (glyph.x, glyph.y);
         for y in 0..8 {
             for x in 0..8 {
                 assets.nonlatin_font.image.put_pixel(
@@ -1027,7 +1031,14 @@ mod tests {
             .nonlatin_font
             .image
             .put_pixel(sx + 2, sy + 1, image::Rgba([255, 255, 255, 255]));
-        assets.unicode.insert(
+        let pack = tempfile::tempdir().unwrap();
+        let path = pack
+            .path()
+            .join("assets/minecraft/textures/font/nonlatin_european.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assets.nonlatin_font.image.save(path).unwrap();
+        let mut packed = MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap();
+        packed.unicode.insert(
             'α',
             crate::menu_assets::UnicodeGlyph {
                 rows: [u32::MAX; 16],
@@ -1035,24 +1046,33 @@ mod tests {
             },
         );
         let mut canvas = Canvas::new(16, 10);
-        assert_eq!(canvas.text_width(Some(&assets), "α"), 4);
-        canvas.text_without_shadow(Some(&assets), 0, 0, "α", [255, 255, 255]);
+        assert_eq!(canvas.text_width(Some(&packed), "α"), 4);
+        canvas.text_without_shadow(Some(&packed), 0, 0, "α", [255, 255, 255]);
         assert_eq!(canvas.pixels[16 + 2], 0xffff_ffff);
         assert_eq!(canvas.pixels.iter().filter(|&&pixel| pixel != 0).count(), 1);
-        assert!(assets.unicode.contains_key(&'한'));
-        assert!(bitmap_glyph(&assets, '한').is_none());
+        assert!(packed.unicode.contains_key(&'한'));
+        assert!(bitmap_glyph(&packed, '한').is_none());
 
-        let pack = tempfile::tempdir().unwrap();
-        let path = pack
-            .path()
-            .join("assets/minecraft/textures/font/nonlatin_european.png");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        assets.nonlatin_font.image.save(path).unwrap();
-        let packed = MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap();
-        assert_eq!(canvas.text_width(Some(&packed), "α"), 4);
-        let mut packed_canvas = Canvas::new(16, 10);
-        packed_canvas.text_without_shadow(Some(&packed), 0, 0, "α", [255, 255, 255]);
-        assert_eq!(packed_canvas.pixels, canvas.pixels);
+        let mut highres = image::imageops::resize(
+            &packed.nonlatin_font.image,
+            packed.nonlatin_font.image.width() * 2,
+            packed.nonlatin_font.image.height() * 2,
+            image::imageops::FilterType::Nearest,
+        );
+        for y in 0..16 {
+            for x in 0..16 {
+                highres.put_pixel(sx * 2 + x, sy * 2 + y, image::Rgba([255, 255, 255, 0]));
+            }
+        }
+        highres.put_pixel(sx * 2 + 2, sy * 2, image::Rgba([255, 255, 255, 255]));
+        highres
+            .save(
+                pack.path()
+                    .join("assets/minecraft/textures/font/nonlatin_european.png"),
+            )
+            .unwrap();
+        let highres_assets = MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap();
+        assert_eq!(canvas.text_width(Some(&highres_assets), "α"), 3);
     }
 
     #[test]

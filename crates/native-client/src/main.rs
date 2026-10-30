@@ -1000,10 +1000,9 @@ fn prepare_existing_world(
                 native_session::player_data::read_saved_vitals(player_data, difficulty.hardcore)
                     .context("cannot read saved player health and food")?,
             );
-            session.set_player_inventory(
-                player_inventory::read_saved_player(player_data)
-                    .context("cannot read saved player inventory")?,
-            );
+            session
+                .restore_saved_player_inventory(player_data)
+                .context("cannot read saved player inventory")?;
             session
                 .set_saved_breathing(
                     native_session::player_data::read_saved_breathing_effects(player_data)

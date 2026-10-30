@@ -141,6 +141,7 @@ pub struct LoadedSession {
     states: [BlockStateId; 5],
     selected: Block,
     inventory: Arc<PlayerInventory>,
+    saved_player_inventory_source: Option<Vec<u8>>,
     recipes: Option<Arc<CraftingRecipes>>,
     loot: Option<Arc<BlockLootTables>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
@@ -1079,6 +1080,13 @@ impl LoadedSession {
         player: &native_persistence::nbt::NamedTag,
         chunks: &BTreeMap<ChunkPos, native_persistence::nbt::NamedTag>,
     ) -> anyhow::Result<PlayerChestDraft> {
+        let initial = self.saved_player_inventory_source.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("saved player inventory source was not captured at session start")
+        })?;
+        anyhow::ensure!(
+            native_persistence::nbt::write(player)? == *initial,
+            "saved player source differs from the session source"
+        );
         anyhow::ensure!(
             chunks.len() == self.chest_dirty_chunks.len()
                 && self
@@ -1795,6 +1803,7 @@ impl LoadedSession {
     }
     /// Replace the temporary demonstration inventory with data from the saved player.
     pub fn set_player_inventory(&mut self, mut inventory: PlayerInventory) {
+        self.saved_player_inventory_source = None;
         self.mining.release();
         self.first_person.invalidate_inventory();
         self.oxygen_inventory_revision = None;
@@ -1840,6 +1849,28 @@ impl LoadedSession {
             origin: self.origin,
             world_revision: self.revision,
         });
+    }
+
+    /// Restore the saved inventory and retain its exact decoded source for
+    /// later coordinated draft checks. Raw file bytes must still be checked
+    /// by the eventual save transaction.
+    pub fn restore_saved_player_inventory(
+        &mut self,
+        source: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "saved player inventory must be restored before the first tick"
+        );
+        anyhow::ensure!(
+            self.saved_player_inventory_source.is_none(),
+            "saved player inventory source was already captured"
+        );
+        let inventory = crate::player_data::read_saved_player(source)?;
+        let encoded = native_persistence::nbt::write(source)?;
+        self.set_player_inventory(inventory);
+        self.saved_player_inventory_source = Some(encoded);
+        Ok(())
     }
 
     pub fn new(
@@ -1926,6 +1957,7 @@ impl LoadedSession {
             states,
             selected: Block::Grass,
             inventory,
+            saved_player_inventory_source: None,
             recipes: None,
             loot: None,
             tool_transforms: [None, None, None],
@@ -12963,6 +12995,65 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_player_draft_requires_the_initial_player_source() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "Inventory".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("Slot".into(), Tag::Byte(0)),
+                            ("id".into(), Tag::String("minecraft:stone".into())),
+                            ("count".into(), Tag::Int(5)),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let mut session = session();
+        let chunks = BTreeMap::new();
+        assert!(session.draft_player_and_chests(&original, &chunks).is_err());
+        session.restore_saved_player_inventory(&original).unwrap();
+        assert!(session.draft_player_and_chests(&original, &chunks).is_ok());
+        let mut changed = original.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            panic!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        assert!(session.draft_player_and_chests(&changed, &chunks).is_err());
+        let mut changed_item = original.clone();
+        let Tag::Compound(fields) = &mut changed_item.value else {
+            panic!()
+        };
+        let Tag::List { values, .. } = &mut fields[1].1 else {
+            panic!()
+        };
+        let Tag::Compound(stack) = &mut values[0] else {
+            panic!()
+        };
+        stack[2].1 = Tag::Int(6);
+        assert!(
+            session
+                .draft_player_and_chests(&changed_item, &chunks)
+                .is_err()
+        );
+        let malformed = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Inventory".into(), Tag::Int(1))]),
+        };
+        assert!(session.restore_saved_player_inventory(&malformed).is_err());
+        assert!(session.draft_player_and_chests(&original, &chunks).is_ok());
+        session.set_player_inventory(PlayerInventory::default());
+        assert!(session.draft_player_and_chests(&original, &chunks).is_err());
+        session.update(TICK);
+        assert!(session.restore_saved_player_inventory(&original).is_err());
+    }
+
+    #[test]
     fn closed_chest_inventory_draft_checks_source_and_survives_eviction() {
         use crate::inventory::PlayerSlot;
         use native_persistence::{
@@ -12972,7 +13063,14 @@ mod tests {
         };
         use native_world::loaded::SavedBlockEntities;
         let (mut session, source_world, position, chunk) = saved_chest_fixture();
-        session.set_player_inventory(PlayerInventory::default());
+        let player = nbt::NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("future_player_data".into(), Tag::Int(42)),
+            ]),
+        };
+        session.restore_saved_player_inventory(&player).unwrap();
         let base = fixture_chunk_document(chunk);
         let state = |name: &str, properties: &[(&str, &str)]| BlockState {
             name: name.into(),
@@ -13024,13 +13122,6 @@ mod tests {
         session.update(TICK);
         let draft = session.draft_chest_inventory_chunk(chunk, &source).unwrap();
         assert!(draft.matches_source(&source).unwrap());
-        let player = nbt::NamedTag {
-            name: "".into(),
-            value: Tag::Compound(vec![
-                ("DataVersion".into(), Tag::Int(5023)),
-                ("future_player_data".into(), Tag::Int(42)),
-            ]),
-        };
         let originals = BTreeMap::from([(chunk, source.clone())]);
         assert!(session.draft_player_state(&player).is_err());
         assert!(
@@ -13041,6 +13132,17 @@ mod tests {
         let combined = session
             .draft_player_and_chests(&player, &originals)
             .unwrap();
+        let mut stale_player = player.clone();
+        let Tag::Compound(fields) = &mut stale_player.value else {
+            panic!()
+        };
+        fields.push(("changed".into(), Tag::Int(1)));
+        assert!(
+            session
+                .draft_player_and_chests(&stale_player, &originals)
+                .is_err()
+        );
+        assert!(session.restore_saved_player_inventory(&player).is_err());
         assert_eq!(
             combined.player().value.get("future_player_data"),
             Some(&Tag::Int(42))
@@ -13610,7 +13712,13 @@ mod tests {
             player,
         )
         .unwrap();
-        session.set_player_inventory(PlayerInventory::default());
+        let player_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        session
+            .restore_saved_player_inventory(&player_source)
+            .unwrap();
         assert!(session.try_open_saved_chest(left - origin));
         session.submit_command(PlayerCommand::InventoryQuickMove {
             slot: PlayerSlot::Chest(0),
@@ -13622,10 +13730,6 @@ mod tests {
         session.update(TICK);
         assert!(session.chest_dirty_chunks.contains(&left_chunk));
         assert!(session.chest_dirty_chunks.contains(&right_chunk));
-        let player_source = NamedTag {
-            name: "".into(),
-            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
-        };
         assert!(
             session
                 .draft_player_and_chests(

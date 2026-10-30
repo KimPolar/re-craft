@@ -2,7 +2,7 @@
 //! No edits are written to disk. Unimplemented collision states act as barriers.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -5795,6 +5795,7 @@ impl LoadedSession {
                 bounds,
                 air,
             };
+            let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
             self.dropped_items.tick_with_fluid_and_proof(
                 origin,
                 self.motion.position,
@@ -5845,9 +5846,7 @@ impl LoadedSession {
                 |bounds, actual, requested| {
                     fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
                 },
-                |item_bounds, actual| {
-                    created_item_path_safe(world, origin, bounds, item_bounds, actual)
-                },
+                |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
             );
             self.tick_experience_orbs(false);
             self.tick += 1;
@@ -6873,6 +6872,7 @@ impl LoadedSession {
             bounds,
             air,
         };
+        let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
         self.dropped_items.tick_with_fluid_and_proof(
             origin,
             self.motion.position,
@@ -6927,9 +6927,7 @@ impl LoadedSession {
             |bounds, actual, requested| {
                 fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
             },
-            |item_bounds, actual| {
-                created_item_path_safe(world, origin, bounds, item_bounds, actual)
-            },
+            |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
         self.tick_experience_orbs(self.death.is_none());
@@ -7166,15 +7164,14 @@ enum Cell {
     State(BlockStateId),
 }
 
-/// Certify only a fully loaded, effect-free movement area for new-item base
-/// state. Unknown blocks, missing sections, fluids and oversized paths defer.
-fn created_item_path_safe(
-    world: &World,
-    origin: IVec3,
-    build: BuildBounds,
-    bounds: BoundingBox,
-    actual: DVec3,
-) -> bool {
+fn created_item_path_region(bounds: BoundingBox, actual: DVec3) -> Option<(IVec3, IVec3)> {
+    if !bounds.min.is_finite()
+        || !bounds.max.is_finite()
+        || !actual.is_finite()
+        || !bounds.min.cmple(bounds.max).all()
+    {
+        return None;
+    }
     let min = bounds.min.min(bounds.min + actual) - DVec3::ONE;
     let max = bounds.max.max(bounds.max + actual) + DVec3::ONE;
     if !min.is_finite()
@@ -7182,7 +7179,7 @@ fn created_item_path_safe(
         || min.min_element() < f64::from(i32::MIN)
         || max.max_element() > f64::from(i32::MAX)
     {
-        return false;
+        return None;
     }
     let low = min.floor().as_ivec3();
     let high = max.floor().as_ivec3();
@@ -7190,8 +7187,55 @@ fn created_item_path_safe(
         .checked_mul(i64::from(high.y) - i64::from(low.y) + 1)
         .and_then(|n| n.checked_mul(i64::from(high.z) - i64::from(low.z) + 1));
     if count.is_none_or(|count| !(1..=4096).contains(&count)) {
-        return false;
+        return None;
     }
+    Some((low, high))
+}
+
+/// Cache only within one tick and one immutable world snapshot. The cap bounds
+/// memory when item paths are spread across many distinct regions.
+struct CreatedItemPathProof<'a> {
+    world: &'a World,
+    origin: IVec3,
+    build: BuildBounds,
+    cache: HashMap<(IVec3, IVec3), bool>,
+}
+
+impl<'a> CreatedItemPathProof<'a> {
+    fn new(world: &'a World, origin: IVec3, build: BuildBounds) -> Self {
+        Self {
+            world,
+            origin,
+            build,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn safe(&mut self, bounds: BoundingBox, actual: DVec3) -> bool {
+        let Some(region) = created_item_path_region(bounds, actual) else {
+            return false;
+        };
+        if let Some(result) = self.cache.get(&region) {
+            return *result;
+        }
+        let result =
+            created_item_region_safe(self.world, self.origin, self.build, region.0, region.1);
+        if self.cache.len() < 4096 {
+            self.cache.insert(region, result);
+        }
+        result
+    }
+}
+
+/// Certify only a fully loaded, effect-free movement area for new-item base
+/// state. Unknown blocks, missing sections, fluids and oversized paths defer.
+fn created_item_region_safe(
+    world: &World,
+    origin: IVec3,
+    build: BuildBounds,
+    low: IVec3,
+    high: IVec3,
+) -> bool {
     for x in low.x..=high.x {
         for y in low.y..=high.y {
             for z in low.z..=high.z {
@@ -7231,6 +7275,18 @@ fn created_item_path_safe(
         }
     }
     true
+}
+
+#[cfg(test)]
+fn created_item_path_safe(
+    world: &World,
+    origin: IVec3,
+    build: BuildBounds,
+    bounds: BoundingBox,
+    actual: DVec3,
+) -> bool {
+    created_item_path_region(bounds, actual)
+        .is_some_and(|(low, high)| created_item_region_safe(world, origin, build, low, high))
 }
 
 fn is_bed(name: &str) -> bool {
@@ -10507,6 +10563,109 @@ mod tests {
             unknown_section,
             DVec3::ZERO
         ));
+    }
+
+    #[test]
+    fn item_path_cache_matches_uncached_proof_and_resets_for_changed_world() {
+        let mut session = session();
+        let bounds = BoundingBox {
+            min: DVec3::new(3.0, 3.0, 3.0),
+            max: DVec3::new(3.25, 3.25, 3.25),
+        };
+        {
+            let mut proof =
+                CreatedItemPathProof::new(&session.world, session.origin, session.bounds);
+            for x in -3..=17 {
+                for y in [0.0, 3.0, 20.0] {
+                    for z in -3..=17 {
+                        let offset = DVec3::new(f64::from(x), y, f64::from(z));
+                        let b = BoundingBox {
+                            min: bounds.min + offset,
+                            max: bounds.max + offset,
+                        };
+                        for actual in [
+                            DVec3::ZERO,
+                            DVec3::new(0.2, -0.3, 0.1),
+                            DVec3::splat(f64::NAN),
+                        ] {
+                            assert_eq!(
+                                proof.safe(b, actual),
+                                created_item_path_safe(
+                                    &session.world,
+                                    session.origin,
+                                    session.bounds,
+                                    b,
+                                    actual
+                                )
+                            );
+                            assert_eq!(
+                                proof.safe(b, actual),
+                                created_item_path_safe(
+                                    &session.world,
+                                    session.origin,
+                                    session.bounds,
+                                    b,
+                                    actual
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(proof.safe(bounds, DVec3::ZERO));
+        }
+        let portal = session.intern_block(state("minecraft:nether_portal", &[("axis", "x")]));
+        assert!(session.set(IVec3::new(3, 3, 3), portal));
+        let mut proof = CreatedItemPathProof::new(&session.world, session.origin, session.bounds);
+        assert!(!proof.safe(bounds, DVec3::ZERO));
+    }
+
+    #[test]
+    #[ignore = "manual synthetic CPU benchmark"]
+    fn benchmark_created_item_path_proof() {
+        use std::{hint::black_box, time::Instant};
+        let session = session();
+        let boxes: Vec<_> = (0..1000)
+            .map(|i| {
+                let p = DVec3::new(
+                    2.25 + f64::from(i % 24) * 0.48,
+                    3.0,
+                    2.25 + f64::from((i / 24) % 24) * 0.48,
+                );
+                BoundingBox {
+                    min: p,
+                    max: p + DVec3::splat(0.25),
+                }
+            })
+            .collect();
+        for cached in [false, true] {
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let mut proof =
+                    CreatedItemPathProof::new(&session.world, session.origin, session.bounds);
+                let start = Instant::now();
+                for &bounds in &boxes {
+                    let valid = if cached {
+                        proof.safe(bounds, DVec3::ZERO)
+                    } else {
+                        created_item_path_safe(
+                            &session.world,
+                            session.origin,
+                            session.bounds,
+                            bounds,
+                            DVec3::ZERO,
+                        )
+                    };
+                    assert!(black_box(valid));
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "1000 created item paths (cached={cached}): p50={:.3} ms, p95={:.3} ms",
+                samples[10], samples[19]
+            );
+        }
     }
 
     #[test]

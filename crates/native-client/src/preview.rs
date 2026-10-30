@@ -1019,10 +1019,14 @@ fn model_light(world: &World, position: IVec3, quad: &Quad, has_skylight: bool) 
         .and_then(|offset| checked_add(position, offset))
         .unwrap_or(position);
     let get = |sky| {
-        stored_light(world, sample, sky)
-            .or_else(|| stored_light(world, position, sky))
-            .unwrap_or(if sky && has_skylight { 15 } else { 0 })
-            .max(quad.light_emission)
+        (if sky && !has_skylight {
+            0
+        } else {
+            stored_light(world, sample, sky)
+                .or_else(|| stored_light(world, position, sky))
+                .unwrap_or(if sky { 15 } else { 0 })
+        })
+        .max(quad.light_emission)
     };
     (get(false), get(true))
 }
@@ -1041,13 +1045,16 @@ fn fluid_light(
     };
     let above = checked_add(sample, IVec3::Y);
     let get = |sky| {
+        if sky && !has_skylight {
+            return 0;
+        }
         let first = stored_light(world, sample, sky);
         let second = above.and_then(|pos| stored_light(world, pos, sky));
         first
             .into_iter()
             .chain(second)
             .max()
-            .unwrap_or(if sky && has_skylight { 15 } else { 0 })
+            .unwrap_or(if sky { 15 } else { 0 })
     };
     let emitted = if kind == FluidKind::Lava { 15 } else { 0 };
     (get(false).max(emitted), get(true))
@@ -2135,6 +2142,19 @@ mod tests {
         assert_eq!(
             fluid_light(&world, position, Direction::Up, FluidKind::Lava, true),
             (15, 12)
+        );
+        quad.light_emission = 0;
+        quad.cullface = Some(Direction::Up);
+        assert_eq!(model_light(&world, position, &quad, false), (8, 0));
+        quad.light_emission = 6;
+        assert_eq!(model_light(&world, position, &quad, false), (8, 6));
+        assert_eq!(
+            fluid_light(&world, position, Direction::Up, FluidKind::Water, false),
+            (8, 0)
+        );
+        assert_eq!(
+            fluid_light(&world, position, Direction::Up, FluidKind::Lava, false),
+            (15, 0)
         );
         assert_eq!(directional_shade(Direction::Up, true), 0.9);
         assert_eq!(directional_shade(Direction::Down, false), 0.5);

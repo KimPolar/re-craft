@@ -134,6 +134,7 @@ public class SprintOracle {
         JsonArray output = new JsonArray();
         for (var scenario : scenarios) {
             player.reset();
+            set(OptionInstance.class, window, "value", Integer.valueOf(scenario.getAsJsonArray().get(0).getAsJsonObject().get("window").getAsInt()));
             JsonArray ticks = new JsonArray();
             for (var value : scenario.getAsJsonArray()) {
                 JsonObject step = value.getAsJsonObject();
@@ -257,7 +258,7 @@ fn sprint_controls_match_vanilla_local_player() {
             let ground = (random >> 19) % 2 == 0;
             let enough = (random >> 23) % 4 != 0;
             let using = (random >> 2) % 4 == 0;
-            ticks.push(json!({"forward":forward,"backward":backward,"shift":shift,"key":key,"collision":collision,"minor":minor,"water":water,"under":under,"swimming":swimming,"ground":ground,"enough":enough,"using":using}));
+            ticks.push(json!({"forward":forward,"backward":backward,"shift":shift,"key":key,"collision":collision,"minor":minor,"water":water,"under":under,"swimming":swimming,"ground":ground,"enough":enough,"using":using,"window":seed % 11}));
         }
         scenarios.push(ticks);
     }
@@ -308,7 +309,8 @@ fn sprint_controls_match_vanilla_local_player() {
             );
             let forward =
                 i8::from(input["forward"].as_bool().unwrap()) - i8::from(state.backward_pressed);
-            let actual = state.update(f32::from(forward));
+            let actual = state
+                .update_with_window(f32::from(forward), input["window"].as_u64().unwrap() as u8);
             previous_sneak = input["shift"].as_bool().unwrap();
             if actual != expected.as_bool().unwrap() && differences.len() < 20 {
                 differences.push(format!("scenario {scenario}, tick {tick}, input {input}: native {actual}, Java {expected}"));

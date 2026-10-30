@@ -235,6 +235,8 @@ pub struct VideoSettings {
     pub discrete_mouse_scroll: bool,
     pub invert_mouse_x: bool,
     pub invert_mouse_y: bool,
+    /// Ticks allowed between forward taps, from 0 through 10.
+    pub sprint_window: u8,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
     pub inactivity_fps_limit: InactivityFpsLimit,
 }
@@ -274,6 +276,7 @@ impl Default for VideoSettings {
             discrete_mouse_scroll: false,
             invert_mouse_x: false,
             invert_mouse_y: false,
+            sprint_window: 7,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }
@@ -307,6 +310,11 @@ impl VideoSettings {
                 self.menu_blur
             } else {
                 5
+            },
+            sprint_window: if self.sprint_window <= 10 {
+                self.sprint_window
+            } else {
+                7
             },
             ..self
         }
@@ -502,6 +510,7 @@ mod tests {
             max_fps: 260,
             fov: 90,
             view_bobbing: true,
+            sprint_window: 0,
             inactivity_fps_limit: InactivityFpsLimit::Minimized,
             ..VideoSettings::default()
         };

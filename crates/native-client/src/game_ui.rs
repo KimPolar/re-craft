@@ -19,7 +19,7 @@ use crate::{
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
     menu_settings::{SoundCategory, SoundSettings, VideoSettings},
-    mouse_ui::{self, MouseControl, MouseUi},
+    mouse_ui::{self, MouseControl, MouseUi, SprintWindowUi},
     recipe_book_ui::{BookAction, RecipeBookUi, inventory_origin},
     renderer::Renderer,
     sound_ui::SoundUi,
@@ -53,6 +53,7 @@ enum PauseButton {
     Options,
     Controls,
     MouseSettings,
+    SprintWindow,
     MouseSensitivity,
     MouseWheelSensitivity,
     MouseDiscreteScroll,
@@ -140,6 +141,7 @@ pub struct GameUi {
     sound: SoundSettings,
     sound_ui: SoundUi,
     mouse_ui: MouseUi,
+    sprint_window_ui: SprintWindowUi,
     sound_dirty: bool,
     audio: Option<crate::audio::UiAudio>,
     slider_pressed: bool,
@@ -187,6 +189,7 @@ impl GameUi {
             sound: crate::menu_settings::load().sound,
             sound_ui: SoundUi::default(),
             mouse_ui: MouseUi::default(),
+            sprint_window_ui: SprintWindowUi::default(),
             sound_dirty: false,
             audio: None,
             slider_pressed: false,
@@ -443,6 +446,15 @@ impl GameUi {
             if dragged {
                 self.last_draw = None;
             }
+        } else if self.paused && self.pause_page == PausePage::Controls {
+            let (w, _) = self.logical_size();
+            let (dragged, changed) =
+                self.sprint_window_ui
+                    .pointer_move(w, self.cursor.0, &mut self.video);
+            self.video_dirty |= changed;
+            if dragged {
+                self.last_draw = None;
+            }
         } else if self.paused && self.pause_page == PausePage::Mouse {
             let (w, _) = self.logical_size();
             let (dragged, changed) = self
@@ -541,6 +553,8 @@ impl GameUi {
             PausePage::Controls => {
                 if hit(mouse_ui::controls_mouse_button(w)) {
                     Some(PauseButton::MouseSettings)
+                } else if hit(SprintWindowUi::rect(w)) {
+                    Some(PauseButton::SprintWindow)
                 } else if hit(Rect {
                     x,
                     y: h - 27,
@@ -648,6 +662,17 @@ impl GameUi {
                 self.mouse_ui = MouseUi::default();
                 self.pause_page = PausePage::Mouse;
                 self.pause_focus = None;
+                PauseAction::None
+            }
+            PauseButton::SprintWindow => {
+                if mouse {
+                    let (w, _) = self.logical_size();
+                    self.video_dirty |=
+                        self.sprint_window_ui
+                            .start(w, self.cursor.0, &mut self.video);
+                } else {
+                    self.sprint_window_ui.keyboard_adjust = !self.sprint_window_ui.keyboard_adjust;
+                }
                 PauseAction::None
             }
             PauseButton::MouseSensitivity => {
@@ -831,6 +856,7 @@ impl GameUi {
         self.slider_pressed = matches!(
             button,
             PauseButton::Fov
+                | PauseButton::SprintWindow
                 | PauseButton::MouseSensitivity
                 | PauseButton::MouseWheelSensitivity
                 | PauseButton::Framerate
@@ -858,7 +884,10 @@ impl GameUi {
 
     pub fn pause_cancel(&mut self) {
         self.slider_pressed = false;
-        if self.paused && self.pause_page == PausePage::Mouse {
+        if self.paused && self.pause_page == PausePage::Controls {
+            self.sprint_window_ui.release();
+            self.last_draw = None;
+        } else if self.paused && self.pause_page == PausePage::Mouse {
             self.mouse_ui.release();
             self.last_draw = None;
         } else if self.paused && self.pause_page == PausePage::Sound {
@@ -1002,7 +1031,11 @@ impl GameUi {
                     PauseButton::Accessibility,
                     PauseButton::Done,
                 ],
-                PausePage::Controls => vec![PauseButton::MouseSettings, PauseButton::Done],
+                PausePage::Controls => vec![
+                    PauseButton::MouseSettings,
+                    PauseButton::SprintWindow,
+                    PauseButton::Done,
+                ],
                 PausePage::Mouse => vec![
                     PauseButton::MouseSensitivity,
                     PauseButton::MouseWheelSensitivity,
@@ -1091,6 +1124,8 @@ impl GameUi {
             }
             self.video_ui.keyboard_adjust = false;
             self.fov_ui.keyboard_adjust = self.pause_focus == Some(PauseButton::Fov);
+            self.sprint_window_ui.keyboard_adjust =
+                self.pause_focus == Some(PauseButton::SprintWindow);
             self.mouse_ui.keyboard_adjust = self.pause_focus.is_some_and(|button| {
                 matches!(
                     button.mouse_control(),
@@ -1109,6 +1144,15 @@ impl GameUi {
                         | PauseButton::MenuBlur
                 )
             );
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Controls
+            && self.pause_focus == Some(PauseButton::SprintWindow)
+            && self.sprint_window_ui.keyboard_adjust
+            && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
+        {
+            self.video_dirty |= self
+                .sprint_window_ui
+                .arrow(key == KeyCode::ArrowRight, &mut self.video);
             self.last_draw = None;
         } else if self.pause_page == PausePage::Mouse
             && self.mouse_ui.keyboard_adjust
@@ -1192,6 +1236,7 @@ impl GameUi {
             if !matches!(
                 button,
                 PauseButton::Fov
+                    | PauseButton::SprintWindow
                     | PauseButton::MouseSensitivity
                     | PauseButton::MouseWheelSensitivity
                     | PauseButton::Framerate
@@ -2036,6 +2081,13 @@ impl GameUi {
                     [255, 255, 255],
                 );
                 mouse_ui::draw_controls_placeholders(&mut canvas, assets);
+                self.sprint_window_ui.draw(
+                    &mut canvas,
+                    assets,
+                    self.video,
+                    self.cursor,
+                    self.pause_focus == Some(PauseButton::SprintWindow),
+                );
                 canvas.button(
                     Some(assets),
                     mouse_ui::controls_mouse_button(w),
@@ -3216,6 +3268,24 @@ mod inventory_tests {
         ui.cursor_moved(f64::from(w / 2 + 10) * scale, 90.0 * scale);
         assert_eq!(ui.click(), PauseAction::None);
         assert_eq!(ui.pause_page, PausePage::Controls);
+        let sprint = SprintWindowUi::rect(w);
+        ui.cursor_moved(
+            f64::from(sprint.x + sprint.w - 4) * scale,
+            f64::from(sprint.y + 10) * scale,
+        );
+        ui.click();
+        assert_eq!(ui.video.sprint_window, 10);
+        ui.cursor_moved(
+            f64::from(sprint.x + 4) * scale,
+            f64::from(sprint.y + 10) * scale,
+        );
+        ui.pause_release();
+        assert_eq!(ui.video.sprint_window, 0);
+        ui.pause_focus = Some(PauseButton::SprintWindow);
+        ui.sprint_window_ui.keyboard_adjust = true;
+        ui.pause_key(KeyCode::ArrowRight, false);
+        assert_eq!(ui.video.sprint_window, 1);
+        assert!(ui.video_needs_save());
         ui.cursor_moved(f64::from(w / 2 - 145) * scale, 45.0 * scale);
         assert_eq!(ui.click(), PauseAction::None);
         assert_eq!(ui.pause_page, PausePage::Mouse);

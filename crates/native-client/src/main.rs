@@ -1423,6 +1423,7 @@ impl App {
         let _ = smoke_test;
         let mut session = LocalSession::demo();
         session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
+        session.set_sprint_window(video.sprint_window);
         if let Some(recipes) = &content.recipes {
             session.set_crafting_recipes(Arc::clone(recipes));
         }
@@ -1510,6 +1511,7 @@ impl App {
 
     fn apply_video(&mut self) {
         let old_fov_effect = self.video.fov_effect_scale;
+        let old_sprint_window = self.video.sprint_window;
         apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
@@ -1519,6 +1521,9 @@ impl App {
         if self.video.fov_effect_scale != old_fov_effect {
             self.session
                 .set_fov_effect_scale(self.video.fov_effect_scale.value() as f32);
+        }
+        if self.video.sprint_window != old_sprint_window {
+            self.session.set_sprint_window(self.video.sprint_window);
         }
     }
 

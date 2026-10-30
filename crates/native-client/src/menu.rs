@@ -30,7 +30,7 @@ use crate::{
     menu_gpu_worker::{MenuFrame, MenuGpuWorker, MenuOverlay},
     menu_settings::{self, Settings, SoundCategory, SoundSettings, VideoSettings},
     menu_software_worker::{MenuSoftwareWorker, SoftwareFrame},
-    mouse_ui::{self, MouseControl, MouseUi},
+    mouse_ui::{self, MouseControl, MouseUi, SprintWindowUi},
     sound_ui::SoundUi,
     video_ui::{VideoControl, VideoUi},
 };
@@ -64,6 +64,7 @@ enum ButtonId {
     Options,
     Controls,
     MouseSettings,
+    SprintWindow,
     MouseSensitivity,
     MouseWheelSensitivity,
     MouseDiscreteScroll,
@@ -899,6 +900,7 @@ struct Menu<'a> {
     video_ui: VideoUi,
     sound_ui: SoundUi,
     mouse_ui: MouseUi,
+    sprint_window_ui: SprintWindowUi,
     accessibility_ui: crate::accessibility_ui::AccessibilityUi,
     fov_ui: FovSlider,
     slider_mouse_pressed: bool,
@@ -946,6 +948,7 @@ impl<'a> Menu<'a> {
             video_ui,
             sound_ui: SoundUi::default(),
             mouse_ui: MouseUi::default(),
+            sprint_window_ui: SprintWindowUi::default(),
             accessibility_ui: crate::accessibility_ui::AccessibilityUi::default(),
             fov_ui,
             slider_mouse_pressed: false,
@@ -1511,6 +1514,15 @@ impl<'a> Menu<'a> {
                     tr("options.mouse_settings", "Mouse Settings..."),
                     true,
                 );
+                let rect = SprintWindowUi::rect(w);
+                add(
+                    ButtonId::SprintWindow,
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    String::new(),
+                    true,
+                );
                 add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
             }
             Screen::Mouse => {
@@ -1716,6 +1728,12 @@ impl<'a> Menu<'a> {
                         .start(width, self.cursor.0, &mut self.state.video);
             }
             ButtonId::Controls => self.state.screen = Screen::Controls,
+            ButtonId::SprintWindow => {
+                let (width, _) = self.logical_size();
+                self.state.video_dirty |=
+                    self.sprint_window_ui
+                        .start(width, self.cursor.0, &mut self.state.video);
+            }
             ButtonId::MouseSettings => {
                 self.mouse_ui = MouseUi::default();
                 self.state.screen = Screen::Mouse;
@@ -1933,7 +1951,8 @@ impl<'a> Menu<'a> {
             && id.accessibility_control().is_none()
             && !matches!(
                 id,
-                ButtonId::VideoFps
+                ButtonId::SprintWindow
+                    | ButtonId::VideoFps
                     | ButtonId::VideoBlur
                     | ButtonId::VideoDistance
                     | ButtonId::VideoVsync
@@ -2341,6 +2360,13 @@ impl<'a> Menu<'a> {
                 );
                 if let Some(assets) = assets {
                     mouse_ui::draw_controls_placeholders(&mut canvas, assets);
+                    self.sprint_window_ui.draw(
+                        &mut canvas,
+                        assets,
+                        self.state.video,
+                        self.cursor,
+                        self.focused == Some(ButtonId::SprintWindow),
+                    );
                 }
             }
             Screen::Mouse => {
@@ -2525,6 +2551,7 @@ impl<'a> Menu<'a> {
         }
         for button in self.buttons() {
             if matches!(button.id, ButtonId::SoundSlider(_))
+                || button.id == ButtonId::SprintWindow
                 || button.id.mouse_control().is_some()
                 || button.id.accessibility_control().is_some()
                 || matches!(
@@ -2725,7 +2752,11 @@ impl ApplicationHandler for Menu<'_> {
                     (position.x / self.scale as f64) as i32,
                     (position.y / self.scale as f64) as i32,
                 );
-                let (dragged, changed) = if self.state.screen == Screen::Mouse {
+                let (dragged, changed) = if self.state.screen == Screen::Controls {
+                    let (w, _) = self.logical_size();
+                    self.sprint_window_ui
+                        .pointer_move(w, self.cursor.0, &mut self.state.video)
+                } else if self.state.screen == Screen::Mouse {
                     let (w, _) = self.logical_size();
                     self.mouse_ui
                         .pointer_move(w, self.cursor.0, &mut self.state.video)
@@ -2799,7 +2830,8 @@ impl ApplicationHandler for Menu<'_> {
                     self.slider_mouse_pressed = matches!(button.id, ButtonId::SoundSlider(_))
                         || matches!(
                             button.id,
-                            ButtonId::VideoFps
+                            ButtonId::SprintWindow
+                                | ButtonId::VideoFps
                                 | ButtonId::MouseSensitivity
                                 | ButtonId::MouseWheelSensitivity
                                 | ButtonId::VideoBlur
@@ -2817,7 +2849,8 @@ impl ApplicationHandler for Menu<'_> {
                     if matches!(button.id, ButtonId::SoundSlider(_))
                         || matches!(
                             button.id,
-                            ButtonId::VideoFps
+                            ButtonId::SprintWindow
+                                | ButtonId::VideoFps
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoVsync
@@ -2896,6 +2929,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.fov_ui.release(self.state.video);
                 self.sound_ui.release();
                 self.mouse_ui.release();
+                self.sprint_window_ui.release();
             }
             WindowEvent::Focused(false) => {
                 self.slider_mouse_pressed = false;
@@ -2904,6 +2938,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.fov_ui.release(self.state.video);
                 self.sound_ui.release();
                 self.mouse_ui.release();
+                self.sprint_window_ui.release();
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Sound && self.state.asset_load.is_none() =>
@@ -3012,6 +3047,14 @@ impl ApplicationHandler for Menu<'_> {
                     if next >= self.state.world_scroll + visible {
                         self.state.world_scroll = next + 1 - visible;
                     }
+                } else if self.state.screen == Screen::Controls
+                    && self.focused == Some(ButtonId::SprintWindow)
+                    && self.sprint_window_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.state.video_dirty |= self
+                        .sprint_window_ui
+                        .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Mouse
                     && self
                         .focused
@@ -3137,6 +3180,8 @@ impl ApplicationHandler for Menu<'_> {
                             )
                         );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
+                        self.sprint_window_ui.keyboard_adjust =
+                            self.focused == Some(ButtonId::SprintWindow);
                         self.mouse_ui.keyboard_adjust = self.focused.is_some_and(|id| {
                             matches!(
                                 id.mouse_control(),
@@ -3167,7 +3212,10 @@ impl ApplicationHandler for Menu<'_> {
                     if let Some(id) = self.focused
                         && self.buttons().iter().any(|b| b.id == id && b.active)
                     {
-                        if matches!(
+                        if id == ButtonId::SprintWindow {
+                            self.sprint_window_ui.keyboard_adjust =
+                                !self.sprint_window_ui.keyboard_adjust;
+                        } else if matches!(
                             id,
                             ButtonId::MouseSensitivity | ButtonId::MouseWheelSensitivity
                         ) {
@@ -4344,6 +4392,19 @@ mod tests {
                     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
                 assert_eq!(saved.video.fov, 110);
                 click(&mut self.menu, event_loop, ButtonId::Options, false);
+                click(&mut self.menu, event_loop, ButtonId::Controls, false);
+                assert_eq!(self.menu.state.screen, Screen::Controls);
+                self.menu.redraw().unwrap();
+                click(&mut self.menu, event_loop, ButtonId::SprintWindow, true);
+                assert_eq!(self.menu.state.video.sprint_window, 10);
+                assert_eq!(self.menu.focused, Some(ButtonId::SprintWindow));
+                assert!(self.menu.sprint_window_ui.keyboard_adjust);
+                click(&mut self.menu, event_loop, ButtonId::Done, false);
+                let saved: Settings = serde_json::from_slice(
+                    &std::fs::read(self.menu.state.settings_path.as_ref().unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved.video.sprint_window, 10);
                 click(&mut self.menu, event_loop, ButtonId::VideoSettings, false);
                 assert_eq!(self.menu.state.screen, Screen::Video);
                 self.menu.redraw().unwrap();
@@ -4356,6 +4417,7 @@ mod tests {
                         vsync: false,
                         max_fps: 260,
                         fov: 110,
+                        sprint_window: 10,
                         view_bobbing: true,
                         inactivity_fps_limit: menu_settings::InactivityFpsLimit::Minimized,
                         ..VideoSettings::default()

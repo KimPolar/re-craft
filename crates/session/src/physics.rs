@@ -525,6 +525,11 @@ pub struct SprintState {
 impl SprintState {
     /// Process the current input before physics, using the previous move's collision.
     pub fn update(&mut self, forward: f32) -> bool {
+        self.update_with_window(forward, 7)
+    }
+
+    /// Apply the configured double-tap window in ticks (0 disables double-tap).
+    pub fn update_with_window(&mut self, forward: f32, window: u8) -> bool {
         self.trigger_time = self.trigger_time.saturating_sub(1);
         let forward_now = forward > 1.0e-5_f32;
         if self.backward_pressed || self.previous_sneak || self.using_item || forward < 0.0 {
@@ -541,8 +546,7 @@ impl SprintState {
                 if self.trigger_time > 0 {
                     self.active = true;
                 } else {
-                    // Vanilla's default sprintWindow is seven ticks.
-                    self.trigger_time = 7;
+                    self.trigger_time = window.min(10);
                 }
             }
             if self.pressed {

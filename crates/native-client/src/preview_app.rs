@@ -130,6 +130,7 @@ pub fn run_play(
 ) -> Result<crate::GameExit> {
     let mut session = session;
     session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
+    session.set_sprint_window(video.sprint_window);
     let snapshot = session.snapshot();
     let camera = Camera {
         eye: eye_for_scene(&snapshot, scene.origin, session.partial_tick()),
@@ -320,6 +321,7 @@ impl Viewer {
         }
         let old_distance = self.video.render_distance;
         let old_fov_effect = self.video.fov_effect_scale;
+        let old_sprint_window = self.video.sprint_window;
         crate::apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
@@ -337,6 +339,11 @@ impl Viewer {
         {
             play.streamer
                 .set_radius(u32::from(self.video.render_distance));
+        }
+        if old_sprint_window != self.video.sprint_window
+            && let Some(play) = &mut self.play
+        {
+            play.session.set_sprint_window(self.video.sprint_window);
         }
     }
 

@@ -32,7 +32,6 @@ pub fn draw_controls_placeholders(canvas: &mut Canvas, assets: &MenuAssets) {
         (0, 2, "key.attack", "Attack"),
         (1, 2, "key.use", "Use Item"),
         (0, 3, "options.autoJump", "Auto-Jump"),
-        (1, 3, "options.sprintWindow", "Sprint Window"),
         (0, 4, "options.quitShortcuts", "Quit Shortcuts"),
         (1, 4, "options.operatorItemsTab", "Operator Items Tab"),
     ] {
@@ -47,6 +46,118 @@ pub fn draw_controls_placeholders(canvas: &mut Canvas, assets: &MenuAssets) {
             false,
             false,
             assets.translate(key, fallback),
+        );
+    }
+}
+
+#[derive(Default)]
+pub struct SprintWindowUi {
+    dragging: bool,
+    pub keyboard_adjust: bool,
+}
+
+impl SprintWindowUi {
+    pub fn rect(width: i32) -> Rect {
+        Rect {
+            x: width / 2 + 5,
+            y: 107,
+            w: 150,
+            h: 20,
+        }
+    }
+
+    pub fn start(&mut self, width: i32, x: i32, settings: &mut VideoSettings) -> bool {
+        self.dragging = true;
+        self.keyboard_adjust = true;
+        self.set_from_pointer(width, x, settings)
+    }
+
+    fn set_from_pointer(&self, width: i32, x: i32, settings: &mut VideoSettings) -> bool {
+        let rect = Self::rect(width);
+        let fraction = (f64::from(x - rect.x - 4) / f64::from(rect.w - 8)).clamp(0.0, 1.0);
+        let next = ((fraction.min(f64::from(0.99999_f32)) * 11.0).floor() as u8).min(10);
+        let changed = settings.sprint_window != next;
+        settings.sprint_window = next;
+        changed
+    }
+
+    pub fn pointer_move(&self, width: i32, x: i32, settings: &mut VideoSettings) -> (bool, bool) {
+        if self.dragging {
+            (true, self.set_from_pointer(width, x, settings))
+        } else {
+            (false, false)
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.dragging = false;
+    }
+
+    pub fn arrow(&mut self, right: bool, settings: &mut VideoSettings) -> bool {
+        let old = settings.sprint_window;
+        settings.sprint_window = if right {
+            old.saturating_add(1).min(10)
+        } else {
+            old.saturating_sub(1)
+        };
+        old != settings.sprint_window
+    }
+
+    pub fn draw(
+        &self,
+        canvas: &mut Canvas,
+        assets: &MenuAssets,
+        settings: VideoSettings,
+        cursor: (i32, i32),
+        focused: bool,
+    ) {
+        let rect = Self::rect(canvas.width);
+        let hovered = rect.contains(cursor.0, cursor.1);
+        let background = if focused && !self.keyboard_adjust {
+            &assets.slider_highlighted
+        } else {
+            &assets.slider
+        };
+        let handle = if hovered || focused && self.keyboard_adjust {
+            &assets.slider_handle_highlighted
+        } else {
+            &assets.slider_handle
+        };
+        canvas.gui_sprite(&background.image, rect, background.scaling);
+        let fraction = match settings.sprint_window {
+            0 => 0.0,
+            10 => 1.0,
+            n => (f64::from(n) + 0.5) / 11.0,
+        };
+        canvas.gui_sprite(
+            &handle.image,
+            Rect {
+                x: rect.x + (fraction * f64::from(rect.w - 8)) as i32,
+                y: rect.y,
+                w: 8,
+                h: 20,
+            },
+            handle.scaling,
+        );
+        let value = if settings.sprint_window == 0 {
+            assets.translate("options.off", "OFF").to_owned()
+        } else {
+            assets
+                .translate("options.value", "%s")
+                .replace("%1$s", &settings.sprint_window.to_string())
+                .replacen("%s", &settings.sprint_window.to_string(), 1)
+        };
+        let text = caption(
+            assets,
+            assets.translate("options.sprintWindow", "Sprint Window"),
+            &value,
+        );
+        canvas.text_centered(
+            Some(assets),
+            rect.x + rect.w / 2,
+            rect.y + 6,
+            &text,
+            [255, 255, 255],
         );
     }
 }

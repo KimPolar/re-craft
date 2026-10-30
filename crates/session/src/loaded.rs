@@ -167,6 +167,7 @@ pub struct LoadedSession {
     commands: VecDeque<PlayerCommand>,
     movement: (f32, f32, bool),
     sprint: crate::physics::SprintState,
+    sprint_window: u8,
     sneak: bool,
     previous_sneak: bool,
     previous_eye_in_water: bool,
@@ -937,6 +938,10 @@ impl LoadedSession {
         }
     }
 
+    pub fn set_sprint_window(&mut self, ticks: u8) {
+        self.sprint_window = ticks.min(10);
+    }
+
     pub fn set_game_master_permission(&mut self, allowed: bool) {
         self.mining.release();
         self.game_master_permission = allowed;
@@ -1162,6 +1167,7 @@ impl LoadedSession {
             commands: VecDeque::new(),
             movement: (0.0, 0.0, false),
             sprint: crate::physics::SprintState::default(),
+            sprint_window: 7,
             sneak: false,
             previous_sneak: false,
             previous_eye_in_water: false,
@@ -5502,7 +5508,9 @@ impl LoadedSession {
             right: self.movement.1,
             yaw_degrees: self.player.yaw.to_degrees() - 180.0,
             jump: self.movement.2,
-            sprinting: self.sprint.update(self.movement.0),
+            sprinting: self
+                .sprint
+                .update_with_window(self.movement.0, self.sprint_window),
             using_item: self.food_use.is_active(),
             moving_slowly,
         };

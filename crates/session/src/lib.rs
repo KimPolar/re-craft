@@ -388,6 +388,7 @@ pub struct LocalSession {
     commands: VecDeque<PlayerCommand>,
     movement: (f32, f32, bool),
     sprint: physics::SprintState,
+    sprint_window: u8,
     sneak: bool,
     previous_sneak: bool,
     fall_distance: f64,
@@ -476,6 +477,7 @@ impl LocalSession {
             commands: VecDeque::new(),
             movement: (0.0, 0.0, false),
             sprint: physics::SprintState::default(),
+            sprint_window: 7,
             sneak: false,
             previous_sneak: false,
             fall_distance: 0.0,
@@ -527,6 +529,10 @@ impl LocalSession {
         if scale.is_finite() {
             self.fov_effect_scale = scale.clamp(0.0, 1.0);
         }
+    }
+
+    pub fn set_sprint_window(&mut self, ticks: u8) {
+        self.sprint_window = ticks.min(10);
     }
 
     pub fn set_player_vitals(&mut self, vitals: survival::PlayerVitals) {
@@ -1152,7 +1158,9 @@ impl LocalSession {
             right: self.movement.1,
             yaw_degrees: self.player.yaw.to_degrees() - 180.0,
             jump: self.movement.2,
-            sprinting: self.sprint.update(self.movement.0),
+            sprinting: self
+                .sprint
+                .update_with_window(self.movement.0, self.sprint_window),
             using_item: self.food_use.is_active(),
             moving_slowly,
         };
@@ -3970,6 +3978,32 @@ mod tests {
         });
         running.update(TICK);
         assert!(!running.snapshot().sprinting);
+    }
+
+    #[test]
+    fn sprint_window_setting_controls_double_tap_in_demo_session() {
+        for (window, expected) in [(0, false), (7, true)] {
+            let mut session = LocalSession::demo();
+            session.set_sprint_window(window);
+            for forward in [1.0, 0.0, 1.0] {
+                session.submit_command(PlayerCommand::Move {
+                    forward,
+                    strafe: 0.0,
+                    jump: false,
+                });
+                session.update(TICK);
+            }
+            assert_eq!(session.snapshot().sprinting, expected, "window={window}");
+            session.submit_command(PlayerCommand::Sprint {
+                pressed: true,
+                backward_pressed: false,
+            });
+            session.update(TICK);
+            assert!(
+                session.snapshot().sprinting,
+                "sprint key works when window={window}"
+            );
+        }
     }
 
     #[test]

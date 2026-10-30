@@ -355,6 +355,20 @@ pub enum CreatedRemovalCause {
     Expired,
 }
 
+/// A verified transfer from a newly spawned item into the player inventory.
+/// Java's pickup statistic uses the pre-transfer count, even for partial pickup.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatedItemPickup {
+    pub uuid: [i32; 4],
+    pub original_stack: ItemStack,
+    pub transferred: u32,
+}
+
+struct CreatedPickupRecord {
+    effect: CreatedItemPickup,
+    chunks: BTreeSet<native_world::loaded::ChunkPos>,
+}
+
 struct RemovedCreatedItem {
     uuid: [i32; 4],
     chunks: BTreeSet<native_world::loaded::ChunkPos>,
@@ -479,6 +493,7 @@ pub(crate) struct ItemEntities {
     // Retain actual removals separately from chunks that failed to load.
     removed_saved: Vec<RemovedSavedItem>,
     removed_created: Vec<RemovedCreatedItem>,
+    created_pickups: Vec<CreatedPickupRecord>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -497,6 +512,7 @@ impl Default for ItemEntities {
             entities: Vec::new(),
             removed_saved: Vec::new(),
             removed_created: Vec::new(),
+            created_pickups: Vec::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1038,6 +1054,19 @@ impl ItemEntities {
             .iter()
             .filter(|item| !item.chunks.is_disjoint(positions))
             .map(|item| (item.uuid, item.cause))
+            .collect()
+    }
+
+    /// Only verified pickup events are reported; a caller must still validate
+    /// the complete chunk drafts and coordinate the player save.
+    pub(crate) fn created_pickup_effects(
+        &self,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> Vec<CreatedItemPickup> {
+        self.created_pickups
+            .iter()
+            .filter(|pickup| !pickup.chunks.is_disjoint(positions))
+            .map(|pickup| pickup.effect.clone())
             .collect()
     }
 
@@ -1885,8 +1914,33 @@ impl ItemEntities {
                 && bounds.max.cmpgt(pickup.min).all()
                 && bounds.min.cmplt(pickup.max).all()
             {
+                let before_count = entity.item.stack.count();
                 let mut stack = Some(entity.item.stack.clone());
                 Arc::make_mut(inventory).pickup_stack(&mut stack, mode == GameMode::Creative);
+                let taken = before_count.saturating_sub(stack.as_ref().map_or(0, |s| s.count()));
+                if taken > 0
+                    && let Some(created) = &entity.created
+                    && created.base_valid
+                    && created.verified_position == entity.item.position
+                    && created.thrower != CreatedThrower::Unknown
+                    && let (Some(uuid), Some(origin_chunk), Some(destination)) = (
+                        created.uuid,
+                        created_chunk(created.origin),
+                        created_chunk(entity.item.position),
+                    )
+                {
+                    let mut chunks = created.visited.clone();
+                    chunks.insert(origin_chunk);
+                    chunks.insert(destination);
+                    self.created_pickups.push(CreatedPickupRecord {
+                        effect: CreatedItemPickup {
+                            uuid,
+                            original_stack: entity.item.stack.clone(),
+                            transferred: taken,
+                        },
+                        chunks,
+                    });
+                }
                 if let Some(remainder) = stack {
                     entity.item.stack = remainder;
                 } else {
@@ -2533,6 +2587,14 @@ mod tests {
             items.created_removal_effects(&group),
             vec![(uuid, CreatedRemovalCause::Pickup)]
         );
+        assert_eq!(
+            items.created_pickup_effects(&group),
+            vec![CreatedItemPickup {
+                uuid,
+                original_stack: stack.clone(),
+                transferred: 3
+            }]
+        );
         assert!(
             items
                 .validate_removed_item_chunk_group(&BTreeSet::from([left]), &Default::default())
@@ -2596,6 +2658,105 @@ mod tests {
         assert!(
             expired
                 .validate_removed_item_chunk_group(&BTreeSet::from([left]), &Default::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn created_item_partial_pickup_records_each_transfer_and_remaining_stack() {
+        use crate::inventory::PlayerSlot;
+        use native_world::loaded::ChunkPos;
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(ItemStack::new("minecraft:stone".into(), 63, 64, Tag::Compound(vec![])).unwrap())
+        ));
+        for slot in 1..36 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(slot),
+                Some(
+                    ItemStack::new("minecraft:dirt".into(), 64, 64, Tag::Compound(vec![])).unwrap()
+                )
+            ));
+        }
+        let mut inventory = Arc::new(inventory);
+        let mut items = ItemEntities::default();
+        let position = DVec3::new(1.5, 2.0, 3.5);
+        let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(position, stack.clone());
+        items.entities[0].velocity = DVec3::ZERO;
+        items.entities[0].no_gravity = true;
+        items.entities[0].pickup_delay = 0;
+        let uuid = items.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        let group = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+        let tick = |items: &mut ItemEntities, inventory: &mut Arc<PlayerInventory>| {
+            items.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                position,
+                PlayerPose::Standing,
+                GameMode::Survival,
+                inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| None,
+                |_, _| true,
+            );
+        };
+        tick(&mut items, &mut inventory);
+        assert_eq!(items.entities[0].item.stack.count(), 2);
+        assert_eq!(inventory.slot(PlayerSlot::Storage(0)).unwrap().count(), 64);
+        assert_eq!(
+            items.created_pickup_effects(&group),
+            vec![CreatedItemPickup {
+                uuid,
+                original_stack: stack.clone(),
+                transferred: 1
+            }]
+        );
+        let draft = items.draft_created_items_in_chunks(&group).unwrap();
+        assert_eq!(
+            crate::saved_item::read(&draft[0].document().value)
+                .unwrap()
+                .unwrap()
+                .stack
+                .count(),
+            2
+        );
+        tick(&mut items, &mut inventory);
+        assert_eq!(
+            items.created_pickup_effects(&group).len(),
+            1,
+            "no capacity produces no transfer"
+        );
+        assert!(Arc::make_mut(&mut inventory).set_slot(PlayerSlot::Storage(1), None));
+        tick(&mut items, &mut inventory);
+        assert!(items.entities.is_empty());
+        assert_eq!(
+            items.created_pickup_effects(&group),
+            vec![
+                CreatedItemPickup {
+                    uuid,
+                    original_stack: stack.clone(),
+                    transferred: 1
+                },
+                CreatedItemPickup {
+                    uuid,
+                    original_stack: stack.with_count(2).unwrap(),
+                    transferred: 2
+                }
+            ]
+        );
+        assert_eq!(
+            items.created_removal_effects(&group),
+            vec![(uuid, CreatedRemovalCause::Pickup)]
+        );
+        assert!(
+            items
+                .validate_removed_item_chunk_group(&group, &Default::default())
                 .is_ok()
         );
     }

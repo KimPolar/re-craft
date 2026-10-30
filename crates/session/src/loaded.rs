@@ -2147,6 +2147,15 @@ impl LoadedSession {
         self.dropped_items.created_removal_effects(positions)
     }
 
+    /// Verified partial and full pickups; save the player inventory together
+    /// with all affected entity and world changes.
+    pub fn created_item_pickup_effects(
+        &self,
+        positions: &BTreeSet<ChunkPos>,
+    ) -> Vec<crate::items::CreatedItemPickup> {
+        self.dropped_items.created_pickup_effects(positions)
+    }
+
     /// Draft a still-live restored falling entity by UUID. Chunk migration,
     /// removals, newly spawned entities and coordinated saving remain separate.
     pub fn draft_saved_falling_entity(
@@ -10993,7 +11002,9 @@ mod tests {
             .unwrap();
         let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.9, 8.5);
         let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
-        session.dropped_items.spawn_from_entity(position, stack);
+        session
+            .dropped_items
+            .spawn_from_entity(position, stack.clone());
         let original = session.draft_created_item_entities(home).unwrap();
         let uuid = crate::saved_item::read(&original[0].document().value)
             .unwrap()
@@ -11011,6 +11022,14 @@ mod tests {
         assert_eq!(
             session.created_item_removal_effects(&group),
             vec![(uuid, crate::items::CreatedRemovalCause::Pickup)]
+        );
+        assert_eq!(
+            session.created_item_pickup_effects(&group),
+            vec![crate::items::CreatedItemPickup {
+                uuid,
+                original_stack: stack,
+                transferred: 3
+            }]
         );
         assert_eq!(
             session

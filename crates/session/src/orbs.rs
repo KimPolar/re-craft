@@ -82,6 +82,7 @@ pub(crate) struct Orbs {
     next_section_sequence: u64,
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
     damage_tags: Option<Arc<OxygenEnchantments>>,
+    uncoordinated_lifecycle: bool,
 }
 
 impl Default for Orbs {
@@ -98,11 +99,40 @@ impl Default for Orbs {
             next_section_sequence: 0,
             active_chunks: None,
             damage_tags: None,
+            uncoordinated_lifecycle: false,
         }
     }
 }
 
 impl Orbs {
+    /// Conservative affected chunks for saved orbs. Creation, pickup, merge
+    /// and removal must be coordinated before a world save can be attempted.
+    pub(crate) fn affected_orb_chunks(
+        &self,
+        saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
+    ) -> anyhow::Result<BTreeSet<native_world::loaded::ChunkPos>> {
+        anyhow::ensure!(
+            !self.uncoordinated_lifecycle,
+            "experience-orb lifecycle effects need coordinated saving"
+        );
+        let mut chunks: BTreeSet<_> = saved_uuids.values().copied().collect();
+        for orb in &self.entities {
+            let position = orb.visual.position;
+            anyhow::ensure!(
+                position.is_finite()
+                    && position.x.abs() <= 30_000_512.0
+                    && position.z.abs() <= 30_000_512.0,
+                "experience orb has an invalid position"
+            );
+            chunks.insert(native_world::loaded::ChunkPos {
+                x: (position.x.floor() as i32).div_euclid(16),
+                z: (position.z.floor() as i32).div_euclid(16),
+            });
+        }
+        self.validate_chunk_group(&chunks, saved_uuids)?;
+        Ok(chunks)
+    }
+
     pub(crate) fn push_from_soil_expansion(&mut self, block: IVec3) {
         let mut changed = false;
         for entity in &mut self.entities {
@@ -332,6 +362,9 @@ impl Orbs {
 
     /// Split and merge newly awarded experience using Java's orb value tiers.
     pub(crate) fn award(&mut self, position: DVec3, mut amount: i32) {
+        if amount > 0 {
+            self.uncoordinated_lifecycle = true;
+        }
         while amount > 0 {
             let value = VALUES
                 .iter()
@@ -646,6 +679,7 @@ impl Orbs {
                         *xp = next_xp;
                         *score = next_score;
                         *player_random = random;
+                        self.uncoordinated_lifecycle = true;
                         self.pickup_delay = 2;
                         let silent = entity
                             .source
@@ -667,6 +701,9 @@ impl Orbs {
                     }
                 }
             }
+        }
+        if removed.iter().any(|&value| value) {
+            self.uncoordinated_lifecycle = true;
         }
         let mut index = 0;
         self.entities.retain(|_| {
@@ -1065,6 +1102,39 @@ mod tests {
             save_unresolved: false,
             damage: OrbDamageState::default(),
         }
+    }
+
+    #[test]
+    fn tracked_orb_chunks_include_saved_source_and_current_destination() {
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::ChunkPos;
+        let uuid = [1, 2, 3, 4];
+        let left = ChunkPos { x: -1, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let mut orb = test_orb(1, DVec3::new(16.5, 2.0, 0.5), 3, 0, 1);
+        orb.source = Some(Arc::new(Tag::Compound(vec![(
+            "UUID".into(),
+            Tag::IntArray(uuid.to_vec()),
+        )])));
+        let mut orbs = Orbs::default();
+        orbs.entities.push(orb);
+        let owners = std::collections::BTreeMap::from([(uuid, left)]);
+        assert_eq!(
+            orbs.affected_orb_chunks(&owners).unwrap(),
+            BTreeSet::from([left, right])
+        );
+        assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
+        orbs.entities[0].visual.position.x = f64::NAN;
+        assert!(orbs.affected_orb_chunks(&owners).is_err());
+    }
+
+    #[test]
+    fn newly_awarded_orb_remains_uncoordinated_even_if_no_longer_live() {
+        let mut orbs = Orbs::default();
+        orbs.award(DVec3::ZERO, 1);
+        assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
+        orbs.entities.clear();
+        assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
     }
 
     #[test]

@@ -128,7 +128,7 @@ pub struct WorldClockDraft {
 /// inclusion before this can authorize an actual gameplay save.
 pub struct PartialSessionSaveDraft {
     pub player_and_terrain: PlayerWorldDraft,
-    pub item_entities: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
+    pub entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
     pub clocks: WorldClockDraft,
 }
 
@@ -1189,9 +1189,9 @@ impl LoadedSession {
         Ok(PlayerWorldDraft { player, chunks })
     }
 
-    /// Snapshot player, terrain, tracked item entity chunks and clocks at the
+    /// Snapshot player, terrain, tracked item and orb chunks and clocks at the
     /// same tick boundary. This remains incomplete for a playable world save.
-    pub fn draft_player_terrain_items_and_clocks(
+    pub fn draft_player_terrain_entities_and_clocks(
         &self,
         player: &native_persistence::nbt::NamedTag,
         terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
@@ -1203,11 +1203,11 @@ impl LoadedSession {
     ) -> anyhow::Result<PartialSessionSaveDraft> {
         let player_and_terrain =
             self.draft_player_and_dirty_chunks(player, terrain, tags, air_and_fluid)?;
-        let item_entities = self.draft_item_entity_chunks()?;
+        let entity_chunks = self.draft_tracked_item_and_orb_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
         Ok(PartialSessionSaveDraft {
             player_and_terrain,
-            item_entities,
+            entity_chunks,
             clocks,
         })
     }
@@ -3215,6 +3215,26 @@ impl LoadedSession {
         let positions = self
             .dropped_items
             .affected_item_chunks(&self.saved_item_uuids)?;
+        self.draft_existing_entity_chunks(&positions)
+    }
+
+    /// Include both item and saved-orb source and destination chunks. Orb
+    /// lifecycle effects that cannot yet be coordinated reject this draft.
+    pub fn draft_tracked_item_and_orb_chunks(
+        &self,
+    ) -> anyhow::Result<BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>>
+    {
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
+        );
+        let mut positions = self
+            .dropped_items
+            .affected_item_chunks(&self.saved_item_uuids)?;
+        positions.extend(
+            self.experience_orbs
+                .affected_orb_chunks(&self.saved_orb_uuids)?,
+        );
         self.draft_existing_entity_chunks(&positions)
     }
 
@@ -14781,6 +14801,7 @@ mod tests {
                 .draft_existing_entity_chunks(&BTreeSet::from([home]))
                 .is_ok()
         );
+        assert!(session.draft_tracked_item_and_orb_chunks().is_ok());
         session.queue_chunk_window(remote, 0);
         session.update(TICK);
         assert!(session.snapshot().experience_orbs.is_empty());
@@ -14792,11 +14813,16 @@ mod tests {
         assert_eq!(session.snapshot().experience_orbs.len(), 1);
         assert_eq!(session.snapshot().experience_orbs[0].position, absolute);
         session.motion.position = absolute - session.origin.as_dvec3();
-        for _ in 0..5 {
+        session.update(TICK);
+        assert_eq!(session.experience.total, 7);
+        assert_eq!(session.snapshot().experience_orbs.len(), 1);
+        assert!(session.draft_tracked_item_and_orb_chunks().is_err());
+        for _ in 0..4 {
             session.update(TICK);
         }
         assert_eq!(session.experience.total, 21);
         assert!(session.snapshot().experience_orbs.is_empty());
+        assert!(session.draft_tracked_item_and_orb_chunks().is_err());
         assert!(session.draft_existing_entity_chunk(home).is_err());
         assert_eq!(
             document.value.get("Entities").unwrap(),
@@ -15072,6 +15098,51 @@ mod tests {
     }
 
     #[test]
+    fn combined_draft_rejects_uncoordinated_orb_awards() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let tags = test_heightmap_tags();
+        assert!(
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &tags,
+                    |_| unreachable!()
+                )
+                .is_ok()
+        );
+        session.experience_orbs.award(DVec3::ZERO, 1);
+        assert!(
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &tags,
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn fresh_items_join_coordinated_chunk_drafts_without_losing_existing_entities() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let mut session = session();
@@ -15158,7 +15229,7 @@ mod tests {
             assert_eq!(automatic[position].document(), drafts[position].document());
         }
         let combined = session
-            .draft_player_terrain_items_and_clocks(
+            .draft_player_terrain_entities_and_clocks(
                 &player_source,
                 &BTreeMap::new(),
                 &clock_source,
@@ -15168,14 +15239,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             combined
-                .item_entities
+                .entity_chunks
                 .keys()
                 .copied()
                 .collect::<BTreeSet<_>>(),
             group
         );
         assert_eq!(
-            combined.item_entities[&home].document(),
+            combined.entity_chunks[&home].document(),
             drafts[&home].document()
         );
         assert!(combined.player_and_terrain.chunks().is_empty());

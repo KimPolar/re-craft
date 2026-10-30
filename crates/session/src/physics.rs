@@ -234,6 +234,16 @@ impl MotionState {
         block_friction: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
+        self.tick_resolved_with_restitution(input, block_friction, collide, |_, _, _| 0.0)
+    }
+
+    pub(crate) fn tick_resolved_with_restitution(
+        &mut self,
+        input: MovementInput,
+        block_friction: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+        restitution: impl FnOnce(DVec3, DVec3, DVec3) -> f64,
+    ) -> (bool, DVec3) {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
         let cosine = f64::from(java_sin(f64::from(radians), true));
@@ -304,7 +314,11 @@ impl MotionState {
         let vertical_collision = requested.y != actual.y;
         self.on_ground = vertical_collision && requested.y < 0.0;
         if vertical_collision {
-            self.velocity.y = 0.0;
+            self.velocity.y = if self.on_ground {
+                restitution(self.position, requested, actual)
+            } else {
+                0.0
+            };
         }
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);

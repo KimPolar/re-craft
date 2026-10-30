@@ -5509,6 +5509,7 @@ impl LoadedSession {
             self.vitals.record_jump(self.game_mode, input.sprinting);
         }
         let before_move = self.motion.position;
+        let collision_support = std::cell::Cell::new(None);
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
             (
                 false,
@@ -5552,7 +5553,55 @@ impl LoadedSession {
                             .contains_liquid(crate::movement::player_bounds(target, player_height))
                 })
         } else {
-            self.motion.tick_resolved(input, friction, resolve)
+            let world = &self.world;
+            let origin = self.origin;
+            let bounds = self.bounds;
+            let air = self.states[0];
+            let no_previous_support = self.ground_without_support;
+            let suppressed = &self.bounce_suppression_tag;
+            self.motion.tick_resolved_with_restitution(
+                input,
+                friction,
+                resolve,
+                |position, requested, actual| {
+                    if sneak {
+                        return 0.0;
+                    }
+                    let support = crate::movement::supporting_block(
+                        position,
+                        actual,
+                        no_previous_support,
+                        block_shape,
+                    );
+                    collision_support.set(Some(support));
+                    let below = crate::movement::movement_on_block(position, support, |pos| {
+                        match cell(world, origin, bounds, pos, air) {
+                            Cell::State(id) => world.state(id).is_some_and(|state| {
+                                state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                            }),
+                            Cell::Missing => false,
+                        }
+                    });
+                    let bounce = match cell(world, origin, bounds, below, air) {
+                        Cell::State(id) => world
+                            .state(id)
+                            .and_then(|state| {
+                                suppressed
+                                    .as_ref()
+                                    .filter(|tag| !tag.contains(&state.name))
+                                    .map(|_| crate::items::block_bounce_restitution(&state.name))
+                            })
+                            .unwrap_or(0.0),
+                        Cell::Missing => 0.0,
+                    };
+                    crate::items::vertical_restitution(
+                        requested.y,
+                        actual.y,
+                        f64::from(bounce),
+                        0.08,
+                    )
+                },
+            )
         };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
@@ -5591,12 +5640,14 @@ impl LoadedSession {
             self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
         }
         if self.motion.on_ground {
-            let support = crate::movement::supporting_block(
-                self.motion.position,
-                actual,
-                self.ground_without_support,
-                block_shape,
-            );
+            let support = collision_support.get().unwrap_or_else(|| {
+                crate::movement::supporting_block(
+                    self.motion.position,
+                    actual,
+                    self.ground_without_support,
+                    block_shape,
+                )
+            });
             self.ground_without_support = support.is_none();
             self.ground_support = support.and_then(|relative| add(self.origin, relative));
             let legacy = crate::movement::legacy_on_block(self.motion.position, support, |pos| {
@@ -6875,6 +6926,47 @@ mod tests {
         session.motion.position.x -= 16.0;
         assert_eq!(session.ground_support, support);
         assert_eq!(session.friction_below(), 0.98);
+    }
+
+    #[test]
+    fn player_bounces_on_slime_unless_sneaking_or_suppressed() {
+        for (name, sneaking, suppressed, bounces, start_y) in [
+            ("minecraft:slime_block", false, false, true, 2.2),
+            ("minecraft:slime_block", true, false, false, 2.2),
+            ("minecraft:slime_block", false, true, false, 2.2),
+            ("minecraft:stone", false, false, false, 2.2),
+            ("minecraft:red_bed", false, false, true, 2.0),
+        ] {
+            let mut session = session();
+            let block = session.intern_block(if name == "minecraft:red_bed" {
+                state(
+                    name,
+                    &[("facing", "north"), ("part", "head"), ("occupied", "false")],
+                )
+            } else {
+                state(name, &[])
+            });
+            assert!(session.set(IVec3::new(4, 1, 4), block));
+            if suppressed {
+                session.set_bounce_suppression_tag(Arc::new(BTreeSet::from([name.into()])));
+            }
+            session.motion.position = DVec3::new(4.5, start_y, 4.5);
+            session.motion.velocity = DVec3::new(0.0, -0.5, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.sneak = sneaking;
+            session.update(TICK);
+            assert!(session.motion.on_ground, "{name}");
+            assert_eq!(
+                session.motion.velocity.y > 0.0,
+                bounces,
+                "{name} sneaking={sneaking} suppressed={suppressed}"
+            );
+            let landed = session.motion.position.y;
+            session.update(TICK);
+            assert_eq!(session.motion.position.y > landed + 1e-6, bounces, "{name}");
+        }
     }
 
     #[test]

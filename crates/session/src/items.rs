@@ -79,14 +79,19 @@ pub(crate) fn block_bounce_restitution(name: &str) -> f32 {
     }
 }
 
-fn vertical_restitution(velocity: f64, actual_y: f64, restitution: f32) -> f64 {
-    if velocity >= -0.04 || restitution <= 0.0 {
+pub(crate) fn vertical_restitution(
+    velocity: f64,
+    actual_y: f64,
+    restitution: f64,
+    gravity: f64,
+) -> f64 {
+    if velocity >= -gravity || restitution <= 0.0 {
         return 0.0;
     }
     let ratio = actual_y / velocity;
     let air_drag = f64::from(0.98_f32);
     let drag = 1.0 + ratio * (air_drag - 1.0);
-    (ratio * 0.04 - velocity) * drag * f64::from(restitution * 0.8_f32)
+    (ratio * gravity - velocity) * drag * restitution
 }
 
 /// The prototype must be resolved from the installed item registry before a
@@ -1542,7 +1547,12 @@ impl ItemEntities {
                 }
                 if hit_y {
                     entity.velocity.y = if entity.on_ground {
-                        vertical_restitution(entity.velocity.y, actual.y, bounce(below))
+                        vertical_restitution(
+                            entity.velocity.y,
+                            actual.y,
+                            f64::from(bounce(below) * 0.8_f32),
+                            0.04,
+                        )
                     } else {
                         0.0
                     };
@@ -4205,6 +4215,7 @@ public class ItemMotionOracle {
         BlockState ground; boolean supportGrid; boolean twoBlocks;
         TestLevel() { super(null,null,null,null,0,0,null,false,0L,0); }
         @Override public boolean isClientSide() { return true; }
+        @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
         @Override public BlockState getBlockState(BlockPos pos) {
             if (!supportGrid) return ground;
             return pos.getY()==0 && pos.getZ()==0 && (pos.getX()==0 || twoBlocks && pos.getX()==1)
@@ -4258,6 +4269,21 @@ public class ItemMotionOracle {
                 catch (Exception e) { throw new RuntimeException(e); }
             }
         }
+    }
+    static class TestPlayer extends net.minecraft.world.entity.player.Player {
+        Vec3 velocity; boolean suppress;
+        TestPlayer() { super(null,null); }
+        void setWorld(Level world) { setLevel(world); }
+        @Override public Vec3 getDeltaMovement() { return velocity; }
+        @Override public void setDeltaMovement(Vec3 v) { velocity=v; }
+        @Override protected double getEffectiveGravity() { return 0.08; }
+        @Override protected double getEntityBounciness() { return 0.0; }
+        @Override protected float getAirDrag() { return 0.98f; }
+        @Override public boolean isSuppressingBounce() { return suppress; }
+        @Override public void gameEvent(net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
+        @Override public BlockPos getBlockPosBelowThatAffectsMyMovement() { return BlockPos.ZERO; }
+        @Override public net.minecraft.world.entity.HumanoidArm getMainArm() { return net.minecraft.world.entity.HumanoidArm.RIGHT; }
+        @Override public net.minecraft.world.level.GameType gameMode() { return net.minecraft.world.level.GameType.SURVIVAL; }
     }
     static JsonArray vector(Vec3 v) { JsonArray a = new JsonArray(); a.add(v.x); a.add(v.y); a.add(v.z); return a; }
     public static void main(String[] args) throws Exception {
@@ -4370,6 +4396,22 @@ public class ItemMotionOracle {
             supportResults.add(support.map(BlockPos::getX).orElse(-99));
         }
         output.add(supportResults);
+        JsonArray livingBounce = new JsonArray();
+        for (String name : new String[]{"minecraft:stone","minecraft:slime_block","minecraft:red_bed","minecraft:shelf_mushroom"})
+        for (boolean suppress : new boolean[]{false,true})
+        for (double velocity : new double[]{-0.08,-0.081,-0.1,-0.5,-2.0})
+        for (double ratio : new double[]{0,0.25,0.8}) {
+            var world = (TestLevel)unsafe.allocateInstance(TestLevel.class);
+            world.ground=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse(name)).defaultBlockState();
+            var player = (TestPlayer)unsafe.allocateInstance(TestPlayer.class);
+            player.setWorld(world); player.velocity=new Vec3(0,velocity,0); player.suppress=suppress;
+            player.verticalCollision=true; player.verticalCollisionBelow=true;
+            RESTITUTE.invoke(player,world.ground,false,false,new Vec3(0,velocity*ratio,0));
+            JsonObject row=new JsonObject(); row.addProperty("block",name); row.addProperty("suppress",suppress);
+            row.addProperty("velocity",velocity); row.addProperty("ratio",ratio); row.addProperty("result",player.velocity.y);
+            livingBounce.add(row);
+        }
+        output.add(livingBounce);
         Files.writeString(Path.of(args[1]),new Gson().toJson(output));
     }
 }
@@ -4626,6 +4668,24 @@ public class ItemMotionOracle {
                     support_index += 1;
                 }
             }
+        }
+        for row in expected[cases.len() + 6].as_array().unwrap() {
+            let velocity = row["velocity"].as_f64().unwrap();
+            let restitution = if row["suppress"].as_bool().unwrap() {
+                0.0
+            } else {
+                f64::from(block_bounce_restitution(row["block"].as_str().unwrap()))
+            };
+            let result = vertical_restitution(
+                velocity,
+                velocity * row["ratio"].as_f64().unwrap(),
+                restitution,
+                0.08,
+            );
+            assert!(
+                (result - row["result"].as_f64().unwrap()).abs() < 1e-12,
+                "living bounce {row}: {result}"
+            );
         }
         for (index, case) in cases.iter().enumerate() {
             let mut items = ItemEntities::default();

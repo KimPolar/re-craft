@@ -438,7 +438,19 @@ fn relight_changes_inner(
     let z_len = usize::try_from(i64::from(max_z) - i64::from(min_z) + 1).ok()?;
     let height = usize::try_from(max_y - min_y + 1).ok()?;
     let length = x_len.checked_mul(z_len).and_then(|n| n.checked_mul(height));
-    let Some(length) = length.filter(|&n| n <= 4_000_000) else {
+    // A sparse bounding box can be very expensive even below the hard limit.
+    // Only consider splitting when its volume is substantially larger than
+    // the sum of each region's individual bounding box.
+    let individual_volume = regions.iter().fold(0usize, |total, region| {
+        let lo = region.low.saturating_sub(RADIUS).max(light.start);
+        let hi = region.high.saturating_add(RADIUS).min(light.end - 1);
+        let height = (hi - lo + 1) as usize;
+        total.saturating_add(((2 * RADIUS + 1) as usize).pow(2).saturating_mul(height))
+    });
+    let should_split = length.is_none_or(|n| n > 4_000_000)
+        || (changes.len() <= 512
+            && length.is_some_and(|n| n > 200_000 && n > individual_volume.saturating_mul(2)));
+    if should_split {
         // Disconnected groups cannot affect each other's boundary values.
         // Stage them on a clone so failure in a later group remains atomic.
         let mut seen = vec![false; changes.len()];
@@ -466,7 +478,9 @@ fn relight_changes_inner(
                     let distance = (i64::from(a.x) - i64::from(b.x)).abs()
                         + (i64::from(a.z) - i64::from(b.z)).abs()
                         + dy;
-                    if distance <= i64::from(2 * RADIUS + 1) {
+                    // Keep a column's source-height history together, even
+                    // when its vertical influence regions do not intersect.
+                    if (a.x, a.z) == (b.x, b.z) || distance <= i64::from(2 * RADIUS + 1) {
                         seen[i] = true;
                         group.push(i);
                     }
@@ -476,23 +490,23 @@ fn relight_changes_inner(
             group.sort_unstable();
             groups.push(group);
         }
-        if groups.len() == 1 {
-            return None;
+        if groups.len() > 1 {
+            let mut staged = world.clone();
+            let mut changed = BTreeSet::new();
+            for group in groups {
+                let group: Vec<_> = group.into_iter().map(|i| changes[i]).collect();
+                changed.extend(relight_changes_inner(
+                    &mut staged,
+                    bounds,
+                    &group,
+                    source_y,
+                )?);
+            }
+            *world = staged;
+            return Some(changed);
         }
-        let mut staged = world.clone();
-        let mut changed = BTreeSet::new();
-        for group in groups {
-            let group: Vec<_> = group.into_iter().map(|i| changes[i]).collect();
-            changed.extend(relight_changes_inner(
-                &mut staged,
-                bounds,
-                &group,
-                source_y,
-            )?);
-        }
-        *world = staged;
-        return Some(changed);
-    };
+    }
+    let length = length.filter(|&n| n <= 4_000_000)?;
     let mut cells = vec![None; length];
     let mut active = Vec::new();
     let index = |x: i32, y: i32, z: i32| -> Option<usize> {
@@ -987,6 +1001,74 @@ mod tests {
         assert!(changed.contains(&ChunkPos { x: 25, z: 0 }));
         assert_eq!(world.light(15, 318, 15, true), Some(14));
         assert_eq!(world.light(415, 318, 15, true), Some(14));
+    }
+
+    #[test]
+    fn sparse_changes_match_individual_updates_and_remain_atomic() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let duplicate: Vec<_> = world
+            .chunks
+            .iter()
+            .map(|(pos, chunk)| {
+                let target = ChunkPos {
+                    x: pos.x + 8,
+                    z: pos.z,
+                };
+                let mut copy = (**chunk).clone();
+                copy.position = target;
+                (target, Arc::new(copy))
+            })
+            .collect();
+        world.chunks.extend(duplicate);
+        let stone = world.intern_state(state("stone", &[]));
+        let changes: Vec<_> = [15, 143]
+            .into_iter()
+            .map(|x| {
+                world.set_block_id(x, 31, 15, stone).unwrap();
+                SkyChange {
+                    position: BlockPosition { x, y: 31, z: 15 },
+                    previous_source: UNBOUNDED_SKY_SOURCE,
+                    current_source: 32,
+                }
+            })
+            .collect();
+        let sources = |x, z| {
+            Some(if z == 15 && (x == 15 || x == 143) {
+                32
+            } else {
+                UNBOUNDED_SKY_SOURCE
+            })
+        };
+        let mut expected = world.clone();
+        for change in &changes {
+            relight_change(
+                &mut expected,
+                bounds,
+                change.position,
+                change.previous_source,
+                change.current_source,
+                sources,
+            )
+            .unwrap();
+        }
+        let mut incomplete = world.clone();
+        let chunk = Arc::make_mut(incomplete.chunks.get_mut(&ChunkPos { x: 8, z: 0 }).unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&1).unwrap()).sky_light = None;
+        let before = incomplete.clone();
+        assert!(relight_changes(&mut incomplete, bounds, &changes, sources).is_none());
+        for (pos, chunk) in &incomplete.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[pos]));
+        }
+        relight_changes(&mut world, bounds, &changes, sources).unwrap();
+        for (pos, chunk) in &world.chunks {
+            for (y, section) in &chunk.sections {
+                assert_eq!(
+                    section.sky_light, expected.chunks[pos].sections[y].sky_light,
+                    "chunk {pos:?}, section {y}"
+                );
+            }
+        }
     }
 
     #[test]

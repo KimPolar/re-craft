@@ -47,6 +47,7 @@ fn main() {
             );
         }
     }
+    let fresh_world = world.clone();
     for (label, y) in [("mid-height", 80), ("top-height", 319)] {
         let position = BlockPosition { x: 15, y, z: 15 };
         let mut source = SkyColumn::load(&world, bounds, 15, 15).unwrap();
@@ -175,4 +176,51 @@ fn main() {
             samples[9]
         );
     }
+
+    let mut sparse = fresh_world;
+    let duplicate: Vec<_> = sparse
+        .chunks
+        .iter()
+        .map(|(pos, chunk)| {
+            let target = ChunkPos {
+                x: pos.x + 8,
+                z: pos.z,
+            };
+            let mut copy = (**chunk).clone();
+            copy.position = target;
+            (target, Arc::new(copy))
+        })
+        .collect();
+    sparse.chunks.extend(duplicate);
+    let changes = [15, 143].map(|x| {
+        sparse.set_block_id(x, 319, 15, stone).unwrap();
+        SkyChange {
+            position: BlockPosition { x, y: 319, z: 15 },
+            previous_source: UNBOUNDED_SKY_SOURCE,
+            current_source: 320,
+        }
+    });
+    let mut samples = Vec::new();
+    for i in 0..12 {
+        let mut input = sparse.clone();
+        let started = Instant::now();
+        black_box(
+            relight_changes(&mut input, bounds, &changes, |x, z| {
+                Some(if z == 15 && (x == 15 || x == 143) {
+                    320
+                } else {
+                    UNBOUNDED_SKY_SOURCE
+                })
+            })
+            .unwrap(),
+        );
+        if i >= 2 {
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "two distant top edits: p50={:.3} ms, p95={:.3} ms (10 samples)",
+        samples[5], samples[9]
+    );
 }

@@ -342,6 +342,17 @@ impl MotionState {
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
     ) -> (bool, DVec3) {
+        self.tick_fluid_with_restitution(input, fluid, collide, can_jump_out, |_, _, _| (0.0, 0.0))
+    }
+
+    pub(crate) fn tick_fluid_with_restitution(
+        &mut self,
+        input: MovementInput,
+        fluid: FluidMovement,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+        can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
+        restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
+    ) -> (bool, DVec3) {
         if fluid.kind == FluidKind::Water && fluid.descend {
             self.velocity.y -= f64::from(0.04_f32);
         }
@@ -393,16 +404,22 @@ impl MotionState {
         let epsilon = f64::from(1.0e-5_f32);
         let blocked_x = (requested.x - actual.x).abs() >= epsilon;
         let blocked_z = (requested.z - actual.z).abs() >= epsilon;
-        if blocked_x {
-            self.velocity.x = 0.0;
-        }
-        if blocked_z {
-            self.velocity.z = 0.0;
-        }
         let vertical_collision = requested.y != actual.y;
         self.on_ground = vertical_collision && requested.y < 0.0;
+        let (horizontal_restitution, vertical_velocity) =
+            if blocked_x || blocked_z || vertical_collision {
+                restitution(self.position, requested, actual)
+            } else {
+                (0.0, 0.0)
+            };
+        if blocked_x {
+            self.velocity.x *= -horizontal_restitution;
+        }
+        if blocked_z {
+            self.velocity.z *= -horizontal_restitution;
+        }
         if vertical_collision {
-            self.velocity.y = 0.0;
+            self.velocity.y = vertical_velocity;
         }
         match fluid.kind {
             FluidKind::Water => {

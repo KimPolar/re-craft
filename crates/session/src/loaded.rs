@@ -5560,6 +5560,66 @@ impl LoadedSession {
         }
         let before_move = self.motion.position;
         let collision_support = std::cell::Cell::new(None);
+        let world = &self.world;
+        let origin = self.origin;
+        let bounds = self.bounds;
+        let air = self.states[0];
+        let no_previous_support = self.ground_without_support;
+        let suppressed = &self.bounce_suppression_tag;
+        let entity_bounce = if sneak {
+            0.0
+        } else {
+            self.bounciness.unwrap_or(0.0)
+        };
+        let restitution = |position: DVec3, requested: DVec3, actual: DVec3| {
+            if requested.y == actual.y {
+                return (entity_bounce, 0.0);
+            }
+            if requested.y >= 0.0 {
+                return (
+                    entity_bounce,
+                    crate::items::collision_restitution(requested.y, actual.y, entity_bounce, 0.08),
+                );
+            }
+            if sneak {
+                return (0.0, 0.0);
+            }
+            let support = crate::movement::supporting_block(
+                position,
+                actual,
+                no_previous_support,
+                block_shape,
+            );
+            collision_support.set(Some(support));
+            let below = crate::movement::movement_on_block(position, support, |pos| {
+                match cell(world, origin, bounds, pos, air) {
+                    Cell::State(id) => world.state(id).is_some_and(|state| {
+                        state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                    }),
+                    Cell::Missing => false,
+                }
+            });
+            let bounce = match cell(world, origin, bounds, below, air) {
+                Cell::State(id) => world
+                    .state(id)
+                    .and_then(|state| {
+                        suppressed
+                            .as_ref()
+                            .filter(|tag| !tag.contains(&state.name))
+                            .map(|_| {
+                                entity_bounce.max(f64::from(
+                                    crate::items::block_bounce_restitution(&state.name),
+                                ))
+                            })
+                    })
+                    .unwrap_or(0.0),
+                Cell::Missing => 0.0,
+            };
+            (
+                entity_bounce,
+                crate::items::vertical_restitution(requested.y, actual.y, bounce, 0.08),
+            )
+        };
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
             (
                 false,
@@ -5595,84 +5655,21 @@ impl LoadedSession {
                 look_y: crate::physics::look_vertical(self.player.pitch),
                 fluid_above: matches!(fluid_view.at(above), fluid::Cell::Fluid(_)),
             };
-            self.motion
-                .tick_fluid(input, movement, resolve, |position, offset| {
+            self.motion.tick_fluid_with_restitution(
+                input,
+                movement,
+                resolve,
+                |position, offset| {
                     let target = position + offset;
                     crate::movement::can_fit_exact(target, player_height, block_shape)
                         && !fluid_view
                             .contains_liquid(crate::movement::player_bounds(target, player_height))
-                })
-        } else {
-            let world = &self.world;
-            let origin = self.origin;
-            let bounds = self.bounds;
-            let air = self.states[0];
-            let no_previous_support = self.ground_without_support;
-            let suppressed = &self.bounce_suppression_tag;
-            let entity_bounce = if sneak {
-                0.0
-            } else {
-                self.bounciness.unwrap_or(0.0)
-            };
-            self.motion.tick_resolved_with_restitution(
-                input,
-                friction,
-                resolve,
-                |position, requested, actual| {
-                    if requested.y == actual.y {
-                        return (entity_bounce, 0.0);
-                    }
-                    if requested.y >= 0.0 {
-                        return (
-                            entity_bounce,
-                            crate::items::collision_restitution(
-                                requested.y,
-                                actual.y,
-                                entity_bounce,
-                                0.08,
-                            ),
-                        );
-                    }
-                    if sneak {
-                        return (0.0, 0.0);
-                    }
-                    let support = crate::movement::supporting_block(
-                        position,
-                        actual,
-                        no_previous_support,
-                        block_shape,
-                    );
-                    collision_support.set(Some(support));
-                    let below = crate::movement::movement_on_block(position, support, |pos| {
-                        match cell(world, origin, bounds, pos, air) {
-                            Cell::State(id) => world.state(id).is_some_and(|state| {
-                                state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
-                            }),
-                            Cell::Missing => false,
-                        }
-                    });
-                    let bounce = match cell(world, origin, bounds, below, air) {
-                        Cell::State(id) => world
-                            .state(id)
-                            .and_then(|state| {
-                                suppressed
-                                    .as_ref()
-                                    .filter(|tag| !tag.contains(&state.name))
-                                    .map(|_| {
-                                        entity_bounce.max(f64::from(
-                                            crate::items::block_bounce_restitution(&state.name),
-                                        ))
-                                    })
-                            })
-                            .unwrap_or(0.0),
-                        Cell::Missing => 0.0,
-                    };
-                    (
-                        entity_bounce,
-                        crate::items::vertical_restitution(requested.y, actual.y, bounce, 0.08),
-                    )
                 },
+                restitution,
             )
+        } else {
+            self.motion
+                .tick_resolved_with_restitution(input, friction, resolve, restitution)
         };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
@@ -7130,6 +7127,57 @@ mod tests {
                 session.motion.velocity.y
             };
             assert!(component < 0.0, "wall={wall}: {component}");
+        }
+    }
+
+    #[test]
+    fn player_bounciness_applies_to_submerged_collisions() {
+        for liquid in ["minecraft:water", "minecraft:lava"] {
+            for (block, position, velocity, axis) in [
+                (
+                    IVec3::new(5, 2, 4),
+                    DVec3::new(4.5, 2.2, 4.5),
+                    DVec3::X * 0.5,
+                    0,
+                ),
+                (
+                    IVec3::new(4, 4, 4),
+                    DVec3::new(4.5, 2.0, 4.5),
+                    DVec3::Y * 0.5,
+                    1,
+                ),
+                (
+                    IVec3::new(4, 1, 4),
+                    DVec3::new(4.5, 2.2, 4.5),
+                    DVec3::Y * -0.5,
+                    2,
+                ),
+            ] {
+                let mut session = liquid_session(liquid);
+                session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
+                session
+                    .set_saved_bounciness(crate::player_data::SavedAttribute::with_base(0.5))
+                    .unwrap();
+                assert!(session.set(block, session.states[3]));
+                session.motion.position = position;
+                session.motion.velocity = velocity;
+                session.motion.on_ground = false;
+                session.player.position = position.as_vec3();
+                session.update(TICK);
+                let result = if axis == 0 {
+                    session.motion.velocity.x
+                } else {
+                    session.motion.velocity.y
+                };
+                assert!(
+                    if axis == 2 {
+                        result > 0.0
+                    } else {
+                        result < 0.0
+                    },
+                    "{liquid} axis={axis}: {result}"
+                );
+            }
         }
     }
 

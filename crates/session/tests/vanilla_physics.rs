@@ -60,6 +60,7 @@ public class PhysicsOracle {
         AttributeInstance speed;
         AttributeInstance jumpStrength;
         MobEffectInstance jumpBoost;
+        MobEffectInstance levitation;
         boolean slowFalling;
         TestPlayer() { super(null, null); }
         void setup(TestLevel world, Vec3 position, Vec3 velocity, boolean ground, float rotation, double wallX) {
@@ -78,8 +79,8 @@ public class PhysicsOracle {
         @Override public boolean isSprinting() { return sprinting; }
         @Override public boolean onClimbable() { return false; }
         @Override public double getAttributeValue(Holder<Attribute> attribute) { return attribute == Attributes.MOVEMENT_SPEED ? speed.getValue() : attribute == Attributes.JUMP_STRENGTH ? jumpStrength.getValue() : 1.0; }
-        @Override public boolean hasEffect(Holder<MobEffect> effect) { return (effect == MobEffects.JUMP_BOOST && jumpBoost != null) || (effect == MobEffects.SLOW_FALLING && slowFalling); }
-        @Override public MobEffectInstance getEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST ? jumpBoost : null; }
+        @Override public boolean hasEffect(Holder<MobEffect> effect) { return (effect == MobEffects.JUMP_BOOST && jumpBoost != null) || (effect == MobEffects.SLOW_FALLING && slowFalling) || (effect == MobEffects.LEVITATION && levitation != null); }
+        @Override public MobEffectInstance getEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST ? jumpBoost : effect == MobEffects.LEVITATION ? levitation : null; }
         @Override public BlockPos getBlockPosBelowThatAffectsMyMovement() { return BlockPos.ZERO; }
         @Override public BlockPos blockPosition() { return BlockPos.ZERO; }
         @Override public HumanoidArm getMainArm() { return HumanoidArm.RIGHT; }
@@ -138,6 +139,8 @@ public class PhysicsOracle {
             entity.jumpBoost = boost < 0 ? null : new MobEffectInstance(MobEffects.JUMP_BOOST, 1000, boost);
             entity.jumpStrength.setBaseValue(scenario.get("strength").getAsDouble());
             entity.slowFalling = scenario.get("slow_falling").getAsBoolean();
+            int levitation = scenario.get("levitation").getAsInt();
+            entity.levitation = levitation < 0 ? null : new MobEffectInstance(MobEffects.LEVITATION, 1000, levitation);
             JsonArray ticks = new JsonArray();
             for (var input : scenario.getAsJsonArray("inputs")) {
                 var i = input.getAsJsonObject();
@@ -399,7 +402,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             };
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s + t/20) % angles.len()],"jump":(35..65).contains(&t),"sprint":(s + t / 7) % 3 == 0,"slow":scenario >= 64 && (s + t / 9) % 3 == 0,"using":(s + t / 11) % 4 == 0}));
         }
-        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"slow_falling":scenario%3==0,"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"slow_falling":scenario%3==0,"levitation":([-1,0,1,127,255][(scenario/3)%5]),"inputs":inputs}));
     }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("PhysicsOracle.java");
@@ -474,6 +477,9 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                     u8::try_from(boost).ok(),
                 ),
                 scenario["slow_falling"].as_bool().unwrap(),
+                scenario["levitation"]
+                    .as_i64()
+                    .and_then(|v| u8::try_from(v).ok()),
                 |position, requested, _| {
                     let mut actual = requested;
                     if actual.y < 0.0 && position.y + actual.y < 0.0 {

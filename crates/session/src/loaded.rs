@@ -5682,7 +5682,13 @@ impl LoadedSession {
                 .map(|effect| effect.amplifier),
         );
         let slow_falling = self.fall.effects().slow_falling.is_some();
-        if slow_falling {
+        let levitation = self
+            .fall
+            .effects()
+            .levitation
+            .as_ref()
+            .map(|effect| effect.amplifier);
+        if slow_falling || levitation.is_some() {
             self.fall_distance = 0.0;
         }
         let start_flight_jump = self.flight.update(
@@ -5855,6 +5861,7 @@ impl LoadedSession {
                 friction,
                 jump_power,
                 slow_falling,
+                levitation,
                 resolve,
                 restitution,
             )
@@ -10642,6 +10649,47 @@ mod tests {
         assert!((active.fall_distance - f64::from(0.2_f32)).abs() < 1e-7);
         assert!(expired.fall_distance > 20.0);
         assert!((active.motion.velocity.y - (-0.21 * f64::from(0.98_f32))).abs() < 1e-7);
+        assert!((expired.motion.velocity.y - (-0.28 * f64::from(0.98_f32))).abs() < 1e-7);
+    }
+
+    #[test]
+    fn levitation_controls_air_motion_and_resets_accumulated_fall() {
+        let make = |duration, slow| {
+            let mut session = session();
+            session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+            session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.fall_distance = 20.0;
+            let effect = |amplifier, duration| {
+                Some(crate::survival::EffectDuration {
+                    amplifier,
+                    duration,
+                    hidden: None,
+                })
+            };
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    levitation: effect(1, duration),
+                    slow_falling: if slow { effect(0, 10) } else { None },
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session.update(TICK);
+            session
+        };
+        let active = make(2, false);
+        let combined = make(2, true);
+        let expired = make(1, false);
+        let expected = (-0.2 + (0.1 - (-0.2)) * 0.2) * f64::from(0.98_f32);
+        assert!((active.motion.velocity.y - expected).abs() < 1e-9);
+        assert_eq!(active.motion.velocity.y, combined.motion.velocity.y);
+        assert!((active.fall_distance - f64::from(0.2_f32)).abs() < 1e-7);
+        assert!(expired.fall_distance > 20.0);
         assert!((expired.motion.velocity.y - (-0.28 * f64::from(0.98_f32))).abs() < 1e-7);
     }
 

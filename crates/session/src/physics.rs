@@ -276,7 +276,7 @@ impl MotionState {
         jump_power: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
-        self.tick_resolved_with_effects(input, block_friction, jump_power, false, collide)
+        self.tick_resolved_with_effects(input, block_friction, jump_power, false, None, collide)
     }
 
     pub fn tick_resolved_with_effects(
@@ -285,6 +285,7 @@ impl MotionState {
         block_friction: f32,
         jump_power: f32,
         slow_falling: bool,
+        levitation: Option<u8>,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
         self.tick_resolved_with_restitution(
@@ -292,6 +293,7 @@ impl MotionState {
             block_friction,
             jump_power,
             slow_falling,
+            levitation,
             collide,
             |_, _, _| (0.0, 0.0),
         )
@@ -303,6 +305,7 @@ impl MotionState {
         block_friction: f32,
         jump_power: f32,
         slow_falling: bool,
+        levitation: Option<u8>,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
     ) -> (bool, DVec3) {
@@ -383,12 +386,17 @@ impl MotionState {
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);
         self.velocity.x *= f64::from(horizontal_drag);
-        let gravity = if slow_falling && self.velocity.y <= 0.0 {
-            0.01
+        let vertical_velocity = if let Some(amplifier) = levitation {
+            self.velocity.y + (0.05 * (f64::from(amplifier) + 1.0) - self.velocity.y) * 0.2
         } else {
-            0.08
+            let gravity = if slow_falling && self.velocity.y <= 0.0 {
+                0.01
+            } else {
+                0.08
+            };
+            self.velocity.y - gravity
         };
-        self.velocity.y = (self.velocity.y - gravity) * f64::from(vertical_drag);
+        self.velocity.y = vertical_velocity * f64::from(vertical_drag);
         self.velocity.z *= f64::from(horizontal_drag);
         let horizontal_collision = blocked_x || blocked_z;
         (

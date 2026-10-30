@@ -269,6 +269,7 @@ pub struct FallEffects {
     pub jump_boost: Option<EffectDuration>,
     pub resistance: Option<EffectDuration>,
     pub slow_falling: Option<EffectDuration>,
+    pub levitation: Option<EffectDuration>,
 }
 
 impl FallEffects {
@@ -276,6 +277,7 @@ impl FallEffects {
         EffectDuration::tick(&mut self.jump_boost);
         EffectDuration::tick(&mut self.resistance);
         EffectDuration::tick(&mut self.slow_falling);
+        EffectDuration::tick(&mut self.levitation);
     }
 }
 

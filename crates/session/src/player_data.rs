@@ -278,6 +278,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "jump_boost") => &mut effects.jump_boost,
             ("minecraft", "resistance") => &mut effects.resistance,
             ("minecraft", "slow_falling") => &mut effects.slow_falling,
+            ("minecraft", "levitation") => &mut effects.levitation,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -872,6 +873,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                     "jump_boost"
                         | "resistance"
                         | "slow_falling"
+                        | "levitation"
                         | "water_breathing"
                         | "conduit_power"
                         | "breath_of_the_nautilus"
@@ -1529,21 +1531,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn saved_slow_falling_survives_hidden_effect_promotion_in_draft() {
+    fn saved_fall_effects_survive_hidden_effect_promotion_in_draft() {
         let player = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![(
                 "active_effects".into(),
                 Tag::List {
                     element_type: TagType::Compound,
-                    values: vec![Tag::Compound(vec![
-                        ("id".into(), Tag::String("minecraft:slow_falling".into())),
-                        ("duration".into(), Tag::Int(1)),
-                        (
-                            "hidden_effect".into(),
-                            Tag::Compound(vec![("duration".into(), Tag::Int(5))]),
-                        ),
-                    ])],
+                    values: vec![
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:slow_falling".into())),
+                            ("duration".into(), Tag::Int(1)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(5))]),
+                            ),
+                        ]),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:levitation".into())),
+                            ("duration".into(), Tag::Int(3)),
+                            ("amplifier".into(), Tag::Byte(1)),
+                        ]),
+                    ],
                 },
             )]),
         };
@@ -1558,6 +1567,9 @@ mod tests {
         };
         assert_eq!(read_saved_fall_effects(&advanced).unwrap(), effects);
         assert_eq!(effects.slow_falling.unwrap().duration, 4);
+        let levitation = effects.levitation.unwrap();
+        assert_eq!(levitation.duration, 2);
+        assert_eq!(levitation.amplifier, 1);
     }
 
     #[test]

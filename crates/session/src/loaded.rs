@@ -12363,6 +12363,34 @@ mod tests {
     }
 
     #[test]
+    fn creative_flight_ignores_fluid_movement_and_uses_flight_ascent() {
+        for name in ["minecraft:water", "minecraft:lava"] {
+            let mut session = liquid_session(name);
+            session.set_game_mode(GameMode::Creative);
+            session.flight.flying = true;
+            session.motion.position = DVec3::new(4.5, 2.0, 4.5);
+            session.motion.velocity = DVec3::new(0.3, 0.0, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.submit_command(PlayerCommand::Move {
+                forward: 0.0,
+                strafe: 0.0,
+                jump: true,
+            });
+            session.update(TICK);
+            assert!(
+                (session.motion.velocity.x - 0.3 * f64::from(0.91_f32)).abs() < 1e-12,
+                "{name}"
+            );
+            assert!(
+                (session.motion.velocity.y - f64::from(session.flight_speed * 3.0_f32) * 0.6).abs()
+                    < 1e-12,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn saved_item_uses_loaded_world_fluid_contacts() {
         for name in ["minecraft:water", "minecraft:lava"] {
             let mut session = liquid_session(name);

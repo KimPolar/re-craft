@@ -136,7 +136,9 @@ impl MotionState {
     ) -> (bool, DVec3) {
         let vertical = i32::from(input.jump) - i32::from(descend);
         self.velocity.y += f64::from(vertical as f32 * flight_speed * 3.0_f32);
-        self.jump_delay = self.jump_delay.saturating_sub(1);
+        // Player.isAffectedByFluids() is false while flying. LivingEntity.aiStep
+        // consequently skips its ordinary jump handling and resets this delay.
+        self.jump_delay = 0;
         if self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z < 9.0e-6 {
             self.velocity.x = 0.0;
             self.velocity.z = 0.0;
@@ -147,12 +149,6 @@ impl MotionState {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
         let cosine = f64::from(java_sin(f64::from(radians), true));
-        if input.jump && self.on_ground && self.jump_delay == 0 {
-            self.jump_from_ground(input.sprinting, sine, cosine);
-            self.jump_delay = 10;
-        } else if !input.jump {
-            self.jump_delay = 0;
-        }
         let friction = if self.on_ground {
             modified_friction(block_friction, 1.0)
         } else {
@@ -614,6 +610,36 @@ pub fn java_sin(radians: f64, cosine: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flying_jump_does_not_apply_ground_jump_impulse() {
+        for flight_speed in [0.0_f32, 0.05] {
+            let mut motion = MotionState {
+                position: DVec3::ZERO,
+                velocity: DVec3::ZERO,
+                on_ground: true,
+                jump_delay: 7,
+            };
+            motion.tick_flying(
+                MovementInput {
+                    forward: 0.0,
+                    right: 0.0,
+                    yaw_degrees: 0.0,
+                    jump: true,
+                    sprinting: false,
+                    using_item: false,
+                    moving_slowly: false,
+                },
+                false,
+                flight_speed,
+                0.6,
+                |_, requested, _| (requested, requested),
+            );
+            assert_eq!(motion.position.y, f64::from(flight_speed * 3.0_f32));
+            assert_eq!(motion.velocity.y, f64::from(flight_speed * 3.0_f32) * 0.6);
+            assert_eq!(motion.jump_delay, 0);
+        }
+    }
 
     #[test]
     fn creative_flight_toggles_on_a_fresh_double_jump_within_the_window() {

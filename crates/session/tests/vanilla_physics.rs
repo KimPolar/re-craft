@@ -228,7 +228,7 @@ fn creative_flight_collision_matches_vanilla_air_movement() {
         .arg("CreativeFlightOracle")
         .arg(&output));
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(rows.len(), 3 * 16 * 64);
+    assert_eq!(rows.len(), 3 * 3 * 16 * 64);
     let mut motion = MotionState {
         position: DVec3::ZERO,
         velocity: DVec3::ZERO,

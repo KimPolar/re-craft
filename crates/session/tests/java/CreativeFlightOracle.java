@@ -19,6 +19,8 @@ import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameType;
@@ -28,9 +30,11 @@ import net.minecraft.world.phys.Vec3;
 public class CreativeFlightOracle {
     static Method restitute;
     static class World extends ClientLevel {
+        int fluid;
         World() { super(null, null, null, null, 0, 0, null, false, 0, 0); }
         @Override public boolean isClientSide() { return false; }
         @Override public BlockState getBlockState(BlockPos pos) { return Blocks.STONE.defaultBlockState(); }
+        @Override public FluidState getFluidState(BlockPos pos) { return (fluid == 1 ? Fluids.WATER : fluid == 2 ? Fluids.LAVA : Fluids.EMPTY).defaultFluidState(); }
     }
     static class Probe extends Player {
         Vec3 velocity = Vec3.ZERO, position = Vec3.ZERO;
@@ -47,6 +51,10 @@ public class CreativeFlightOracle {
         @Override public void setDeltaMovement(double x, double y, double z) { velocity = new Vec3(x,y,z); }
         @Override public float getYRot() { return yaw; }
         @Override public boolean isSprinting() { return sprint; }
+        @Override public boolean isSwimming() { return false; }
+        @Override public boolean isFallFlying() { return false; }
+        @Override public boolean isInWater() { return ((World)level()).fluid == 1; }
+        @Override public boolean isInLava() { return ((World)level()).fluid == 2; }
         @Override public boolean onClimbable() { return false; }
         @Override public boolean shouldDiscardFriction() { return false; }
         @Override protected boolean omnidirectionalAirMover() { return false; }
@@ -94,11 +102,13 @@ public class CreativeFlightOracle {
         player.setWorld(world);
         Field abilities = Player.class.getDeclaredField("abilities"); abilities.setAccessible(true);
         var fly = new Abilities(); fly.flying = true; abilities.set(player, fly);
-        Method travel = LivingEntity.class.getDeclaredMethod("travelInAir", Vec3.class); travel.setAccessible(true);
+        Field blockPosition = Entity.class.getDeclaredField("blockPosition"); blockPosition.setAccessible(true); blockPosition.set(player, BlockPos.ZERO);
         restitute = Entity.class.getDeclaredMethod("restituteMovementAfterCollisions", BlockState.class, boolean.class, boolean.class, Vec3.class); restitute.setAccessible(true);
         Method modify = LocalPlayer.class.getDeclaredMethod("modifyInput", Vec2.class); modify.setAccessible(true);
         var rows = new JsonArray();
-        for (double bounce : new double[]{0.0, 0.25, 0.8}) for (int seed = 0; seed < 16; seed++) {
+        for (int fluid = 0; fluid < 3; fluid++) for (double bounce : new double[]{0.0, 0.25, 0.8}) for (int seed = 0; seed < 16; seed++) {
+            world.fluid = fluid;
+            if (player.isAffectedByFluids()) throw new AssertionError("Flying player must ignore fluids");
             player.bounce = bounce;
             fly.setFlyingSpeed(new float[]{0.0f, 0.01f, 0.05f, 0.1f, 0.2f}[seed % 5]);
             player.position = Vec3.ZERO;
@@ -116,13 +126,11 @@ public class CreativeFlightOracle {
                 if (x*x + z*z < 9.0e-6) { x = 0; z = 0; }
                 if (Math.abs(y) < 0.003) y = 0;
                 player.velocity = new Vec3(x,y,z);
-                if (jump && player.grounded && player.delay == 0) { player.jumpFromGround(); player.delay = 10; }
-                else if (!jump) player.delay = 0;
-                double oldY = player.velocity.y;
+                if (jump && player.isAffectedByFluids()) throw new AssertionError("Unexpected ordinary jump while flying");
+                player.delay = 0;
                 Vec2 key = new Vec2(-right, forward).normalized();
                 Vec2 adjusted = (Vec2) modify.invoke(input, key);
-                travel.invoke(player, new Vec3(adjusted.x, 0, adjusted.y));
-                player.velocity = new Vec3(player.velocity.x, oldY * 0.6, player.velocity.z);
+                player.travel(new Vec3(adjusted.x, 0, adjusted.y));
                 var row = new JsonObject();
                 row.addProperty("seed", seed); row.addProperty("tick", tick);
                 row.addProperty("forward", forward); row.addProperty("right", right);
@@ -130,6 +138,7 @@ public class CreativeFlightOracle {
                 row.addProperty("sprint", player.sprint); row.addProperty("yaw", player.yaw);
                 row.addProperty("speed", fly.getFlyingSpeed());
                 row.addProperty("bounce", bounce);
+                row.addProperty("fluid", fluid);
                 row.addProperty("ground", player.grounded); row.addProperty("delay", player.delay);
                 row.add("position", vec(player.position)); row.add("velocity", vec(player.velocity));
                 rows.add(row);

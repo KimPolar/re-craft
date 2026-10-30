@@ -152,6 +152,82 @@ impl SavedChest {
         self.source.get("CustomName")
     }
 
+    /// Interpret the known item/count subset of 26.3's lock item predicate.
+    /// Unknown predicates remain unavailable rather than being treated as open.
+    pub(crate) fn can_unlock(&self, item: Option<&ItemStack>, spectator: bool) -> Result<bool> {
+        if spectator {
+            return Ok(true);
+        }
+        let Some(lock) = unique(&self.source, "lock")? else {
+            return Ok(true);
+        };
+        let Tag::Compound(fields) = lock else {
+            bail!("unsupported lock predicate")
+        };
+        ensure!(
+            fields
+                .iter()
+                .all(|(name, _)| name.matches("items") || name.matches("count")),
+            "unsupported lock predicate field"
+        );
+        if let Some(items) = unique(lock, "items")? {
+            let choices = match items {
+                Tag::String(_) => std::slice::from_ref(items),
+                Tag::List {
+                    element_type: TagType::String,
+                    values,
+                } => values.as_slice(),
+                _ => bail!("unsupported lock item set"),
+            };
+            let mut matched = false;
+            for choice in choices {
+                let Tag::String(id) = choice else {
+                    bail!("invalid lock item")
+                };
+                let id = String::from_utf16(&id.0).context("invalid lock item identifier")?;
+                ensure!(!id.starts_with('#'), "item tag locks are unsupported");
+                let id = ResourceId::parse(&id)?;
+                let id = format!("{}:{}", id.namespace, id.path);
+                matched |= item.map_or(id == "minecraft:air", |item| item.id() == id);
+            }
+            if !matched {
+                return Ok(false);
+            }
+        }
+        let count = item.map_or(0, |stack| stack.count() as i64);
+        if let Some(range) = unique(lock, "count")? {
+            let bound = |value: &Tag| -> Result<i64> {
+                value
+                    .as_java_int()
+                    .map(i64::from)
+                    .context("unsupported lock count")
+            };
+            let (min, max) = if let Tag::Compound(fields) = range {
+                ensure!(
+                    fields
+                        .iter()
+                        .all(|(name, _)| name.matches("min") || name.matches("max")),
+                    "unsupported lock count field"
+                );
+                (
+                    unique(range, "min")?.map(bound).transpose()?,
+                    unique(range, "max")?.map(bound).transpose()?,
+                )
+            } else {
+                let value = bound(range)?;
+                (Some(value), Some(value))
+            };
+            ensure!(
+                min.zip(max).is_none_or(|(min, max)| min <= max),
+                "invalid lock count range"
+            );
+            if min.is_some_and(|min| count < min) || max.is_some_and(|max| count > max) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn inventory_changed(&self) -> bool {
         self.slots != self.original_slots
     }
@@ -306,10 +382,8 @@ pub fn read(
         unique(&entity, "LootTable")?.is_none(),
         "chest loot table must be generated first"
     );
-    ensure!(
-        unique(&entity, "lock")?.is_none() && unique(&entity, "Lock")?.is_none(),
-        "locked chest interaction is unsupported"
-    );
+    unique(&entity, "lock")?;
+    unique(&entity, "Lock")?;
     let mut slots: [Option<ItemStack>; 27] = std::array::from_fn(|_| None);
     if let Some(items) = unique(&entity, "Items")? {
         let Tag::List {
@@ -551,7 +625,7 @@ mod tests {
         assert!(saved.draft_inventory(&changed).is_err());
     }
     #[test]
-    fn rejects_unavailable_loot_locks_and_ambiguous_slots() {
+    fn rejects_unavailable_loot_and_ambiguous_slots() {
         let position = IVec3::new(-1, 64, 32);
         let chunk = ChunkPos { x: -1, z: 2 };
         assert!(read(&SavedBlockEntities::Unavailable, chunk, position).is_err());
@@ -574,7 +648,23 @@ mod tests {
             unreachable!()
         };
         fields.push(("lock".into(), Tag::Compound(vec![])));
-        assert!(read(&payload(vec![locked]), chunk, position).is_err());
+        let locked = read(&payload(vec![locked]), chunk, position)
+            .unwrap()
+            .unwrap();
+        assert!(locked.can_unlock(None, false).unwrap());
+        let mut unsupported = chest();
+        let Tag::Compound(fields) = &mut unsupported else {
+            unreachable!()
+        };
+        fields.push((
+            "lock".into(),
+            Tag::Compound(vec![("components".into(), Tag::Compound(vec![]))]),
+        ));
+        let unsupported = read(&payload(vec![unsupported]), chunk, position)
+            .unwrap()
+            .unwrap();
+        assert!(unsupported.can_unlock(None, false).is_err());
+        assert!(unsupported.can_unlock(None, true).unwrap());
         assert!(read(&payload(vec![chest(), chest()]), chunk, position).is_err());
         let mut duplicate = chest();
         let Tag::Compound(fields) = &mut duplicate else {
@@ -590,5 +680,90 @@ mod tests {
         };
         values.push(values[0].clone());
         assert!(read(&payload(vec![duplicate]), chunk, position).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn lock_item_and_count_predicates_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChestLockOracle.java");
+        let output = temp.path().join("locks.nbt");
+        std::fs::write(&source, include_str!("../tests/java/ChestLockOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ChestLockOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "oracle failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let oracle = nbt::read(&std::fs::read(output).unwrap()).unwrap();
+        let Tag::List { values, .. } = oracle.value.get("cases").unwrap() else {
+            panic!()
+        };
+        let stack =
+            |id: &str, count| ItemStack::new(id.into(), count, 64, Tag::Compound(vec![])).unwrap();
+        let hands = [
+            None,
+            Some(stack("minecraft:diamond", 1)),
+            Some(stack("minecraft:diamond", 3)),
+            Some(stack("minecraft:stone", 2)),
+        ];
+        for (case, row) in values.iter().enumerate() {
+            let mut original = chest();
+            let Tag::Compound(fields) = &mut original else {
+                panic!()
+            };
+            fields.push(("lock".into(), row.get("lock").unwrap().clone()));
+            let saved = read(
+                &payload(vec![original]),
+                ChunkPos { x: -1, z: 2 },
+                IVec3::new(-1, 64, 32),
+            )
+            .unwrap()
+            .unwrap();
+            let Tag::ByteArray(expected) = row.get("answers").unwrap() else {
+                panic!()
+            };
+            for (hand, &answer) in hands.iter().zip(expected) {
+                assert_eq!(
+                    saved.can_unlock(hand.as_ref(), false).unwrap(),
+                    answer != 0,
+                    "case {case} hand {hand:?}"
+                );
+                assert!(saved.can_unlock(hand.as_ref(), true).unwrap());
+            }
+        }
     }
 }

@@ -2793,6 +2793,13 @@ impl LoadedSession {
         let Ok(Some(chest)) = self.saved_chest(position) else {
             return false;
         };
+        let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+            self.inventory.selected(),
+        ));
+        let spectator = self.game_mode == GameMode::Spectator;
+        if !matches!(chest.can_unlock(hand, spectator), Ok(true)) {
+            return false;
+        }
         let pair = match kind {
             Some("single") => None,
             Some("left" | "right") => {
@@ -2829,6 +2836,9 @@ impl LoadedSession {
                 let Ok(Some(other)) = self.saved_chest(other_position) else {
                     return false;
                 };
+                if !matches!(other.can_unlock(hand, spectator), Ok(true)) {
+                    return false;
+                }
                 Some((other_position, other))
             }
             _ => return false,
@@ -12902,6 +12912,99 @@ mod tests {
             assert!(session.set(relative + IVec3::Y, block));
             assert!(!session.try_open_saved_chest(relative), "{name}");
         }
+    }
+
+    #[test]
+    fn locked_chests_check_main_hand_and_both_halves() {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, _, left, chunk) = saved_chest_fixture();
+        session.set_player_inventory(PlayerInventory::default());
+        let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        let mut data = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut data.value else {
+            panic!()
+        };
+        let Tag::Compound(first) = &mut values[0] else {
+            panic!()
+        };
+        first.push((
+            "lock".into(),
+            Tag::Compound(vec![
+                ("items".into(), Tag::String("minecraft:diamond".into())),
+                (
+                    "count".into(),
+                    Tag::Compound(vec![("min".into(), Tag::Int(2))]),
+                ),
+            ]),
+        ));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
+            );
+        assert!(!session.try_open_saved_chest(left - session.origin));
+        let diamond =
+            |count| ItemStack::new("minecraft:diamond".into(), count, 64, Tag::Compound(vec![]));
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Offhand, diamond(3));
+        assert!(!session.try_open_saved_chest(left - session.origin));
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Storage(0), diamond(2));
+        assert!(session.try_open_saved_chest(left - session.origin));
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        let right = left + IVec3::X;
+        for (position, kind) in [(left, "left"), (right, "right")] {
+            let id = session.intern_block(state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", kind),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(position - session.origin, id));
+        }
+        let Tag::List { values, .. } = &mut data.value else {
+            panic!()
+        };
+        values.push(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(right.x)),
+            ("y".into(), Tag::Int(right.y)),
+            ("z".into(), Tag::Int(right.z)),
+            (
+                "lock".into(),
+                Tag::Compound(vec![
+                    ("items".into(), Tag::String("minecraft:diamond".into())),
+                    (
+                        "count".into(),
+                        Tag::Compound(vec![("min".into(), Tag::Int(3))]),
+                    ),
+                ]),
+            ),
+        ]));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
+            );
+        assert!(!session.try_open_saved_chest(left - session.origin));
+        assert!(!session.try_open_saved_chest(right - session.origin));
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Storage(0), diamond(3));
+        assert!(session.try_open_saved_chest(right - session.origin));
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Storage(0), None);
+        session.set_game_mode(GameMode::Spectator);
+        assert!(session.try_open_saved_chest(left - session.origin));
     }
 
     #[test]

@@ -198,6 +198,7 @@ struct CreatedItemIdentity {
     origin: DVec3,
     thrower: CreatedThrower,
     yaw: f32,
+    fall_distance: f64,
     ticked: bool,
 }
 
@@ -223,6 +224,7 @@ impl CreatedItemIdentity {
             origin,
             thrower,
             yaw,
+            fall_distance: 0.0,
             ticked: false,
         }
     }
@@ -684,7 +686,7 @@ impl ItemEntities {
                 thrower,
                 crate::saved_item::CreatedItemBase {
                     rotation: [created.yaw, 0.0],
-                    fall_distance: 0.0,
+                    fall_distance: created.fall_distance,
                     air: 300,
                     portal_cooldown: 0,
                 },
@@ -1378,6 +1380,14 @@ impl ItemEntities {
             let relative = entity.item.position - origin.as_dvec3();
             let bounds = item_bounds(relative);
             let contacts = fluid(bounds);
+            if let Some(created) = &mut entity.created {
+                if contacts.water.depth > 0.0 {
+                    created.fall_distance = 0.0;
+                }
+                if contacts.lava.depth > 0.0 {
+                    created.fall_distance *= 0.5;
+                }
+            }
             if let Some(rules) = damage_rules
                 && apply_fire_tick(entity, rules, contacts.lava.depth > 0.0).unwrap_or(false)
             {
@@ -1428,6 +1438,14 @@ impl ItemEntities {
                 let hit_z = (requested.z - actual.z).abs() >= f64::from(1.0e-5_f32);
                 let hit_y = requested.y != actual.y;
                 entity.on_ground = hit_y && requested.y < 0.0;
+                if let Some(created) = &mut entity.created {
+                    if entity.on_ground {
+                        created.fall_distance = 0.0;
+                    } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
+                        // Entity.checkFallDamage rounds the displacement to float.
+                        created.fall_distance -= f64::from(actual.y as f32);
+                    }
+                }
                 if hit_x {
                     entity.velocity.x = 0.0;
                 }
@@ -1951,6 +1969,54 @@ mod tests {
             PlayerDropOrigin::Direct,
         );
         assert!(unknown.draft_created_items_in_chunk(pos).is_err());
+    }
+
+    #[test]
+    fn created_item_fall_distance_uses_java_float_displacement_and_ground_reset() {
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(0.5, 1.0, 0.5), stack);
+        items.entities[0].velocity = DVec3::new(0.0, -0.1, 0.0);
+        let mut inventory = Arc::new(PlayerInventory::default());
+        let shape = |pos: IVec3| {
+            if pos.y < 0 {
+                native_world::collision::unknown_barrier()
+            } else {
+                &[]
+            }
+        };
+        items.tick(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            &mut inventory,
+            shape,
+            |_| 0.6,
+        );
+        assert_eq!(
+            items.entities[0].created.as_ref().unwrap().fall_distance,
+            f64::from(0.14_f32)
+        );
+        for _ in 0..30 {
+            items.tick(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Survival,
+                &mut inventory,
+                shape,
+                |_| 0.6,
+            );
+            if items.entities[0].on_ground {
+                break;
+            }
+        }
+        assert!(items.entities[0].on_ground);
+        assert_eq!(
+            items.entities[0].created.as_ref().unwrap().fall_distance,
+            0.0
+        );
     }
 
     #[test]
@@ -4049,7 +4115,12 @@ public class ItemMotionOracle {
         @Override public ItemStack getItem() { return stack == null ? new ItemStack(Items.DIRT) : stack; }
         @Override public void setItem(ItemStack value) { stack = value; }
         @Override public void remove(Entity.RemovalReason reason) { removed = true; }
-        @Override public void baseTick() { }
+        @Override public void baseTick() {
+            // Preserve the fall-distance effects from Entity.baseTick while
+            // avoiding unrelated client world and fire machinery in this mock.
+            if (isInWater()) resetFallDistance();
+            if (isInLava()) fallDistance *= 0.5;
+        }
         @Override public boolean isInWater() { return fluidKind == 1; }
         @Override public boolean isInLava() { return fluidKind == 2; }
         @Override public double getFluidHeight(TagKey<Fluid> tag) { return 1.0; }
@@ -4068,6 +4139,10 @@ public class ItemMotionOracle {
             boolean blocked = y != requested.y;
             pos(new Vec3(getX() + requested.x, getY() + y, getZ() + requested.z));
             grounded = blocked && requested.y < 0;
+            // The real Entity.move calls this with collision-adjusted Y.
+            // Landing also triggers block effects, which this mock omits.
+            if (grounded) resetFallDistance();
+            else checkFallDamage(y, false, world.getBlockState(BlockPos.ZERO), BlockPos.ZERO);
             if (blocked) velocity = new Vec3(velocity.x, 0, velocity.z);
         }
     }
@@ -4099,6 +4174,7 @@ public class ItemMotionOracle {
                 item.tickCount++; item.tick();
                 JsonObject tick = new JsonObject(); tick.add("p", vector(new Vec3(item.getX(),item.getY(),item.getZ())));
                 tick.add("v",vector(item.velocity)); tick.addProperty("ground",item.grounded);
+                tick.addProperty("fall",item.fallDistance);
                 tick.addProperty("age",age.getInt(item)); tick.addProperty("delay",delay.getInt(item)); ticks.add(tick);
             }
             output.add(ticks);
@@ -4416,7 +4492,14 @@ public class ItemMotionOracle {
                 no_gravity: case["no_gravity"].as_bool().unwrap(),
                 owner: None,
                 _saved_source: None,
-                created: None,
+                created: Some(CreatedItemIdentity {
+                    uuid: Some([1, 2, 3, 4]),
+                    origin: vec(&case["p"]),
+                    thrower: CreatedThrower::Known(None),
+                    yaw: 0.0,
+                    fall_distance: 0.0,
+                    ticked: false,
+                }),
                 id: index as u32,
                 section_sequence: 0,
                 _damage_state: ItemDamageState::default(),
@@ -4478,7 +4561,11 @@ public class ItemMotionOracle {
                         && velocity_error < 1.0e-10
                         && actual.on_ground == oracle["ground"].as_bool().unwrap()
                         && actual.lifetime == oracle["age"].as_i64().unwrap() as i32
-                        && actual.pickup_delay == oracle["delay"].as_i64().unwrap() as i32,
+                        && actual.pickup_delay == oracle["delay"].as_i64().unwrap() as i32
+                        && (actual.created.as_ref().unwrap().fall_distance
+                            - oracle["fall"].as_f64().unwrap())
+                        .abs()
+                            < 1e-12,
                     "case {index} tick {tick}: actual position {:?} velocity {:?} grounded {}, expected {oracle}",
                     actual.item.position,
                     actual.velocity,

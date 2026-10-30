@@ -842,6 +842,9 @@ fn prepare_existing_world(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        session
+            .set_has_skylight(profile.has_skylight)
+            .map_err(anyhow::Error::msg)?;
         let clocks = reader.world_clocks().and_then(|mut clocks| {
             for id in resources.list_data("world_clock")? {
                 let id = native_persistence::world::DimensionId::parse(&format!(

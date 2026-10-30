@@ -219,6 +219,7 @@ pub struct LoadedSession {
     revision: u64,
     pending_light: BTreeMap<BlockPosition, PendingLight>,
     light_generation: u64,
+    sky_lighting: crate::sky_lighting::SkyLighting,
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
@@ -471,6 +472,15 @@ impl LoadedSession {
 
     pub fn set_random_tick_speed(&mut self, speed: u32) {
         self.random_tick_speed = speed;
+    }
+
+    /// Configure the dimension's sky-light engine before simulation begins.
+    pub fn set_has_skylight(&mut self, has_skylight: bool) -> Result<(), &'static str> {
+        if self.tick != 0 || !self.block_edits.is_empty() {
+            return Err("sky-light capability must be configured before simulation begins");
+        }
+        self.sky_lighting.set_enabled(has_skylight);
+        Ok(())
     }
 
     /// Restore the effects and persistent oxygen attribute from the saved player.
@@ -1667,6 +1677,7 @@ impl LoadedSession {
             revision: 0,
             pending_light: BTreeMap::new(),
             light_generation: 0,
+            sky_lighting: crate::sky_lighting::SkyLighting::default(),
             snapshot,
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
@@ -3626,6 +3637,7 @@ impl LoadedSession {
         if changed {
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
+            self.sky_lighting.streaming_changed();
         }
         if changed || self.tick == 0 {
             self.dropped_items
@@ -4478,6 +4490,16 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
+        self.sky_lighting.record(
+            BlockPosition {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            },
+            original,
+            id,
+            chunk,
+        );
         let relight = native_world::block_light::light_change_for_edit(
             original_state.as_ref(),
             &replacement_state,
@@ -4506,6 +4528,14 @@ impl LoadedSession {
             },
             original_state,
             replacement_state,
+        );
+        self.sky_lighting.discard_trivial(
+            &self.world,
+            BlockPosition {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            },
         );
         if let Some(mut maps) = self.spawn_heightmaps.remove(&chunk_pos) {
             let update = (|| -> anyhow::Result<()> {
@@ -5671,6 +5701,13 @@ impl LoadedSession {
         self.refresh_movement_speed();
         let camera_speed = self.movement_speed(camera_sprinting);
         self.apply_streaming();
+        let sky_bounds =
+            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        let sky_changed = self.sky_lighting.advance(&mut self.world, sky_bounds);
+        if !sky_changed.is_empty() {
+            self.dirty_chunks.extend(sky_changed);
+            self.revision += 1;
+        }
         self.retry_pending_light();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
@@ -7913,6 +7950,68 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn loaded_session_applies_background_sky_updates_to_snapshots() {
+        let mut session = session();
+        session.set_has_skylight(true).unwrap();
+        session.set_random_tick_speed(0);
+        let air = session.states[0];
+        let origin_chunk = BlockPosition {
+            x: session.origin.x,
+            y: 0,
+            z: session.origin.z,
+        }
+        .chunk();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let pos = ChunkPos {
+                    x: origin_chunk.x + x,
+                    z: origin_chunk.z + z,
+                };
+                let sections = (-1..=2)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: (0..=1).contains(&y).then(|| Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                                sky_light: Some(Box::new([0xff; LIGHT_BYTES])),
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        let relative = IVec3::new(15, 15, 15);
+        assert!(session.set(relative, stone));
+        let absolute = session.origin + relative;
+        session.update(TICK);
+        let old_snapshot = session.snapshot();
+        session.sky_lighting.wait_for_worker();
+        session.update(TICK);
+        let new_snapshot = session.snapshot();
+        let SessionWorld::Loaded(old) = &old_snapshot.world else {
+            panic!("loaded world expected")
+        };
+        let SessionWorld::Loaded(new) = &new_snapshot.world else {
+            panic!("loaded world expected")
+        };
+        assert_eq!(old.light(absolute.x, 14, absolute.z, true), Some(15));
+        assert_eq!(new.light(absolute.x, 14, absolute.z, true), Some(14));
+        assert!(new_snapshot.world_revision > old_snapshot.world_revision);
     }
 
     #[test]

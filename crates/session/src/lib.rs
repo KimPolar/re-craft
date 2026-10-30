@@ -37,6 +37,7 @@ pub mod respawn;
 pub mod saved_falling_block;
 pub mod saved_item;
 pub mod saved_orb;
+mod sky_lighting;
 mod spawn_entities;
 pub mod spawn_heightmaps;
 pub mod survival;

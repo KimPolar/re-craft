@@ -1,0 +1,237 @@
+//! Redstone signal queries for the currently simulated sources.
+//!
+//! Unknown blocks propagate uncertainty, so a consumer is never switched off
+//! merely because its real source has not been implemented yet.
+
+use glam::IVec3;
+use native_world::loaded::BlockState;
+
+const DIRECTIONS: [IVec3; 6] = [
+    IVec3::NEG_Y,
+    IVec3::Y,
+    IVec3::NEG_Z,
+    IVec3::Z,
+    IVec3::NEG_X,
+    IVec3::X,
+];
+
+fn add(a: IVec3, b: IVec3) -> Option<IVec3> {
+    Some(IVec3::new(
+        a.x.checked_add(b.x)?,
+        a.y.checked_add(b.y)?,
+        a.z.checked_add(b.z)?,
+    ))
+}
+
+fn button_connected_direction(state: &BlockState) -> Option<IVec3> {
+    native_core::button::Button::from_id(&state.name)?;
+    native_world::collision::block_outline(state)?;
+    match state.properties.get("face")?.as_str() {
+        "floor" => Some(IVec3::Y),
+        "ceiling" => Some(IVec3::NEG_Y),
+        "wall" => match state.properties.get("facing")?.as_str() {
+            "north" => Some(IVec3::NEG_Z),
+            "south" => Some(IVec3::Z),
+            "west" => Some(IVec3::NEG_X),
+            "east" => Some(IVec3::X),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Return weak signal, direct signal in the query direction, and whether the
+/// block relays direct power from its neighbours. None means not yet modeled.
+pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
+    if !DIRECTIONS.contains(&direction) {
+        return None;
+    }
+    if native_core::button::Button::from_id(&state.name).is_some() {
+        let connected = button_connected_direction(state)?;
+        let powered = match state.properties.get("powered")?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        return Some((
+            if powered { 15 } else { 0 },
+            if powered && direction == connected {
+                15
+            } else {
+                0
+            },
+            false,
+        ));
+    }
+    let empty = state.properties.is_empty();
+    let axis = state.properties.len() == 1
+        && matches!(
+            state.properties.get("axis").map(String::as_str),
+            Some("x" | "y" | "z")
+        );
+    let id = state.name.as_str();
+    if (axis
+        && (id.ends_with("_log")
+            || id.ends_with("_wood")
+            || id.ends_with("_stem")
+            || id.ends_with("_hyphae")
+            || matches!(
+                id,
+                "minecraft:bamboo_block" | "minecraft:stripped_bamboo_block"
+            ))
+        && native_core::wood::Wood::from_id(id).is_some())
+        || (empty && id.ends_with("_planks") && native_core::wood::Planks::from_id(id).is_some())
+    {
+        return Some((0, 0, true));
+    }
+    match state.name.as_str() {
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" if empty => {
+            Some((0, 0, false))
+        }
+        "minecraft:glass"
+        | "minecraft:ice"
+        | "minecraft:honey_block"
+        | "minecraft:glowstone"
+        | "minecraft:dirt_path"
+            if empty =>
+        {
+            Some((0, 0, false))
+        }
+        "minecraft:farmland"
+            if state.properties.len() == 1
+                && matches!(
+                    state.properties.get("moisture").map(String::as_str),
+                    Some("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7")
+                ) =>
+        {
+            Some((0, 0, false))
+        }
+        "minecraft:redstone_block" if empty => Some((15, 0, false)),
+        "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+            if state.properties.len() == 1
+                && matches!(
+                    state.properties.get("snowy").map(String::as_str),
+                    Some("true" | "false")
+                ) =>
+        {
+            Some((0, 0, true))
+        }
+        "minecraft:basalt" | "minecraft:hay_block" if axis => Some((0, 0, true)),
+        "minecraft:stone"
+        | "minecraft:cobblestone"
+        | "minecraft:stone_bricks"
+        | "minecraft:dirt"
+        | "minecraft:coarse_dirt"
+        | "minecraft:rooted_dirt"
+        | "minecraft:sand"
+        | "minecraft:red_sand"
+        | "minecraft:gravel"
+        | "minecraft:granite"
+        | "minecraft:diorite"
+        | "minecraft:andesite"
+        | "minecraft:tuff"
+        | "minecraft:netherrack"
+        | "minecraft:end_stone"
+        | "minecraft:obsidian"
+        | "minecraft:soul_soil"
+        | "minecraft:snow_block"
+        | "minecraft:slime_block"
+        | "minecraft:packed_ice"
+        | "minecraft:blue_ice"
+        | "minecraft:clay"
+            if empty =>
+        {
+            Some((0, 0, true))
+        }
+        "minecraft:redstone_lamp"
+            if state.properties.len() == 1
+                && matches!(
+                    state.properties.get("lit").map(String::as_str),
+                    Some("true" | "false")
+                ) =>
+        {
+            Some((0, 0, true))
+        }
+        _ => None,
+    }
+}
+
+/// Java's `hasNeighborSignal` for known sources and conductors.
+pub fn neighbor_signal<'a>(
+    position: IVec3,
+    mut block: impl FnMut(IVec3) -> Option<&'a BlockState>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for direction in DIRECTIONS {
+        let Some(neighbor) = add(position, direction) else {
+            unknown = true;
+            continue;
+        };
+        let Some((weak, _, conductor)) = block(neighbor).and_then(|state| source(state, direction))
+        else {
+            unknown = true;
+            continue;
+        };
+        if weak > 0 {
+            return Some(true);
+        }
+        if conductor {
+            for incoming in DIRECTIONS {
+                let Some(source_pos) = add(neighbor, incoming) else {
+                    unknown = true;
+                    continue;
+                };
+                match block(source_pos).and_then(|state| source(state, incoming)) {
+                    Some((_, direct, _)) if direct > 0 => return Some(true),
+                    Some(_) => {}
+                    None => unknown = true,
+                }
+            }
+        }
+    }
+    if unknown { None } else { Some(false) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn known_power_wins_over_unknown_but_no_power_remains_uncertain() {
+        let air = BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        let unknown = BlockState {
+            name: "minecraft:unknown_source".into(),
+            properties: BTreeMap::new(),
+        };
+        let button = BlockState {
+            name: "minecraft:stone_button".into(),
+            properties: [
+                ("face".into(), "wall".into()),
+                ("facing".into(), "east".into()),
+                ("powered".into(), "true".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let query = |powered: bool, missing: bool| {
+            neighbor_signal(IVec3::ZERO, |pos| {
+                if pos == IVec3::NEG_Y {
+                    if missing { None } else { Some(&unknown) }
+                } else if pos == IVec3::X && powered {
+                    Some(&button)
+                } else {
+                    Some(&air)
+                }
+            })
+        };
+        assert_eq!(query(true, false), Some(true));
+        assert_eq!(query(true, true), Some(true));
+        assert_eq!(query(false, false), None);
+        assert_eq!(query(false, true), None);
+        assert_eq!(neighbor_signal(IVec3::ZERO, |_| Some(&air)), Some(false));
+    }
+}

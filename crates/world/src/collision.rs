@@ -254,6 +254,8 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         id,
         "stone"
             | "stone_bricks"
+            | "redstone_lamp"
+            | "redstone_block"
             | "crafting_table"
             | "granite"
             | "diorite"

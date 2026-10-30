@@ -259,6 +259,10 @@ pub struct LoadedSession {
     button_deferred: ButtonTickQueue,
     button_deferred_revision: Option<u64>,
     button_pending: BTreeSet<ButtonTickKey>,
+    lamp_ticks: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
+    lamp_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
+    lamp_deferred_revision: Option<u64>,
+    lamp_pending: BTreeSet<(i32, i32, i32)>,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     falling_sand: Vec<FallingSand>,
@@ -1731,6 +1735,10 @@ impl LoadedSession {
             button_deferred: BTreeMap::new(),
             button_deferred_revision: None,
             button_pending: BTreeSet::new(),
+            lamp_ticks: BTreeMap::new(),
+            lamp_deferred: BTreeMap::new(),
+            lamp_deferred_revision: None,
+            lamp_pending: BTreeSet::new(),
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             falling_sand: Vec::new(),
@@ -1751,6 +1759,7 @@ impl LoadedSession {
         for (_, ticks) in saved_sand_ticks {
             session.enqueue_saved_sand(&ticks);
             session.enqueue_saved_buttons(&ticks);
+            session.enqueue_saved_lamps(&ticks);
             session.enqueue_saved_soil(&ticks);
         }
         Ok(session)
@@ -2504,6 +2513,10 @@ impl LoadedSession {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
                         || native_core::button::Button::from_id(&tick.block).is_some()
+                        || matches!(
+                            tick.block.as_str(),
+                            "minecraft:redstone_lamp" | "redstone_lamp"
+                        )
                 }),
                 "chunk contains block ticks that are not simulated"
             );
@@ -2555,6 +2568,34 @@ impl LoadedSession {
                 .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
                 .all(|key| queued_buttons.contains(key)),
             "button tick is missing its scheduled order"
+        );
+        let mut queued_lamps = BTreeSet::new();
+        for (order, &(x, y, z)) in self
+            .lamp_ticks
+            .iter()
+            .chain(&self.lamp_deferred)
+            .filter(|(_, (x, _, z))| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+        {
+            queued_lamps.insert((x, y, z));
+            let delay = i32::try_from(order.0 - i128::from(self.tick))
+                .context("lamp tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: "minecraft:redstone_lamp".into(),
+                    position: [x, y, z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.lamp_pending
+                .iter()
+                .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+                .all(|key| queued_lamps.contains(key)),
+            "lamp tick is missing its scheduled order"
         );
         let mut queued_soil = BTreeSet::new();
         for (order, &(absolute, soil)) in
@@ -3505,6 +3546,7 @@ impl LoadedSession {
                     self.enqueue_saved_fluids(pos, &ticks);
                     self.enqueue_saved_sand(&sand_ticks);
                     self.enqueue_saved_buttons(&sand_ticks);
+                    self.enqueue_saved_lamps(&sand_ticks);
                     self.enqueue_saved_soil(&sand_ticks);
                 }
             }
@@ -3674,6 +3716,7 @@ impl LoadedSession {
                                     self.enqueue_saved_fluids(pos, &saved_ticks);
                                     self.enqueue_saved_sand(&saved_sand_ticks);
                                     self.enqueue_saved_buttons(&saved_sand_ticks);
+                                    self.enqueue_saved_lamps(&saved_sand_ticks);
                                     self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
                                 changed = true;
@@ -4516,6 +4559,10 @@ impl LoadedSession {
     }
 
     fn set(&mut self, relative: IVec3, id: BlockStateId) -> bool {
+        self.set_with_notify(relative, id, true)
+    }
+
+    fn set_with_notify(&mut self, relative: IVec3, id: BlockStateId, notify: bool) -> bool {
         let Some(pos) = add(self.origin, relative) else {
             return false;
         };
@@ -4669,8 +4716,10 @@ impl LoadedSession {
             }
         }
         self.revision += 1;
-        self.block_notifications.push_back((relative, old, id));
-        self.notify_fluid_neighbors();
+        if notify {
+            self.block_notifications.push_back((relative, old, id));
+            self.notify_fluid_neighbors();
+        }
         true
     }
 
@@ -4822,6 +4871,96 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_lamps(&mut self, ticks: &[SavedBlockTick]) {
+        for (index, tick) in ticks.iter().enumerate() {
+            if !matches!(
+                tick.block.as_str(),
+                "minecraft:redstone_lamp" | "redstone_lamp"
+            ) {
+                continue;
+            }
+            let [x, y, z] = tick.position;
+            let key = (x, y, z);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            self.lamp_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.lamp_ticks.insert(
+                (
+                    i128::from(self.tick) + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_lamp(&mut self, relative: IVec3) {
+        let Some(absolute) = add(self.origin, relative) else {
+            return;
+        };
+        let key = (absolute.x, absolute.y, absolute.z);
+        if !self.lamp_pending.insert(key) {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.0, key.2);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.lamp_ticks.insert(
+            (
+                i128::from(self.tick) + 4,
+                0,
+                i64::try_from(sequence).unwrap_or(i64::MAX),
+                sequence,
+            ),
+            key,
+        );
+    }
+
+    fn lamp_power(&self, relative: IVec3) -> Option<bool> {
+        crate::redstone::neighbor_signal(relative, |pos| {
+            match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+                Cell::State(id) => self.world.state(id),
+                Cell::Missing => None,
+            }
+        })
+    }
+
+    fn update_lamp(&mut self, relative: IVec3) {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return;
+        };
+        let Some(state) = self.world.state(id) else {
+            return;
+        };
+        let Some(lit) = redstone_lamp_lit(state) else {
+            return;
+        };
+        match (lit, self.lamp_power(relative)) {
+            (false, Some(true)) => {
+                let mut next = state.clone();
+                next.properties.insert("lit".into(), "true".into());
+                let id = self.intern_block(next);
+                self.set_with_notify(relative, id, false);
+            }
+            (true, Some(false)) => self.schedule_lamp(relative),
+            _ => {}
+        }
+    }
+
     fn enqueue_saved_soil(&mut self, ticks: &[SavedBlockTick]) {
         for (index, tick) in ticks.iter().enumerate() {
             let Some(soil) = SoilKind::from_name(&tick.block) else {
@@ -4961,17 +5100,17 @@ impl LoadedSession {
     }
 
     fn advance_block_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, true, true);
+        self.advance_scheduled_block_ticks(true, true, true, true);
     }
 
     #[cfg(test)]
     fn advance_sand_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, false, false);
+        self.advance_scheduled_block_ticks(true, false, false, false);
     }
 
     #[cfg(test)]
     fn advance_soil_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(false, false, true);
+        self.advance_scheduled_block_ticks(false, false, true, false);
     }
 
     fn advance_scheduled_block_ticks(
@@ -4979,6 +5118,7 @@ impl LoadedSession {
         process_sand: bool,
         process_buttons: bool,
         process_soil: bool,
+        process_lamps: bool,
     ) {
         let revision = self.revision;
         if process_sand && self.sand_deferred_revision != Some(revision) {
@@ -4990,9 +5130,13 @@ impl LoadedSession {
         if process_soil && self.soil_deferred_revision != Some(revision) {
             self.soil_ticks.append(&mut self.soil_deferred);
         }
+        if process_lamps && self.lamp_deferred_revision != Some(revision) {
+            self.lamp_ticks.append(&mut self.lamp_deferred);
+        }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
+        let mut deferred_lamps = Vec::new();
         let mut executed = 0;
         while executed < 65_536 {
             let sand_order = process_sand
@@ -5004,11 +5148,18 @@ impl LoadedSession {
             let soil_order = process_soil
                 .then(|| self.soil_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
-            let Some((order, kind)) = [(sand_order, 0), (button_order, 1), (soil_order, 2)]
-                .into_iter()
-                .filter_map(|(order, kind)| order.map(|order| (order, kind)))
-                .min()
-            else {
+            let lamp_order = process_lamps
+                .then(|| self.lamp_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
+            let Some((order, kind)) = [
+                (sand_order, 0),
+                (button_order, 1),
+                (soil_order, 2),
+                (lamp_order, 3),
+            ]
+            .into_iter()
+            .filter_map(|(order, kind)| order.map(|order| (order, kind)))
+            .min() else {
                 break;
             };
             if order.0 > i128::from(self.tick) {
@@ -5097,6 +5248,44 @@ impl LoadedSession {
                 if self.set_button_power(relative, key.kind, false) {
                     self.push_button_sound(relative, key.kind, false);
                 }
+            } else if kind == 3 {
+                let (order, key) = self
+                    .lamp_ticks
+                    .pop_first()
+                    .expect("selected lamp tick remains queued");
+                let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    deferred_lamps.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    deferred_lamps.push((order, key));
+                    continue;
+                };
+                let lit = self.world.state(id).and_then(redstone_lamp_lit);
+                let power = if lit == Some(true) {
+                    self.lamp_power(relative)
+                } else {
+                    Some(false)
+                };
+                let Some(power) = power else {
+                    deferred_lamps.push((order, key));
+                    continue;
+                };
+                self.lamp_pending.remove(&key);
+                self.mark_tick_chunk_dirty(key.0, key.2);
+                executed += 1;
+                if lit == Some(true) && !power {
+                    let mut next = self.world.state(id).expect("lamp state exists").clone();
+                    next.properties.insert("lit".into(), "false".into());
+                    let next = self.intern_block(next);
+                    self.set_with_notify(relative, next, false);
+                }
             } else {
                 let (order, (absolute, soil)) = self
                     .soil_ticks
@@ -5159,6 +5348,10 @@ impl LoadedSession {
         if process_soil {
             self.soil_deferred.extend(deferred_soil);
             self.soil_deferred_revision = Some(revision);
+        }
+        if process_lamps {
+            self.lamp_deferred.extend(deferred_lamps);
+            self.lamp_deferred_revision = Some(revision);
         }
         if process_sand {
             self.sand_deferred.extend(deferred_sand);
@@ -5455,6 +5648,8 @@ impl LoadedSession {
         let new_name = self.world.state(new).map(|state| state.name.as_str());
         let changed_kind = old_name != new_name;
         let new_sand = new_name.and_then(FallingKind::from_id);
+        let old_support = self.world.state(old).and_then(button_support_direction);
+        let new_support = self.world.state(new).and_then(button_support_direction);
         if changed_kind
             && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
             && let Some(fluid) = self.ordinary_fluid(new)
@@ -5488,6 +5683,9 @@ impl LoadedSession {
             ) else {
                 continue;
             };
+            if self.world.state(id).and_then(redstone_lamp_lit).is_some() {
+                self.update_lamp(neighbor);
+            }
             let button_support = self.world.state(id).and_then(button_support_direction);
             let button_kind = self
                 .world
@@ -5518,6 +5716,27 @@ impl LoadedSession {
                 && !(fluid.kind == FluidKind::Lava && self.react_lava(neighbor))
             {
                 self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
+            }
+        }
+        // Button changes explicitly notify both the button and its support.
+        for (index, support) in [old_support, new_support].into_iter().enumerate() {
+            if index == 1 && support == old_support {
+                continue;
+            }
+            let Some(support) = support else { continue };
+            if let Some(support) = add(position, support) {
+                for direction in [
+                    IVec3::NEG_Y,
+                    IVec3::Y,
+                    IVec3::NEG_Z,
+                    IVec3::Z,
+                    IVec3::NEG_X,
+                    IVec3::X,
+                ] {
+                    if let Some(neighbor) = add(support, direction) {
+                        self.update_lamp(neighbor);
+                    }
+                }
             }
         }
         if let Some(below) = add(position, IVec3::NEG_Y)
@@ -7992,6 +8211,17 @@ fn redstone_ore_lit(state: &BlockState) -> Option<bool> {
     }
 }
 
+fn redstone_lamp_lit(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:redstone_lamp" || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("lit")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn cell(
     world: &World,
     origin: IVec3,
@@ -8257,6 +8487,361 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn button_drives_lamp_directly_and_through_its_support() {
+        for indirect in [false, true] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let lamp = IVec3::new(8, 5, 8);
+            let support = lamp + IVec3::X;
+            let button = lamp + IVec3::X * if indirect { 2 } else { 1 };
+            let button_support = button + IVec3::X;
+            let stone = session.states[3];
+            if indirect {
+                session.set(support, stone);
+            } else {
+                session.set(button_support, stone);
+            }
+            let lamp_id =
+                session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+            assert!(session.set(lamp, lamp_id));
+            let kind = native_core::button::Button::from_id("minecraft:stone_button").unwrap();
+            // For the indirect case the support lies west of the button.
+            let face = if indirect { IVec3::X } else { IVec3::NEG_X };
+            let button_id = session.intern_block(button_state(kind, face, 0.0).unwrap());
+            assert!(session.set(button, button_id));
+            assert!(session.use_button(button));
+            let lit = |session: &LoadedSession| {
+                let p = session.origin + lamp;
+                redstone_lamp_lit(session.world.block(p.x, p.y, p.z).unwrap()).unwrap()
+            };
+            assert!(lit(&session), "indirect={indirect}");
+            for _ in 0..21 {
+                session.update(TICK);
+            }
+            assert!(lit(&session));
+            let home = session.player_chunk().unwrap();
+            assert!(
+                session
+                    .draft_block_ticks(home)
+                    .unwrap()
+                    .iter()
+                    .any(|tick| tick.block == "minecraft:redstone_lamp")
+            );
+            for _ in 0..3 {
+                session.update(TICK);
+            }
+            assert!(lit(&session));
+            session.update(TICK);
+            assert!(!lit(&session), "indirect={indirect}");
+        }
+    }
+
+    #[test]
+    fn lamp_stays_on_when_repowered_or_signal_is_unknown() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let lamp = IVec3::new(8, 5, 8);
+        let power = lamp + IVec3::X;
+        let lamp_id = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+        session.set(lamp, lamp_id);
+        let source = session.intern_block(state("minecraft:redstone_block", &[]));
+        session.set(power, source);
+        let read = |session: &LoadedSession| {
+            let p = session.origin + lamp;
+            redstone_lamp_lit(session.world.block(p.x, p.y, p.z).unwrap()).unwrap()
+        };
+        assert!(read(&session));
+        session.set(power, session.states[0]);
+        session.update(TICK * 2);
+        session.set(power, source);
+        session.update(TICK * 5);
+        assert!(read(&session));
+        assert!(session.lamp_pending.is_empty());
+        let unknown = session.intern_block(state("minecraft:unimplemented_source", &[]));
+        session.set(lamp + IVec3::NEG_X, unknown);
+        session.set(power, session.states[0]);
+        session.update(TICK * 5);
+        assert!(read(&session));
+        session.set(lamp + IVec3::NEG_X, session.states[0]);
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert!(!read(&session));
+    }
+
+    #[test]
+    fn removing_button_support_starts_lamp_shutdown() {
+        let mut session = session();
+        let lamp = IVec3::new(8, 5, 8);
+        let button = lamp + IVec3::X;
+        let support = button + IVec3::X;
+        session.set(support, session.states[3]);
+        let lamp_id = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+        session.set(lamp, lamp_id);
+        let kind = native_core::button::Button::from_id("minecraft:stone_button").unwrap();
+        let button_id = session.intern_block(button_state(kind, IVec3::NEG_X, 0.0).unwrap());
+        session.set(button, button_id);
+        assert!(session.use_button(button));
+        assert!(session.set(support, session.states[0]));
+        let pos = session.origin + lamp;
+        assert_eq!(
+            redstone_lamp_lit(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+            Some(true)
+        );
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, button, session.states[0]), Cell::State(id) if id == session.states[0])
+        );
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert_eq!(
+            redstone_lamp_lit(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn saved_lamp_tick_is_preserved_across_chunk_unload() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let relative = IVec3::new(8, 5, 8);
+        let absolute = session.origin + relative;
+        let lit = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "true")]));
+        assert!(session.set(relative, lit));
+        let tick = SavedBlockTick {
+            block: "minecraft:redstone_lamp".into(),
+            position: absolute.to_array(),
+            delay: 2,
+            priority: 0,
+        };
+        session.enqueue_saved_lamps(std::slice::from_ref(&tick));
+        assert_eq!(session.draft_block_ticks(home).unwrap(), vec![tick]);
+        session.queue_chunk_window(remote, 0);
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert_eq!(session.lamp_deferred.len(), 1);
+        assert_eq!(session.draft_block_ticks(home).unwrap()[0].delay, -3);
+        session.queue_chunk_window(home, 0);
+        session.update(TICK);
+        assert_eq!(
+            redstone_lamp_lit(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+            ),
+            Some(false)
+        );
+        assert!(session.lamp_pending.is_empty());
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn lamp_neighbor_and_scheduled_tick_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("RedstoneLampOracle.java");
+        let result = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RedstoneLampOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RedstoneLampOracle")
+            .arg(&result));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            let tick = row[0].as_bool().unwrap();
+            let lit = row[1].as_bool().unwrap();
+            let power = row[2].as_bool().unwrap();
+            let mut session = session();
+            let relative = IVec3::new(8, 5, 8);
+            if power {
+                let source = session.intern_block(state("minecraft:redstone_block", &[]));
+                session.set(relative + IVec3::X, source);
+            }
+            let lamp = session.intern_block(state(
+                "minecraft:redstone_lamp",
+                &[("lit", if lit { "true" } else { "false" })],
+            ));
+            session.set(relative, lamp);
+            if tick {
+                let absolute = session.origin + relative;
+                session.enqueue_saved_lamps(&[SavedBlockTick {
+                    block: "minecraft:redstone_lamp".into(),
+                    position: absolute.to_array(),
+                    delay: 0,
+                    priority: 0,
+                }]);
+                session.advance_block_ticks();
+            } else {
+                session.update_lamp(relative);
+            }
+            let absolute = session.origin + relative;
+            let got = redstone_lamp_lit(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(got, row[3].as_bool().unwrap(), "{row}");
+            let delay = session
+                .lamp_ticks
+                .first_key_value()
+                .map_or(-1, |(order, _)| {
+                    i64::try_from(order.0 - i128::from(session.tick)).unwrap()
+                });
+            assert_eq!(delay, row[4].as_i64().unwrap(), "{row}");
+            assert!(matches!(row[5].as_i64().unwrap(), -1 | 2), "{row}");
+        }
+    }
+
+    #[test]
+    fn powered_lamp_updates_block_light_and_preserves_old_snapshot() {
+        let mut session = session();
+        let air = session.states[0];
+        let origin_chunk = BlockPosition {
+            x: session.origin.x,
+            y: 0,
+            z: session.origin.z,
+        }
+        .chunk();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let pos = ChunkPos {
+                    x: origin_chunk.x + x,
+                    z: origin_chunk.z + z,
+                };
+                let sections = (0..=1)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                                sky_light: None,
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        block_light_correct: true,
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        sections,
+                    }),
+                );
+            }
+        }
+        let relative = IVec3::new(15, 15, 15);
+        let absolute = session.origin + relative;
+        let lamp = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+        let source = session.intern_block(state("minecraft:redstone_block", &[]));
+        assert!(session.set(relative, lamp));
+        let old = session.world.clone();
+        assert!(session.set(relative + IVec3::X, source));
+        assert_eq!(
+            redstone_lamp_lit(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y + 1, absolute.z, false),
+            Some(14)
+        );
+        assert_eq!(
+            old.light(absolute.x, absolute.y + 1, absolute.z, false),
+            Some(0)
+        );
+        assert!(session.set(relative + IVec3::X, air));
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y + 1, absolute.z, false),
+            Some(0)
+        );
+        let button_pos = relative + IVec3::X;
+        session.set(button_pos + IVec3::X, session.states[3]);
+        let kind = native_core::button::Button::from_id("minecraft:stone_button").unwrap();
+        let button = session.intern_block(button_state(kind, IVec3::NEG_X, 0.0).unwrap());
+        assert!(session.set(button_pos, button));
+        assert!(session.use_button(button_pos));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y + 1, absolute.z, false),
+            Some(14)
+        );
+        for _ in 0..25 {
+            session.update(TICK);
+        }
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y + 1, absolute.z, false),
+            Some(0)
+        );
     }
 
     #[test]
@@ -17661,6 +18246,12 @@ mod tests {
                 priority: 1,
             },
             SavedBlockTick {
+                block: "minecraft:redstone_lamp".into(),
+                position,
+                delay: 4,
+                priority: 0,
+            },
+            SavedBlockTick {
                 block: "minecraft:gravel".into(),
                 position,
                 delay: 3,
@@ -17672,6 +18263,7 @@ mod tests {
             .insert(home, source_ticks.clone());
         session.enqueue_saved_sand(&source_ticks);
         session.enqueue_saved_buttons(&source_ticks);
+        session.enqueue_saved_lamps(&source_ticks);
         session.enqueue_saved_soil(&source_ticks);
 
         let drafted = session.draft_block_ticks(home).unwrap();

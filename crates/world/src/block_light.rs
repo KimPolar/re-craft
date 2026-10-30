@@ -196,6 +196,14 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             };
             (15, emission)
         }
+        "minecraft:redstone_lamp" if state.properties.len() == 1 => {
+            (15, if boolean("lit")? { 15 } else { 0 })
+        }
+        "minecraft:redstone_block" if state.properties.is_empty() => (15, 0),
+        name if native_core::button::Button::from_id(name).is_some() => {
+            crate::collision::block_outline(state)?;
+            (0, 0)
+        }
         "minecraft:torch" if state.properties.is_empty() => (0, 14),
         "minecraft:soul_torch" if state.properties.is_empty() => (0, 10),
         "minecraft:wall_torch" if state.properties.len() == 1 && facing() => (0, 14),
@@ -1831,6 +1839,23 @@ mod tests {
             "soul_wall_torch",
             "redstone_torch",
             "redstone_wall_torch",
+            "redstone_lamp",
+            "redstone_block",
+            "stone_button",
+            "polished_blackstone_button",
+            "oak_button",
+            "spruce_button",
+            "birch_button",
+            "jungle_button",
+            "acacia_button",
+            "dark_oak_button",
+            "pale_oak_button",
+            "mangrove_button",
+            "cherry_button",
+            "bamboo_button",
+            "crimson_button",
+            "warped_button",
+            "poplar_button",
             "lantern",
             "soul_lantern",
             "glowstone",
@@ -2269,7 +2294,7 @@ mod tests {
         ] {
             states.push(state(name, None));
         }
-        for name in ["redstone_ore", "deepslate_redstone_ore"] {
+        for name in ["redstone_ore", "deepslate_redstone_ore", "redstone_lamp"] {
             for lit in [false, true] {
                 states.push(state(name, Some(lit)));
             }

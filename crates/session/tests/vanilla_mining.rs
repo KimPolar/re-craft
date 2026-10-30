@@ -1668,6 +1668,270 @@ fn button_types_and_installed_loot_match_vanilla() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn button_neighbor_signal_matches_vanilla() {
+    use glam::IVec3;
+    use native_world::loaded::BlockState;
+    use std::collections::BTreeMap;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("RedstoneSignalOracle.java");
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("result.json");
+    std::fs::write(&source, include_str!("java/RedstoneSignalOracle.java")).unwrap();
+    let air = BlockState {
+        name: "minecraft:air".into(),
+        properties: BTreeMap::new(),
+    };
+    let stone = BlockState {
+        name: "minecraft:stone".into(),
+        properties: BTreeMap::new(),
+    };
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    let dirs = [
+        IVec3::NEG_Y,
+        IVec3::Y,
+        IVec3::NEG_Z,
+        IVec3::Z,
+        IVec3::NEG_X,
+        IVec3::X,
+    ];
+    let value = |position: IVec3, state: &BlockState| serde_json::json!({"pos": position.to_array(), "id": state.name, "properties": state.properties});
+    for button in native_core::button::Button::ALL {
+        for face in ["floor", "wall", "ceiling"] {
+            for facing in ["north", "south", "west", "east"] {
+                for powered in ["true", "false"] {
+                    let state = BlockState {
+                        name: button.id().into(),
+                        properties: [
+                            ("face".into(), face.into()),
+                            ("facing".into(), facing.into()),
+                            ("powered".into(), powered.into()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    };
+                    for direction in dirs {
+                        let mut blocks = BTreeMap::new();
+                        blocks.insert(direction.to_array(), state.clone());
+                        expected.push(
+                            native_session::redstone::neighbor_signal(IVec3::ZERO, |p| {
+                                Some(blocks.get(&p.to_array()).unwrap_or(&air))
+                            })
+                            .unwrap(),
+                        );
+                        cases.push(serde_json::json!([value(direction, &state)]));
+                        for incoming in dirs {
+                            let source_pos = direction + incoming;
+                            if source_pos == IVec3::ZERO {
+                                continue;
+                            }
+                            let mut blocks = BTreeMap::new();
+                            blocks.insert(direction.to_array(), stone.clone());
+                            blocks.insert(source_pos.to_array(), state.clone());
+                            expected.push(
+                                native_session::redstone::neighbor_signal(IVec3::ZERO, |p| {
+                                    Some(blocks.get(&p.to_array()).unwrap_or(&air))
+                                })
+                                .unwrap(),
+                            );
+                            cases.push(serde_json::json!([
+                                value(direction, &stone),
+                                value(source_pos, &state)
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let redstone = BlockState {
+        name: "minecraft:redstone_block".into(),
+        properties: BTreeMap::new(),
+    };
+    let glass = BlockState {
+        name: "minecraft:glass".into(),
+        properties: BTreeMap::new(),
+    };
+    let lamp = BlockState {
+        name: "minecraft:redstone_lamp".into(),
+        properties: [("lit".into(), "false".into())].into_iter().collect(),
+    };
+    let button = BlockState {
+        name: "minecraft:stone_button".into(),
+        properties: [
+            ("face".into(), "wall".into()),
+            ("facing".into(), "east".into()),
+            ("powered".into(), "true".into()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    for blocks_list in [
+        vec![(IVec3::X, redstone.clone())],
+        vec![(IVec3::X, stone.clone()), (IVec3::X * 2, redstone)],
+        vec![(IVec3::X, glass), (IVec3::X * 2, button.clone())],
+        vec![(IVec3::X, lamp), (IVec3::X * 2, button)],
+    ] {
+        let blocks: BTreeMap<_, _> = blocks_list
+            .iter()
+            .map(|(p, state)| (p.to_array(), state.clone()))
+            .collect();
+        expected.push(
+            native_session::redstone::neighbor_signal(IVec3::ZERO, |p| {
+                Some(blocks.get(&p.to_array()).unwrap_or(&air))
+            })
+            .unwrap(),
+        );
+        cases.push(Value::Array(
+            blocks_list
+                .iter()
+                .map(|(p, state)| value(*p, state))
+                .collect(),
+        ));
+    }
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("RedstoneSignalOracle")
+        .arg(&input)
+        .arg(&output));
+    let actual: Vec<bool> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(actual.len(), expected.len());
+    for (i, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+        assert_eq!(actual, expected, "case {}: {}", i, cases[i]);
+    }
+    eprintln!(
+        "Compared {} direct and conducted button signal cases with Java 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn supported_redstone_conductors_match_java_states() {
+    use glam::IVec3;
+    use native_world::loaded::BlockState;
+    use std::collections::BTreeMap;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("RedstoneConductorOracle.java");
+    let output = temp.path().join("output.json");
+    std::fs::write(&source, include_str!("java/RedstoneConductorOracle.java")).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let ids = [
+        "air",
+        "cave_air",
+        "void_air",
+        "glass",
+        "ice",
+        "honey_block",
+        "glowstone",
+        "dirt_path",
+        "farmland",
+        "redstone_block",
+        "grass_block",
+        "podzol",
+        "mycelium",
+        "basalt",
+        "hay_block",
+        "stone",
+        "cobblestone",
+        "stone_bricks",
+        "dirt",
+        "coarse_dirt",
+        "rooted_dirt",
+        "sand",
+        "red_sand",
+        "gravel",
+        "granite",
+        "diorite",
+        "andesite",
+        "tuff",
+        "netherrack",
+        "end_stone",
+        "obsidian",
+        "soul_soil",
+        "snow_block",
+        "slime_block",
+        "packed_ice",
+        "blue_ice",
+        "clay",
+        "redstone_lamp",
+    ];
+    let mut command = Command::new(java.join("java.exe"));
+    command
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("RedstoneConductorOracle")
+        .arg(&output)
+        .args(ids.into_iter().map(|id| format!("minecraft:{id}")))
+        .args(native_core::wood::Wood::all().map(|wood| wood.id()))
+        .args(
+            native_core::wood::Planks::ALL
+                .into_iter()
+                .map(|planks| planks.id()),
+        );
+    run(&mut command);
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let directions = [
+        IVec3::NEG_Y,
+        IVec3::Y,
+        IVec3::NEG_Z,
+        IVec3::Z,
+        IVec3::NEG_X,
+        IVec3::X,
+    ];
+    for row in &rows {
+        let state = BlockState {
+            name: row["id"].as_str().unwrap().into(),
+            properties: row["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        };
+        for (i, direction) in directions.into_iter().enumerate() {
+            let actual = native_session::redstone::source(&state, direction)
+                .unwrap_or_else(|| panic!("unsupported {state:?}"));
+            assert_eq!(
+                actual,
+                (
+                    row["weak"][i].as_u64().unwrap() as u8,
+                    row["direct"][i].as_u64().unwrap() as u8,
+                    row["conductor"].as_bool().unwrap()
+                ),
+                "{state:?} {direction:?}"
+            );
+        }
+    }
+    eprintln!(
+        "Compared {} supported source states in six directions with Java 26.3",
+        rows.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn ore_mining_and_harvest_tiers_match_vanilla() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

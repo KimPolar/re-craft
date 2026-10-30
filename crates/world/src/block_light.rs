@@ -218,7 +218,8 @@ pub fn relight_redstone(
                     continue;
                 }
                 let p = offset(center, (dx, dy, dz))?;
-                if world.chunks.get(&p.chunk())?.status.as_deref() != Some("minecraft:full") {
+                let chunk = world.chunks.get(&p.chunk())?;
+                if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                     return None;
                 }
                 let (opacity, emission) = properties(world.block(p.x, p.y, p.z)?)?;
@@ -236,7 +237,8 @@ pub fn relight_redstone(
             {
                 continue;
             }
-            if world.chunks.get(&next.chunk())?.status.as_deref() != Some("minecraft:full") {
+            let chunk = world.chunks.get(&next.chunk())?;
+            if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
             properties(world.block(next.x, next.y, next.z)?)?;
@@ -273,7 +275,9 @@ pub fn relight_redstone(
         let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
         let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
         let section = Arc::make_mut(chunk.sections.get_mut(&section_y)?);
-        let data = section.block_light.as_mut()?;
+        let data = section
+            .block_light
+            .get_or_insert_with(|| Box::new([0; crate::loaded::LIGHT_BYTES]));
         let index = p.x.rem_euclid(16) as usize
             + p.z.rem_euclid(16) as usize * 16
             + p.y.rem_euclid(16) as usize * 256;
@@ -319,6 +323,7 @@ mod tests {
             for z in 0..=1 {
                 let chunk_pos = ChunkPos { x, z };
                 let mut chunk = Chunk {
+                    block_light_correct: true,
                     position: chunk_pos,
                     status: Some("minecraft:full".into()),
                     sections: BTreeMap::new(),
@@ -392,6 +397,40 @@ mod tests {
             assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
         }
         assert_eq!(light(&world, center), 0);
+    }
+
+    #[test]
+    fn absent_saved_light_is_zero_only_for_correct_chunks() {
+        let (mut world, _, lit, _) = fixture();
+        for chunk in world.chunks.values_mut() {
+            for section in Arc::make_mut(chunk).sections.values_mut() {
+                Arc::make_mut(section).block_light = None;
+            }
+        }
+        let center = position(15, 15, 15);
+        set(&mut world, center, lit);
+        let before = world.clone();
+        assert_eq!(light(&world, center), 0);
+        assert!(relight_redstone(&mut world, center, false).unwrap().len() > 1);
+        assert_eq!(light(&world, position(16, 15, 15)), 8);
+        assert_eq!(light(&before, position(16, 15, 15)), 0);
+        assert!(
+            before
+                .chunks
+                .values()
+                .flat_map(|chunk| chunk.sections.values())
+                .all(|section| section.block_light.is_none())
+        );
+
+        let (mut incomplete, _, lit, _) = fixture();
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        Arc::make_mut(incomplete.chunks.get_mut(&neighbor).unwrap()).block_light_correct = false;
+        set(&mut incomplete, center, lit);
+        let before = incomplete.clone();
+        assert!(relight_redstone(&mut incomplete, center, false).is_none());
+        for (key, chunk) in &incomplete.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
+        }
     }
 
     #[test]
@@ -629,6 +668,11 @@ mod tests {
         let expected: Vec<Vec<u8>> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         let (mut world, unlit, lit, stone) = fixture();
+        for chunk in world.chunks.values_mut() {
+            for section in Arc::make_mut(chunk).sections.values_mut() {
+                Arc::make_mut(section).block_light = None;
+            }
+        }
         let air = world.intern_state(state("air", None));
         let torch = world.intern_state(state("torch", None));
         let water = world.intern_state(BlockState {

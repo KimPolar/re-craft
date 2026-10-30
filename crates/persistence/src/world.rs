@@ -280,6 +280,16 @@ impl LoadedChunk {
             .is_some_and(|status| status.matches("minecraft:full"))
     }
 
+    /// Java writes isLightOn when the saved chunk's light is complete. Treat
+    /// malformed or duplicate markers as unknown rather than assuming darkness.
+    pub fn block_light_correct(&self) -> bool {
+        let Tag::Compound(fields) = &self.document.value else {
+            return false;
+        };
+        let mut markers = fields.iter().filter(|(name, _)| name.matches("isLightOn"));
+        matches!(markers.next(), Some((_, Tag::Byte(1)))) && markers.next().is_none()
+    }
+
     /// Returns None for absent block-state data; that is distinct from minecraft:air.
     pub fn block(&self, x: i32, y: i32, z: i32) -> Option<&BlockState> {
         if x.div_euclid(16) != self.position.x || z.div_euclid(16) != self.position.z {
@@ -471,6 +481,7 @@ impl ChunkArea {
             world.chunks.insert(
                 position,
                 Arc::new(loaded::Chunk {
+                    block_light_correct: chunk.block_light_correct(),
                     position,
                     status,
                     sections,
@@ -2429,6 +2440,69 @@ mod tests {
                 .contains(&native_world::loaded::ChunkPos { x: 0, z: -1 })
         );
         assert!(decode_chunk(root, ChunkPos { x: 0, z: 0 }).is_err());
+    }
+
+    #[test]
+    fn omitted_block_light_requires_an_unambiguous_light_on_marker() {
+        let section = Tag::Compound(vec![
+            ("Y".into(), Tag::Byte(0)),
+            (
+                "block_states".into(),
+                Tag::Compound(vec![(
+                    "palette".into(),
+                    Tag::List {
+                        element_type: TagType::String,
+                        values: vec![Tag::String("minecraft:stone".into())],
+                    },
+                )]),
+            ),
+        ]);
+        for (markers, expected) in [
+            (vec![], false),
+            (vec![Tag::Byte(0)], false),
+            (vec![Tag::Byte(1)], true),
+            (vec![Tag::Int(1)], false),
+            (vec![Tag::Byte(1), Tag::Byte(1)], false),
+        ] {
+            let mut fields = vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("xPos".into(), Tag::Int(0)),
+                ("zPos".into(), Tag::Int(0)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+                (
+                    "sections".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![section.clone()],
+                    },
+                ),
+            ];
+            fields.extend(markers.into_iter().map(|tag| ("isLightOn".into(), tag)));
+            let loaded = decode_chunk(
+                NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(fields),
+                },
+                ChunkPos { x: 0, z: 0 },
+            )
+            .unwrap();
+            assert_eq!(loaded.block_light_correct(), expected);
+            let area = ChunkArea {
+                center: loaded.position,
+                radius: 0,
+                chunks: BTreeMap::from([(loaded.position, Arc::new(loaded))]),
+                missing: vec![],
+            };
+            let world = area
+                .materialize(&DimensionId::parse("overworld").unwrap())
+                .unwrap();
+            assert_eq!(world.light(0, 0, 0, false), expected.then_some(0));
+            assert_eq!(
+                world.light(0, 16, 0, false),
+                None,
+                "missing sections remain unknown"
+            );
+        }
     }
 
     #[test]

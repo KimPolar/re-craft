@@ -154,6 +154,7 @@ fn saved_spawn_selection_matches_java() {
         world.chunks.insert(
             chunk,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: chunk,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(3, section(lower)), (4, section(upper))]),
@@ -868,6 +869,7 @@ fn loaded_chunk_bed_and_anchor_search_matches_java_shapes() {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(3, section(bottom)), (4, section(top))]),
@@ -1132,6 +1134,7 @@ fn shared_spawn_height_and_candidate_parameters_match_java() {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections,
@@ -1466,6 +1469,7 @@ fn loaded_world_spawn_block_and_liquid_collision_matches_java() {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -1621,6 +1625,7 @@ fn saved_spawn_entities_match_java_noncolliding_types_and_defer_dynamic_types() 
     world.chunks.insert(
         home,
         Arc::new(Chunk {
+            block_light_correct: false,
             position: home,
             status: Some("minecraft:full".into()),
             sections: BTreeMap::from([(

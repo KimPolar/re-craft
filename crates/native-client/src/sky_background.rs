@@ -860,6 +860,7 @@ mod tests {
                 world.chunks.insert(
                     position,
                     Arc::new(Chunk {
+                        block_light_correct: false,
                         position,
                         status: None,
                         sections: BTreeMap::from([(

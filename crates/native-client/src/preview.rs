@@ -684,7 +684,7 @@ fn same_neighborhood(a: &[Option<Arc<Chunk>>; 9], b: &[Option<Arc<Chunk>>; 9]) -
 }
 
 fn same_neighbor_boundary(a: &Chunk, b: &Chunk, dx: i32, dz: i32) -> bool {
-    if a.sections.len() != b.sections.len() {
+    if a.block_light_correct != b.block_light_correct || a.sections.len() != b.sections.len() {
         return false;
     }
     for (y, a) in &a.sections {
@@ -1298,6 +1298,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -1391,6 +1392,7 @@ mod tests {
             world.chunks.insert(
                 position,
                 Arc::new(Chunk {
+                    block_light_correct: false,
                     position,
                     status: Some("minecraft:full".into()),
                     sections: BTreeMap::from([(
@@ -1444,6 +1446,7 @@ mod tests {
         replaced.chunks.insert(
             home,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: home,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -1533,6 +1536,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -1581,6 +1585,7 @@ mod tests {
                 world.chunks.insert(
                     position,
                     Arc::new(Chunk {
+                        block_light_correct: false,
                         position,
                         status: Some("minecraft:full".into()),
                         sections: BTreeMap::new(),
@@ -1670,6 +1675,7 @@ mod tests {
                 world.chunks.insert(
                     pos,
                     Arc::new(Chunk {
+                        block_light_correct: false,
                         position: pos,
                         status: Some("minecraft:full".into()),
                         sections: BTreeMap::from([(
@@ -1806,6 +1812,7 @@ mod tests {
                 world.chunks.insert(
                     pos,
                     Arc::new(Chunk {
+                        block_light_correct: false,
                         position: pos,
                         status: Some("minecraft:full".into()),
                         sections: BTreeMap::from([(
@@ -1934,6 +1941,7 @@ mod tests {
                 world.chunks.insert(
                     pos,
                     Arc::new(Chunk {
+                        block_light_correct: false,
                         position: pos,
                         status: Some("minecraft:full".into()),
                         sections: BTreeMap::from([(
@@ -1995,6 +2003,7 @@ mod tests {
             world.chunks.insert(
                 pos,
                 Arc::new(Chunk {
+                    block_light_correct: false,
                     position: pos,
                     status: Some("minecraft:full".into()),
                     sections: BTreeMap::from([(
@@ -2032,6 +2041,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -2081,6 +2091,7 @@ mod tests {
         world.chunks.insert(
             chunk_pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: chunk_pos,
                 status: None,
                 sections: BTreeMap::from([(
@@ -2147,6 +2158,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: None,
                 sections: BTreeMap::from([(
@@ -2195,6 +2207,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -2260,6 +2273,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -2321,6 +2335,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: None,
                 sections: BTreeMap::from([(
@@ -2409,6 +2424,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: None,
                 sections: BTreeMap::from([(

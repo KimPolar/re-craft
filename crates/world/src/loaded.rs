@@ -164,6 +164,9 @@ pub struct Section {
 pub struct Chunk {
     pub position: ChunkPos,
     pub status: Option<String>,
+    /// True only when the source explicitly marks its saved lighting complete.
+    /// A missing block-light array then represents a zero-filled layer.
+    pub block_light_correct: bool,
     pub sections: BTreeMap<i8, Arc<Section>>,
 }
 
@@ -373,6 +376,7 @@ impl World {
         self.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: chunk.block_light_correct,
                 position: pos,
                 status: chunk.status.clone(),
                 sections,
@@ -471,7 +475,13 @@ impl World {
         let data = if sky {
             section.sky_light.as_ref()?
         } else {
-            section.block_light.as_ref()?
+            match section.block_light.as_ref() {
+                Some(data) => data,
+                None => {
+                    let chunk = self.chunks.get(&BlockPosition { x, y, z }.chunk())?;
+                    return chunk.block_light_correct.then_some(0);
+                }
+            }
         };
         let index = local.0 + local.2 * 16 + local.1 * 256;
         let byte = *data.get(index / 2)?;
@@ -554,6 +564,7 @@ mod tests {
         source.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: true,
                 position: pos,
                 status: Some("minecraft:full".into()),
                 sections: BTreeMap::from([(
@@ -575,6 +586,7 @@ mod tests {
         dest.intern_biome("minecraft:plains".into());
         dest.missing_chunks.insert(pos);
         assert!(dest.import_chunk(&source, pos).unwrap());
+        assert!(dest.chunks[&pos].block_light_correct);
         assert_eq!(
             dest.saved_block_ticks.get(&pos),
             source.saved_block_ticks.get(&pos)
@@ -677,6 +689,7 @@ mod tests {
         world.chunks.insert(
             pos,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: pos,
                 status: None,
                 sections: BTreeMap::from([(-1, section()), (0, section())]),
@@ -686,6 +699,7 @@ mod tests {
         world.chunks.insert(
             neighbor,
             Arc::new(Chunk {
+                block_light_correct: false,
                 position: neighbor,
                 status: None,
                 sections: BTreeMap::from([(0, section())]),

@@ -118,6 +118,26 @@ pub struct PlayerWorldDraft {
     chunks: BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>,
 }
 
+/// A partial clock update bound to the decoded document loaded at session start.
+pub struct WorldClockDraft {
+    source_nbt: Vec<u8>,
+    clocks: BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
+}
+
+impl WorldClockDraft {
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut native_persistence::save::WorldSavePlan,
+        source: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            native_persistence::nbt::write(source)? == self.source_nbt,
+            "world clock source differs from the session source"
+        );
+        plan.add_world_clocks(source, &self.clocks)
+    }
+}
+
 impl PlayerWorldDraft {
     pub fn player(&self) -> &native_persistence::nbt::NamedTag {
         self.player.document()
@@ -325,6 +345,7 @@ pub struct LoadedSession {
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
+    saved_clock_source: Option<Vec<u8>>,
     advance_time: bool,
     fast_lava: bool,
     fast_lava_environment: Option<Arc<native_resources::fluid_environment::FastLavaEnvironment>>,
@@ -2186,6 +2207,7 @@ impl LoadedSession {
             falling_fire_tag: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
+            saved_clock_source: None,
             advance_time: true,
             fast_lava,
             fast_lava_environment: None,
@@ -4206,8 +4228,70 @@ impl LoadedSession {
         >,
         advance_time: bool,
     ) {
+        self.saved_clock_source = None;
         self.world_clocks = clocks;
         self.advance_time = advance_time;
+    }
+
+    /// Capture the exact decoded clock source and install its states. Extra
+    /// active data-pack clock identifiers must start from their default state.
+    pub fn restore_saved_world_clocks(
+        &mut self,
+        source: &native_persistence::nbt::NamedTag,
+        clocks: BTreeMap<
+            native_persistence::world::DimensionId,
+            native_persistence::world::SavedClock,
+        >,
+        advance_time: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0
+                && self.accumulated == Duration::ZERO
+                && self.saved_clock_source.is_none(),
+            "world clocks must be restored once before the first tick"
+        );
+        let saved = native_persistence::world::parse_world_clocks(source)?;
+        anyhow::ensure!(
+            saved
+                .iter()
+                .all(|(id, clock)| clocks.get(id) == Some(clock))
+                && clocks
+                    .iter()
+                    .all(|(id, clock)| saved.contains_key(id) || *clock == Default::default()),
+            "world clocks differ from the saved source"
+        );
+        let encoded = native_persistence::nbt::write(source)?;
+        self.set_world_clocks(clocks, advance_time);
+        self.saved_clock_source = Some(encoded);
+        Ok(())
+    }
+
+    /// Prepare clocks for a partial transaction; raw file bytes and other
+    /// world effects still require checking by the eventual world save.
+    pub fn draft_world_clocks(
+        &self,
+        source: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<WorldClockDraft> {
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
+        );
+        let original = self.saved_clock_source.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("world clock source was not captured at session start")
+        })?;
+        anyhow::ensure!(
+            native_persistence::nbt::write(source)? == *original,
+            "world clock source differs from the session source"
+        );
+        // Validate that this state can be serialized while retaining unknown fields.
+        native_persistence::world::WorldReader::update_world_clock_document(
+            source,
+            &self.world_clocks,
+        )?;
+        Ok(WorldClockDraft {
+            source_nbt: original.clone(),
+            clocks: self.world_clocks.clone(),
+        })
     }
 
     pub fn world_clock(
@@ -13063,6 +13147,90 @@ mod tests {
                 .count(),
             5
         );
+    }
+
+    #[test]
+    fn clock_draft_is_bound_to_the_initial_source() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            save::WorldSavePlan,
+            world::{DimensionId, SavedClock},
+        };
+        let id = DimensionId::parse("minecraft:overworld").unwrap();
+        let extra = DimensionId::parse("example:custom").unwrap();
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("future".into(), Tag::Int(42)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:overworld".into(),
+                        Tag::Compound(vec![
+                            ("total_ticks".into(), Tag::Long(10)),
+                            ("unknown".into(), Tag::Int(7)),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let mut session = session();
+        assert!(session.draft_world_clocks(&original).is_err());
+        let clock = SavedClock {
+            total_ticks: 10,
+            ..Default::default()
+        };
+        assert!(
+            session
+                .restore_saved_world_clocks(&original, BTreeMap::new(), true)
+                .is_err()
+        );
+        assert!(
+            session
+                .restore_saved_world_clocks(
+                    &original,
+                    BTreeMap::from([
+                        (id.clone(), clock),
+                        (
+                            extra.clone(),
+                            SavedClock {
+                                total_ticks: 3,
+                                ..Default::default()
+                            }
+                        )
+                    ]),
+                    true
+                )
+                .is_err()
+        );
+        session
+            .restore_saved_world_clocks(
+                &original,
+                BTreeMap::from([(id.clone(), clock), (extra.clone(), SavedClock::default())]),
+                true,
+            )
+            .unwrap();
+        assert!(
+            session
+                .restore_saved_world_clocks(&original, BTreeMap::new(), true)
+                .is_err()
+        );
+        session.update(TICK);
+        let draft = session.draft_world_clocks(&original).unwrap();
+        assert_eq!(draft.clocks[&id].total_ticks, 11);
+        assert_eq!(draft.clocks[&extra].total_ticks, 1);
+        let mut stale = original.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            panic!()
+        };
+        fields.push(("changed".into(), Tag::Int(1)));
+        assert!(session.draft_world_clocks(&stale).is_err());
+        let mut plan = WorldSavePlan::new();
+        assert!(draft.add_to_save_plan(&mut plan, &stale).is_err());
+        draft.add_to_save_plan(&mut plan, &original).unwrap();
+        session.set_world_clocks(BTreeMap::new(), true);
+        assert!(session.draft_world_clocks(&original).is_err());
     }
 
     #[test]

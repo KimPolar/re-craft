@@ -848,7 +848,12 @@ fn prepare_existing_world(
         session
             .set_has_skylight(profile.has_skylight)
             .map_err(anyhow::Error::msg)?;
-        let clocks = reader.world_clocks().and_then(|mut clocks| {
+        let clocks = reader.world_clocks_document().and_then(|source| {
+            let mut clocks = source
+                .as_ref()
+                .map(native_persistence::world::parse_world_clocks)
+                .transpose()?
+                .unwrap_or_default();
             for id in resources.list_data("world_clock")? {
                 let id = native_persistence::world::DimensionId::parse(&format!(
                     "{}:{}",
@@ -856,10 +861,17 @@ fn prepare_existing_world(
                 ))?;
                 clocks.entry(id).or_default();
             }
-            Ok(clocks)
+            Ok((clocks, source))
         });
         match clocks {
-            Ok(clocks) => session.set_world_clocks(clocks, rules.advance_time),
+            Ok((clocks, Some(source))) => {
+                if let Err(error) =
+                    session.restore_saved_world_clocks(&source, clocks, rules.advance_time)
+                {
+                    eprintln!("World clocks are unavailable: {error:#}");
+                }
+            }
+            Ok((clocks, None)) => session.set_world_clocks(clocks, rules.advance_time),
             Err(error) => eprintln!("World clocks are unavailable: {error:#}"),
         }
         if let Some(environment) = fast_lava

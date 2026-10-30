@@ -421,16 +421,19 @@ public class LightRegionOracle {
     session
         .restore_saved_player_inventory(&player_source)
         .unwrap();
-    session.set_world_clocks(
-        BTreeMap::from([(
-            dimension.clone(),
-            native_persistence::world::SavedClock {
-                total_ticks: 10,
-                ..Default::default()
-            },
-        )]),
-        true,
-    );
+    session
+        .restore_saved_world_clocks(
+            &clock_source,
+            BTreeMap::from([(
+                dimension.clone(),
+                native_persistence::world::SavedClock {
+                    total_ticks: 10,
+                    ..Default::default()
+                },
+            )]),
+            true,
+        )
+        .unwrap();
     session.set_random_tick_speed(0);
     session.submit_command(PlayerCommand::Place);
     session.update(Duration::from_millis(50));
@@ -505,7 +508,10 @@ public class LightRegionOracle {
         player
             .add_to_save_plan(&mut plan, [0, 0, 0, 1], &player_source)
             .unwrap();
-        plan.add_world_clocks(&clock_source, &session.world_clocks())
+        session
+            .draft_world_clocks(&clock_source)
+            .unwrap()
+            .add_to_save_plan(&mut plan, &clock_source)
             .unwrap();
         plan
     };

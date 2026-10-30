@@ -747,7 +747,8 @@ fn clock_float(tag: &Tag) -> Option<f32> {
     }
 }
 
-fn parse_world_clocks(root: &NamedTag) -> Result<BTreeMap<DimensionId, SavedClock>> {
+/// Decode a captured world-clock document without reopening the world file.
+pub fn parse_world_clocks(root: &NamedTag) -> Result<BTreeMap<DimensionId, SavedClock>> {
     match root.value.get("DataVersion") {
         Some(Tag::Int(TARGET_DATA_VERSION)) => {}
         Some(Tag::Int(version)) => {
@@ -1179,6 +1180,33 @@ impl WorldReader {
         clocks: &BTreeMap<DimensionId, SavedClock>,
     ) -> Result<NamedTag> {
         parse_world_clocks(source)?;
+        let Tag::Compound(source_fields) = &source.value else {
+            unreachable!()
+        };
+        for key in ["DataVersion", "data"] {
+            ensure!(
+                source_fields
+                    .iter()
+                    .filter(|(name, _)| name.matches(key))
+                    .count()
+                    <= 1,
+                "duplicate world clocks {key}"
+            );
+        }
+        let Some(Tag::Compound(source_entries)) = source.value.get("data") else {
+            unreachable!()
+        };
+        for (_, entry) in source_entries {
+            let Tag::Compound(fields) = entry else {
+                unreachable!()
+            };
+            for key in ["total_ticks", "partial_tick", "rate", "paused"] {
+                ensure!(
+                    fields.iter().filter(|(name, _)| name.matches(key)).count() <= 1,
+                    "duplicate world clock {key}"
+                );
+            }
+        }
         let mut document = source.clone();
         let Tag::Compound(root) = &mut document.value else {
             bail!("world clocks document must be a compound");
@@ -1709,6 +1737,29 @@ mod tests {
             }
         );
         assert_eq!(saved_clocks[&overworld].total_ticks, 99);
+        let mut duplicate_root = source.clone();
+        let Tag::Compound(fields) = &mut duplicate_root.value else {
+            panic!()
+        };
+        fields.push(("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)));
+        assert!(WorldReader::update_world_clock_document(&duplicate_root, &saved_clocks).is_err());
+        let mut duplicate_clock = source.clone();
+        let Tag::Compound(root) = &mut duplicate_clock.value else {
+            panic!()
+        };
+        let Tag::Compound(entries) = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("data"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut entries[0].1 else {
+            panic!()
+        };
+        fields.push(("rate".into(), Tag::Float(2.5)));
+        assert!(WorldReader::update_world_clock_document(&duplicate_clock, &saved_clocks).is_err());
         write_gzip(&path, &file(TARGET_DATA_VERSION, 0.0));
         assert!(reader.world_clocks().is_err());
         write_gzip(&path, &file(1, 1.0));

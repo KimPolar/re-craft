@@ -352,6 +352,7 @@ pub struct LoadedSession {
     locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
+    removed_falling_sand: Vec<FallingSand>,
     uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
@@ -2250,6 +2251,7 @@ impl LoadedSession {
             locked_chest_sounds: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
+            removed_falling_sand: Vec::new(),
             uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
             bounce_suppression_tag: None,
@@ -3128,22 +3130,30 @@ impl LoadedSession {
             if crate::saved_item::optional_uuid(source, "UUID")? != Some(uuid) {
                 continue;
             }
-            let original = native_persistence::nbt::NamedTag {
-                name: "".into(),
-                value: (**source).clone(),
-            };
-            let state = crate::saved_falling_block::FallingSaveState {
-                position: entity.motion.position,
-                velocity: entity.motion.velocity,
-                on_ground: entity.on_ground,
-                no_gravity: entity.motion.no_gravity,
-                time: entity.motion.age,
-                drop_item: entity.drop_item,
-                cancel_drop: entity.cancel_drop,
-            };
-            return Ok(Some(crate::saved_falling_block::draft(&original, state)?));
+            return Ok(Some(draft_falling_sand(entity)?));
         }
         Ok(None)
+    }
+
+    fn draft_removed_falling_entity(
+        &self,
+        uuid: [i32; 4],
+    ) -> anyhow::Result<Option<crate::saved_falling_block::FallingBlockDraft>> {
+        let mut result = None;
+        for entity in &self.removed_falling_sand {
+            if entity
+                .source
+                .as_ref()
+                .map(|source| crate::saved_item::optional_uuid(source, "UUID"))
+                .transpose()?
+                .flatten()
+                == Some(uuid)
+            {
+                anyhow::ensure!(result.is_none(), "duplicate removed falling entity UUID");
+                result = Some(draft_falling_sand(entity)?);
+            }
+        }
+        Ok(result)
     }
 
     /// Draft a still-live restored orb without writing world files.
@@ -3323,7 +3333,7 @@ impl LoadedSession {
             "falling-block lifecycle effects need coordinated saving"
         );
         positions.extend(self.saved_falling_uuids.values().copied());
-        for entity in &self.falling_sand {
+        for entity in self.falling_sand.iter().chain(&self.removed_falling_sand) {
             let position = entity.motion.position;
             anyhow::ensure!(
                 position.is_finite()
@@ -3355,8 +3365,13 @@ impl LoadedSession {
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
         );
+        ensure!(
+            !self.uncoordinated_falling_lifecycle,
+            "falling-block lifecycle effects need coordinated saving"
+        );
         let mut originals = std::collections::BTreeMap::new();
         let mut falling = Vec::new();
+        let mut removed_falling = Vec::new();
         let mut items = Vec::new();
         let mut removed_items = Vec::new();
         let mut orbs = Vec::new();
@@ -3376,10 +3391,14 @@ impl LoadedSession {
             for entity in chunk.entities() {
                 if let Some(saved) = crate::saved_falling_block::read(entity)? {
                     let uuid = saved.uuid.context("falling entity has no stable UUID")?;
-                    falling.push(
-                        self.draft_saved_falling_entity(uuid)?
-                            .context("falling entity was removed or could not be simulated")?,
-                    );
+                    if let Some(entity) = self.draft_saved_falling_entity(uuid)? {
+                        falling.push(entity);
+                    } else {
+                        removed_falling.push(
+                            self.draft_removed_falling_entity(uuid)?
+                                .context("falling entity was removed or could not be simulated")?,
+                        );
+                    }
                 } else if let Some(saved) = crate::saved_item::read(entity)? {
                     let uuid = saved.uuid.context("item has no stable UUID")?;
                     if let Some(item) = self.draft_saved_item_entity(uuid)? {
@@ -3406,7 +3425,7 @@ impl LoadedSession {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
-        for entity in &self.falling_sand {
+        for entity in self.falling_sand.iter().chain(&self.removed_falling_sand) {
             let position = entity.motion.position;
             ensure!(
                 position.is_finite()
@@ -3495,9 +3514,10 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_created_orbs(
+        crate::saved_falling_block::draft_entity_chunks_with_falling_removals(
             &originals,
             &replacements,
+            &removed_falling,
             &removed_items,
             &removed_orbs,
             &created_items,
@@ -6979,6 +6999,7 @@ impl LoadedSession {
 
     fn advance_falling_sand(&mut self) {
         let before = self.falling_sand.len();
+        let removed_before = self.removed_falling_sand.len();
         let mut remaining = Vec::new();
         for mut entity in std::mem::take(&mut self.falling_sand) {
             entity.previous = entity.motion.position;
@@ -7052,6 +7073,7 @@ impl LoadedSession {
             entity.on_ground = collision.on_ground;
             if collision.on_ground {
                 if entity.cancel_drop {
+                    self.track_removed_falling_sand(entity);
                     continue;
                 }
                 let target = entity.motion.position.floor().as_ivec3();
@@ -7092,6 +7114,7 @@ impl LoadedSession {
                     match self.falling_support_is_free(below) {
                         Some(true) => {
                             self.drop_falling_sand(&entity);
+                            self.track_removed_falling_sand(entity);
                             continue;
                         }
                         None => {
@@ -7103,6 +7126,7 @@ impl LoadedSession {
                     let name = entity.kind.id();
                     let id = self.intern_block(state(name, &[]));
                     if self.set(target_relative, id) {
+                        self.track_removed_falling_sand(entity);
                         continue;
                     }
                 } else if self
@@ -7112,6 +7136,7 @@ impl LoadedSession {
                     .is_some_and(crate::falling_block::known_collision_support)
                 {
                     self.drop_falling_sand(&entity);
+                    self.track_removed_falling_sand(entity);
                     continue;
                 }
             }
@@ -7124,14 +7149,30 @@ impl LoadedSession {
                 )
             {
                 self.drop_falling_sand(&entity);
+                self.track_removed_falling_sand(entity);
                 continue;
             }
             remaining.push(entity);
         }
-        if remaining.len() != before {
+        if remaining.len() + self.removed_falling_sand.len() - removed_before != before {
             self.uncoordinated_falling_lifecycle = true;
         }
         self.falling_sand = remaining;
+    }
+
+    fn track_removed_falling_sand(&mut self, entity: FallingSand) {
+        if entity
+            .source
+            .as_ref()
+            .and_then(|source| {
+                crate::saved_item::optional_uuid(source, "UUID")
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+        {
+            self.removed_falling_sand.push(entity);
+        }
     }
 
     fn drop_falling_sand(&mut self, entity: &FallingSand) {
@@ -8996,6 +9037,30 @@ fn subtract(a: IVec3, b: IVec3) -> Option<IVec3> {
         a.y.checked_sub(b.y)?,
         a.z.checked_sub(b.z)?,
     ))
+}
+
+fn draft_falling_sand(
+    entity: &FallingSand,
+) -> anyhow::Result<crate::saved_falling_block::FallingBlockDraft> {
+    use anyhow::Context;
+    let source = entity
+        .source
+        .as_ref()
+        .context("falling entity has no saved source")?;
+    let original = native_persistence::nbt::NamedTag {
+        name: "".into(),
+        value: (**source).clone(),
+    };
+    let state = crate::saved_falling_block::FallingSaveState {
+        position: entity.motion.position,
+        velocity: entity.motion.velocity,
+        on_ground: entity.on_ground,
+        no_gravity: entity.motion.no_gravity,
+        time: entity.motion.age,
+        drop_item: entity.drop_item,
+        cancel_drop: entity.cancel_drop,
+    };
+    crate::saved_falling_block::draft(&original, state)
 }
 
 #[derive(Clone, Copy)]
@@ -17090,6 +17155,7 @@ mod tests {
             let position = session.origin.as_dvec3() + DVec3::new(10.5, 2.0, 8.5);
             let entity = Tag::Compound(vec![
                 ("id".into(), Tag::String("minecraft:falling_block".into())),
+                ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
                 (
                     "Pos".into(),
                     Tag::List {
@@ -17109,13 +17175,17 @@ mod tests {
                 },
                 document: Arc::new(NamedTag {
                     name: "".into(),
-                    value: Tag::Compound(vec![(
-                        "Entities".into(),
-                        Tag::List {
-                            element_type: TagType::Compound,
-                            values: vec![entity],
-                        },
-                    )]),
+                    value: Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                        (
+                            "Entities".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![entity],
+                            },
+                        ),
+                    ]),
                 }),
             });
             session
@@ -17127,10 +17197,337 @@ mod tests {
                 session.advance_falling_sand();
             }
             assert!(session.falling_sand.is_empty());
-            assert!(session.uncoordinated_falling_lifecycle);
+            assert!(!session.uncoordinated_falling_lifecycle);
             assert_eq!(
                 session.dropped_items.snapshot().len(),
                 usize::from(drop_item && !cancel)
+            );
+            let drafts = session.draft_tracked_entity_chunks().unwrap();
+            let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(values.len(), usize::from(drop_item && !cancel));
+            if let Some(item) = values.first() {
+                assert_eq!(
+                    crate::saved_item::read(item).unwrap().unwrap().stack.id(),
+                    "minecraft:sand"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_falling_block_landing_joins_entity_and_terrain_drafts() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use native_persistence::palette;
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        let block = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:falling_block".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("BlockState".into(), Tag::String("minecraft:sand".into())),
+            ("Time".into(), Tag::Int(1)),
+            ("DropItem".into(), Tag::Byte(1)),
+        ]);
+        let pig = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+        ]);
+        let make = |falling: Tag| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![falling, pig.clone()],
+                    },
+                ),
+            ]),
+        };
+        let original = Arc::new(make(block.clone()));
+        let make_chunk = |document: Arc<NamedTag>| {
+            SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                position: native_persistence::world::ChunkPos {
+                    x: home.x,
+                    z: home.z,
+                },
+                document,
+            }))
+        };
+        session
+            .set_initial_entity_chunk(home, make_chunk(Arc::clone(&original)))
+            .unwrap();
+        session.activate_saved_falling_sand();
+        for _ in 0..30 {
+            session.advance_falling_sand();
+            if session.falling_sand.is_empty() {
+                break;
+            }
+        }
+        assert!(session.falling_sand.is_empty());
+        assert!(!session.uncoordinated_falling_lifecycle);
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 3, 1, session.origin.z + 3)
+                .unwrap()
+                .name,
+            "minecraft:sand"
+        );
+        let drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values, &[pig.clone()]);
+        let terrain_source = fixture_chunk_document(home);
+        let terrain = session.draft_changed_chunk(home, &terrain_source).unwrap();
+        let section = palette::decode_sections(&terrain.document().value)
+            .unwrap()
+            .remove(0)
+            .blocks
+            .unwrap();
+        assert_eq!(
+            section.block(3, 1, 3).unwrap().name,
+            "minecraft:sand".into()
+        );
+        assert!(session.dirty_chunk_positions().contains(&home));
+        assert!(session.draft_existing_entity_chunk(home).is_err());
+        let mut stale_block = block;
+        let Tag::Compound(fields) = &mut stale_block else {
+            panic!()
+        };
+        fields.push(("changed".into(), Tag::Int(1)));
+        session
+            .entity_chunks
+            .insert(home, make_chunk(Arc::new(make(stale_block))));
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        session.entity_chunks.insert(home, make_chunk(original));
+        assert!(session.draft_tracked_entity_chunks().is_ok());
+    }
+
+    #[test]
+    fn saved_falling_block_drop_is_not_omitted_from_entity_draft() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let slab = session.intern_block(state(
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        ));
+        assert!(session.set(IVec3::new(10, 1, 8), slab));
+        let position = session.origin.as_dvec3() + DVec3::new(10.5, 2.0, 8.5);
+        let falling = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:falling_block".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("BlockState".into(), Tag::String("minecraft:sand".into())),
+            ("Time".into(), Tag::Int(1)),
+            ("DropItem".into(), Tag::Byte(1)),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![falling],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document,
+                })),
+            )
+            .unwrap();
+        session.activate_saved_falling_sand();
+        for _ in 0..20 {
+            session.advance_falling_sand();
+            if session.falling_sand.is_empty() {
+                break;
+            }
+        }
+        assert!(session.falling_sand.is_empty());
+        assert!(!session.uncoordinated_falling_lifecycle);
+        assert_eq!(session.dropped_items.snapshot().len(), 1);
+        let draft = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = draft[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            crate::saved_item::read(&values[0])
+                .unwrap()
+                .unwrap()
+                .stack
+                .id(),
+            "minecraft:sand"
+        );
+        session.update(TICK);
+        assert!(
+            session.draft_tracked_entity_chunks().is_err(),
+            "unknown slab path effects must remain unavailable"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn saved_falling_landing_drafts_are_decoded_by_java() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        let falling = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:falling_block".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("BlockState".into(), Tag::String("minecraft:sand".into())),
+            ("Time".into(), Tag::Int(1)),
+        ]);
+        let pig = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![falling, pig],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document,
+                })),
+            )
+            .unwrap();
+        session.activate_saved_falling_sand();
+        for _ in 0..30 {
+            session.advance_falling_sand();
+            if session.falling_sand.is_empty() {
+                break;
+            }
+        }
+        assert!(session.falling_sand.is_empty());
+        let entities = session.draft_tracked_entity_chunks().unwrap();
+        let terrain = session
+            .draft_changed_chunk(home, &fixture_chunk_document(home))
+            .unwrap();
+        let Tag::List { values, .. } = terrain.document().value.get("sections").unwrap() else {
+            panic!()
+        };
+        let blocks = values[0].get("block_states").unwrap();
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let entity_path = temp.path().join("entities.nbt");
+        let block_path = temp.path().join("blocks.nbt");
+        std::fs::write(
+            &entity_path,
+            nbt::write(entities[&home].document()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &block_path,
+            nbt::write(&NamedTag {
+                name: "".into(),
+                value: blocks.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FallingLandingDraftOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FallingLandingDraftOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("FallingLandingDraftOracle")
+                .arg(entity_path)
+                .arg(block_path),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java landing oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }

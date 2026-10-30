@@ -326,6 +326,27 @@ pub fn draft_entity_chunks_with_created_orbs(
     created_items: &[saved_item::CreatedItemDraft],
     created_orbs: &[saved_orb::CreatedOrbDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_falling_removals(
+        originals,
+        replacements,
+        &[],
+        removed_items,
+        removed_orbs,
+        created_items,
+        created_orbs,
+    )
+}
+
+/// The caller must also include landing blocks, drops and all related changes.
+pub fn draft_entity_chunks_with_falling_removals(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
+    replacements: &[EntityReplacement<'_>],
+    removed_falling: &[FallingBlockDraft],
+    removed_items: &[saved_item::ItemDraft],
+    removed_orbs: &[saved_orb::OrbDraft],
+    created_items: &[saved_item::CreatedItemDraft],
+    created_orbs: &[saved_orb::CreatedOrbDraft],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     let empty: BTreeMap<_, _> = originals
         .iter()
         .filter(|(_, source)| source.is_none())
@@ -356,9 +377,10 @@ pub fn draft_entity_chunks_with_created_orbs(
         .iter()
         .map(|(&pos, source)| (pos, source.unwrap_or_else(|| &empty[&pos])))
         .collect();
-    let removals: Vec<_> = removed_items
+    let removals: Vec<_> = removed_falling
         .iter()
-        .map(EntityReplacement::Item)
+        .map(EntityReplacement::Falling)
+        .chain(removed_items.iter().map(EntityReplacement::Item))
         .chain(removed_orbs.iter().map(EntityReplacement::Orb))
         .collect();
     let created: Vec<_> = created_items
@@ -840,6 +862,128 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    #[test]
+    fn falling_removal_requires_matching_source_and_final_chunk() {
+        use native_world::loaded::ChunkPos;
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let mut entity = base();
+        let Tag::Compound(fields) = &mut entity else {
+            panic!()
+        };
+        fields.push(("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])));
+        fields.push(("BlockState".into(), Tag::String("minecraft:sand".into())));
+        let pig = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+        ]);
+        let make = |entity: Tag| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![0, 0])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![entity, pig.clone()],
+                    },
+                ),
+            ]),
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: entity.clone(),
+        };
+        let chunk = make(entity.clone());
+        let removal = draft(
+            &original,
+            FallingSaveState {
+                position: DVec3::new(17.0, 2.0, 3.0),
+                velocity: DVec3::ZERO,
+                on_ground: true,
+                no_gravity: false,
+                time: 12,
+                drop_item: true,
+                cancel_drop: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            draft_entity_chunks_with_falling_removals(
+                &BTreeMap::from([(home, Some(&chunk))]),
+                &[],
+                &[removal],
+                &[],
+                &[],
+                &[],
+                &[]
+            )
+            .is_err()
+        );
+        let removal = draft(
+            &original,
+            FallingSaveState {
+                position: DVec3::new(17.0, 2.0, 3.0),
+                velocity: DVec3::ZERO,
+                on_ground: true,
+                no_gravity: false,
+                time: 12,
+                drop_item: true,
+                cancel_drop: false,
+            },
+        )
+        .unwrap();
+        let sources = BTreeMap::from([(home, Some(&chunk)), (target, None)]);
+        let drafts = draft_entity_chunks_with_falling_removals(
+            &sources,
+            &[],
+            &[removal],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values, &[pig.clone()]);
+        assert!(drafts[&target].source_was_absent());
+        let mut changed = entity;
+        let Tag::Compound(fields) = &mut changed else {
+            panic!()
+        };
+        fields.push(("extra".into(), Tag::Int(1)));
+        let stale = make(changed);
+        let removal = draft(
+            &original,
+            FallingSaveState {
+                position: DVec3::new(17.0, 2.0, 3.0),
+                velocity: DVec3::ZERO,
+                on_ground: true,
+                no_gravity: false,
+                time: 12,
+                drop_item: true,
+                cancel_drop: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            draft_entity_chunks_with_falling_removals(
+                &BTreeMap::from([(home, Some(&stale)), (target, None)]),
+                &[],
+                &[removal],
+                &[],
+                &[],
+                &[],
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use glam::{IVec3, Vec3};
 use native_core::wood::{Planks, Wood};
 
+pub mod block_light;
 pub mod collision;
 pub mod fluid;
 pub mod fluid_sim;

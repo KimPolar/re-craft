@@ -4387,6 +4387,13 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
+        let old_ore_lit = original_state.as_ref().and_then(redstone_ore_lit);
+        let new_ore_lit = redstone_ore_lit(&replacement_state);
+        let relight = match (old_ore_lit, new_ore_lit) {
+            (Some(old_lit), Some(new_lit)) if old_lit != new_lit => Some(false),
+            (Some(true), None) => Some(true),
+            _ => None,
+        };
         let world = Arc::make_mut(&mut self.world);
         let chunk = world.chunks.get_mut(&chunk_pos).expect("chunk was checked");
         let chunk = Arc::make_mut(chunk);
@@ -4453,6 +4460,19 @@ impl LoadedSession {
                 current: id,
             });
         self.dirty_chunks.insert(chunk_pos);
+        if let Some(opacity_changed) = relight {
+            if let Some(changed) = native_world::block_light::relight_redstone(
+                Arc::make_mut(&mut self.world),
+                BlockPosition {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                },
+                opacity_changed,
+            ) {
+                self.dirty_chunks.extend(changed);
+            }
+        }
         self.revision += 1;
         self.block_notifications.push_back((relative, old, id));
         self.notify_fluid_neighbors();
@@ -7787,6 +7807,75 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn ore_light_changes_update_neighbor_chunks_and_preserve_snapshots() {
+        let mut session = session();
+        let air = session.states[0];
+        let origin_chunk = BlockPosition {
+            x: session.origin.x,
+            y: 0,
+            z: session.origin.z,
+        }
+        .chunk();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let pos = ChunkPos {
+                    x: origin_chunk.x + x,
+                    z: origin_chunk.z + z,
+                };
+                let sections = (0..=1)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: Some(Box::new([0; LIGHT_BYTES])),
+                                sky_light: None,
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        sections,
+                    }),
+                );
+            }
+        }
+        let ore = session.intern_block(state("minecraft:redstone_ore", &[("lit", "false")]));
+        let relative = IVec3::new(15, 15, 15);
+        assert!(session.set(relative, ore));
+        session.dirty_chunks.clear();
+        let old = session.world.clone();
+        assert!(session.set_redstone_ore_lit(relative, true));
+        let absolute = session.origin + relative;
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(8)
+        );
+        assert_eq!(
+            old.light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(0)
+        );
+        assert!(session.dirty_chunks.contains(&ChunkPos {
+            x: origin_chunk.x + 1,
+            z: origin_chunk.z
+        }));
+        assert!(session.set_redstone_ore_lit(relative, false));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(0)
+        );
     }
 
     #[test]

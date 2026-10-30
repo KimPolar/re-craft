@@ -311,6 +311,15 @@ pub struct SystemMessage {
     pub tick: u64,
 }
 
+/// A transient overlay message from a chest that could not be unlocked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LockedChestMessage {
+    pub tick: u64,
+    pub sequence: u64,
+    pub double_chest: bool,
+    pub custom_name: Option<native_persistence::nbt::Tag>,
+}
+
 /// Java clamps player pitch to 90 degrees in each direction.
 pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2;
 
@@ -359,6 +368,7 @@ pub struct WorldSnapshot {
     pub experience_orbs: Arc<[orbs::ExperienceOrb]>,
     /// Recent messages are shared between snapshots and copied only on change.
     pub system_messages: Arc<[SystemMessage]>,
+    pub locked_chest_message: Option<Arc<LockedChestMessage>>,
     pub tick: u64,
     /// Absolute block origin for relative player and mesh coordinates.
     pub origin: IVec3,
@@ -475,6 +485,7 @@ impl LocalSession {
             falling_blocks: Arc::from([]),
             experience_orbs: Arc::from([]),
             system_messages: Arc::from([]),
+            locked_chest_message: None,
             tick: 0,
             origin: IVec3::ZERO,
             world_revision: world.revision(),
@@ -632,6 +643,7 @@ impl LocalSession {
             falling_blocks: Arc::from([]),
             experience_orbs: self.experience_orbs.snapshot(),
             system_messages: Arc::clone(&self.snapshot.system_messages),
+            locked_chest_message: self.snapshot.locked_chest_message.clone(),
             tick: self.tick,
             origin: IVec3::ZERO,
             world_revision: self.world.revision(),
@@ -1635,6 +1647,7 @@ impl GameSession for LocalSession {
                 falling_blocks: Arc::from([]),
                 experience_orbs: self.experience_orbs.snapshot(),
                 system_messages: Arc::clone(&self.snapshot.system_messages),
+                locked_chest_message: self.snapshot.locked_chest_message.clone(),
                 tick: self.tick,
                 origin: IVec3::ZERO,
                 world_revision: self.world.revision(),

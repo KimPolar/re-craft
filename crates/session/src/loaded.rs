@@ -225,6 +225,7 @@ pub struct LoadedSession {
     world_respawn_search: Option<ActiveWorldRespawnSearch>,
     world_respawn_needed: bool,
     system_messages: Arc<[crate::SystemMessage]>,
+    locked_chest_message: Option<Arc<crate::LockedChestMessage>>,
     /// A request retains the border at the time it was accepted while its
     /// destination is prepared across later ticks.
     respawn_request_tick: Option<u64>,
@@ -347,6 +348,7 @@ pub struct LoadedSession {
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
     chest_sounds: VecDeque<ChestSoundEvent>,
+    locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     uncoordinated_falling_lifecycle: bool,
@@ -425,6 +427,12 @@ pub struct ChestSoundEvent {
     pub opening: bool,
     pub pitch: f32,
     pub tick: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LockedChestSoundEvent {
+    pub position: DVec3,
     pub sequence: u64,
 }
 
@@ -1969,6 +1977,7 @@ impl LoadedSession {
             falling_blocks: self.falling_sand_snapshot(),
             experience_orbs: self.experience_orbs.snapshot(),
             system_messages: Arc::clone(&self.system_messages),
+            locked_chest_message: self.locked_chest_message.clone(),
             tick: self.tick,
             origin: self.origin,
             world_revision: self.revision,
@@ -2058,6 +2067,7 @@ impl LoadedSession {
             falling_blocks: Arc::from([]),
             experience_orbs: Arc::from([]),
             system_messages: Arc::from([]),
+            locked_chest_message: None,
             tick: 0,
             origin,
             world_revision: 0,
@@ -2109,6 +2119,7 @@ impl LoadedSession {
             world_respawn_search: None,
             world_respawn_needed: false,
             system_messages: Arc::from([]),
+            locked_chest_message: None,
             respawn_request_tick: None,
             respawn_target_ready: false,
             respawn_availability: None,
@@ -2234,6 +2245,7 @@ impl LoadedSession {
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
             chest_sounds: VecDeque::new(),
+            locked_chest_sounds: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             uncoordinated_falling_lifecycle: false,
@@ -2793,13 +2805,6 @@ impl LoadedSession {
         let Ok(Some(chest)) = self.saved_chest(position) else {
             return false;
         };
-        let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
-            self.inventory.selected(),
-        ));
-        let spectator = self.game_mode == GameMode::Spectator;
-        if !matches!(chest.can_unlock(hand, spectator), Ok(true)) {
-            return false;
-        }
         let pair = match kind {
             Some("single") => None,
             Some("left" | "right") => {
@@ -2836,13 +2841,34 @@ impl LoadedSession {
                 let Ok(Some(other)) = self.saved_chest(other_position) else {
                     return false;
                 };
-                if !matches!(other.can_unlock(hand, spectator), Ok(true)) {
-                    return false;
-                }
                 Some((other_position, other))
             }
             _ => return false,
         };
+        let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+            self.inventory.selected(),
+        ));
+        let spectator = self.game_mode == GameMode::Spectator;
+        let first = chest.can_unlock(hand, spectator);
+        let second = pair
+            .as_ref()
+            .map(|(_, other)| other.can_unlock(hand, spectator));
+        if first.is_err() || second.as_ref().is_some_and(Result::is_err) {
+            return false;
+        }
+        if matches!(first, Ok(false)) || matches!(second, Some(Ok(false))) {
+            let (custom_name, other_position) = match &pair {
+                Some((other_position, other)) if kind == Some("left") => {
+                    (chest_title(other, Some(&chest)), Some(*other_position))
+                }
+                Some((other_position, other)) => {
+                    (chest_title(&chest, Some(other)), Some(*other_position))
+                }
+                None => (chest_title(&chest, None), None),
+            };
+            self.notify_chest_locked(position, other_position, custom_name);
+            return false;
+        }
         let key = |p: IVec3| (p.x, p.y, p.z);
         if let Some((other_position, other)) = pair {
             let (right_position, right, left_position, left) = if kind == Some("right") {
@@ -2924,6 +2950,37 @@ impl LoadedSession {
 
     pub fn take_chest_sounds(&mut self) -> Vec<ChestSoundEvent> {
         self.chest_sounds.drain(..).collect()
+    }
+
+    fn notify_chest_locked(
+        &mut self,
+        position: IVec3,
+        other: Option<IVec3>,
+        custom_name: Option<native_persistence::nbt::Tag>,
+    ) {
+        let sequence = self.next_sound_sequence();
+        let center = position.as_dvec3()
+            + DVec3::splat(0.5)
+            + other.map_or(DVec3::ZERO, |other| {
+                (other.as_dvec3() - position.as_dvec3()) * 0.5
+            });
+        self.locked_chest_message = Some(Arc::new(crate::LockedChestMessage {
+            tick: self.tick,
+            sequence,
+            double_chest: other.is_some(),
+            custom_name,
+        }));
+        if self.locked_chest_sounds.len() == 4096 {
+            self.locked_chest_sounds.pop_front();
+        }
+        self.locked_chest_sounds.push_back(LockedChestSoundEvent {
+            position: center,
+            sequence,
+        });
+    }
+
+    pub fn take_locked_chest_sounds(&mut self) -> Vec<LockedChestSoundEvent> {
+        self.locked_chest_sounds.drain(..).collect()
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -8873,6 +8930,7 @@ impl GameSession for LoadedSession {
                 falling_blocks: self.falling_sand_snapshot(),
                 experience_orbs: self.experience_orbs.snapshot(),
                 system_messages: Arc::clone(&self.system_messages),
+                locked_chest_message: self.locked_chest_message.clone(),
                 tick: self.tick,
                 origin: self.origin,
                 world_revision: self.revision,
@@ -12940,6 +12998,7 @@ mod tests {
                 ),
             ]),
         ));
+        first.push(("CustomName".into(), Tag::String("Left".into())));
         Arc::make_mut(&mut session.world)
             .saved_block_entities
             .insert(
@@ -12947,6 +13006,23 @@ mod tests {
                 SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
             );
         assert!(!session.try_open_saved_chest(left - session.origin));
+        let message = session.locked_chest_message.as_ref().unwrap();
+        assert!(!message.double_chest);
+        assert_eq!(message.custom_name, Some(Tag::String("Left".into())));
+        let event = session.take_locked_chest_sounds().pop().unwrap();
+        assert_eq!(event.position, left.as_dvec3() + DVec3::splat(0.5));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(
+            session
+                .snapshot()
+                .locked_chest_message
+                .as_ref()
+                .unwrap()
+                .custom_name,
+            Some(Tag::String("Left".into()))
+        );
+        assert_eq!(session.take_locked_chest_sounds().len(), 1);
         let diamond =
             |count| ItemStack::new("minecraft:diamond".into(), count, 64, Tag::Compound(vec![]));
         Arc::make_mut(&mut session.inventory)
@@ -12977,6 +13053,7 @@ mod tests {
             ("x".into(), Tag::Int(right.x)),
             ("y".into(), Tag::Int(right.y)),
             ("z".into(), Tag::Int(right.z)),
+            ("CustomName".into(), Tag::String("Right".into())),
             (
                 "lock".into(),
                 Tag::Compound(vec![
@@ -12995,6 +13072,14 @@ mod tests {
                 SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
             );
         assert!(!session.try_open_saved_chest(left - session.origin));
+        let message = session.locked_chest_message.as_ref().unwrap();
+        assert!(message.double_chest);
+        assert_eq!(message.custom_name, Some(Tag::String("Right".into())));
+        let event = session.take_locked_chest_sounds().pop().unwrap();
+        assert_eq!(
+            event.position,
+            (left.as_dvec3() + right.as_dvec3()) * 0.5 + DVec3::splat(0.5)
+        );
         assert!(!session.try_open_saved_chest(right - session.origin));
         Arc::make_mut(&mut session.inventory)
             .set_slot(crate::inventory::PlayerSlot::Storage(0), diamond(3));

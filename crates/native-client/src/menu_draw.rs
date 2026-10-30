@@ -653,6 +653,64 @@ impl Canvas {
     }
 
     /// Draw resolved component spans using the existing resource-pack font.
+    pub fn component_width(
+        &self,
+        assets: Option<&MenuAssets>,
+        spans: &[crate::text_component::Span],
+    ) -> i32 {
+        spans
+            .iter()
+            .flat_map(|span| {
+                span.text
+                    .chars()
+                    .map(move |ch| glyph_width(assets, ch) + i32::from(span.style.bold))
+            })
+            .sum()
+    }
+
+    pub fn component_shadow_alpha(
+        &mut self,
+        assets: Option<&MenuAssets>,
+        x: i32,
+        y: i32,
+        spans: &[crate::text_component::Span],
+        opacity: u8,
+    ) {
+        let width = self.component_width(assets, spans);
+        if width <= 0 || opacity == 0 {
+            return;
+        }
+        let left = x.max(0);
+        let right = x.saturating_add(width).saturating_add(12).min(self.width);
+        if right <= left {
+            return;
+        }
+        let mut scratch = Canvas::new((right - left) as u32, 11);
+        let shadow: Vec<_> = spans
+            .iter()
+            .map(|span| {
+                let mut span = span.clone();
+                let color = span.style.color.unwrap_or([255; 3]);
+                span.style.color = Some(color.map(|channel| channel / 4));
+                span
+            })
+            .collect();
+        scratch.component_without_shadow(assets, x - left + 1, 1, &shadow, [63; 3]);
+        scratch.component_without_shadow(assets, x - left, 0, spans, [255; 3]);
+        for sy in 0..scratch.height {
+            for sx in 0..scratch.width {
+                let value = scratch.pixels[(sy * scratch.width + sx) as usize];
+                let alpha = ((value >> 24) * u32::from(opacity) / 255) as u8;
+                self.pixel(
+                    left + sx,
+                    y + sy,
+                    [(value >> 16) as u8, (value >> 8) as u8, value as u8, alpha],
+                );
+            }
+        }
+    }
+
+    /// Draw resolved component spans using the existing resource-pack font.
     pub fn component_without_shadow(
         &mut self,
         assets: Option<&MenuAssets>,

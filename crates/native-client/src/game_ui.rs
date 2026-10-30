@@ -131,6 +131,7 @@ struct DrawKey {
     experience: crate::experience_hud::Display,
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
+    action_bar: Option<(u64, u8)>,
 }
 
 pub struct GameUi {
@@ -166,6 +167,7 @@ pub struct GameUi {
     experience: crate::experience_hud::Display,
     death: Option<DeathScreen>,
     system_messages: Arc<[native_session::SystemMessage]>,
+    locked_chest_message: Option<Arc<native_session::LockedChestMessage>>,
     snapshot_messages: Arc<[native_session::SystemMessage]>,
     local_messages: Vec<native_session::SystemMessage>,
 }
@@ -219,6 +221,7 @@ impl GameUi {
             ),
             death: None,
             system_messages: Arc::from([]),
+            locked_chest_message: None,
             snapshot_messages: Arc::from([]),
             local_messages: Vec::new(),
         }
@@ -1463,6 +1466,7 @@ impl GameUi {
         }
         let inventory = &snapshot.inventory;
         let tick = snapshot.tick;
+        self.locked_chest_message = snapshot.locked_chest_message.clone();
         self.sync_hud(snapshot);
         renderer.set_screen_blur(
             if self.death.is_none() && (self.paused || inventory.is_open()) {
@@ -1635,6 +1639,7 @@ impl GameUi {
             experience: self.experience,
             hud_tick: self.hud.animation_key(tick),
             chat: crate::chat_hud::display_key(&self.assets.chat, &self.system_messages, tick),
+            action_bar: crate::action_bar::display_key(self.locked_chest_message.as_deref(), tick),
         };
         if self.last_draw == Some(key) {
             return None;
@@ -1698,6 +1703,12 @@ impl GameUi {
         crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
         crate::experience_hud::draw(&mut canvas, assets, self.experience);
         crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
+        crate::action_bar::draw(
+            &mut canvas,
+            Some(assets),
+            self.locked_chest_message.as_deref(),
+            tick,
+        );
         if self.video.menu_blur > 0 && (self.paused || inventory.is_open()) {
             self.pre_blur_hud = Some(canvas);
             canvas = Canvas::new((size.0 / scale).max(1), (size.1 / scale).max(1));

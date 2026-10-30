@@ -456,10 +456,16 @@ impl Viewer {
             let mut buttons = play.session.take_button_sounds().into_iter().peekable();
             let mut levers = play.session.take_lever_sounds().into_iter().peekable();
             let mut chests = play.session.take_chest_sounds().into_iter().peekable();
+            let mut locked_chests = play
+                .session
+                .take_locked_chest_sounds()
+                .into_iter()
+                .peekable();
             while let Some((_, kind)) = [
                 buttons.peek().map(|event| (event.sequence, 0)),
                 levers.peek().map(|event| (event.sequence, 1)),
                 chests.peek().map(|event| (event.sequence, 2)),
+                locked_chests.peek().map(|event| (event.sequence, 3)),
             ]
             .into_iter()
             .flatten()
@@ -478,10 +484,16 @@ impl Viewer {
                             audio.lever(event);
                         }
                     }
-                    _ => {
+                    2 => {
                         let event = chests.next().unwrap();
                         if let Some(audio) = &self.audio {
                             audio.chest(event);
+                        }
+                    }
+                    _ => {
+                        let event = locked_chests.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.locked_chest(event);
                         }
                     }
                 }
@@ -2213,6 +2225,7 @@ mod tests {
             falling_blocks: Arc::clone(&previous.falling_blocks),
             experience_orbs: Arc::clone(&previous.experience_orbs),
             system_messages: Arc::clone(&previous.system_messages),
+            locked_chest_message: previous.locked_chest_message.clone(),
             tick: previous.tick,
             origin: glam::IVec3::new(16_000_016, 0, -16_000_000),
             world_revision: previous.world_revision,

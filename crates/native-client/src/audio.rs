@@ -154,6 +154,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn locked_chest(&self, event: native_session::loaded::LockedChestSoundEvent) {
+        let _ = self.audio.commands.try_send(Command::LockedChest(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     pub fn item_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Item);
     }
@@ -190,6 +199,7 @@ enum Command {
     Button(Resources, native_session::loaded::ButtonSoundEvent),
     Lever(Resources, native_session::loaded::LeverSoundEvent),
     Chest(Resources, native_session::loaded::ChestSoundEvent),
+    LockedChest(Resources, native_session::loaded::LockedChestSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
 }
 
@@ -674,15 +684,30 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, button, lever, chest, pickup) = match command {
-            Command::Prepare(resources) => (resources, false, None, None, None, None),
-            Command::Click(resources) => (resources, true, None, None, None, None),
-            Command::Button(resources, event) => (resources, true, Some(event), None, None, None),
-            Command::Lever(resources, event) => (resources, true, None, Some(event), None, None),
-            Command::Chest(resources, event) => (resources, true, None, None, Some(event), None),
-            Command::Pickup(resources, position, kind) => {
-                (resources, true, None, None, None, Some((position, kind)))
+        let (resources, play, button, lever, chest, locked, pickup) = match command {
+            Command::Prepare(resources) => (resources, false, None, None, None, None, None),
+            Command::Click(resources) => (resources, true, None, None, None, None, None),
+            Command::Button(resources, event) => {
+                (resources, true, Some(event), None, None, None, None)
             }
+            Command::Lever(resources, event) => {
+                (resources, true, None, Some(event), None, None, None)
+            }
+            Command::Chest(resources, event) => {
+                (resources, true, None, None, Some(event), None, None)
+            }
+            Command::LockedChest(resources, event) => {
+                (resources, true, None, None, None, Some(event), None)
+            }
+            Command::Pickup(resources, position, kind) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                None,
+                Some((position, kind)),
+            ),
         };
         if catalog
             .as_ref()
@@ -705,6 +730,15 @@ fn run(
             };
             let resolved = if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
+            } else if let Some(event) = locked {
+                catalog.resolve(
+                    "block.chest.locked",
+                    1.0,
+                    1.0,
+                    Some(event.position),
+                    chosen_random,
+                    config.sample_rate.0,
+                )
             } else if let Some(event) = chest {
                 catalog.chest(event, chosen_random, config.sample_rate.0)
             } else if let Some(event) = lever {
@@ -777,6 +811,14 @@ mod tests {
         assert!(
             matches!(probe.receiver.try_recv(), Ok(Command::Chest(_, actual)) if actual == event)
         );
+        let locked = native_session::loaded::LockedChestSoundEvent {
+            position: event.position,
+            sequence: 8,
+        };
+        ui.locked_chest(locked);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::LockedChest(_, actual)) if actual == locked)
+        );
     }
 
     #[test]
@@ -805,10 +847,24 @@ mod tests {
             assert_eq!(voice.spatial.unwrap().position, position);
             assert!(!voice.player_sound);
         }
+        let voice = vanilla
+            .resolve(
+                "block.chest.locked",
+                1.0,
+                1.0,
+                Some(position),
+                &mut LegacyRandom::new(3),
+                48000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(voice.clip.samples.iter().any(|sample| *sample != 0));
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert!(!voice.player_sound);
         let pack = tempfile::tempdir().unwrap();
         let directory = pack.path().join("assets/minecraft");
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("sounds.json"), br#"{"block.chest.open":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"block.chest.open":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]},"block.chest.locked":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.3,"pitch":1.25}]}}"#).unwrap();
         let mut catalog = Catalog::load(Resources {
             root,
             packs: vec![pack.path().to_path_buf()],
@@ -832,6 +888,19 @@ mod tests {
         );
         assert_eq!(voice.spatial.unwrap().position, position);
         assert!(!voice.player_sound);
+        let locked = catalog
+            .resolve(
+                "block.chest.locked",
+                1.0,
+                1.0,
+                Some(position),
+                &mut LegacyRandom::new(1),
+                48000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked.volume, 0.3);
+        assert_eq!(locked.step, f64::from(locked.clip.rate) / 48000.0 * 1.25);
     }
     #[test]
     fn mixer_resamples_and_finishes_multiple_voices() {

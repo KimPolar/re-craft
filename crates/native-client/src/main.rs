@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accessibility_ui;
+mod action_bar;
 mod audio;
 mod blur_ui;
 mod breaking_render;

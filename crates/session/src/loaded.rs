@@ -162,6 +162,7 @@ pub struct LoadedSession {
     flight: crate::physics::FlightState,
     fov_effect_scale: f32,
     food_use: crate::survival::FoodUse,
+    use_repeat: crate::interaction::UseRepeat,
     mining: mining::Mining,
     first_person: crate::animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
@@ -1162,6 +1163,7 @@ impl LoadedSession {
             flight: crate::physics::FlightState::default(),
             fov_effect_scale: 1.0,
             food_use: crate::survival::FoodUse::default(),
+            use_repeat: crate::interaction::UseRepeat::default(),
             mining: mining::Mining::default(),
             first_person: crate::animation::FirstPersonState::default(),
             commands: VecDeque::new(),
@@ -2737,6 +2739,7 @@ impl LoadedSession {
         self.flight.flying = self.game_mode == GameMode::Spectator;
         self.experience_orbs.reset_player_pickup_delay();
         self.food_use = crate::survival::FoodUse::default();
+        self.use_repeat = crate::interaction::UseRepeat::default();
         self.mining.release();
         self.first_person = crate::animation::FirstPersonState::default();
         self.selected = selected_inventory_block(&self.inventory);
@@ -5008,7 +5011,21 @@ impl LoadedSession {
             self.mark_advanced_saved_tick_chunks_dirty();
             return;
         }
-        while let Some(command) = self.commands.pop_front() {
+        self.use_repeat.advance_tick();
+        let mut repeated_use = false;
+        loop {
+            let command = if let Some(command) = self.commands.pop_front() {
+                command
+            } else if !repeated_use
+                && self.use_repeat.ready()
+                && !self.food_use.is_active()
+                && !self.inventory.is_open()
+            {
+                repeated_use = true;
+                PlayerCommand::Place
+            } else {
+                break;
+            };
             let before_inventory = Arc::clone(&self.inventory);
             match command {
                 PlayerCommand::Respawn => {}
@@ -5231,6 +5248,9 @@ impl LoadedSession {
                     }
                 }
                 PlayerCommand::PickBlock => {}
+                PlayerCommand::Break if self.food_use.is_active() && !self.inventory.is_open() => {
+                    self.mining.hold_without_start();
+                }
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
@@ -5253,9 +5273,18 @@ impl LoadedSession {
                 }
                 PlayerCommand::Break => {}
                 PlayerCommand::StopBreak => self.mining.release(),
-                PlayerCommand::StopUse => self.food_use.cancel(),
-                PlayerCommand::UseHeld(held) => self.food_use.set_held(held),
+                PlayerCommand::StopUse => {
+                    self.use_repeat.release();
+                    self.food_use.cancel();
+                }
+                PlayerCommand::UseHeld(held) => {
+                    self.use_repeat.set_held(held);
+                    self.food_use.set_held(held);
+                }
+                PlayerCommand::Place
+                    if self.food_use.is_active() || self.mining.is_destroying() => {}
                 PlayerCommand::Place if !self.inventory.is_open() => {
+                    self.use_repeat.used();
                     let main_hand =
                         crate::inventory::PlayerSlot::Storage(self.inventory.selected());
                     let mut handled = false;
@@ -5356,7 +5385,10 @@ impl LoadedSession {
             );
             self.selected = selected_inventory_block(&self.inventory);
         }
-        if self.mining.held() && self.game_mode.allows_basic_building() {
+        if self.mining.held()
+            && !self.food_use.is_active()
+            && self.game_mode.allows_basic_building()
+        {
             let target = self.mining_target();
             if target.is_some() {
                 self.first_person.swing.start(crate::animation::Hand::Main);

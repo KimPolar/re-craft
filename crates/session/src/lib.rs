@@ -24,6 +24,7 @@ pub mod equippable;
 pub mod experience;
 pub mod fall;
 pub mod falling_block;
+mod interaction;
 pub mod inventory;
 pub mod items;
 pub mod loaded;
@@ -383,6 +384,7 @@ pub struct LocalSession {
     armor: equipment_attributes::ArmorTracker,
     survival_rules: survival::SurvivalRules,
     food_use: survival::FoodUse,
+    use_repeat: interaction::UseRepeat,
     mining: mining::Mining,
     first_person: animation::FirstPersonState,
     commands: VecDeque<PlayerCommand>,
@@ -472,6 +474,7 @@ impl LocalSession {
             armor: equipment_attributes::ArmorTracker::default(),
             survival_rules: survival::SurvivalRules::default(),
             food_use: survival::FoodUse::default(),
+            use_repeat: interaction::UseRepeat::default(),
             mining: mining::Mining::default(),
             first_person: animation::FirstPersonState::default(),
             commands: VecDeque::new(),
@@ -797,7 +800,21 @@ impl LocalSession {
             self.tick += 1;
             return;
         }
-        while let Some(command) = self.commands.pop_front() {
+        self.use_repeat.advance_tick();
+        let mut repeated_use = false;
+        loop {
+            let command = if let Some(command) = self.commands.pop_front() {
+                command
+            } else if !repeated_use
+                && self.use_repeat.ready()
+                && !self.food_use.is_active()
+                && !self.inventory.is_open()
+            {
+                repeated_use = true;
+                PlayerCommand::Place
+            } else {
+                break;
+            };
             let before_inventory = Arc::clone(&self.inventory);
             match command {
                 PlayerCommand::Respawn => {}
@@ -1009,6 +1026,9 @@ impl LocalSession {
                     }
                 }
                 PlayerCommand::PickBlock => {}
+                PlayerCommand::Break if self.food_use.is_active() && !self.inventory.is_open() => {
+                    self.mining.hold_without_start();
+                }
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
@@ -1031,9 +1051,18 @@ impl LocalSession {
                 }
                 PlayerCommand::Break => {}
                 PlayerCommand::StopBreak => self.mining.release(),
-                PlayerCommand::StopUse => self.food_use.cancel(),
-                PlayerCommand::UseHeld(held) => self.food_use.set_held(held),
+                PlayerCommand::StopUse => {
+                    self.use_repeat.release();
+                    self.food_use.cancel();
+                }
+                PlayerCommand::UseHeld(held) => {
+                    self.use_repeat.set_held(held);
+                    self.food_use.set_held(held);
+                }
+                PlayerCommand::Place
+                    if self.food_use.is_active() || self.mining.is_destroying() => {}
                 PlayerCommand::Place if !self.inventory.is_open() => {
+                    self.use_repeat.used();
                     let main_hand = PlayerSlot::Storage(self.inventory.selected());
                     let mut handled = false;
                     if let Some(hit) =
@@ -1115,7 +1144,10 @@ impl LocalSession {
             self.selected_block = selected_inventory_block(&self.inventory);
         }
 
-        if self.mining.held() && self.game_mode.allows_basic_building() {
+        if self.mining.held()
+            && !self.food_use.is_active()
+            && self.game_mode.allows_basic_building()
+        {
             let target = self.mining_target();
             if target.is_some() {
                 self.first_person.swing.start(animation::Hand::Main);
@@ -1478,6 +1510,7 @@ impl LocalSession {
         self.ground_without_support = false;
         self.fall = fall::FallTracker::default();
         self.food_use = survival::FoodUse::default();
+        self.use_repeat = interaction::UseRepeat::default();
         self.mining.release();
         self.first_person = animation::FirstPersonState::default();
         self.armor.invalidate();
@@ -4193,6 +4226,41 @@ mod tests {
                 .block(IVec3::new(0, 4, 5)),
             Block::Air
         );
+    }
+
+    #[test]
+    fn holding_use_repeats_at_four_ticks_and_stops_on_release() {
+        let mut world = World::demo();
+        world.set_block(IVec3::new(0, 4, 1), Block::Stone);
+        let mut session = LocalSession::new(world);
+        session.submit_command(PlayerCommand::Select(Block::Dirt));
+        session.submit_command(PlayerCommand::UseHeld(true));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 2)), Block::Dirt);
+        session.update(TICK * 3);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 3)), Block::Air);
+        session.update(TICK);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 3)), Block::Dirt);
+        session.submit_command(PlayerCommand::StopUse);
+        session.update(TICK * 4);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 4)), Block::Air);
+    }
+
+    #[test]
+    fn held_use_waits_while_destroying_a_block() {
+        let mut world = World::demo();
+        world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+        let mut session = LocalSession::new(world);
+        session.submit_command(PlayerCommand::Select(Block::Dirt));
+        session.submit_command(PlayerCommand::Break);
+        session.submit_command(PlayerCommand::UseHeld(true));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 4)), Block::Air);
+        session.submit_command(PlayerCommand::StopBreak);
+        session.update(TICK);
+        assert_eq!(session.world.block(IVec3::new(0, 4, 4)), Block::Dirt);
     }
 
     #[test]

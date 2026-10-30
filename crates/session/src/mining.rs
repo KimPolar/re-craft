@@ -242,6 +242,14 @@ impl Mining {
         self.held
     }
 
+    pub fn hold_without_start(&mut self) {
+        self.held = true;
+    }
+
+    pub fn is_destroying(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn release(&mut self) {
         self.held = false;
         self.started_this_tick = false;

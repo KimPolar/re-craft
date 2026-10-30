@@ -1442,6 +1442,7 @@ impl GameUi {
         snapshot: &native_session::WorldSnapshot,
         partial: f32,
     ) -> Result<()> {
+        self.held_models.begin_frame();
         self.sync_death(snapshot);
         if !Arc::ptr_eq(&self.snapshot_messages, &snapshot.system_messages) {
             self.snapshot_messages = Arc::clone(&snapshot.system_messages);

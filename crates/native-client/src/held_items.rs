@@ -604,6 +604,10 @@ enum Entry {
 
 const MAX_CACHED_MODELS: usize = 64;
 const MAX_CACHED_BYTES: usize = 128 * 1024 * 1024;
+// Visible models may exceed the idle budget, but remain bounded even in a
+// world with an unusually large number of distinct item models.
+const MAX_ACTIVE_MODELS: usize = 256;
+const MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
 type LoadedItem = Option<(Arc<HeldModel>, usize)>;
 
 // Count unique CPU images and quad storage once, on the background worker.
@@ -655,6 +659,9 @@ pub struct ItemModelCache {
     entries: HashMap<ModelKey, Entry>,
     order: VecDeque<ModelKey>,
     bytes: usize,
+    frame_started: bool,
+    active: HashSet<ModelKey>,
+    previous_active: HashSet<ModelKey>,
 }
 
 impl ItemModelCache {
@@ -693,7 +700,18 @@ impl ItemModelCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
         }
+    }
+
+    /// Protect models used in this and the preceding frame. Eviction runs only
+    /// after requests are recorded, so a large visible set can finish loading.
+    pub fn begin_frame(&mut self) {
+        self.frame_started = true;
+        std::mem::swap(&mut self.previous_active, &mut self.active);
+        self.active.clear();
     }
 
     /// Returns true when a completed request can change the visible preview.
@@ -719,7 +737,16 @@ impl ItemModelCache {
         while self.order.len() > MAX_CACHED_MODELS
             || (self.bytes > MAX_CACHED_BYTES && self.order.len() > 1)
         {
-            let Some(oldest) = self.order.pop_front() else {
+            let oldest = self.order.iter().position(|key| {
+                !self.frame_started
+                    || (!self.active.contains(key) && !self.previous_active.contains(key))
+            });
+            let hard_limit = self.order.len() > MAX_ACTIVE_MODELS
+                || (self.bytes > MAX_ACTIVE_BYTES && self.order.len() > 1);
+            let Some(index) = oldest.or_else(|| hard_limit.then_some(0)) else {
+                break;
+            };
+            let Some(oldest) = self.order.remove(index) else {
                 break;
             };
             if let Some(Entry::Ready { bytes, .. }) = self.entries.remove(&oldest) {
@@ -738,12 +765,18 @@ impl ItemModelCache {
 
     fn get_key(&mut self, key: ModelKey) -> Option<Arc<HeldModel>> {
         if let Some(entry) = self.entries.get(&key) {
+            if self.frame_started {
+                self.active.insert(key);
+            }
             return match entry {
                 Entry::Ready { model, .. } => Some(Arc::clone(model)),
                 _ => None,
             };
         }
         if self.request.try_send(key.clone()).is_ok() {
+            if self.frame_started {
+                self.active.insert(key.clone());
+            }
             self.entries.insert(key.clone(), Entry::Pending);
             self.order.push_back(key);
             self.trim();
@@ -1107,20 +1140,10 @@ public class PaletteOracle {
         assert_eq!(DisplayTransform::parse(None).unwrap().scale, Vec3::ONE);
     }
 
-    #[test]
-    fn cache_retains_a_full_inventory_and_evicts_when_memory_is_full() {
-        let (request, requests) = mpsc::sync_channel(64);
-        let (results, response) = mpsc::channel();
-        let mut cache = ItemModelCache {
-            request,
-            response,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            bytes: 0,
-        };
+    fn test_model() -> Arc<HeldModel> {
         let display = DisplayTransform::parse(None).unwrap();
         let image = Arc::new(RgbaImage::new(1, 1));
-        let model = Arc::new(HeldModel {
+        Arc::new(HeldModel {
             numeric_item_id: None,
             quads: crate::generated_item::bake(Arc::clone(&image), [1.0; 3], 0).unwrap(),
             glint: false,
@@ -1141,7 +1164,24 @@ public class PaletteOracle {
                 tint: [1.0; 3],
                 glint_uv: None,
             }],
-        });
+        })
+    }
+
+    #[test]
+    fn cache_retains_a_full_inventory_and_evicts_when_memory_is_full() {
+        let (request, requests) = mpsc::sync_channel(64);
+        let (results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+        };
+        let model = test_model();
         let size = estimated_bytes(&model);
         for index in 0..45 {
             let id = format!("minecraft:item_{index}");
@@ -1176,6 +1216,153 @@ public class PaletteOracle {
                 .contains_key(&ModelKey::plain("minecraft:item_0"))
         );
         assert!(cache.get("minecraft:item_44").is_some());
+    }
+
+    #[test]
+    fn cache_keeps_large_visible_set_and_reclaims_it_after_use() {
+        let (baseline_request, baseline_requests) = mpsc::sync_channel(128);
+        let (baseline_results, baseline_response) = mpsc::channel();
+        let mut baseline = ItemModelCache {
+            request: baseline_request,
+            response: baseline_response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+        };
+        let model = test_model();
+        let size = estimated_bytes(&model);
+        for index in 0..80 {
+            baseline.get(&format!("minecraft:item_{index}"));
+        }
+        for _ in 0..80 {
+            baseline_results
+                .send((
+                    baseline_requests.try_recv().unwrap(),
+                    Some((Arc::clone(&model), size)),
+                ))
+                .unwrap();
+        }
+        baseline.poll();
+        let baseline_hits = (0..80)
+            .filter(|index| baseline.get(&format!("minecraft:item_{index}")).is_some())
+            .count();
+        assert_eq!(
+            baseline_hits, 0,
+            "FIFO eviction reproduces the visible-set churn"
+        );
+
+        let (request, requests) = mpsc::sync_channel(128);
+        let (results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+        };
+        cache.begin_frame();
+        for index in 0..80 {
+            assert!(cache.get(&format!("minecraft:item_{index}")).is_none());
+        }
+        for _ in 0..80 {
+            results
+                .send((
+                    requests.try_recv().unwrap(),
+                    Some((Arc::clone(&model), size)),
+                ))
+                .unwrap();
+        }
+        assert!(cache.poll());
+        cache.begin_frame();
+        for index in 0..80 {
+            assert!(
+                cache.get(&format!("minecraft:item_{index}")).is_some(),
+                "visible item {index} was evicted"
+            );
+        }
+        eprintln!(
+            "80 visible models: {baseline_hits} cache hits with FIFO, 80 with frame protection"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "visible items must not reload every frame"
+        );
+        cache.begin_frame();
+        cache.begin_frame();
+        cache.poll();
+        assert!(cache.entries.len() <= MAX_CACHED_MODELS);
+    }
+
+    #[test]
+    fn visible_models_still_obey_hard_cache_limits() {
+        let (request, _requests) = mpsc::sync_channel(512);
+        let (results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+        };
+        cache.begin_frame();
+        for index in 0..(MAX_ACTIVE_MODELS + 40) {
+            cache.get(&format!("minecraft:item_{index}"));
+        }
+        assert_eq!(cache.entries.len(), MAX_ACTIVE_MODELS);
+        let model = test_model();
+        for index in 40..43 {
+            results
+                .send((
+                    ModelKey::plain(&format!("minecraft:item_{index}")),
+                    Some((Arc::clone(&model), MAX_ACTIVE_BYTES / 2)),
+                ))
+                .unwrap();
+        }
+        cache.poll();
+        assert!(cache.bytes <= MAX_ACTIVE_BYTES);
+        assert!(cache.entries.len() <= MAX_ACTIVE_MODELS);
+    }
+
+    #[test]
+    fn visible_models_finish_loading_through_bounded_worker_queue() {
+        let (request, requests) = mpsc::sync_channel(32);
+        let (results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+        };
+        let model = test_model();
+        let size = estimated_bytes(&model);
+        let mut hits = 0;
+        for _ in 0..8 {
+            cache.begin_frame();
+            cache.poll();
+            hits = (0..80)
+                .filter(|index| cache.get(&format!("minecraft:item_{index}")).is_some())
+                .count();
+            while let Ok(key) = requests.try_recv() {
+                results
+                    .send((key, Some((Arc::clone(&model), size))))
+                    .unwrap();
+            }
+        }
+        assert_eq!(hits, 80);
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
@@ -1241,6 +1428,22 @@ public class PaletteOracle {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(model.right.rotation, Vec3::new(7.0, 13.0, 19.0));
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn all_button_item_models_load_from_installed_resources() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut loader = open_loader(&game, &[]);
+        for button in native_core::button::Button::ALL {
+            let model = loader
+                .load(button.id())
+                .unwrap_or_else(|error| panic!("{}: {error:#}", button.id()));
+            assert!(!model.quads.is_empty(), "{}", button.id());
+            assert!(crate::item_gui::render(&model).is_some(), "{}", button.id());
+        }
     }
 
     #[test]

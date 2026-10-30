@@ -288,3 +288,306 @@ fn edited_session_chunk_round_trips_through_vanilla_palette() {
             .map(|height| height.to_string()),
         ));
 }
+
+#[test]
+#[cfg(windows)]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn session_lighting_and_block_changes_survive_java_region_round_trip() {
+    use native_persistence::{
+        save::{WorldSavePlan, WorldWriteGuard},
+        world::WorldReader,
+    };
+    use native_session::{SessionWorld, inventory::PlayerInventory};
+    let (game, java) = game_and_java();
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_block_ids().unwrap();
+    let tags =
+        native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &registry).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/session-light-region-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("world-")
+        .tempdir_in(root)
+        .unwrap();
+    let java_source = temp.path().join("LightRegionOracle.java");
+    std::fs::write(&java_source, r#"
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.nbt.*;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.*;
+import net.minecraft.world.level.chunk.storage.*;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+public class LightRegionOracle {
+  static RegionFile open(Path dir) throws Exception {
+    return new RegionFile(new RegionStorageInfo("light", null, "region"),dir.resolve("r.0.0.mca"),dir,RegionFileVersion.VERSION_NONE,false);
+  }
+  public static void main(String[] args) throws Exception {
+    SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var world=Path.of(args[1]); var dir=world.resolve("dimensions/minecraft/overworld/region");
+    if(args[0].equals("seed")) {
+      Files.createDirectories(dir);
+      var level=new CompoundTag(); var data=new CompoundTag(); data.putInt("DataVersion",5023); level.put("Data",data); NbtIo.writeCompressed(level,world.resolve("level.dat"));
+      var playerDir=world.resolve("players/data"); Files.createDirectories(playerDir);
+      var player=new CompoundTag(); player.putInt("DataVersion",5023); player.putIntArray("UUID",new int[]{0,0,0,1}); player.putString("Dimension","minecraft:overworld"); player.putLong("future_player",83);
+      NbtIo.writeCompressed(player,playerDir.resolve("00000000-0000-0000-0000-000000000001.dat"));
+      var clockDir=world.resolve("data/minecraft"); Files.createDirectories(clockDir);
+      var clock=new CompoundTag(); clock.putInt("DataVersion",5023); var clocks=new CompoundTag(); var overworld=new CompoundTag(); overworld.putLong("total_ticks",10); overworld.putInt("future_clock",17); clocks.put("minecraft:overworld",overworld); clock.put("data",clocks); NbtIo.writeCompressed(clock,clockDir.resolve("world_clocks.dat"));
+      try(var region=open(dir)) { for(int x=0;x<3;x++) for(int z=0;z<3;z++) {
+        var chunk=new CompoundTag(); chunk.putInt("DataVersion",5023); chunk.putInt("xPos",x); chunk.putInt("zPos",z); chunk.putString("Status","minecraft:full"); chunk.putBoolean("isLightOn",true); chunk.putLong("future_data",42+x*3+z);
+        var palette=new ListTag(); var air=new CompoundTag(); air.putString("id","minecraft:air"); palette.add(air);
+        var states=new CompoundTag();
+        if(x==1 && z==1) { var ore=new CompoundTag(); ore.putString("id","minecraft:redstone_ore"); var properties=new CompoundTag(); properties.putString("lit","false"); ore.put("properties",properties); palette.add(ore); long[] words=new long[256]; int index=8+6*16+2*256; words[index/16] |= 1L << ((index%16)*4); states.putLongArray("data",words); }
+        states.put("palette",palette); var section=new CompoundTag(); section.putByte("Y",(byte)0); section.put("block_states",states); section.putByteArray("BlockLight",new byte[2048]); section.putString("future_section","keep");
+        var sections=new ListTag(); sections.add(section); chunk.put("sections",sections);
+        try(var out=region.getChunkDataOutputStream(new ChunkPos(x,z))) { NbtIo.write(chunk,(DataOutput)out); }
+      }}
+    } else if(args[0].equals("alter")) {
+      try(var region=open(dir)) { CompoundTag chunk;
+        try(var in=region.getChunkDataInputStream(new ChunkPos(1,1))) { chunk=NbtIo.read((DataInput)in); }
+        chunk.putLong("future_data",999);
+        try(var out=region.getChunkDataOutputStream(new ChunkPos(1,1))) { NbtIo.write(chunk,(DataOutput)out); }
+      }
+    } else {
+      byte[] expected=Files.readAllBytes(Path.of(args[2])); int at=0; var codec=PalettedContainer.codecRW(BlockState.CODEC,Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState()); var documents=new LinkedHashMap<ChunkPos,CompoundTag>();
+      try(var region=open(dir)) { for(int x=0;x<3;x++) for(int z=0;z<3;z++) {
+        try(var in=region.getChunkDataInputStream(new ChunkPos(x,z))) {
+          var chunk=NbtIo.read((DataInput)in); documents.put(new ChunkPos(x,z),chunk); if(chunk.getLongOr("future_data",-1)!=42+x*3+z || !chunk.getBooleanOr("isLightOn",false)) throw new AssertionError("chunk metadata");
+          var sections=chunk.getListOrEmpty("sections"); Map<Integer,CompoundTag> byY=new HashMap<>(); for(var tag:sections) { var section=(CompoundTag)tag; byY.put((int)section.getByteOr("Y",(byte)-99),section); }
+          var primary=byY.get(0); if(primary==null || !primary.getStringOr("future_section","").equals("keep")) throw new AssertionError("section metadata");
+          if(x==1 && z==1) { var blocks=codec.parse(NbtOps.INSTANCE,primary.get("block_states")).getOrThrow(); var ore=blocks.get(8,2,6); if(!ore.is(Blocks.REDSTONE_ORE) || !ore.getValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT)) throw new AssertionError("ore state"); }
+          for(int y=-1;y<=1;y++) { var section=byY.get(y); byte[] bytes=section==null ? new byte[2048] : section.getByteArray("BlockLight").orElse(new byte[2048]); var light=new DataLayer(bytes);
+            for(int ly=0;ly<16;ly++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) { if(light.get(lx,ly,lz)!=(expected[at++]&255)) throw new AssertionError("light mismatch chunk="+x+","+z+" section="+y+" local="+lx+","+ly+","+lz); }
+          }
+        }
+      }
+        for(var entry:documents.entrySet()) try(var out=region.getChunkDataOutputStream(entry.getKey())) { NbtIo.write(entry.getValue(),(DataOutput)out); }
+      }
+      if(at!=expected.length) throw new AssertionError("sample count");
+      var player=NbtIo.readCompressed(world.resolve("players/data/00000000-0000-0000-0000-000000000001.dat"),NbtAccounter.unlimitedHeap());
+      if(!Arrays.equals(player.getIntArray("UUID").orElseThrow(),new int[]{0,0,0,1}) || player.getLongOr("future_player",0)!=83 || player.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=24.5) throw new AssertionError("player data");
+      var clock=NbtIo.readCompressed(world.resolve("data/minecraft/world_clocks.dat"),NbtAccounter.unlimitedHeap()); var overworld=clock.getCompoundOrEmpty("data").getCompoundOrEmpty("minecraft:overworld");
+      if(overworld.getLongOr("total_ticks",0)!=11 || overworld.getIntOr("future_clock",0)!=17) throw new AssertionError("clock data");
+    }
+  }
+}
+"#).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&java_source));
+    let world_path = temp.path().join("world");
+    std::fs::create_dir(&world_path).unwrap();
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LightRegionOracle")
+        .arg("seed")
+        .arg(&world_path));
+    let dimension = DimensionId::parse("minecraft:overworld").unwrap();
+    let player_path = world_path.join("players/data/00000000-0000-0000-0000-000000000001.dat");
+    let clock_path = world_path.join("data/minecraft/world_clocks.dat");
+    let player_source = nbt::read_gzip(std::fs::File::open(&player_path).unwrap()).unwrap();
+    let clock_source = nbt::read_gzip(std::fs::File::open(&clock_path).unwrap()).unwrap();
+    let mut reader = WorldReader::open(&world_path, dimension.clone()).unwrap();
+    let area = reader.read_area(ChunkPos { x: 1, z: 1 }, 1).unwrap();
+    assert_eq!(area.chunks.len(), 9);
+    let world = area.materialize(&dimension).unwrap();
+    drop(reader);
+    let player = PlayerState {
+        position: Vec3::new(24.5, 1.0, 24.5),
+        yaw: 0.0,
+        pitch: 0.0,
+        vertical_velocity: 0.0,
+        on_ground: true,
+        pose: PlayerPose::Standing,
+    };
+    let mut session = LoadedSession::new(
+        world,
+        IVec3::ZERO,
+        BuildBounds {
+            min_y: 0,
+            max_y: 16,
+        },
+        player,
+    )
+    .unwrap();
+    session.set_player_inventory(PlayerInventory::default());
+    session.set_world_clocks(
+        BTreeMap::from([(
+            dimension.clone(),
+            native_persistence::world::SavedClock {
+                total_ticks: 10,
+                ..Default::default()
+            },
+        )]),
+        true,
+    );
+    session.set_random_tick_speed(0);
+    session.submit_command(PlayerCommand::Place);
+    session.update(Duration::from_millis(50));
+    let snapshot = session.snapshot();
+    let SessionWorld::Loaded(loaded) = &snapshot.world else {
+        panic!("loaded world expected")
+    };
+    assert_eq!(
+        loaded
+            .block(24, 2, 22)
+            .unwrap()
+            .properties
+            .get("lit")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(loaded.light(24, 2, 23, false), Some(8));
+    let mut samples = Vec::new();
+    for x in 0..3 {
+        for z in 0..3 {
+            for sy in -1..=1 {
+                for y in 0..16 {
+                    for z0 in 0..16 {
+                        for x0 in 0..16 {
+                            samples.push(
+                                loaded
+                                    .light(x * 16 + x0, sy * 16 + y, z * 16 + z0, false)
+                                    .unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let sample_path = temp.path().join("light.bin");
+    std::fs::write(&sample_path, &samples).unwrap();
+    let dirty = session.dirty_chunk_positions();
+    assert!(dirty.len() > 1, "light should cross chunk boundaries");
+    let make_plan = || {
+        let mut plan = WorldSavePlan::new();
+        for &position in &dirty {
+            let source = &area.chunks[&ChunkPos {
+                x: position.x,
+                z: position.z,
+            }]
+                .document;
+            let draft = session
+                .draft_dirty_chunk_with_lighting(position, source, &tags, |state| {
+                    Ok((state.name.matches("minecraft:air"), false))
+                })
+                .unwrap();
+            plan.add_chunk(dimension.clone(), draft, 1_777_777).unwrap();
+        }
+        session
+            .draft_player_state(&player_source)
+            .unwrap()
+            .add_to_save_plan(&mut plan, [0, 0, 0, 1], &player_source)
+            .unwrap();
+        plan.add_world_clocks(&clock_source, &session.world_clocks())
+            .unwrap();
+        plan
+    };
+    let stale_plan = make_plan();
+    let region_path = world_path.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let original_region = std::fs::read(&region_path).unwrap();
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LightRegionOracle")
+        .arg("alter")
+        .arg(&world_path));
+    let changed_region = std::fs::read(&region_path).unwrap();
+    let unchanged_player = std::fs::read(&player_path).unwrap();
+    let unchanged_clock = std::fs::read(&clock_path).unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world_path).unwrap();
+    assert!(writer.write_plan(stale_plan, |_, _| Ok(())).is_err());
+    drop(writer);
+    assert_eq!(std::fs::read(&region_path).unwrap(), changed_region);
+    assert_eq!(std::fs::read(&player_path).unwrap(), unchanged_player);
+    assert_eq!(std::fs::read(&clock_path).unwrap(), unchanged_clock);
+    assert!(!world_path.join(".minecraft-native-pending").exists());
+    std::fs::write(&region_path, &original_region).unwrap();
+    let plan = make_plan();
+    let mut writer = WorldWriteGuard::acquire(&world_path).unwrap();
+    let result = writer
+        .write_plan(plan, |_, change| {
+            anyhow::ensure!(
+                change.expected.name.matches("minecraft:redstone_ore")
+                    && change.replacement.name.matches("minecraft:redstone_ore"),
+                "unexpected block edit"
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(writer);
+    assert_eq!(
+        std::fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+        original_region
+    );
+    assert_eq!(
+        std::fs::read(
+            result
+                .backup_directory
+                .join("players/00000000-0000-0000-0000-000000000001.dat")
+        )
+        .unwrap(),
+        unchanged_player
+    );
+    assert_eq!(
+        std::fs::read(result.backup_directory.join("world-data/world_clocks.dat")).unwrap(),
+        unchanged_clock
+    );
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LightRegionOracle")
+        .arg("verify")
+        .arg(&world_path)
+        .arg(&sample_path));
+    let mut reader = WorldReader::open(&world_path, dimension.clone()).unwrap();
+    let reloaded = reader.read_area(ChunkPos { x: 1, z: 1 }, 1).unwrap();
+    let reloaded_world = reloaded.materialize(&dimension).unwrap();
+    assert_eq!(
+        reloaded_world
+            .block(24, 2, 22)
+            .unwrap()
+            .properties
+            .get("lit")
+            .map(String::as_str),
+        Some("true")
+    );
+    let mut index = 0;
+    for x in 0..3 {
+        for z in 0..3 {
+            for sy in -1..=1 {
+                for y in 0..16 {
+                    for z0 in 0..16 {
+                        for x0 in 0..16 {
+                            assert_eq!(
+                                reloaded_world
+                                    .light(x * 16 + x0, sy * 16 + y, z * 16 + z0, false)
+                                    .unwrap_or(0),
+                                samples[index]
+                            );
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(index, samples.len());
+    for (position, chunk) in reloaded.chunks {
+        assert_eq!(
+            chunk.document.value.get("future_data"),
+            Some(&Tag::Long(
+                42 + i64::from(position.x) * 3 + i64::from(position.z)
+            ))
+        );
+    }
+}

@@ -77,10 +77,26 @@ pub(super) fn supporting_block<'a>(
     position: DVec3,
     movement: DVec3,
     no_previous_support: bool,
+    block_shape: impl FnMut(IVec3) -> &'a [Aabb],
+) -> Option<IVec3> {
+    supporting_box(
+        position,
+        f64::from(PLAYER_HALF_WIDTH),
+        movement,
+        no_previous_support,
+        block_shape,
+    )
+}
+
+/// Resolve the support for an entity with a square horizontal footprint.
+pub(super) fn supporting_box<'a>(
+    position: DVec3,
+    half: f64,
+    movement: DVec3,
+    no_previous_support: bool,
     mut block_shape: impl FnMut(IVec3) -> &'a [Aabb],
 ) -> Option<IVec3> {
     let find = |offset: DVec3, block_shape: &mut dyn FnMut(IVec3) -> &'a [Aabb]| {
-        let half = f64::from(PLAYER_HALF_WIDTH);
         let area = BoundingBox {
             min: position + offset + DVec3::new(-half, -1.0e-6, -half),
             max: position + offset + DVec3::new(half, 0.0, half),

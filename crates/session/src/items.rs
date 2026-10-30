@@ -224,6 +224,7 @@ struct ItemEntity {
     item: DroppedItem,
     velocity: DVec3,
     on_ground: bool,
+    ground_without_support: bool,
     pickup_delay: i32,
     lifetime: i32,
     no_gravity: bool,
@@ -927,6 +928,7 @@ impl ItemEntities {
                 // lifetime is saved, but Entity.tickCount is not.
                 entity.item.age = 0;
                 entity.item.previous_position = entity.item.position;
+                entity.ground_without_support = false;
                 entity.section_sequence = self.next_section_sequence;
                 self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
             }
@@ -969,6 +971,7 @@ impl ItemEntities {
             },
             velocity: saved.velocity,
             on_ground: saved.on_ground,
+            ground_without_support: false,
             pickup_delay: i32::from(saved.pickup_delay),
             lifetime: i32::from(saved.age),
             no_gravity: saved.no_gravity,
@@ -1007,6 +1010,7 @@ impl ItemEntities {
             },
             velocity,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 10,
             lifetime: 0,
             no_gravity: false,
@@ -1072,6 +1076,7 @@ impl ItemEntities {
             },
             velocity,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 40,
             lifetime: 0,
             no_gravity: false,
@@ -1132,6 +1137,7 @@ impl ItemEntities {
             },
             velocity,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 40,
             lifetime: 0,
             no_gravity: false,
@@ -1307,6 +1313,7 @@ impl ItemEntities {
                     },
                     velocity,
                     on_ground: false,
+                    ground_without_support: false,
                     pickup_delay: 10,
                     lifetime: 0,
                     no_gravity: false,
@@ -1348,6 +1355,7 @@ impl ItemEntities {
             shape,
             friction,
             |_| 0.0,
+            |_| false,
             512,
             |_| native_world::fluid::FluidContacts::default(),
             false,
@@ -1366,12 +1374,24 @@ impl ItemEntities {
         shape: impl FnMut(IVec3) -> &'a [Aabb],
         friction: impl FnMut(IVec3) -> f32,
         bounce: impl FnMut(IVec3) -> f32,
+        keep_support_height: impl FnMut(IVec3) -> bool,
         fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
         path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
     ) {
         self.tick_with_threshold(
-            origin, player, pose, mode, inventory, shape, friction, bounce, 512, fluid, fast_lava,
+            origin,
+            player,
+            pose,
+            mode,
+            inventory,
+            shape,
+            friction,
+            bounce,
+            keep_support_height,
+            512,
+            fluid,
+            fast_lava,
             path,
         );
     }
@@ -1387,6 +1407,7 @@ impl ItemEntities {
         mut shape: impl FnMut(IVec3) -> &'a [Aabb],
         mut friction: impl FnMut(IVec3) -> f32,
         mut bounce: impl FnMut(IVec3) -> f32,
+        mut keep_support_height: impl FnMut(IVec3) -> bool,
         index_threshold: usize,
         mut fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
@@ -1485,6 +1506,32 @@ impl ItemEntities {
                 let hit_z = (requested.z - actual.z).abs() >= f64::from(1.0e-5_f32);
                 let hit_y = requested.y != actual.y;
                 entity.on_ground = hit_y && requested.y < 0.0;
+                let relative_position = entity.item.position - origin.as_dvec3();
+                let support = if entity.on_ground {
+                    let found = movement::supporting_box(
+                        relative_position,
+                        0.125,
+                        actual,
+                        entity.ground_without_support,
+                        &mut shape,
+                    );
+                    entity.ground_without_support = found.is_none();
+                    found
+                } else {
+                    entity.ground_without_support = false;
+                    None
+                };
+                let below = match support {
+                    Some(cell) if keep_support_height(cell) => cell,
+                    Some(cell) => IVec3::new(
+                        cell.x,
+                        (relative_position.y - f64::from(0.500001_f32)).floor() as i32,
+                        cell.z,
+                    ),
+                    None => (relative_position - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
+                        .floor()
+                        .as_ivec3(),
+                };
                 if let Some(created) = &mut entity.created {
                     if entity.on_ground {
                         created.fall_distance = 0.0;
@@ -1500,11 +1547,6 @@ impl ItemEntities {
                     entity.velocity.z = 0.0;
                 }
                 if hit_y {
-                    let below = (entity.item.position
-                        - origin.as_dvec3()
-                        - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
-                    .floor()
-                    .as_ivec3();
                     entity.velocity.y = if entity.on_ground {
                         vertical_restitution(entity.velocity.y, actual.y, bounce(below))
                     } else {
@@ -1513,11 +1555,6 @@ impl ItemEntities {
                 }
                 let drag = 0.98_f32;
                 let ground_drag = if entity.on_ground {
-                    let below = (entity.item.position
-                        - origin.as_dvec3()
-                        - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
-                    .floor()
-                    .as_ivec3();
                     drag * friction(below)
                 } else {
                     drag
@@ -2160,6 +2197,7 @@ mod tests {
             },
             velocity: DVec3::ZERO,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 0,
             lifetime: 0,
             no_gravity: false,
@@ -2850,6 +2888,7 @@ mod tests {
                             },
                             velocity: DVec3::ZERO,
                             on_ground: false,
+                            ground_without_support: false,
                             pickup_delay: 0,
                             lifetime: 0,
                             no_gravity: true,
@@ -2880,6 +2919,7 @@ mod tests {
                                 |_| &[],
                                 |_| 0.6,
                                 |_| 0.0,
+                                |_| false,
                                 threshold,
                                 |_| native_world::fluid::FluidContacts::default(),
                                 false,
@@ -2929,6 +2969,7 @@ mod tests {
                 },
                 velocity: DVec3::ZERO,
                 on_ground: false,
+                ground_without_support: false,
                 pickup_delay: 0,
                 lifetime: 0,
                 no_gravity: true,
@@ -2998,6 +3039,7 @@ mod tests {
                     DVec3::ZERO
                 },
                 on_ground: false,
+                ground_without_support: false,
                 pickup_delay: 0,
                 lifetime: 0,
                 no_gravity: true,
@@ -3080,6 +3122,7 @@ mod tests {
                 },
                 velocity: DVec3::ZERO,
                 on_ground: false,
+                ground_without_support: false,
                 pickup_delay: delay,
                 lifetime,
                 no_gravity: true,
@@ -3134,6 +3177,7 @@ mod tests {
                 },
                 velocity: DVec3::ZERO,
                 on_ground: false,
+                ground_without_support: false,
                 pickup_delay: 0,
                 lifetime: 0,
                 no_gravity: true,
@@ -3191,6 +3235,7 @@ mod tests {
                     DVec3::ZERO
                 },
                 on_ground: false,
+                ground_without_support: false,
                 pickup_delay: 0,
                 lifetime: 0,
                 no_gravity: true,
@@ -3236,6 +3281,7 @@ mod tests {
             },
             velocity: DVec3::ZERO,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 7,
             lifetime: 123,
             no_gravity: true,
@@ -3272,6 +3318,7 @@ mod tests {
             },
             velocity: DVec3::ZERO,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: i32::from(i16::MAX),
             lifetime: i32::from(i16::MIN),
             no_gravity: true,
@@ -3329,6 +3376,7 @@ mod tests {
             },
             velocity: DVec3::ZERO,
             on_ground: false,
+            ground_without_support: false,
             pickup_delay: 0,
             lifetime: 5799,
             no_gravity: true,
@@ -4160,10 +4208,15 @@ public class ItemMotionOracle {
                    RESTITUTE=Entity.class.getDeclaredMethod("restituteMovementAfterCollisions", BlockState.class, boolean.class, boolean.class, Vec3.class); RESTITUTE.setAccessible(true); }
              catch (Exception e) { throw new RuntimeException(e); } }
     static class TestLevel extends ClientLevel {
-        BlockState ground;
+        BlockState ground; boolean supportGrid; boolean twoBlocks;
         TestLevel() { super(null,null,null,null,0,0,null,false,0L,0); }
         @Override public boolean isClientSide() { return true; }
-        @Override public BlockState getBlockState(BlockPos pos) { return ground; }
+        @Override public BlockState getBlockState(BlockPos pos) {
+            if (!supportGrid) return ground;
+            return pos.getY()==0 && pos.getZ()==0 && (pos.getX()==0 || twoBlocks && pos.getX()==1)
+                ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState();
+        }
+        @Override public net.minecraft.world.level.BlockGetter getChunkForCollisions(int x,int z) { return this; }
     }
     static class TestItem extends ItemEntity {
         Vec3 velocity; boolean grounded; boolean noGravity; Level world; int identity;
@@ -4185,6 +4238,7 @@ public class ItemMotionOracle {
         @Override public double getFluidHeight(TagKey<Fluid> tag) { return 1.0; }
         @Override public boolean isNoGravity() { return noGravity; }
         @Override public boolean isSuppressingBounce() { return false; }
+        @Override public boolean isDescending() { return false; }
         @Override public void gameEvent(net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
         @Override public boolean onGround() { return grounded; }
         @Override public int getId() { return identity; }
@@ -4312,6 +4366,16 @@ public class ItemMotionOracle {
             afterReturn.add(((TestItem)entity).identity); return Continuation.CONTINUE;
         });
         output.add(afterReturn);
+        JsonArray supportResults = new JsonArray();
+        for (int mode=0;mode<2;mode++) for (double x : new double[]{0.8,0.9,1.0,1.02,1.12,1.2}) {
+            var world = (TestLevel)unsafe.allocateInstance(TestLevel.class);
+            world.supportGrid=true; world.twoBlocks=mode==1;
+            var item = (TestItem)unsafe.allocateInstance(TestItem.class); item.world=world;
+            item.pos(new Vec3(x,1,0.5));
+            var support = world.findSupportingBlock(item,new AABB(x-0.125,1-1.0e-6,0.375,x+0.125,1,0.625));
+            supportResults.add(support.map(BlockPos::getX).orElse(-99));
+        }
+        output.add(supportResults);
         Files.writeString(Path.of(args[1]),new Gson().toJson(output));
     }
 }
@@ -4409,6 +4473,7 @@ public class ItemMotionOracle {
                         },
                         velocity: DVec3::ZERO,
                         on_ground: false,
+                        ground_without_support: false,
                         pickup_delay,
                         lifetime,
                         no_gravity: true,
@@ -4472,6 +4537,7 @@ public class ItemMotionOracle {
                             },
                             velocity: DVec3::ZERO,
                             on_ground: false,
+                            ground_without_support: false,
                             pickup_delay: 5 + i as i32 * 5,
                             lifetime: 100 + i as i32 * 100,
                             no_gravity: true,
@@ -4540,6 +4606,31 @@ public class ItemMotionOracle {
             .map(|value| value.as_u64().unwrap() as usize)
             .collect();
         assert_eq!(order, returned_order);
+        let support_results = expected[cases.len() + 5].as_array().unwrap();
+        let mut support_index = 0;
+        for mode in 0..2 {
+            for x in [0.8, 0.9, 1.0, 1.02, 1.12, 1.2] {
+                let support = movement::supporting_box(
+                    DVec3::new(x, 1.0, 0.5),
+                    0.125,
+                    DVec3::ZERO,
+                    true,
+                    |pos| {
+                        if pos.y == 0 && pos.z == 0 && (pos.x == 0 || mode == 1 && pos.x == 1) {
+                            native_world::collision::unknown_barrier()
+                        } else {
+                            &[]
+                        }
+                    },
+                );
+                assert_eq!(
+                    support.map_or(-99, |pos| pos.x),
+                    support_results[support_index].as_i64().unwrap() as i32,
+                    "support mode={mode}, x={x}"
+                );
+                support_index += 1;
+            }
+        }
         for (index, case) in cases.iter().enumerate() {
             let mut items = ItemEntities::default();
             let stack =
@@ -4554,6 +4645,7 @@ public class ItemMotionOracle {
                 },
                 velocity: vec(&case["v"]),
                 on_ground: case["ground"].as_bool().unwrap(),
+                ground_without_support: false,
                 pickup_delay: case["delay"].as_i64().unwrap() as i32,
                 lifetime: case["age"].as_i64().unwrap() as i32,
                 no_gravity: case["no_gravity"].as_bool().unwrap(),
@@ -4601,6 +4693,7 @@ public class ItemMotionOracle {
                     },
                     |_| friction,
                     |_| bounce,
+                    |_| false,
                     |bounds| {
                         use native_world::fluid::{Cell, FluidKind, FluidState};
                         let kind = match case["fluid"].as_i64().unwrap() {

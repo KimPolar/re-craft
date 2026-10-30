@@ -4914,6 +4914,12 @@ impl LoadedSession {
                     }),
                     Cell::Missing => 0.0,
                 },
+                |pos| match cell(world, origin, bounds, pos, air) {
+                    Cell::State(id) => world.state(id).is_some_and(|state| {
+                        state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                    }),
+                    Cell::Missing => false,
+                },
                 |item_bounds| {
                     if fluid_view.chunks_loaded(item_bounds) {
                         fluid::contacts(
@@ -5762,6 +5768,12 @@ impl LoadedSession {
                         .map_or(0.0, |_| crate::items::block_bounce_restitution(&state.name))
                 }),
                 Cell::Missing => 0.0,
+            },
+            |pos| match cell(world, origin, bounds, pos, air) {
+                Cell::State(id) => world.state(id).is_some_and(|state| {
+                    state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                }),
+                Cell::Missing => false,
             },
             |item_bounds| {
                 if fluid_view.chunks_loaded(item_bounds) {
@@ -11991,10 +12003,11 @@ mod tests {
 
     #[test]
     fn loaded_item_bounces_on_slime_but_not_stone() {
-        for (name, suppressed, expected_bounce) in [
-            ("minecraft:slime_block", false, true),
-            ("minecraft:slime_block", true, false),
-            ("minecraft:stone", false, false),
+        for (name, suppressed, expected_bounce, x) in [
+            ("minecraft:slime_block", false, true, 4.5),
+            ("minecraft:slime_block", false, true, 5.02),
+            ("minecraft:slime_block", true, false, 5.02),
+            ("minecraft:stone", false, false, 5.02),
         ] {
             let mut session = session();
             if suppressed {
@@ -12002,7 +12015,7 @@ mod tests {
             }
             let block = session.intern_block(state(name, &[]));
             assert!(session.set(IVec3::new(4, 1, 4), block));
-            let position = session.origin.as_dvec3() + DVec3::new(4.5, 2.2, 4.5);
+            let position = session.origin.as_dvec3() + DVec3::new(x, 2.2, 4.5);
             session
                 .dropped_items
                 .spawn_saved(crate::saved_item::SavedItemState {
@@ -12037,7 +12050,7 @@ mod tests {
             assert_eq!(
                 next > landed + 0.001,
                 expected_bounce,
-                "{name}: {landed} -> {next}"
+                "{name} x={x}: {landed} -> {next}"
             );
         }
     }

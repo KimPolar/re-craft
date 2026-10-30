@@ -890,8 +890,11 @@ impl PlayerInventory {
         true
     }
     /// Return the chest to the session after closing, including on death.
+    pub fn has_closed_chest(&self) -> bool {
+        !self.is_open() && self.chest.is_some()
+    }
     pub fn take_closed_chest(&mut self) -> Option<(IVec3, [Option<ItemStack>; 27])> {
-        if self.is_open() {
+        if !self.has_closed_chest() {
             return None;
         }
         let chest = self.chest.take()?;

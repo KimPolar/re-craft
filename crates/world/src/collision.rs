@@ -23,6 +23,10 @@ const HONEY: &[Aabb] = &[Aabb {
     min: Vec3::new(1.0 / 16.0, 0.0, 1.0 / 16.0),
     max: Vec3::new(15.0 / 16.0, 15.0 / 16.0, 15.0 / 16.0),
 }];
+const SINGLE_CHEST: &[Aabb] = &[Aabb {
+    min: Vec3::new(1.0 / 16.0, 0.0, 1.0 / 16.0),
+    max: Vec3::new(15.0 / 16.0, 14.0 / 16.0, 15.0 / 16.0),
+}];
 
 /// Collision and outline for blocks represented by the temporary demo world.
 pub fn demo_shape(block: crate::Block) -> &'static [Aabb] {
@@ -75,6 +79,7 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     // These blocks do not supply a full sturdy face, even where collision
     // geometry (notably leaves) appears to cover the whole cube.
     if id == "honey_block"
+        || matches!(id, "chest" | "trapped_chest")
         || id == "flower_pot"
         || id.starts_with("potted_")
         || id == "glass_pane"
@@ -177,6 +182,22 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if matches!(id, "chest" | "trapped_chest") {
+        return (state.properties.len() == 3
+            && matches!(
+                state.properties.get("facing").map(String::as_str),
+                Some("north" | "south" | "west" | "east")
+            )
+            && state
+                .properties
+                .get("type")
+                .is_some_and(|value| value == "single")
+            && matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            ))
+        .then(|| SINGLE_CHEST.to_vec());
+    }
     if id == "lever" {
         lever_outline(state)?;
         return Some(EMPTY.to_vec());

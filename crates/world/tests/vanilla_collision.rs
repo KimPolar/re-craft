@@ -323,6 +323,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut outlines_checked = 0usize;
     let mut button_states_checked = 0usize;
     let mut lever_states_checked = 0usize;
+    let mut single_chest_states_checked = 0usize;
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
@@ -381,6 +382,14 @@ fn implemented_collision_shapes_match_vanilla_states() {
         let Some(actual) = block_shape(&state) else {
             continue;
         };
+        if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
+            && state
+                .properties
+                .get("type")
+                .is_some_and(|value| value == "single")
+        {
+            single_chest_states_checked += 1;
+        }
         let short_id = id.strip_prefix("minecraft:").unwrap();
         if matches!(
             short_id,
@@ -502,6 +511,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert_eq!(
         lever_states_checked, 24,
         "lever states missing from Java oracle"
+    );
+    assert_eq!(
+        single_chest_states_checked, 16,
+        "single chest states missing from Java oracle"
     );
     assert!(fire_checked >= 2, "fire states missing from Java oracle");
     assert!(plant_checked >= 3, "plant states missing from Java oracle");

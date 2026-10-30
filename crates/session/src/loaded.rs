@@ -225,6 +225,8 @@ pub struct LoadedSession {
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
+    chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
+    chest_dirty_chunks: BTreeSet<ChunkPos>,
     tick_dirty_chunks: BTreeSet<ChunkPos>,
     tick_chunks_needing_dirty: BTreeSet<ChunkPos>,
     block_edits: BTreeMap<ChunkPos, BTreeMap<(i32, i32, i32), RecordedBlockEdit>>,
@@ -1024,6 +1026,10 @@ impl LoadedSession {
             "pending player commands have not reached a tick"
         );
         anyhow::ensure!(
+            self.chest_dirty_chunks.is_empty(),
+            "changed chest inventories require a coordinated world save"
+        );
+        anyhow::ensure!(
             crate::player_data::read_saved_walking_speed(original)? == self.walking_speed,
             "saved walking speed does not match the session"
         );
@@ -1488,6 +1494,8 @@ impl LoadedSession {
         self.dirty_chunks.contains(&position)
             || self.tick_dirty_chunks.contains(&position)
             || self.tick_chunks_needing_dirty.contains(&position)
+            || self.chest_dirty_chunks.contains(&position)
+            || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p }) if p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)
     }
 
     // Activated entity data is the source for drafts even when its terrain is
@@ -1812,6 +1820,8 @@ impl LoadedSession {
             snapshot,
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
+            chest_contents: BTreeMap::new(),
+            chest_dirty_chunks: BTreeSet::new(),
             tick_dirty_chunks: BTreeSet::new(),
             tick_chunks_needing_dirty: BTreeSet::new(),
             block_edits: BTreeMap::new(),
@@ -2292,7 +2302,73 @@ impl LoadedSession {
             .saved_block_entities
             .get(&chunk)
             .context("block entity chunk is unavailable")?;
-        crate::saved_chest::read(payload, chunk, position)
+        let saved = crate::saved_chest::read(payload, chunk, position)?;
+        let key = (position.x, position.y, position.z);
+        if let Some(current) = self.chest_contents.get(&key) {
+            anyhow::ensure!(
+                saved
+                    .as_ref()
+                    .is_some_and(|source| source.source() == current.source()),
+                "saved chest source changed while the session was active"
+            );
+            return Ok(Some(current.clone()));
+        }
+        Ok(saved)
+    }
+
+    /// Return closed container contents to their owning block before any
+    /// further menu can open. Dirty chunks remain resident or parked.
+    fn collect_closed_chest(&mut self) {
+        if !self.inventory.has_closed_chest() {
+            return;
+        }
+        let Some((position, slots)) = Arc::make_mut(&mut self.inventory).take_closed_chest() else {
+            return;
+        };
+        let key = (position.x, position.y, position.z);
+        let chest = self
+            .chest_contents
+            .get_mut(&key)
+            .expect("opened chest has an owner");
+        if chest.slots != slots {
+            chest.slots = slots;
+            self.chest_dirty_chunks.insert(ChunkPos {
+                x: position.x.div_euclid(16),
+                z: position.z.div_euclid(16),
+            });
+        }
+    }
+
+    fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
+        let Some(position) = add(self.origin, relative) else {
+            return false;
+        };
+        let Some(above) = add(relative, IVec3::Y) else {
+            return false;
+        };
+        let Cell::State(id) = cell(&self.world, self.origin, self.bounds, above, self.states[0])
+        else {
+            return false;
+        };
+        let Some(above) = self.world.state(id) else {
+            return false;
+        };
+        // Unknown conductor behavior must not be treated as open space.
+        if !matches!(
+            crate::redstone::source(above, IVec3::Y),
+            Some((_, _, false))
+        ) {
+            return false;
+        }
+        let Ok(Some(chest)) = self.saved_chest(position) else {
+            return false;
+        };
+        let key = (position.x, position.y, position.z);
+        if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
+            return false;
+        }
+        self.chest_contents.insert(key, chest);
+        true
     }
 
     /// Draft an existing saved item; this does not authorize a world write.
@@ -4528,6 +4604,13 @@ impl LoadedSession {
             return None;
         };
         let block = self.world.state(id)?;
+        // Block-entity removal and item scattering are not coordinated yet.
+        if matches!(
+            block.name.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest"
+        ) {
+            return None;
+        }
         if mining::requires_game_master_permission(&block.name)
             && (self.game_mode != GameMode::Creative || !self.game_master_permission)
         {
@@ -6726,6 +6809,7 @@ impl LoadedSession {
                         let off = self.inventory.slot(crate::inventory::PlayerSlot::Offhand);
                         let bypass = self.sneak && (main.is_some() || off.is_some());
                         let table = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:crafting_table"));
+                        let chest = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:chest" | "minecraft:trapped_chest")));
                         let ore = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).and_then(redstone_ore_lit).is_some());
                         let block_item = main.is_some_and(|item| {
                             Block::from_item_id(item.id()).is_some()
@@ -6753,6 +6837,14 @@ impl LoadedSession {
                                 && (self.use_button(hit.position) || self.use_lever(hit.position))
                             {
                                 handled = true;
+                            } else if chest && (self.game_mode == GameMode::Spectator || !bypass) {
+                                handled = true;
+                                self.mining.release();
+                                if self.try_open_saved_chest(hit.position)
+                                    && self.game_mode != GameMode::Spectator
+                                {
+                                    self.first_person.swing.start(crate::animation::Hand::Main);
+                                }
                             } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
                                 handled = true;
                                 self.mining.release();
@@ -6834,6 +6926,7 @@ impl LoadedSession {
                 }
                 PlayerCommand::Place => {}
             }
+            self.collect_closed_chest();
             update_recipe_unlocks(
                 &mut self.inventory,
                 &before_inventory,
@@ -7427,10 +7520,18 @@ impl LoadedSession {
             camera_flying,
             self.fov_effect_scale,
         );
-        if let Some(InventoryMenu::CraftingTable { position }) = self.inventory.menu() {
+        if let Some(menu @ (InventoryMenu::CraftingTable { .. } | InventoryMenu::Chest { .. })) =
+            self.inventory.menu()
+        {
+            let position = match menu {
+                InventoryMenu::CraftingTable { position } | InventoryMenu::Chest { position } => {
+                    position
+                }
+                InventoryMenu::Player => unreachable!(),
+            };
             let relative = subtract(position, self.origin);
             let valid = relative.is_some_and(|relative| {
-                matches!(cell(&self.world, self.origin, self.bounds, relative, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:crafting_table"))
+                matches!(cell(&self.world, self.origin, self.bounds, relative, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| match menu { InventoryMenu::CraftingTable { .. } => state.name == "minecraft:crafting_table", InventoryMenu::Chest { .. } => matches!(state.name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") && state.properties.get("type").is_some_and(|value| value == "single"), InventoryMenu::Player => false }))
                     && within_crafting_range(self.motion.position, self.player.pose, relative, self.game_mode)
             });
             if !valid && let Some(drops) = Arc::make_mut(&mut self.inventory).toggle_with_drops() {
@@ -7445,6 +7546,7 @@ impl LoadedSession {
                 }
             }
         }
+        self.collect_closed_chest();
         let world = &self.world;
         let shapes = &self.shapes;
         let origin = self.origin;
@@ -7543,6 +7645,7 @@ impl LoadedSession {
         }
         if self.death.is_some() {
             self.process_death();
+            self.collect_closed_chest();
             self.refresh_respawn_availability();
         }
         self.tick += 1;
@@ -11046,8 +11149,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn saved_single_chest_follows_chunk_unload_and_reload() {
+    fn saved_chest_fixture() -> (LoadedSession, World, IVec3, ChunkPos) {
         use native_persistence::nbt::{self, NamedTag, Tag, TagType};
         use native_world::loaded::SavedBlockEntities;
         let (mut world, origin, player) = fixture();
@@ -11106,6 +11208,15 @@ mod tests {
             player,
         )
         .unwrap();
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
+        session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
+        (session, source, position, home)
+    }
+
+    #[test]
+    fn saved_single_chest_follows_chunk_unload_and_reload() {
+        let (mut session, source, position, home) = saved_chest_fixture();
         let read = |session: &LoadedSession| {
             session.saved_chest(position).unwrap().unwrap().slots[3]
                 .as_ref()
@@ -11125,6 +11236,121 @@ mod tests {
         session.queue_loaded_chunk(home, source);
         session.apply_streaming();
         assert_eq!(read(&session), 5);
+    }
+
+    #[test]
+    fn saved_chest_opens_moves_items_and_survives_streaming() {
+        use crate::inventory::PlayerSlot;
+        let (mut session, source, position, home) = saved_chest_fixture();
+        session.set_player_inventory(PlayerInventory::default());
+        assert_eq!(session.ray_hit().unwrap().position, IVec3::new(8, 2, 6));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest { position })
+        );
+        let old = session.snapshot();
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(3),
+        });
+        session.update(TICK);
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            5
+        );
+        assert!(session.inventory.slot(PlayerSlot::Chest(3)).is_none());
+        assert_eq!(old.inventory.slot(PlayerSlot::Chest(3)).unwrap().count(), 5);
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        assert!(!session.inventory.is_open());
+        assert!(session.saved_chest(position).unwrap().unwrap().slots[3].is_none());
+        assert!(session.chest_dirty_chunks.contains(&home));
+        assert!(session.has_unsaved_chunk_changes(home));
+        let player_source = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![]),
+        };
+        let error = session.draft_player_state(&player_source).unwrap_err();
+        assert!(format!("{error:#}").contains("changed chest inventories"));
+        let remote = ChunkPos {
+            x: home.x + 3,
+            z: home.z,
+        };
+        session.queue_chunk_window(remote, 0);
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&home));
+        session.queue_chunk_window(home, 0);
+        session.queue_loaded_chunk(home, source);
+        session.apply_streaming();
+        assert!(session.saved_chest(position).unwrap().unwrap().slots[3].is_none());
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest { position })
+        );
+        assert!(session.inventory.slot(PlayerSlot::Chest(3)).is_none());
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn chest_blocked_by_solid_and_unrecognized_above_stays_closed() {
+        let (mut session, _, _, _) = saved_chest_fixture();
+        let above = IVec3::new(8, 3, 6);
+        assert!(session.set(above, session.states[3]));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(!session.inventory.is_open());
+        let unknown = session.intern_block(state("example:unknown", &[]));
+        assert!(session.set(above, unknown));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(!session.inventory.is_open());
+        assert!(session.set(above, session.states[0]));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(matches!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest { .. })
+        ));
+    }
+
+    #[test]
+    fn chest_closes_when_player_moves_out_of_range_without_losing_items() {
+        use crate::inventory::PlayerSlot;
+        let (mut session, _, position, home) = saved_chest_fixture();
+        session.set_player_inventory(PlayerInventory::default());
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(3),
+        });
+        session.update(TICK);
+        session.motion.position.x += 12.0;
+        session.update(TICK);
+        assert!(!session.inventory.is_open());
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            5
+        );
+        assert!(session.saved_chest(position).unwrap().unwrap().slots[3].is_none());
+        assert!(session.chest_dirty_chunks.contains(&home));
     }
 
     #[test]

@@ -7,9 +7,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use glam::Vec3;
-use glam::{DVec3, IVec3};
+use glam::{DVec3, IVec3, Vec3};
 use native_persistence::heightmap::{
     BlockHeightFlags, HeightBounds, SpawnHeightmapKind, SpawnHeightmaps,
 };
@@ -226,6 +224,7 @@ pub struct LoadedSession {
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
+    placed_chests: BTreeSet<(i32, i32, i32)>,
     chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
     open_trapped_chests: BTreeSet<(i32, i32, i32)>,
@@ -1986,6 +1985,7 @@ impl LoadedSession {
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
+            placed_chests: BTreeSet::new(),
             chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
             open_trapped_chests: BTreeSet::new(),
@@ -2469,6 +2469,18 @@ impl LoadedSession {
             ),
             "unsupported chest type"
         );
+        let key = (position.x, position.y, position.z);
+        if self.placed_chests.contains(&key) {
+            let chest = self
+                .chest_contents
+                .get(&key)
+                .context("placed chest data is unavailable")?;
+            anyhow::ensure!(
+                matches!(chest.source().get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(&block.name)),
+                "placed chest block entity does not match its block"
+            );
+            return Ok(Some(chest.clone()));
+        }
         let payload = self
             .world
             .saved_block_entities
@@ -2486,7 +2498,6 @@ impl LoadedSession {
                 "chest block entity does not match its block type"
             );
         }
-        let key = (position.x, position.y, position.z);
         if let Some(current) = self.chest_contents.get(&key) {
             anyhow::ensure!(
                 saved
@@ -2720,10 +2731,14 @@ impl LoadedSession {
             x: position.x.div_euclid(16),
             z: position.z.div_euclid(16),
         };
-        if matches!(
-            self.world.saved_block_entities.get(&chunk),
-            None | Some(native_world::loaded::SavedBlockEntities::Unavailable)
-        ) {
+        if !self
+            .placed_chests
+            .contains(&(position.x, position.y, position.z))
+            && matches!(
+                self.world.saved_block_entities.get(&chunk),
+                None | Some(native_world::loaded::SavedBlockEntities::Unavailable)
+            )
+        {
             return None;
         }
         let count = u32::from(
@@ -4853,6 +4868,164 @@ impl LoadedSession {
         };
         let id = self.intern_block(block);
         self.set(target, id).then_some(hand)
+    }
+
+    fn place_chest(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        use native_persistence::nbt::Tag;
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if !matches!(held.id(), "minecraft:chest" | "minecraft:trapped_chest")
+            || held.max_count().is_none()
+            || !matches!(held.components(), Tag::Compound(fields) if fields.is_empty())
+        {
+            return None;
+        }
+        let name = held.id().to_owned();
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let replace = button_can_replace(self.world.state(clicked)?)?;
+        let target = if replace {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(old) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let old_state = self.world.state(old)?;
+        if button_can_replace(old_state) != Some(true) {
+            return None;
+        }
+        let water = if old_state.name == "minecraft:water" {
+            self.ordinary_fluid(old).is_some()
+        } else {
+            false
+        };
+        if old_state.name == "minecraft:water" && !water {
+            return None;
+        }
+        let absolute = add(self.origin, target)?;
+        let key = (absolute.x, absolute.y, absolute.z);
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        if self.placed_chests.contains(&key)
+            || crate::saved_chest::read(
+                self.world.saved_block_entities.get(&chunk)?,
+                chunk,
+                absolute,
+            )
+            .ok()?
+            .is_some()
+        {
+            return None;
+        }
+        if !self.player.yaw.is_finite() {
+            return None;
+        }
+        let java_yaw = f64::from(self.player.yaw.to_degrees() - 180.0);
+        let horizontal = [IVec3::Z, IVec3::NEG_X, IVec3::NEG_Z, IVec3::X]
+            [(((java_yaw / 90.0 + 0.5).floor() as i32) & 3) as usize];
+        let placed = crate::chest_placement::placement(
+            &name,
+            horizontal,
+            hit.face,
+            self.sneak,
+            water,
+            |direction| {
+                let neighbor = add(target, direction)?;
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    neighbor,
+                    self.states[0],
+                ) else {
+                    return None;
+                };
+                self.world.state(id)
+            },
+        )?;
+        let shape = block_shape(&placed)?;
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let partner = if placed.properties.get("type")?.as_str() == "single" {
+            None
+        } else {
+            let direction = native_world::collision::chest_connection(&placed)?;
+            let pos = add(target, direction)?;
+            let partner_position = add(self.origin, pos)?;
+            let partner_chunk = ChunkPos {
+                x: partner_position.x.div_euclid(16),
+                z: partner_position.z.div_euclid(16),
+            };
+            if self.world.chunks.get(&partner_chunk)?.status.as_deref() != Some("minecraft:full") {
+                return None;
+            }
+            let Cell::State(id) = cell(&self.world, self.origin, self.bounds, pos, self.states[0])
+            else {
+                return None;
+            };
+            let mut state = self.world.state(id)?.clone();
+            if state.name != name || state.properties.get("type")?.as_str() != "single" {
+                return None;
+            }
+            state.properties.insert(
+                "type".into(),
+                if placed.properties.get("type")?.as_str() == "left" {
+                    "right"
+                } else {
+                    "left"
+                }
+                .into(),
+            );
+            Some((pos, state))
+        };
+        let id = self.intern_block(placed);
+        self.placed_chests.insert(key);
+        self.chest_contents
+            .insert(key, crate::saved_chest::SavedChest::placed(absolute, &name));
+        if !self.set(target, id) {
+            self.placed_chests.remove(&key);
+            self.chest_contents.remove(&key);
+            return None;
+        }
+        if let Some((pos, state)) = partner {
+            let id = self.intern_block(state);
+            if !self.set(pos, id) {
+                self.set(target, old);
+                self.placed_chests.remove(&key);
+                self.chest_contents.remove(&key);
+                return None;
+            }
+        }
+        Some(hand)
     }
 
     fn ray_hit(&self) -> Option<ShapeRayHit> {
@@ -7218,6 +7391,8 @@ impl LoadedSession {
                                     "minecraft:redstone_lamp"
                                         | "minecraft:redstone_block"
                                         | "minecraft:lever"
+                                        | "minecraft:chest"
+                                        | "minecraft:trapped_chest"
                                 )
                         });
                         let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
@@ -7264,8 +7439,10 @@ impl LoadedSession {
                             {
                                 handled = true;
                             } else if self.game_mode.allows_basic_building()
-                                && let Some(hand) =
-                                    self.place_button(hit).or_else(|| self.place_redstone(hit))
+                                && let Some(hand) = self
+                                    .place_button(hit)
+                                    .or_else(|| self.place_redstone(hit))
+                                    .or_else(|| self.place_chest(hit))
                             {
                                 handled = true;
                                 let swing = if hand == crate::inventory::PlayerSlot::Offhand {
@@ -8869,6 +9046,11 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         block_outline(block).is_some()
     } else if block.name == "minecraft:redstone_lamp" {
         redstone_lamp_lit(block).is_some()
+    } else if matches!(
+        block.name.as_str(),
+        "minecraft:chest" | "minecraft:trapped_chest"
+    ) {
+        block_shape(block).is_some()
     } else {
         block.name == "minecraft:redstone_block" && block.properties.is_empty()
     };
@@ -8922,6 +9104,13 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
 /// These default block behaviors were checked with a stone-button placement
 /// context. Other replaceable states can have item-specific rules.
 fn button_can_replace(block: &BlockState) -> Option<bool> {
+    if matches!(
+        block.name.as_str(),
+        "minecraft:chest" | "minecraft:trapped_chest"
+    ) {
+        block_shape(block)?;
+        return Some(false);
+    }
     let id = block.name.strip_prefix("minecraft:")?;
     if matches!(
         id,
@@ -11658,6 +11847,191 @@ mod tests {
             );
         session.set_random_tick_speed(0);
         (session, position, chunk)
+    }
+
+    #[test]
+    fn placed_chests_open_and_consume_the_correct_hand() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        for name in ["minecraft:chest", "minecraft:trapped_chest"] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                    let mut session = session();
+                    let chunk = session.player_chunk().unwrap();
+                    Arc::make_mut(&mut session.world)
+                        .saved_block_entities
+                        .insert(chunk, SavedBlockEntities::Empty);
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(
+                        hand,
+                        ItemStack::new(name.into(), 2, 64, Tag::Compound(vec![])),
+                    );
+                    session.set_player_inventory(inventory);
+                    session.set_game_mode(mode);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    let target = session.origin + IVec3::new(8, 2, 7);
+                    let block = session.world.block(target.x, target.y, target.z).unwrap();
+                    if mode == GameMode::Adventure {
+                        assert_eq!(block.name, "minecraft:air");
+                        assert_eq!(session.inventory.slot(hand).unwrap().count(), 2);
+                        continue;
+                    }
+                    assert_eq!(block.name, name);
+                    assert_eq!(
+                        block.properties.get("type").map(String::as_str),
+                        Some("single")
+                    );
+                    assert_eq!(
+                        session.inventory.slot(hand).unwrap().count(),
+                        if mode == GameMode::Creative { 2 } else { 1 }
+                    );
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    assert!(
+                        matches!(session.inventory.menu(), Some(InventoryMenu::Chest { position, other: None }) if position == target)
+                    );
+                    assert!(session.inventory.slot(PlayerSlot::Chest(0)).is_none());
+                    if name == "minecraft:trapped_chest" {
+                        assert_eq!(
+                            session.redstone_source(target - session.origin, IVec3::Y),
+                            Some((1, 1, false))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placed_chests_join_and_keep_separate_inventories() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:chest".into(), 2, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        for x in [5, 6] {
+            let hit = ShapeRayHit {
+                position: IVec3::new(x, 0, 5),
+                face: IVec3::Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(session.place_chest(hit), Some(PlayerSlot::Storage(0)));
+        }
+        let first = IVec3::new(5, 1, 5);
+        let second = IVec3::new(6, 1, 5);
+        let state_at = |relative: IVec3| {
+            let p = session.origin + relative;
+            session.world.block(p.x, p.y, p.z).unwrap().properties["type"].clone()
+        };
+        assert_eq!(state_at(first), "right");
+        assert_eq!(state_at(second), "left");
+        assert!(session.try_open_saved_chest(first));
+        assert!(matches!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest { other: Some(_), .. })
+        ));
+        assert!(session.inventory.slot(PlayerSlot::Chest(53)).is_none());
+    }
+
+    #[test]
+    fn placed_chest_waterlogging_streaming_and_missing_entity_data() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:chest".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        let target = IVec3::new(5, 1, 5);
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set(target, water));
+        let hit = ShapeRayHit {
+            position: target,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        assert!(session.place_chest(hit).is_none());
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Unavailable);
+        assert!(session.place_chest(hit).is_none());
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        let source = (*session.world).clone();
+        assert!(session.place_chest(hit).is_some());
+        let pos = session.origin + target;
+        assert_eq!(
+            session.world.block(pos.x, pos.y, pos.z).unwrap().properties["waterlogged"],
+            "true"
+        );
+        session.queue_chunk_window(
+            ChunkPos {
+                x: chunk.x + 3,
+                z: chunk.z,
+            },
+            0,
+        );
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&chunk));
+        session.queue_chunk_window(chunk, 0);
+        session.queue_loaded_chunk(chunk, source);
+        session.apply_streaming();
+        assert!(session.try_open_saved_chest(target));
+        assert!(
+            matches!(session.inventory.menu(), Some(InventoryMenu::Chest { position, .. }) if position == pos)
+        );
+    }
+
+    #[test]
+    fn creative_pick_selects_chest_types() {
+        use crate::inventory::PlayerSlot;
+        for trapped in [false, true] {
+            let (mut session, position) = if trapped {
+                let (session, position, _) = trapped_chest_fixture();
+                (session, position)
+            } else {
+                let (session, _, position, _) = saved_chest_fixture();
+                (session, position)
+            };
+            session.set_game_mode(GameMode::Creative);
+            session.set_player_inventory(PlayerInventory::default());
+            assert_eq!(
+                session.ray_hit().unwrap().position,
+                position - session.origin
+            );
+            session.submit_command(PlayerCommand::PickBlock);
+            session.update(TICK);
+            let item = session
+                .inventory
+                .slot(PlayerSlot::Storage(session.inventory.selected()))
+                .unwrap();
+            assert_eq!(
+                item.id(),
+                if trapped {
+                    "minecraft:trapped_chest"
+                } else {
+                    "minecraft:chest"
+                }
+            );
+        }
     }
 
     #[test]

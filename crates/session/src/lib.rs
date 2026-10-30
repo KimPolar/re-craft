@@ -19,6 +19,7 @@ use native_world::{Block, World};
 pub mod animation;
 pub mod camera;
 pub mod chest_lid;
+pub mod chest_placement;
 mod equipment_attributes;
 pub use equipment_attributes::ArmorValues;
 pub mod equippable;

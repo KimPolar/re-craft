@@ -18,6 +18,20 @@ pub struct SavedChest {
 }
 
 impl SavedChest {
+    pub(crate) fn placed(position: IVec3, id: &str) -> Self {
+        let slots = std::array::from_fn(|_| None);
+        Self {
+            position,
+            slots: slots.clone(),
+            original_slots: slots,
+            source: Arc::new(Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(position.x)),
+                ("y".into(), Tag::Int(position.y)),
+                ("z".into(), Tag::Int(position.z)),
+            ])),
+        }
+    }
     pub fn source(&self) -> &Tag {
         &self.source
     }

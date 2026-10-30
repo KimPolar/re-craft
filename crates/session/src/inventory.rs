@@ -2278,6 +2278,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "crafting_table",
     "furnace",
     "chest",
+    "trapped_chest",
     "torch",
     "hanging_roots",
     "bamboo_planks",

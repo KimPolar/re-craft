@@ -1937,6 +1937,91 @@ fn button_neighbor_signal_matches_vanilla() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn chest_placement_states_match_vanilla() {
+    use glam::IVec3;
+    use native_world::loaded::BlockState;
+    use std::collections::BTreeMap;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("ChestPlacementOracle.java");
+    let output = temp.path().join("placement.json");
+    std::fs::write(&source, include_str!("java/ChestPlacementOracle.java")).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ChestPlacementOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), 6528);
+    let direction = |name: &str| match name {
+        "north" => IVec3::NEG_Z,
+        "south" => IVec3::Z,
+        "west" => IVec3::NEG_X,
+        "east" => IVec3::X,
+        "up" => IVec3::Y,
+        "down" => IVec3::NEG_Y,
+        _ => panic!("unknown direction"),
+    };
+    let air = BlockState {
+        name: "minecraft:air".into(),
+        properties: BTreeMap::new(),
+    };
+    for row in &rows {
+        let id = if row["trapped"].as_bool().unwrap() {
+            "minecraft:trapped_chest"
+        } else {
+            "minecraft:chest"
+        };
+        let mut blocks = BTreeMap::new();
+        for neighbor in row["neighbors"].as_array().unwrap() {
+            blocks.insert(
+                direction(neighbor["dir"].as_str().unwrap()).to_array(),
+                BlockState {
+                    name: id.into(),
+                    properties: [
+                        ("facing".into(), neighbor["facing"].as_str().unwrap().into()),
+                        ("type".into(), neighbor["type"].as_str().unwrap().into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            );
+        }
+        let actual = native_session::chest_placement::placement(
+            id,
+            direction(row["look"].as_str().unwrap()),
+            direction(row["face"].as_str().unwrap()),
+            row["sneak"].as_bool().unwrap(),
+            row["water"].as_bool().unwrap(),
+            |dir| Some(blocks.get(&dir.to_array()).unwrap_or(&air)),
+        )
+        .unwrap();
+        let expected: BTreeMap<String, String> = row["properties"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().into()))
+            .collect();
+        assert_eq!(actual.properties, expected, "{row}");
+    }
+    eprintln!(
+        "Compared {} chest placement states with Java 26.3",
+        rows.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn trapped_chest_signal_matches_vanilla() {
     use glam::IVec3;
     use native_world::loaded::BlockState;

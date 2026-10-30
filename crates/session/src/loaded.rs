@@ -7835,7 +7835,21 @@ fn stone_button_can_replace(block: &BlockState) -> Option<bool> {
     ) {
         return Some(true);
     }
-    if id.ends_with("_slab") || id.ends_with("_stairs") || id.ends_with("_button") {
+    if id.ends_with("_slab")
+        || id.ends_with("_stairs")
+        || id.ends_with("_button")
+        || id.ends_with("_leaves")
+        || id.ends_with("_fence")
+        || id.ends_with("_bed")
+        || id.ends_with("_stained_glass_pane")
+        || id.starts_with("potted_")
+        || matches!(
+            id,
+            "dirt_path" | "farmland" | "honey_block" | "flower_pot" | "glass_pane" | "iron_bars"
+        )
+    {
+        // Reject malformed known shapes instead of treating them as reliable support.
+        block_shape(block)?;
         return Some(false);
     }
     if button_support_face(block, IVec3::Y) == Some(true) {
@@ -19318,6 +19332,182 @@ mod tests {
                     "changed support {kind} {face:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn additional_supports_update_attached_buttons_on_every_face() {
+        let cases = [
+            state("minecraft:dirt_path", &[]),
+            state("minecraft:farmland", &[("moisture", "7")]),
+            state(
+                "minecraft:straw_bed",
+                &[("part", "head"), ("facing", "north"), ("occupied", "false")],
+            ),
+            state("minecraft:honey_block", &[]),
+            state(
+                "minecraft:oak_leaves",
+                &[
+                    ("distance", "1"),
+                    ("persistent", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "true"),
+                    ("south", "false"),
+                    ("west", "true"),
+                    ("east", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                "minecraft:glass_pane",
+                &[
+                    ("north", "true"),
+                    ("south", "true"),
+                    ("west", "false"),
+                    ("east", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                "minecraft:red_bed",
+                &[("part", "head"), ("facing", "north"), ("occupied", "false")],
+            ),
+            state("minecraft:flower_pot", &[]),
+        ];
+        for support_state in cases {
+            assert_eq!(stone_button_can_replace(&support_state), Some(false));
+            for face in [
+                IVec3::X,
+                IVec3::NEG_X,
+                IVec3::Y,
+                IVec3::NEG_Y,
+                IVec3::Z,
+                IVec3::NEG_Z,
+            ] {
+                let expected = matches!(
+                    support_state.name.as_str(),
+                    "minecraft:dirt_path" | "minecraft:farmland" | "minecraft:straw_bed"
+                ) && face == IVec3::NEG_Y;
+                assert_eq!(
+                    button_support_face(&support_state, face),
+                    Some(expected),
+                    "{support_state:?} {face:?}"
+                );
+                let mut session = session();
+                let support = IVec3::new(8, 2, 6);
+                let button = support + face;
+                let button_id = session.intern_block(stone_button_state(face, 0.0).unwrap());
+                assert!(session.set(button, button_id));
+                let support_id = session.intern_block(support_state.clone());
+                assert!(session.set(support, support_id));
+                assert!(
+                    matches!(cell(&session.world, session.origin, session.bounds, button, session.states[0]), Cell::State(id) if (id == button_id) == expected),
+                    "{support_state:?} {face:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn button_placement_skips_nonsturdy_leaves_for_next_support() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:stone_button".into(),
+                1,
+                64,
+                Tag::Compound(vec![]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        let support = IVec3::new(8, 2, 6);
+        let leaves = session.intern_block(state(
+            "minecraft:oak_leaves",
+            &[
+                ("distance", "1"),
+                ("persistent", "false"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set(support, leaves));
+        let hit = ShapeRayHit {
+            position: support,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        let target = support + hit.face;
+        let directions =
+            button_placement_directions(session.player.yaw, session.player.pitch, hit.face, false)
+                .unwrap();
+        assert!(session.set(target + directions[1], session.states[3]));
+        assert_eq!(
+            session.place_stone_button(hit),
+            Some(PlayerSlot::Storage(0))
+        );
+        let absolute = session.origin + target;
+        let placed = session
+            .world
+            .block(absolute.x, absolute.y, absolute.z)
+            .unwrap();
+        assert_eq!(stone_button_support_direction(placed), Some(directions[1]));
+    }
+
+    #[test]
+    fn button_can_attach_beneath_paths_and_straw_beds() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for support_state in [
+            state("minecraft:dirt_path", &[]),
+            state("minecraft:farmland", &[("moisture", "0")]),
+            state(
+                "minecraft:straw_bed",
+                &[("part", "foot"), ("facing", "north"), ("occupied", "false")],
+            ),
+        ] {
+            let mut session = session();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:stone_button".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            let support = IVec3::new(8, 2, 6);
+            let target = support + IVec3::NEG_Y;
+            session.set(target, session.states[0]);
+            let support_id = session.intern_block(support_state.clone());
+            assert!(session.set(support, support_id));
+            let hit = ShapeRayHit {
+                position: support,
+                face: IVec3::NEG_Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(
+                session.place_stone_button(hit),
+                Some(PlayerSlot::Storage(0)),
+                "{support_state:?}"
+            );
+            let absolute = session.origin + target;
+            let placed = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(stone_button_support_direction(placed), Some(IVec3::Y));
         }
     }
 

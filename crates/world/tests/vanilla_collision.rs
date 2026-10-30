@@ -21,6 +21,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.DirectionalPlaceContext;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
@@ -39,6 +40,8 @@ public class CollisionOracle {
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        Items.STONE_BUTTON.builtInRegistryHolder().bindComponents(net.minecraft.core.component.DataComponentMap.builder().set(net.minecraft.core.component.DataComponents.MAX_STACK_SIZE, 64).build());
+        ItemStack button = new ItemStack(Items.STONE_BUTTON);
         var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
         var world = (World)((sun.misc.Unsafe)field.get(null)).allocateInstance(World.class);
         JsonArray all = new JsonArray();
@@ -51,6 +54,7 @@ public class CollisionOracle {
             record.addProperty("fallingFree", FallingBlock.isFree(state));
             world.state = state;
             record.addProperty("landingReplaceable", state.canBeReplaced(new DirectionalPlaceContext(world, BlockPos.ZERO, Direction.DOWN, ItemStack.EMPTY, Direction.UP)));
+            record.addProperty("buttonReplaceable", state.canBeReplaced(new DirectionalPlaceContext(world, BlockPos.ZERO, Direction.DOWN, button, Direction.UP)));
             if (java.util.Set.of("minecraft:short_grass", "minecraft:fern", "minecraft:dead_bush").contains(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString())) {
                 world.state = state;
                 record.addProperty("fallingReplaceable", state.canBeReplaced(new DirectionalPlaceContext(world, BlockPos.ZERO, Direction.DOWN, ItemStack.EMPTY, Direction.UP)));
@@ -323,6 +327,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut plant_checked = 0usize;
     let mut liquid_checked = 0usize;
     let mut soil_cover_checked = 0usize;
+    let mut partial_support_checked = 0usize;
     let mut failures = Vec::new();
     for entry in records.as_array().unwrap() {
         let id = entry["id"].as_str().unwrap();
@@ -368,6 +373,30 @@ fn implemented_collision_shapes_match_vanilla_states() {
         let Some(actual) = block_shape(&state) else {
             continue;
         };
+        let short_id = id.strip_prefix("minecraft:").unwrap();
+        if matches!(
+            short_id,
+            "dirt_path"
+                | "farmland"
+                | "straw_bed"
+                | "honey_block"
+                | "flower_pot"
+                | "glass_pane"
+                | "iron_bars"
+        ) || short_id.starts_with("potted_")
+            || short_id.ends_with("_leaves")
+            || short_id.ends_with("_fence")
+            || short_id.ends_with("_bed")
+            || short_id.ends_with("_stained_glass_pane")
+        {
+            assert_eq!(
+                entry["buttonReplaceable"].as_bool(),
+                Some(false),
+                "{state:?}"
+            );
+            assert!(!entry["dynamic"].as_bool().unwrap(), "{state:?}");
+            partial_support_checked += 1;
+        }
         if id.ends_with("_button") {
             assert!(
                 block_outline(&state).is_some(),
@@ -455,6 +484,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
         "slab and stair support states missing"
     );
     assert!(
+        partial_support_checked > 1000,
+        "additional support families missing"
+    );
+    assert!(
         button_states_checked >= 24,
         "button states missing from Java oracle"
     );
@@ -470,6 +503,6 @@ fn implemented_collision_shapes_match_vanilla_states() {
         failures.join("\n")
     );
     println!(
-        "Compared {checked} collision and {outlines_checked} targeting shapes, including {button_states_checked} button states, {sturdy_checked} support faces and {soil_cover_checked} slab/stair solidity states, against Minecraft 26.3"
+        "Compared {checked} collision and {outlines_checked} targeting shapes, including {button_states_checked} button states, {sturdy_checked} support faces, {partial_support_checked} extra support states and {soil_cover_checked} slab/stair solidity states, against Minecraft 26.3"
     );
 }

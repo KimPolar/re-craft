@@ -69,10 +69,27 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     if shape.is_empty() {
         return Some(false);
     }
+    if matches!(id, "dirt_path" | "farmland" | "straw_bed") {
+        return Some(direction == IVec3::NEG_Y);
+    }
+    // These blocks do not supply a full sturdy face, even where collision
+    // geometry (notably leaves) appears to cover the whole cube.
+    if id == "honey_block"
+        || id == "flower_pot"
+        || id.starts_with("potted_")
+        || id == "glass_pane"
+        || id == "iron_bars"
+        || id.ends_with("_stained_glass_pane")
+        || id.ends_with("_fence")
+        || id.ends_with("_leaves")
+        || id.ends_with("_bed")
+    {
+        return Some(false);
+    }
     if id.ends_with("_slab") || id.ends_with("_stairs") {
         return Some(covers_full_face(&shape, direction));
     }
-    if !id.ends_with("_leaves") && shape.as_slice() == FULL {
+    if shape.as_slice() == FULL {
         return Some(true);
     }
     None

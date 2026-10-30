@@ -164,7 +164,7 @@ pub fn read(
     }
     let Some(entity) = found else { return Ok(None) };
     ensure!(
-        matches!(unique(&entity, "id")?, Some(Tag::String(id)) if id.matches("minecraft:chest") || id.matches("chest")),
+        matches!(unique(&entity, "id")?, Some(Tag::String(id)) if id.matches("minecraft:chest") || id.matches("chest") || id.matches("minecraft:trapped_chest") || id.matches("trapped_chest")),
         "saved block entity is not a chest"
     );
     ensure!(

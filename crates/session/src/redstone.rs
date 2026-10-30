@@ -55,6 +55,10 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
     if !DIRECTIONS.contains(&direction) {
         return None;
     }
+    if state.name == "minecraft:chest" {
+        native_world::collision::block_shape(state)?;
+        return Some((0, 0, false));
+    }
     if state.name == "minecraft:lever"
         || native_core::button::Button::from_id(&state.name).is_some()
     {
@@ -172,10 +176,39 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
     }
 }
 
+/// Signal from a trapped chest with a known opener count. Unknown block
+/// entities must remain unknown rather than being treated as unpowered.
+pub fn trapped_chest_source(
+    state: &BlockState,
+    direction: IVec3,
+    openers: u32,
+) -> Option<(u8, u8, bool)> {
+    if state.name != "minecraft:trapped_chest" || !DIRECTIONS.contains(&direction) {
+        return None;
+    }
+    native_world::collision::block_shape(state)?;
+    let strength = openers.min(15) as u8;
+    Some((
+        strength,
+        if direction == IVec3::Y { strength } else { 0 },
+        false,
+    ))
+}
+
 /// Java's `hasNeighborSignal` for known sources and conductors.
 pub fn neighbor_signal<'a>(
     position: IVec3,
     mut block: impl FnMut(IVec3) -> Option<&'a BlockState>,
+) -> Option<bool> {
+    neighbor_signal_from(position, |position, direction| {
+        block(position).and_then(|state| source(state, direction))
+    })
+}
+
+/// As above, using a world-aware source query for block entities.
+pub fn neighbor_signal_from(
+    position: IVec3,
+    mut signal: impl FnMut(IVec3, IVec3) -> Option<(u8, u8, bool)>,
 ) -> Option<bool> {
     let mut unknown = false;
     for direction in DIRECTIONS {
@@ -183,8 +216,7 @@ pub fn neighbor_signal<'a>(
             unknown = true;
             continue;
         };
-        let Some((weak, _, conductor)) = block(neighbor).and_then(|state| source(state, direction))
-        else {
+        let Some((weak, _, conductor)) = signal(neighbor, direction) else {
             unknown = true;
             continue;
         };
@@ -197,7 +229,7 @@ pub fn neighbor_signal<'a>(
                     unknown = true;
                     continue;
                 };
-                match block(source_pos).and_then(|state| source(state, incoming)) {
+                match signal(source_pos, incoming) {
                     Some((_, direct, _)) if direct > 0 => return Some(true),
                     Some(_) => {}
                     None => unknown = true,

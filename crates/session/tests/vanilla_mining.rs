@@ -1937,6 +1937,104 @@ fn button_neighbor_signal_matches_vanilla() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn trapped_chest_signal_matches_vanilla() {
+    use glam::IVec3;
+    use native_world::loaded::BlockState;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("TrappedChestSignalOracle.java");
+    let output = temp.path().join("result.json");
+    std::fs::write(&source, include_str!("java/TrappedChestSignalOracle.java")).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("TrappedChestSignalOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    assert_eq!(rows.len(), 1440);
+    for row in rows {
+        let trapped = row["trapped"].as_bool().unwrap();
+        let name = if trapped {
+            "minecraft:trapped_chest"
+        } else {
+            "minecraft:chest"
+        };
+        assert_eq!(row["entityId"].as_str(), Some(name));
+        let state = BlockState {
+            name: name.into(),
+            properties: [
+                ("type".into(), row["type"].as_str().unwrap().into()),
+                ("facing".into(), row["facing"].as_str().unwrap().into()),
+                (
+                    "waterlogged".into(),
+                    row["waterlogged"].as_bool().unwrap().to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let direction = match row["direction"].as_str().unwrap() {
+            "down" => IVec3::NEG_Y,
+            "up" => IVec3::Y,
+            "north" => IVec3::NEG_Z,
+            "south" => IVec3::Z,
+            "west" => IVec3::NEG_X,
+            "east" => IVec3::X,
+            _ => unreachable!(),
+        };
+        let actual = if trapped {
+            native_session::redstone::trapped_chest_source(
+                &state,
+                direction,
+                row["count"].as_u64().unwrap() as u32,
+            )
+        } else {
+            native_session::redstone::source(&state, direction)
+        }
+        .unwrap();
+        assert_eq!(
+            (u64::from(actual.0), u64::from(actual.1), actual.2),
+            (
+                row["weak"].as_u64().unwrap(),
+                row["direct"].as_u64().unwrap(),
+                row["conductor"].as_bool().unwrap()
+            ),
+            "{row}"
+        );
+    }
+    let raw = std::fs::read(format!("{}.nbt", output.display())).unwrap();
+    let entity = native_persistence::nbt::read(&raw).unwrap().value;
+    let document = native_persistence::nbt::NamedTag {
+        name: "".into(),
+        value: native_persistence::nbt::Tag::List {
+            element_type: native_persistence::nbt::TagType::Compound,
+            values: vec![entity],
+        },
+    };
+    let bytes = native_persistence::nbt::write(&document).unwrap();
+    let payload = native_world::loaded::SavedBlockEntities::Encoded(bytes.into());
+    let saved = native_session::saved_chest::read(
+        &payload,
+        native_world::loaded::ChunkPos { x: 0, z: 0 },
+        IVec3::ZERO,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(saved.slots[4].as_ref().unwrap().id(), "minecraft:diamond");
+    assert_eq!(saved.slots[4].as_ref().unwrap().count(), 3);
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn supported_redstone_conductors_match_java_states() {
     use glam::IVec3;
     use native_world::loaded::BlockState;

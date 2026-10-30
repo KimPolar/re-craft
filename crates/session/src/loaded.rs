@@ -228,6 +228,7 @@ pub struct LoadedSession {
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
+    open_trapped_chests: BTreeSet<(i32, i32, i32)>,
     tick_dirty_chunks: BTreeSet<ChunkPos>,
     tick_chunks_needing_dirty: BTreeSet<ChunkPos>,
     block_edits: BTreeMap<ChunkPos, BTreeMap<(i32, i32, i32), RecordedBlockEdit>>,
@@ -1839,6 +1840,7 @@ impl LoadedSession {
             chest_contents: BTreeMap::new(),
             chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
+            open_trapped_chests: BTreeSet::new(),
             tick_dirty_chunks: BTreeSet::new(),
             tick_chunks_needing_dirty: BTreeSet::new(),
             block_edits: BTreeMap::new(),
@@ -2325,6 +2327,17 @@ impl LoadedSession {
             .get(&chunk)
             .context("block entity chunk is unavailable")?;
         let saved = crate::saved_chest::read(payload, chunk, position)?;
+        if let Some(saved) = &saved {
+            let id = saved.source().get("id");
+            let expected_short = block
+                .name
+                .strip_prefix("minecraft:")
+                .expect("checked vanilla chest");
+            anyhow::ensure!(
+                matches!(id, Some(native_persistence::nbt::Tag::String(id)) if id.matches(&block.name) || id.matches(expected_short)),
+                "chest block entity does not match its block type"
+            );
+        }
         let key = (position.x, position.y, position.z);
         if let Some(current) = self.chest_contents.get(&key) {
             anyhow::ensure!(
@@ -2349,6 +2362,10 @@ impl LoadedSession {
             return;
         };
         self.push_chest_sound(position, other, false);
+        self.set_trapped_chest_open(position, false);
+        if let Some(other) = other {
+            self.set_trapped_chest_open(other, false);
+        }
         for (index, position) in [Some(position), other].into_iter().flatten().enumerate() {
             let key = (position.x, position.y, position.z);
             let chest = self
@@ -2377,6 +2394,9 @@ impl LoadedSession {
         let Some(above) = self.world.state(id) else {
             return false;
         };
+        if above.name == "minecraft:trapped_chest" {
+            return native_world::collision::block_shape(above).is_some();
+        }
         // Unknown conductor behavior must not be treated as open space.
         matches!(
             crate::redstone::source(above, IVec3::Y),
@@ -2456,12 +2476,19 @@ impl LoadedSession {
             self.chest_contents.insert(key(right_position), right);
             self.chest_contents.insert(key(left_position), left);
             self.push_chest_sound(right_position, Some(left_position), true);
+            if self.game_mode != GameMode::Spectator {
+                self.set_trapped_chest_open(right_position, true);
+                self.set_trapped_chest_open(left_position, true);
+            }
         } else {
             if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
                 return false;
             }
             self.chest_contents.insert(key(position), chest);
             self.push_chest_sound(position, None, true);
+            if self.game_mode != GameMode::Spectator {
+                self.set_trapped_chest_open(position, true);
+            }
         }
         true
     }
@@ -2510,6 +2537,77 @@ impl LoadedSession {
 
     pub fn take_chest_sounds(&mut self) -> Vec<ChestSoundEvent> {
         self.chest_sounds.drain(..).collect()
+    }
+
+    fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let state = self.world.state(id)?;
+        if state.name != "minecraft:trapped_chest" {
+            return crate::redstone::source(state, direction);
+        }
+        let position = add(self.origin, relative)?;
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        if matches!(
+            self.world.saved_block_entities.get(&chunk),
+            None | Some(native_world::loaded::SavedBlockEntities::Unavailable)
+        ) {
+            return None;
+        }
+        let count = u32::from(
+            self.open_trapped_chests
+                .contains(&(position.x, position.y, position.z)),
+        );
+        crate::redstone::trapped_chest_source(state, direction, count)
+    }
+
+    fn set_trapped_chest_open(&mut self, position: IVec3, opening: bool) {
+        let key = (position.x, position.y, position.z);
+        let trapped = self
+            .world
+            .block(position.x, position.y, position.z)
+            .is_some_and(|state| state.name == "minecraft:trapped_chest");
+        if opening && !trapped {
+            return;
+        }
+        let changed = if opening {
+            self.open_trapped_chests.insert(key)
+        } else {
+            self.open_trapped_chests.remove(&key)
+        };
+        if !changed || !trapped {
+            return;
+        }
+        let Some(relative) = subtract(position, self.origin) else {
+            return;
+        };
+        for origin in [Some(relative), add(relative, IVec3::NEG_Y)]
+            .into_iter()
+            .flatten()
+        {
+            for direction in [
+                IVec3::NEG_Y,
+                IVec3::Y,
+                IVec3::NEG_Z,
+                IVec3::Z,
+                IVec3::NEG_X,
+                IVec3::X,
+            ] {
+                if let Some(neighbor) = add(origin, direction) {
+                    self.update_lamp(neighbor);
+                }
+            }
+        }
     }
 
     /// Draft an existing saved item; this does not authorize a world write.
@@ -4578,14 +4676,11 @@ impl LoadedSession {
             // direct signal to adjacent conductors; an air placeholder has the
             // same direct signal as the lamp itself.
             let air = self.world.state(self.states[0])?;
-            let lit = crate::redstone::neighbor_signal(target, |pos| {
+            let lit = crate::redstone::neighbor_signal_from(target, |pos, direction| {
                 if pos == target {
-                    return Some(air);
+                    return crate::redstone::source(air, direction);
                 }
-                match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
-                    Cell::State(id) => self.world.state(id),
-                    Cell::Missing => None,
-                }
+                self.redstone_source(pos, direction)
             })?;
             state(
                 "minecraft:redstone_lamp",
@@ -5410,11 +5505,8 @@ impl LoadedSession {
     }
 
     fn lamp_power(&self, relative: IVec3) -> Option<bool> {
-        crate::redstone::neighbor_signal(relative, |pos| {
-            match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
-                Cell::State(id) => self.world.state(id),
-                Cell::Missing => None,
-            }
+        crate::redstone::neighbor_signal_from(relative, |pos, direction| {
+            self.redstone_source(pos, direction)
         })
     }
 
@@ -11364,6 +11456,181 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         (session, source, position, home)
+    }
+
+    fn trapped_chest_fixture() -> (LoadedSession, IVec3, ChunkPos) {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        let id = session.intern_block(state(
+            "minecraft:trapped_chest",
+            &[
+                ("facing", "north"),
+                ("type", "single"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set(position - session.origin, id));
+        let SavedBlockEntities::Encoded(bytes) =
+            session.world.saved_block_entities.get(&chunk).unwrap()
+        else {
+            panic!("expected saved entity")
+        };
+        let mut doc = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut doc.value else {
+            panic!("expected list")
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!("expected chest")
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("id"))
+            .unwrap()
+            .1 = Tag::String("minecraft:trapped_chest".into());
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&doc).unwrap().into()),
+            );
+        session.set_random_tick_speed(0);
+        (session, position, chunk)
+    }
+
+    #[test]
+    fn trapped_chest_drives_direct_and_conducted_lamps_on_open_and_close() {
+        let (mut session, chest, _) = trapped_chest_fixture();
+        let relative = chest - session.origin;
+        let direct = relative + IVec3::NEG_X;
+        let below = relative + IVec3::NEG_Y;
+        let indirect = below + IVec3::X;
+        let lamp = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+        assert!(session.set(direct, lamp));
+        assert!(session.set(below, session.states[3]));
+        assert!(session.set(indirect, lamp));
+        let lit = |session: &LoadedSession, relative: IVec3| {
+            let pos = session.origin + relative;
+            redstone_lamp_lit(session.world.block(pos.x, pos.y, pos.z).unwrap()).unwrap()
+        };
+        assert_eq!(
+            session.redstone_source(relative, IVec3::Y),
+            Some((0, 0, false))
+        );
+        assert!(session.try_open_saved_chest(relative));
+        assert_eq!(
+            session.redstone_source(relative, IVec3::Y),
+            Some((1, 1, false))
+        );
+        assert_eq!(
+            session.redstone_source(relative, IVec3::X),
+            Some((1, 0, false))
+        );
+        assert!(lit(&session, direct));
+        assert!(lit(&session, indirect));
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        assert_eq!(
+            session.redstone_source(relative, IVec3::Y),
+            Some((0, 0, false))
+        );
+        assert!(lit(&session, direct));
+        assert!(lit(&session, indirect));
+        assert_eq!(session.lamp_pending.len(), 2);
+        for _ in 0..5 {
+            session.update(TICK);
+        }
+        assert!(!lit(&session, direct));
+        assert!(!lit(&session, indirect));
+    }
+
+    #[test]
+    fn trapped_chest_signal_requires_known_block_entity_data() {
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, chest, chunk) = trapped_chest_fixture();
+        let relative = chest - session.origin;
+        assert_eq!(
+            session.redstone_source(relative, IVec3::Y),
+            Some((0, 0, false))
+        );
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Unavailable);
+        assert_eq!(session.redstone_source(relative, IVec3::Y), None);
+        assert!(!session.try_open_saved_chest(relative));
+    }
+
+    #[test]
+    fn trapped_chest_rejects_a_regular_chest_block_entity() {
+        let (mut session, _, position, _) = saved_chest_fixture();
+        let id = session.intern_block(state(
+            "minecraft:trapped_chest",
+            &[
+                ("facing", "north"),
+                ("type", "single"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set(position - session.origin, id));
+        assert!(session.saved_chest(position).is_err());
+        assert!(!session.try_open_saved_chest(position - session.origin));
+    }
+
+    #[test]
+    fn double_trapped_chest_powers_both_halves_and_clears_both_on_close() {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, left, chunk) = trapped_chest_fixture();
+        let right = left + IVec3::X;
+        for (position, kind) in [(left, "left"), (right, "right")] {
+            let id = session.intern_block(state(
+                "minecraft:trapped_chest",
+                &[
+                    ("facing", "north"),
+                    ("type", kind),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(position - session.origin, id));
+        }
+        let SavedBlockEntities::Encoded(bytes) =
+            session.world.saved_block_entities.get(&chunk).unwrap()
+        else {
+            panic!("expected block entities")
+        };
+        let mut doc = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut doc.value else {
+            panic!("expected list")
+        };
+        values.push(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:trapped_chest".into())),
+            ("x".into(), Tag::Int(right.x)),
+            ("y".into(), Tag::Int(right.y)),
+            ("z".into(), Tag::Int(right.z)),
+        ]));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&doc).unwrap().into()),
+            );
+        assert!(session.try_open_saved_chest(left - session.origin));
+        for pos in [left, right] {
+            assert_eq!(
+                session.redstone_source(pos - session.origin, IVec3::Y),
+                Some((1, 1, false))
+            );
+        }
+        assert_eq!(session.open_trapped_chests.len(), 2);
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        for pos in [left, right] {
+            assert_eq!(
+                session.redstone_source(pos - session.origin, IVec3::Y),
+                Some((0, 0, false))
+            );
+        }
+        assert!(session.open_trapped_chests.is_empty());
     }
 
     #[test]

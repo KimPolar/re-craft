@@ -467,6 +467,7 @@ fn run_demo(
 ) -> Result<GameExit> {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(atlas, smoke_test, assets, content, video);
+    app.audio = audio.clone();
     if let Some(ui) = &mut app.ui {
         ui.set_audio(audio);
     }
@@ -1446,6 +1447,8 @@ struct App {
     hotbar_scroll: mouse_scroll::HotbarScroll,
     captured: bool,
     ui: Option<GameUi>,
+    audio: Option<audio::UiAudio>,
+    audio_listener: Option<(glam::DVec3, f32)>,
     inventory_wait: Option<u64>,
     menu_open: bool,
     death_visible: bool,
@@ -1517,6 +1520,8 @@ impl App {
             hotbar_scroll: mouse_scroll::HotbarScroll::default(),
             captured: false,
             ui,
+            audio: None,
+            audio_listener: None,
             inventory_wait: None,
             menu_open: false,
             death_visible: false,
@@ -2255,6 +2260,20 @@ impl ApplicationHandler for App {
             if !self.ui.as_ref().is_some_and(GameUi::paused) {
                 self.session
                     .update(now.saturating_duration_since(self.last_update));
+            }
+            if let Some(audio) = &self.audio {
+                let snapshot = self.session.snapshot();
+                let eye = snapshot.camera.eye(self.session.partial_tick());
+                let (yaw, _) = self.visual_look.angles(&snapshot);
+                if self.audio_listener != Some((eye, yaw)) {
+                    audio.set_listener(eye, yaw);
+                    self.audio_listener = Some((eye, yaw));
+                }
+                for position in self.session.take_item_pickup_sounds() {
+                    audio.item_pickup(position);
+                }
+            } else {
+                self.session.take_item_pickup_sounds();
             }
             self.last_update = now;
             let size = window.inner_size();

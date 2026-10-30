@@ -361,6 +361,10 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
+    /// Drain one-shot item pickup sounds after advancing the session.
+    pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.dropped_items.take_pickup_sounds()
+    }
     /// Restore health and food before play begins. World files remain untouched.
     pub fn set_player_vitals(&mut self, vitals: crate::survival::PlayerVitals) {
         self.vitals = vitals;
@@ -11018,6 +11022,8 @@ mod tests {
             }
         }
         assert!(session.snapshot().dropped_items.is_empty());
+        assert_eq!(session.take_item_pickup_sounds().len(), 1);
+        assert!(session.take_item_pickup_sounds().is_empty());
         let group = BTreeSet::from([home]);
         assert_eq!(
             session.created_item_removal_effects(&group),

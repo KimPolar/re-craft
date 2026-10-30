@@ -97,6 +97,7 @@ pub struct Audio {
     commands: mpsc::SyncSender<Command>,
     gain: Arc<AtomicU32>,
     block_gain: Arc<AtomicU32>,
+    player_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 }
 
@@ -120,6 +121,9 @@ impl UiAudio {
     pub fn set_block_gain(&self, gain: f32) {
         self.audio.set_block_gain(gain);
     }
+    pub fn set_player_gain(&self, gain: f32) {
+        self.audio.set_player_gain(gain);
+    }
     pub fn set_listener(&self, eye: glam::DVec3, yaw: f32) {
         self.audio.listener.publish(Listener { eye, yaw });
     }
@@ -132,12 +136,22 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn item_pickup(&self, position: glam::DVec3) {
+        let _ = self.audio.commands.try_send(Command::ItemPickup(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            position,
+        ));
+    }
 }
 
 enum Command {
     Prepare(Resources),
     Click(Resources),
     Button(Resources, native_session::loaded::ButtonSoundEvent),
+    ItemPickup(Resources, glam::DVec3),
 }
 
 impl Audio {
@@ -146,12 +160,14 @@ impl Audio {
         let (commands, receiver) = mpsc::sync_channel(32);
         let gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let block_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let player_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let listener = Arc::new(SharedListener::default());
         (
             Self {
                 commands,
                 gain: gain.clone(),
                 block_gain,
+                player_gain,
                 listener,
             },
             AudioProbe { receiver, gain },
@@ -163,12 +179,20 @@ impl Audio {
         let output_gain = gain.clone();
         let block_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_block_gain = block_gain.clone();
+        let player_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let output_player_gain = player_gain.clone();
         let listener = Arc::new(SharedListener::default());
         let output_listener = listener.clone();
         std::thread::Builder::new()
             .name("audio-resources".into())
             .spawn(move || {
-                if let Err(error) = run(receiver, output_gain, output_block_gain, output_listener) {
+                if let Err(error) = run(
+                    receiver,
+                    output_gain,
+                    output_block_gain,
+                    output_player_gain,
+                    output_listener,
+                ) {
                     eprintln!("Audio unavailable: {error:#}");
                 }
             })?;
@@ -176,6 +200,7 @@ impl Audio {
             commands,
             gain,
             block_gain,
+            player_gain,
             listener,
         })
     }
@@ -186,6 +211,10 @@ impl Audio {
     }
     pub fn set_block_gain(&self, gain: f32) {
         self.block_gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn set_player_gain(&self, gain: f32) {
+        self.player_gain
             .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
@@ -236,6 +265,7 @@ struct Voice {
     step: f64,
     volume: f32,
     spatial: Option<SpatialSource>,
+    player_sound: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +330,7 @@ fn mix(
     channels: usize,
     gain: f32,
     block_gain: f32,
+    player_gain: f32,
     listener: Listener,
 ) {
     output.fill(0.0);
@@ -310,7 +341,9 @@ fn mix(
             .map_or((1.0, 0.0), |source| source.factors(listener));
         let volume = voice.volume
             * attenuation
-            * if voice.spatial.is_some() {
+            * if voice.player_sound {
+                player_gain
+            } else if voice.spatial.is_some() {
                 block_gain
             } else {
                 gain
@@ -359,6 +392,7 @@ fn output_stream<T>(
     receiver: mpsc::Receiver<Voice>,
     gain: Arc<AtomicU32>,
     block_gain: Arc<AtomicU32>,
+    player_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 ) -> Result<cpal::Stream>
 where
@@ -385,6 +419,7 @@ where
                 channels,
                 f32::from_bits(gain.load(Ordering::Relaxed)),
                 f32::from_bits(block_gain.load(Ordering::Relaxed)),
+                f32::from_bits(player_gain.load(Ordering::Relaxed)),
                 last_listener,
             );
             #[cfg(test)]
@@ -428,14 +463,38 @@ impl Catalog {
     }
 
     fn click(&mut self, random: &mut LegacyRandom, output_rate: u32) -> Result<Option<Voice>> {
-        self.resolve("ui.button.click", 0.25, None, random, output_rate)
+        self.resolve("ui.button.click", 0.25, 1.0, None, random, output_rate)
+    }
+
+    fn item_pickup(
+        &mut self,
+        position: glam::DVec3,
+        random: &mut LegacyRandom,
+        output_rate: u32,
+    ) -> Result<Option<Voice>> {
+        let pitch = (random.next_float() - random.next_float()) * 1.4 + 2.0;
+        self.resolve(
+            "entity.item.pickup",
+            0.2,
+            pitch,
+            Some(position),
+            random,
+            output_rate,
+        )
+        .map(|voice| {
+            voice.map(|mut voice| {
+                voice.player_sound = true;
+                voice
+            })
+        })
     }
 
     fn resolve(
         &mut self,
         event: &str,
         base_volume: f32,
-        spatial: Option<glam::IVec3>,
+        base_pitch: f32,
+        spatial: Option<glam::DVec3>,
         random: &mut LegacyRandom,
         output_rate: u32,
     ) -> Result<Option<Voice>> {
@@ -480,9 +539,9 @@ impl Catalog {
         };
         let raw_volume = base_volume * product(&selected.volume_factors)?;
         let volume = raw_volume.clamp(0.0, 1.0);
-        let pitch = product(&selected.pitch_factors)?.clamp(0.5, 2.0);
+        let pitch = (base_pitch * product(&selected.pitch_factors)?).clamp(0.5, 2.0);
         let spatial = spatial.map(|position| SpatialSource {
-            position: position.as_dvec3() + glam::DVec3::splat(0.5),
+            position,
             radius: f64::from(selected.attenuation_distance) * f64::from(raw_volume.max(1.0)),
         });
         Ok(Some(Voice {
@@ -491,6 +550,7 @@ impl Catalog {
             frame: 0.0,
             volume,
             spatial,
+            player_sound: false,
         }))
     }
 }
@@ -499,6 +559,7 @@ fn run(
     receiver: mpsc::Receiver<Command>,
     gain: Arc<AtomicU32>,
     block_gain: Arc<AtomicU32>,
+    player_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 ) -> Result<()> {
     let device = cpal::default_host()
@@ -508,15 +569,33 @@ fn run(
     let config = supported.config();
     let (sender, voices) = mpsc::sync_channel(MAX_VOICES);
     let _stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => {
-            output_stream::<f32>(&device, &config, voices, gain, block_gain, listener)?
-        }
-        cpal::SampleFormat::I16 => {
-            output_stream::<i16>(&device, &config, voices, gain, block_gain, listener)?
-        }
-        cpal::SampleFormat::U16 => {
-            output_stream::<u16>(&device, &config, voices, gain, block_gain, listener)?
-        }
+        cpal::SampleFormat::F32 => output_stream::<f32>(
+            &device,
+            &config,
+            voices,
+            gain,
+            block_gain,
+            player_gain,
+            listener,
+        )?,
+        cpal::SampleFormat::I16 => output_stream::<i16>(
+            &device,
+            &config,
+            voices,
+            gain,
+            block_gain,
+            player_gain,
+            listener,
+        )?,
+        cpal::SampleFormat::U16 => output_stream::<u16>(
+            &device,
+            &config,
+            voices,
+            gain,
+            block_gain,
+            player_gain,
+            listener,
+        )?,
         other => bail!("unsupported output sample format {other:?}"),
     };
     let seed = std::time::SystemTime::now()
@@ -526,10 +605,11 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, spatial) = match command {
-            Command::Prepare(resources) => (resources, false, None),
-            Command::Click(resources) => (resources, true, None),
-            Command::Button(resources, event) => (resources, true, Some(event)),
+        let (resources, play, button, pickup) = match command {
+            Command::Prepare(resources) => (resources, false, None, None),
+            Command::Click(resources) => (resources, true, None, None),
+            Command::Button(resources, event) => (resources, true, Some(event), None),
+            Command::ItemPickup(resources, position) => (resources, true, None, Some(position)),
         };
         if catalog
             .as_ref()
@@ -550,19 +630,24 @@ fn run(
             } else {
                 &mut preload_random
             };
-            let resolved = match spatial {
-                Some(event) => catalog.resolve(
-                    if event.powered {
-                        "block.stone_button.click_on"
-                    } else {
-                        "block.stone_button.click_off"
-                    },
-                    1.0,
-                    Some(event.position),
-                    chosen_random,
-                    config.sample_rate.0,
-                ),
-                None => catalog.click(chosen_random, config.sample_rate.0),
+            let resolved = if let Some(position) = pickup {
+                catalog.item_pickup(position, chosen_random, config.sample_rate.0)
+            } else {
+                match button {
+                    Some(event) => catalog.resolve(
+                        if event.powered {
+                            "block.stone_button.click_on"
+                        } else {
+                            "block.stone_button.click_off"
+                        },
+                        1.0,
+                        1.0,
+                        Some(event.position.as_dvec3() + glam::DVec3::splat(0.5)),
+                        chosen_random,
+                        config.sample_rate.0,
+                    ),
+                    None => catalog.click(chosen_random, config.sample_rate.0),
+                }
             };
             match resolved {
                 Ok(Some(voice)) => {
@@ -571,7 +656,7 @@ fn run(
                     }
                 }
                 Ok(None) => {}
-                Err(error) => eprintln!("Cannot play button sound: {error:#}"),
+                Err(error) => eprintln!("Cannot play sound: {error:#}"),
             }
         }
     }
@@ -594,9 +679,18 @@ mod tests {
             step: 0.5,
             volume: 0.5,
             spatial: None,
+            player_sound: false,
         }];
         let mut output = [0.0; 12];
-        mix(&mut voices, &mut output, 2, 1.0, 1.0, Listener::default());
+        mix(
+            &mut voices,
+            &mut output,
+            2,
+            1.0,
+            1.0,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(
             output,
             [
@@ -619,14 +713,39 @@ mod tests {
             step: 1.0,
             volume: 1.0,
             spatial: None,
+            player_sound: false,
         };
         let mut voices = vec![voice(), voice()];
         let mut output = [0.0; 1];
-        mix(&mut voices, &mut output, 1, 0.25, 1.0, Listener::default());
+        mix(
+            &mut voices,
+            &mut output,
+            1,
+            0.25,
+            1.0,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(output[0], 32767.0 / 32768.0 * 0.5);
-        mix(&mut voices, &mut output, 1, 0.0, 1.0, Listener::default());
+        mix(
+            &mut voices,
+            &mut output,
+            1,
+            0.0,
+            1.0,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(output[0], 0.0);
-        mix(&mut voices, &mut output, 1, 1.0, 1.0, Listener::default());
+        mix(
+            &mut voices,
+            &mut output,
+            1,
+            1.0,
+            1.0,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(output[0], 1.0);
         assert!(voices.is_empty());
     }
@@ -645,6 +764,7 @@ mod tests {
                 step: 1.0,
                 volume: 1.0,
                 spatial: None,
+                player_sound: false,
             },
             Voice {
                 clip,
@@ -655,14 +775,136 @@ mod tests {
                     position: glam::DVec3::X,
                     radius: f64::INFINITY,
                 }),
+                player_sound: false,
             },
         ];
         let mut frame = [0.0; 2];
-        mix(&mut voices, &mut frame, 2, 0.5, 0.0, Listener::default());
+        mix(
+            &mut voices,
+            &mut frame,
+            2,
+            0.5,
+            0.0,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(frame, [0.25, 0.25]);
-        mix(&mut voices, &mut frame, 2, 0.0, 0.5, Listener::default());
+        mix(
+            &mut voices,
+            &mut frame,
+            2,
+            0.0,
+            0.5,
+            1.0,
+            Listener::default(),
+        );
         assert_eq!(frame[0], 0.0);
         assert!((frame[1] - 0.25 * 2.0_f32.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn player_sound_gain_is_independent_and_updates_active_voice() {
+        let clip = Arc::new(Clip {
+            samples: vec![16384; 2],
+            channels: 1,
+            rate: 1,
+        });
+        let mut voices = vec![Voice {
+            clip,
+            frame: 0.0,
+            step: 1.0,
+            volume: 1.0,
+            spatial: Some(SpatialSource {
+                position: glam::DVec3::ZERO,
+                radius: 16.0,
+            }),
+            player_sound: true,
+        }];
+        let mut output = [0.0; 2];
+        mix(
+            &mut voices,
+            &mut output,
+            2,
+            0.0,
+            0.0,
+            0.5,
+            Listener::default(),
+        );
+        assert_eq!(output, [0.25, 0.25]);
+        mix(
+            &mut voices,
+            &mut output,
+            2,
+            1.0,
+            1.0,
+            0.0,
+            Listener::default(),
+        );
+        assert_eq!(output, [0.0, 0.0]);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn item_pickup_uses_resource_pack_and_player_sound() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let mut vanilla = Catalog::load(Resources {
+            root: root.clone(),
+            packs: Vec::new(),
+        })
+        .unwrap();
+        let default_voice = vanilla
+            .item_pickup(glam::DVec3::ZERO, &mut LegacyRandom::new(1), 48000)
+            .unwrap()
+            .unwrap();
+        assert!(default_voice.clip.samples.iter().any(|&sample| sample != 0));
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"entity.item.pickup":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let mut expected = LegacyRandom::new(42);
+        let pitch = ((expected.next_float() - expected.next_float()) * 1.4 + 2.0) * 1.5;
+        let position = glam::DVec3::new(17.25, 64.7, -3.125);
+        let voice = catalog
+            .item_pickup(position, &mut LegacyRandom::new(42), 48000)
+            .unwrap()
+            .unwrap();
+        assert!(voice.player_sound);
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert_eq!(voice.volume, 0.2_f32 * 0.4);
+        assert_eq!(
+            voice.step,
+            f64::from(voice.clip.rate) / 48000.0 * f64::from(pitch.clamp(0.5, 2.0))
+        );
+        assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+    }
+
+    #[test]
+    #[ignore = "requires an available Windows audio output and installed 26.3 assets"]
+    fn item_pickup_reaches_output_with_only_player_gain_enabled() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let audio = Audio::new().unwrap();
+        audio.prepare(&root, &[]);
+        let ui = UiAudio::new(audio, root, Vec::new());
+        ui.set_gain(0.0);
+        ui.set_block_gain(0.0);
+        ui.set_player_gain(1.0);
+        reset_test_rendered();
+        let position = glam::DVec3::new(1234.25, 64.0, -900.5);
+        ui.set_listener(position, 0.0);
+        ui.item_pickup(position);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !test_rendered() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            test_rendered(),
+            "item sound did not reach the output callback"
+        );
     }
 
     #[test]
@@ -682,13 +924,14 @@ mod tests {
                 position,
                 radius: 16.0,
             }),
+            player_sound: false,
         }];
         let mut output = [0.0; 2];
         let front = Listener {
             eye: position - glam::DVec3::X * 8.0,
             yaw: 0.0,
         };
-        mix(&mut voices, &mut output, 2, 0.0, 1.0, front);
+        mix(&mut voices, &mut output, 2, 0.0, 1.0, 1.0, front);
         assert_eq!(output[0], 0.0);
         assert!((output[1] - 0.25 * 2.0_f32.sqrt()).abs() < 1e-6);
         mix(
@@ -696,6 +939,7 @@ mod tests {
             &mut output,
             2,
             0.0,
+            1.0,
             1.0,
             Listener {
                 yaw: std::f32::consts::PI,
@@ -709,6 +953,7 @@ mod tests {
             2,
             0.0,
             1.0,
+            1.0,
             Listener {
                 eye: position - glam::DVec3::X * 17.0,
                 yaw: 0.0,
@@ -720,6 +965,7 @@ mod tests {
             &mut output,
             2,
             0.0,
+            1.0,
             1.0,
             Listener {
                 eye: position,
@@ -784,7 +1030,14 @@ mod tests {
             let pos = glam::IVec3::ZERO;
             let centered = pos.as_dvec3() + glam::DVec3::splat(0.5);
             let voice = catalog
-                .resolve(event, 1.0, Some(pos), &mut LegacyRandom::new(42), 48000)
+                .resolve(
+                    event,
+                    1.0,
+                    1.0,
+                    Some(centered),
+                    &mut LegacyRandom::new(42),
+                    48000,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(voice.volume, 0.3_f32);

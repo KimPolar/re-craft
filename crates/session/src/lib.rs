@@ -405,6 +405,10 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
+    /// Drain one-shot item pickup sounds after advancing the session.
+    pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.dropped_items.take_pickup_sounds()
+    }
     pub fn demo() -> Self {
         Self::new(World::demo())
     }

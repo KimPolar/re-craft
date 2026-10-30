@@ -205,6 +205,9 @@ impl SoundSettings {
     pub fn block_gain(self) -> f32 {
         (self.get(SoundCategory::Master) as f32) * (self.get(SoundCategory::Block) as f32)
     }
+    pub fn player_gain(self) -> f32 {
+        (self.get(SoundCategory::Master) as f32) * (self.get(SoundCategory::Player) as f32)
+    }
     fn valid(mut self) -> Self {
         for value in &mut self.volumes {
             *value = value.valid_or(1.0);

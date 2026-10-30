@@ -336,6 +336,7 @@ impl GameUi {
         if let Some(audio) = &self.audio {
             audio.set_gain(self.sound.ui_gain());
             audio.set_block_gain(self.sound.block_gain());
+            audio.set_player_gain(self.sound.player_gain());
         }
     }
 

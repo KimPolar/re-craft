@@ -4,7 +4,7 @@
 //! world's exact random stream are not implemented yet.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -498,6 +498,7 @@ pub(crate) struct ItemEntities {
     removed_saved: Vec<RemovedSavedItem>,
     removed_created: Vec<RemovedCreatedItem>,
     created_pickups: Vec<CreatedPickupRecord>,
+    pickup_sounds: VecDeque<DVec3>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -517,6 +518,7 @@ impl Default for ItemEntities {
             removed_saved: Vec::new(),
             removed_created: Vec::new(),
             created_pickups: Vec::new(),
+            pickup_sounds: VecDeque::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1072,6 +1074,10 @@ impl ItemEntities {
             .filter(|pickup| !pickup.chunks.is_disjoint(positions))
             .map(|pickup| pickup.effect.clone())
             .collect()
+    }
+
+    pub(crate) fn take_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.pickup_sounds.drain(..).collect()
     }
 
     #[cfg(test)]
@@ -1921,6 +1927,18 @@ impl ItemEntities {
                 let mut stack = Some(entity.item.stack.clone());
                 let (pickup_succeeded, transferred) = Arc::make_mut(inventory)
                     .pickup_stack_with_transfer(&mut stack, mode == GameMode::Creative);
+                let silent = entity
+                    ._saved_source
+                    .as_ref()
+                    .and_then(|source| source.get("Silent"))
+                    .and_then(crate::player_data::numeric_byte)
+                    .is_some_and(|value| value != 0);
+                if pickup_succeeded && !silent {
+                    if self.pickup_sounds.len() == 4096 {
+                        self.pickup_sounds.pop_front();
+                    }
+                    self.pickup_sounds.push_back(entity.item.position);
+                }
                 let discarded = entity.item.stack.count()
                     - transferred
                     - stack.as_ref().map_or(0, |s| s.count());
@@ -2718,6 +2736,7 @@ mod tests {
         };
         tick(&mut items, &mut inventory);
         assert_eq!(items.entities[0].item.stack.count(), 2);
+        assert!(items.take_pickup_sounds().is_empty());
         assert_eq!(inventory.slot(PlayerSlot::Storage(0)).unwrap().count(), 64);
         assert_eq!(
             items.created_pickup_effects(&group),
@@ -2747,6 +2766,8 @@ mod tests {
         assert!(Arc::make_mut(&mut inventory).set_slot(PlayerSlot::Storage(1), None));
         tick(&mut items, &mut inventory);
         assert!(items.entities.is_empty());
+        assert_eq!(items.take_pickup_sounds(), vec![position]);
+        assert!(items.take_pickup_sounds().is_empty());
         assert_eq!(
             items.created_pickup_effects(&group),
             vec![
@@ -2821,6 +2842,7 @@ mod tests {
             );
             let group = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
             assert!(items.entities.is_empty());
+            assert_eq!(items.take_pickup_sounds(), vec![position]);
             assert_eq!(inventory.slot(PlayerSlot::Storage(0)).unwrap().count(), 64);
             assert_eq!(
                 items.created_pickup_effects(&group),
@@ -2837,6 +2859,47 @@ mod tests {
                 vec![(uuid, CreatedRemovalCause::Pickup)]
             );
         }
+    }
+
+    #[test]
+    fn silent_saved_item_is_collected_without_pickup_sound() {
+        let mut items = ItemEntities::default();
+        let position = DVec3::new(1.5, 2.0, 3.5);
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(position, stack);
+        let entity = &mut items.entities[0];
+        entity.velocity = DVec3::ZERO;
+        entity.no_gravity = true;
+        entity.pickup_delay = 0;
+        entity._saved_source = Some(Arc::new(Tag::Compound(vec![(
+            "Silent".into(),
+            Tag::Byte(1),
+        )])));
+        let mut inventory = Arc::new(PlayerInventory::default());
+        items.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            position,
+            PlayerPose::Standing,
+            GameMode::Survival,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        assert!(items.entities.is_empty());
+        assert!(items.take_pickup_sounds().is_empty());
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]

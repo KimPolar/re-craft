@@ -58,6 +58,7 @@ public class PhysicsOracle {
         double wall;
         int delay;
         AttributeInstance speed;
+        AttributeMap attributes;
         AttributeInstance jumpStrength;
         MobEffectInstance jumpBoost;
         MobEffectInstance levitation;
@@ -118,7 +119,8 @@ public class PhysicsOracle {
         TestLevel level = (TestLevel) unsafe.allocateInstance(TestLevel.class);
         TestPlayer entity = (TestPlayer) unsafe.allocateInstance(TestPlayer.class);
         Field abilities = Player.class.getDeclaredField("abilities"); abilities.setAccessible(true); abilities.set(entity, new Abilities());
-        entity.speed = new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.MOVEMENT_SPEED);
+        entity.attributes = new AttributeMap(Player.createAttributes().build());
+        entity.speed = entity.attributes.getInstance(Attributes.MOVEMENT_SPEED);
         entity.jumpStrength = new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.JUMP_STRENGTH);
         Field modifierField = LivingEntity.class.getDeclaredField("SPEED_MODIFIER_SPRINTING"); modifierField.setAccessible(true);
         AttributeModifier modifier = (AttributeModifier) modifierField.get(null);
@@ -141,6 +143,13 @@ public class PhysicsOracle {
             entity.slowFalling = scenario.get("slow_falling").getAsBoolean();
             int levitation = scenario.get("levitation").getAsInt();
             entity.levitation = levitation < 0 ? null : new MobEffectInstance(MobEffects.LEVITATION, 1000, levitation);
+            MobEffects.SPEED.value().removeAttributeModifiers(entity.attributes);
+            MobEffects.SLOWNESS.value().removeAttributeModifiers(entity.attributes);
+            entity.speed.setBaseValue(scenario.get("move_base").getAsDouble());
+            int speedEffect = scenario.get("speed_effect").getAsInt();
+            int slownessEffect = scenario.get("slowness_effect").getAsInt();
+            if (speedEffect >= 0) MobEffects.SPEED.value().addAttributeModifiers(entity.attributes, speedEffect);
+            if (slownessEffect >= 0) MobEffects.SLOWNESS.value().addAttributeModifiers(entity.attributes, slownessEffect);
             JsonArray ticks = new JsonArray();
             for (var input : scenario.getAsJsonArray("inputs")) {
                 var i = input.getAsJsonObject();
@@ -163,7 +172,7 @@ public class PhysicsOracle {
                 travel.invoke(entity, new Vec3(modified.x, 0, modified.y));
                 local.setYRot(entity.yaw); local.xxa = modified.x; local.zza = modified.y;
                 boolean isMinor = entity.horizontal && (boolean) minor.invoke(local, entity.moved);
-                JsonObject tick = new JsonObject(); tick.add("position", vec(entity.p)); tick.add("velocity", vec(entity.v)); tick.addProperty("ground", entity.grounded); tick.addProperty("delay", entity.delay); tick.addProperty("horizontal", entity.horizontal); tick.addProperty("minor", isMinor); ticks.add(tick);
+                JsonObject tick = new JsonObject(); tick.add("position", vec(entity.p)); tick.add("velocity", vec(entity.v)); tick.add("moved", vec(entity.moved)); tick.addProperty("speed", entity.speed.getValue()); tick.addProperty("ground", entity.grounded); tick.addProperty("delay", entity.delay); tick.addProperty("horizontal", entity.horizontal); tick.addProperty("minor", isMinor); ticks.add(tick);
             }
             results.add(ticks);
         }
@@ -402,7 +411,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             };
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s + t/20) % angles.len()],"jump":(35..65).contains(&t),"sprint":(s + t / 7) % 3 == 0,"slow":scenario >= 64 && (s + t / 9) % 3 == 0,"using":(s + t / 11) % 4 == 0}));
         }
-        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"slow_falling":scenario%3==0,"levitation":([-1,0,1,127,255][(scenario/3)%5]),"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"move_base":([-0.1,0.0,0.1,0.2,0.4][(scenario/2)%5]),"speed_effect":([-1,0,1,3][scenario%4]),"slowness_effect":([-1,0,1,3][(scenario/4)%4]),"slow_falling":scenario%3==0,"levitation":([-1,0,1,127,255][(scenario/3)%5]),"inputs":inputs}));
     }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("PhysicsOracle.java");
@@ -448,6 +457,31 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
     let mut collision_counts = [0, 0];
     assert_eq!(results.len(), scenarios.len());
     for (s, (scenario, results)) in scenarios.iter().zip(results).enumerate() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "attributes".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                        (
+                            "base".into(),
+                            Tag::Double(scenario["move_base"].as_f64().unwrap()),
+                        ),
+                    ])],
+                },
+            )]),
+        };
+        let movement =
+            native_session::player_data::read_saved_movement_speed_attribute(&source).unwrap();
+        let speed_effect = scenario["speed_effect"]
+            .as_i64()
+            .and_then(|v| u8::try_from(v).ok());
+        let slowness_effect = scenario["slowness_effect"]
+            .as_i64()
+            .and_then(|v| u8::try_from(v).ok());
         let mut state = MotionState {
             position: vec(&scenario["position"]),
             velocity: vec(&scenario["velocity"]),
@@ -467,10 +501,19 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                 using_item: input["using"].as_bool().unwrap(),
                 moving_slowly: input["slow"].as_bool().unwrap(),
             };
+            let speed = movement
+                .movement_speed(speed_effect, slowness_effect, command.sprinting)
+                .unwrap();
+            assert_eq!(
+                speed.to_bits(),
+                (result["speed"].as_f64().unwrap() as f32).to_bits(),
+                "scenario {s} tick {t}"
+            );
             let boost = scenario["boost"].as_i64().unwrap();
-            let (major_collision, _) = state.tick_resolved_with_effects(
+            let (major_collision, moved) = state.tick_resolved_with_effects(
                 command,
                 ground_friction(scenario["block"].as_str().unwrap()),
+                speed,
                 native_session::physics::jump_power(
                     scenario["strength"].as_f64().unwrap().clamp(0.0, 32.0),
                     native_session::physics::block_jump_factor(scenario["block"].as_str().unwrap()),
@@ -511,7 +554,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                 && errors.len() < 20
             {
                 errors.push(format!(
-                    "scenario {s}, tick {t}, input {input}: native {state:?}, Java {result}"
+                    "scenario {s}, tick {t}, input {input}: native {state:?}, moved {moved:?}, collision {major_collision}, Java {result}"
                 ));
             }
         }

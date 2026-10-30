@@ -1031,6 +1031,12 @@ fn prepare_existing_world(
             session
                 .set_saved_fall(safe, multiplier, fall_effects)
                 .context("cannot configure fall damage")?;
+            session
+                .set_saved_movement_speed(
+                    native_session::player_data::read_saved_movement_speed_attribute(player_data)
+                        .context("cannot read saved movement speed")?,
+                )
+                .context("cannot restore saved movement speed")?;
 
             let mut prepare_respawn =
                 || -> Result<Option<Option<native_session::loaded::SavedRespawnSupport>>> {

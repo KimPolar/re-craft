@@ -161,6 +161,8 @@ pub struct LoadedSession {
     jump_strength_attribute: crate::player_data::SavedAttribute,
     jump_strength_inventory_revision: Option<u64>,
     jump_strength: Option<f64>,
+    movement_speed_attribute: crate::player_data::SavedAttribute,
+    movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -449,6 +451,7 @@ impl LoadedSession {
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.movement_speed_cache = None;
         Ok(())
     }
 
@@ -478,6 +481,7 @@ impl LoadedSession {
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.movement_speed_cache = None;
         Ok(())
     }
 
@@ -571,6 +575,108 @@ impl LoadedSession {
         }
     }
 
+    /// Restore the saved attribute, including effect modifiers stored by Java.
+    pub fn set_saved_movement_speed(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        attribute.value(0.0, 1024.0)?;
+        self.movement_speed_attribute = attribute;
+        self.movement_speed_cache = None;
+        Ok(())
+    }
+
+    fn refresh_movement_speed(&mut self) {
+        let revision = self.inventory.revision();
+        let speed = self
+            .fall
+            .effects()
+            .speed
+            .as_ref()
+            .map(|effect| effect.amplifier);
+        let slowness = self
+            .fall
+            .effects()
+            .slowness
+            .as_ref()
+            .map(|effect| effect.amplifier);
+        if self
+            .movement_speed_cache
+            .as_ref()
+            .is_some_and(|cache| (cache.0, cache.1, cache.2) == (revision, speed, slowness))
+        {
+            return;
+        }
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        let result = crate::equipment_attributes::equipped_attribute(
+            &self.movement_speed_attribute,
+            &self.inventory,
+            &registry,
+            "movement_speed",
+        )
+        .and_then(|attribute| {
+            Ok([
+                attribute.movement_speed(None, None, false)?,
+                attribute.movement_speed(None, None, true)?,
+            ])
+        });
+        let values = match result {
+            Ok(values) => values,
+            Err(error) => {
+                self.stream_errors
+                    .push(format!("player movement speed equipment: {error:#}"));
+                [
+                    0.1_f32,
+                    (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32,
+                ]
+            }
+        };
+        self.movement_speed_cache = Some((revision, speed, slowness, values));
+    }
+
+    fn movement_speed(&self, sprinting: bool) -> f32 {
+        self.movement_speed_cache
+            .as_ref()
+            .map_or(0.1, |cache| cache.3[usize::from(sprinting)])
+    }
+
+    fn update_movement_effect_modifiers(&mut self, transitions: [bool; 2]) {
+        use native_resources::enchantments::{AttributeModifier, AttributeOperation};
+        use native_resources::packs::ResourceId;
+        for (transition, current, name, base) in [
+            (
+                transitions[0],
+                &self.fall.effects().speed,
+                "effect.speed",
+                f64::from(0.2_f32),
+            ),
+            (
+                transitions[1],
+                &self.fall.effects().slowness,
+                "effect.slowness",
+                f64::from(-0.15_f32),
+            ),
+        ] {
+            if transition {
+                let id = ResourceId::parse(&format!("minecraft:{name}"))
+                    .expect("vanilla effect identifier");
+                self.movement_speed_attribute.remove_modifier(&id);
+                if let Some(effect) = current {
+                    self.movement_speed_attribute.apply(AttributeModifier {
+                        id,
+                        operation: AttributeOperation::AddMultipliedTotal,
+                        amount: base * (f64::from(effect.amplifier) + 1.0),
+                    });
+                }
+                self.movement_speed_cache = None;
+            }
+        }
+    }
+
     /// Restore the persistent fall attributes and active status effects.
     pub fn set_saved_fall(
         &mut self,
@@ -585,6 +691,7 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("active enchantment registry is unavailable"))?;
         self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
+        self.movement_speed_cache = None;
         Ok(())
     }
 
@@ -1082,6 +1189,7 @@ impl LoadedSession {
         self.oxygen_inventory_revision = None;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.movement_speed_cache = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
             inventory.set_enchantments(Arc::clone(enchantments));
@@ -1251,6 +1359,10 @@ impl LoadedSession {
             )),
             jump_strength_inventory_revision: None,
             jump_strength: Some(f64::from(0.42_f32)),
+            movement_speed_attribute: crate::player_data::SavedAttribute::with_base(f64::from(
+                0.1_f32,
+            )),
+            movement_speed_cache: None,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
@@ -2820,6 +2932,8 @@ impl LoadedSession {
         self.jump_strength_attribute.clear_modifiers();
         self.jump_strength_inventory_revision = None;
         self.jump_strength = self.jump_strength_attribute.value(0.0, 32.0).ok();
+        self.movement_speed_attribute.clear_modifiers();
+        self.movement_speed_cache = None;
         self.fall.reset_after_death();
         self.breathing_effects = crate::survival::BreathingEffects::default();
         self.effect_save_invalid = true;
@@ -5013,6 +5127,8 @@ impl LoadedSession {
         let camera_target_eye_height = self.player.pose.eye_height();
         let camera_sprinting = self.sprint.active;
         let camera_flying = self.flight.flying;
+        self.refresh_movement_speed();
+        let camera_speed = self.movement_speed(camera_sprinting);
         self.apply_streaming();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
@@ -5051,10 +5167,10 @@ impl LoadedSession {
             self.mining.release();
             self.food_use.cancel();
             self.camera.begin_bob_tick(DVec3::ZERO, false);
-            self.camera.tick(
+            self.camera.tick_with_speed(
                 self.motion.position,
                 self.player.pose.eye_height(),
-                false,
+                camera_speed,
                 camera_flying,
                 self.fov_effect_scale,
             );
@@ -5536,20 +5652,6 @@ impl LoadedSession {
         self.refresh_bounciness();
         self.refresh_jump_strength();
         let friction = self.friction_below();
-        let block_shape = |cell_pos| match cell(
-            &self.world,
-            self.origin,
-            self.bounds,
-            cell_pos,
-            self.states[0],
-        ) {
-            Cell::Missing => unknown_barrier(),
-            Cell::State(id) => self
-                .shapes
-                .get(id.0 as usize)
-                .and_then(Option::as_deref)
-                .unwrap_or_else(|| unknown_barrier()),
-        };
         let fluid_view = FluidView {
             world: &self.world,
             shapes: &self.shapes,
@@ -5617,7 +5719,37 @@ impl LoadedSession {
             });
         tracking.ticks = tracking.ticks.saturating_add(1);
         self.breathing_effects.tick();
+        let transitions =
+            [&self.fall.effects().speed, &self.fall.effects().slowness].map(|effect| {
+                effect
+                    .as_ref()
+                    .is_some_and(|effect| effect.duration != -1 && effect.duration <= 1)
+            });
         self.fall.tick_effects();
+        self.update_movement_effect_modifiers(transitions);
+        self.refresh_movement_speed();
+        let fluid_view = FluidView {
+            world: &self.world,
+            shapes: &self.shapes,
+            fluids: &self.fluids,
+            origin: self.origin,
+            bounds: self.bounds,
+            air: self.states[0],
+        };
+        let block_shape = |cell_pos| match cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            cell_pos,
+            self.states[0],
+        ) {
+            Cell::Missing => unknown_barrier(),
+            Cell::State(id) => self
+                .shapes
+                .get(id.0 as usize)
+                .and_then(Option::as_deref)
+                .unwrap_or_else(|| unknown_barrier()),
+        };
         self.swimming = if self.flight.flying {
             false
         } else if self.swimming {
@@ -5682,6 +5814,7 @@ impl LoadedSession {
                 .map(|effect| effect.amplifier),
         );
         let slow_falling = self.fall.effects().slow_falling.is_some();
+        let movement_speed = self.movement_speed(input.sprinting);
         let levitation = self
             .fall
             .effects()
@@ -5812,12 +5945,13 @@ impl LoadedSession {
                     .tick_spectator(input, self.sneak, self.flight_speed),
             )
         } else if flying {
-            self.motion.tick_flying_with_bounciness(
+            self.motion.tick_flying_with_movement_speed(
                 input,
                 self.sneak,
                 self.flight_speed,
                 friction,
                 entity_bounce,
+                movement_speed,
                 |position, requested, on_ground| {
                     (
                         requested,
@@ -5859,6 +5993,7 @@ impl LoadedSession {
             self.motion.tick_resolved_with_restitution(
                 input,
                 friction,
+                movement_speed,
                 jump_power,
                 slow_falling,
                 levitation,
@@ -6024,10 +6159,10 @@ impl LoadedSession {
         self.player.position = self.motion.position.as_vec3();
         self.player.vertical_velocity = (self.motion.velocity.y * 20.0) as f32;
         self.player.on_ground = self.motion.on_ground;
-        self.camera.tick(
+        self.camera.tick_with_speed(
             self.motion.position,
             camera_target_eye_height,
-            camera_sprinting,
+            camera_speed,
             camera_flying,
             self.fov_effect_scale,
         );
@@ -7337,6 +7472,115 @@ mod tests {
             .set_slot(crate::inventory::PlayerSlot::Armor(0), None);
         session.refresh_jump_strength();
         assert_eq!(session.jump_strength, Some(0.3));
+    }
+
+    #[test]
+    fn movement_speed_tracks_saved_effect_modifiers_and_their_transitions() {
+        use native_resources::{
+            enchantments::{AttributeModifier, AttributeOperation},
+            packs::ResourceId,
+        };
+        let mut session = session();
+        let effects = crate::survival::FallEffects {
+            speed: Some(crate::survival::EffectDuration {
+                amplifier: 1,
+                duration: 1,
+                hidden: Some(Box::new(crate::survival::EffectDuration {
+                    amplifier: 0,
+                    duration: 4,
+                    hidden: None,
+                })),
+            }),
+            slowness: Some(crate::survival::EffectDuration {
+                amplifier: 0,
+                duration: 2,
+                hidden: None,
+            }),
+            ..Default::default()
+        };
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            effects,
+            Arc::new(OxygenEnchantments::default()),
+        );
+        let mut saved = crate::player_data::SavedAttribute::with_base(f64::from(0.1_f32));
+        for (id, amount) in [
+            ("minecraft:effect.speed", f64::from(0.2_f32) * 2.0),
+            ("minecraft:effect.slowness", f64::from(-0.15_f32)),
+        ] {
+            saved.apply(AttributeModifier {
+                id: ResourceId::parse(id).unwrap(),
+                amount,
+                operation: AttributeOperation::AddMultipliedTotal,
+            });
+        }
+        session.set_saved_movement_speed(saved).unwrap();
+        session.update(TICK);
+        let promoted =
+            (f64::from(0.1_f32) * (1.0 + f64::from(-0.15_f32)) * (1.0 + f64::from(0.2_f32))) as f32;
+        assert!((session.movement_speed(false) - promoted).abs() < 1e-7);
+        session.update(TICK);
+        assert!((session.movement_speed(false) - 0.12).abs() < 1e-7);
+        session.update(TICK);
+        session.update(TICK);
+        assert_eq!(session.movement_speed(false), 0.1_f32);
+
+        // Java loads active effects and persistent attributes separately: it
+        // does not invent a missing effect modifier until a transition occurs.
+        let mut absent = self::session();
+        absent.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                speed: Some(crate::survival::EffectDuration {
+                    amplifier: 3,
+                    duration: 10,
+                    hidden: None,
+                }),
+                ..Default::default()
+            },
+            Arc::new(OxygenEnchantments::default()),
+        );
+        absent.refresh_movement_speed();
+        assert_eq!(absent.movement_speed(false), 0.1_f32);
+    }
+
+    #[test]
+    fn movement_speed_refreshes_when_equipment_changes() {
+        use native_persistence::nbt::{Tag, TagType};
+        let mut session = session();
+        session
+            .set_saved_movement_speed(crate::player_data::SavedAttribute::with_base(0.2))
+            .unwrap();
+        let component = Tag::Compound(vec![(
+            "minecraft:attribute_modifiers".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    (
+                        "type".into(),
+                        Tag::String("minecraft:movement_speed".into()),
+                    ),
+                    ("id".into(), Tag::String("example:boots".into())),
+                    ("operation".into(), Tag::String("add_value".into())),
+                    ("amount".into(), Tag::Double(0.3)),
+                    ("slot".into(), Tag::String("feet".into())),
+                ])],
+            },
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            crate::inventory::PlayerSlot::Armor(3),
+            ItemStack::unresolved("minecraft:leather_boots".into(), 1, component),
+        );
+        session.set_player_inventory(inventory);
+        session.refresh_movement_speed();
+        assert_eq!(session.movement_speed(false), 0.5);
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(3), None);
+        session.refresh_movement_speed();
+        assert_eq!(session.movement_speed(false), 0.2_f32);
     }
 
     #[test]

@@ -40,16 +40,33 @@ impl CameraMotion {
         flying: bool,
         effect_scale: f32,
     ) {
-        self.previous_position = self.position;
-        self.position = position;
-        self.previous_eye_height = self.eye_height;
-        self.eye_height += (target_eye_height - self.eye_height) * 0.5;
-        self.previous_fov_modifier = self.fov_modifier;
         let movement_speed = if sprinting {
             (0.1_f64 * 1.3) as f32
         } else {
             0.1_f32
         };
+        self.tick_with_speed(
+            position,
+            target_eye_height,
+            movement_speed,
+            flying,
+            effect_scale,
+        );
+    }
+
+    pub(crate) fn tick_with_speed(
+        &mut self,
+        position: DVec3,
+        target_eye_height: f32,
+        movement_speed: f32,
+        flying: bool,
+        effect_scale: f32,
+    ) {
+        self.previous_position = self.position;
+        self.position = position;
+        self.previous_eye_height = self.eye_height;
+        self.eye_height += (target_eye_height - self.eye_height) * 0.5;
+        self.previous_fov_modifier = self.fov_modifier;
         let modifier = if flying { 1.1_f32 } else { 1.0_f32 };
         let target =
             1.0_f32 + effect_scale * (modifier * ((movement_speed / 0.1_f32 + 1.0) / 2.0) - 1.0);

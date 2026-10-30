@@ -270,6 +270,8 @@ pub struct FallEffects {
     pub resistance: Option<EffectDuration>,
     pub slow_falling: Option<EffectDuration>,
     pub levitation: Option<EffectDuration>,
+    pub speed: Option<EffectDuration>,
+    pub slowness: Option<EffectDuration>,
 }
 
 impl FallEffects {
@@ -278,6 +280,8 @@ impl FallEffects {
         EffectDuration::tick(&mut self.resistance);
         EffectDuration::tick(&mut self.slow_falling);
         EffectDuration::tick(&mut self.levitation);
+        EffectDuration::tick(&mut self.speed);
+        EffectDuration::tick(&mut self.slowness);
     }
 }
 

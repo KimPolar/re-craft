@@ -105,6 +105,10 @@ impl SavedAttribute {
         self.modifiers.clear();
     }
 
+    pub(crate) fn remove_modifier(&mut self, id: &ResourceId) {
+        self.modifiers.remove(id);
+    }
+
     pub(crate) fn value(&self, minimum: f64, maximum: f64) -> Result<f64> {
         let mut value = self.base;
         for modifier in self
@@ -131,6 +135,36 @@ impl SavedAttribute {
         }
         ensure!(value.is_finite(), "saved attribute is not finite");
         Ok(value.clamp(minimum, maximum))
+    }
+
+    /// Apply vanilla effect and sprint modifiers to the assembled movement attribute.
+    pub fn movement_speed(
+        &self,
+        speed: Option<u8>,
+        slowness: Option<u8>,
+        sprinting: bool,
+    ) -> Result<f32> {
+        let mut attribute = self.clone();
+        for (name, amplifier, amount) in [
+            ("effect.speed", speed, f64::from(0.2_f32)),
+            ("effect.slowness", slowness, f64::from(-0.15_f32)),
+        ] {
+            if let Some(amplifier) = amplifier {
+                attribute.apply(AttributeModifier {
+                    id: ResourceId::parse(&format!("minecraft:{name}"))?,
+                    operation: AttributeOperation::AddMultipliedTotal,
+                    amount: amount * (f64::from(amplifier) + 1.0),
+                });
+            }
+        }
+        if sprinting {
+            attribute.apply(AttributeModifier {
+                id: ResourceId::parse("minecraft:sprinting")?,
+                operation: AttributeOperation::AddMultipliedTotal,
+                amount: f64::from(0.3_f32),
+            });
+        }
+        Ok(attribute.value(0.0, 1024.0)? as f32)
     }
 }
 
@@ -209,6 +243,10 @@ pub fn read_saved_jump_strength_attribute(player: &NamedTag) -> Result<SavedAttr
     saved_attribute(player, "jump_strength", f64::from(0.42_f32))
 }
 
+pub fn read_saved_movement_speed_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "movement_speed", f64::from(0.1_f32))
+}
+
 /// Preserve persistent armor and toughness modifiers for equipment changes.
 pub fn read_saved_armor_attributes(player: &NamedTag) -> Result<(SavedAttribute, SavedAttribute)> {
     Ok((
@@ -279,6 +317,8 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "resistance") => &mut effects.resistance,
             ("minecraft", "slow_falling") => &mut effects.slow_falling,
             ("minecraft", "levitation") => &mut effects.levitation,
+            ("minecraft", "speed") => &mut effects.speed,
+            ("minecraft", "slowness") => &mut effects.slowness,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1645,7 +1685,7 @@ mod tests {
                 ("duration".into(), Tag::Int(5)),
             ])
         };
-        assert!(advance_saved_effects(&player(vec![effect("minecraft:speed")]), 1).is_err());
+        assert!(advance_saved_effects(&player(vec![effect("minecraft:weakness")]), 1).is_err());
         assert!(
             advance_saved_effects(
                 &player(vec![effect("minecraft:resistance"), effect("resistance")]),

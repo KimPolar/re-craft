@@ -52,6 +52,14 @@ pub fn block_jump_factor(block: &str) -> f32 {
     }
 }
 
+fn default_movement_speed(sprinting: bool) -> f32 {
+    if sprinting {
+        (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32
+    } else {
+        0.1_f32
+    }
+}
+
 /// Minecraft applies the accumulated vertical wheel count in float precision.
 pub fn adjust_flight_speed(speed: f32, steps: i32) -> f32 {
     (speed + steps as f32 * 0.005_f32).clamp(0.0, 0.2)
@@ -149,6 +157,27 @@ impl MotionState {
         bounciness: f64,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
+        self.tick_flying_with_movement_speed(
+            input,
+            descend,
+            flight_speed,
+            block_friction,
+            bounciness,
+            default_movement_speed(input.sprinting),
+            collide,
+        )
+    }
+
+    pub(crate) fn tick_flying_with_movement_speed(
+        &mut self,
+        input: MovementInput,
+        descend: bool,
+        flight_speed: f32,
+        block_friction: f32,
+        bounciness: f64,
+        movement_speed: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
         let vertical = i32::from(input.jump) - i32::from(descend);
         self.velocity.y += f64::from(vertical as f32 * flight_speed * 3.0_f32);
         // Player.isAffectedByFluids() is false while flying. LivingEntity.aiStep
@@ -170,15 +199,10 @@ impl MotionState {
             1.0
         };
         let speed = if self.on_ground {
-            let ground_speed = if input.sprinting {
-                (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32
-            } else {
-                0.1_f32
-            };
             if f64::from(friction) > 0.6 {
-                ground_speed * (0.21600002_f32 / (friction * friction * friction))
+                movement_speed * (0.21600002_f32 / (friction * friction * friction))
             } else {
-                ground_speed
+                movement_speed
             }
         } else if input.sprinting {
             flight_speed * 2.0_f32
@@ -276,13 +300,22 @@ impl MotionState {
         jump_power: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
-        self.tick_resolved_with_effects(input, block_friction, jump_power, false, None, collide)
+        self.tick_resolved_with_effects(
+            input,
+            block_friction,
+            default_movement_speed(input.sprinting),
+            jump_power,
+            false,
+            None,
+            collide,
+        )
     }
 
     pub fn tick_resolved_with_effects(
         &mut self,
         input: MovementInput,
         block_friction: f32,
+        movement_speed: f32,
         jump_power: f32,
         slow_falling: bool,
         levitation: Option<u8>,
@@ -291,6 +324,7 @@ impl MotionState {
         self.tick_resolved_with_restitution(
             input,
             block_friction,
+            movement_speed,
             jump_power,
             slow_falling,
             levitation,
@@ -303,6 +337,7 @@ impl MotionState {
         &mut self,
         input: MovementInput,
         block_friction: f32,
+        movement_speed: f32,
         jump_power: f32,
         slow_falling: bool,
         levitation: Option<u8>,
@@ -334,19 +369,14 @@ impl MotionState {
         } else {
             1.0
         };
-        let ground_speed = if input.sprinting {
-            (f64::from(0.1_f32) * (1.0 + f64::from(0.3_f32))) as f32
-        } else {
-            0.1_f32
-        };
         let speed = if self.on_ground {
             if f64::from(friction) > 0.6 {
-                ground_speed * (0.21600002_f32 / (friction * friction * friction))
+                movement_speed * (0.21600002_f32 / (friction * friction * friction))
             } else {
-                ground_speed
+                movement_speed
             }
         } else if input.sprinting {
-            0.026_f32
+            0.02_f32 * 1.3_f32
         } else {
             0.02_f32
         };

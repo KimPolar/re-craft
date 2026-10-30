@@ -1855,15 +1855,24 @@ fn demo_transform_state(block: Block) -> Option<TransformState> {
     Some(TransformState { name, properties })
 }
 
-/// Offhand placement is known only when the main hand is empty. Other main
-/// hand items may consume, fail, or pass an interaction for item-specific reasons.
-fn placement_hand(inventory: &PlayerInventory) -> Option<(PlayerSlot, Block)> {
+/// Only fall through for items whose ordinary use-on-block and use-in-air
+/// both pass. Unknown item components may change either interaction.
+fn placement_input_hand(inventory: &PlayerInventory) -> PlayerSlot {
     let main = PlayerSlot::Storage(inventory.selected());
-    let hand = if inventory.slot(main).is_some() {
-        main
-    } else {
+    if inventory.slot(main).is_none_or(|item| {
+        inventory::ordinary_return_supported(item)
+            && (item.id() == "minecraft:stick"
+                || item.id().ends_with("_pickaxe")
+                || item.id().ends_with("_sword"))
+    }) {
         PlayerSlot::Offhand
-    };
+    } else {
+        main
+    }
+}
+
+fn placement_hand(inventory: &PlayerInventory) -> Option<(PlayerSlot, Block)> {
+    let hand = placement_input_hand(inventory);
     let block = inventory_block(inventory, hand);
     block.is_solid().then_some((hand, block))
 }
@@ -4638,12 +4647,39 @@ mod tests {
     }
 
     #[test]
-    fn basic_placement_uses_offhand_only_when_main_hand_is_empty() {
+    fn placement_hand_does_not_assume_unknown_component_behavior() {
+        use native_persistence::nbt::Tag;
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            inventory::ItemStack::unresolved(
+                "minecraft:stick".into(),
+                1,
+                Tag::Compound(vec![("minecraft:consumable".into(), Tag::Compound(vec![]))]),
+            ),
+        );
+        inventory.set_slot(
+            PlayerSlot::Offhand,
+            inventory::ItemStack::new("minecraft:dirt".into(), 2, 64, Tag::Compound(vec![])),
+        );
+        assert_eq!(placement_input_hand(&inventory), PlayerSlot::Storage(0));
+        assert!(placement_hand(&inventory).is_none());
+    }
+
+    #[test]
+    fn basic_placement_uses_offhand_after_passive_main_hand() {
         use inventory::ItemStack;
         use native_persistence::nbt::Tag;
         for (mode, main, expected, main_count, off_count) in [
             (GameMode::Survival, None, Block::Dirt, None, 1),
             (GameMode::Creative, None, Block::Dirt, None, 2),
+            (
+                GameMode::Survival,
+                Some("minecraft:stick"),
+                Block::Dirt,
+                Some(2),
+                1,
+            ),
             (
                 GameMode::Survival,
                 Some("minecraft:stone"),
@@ -4685,7 +4721,7 @@ mod tests {
                 after.first_person.swing.hand(),
                 if expected == Block::Air {
                     None
-                } else if main.is_none() {
+                } else if main.is_none() || main == Some("minecraft:stick") {
                     Some(animation::Hand::Off)
                 } else {
                     Some(animation::Hand::Main)

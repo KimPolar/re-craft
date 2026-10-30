@@ -4087,13 +4087,7 @@ impl LoadedSession {
     /// Test candidate supports in Java's view-dependent order. An unknown
     /// earlier support cannot safely be skipped in favour of a later one.
     fn place_button(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
-        use crate::inventory::PlayerSlot;
-        let main = PlayerSlot::Storage(self.inventory.selected());
-        let hand = if self.inventory.slot(main).is_some() {
-            main
-        } else {
-            PlayerSlot::Offhand
-        };
+        let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
         let kind = native_core::button::Button::from_id(held.id());
         let lever = held.id() == "minecraft:lever";
@@ -4171,13 +4165,7 @@ impl LoadedSession {
     /// Place the currently supported full-cube redstone items. A lamp's
     /// initial lit state depends on all known neighboring signals.
     fn place_redstone(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
-        use crate::inventory::PlayerSlot;
-        let main = PlayerSlot::Storage(self.inventory.selected());
-        let hand = if self.inventory.slot(main).is_some() {
-            main
-        } else {
-            PlayerSlot::Offhand
-        };
+        let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
         if held.max_count().is_none() {
             return None;
@@ -20071,6 +20059,69 @@ mod tests {
                     .name,
                 "minecraft:air"
             );
+        }
+    }
+
+    #[test]
+    fn passive_main_hand_allows_offhand_block_placement() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for main in [
+            "minecraft:stick",
+            "minecraft:wooden_pickaxe",
+            "minecraft:iron_sword",
+        ] {
+            for offhand in [
+                "minecraft:stone_bricks",
+                "minecraft:stone_button",
+                "minecraft:lever",
+                "minecraft:redstone_lamp",
+                "minecraft:redstone_block",
+            ] {
+                for mode in [GameMode::Survival, GameMode::Creative] {
+                    let mut session = session();
+                    session.set_game_mode(mode);
+                    let mut inventory = PlayerInventory::default();
+                    let max = if main == "minecraft:stick" { 64 } else { 1 };
+                    inventory.set_slot(
+                        PlayerSlot::Storage(0),
+                        ItemStack::new(main.into(), 1, max, Tag::Compound(vec![])),
+                    );
+                    inventory.set_slot(
+                        PlayerSlot::Offhand,
+                        ItemStack::new(offhand.into(), 2, 64, Tag::Compound(vec![])),
+                    );
+                    session.set_player_inventory(inventory);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    let target = session.origin + IVec3::new(8, 2, 7);
+                    assert_eq!(
+                        session
+                            .world
+                            .block(target.x, target.y, target.z)
+                            .unwrap()
+                            .name,
+                        offhand,
+                        "{main} {offhand} {mode:?}"
+                    );
+                    assert_eq!(
+                        session.first_person.swing.hand(),
+                        Some(crate::animation::Hand::Off)
+                    );
+                    assert_eq!(
+                        session
+                            .inventory
+                            .slot(PlayerSlot::Storage(0))
+                            .unwrap()
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+                        if mode == GameMode::Survival { 1 } else { 2 }
+                    );
+                }
+            }
         }
     }
 

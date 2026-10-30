@@ -55,6 +55,13 @@ public class ItemRegistryOracle {
         && m.getDeclaringClass()!=Item.class));
       v.addProperty("equippable",item.components().has(DataComponents.EQUIPPABLE));
       v.addProperty("tool",item.components().has(DataComponents.TOOL));
+      v.addProperty("passive_use", item.getClass().getMethod("useOn",net.minecraft.world.item.context.UseOnContext.class).getDeclaringClass()==Item.class
+        && item.getClass().getMethod("use",net.minecraft.world.level.Level.class,Player.class,net.minecraft.world.InteractionHand.class).getDeclaringClass()==Item.class
+        && !item.components().has(DataComponents.BLOCK_TRANSFORMER)
+        && !item.components().has(DataComponents.CONSUMABLE)
+        && !item.components().has(DataComponents.EQUIPPABLE)
+        && !item.components().has(DataComponents.BLOCKS_ATTACKS)
+        && !item.components().has(DataComponents.KINETIC_WEAPON));
       v.addProperty("remainder",item.getCraftingRemainder()!=null);
       String id=BuiltInRegistries.ITEM.getKey(item).toString();
       var initial=new ItemStack(item,1);
@@ -162,6 +169,21 @@ fn implemented_item_defaults_and_click_assumptions_match_vanilla() {
         .arg(&output)
         .args(native_core::wood::Wood::all().map(|wood| wood.id())));
     let result: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(result["minecraft:stick"]["passive_use"], true);
+    for material in [
+        "wooden",
+        "stone",
+        "copper",
+        "iron",
+        "golden",
+        "diamond",
+        "netherite",
+    ] {
+        for kind in ["pickaxe", "sword"] {
+            let id = format!("minecraft:{material}_{kind}");
+            assert_eq!(result[&id]["passive_use"], true, "{id}");
+        }
+    }
     let mut checked = 0;
     let mut bars_checked = 0;
     for (id, value) in result.as_object().unwrap() {

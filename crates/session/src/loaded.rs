@@ -2309,8 +2309,8 @@ impl LoadedSession {
     }
 
     /// Prepare a group of known entity chunks including transfers into empty
-    /// chunks, including supported saved-item merges and removals. This does
-    /// not enable a world write: creation and other effects remain prerequisites.
+    /// chunks, including supported saved-item merges, removals, and fresh item
+    /// creations. This does not enable a world write: other effects remain prerequisites.
     pub fn draft_existing_entity_chunks(
         &self,
         positions: &std::collections::BTreeSet<ChunkPos>,
@@ -2408,6 +2408,31 @@ impl LoadedSession {
             .validate_item_chunk_group(positions, &self.saved_item_uuids)?;
         self.dropped_items
             .validate_removed_item_chunk_group(positions, &self.saved_item_uuids)?;
+        let created_items = self
+            .dropped_items
+            .draft_created_items_in_chunks(positions)?;
+        if !created_items.is_empty() {
+            let mut created_uuids = BTreeSet::new();
+            for item in &created_items {
+                let uuid = crate::saved_item::optional_uuid(&item.document().value, "UUID")?
+                    .context("created item has no stable UUID")?;
+                ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
+            }
+            // Check known source chunks outside this group as well. Unloaded
+            // entities and world effects still prevent using this as a save.
+            for data in self.entity_chunks.values() {
+                if let SavedEntityData::Present(chunk) = data {
+                    for entity in chunk.entities() {
+                        if let Some(uuid) = crate::saved_item::optional_uuid(entity, "UUID")? {
+                            ensure!(
+                                !created_uuids.contains(&uuid),
+                                "created item UUID conflicts with a saved entity"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.experience_orbs
             .validate_chunk_group(positions, &self.saved_orb_uuids)?;
         let replacements: Vec<_> = falling
@@ -2416,10 +2441,11 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_removals(
+        crate::saved_falling_block::draft_entity_chunks_with_item_changes(
             &originals,
             &replacements,
             &removed_items,
+            &created_items,
         )
     }
 
@@ -10201,6 +10227,238 @@ mod tests {
         session.queue_chunk_window(home, 0);
         session.update(TICK);
         assert!(session.snapshot().dropped_items.is_empty());
+    }
+
+    #[test]
+    fn fresh_items_join_coordinated_chunk_drafts_without_losing_existing_entities() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let remote = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut remote_terrain = (**session.world.chunks.get(&home).unwrap()).clone();
+        remote_terrain.position = remote;
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(remote, Arc::new(remote_terrain));
+        let pig = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![12, 34, 56, 78])),
+            ("future".into(), Tag::Long(42)),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![pig.clone()],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::clone(&document),
+                })),
+            )
+            .unwrap();
+        session
+            .set_initial_entity_chunk(remote, SavedEntityData::Empty)
+            .unwrap();
+        let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        for pos in [home, remote] {
+            session.dropped_items.spawn_from_entity(
+                DVec3::new(
+                    f64::from(pos.x * 16) + 3.5,
+                    70.0,
+                    f64::from(pos.z * 16) + 3.5,
+                ),
+                stack.clone(),
+            );
+        }
+        let group = BTreeSet::from([home, remote]);
+        let drafts = session.draft_existing_entity_chunks(&group).unwrap();
+        assert!(drafts[&home].matches_source(&document).unwrap());
+        let Some(Tag::List {
+            values: home_entities,
+            ..
+        }) = drafts[&home].document().value.get("Entities")
+        else {
+            panic!("missing entities")
+        };
+        assert_eq!(home_entities[0], pig);
+        let Some(Tag::List {
+            values: remote_entities,
+            ..
+        }) = drafts[&remote].document().value.get("Entities")
+        else {
+            panic!("missing entities")
+        };
+        assert_eq!(home_entities.len(), 2);
+        assert_eq!(remote_entities.len(), 1);
+        let first = crate::saved_item::read(&home_entities[1]).unwrap().unwrap();
+        let second = crate::saved_item::read(&remote_entities[0])
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.uuid, second.uuid);
+        assert_eq!(first.stack.count(), 3);
+        assert_eq!(second.stack.count(), 3);
+        let conflict = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(first.uuid.unwrap().to_vec())),
+        ]);
+        let remote_document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![remote.x, remote.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![conflict],
+                    },
+                ),
+            ]),
+        };
+        session
+            .set_initial_entity_chunk(
+                remote,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: remote.x,
+                        z: remote.z,
+                    },
+                    document: Arc::new(remote_document),
+                })),
+            )
+            .unwrap();
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_err(),
+            "UUID conflicts in known chunks outside the group must be rejected"
+        );
+        session
+            .set_initial_entity_chunk(remote, SavedEntityData::Empty)
+            .unwrap();
+        assert_eq!(
+            document.value.get("Entities").unwrap(),
+            &Tag::List {
+                element_type: TagType::Compound,
+                values: vec![pig]
+            }
+        );
+        session.update(TICK);
+        assert!(
+            session.draft_existing_entity_chunks(&group).is_err(),
+            "ticked base state must not be guessed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn coordinated_created_item_is_decoded_by_java() {
+        use native_persistence::nbt::{Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let (mut world, _, player) = fixture();
+        let original = *world.chunks.keys().next().unwrap();
+        let pos = ChunkPos { x: 0, z: -1 };
+        let mut chunk = (*world.chunks.remove(&original).unwrap()).clone();
+        chunk.position = pos;
+        world.chunks.insert(pos, Arc::new(chunk));
+        let mut session = LoadedSession::new(
+            world,
+            IVec3::new(0, 0, -16),
+            BuildBounds {
+                min_y: 0,
+                max_y: 128,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_initial_entity_chunk(pos, SavedEntityData::Empty)
+            .unwrap();
+        let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        session
+            .dropped_items
+            .spawn_from_entity(DVec3::new(2.0, 63.0, -2.0), stack);
+        let drafts = session
+            .draft_existing_entity_chunks(&BTreeSet::from([pos]))
+            .unwrap();
+        let Some(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        }) = drafts[&pos].document().value.get("Entities")
+        else {
+            panic!("missing entity list")
+        };
+        assert_eq!(values.len(), 1);
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let entity = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: values[0].clone(),
+        };
+        std::fs::write(
+            temp.path().join("live-created-item.nbt"),
+            native_persistence::nbt::write(&entity).unwrap(),
+        )
+        .unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SavedItemOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/SavedItemOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SavedItemOracle")
+                .arg(temp.path())
+                .arg("--live-only"),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java item oracle failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

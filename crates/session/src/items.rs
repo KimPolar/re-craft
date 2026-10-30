@@ -602,11 +602,33 @@ impl ItemEntities {
                 continue;
             }
             if let Some(created) = &entity.created {
-                ensure!(created.uuid.is_some(), "new item UUID is unavailable");
+                ensure!(
+                    entity._saved_source.is_none(),
+                    "created item has a saved source"
+                );
+                let uuid = created.uuid.context("new item UUID is unavailable")?;
                 ensure!(
                     created.thrower != CreatedThrower::Unknown,
                     "new item thrower is unknown"
                 );
+                ensure!(seen.insert(uuid), "duplicate live item UUID");
+                ensure!(
+                    self.player_uuid != Some(uuid),
+                    "new item UUID conflicts with the player"
+                );
+                ensure!(
+                    !saved_uuids.contains_key(&uuid),
+                    "new item UUID conflicts with a saved item"
+                );
+                ensure!(
+                    origin_chunk.is_some_and(|pos| positions.contains(&pos)),
+                    "new item origin chunk is unavailable"
+                );
+                ensure!(
+                    positions.contains(&destination),
+                    "new item destination chunk is unavailable"
+                );
+                continue;
             }
             let uuid = uuid.context("new item needs coordinated creation")?;
             ensure!(seen.insert(uuid), "duplicate live item UUID");
@@ -684,10 +706,17 @@ impl ItemEntities {
         &self,
         pos: native_world::loaded::ChunkPos,
     ) -> anyhow::Result<Vec<crate::saved_item::CreatedItemDraft>> {
+        self.draft_created_items_in_chunks(&BTreeSet::from([pos]))
+    }
+
+    /// Traverse live items once even when a transaction contains many chunks.
+    pub(crate) fn draft_created_items_in_chunks(
+        &self,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> anyhow::Result<Vec<crate::saved_item::CreatedItemDraft>> {
         use anyhow::{Context, ensure};
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
-        let positions = BTreeSet::from([pos]);
         for entity in &self.entities {
             let Some(created) = &entity.created else {
                 continue;
@@ -696,8 +725,8 @@ impl ItemEntities {
                 created.origin.is_finite() && entity.item.position.is_finite(),
                 "created item position is invalid"
             );
-            let in_origin = Self::active_in(&positions, created.origin);
-            let in_current = Self::active_in(&positions, entity.item.position);
+            let in_origin = Self::active_in(positions, created.origin);
+            let in_current = Self::active_in(positions, entity.item.position);
             if !in_origin && !in_current {
                 continue;
             }
@@ -2030,6 +2059,59 @@ mod tests {
                 CreatedThrower::Known(None),
                 CreatedThrower::Known(None)
             ]
+        );
+    }
+
+    #[test]
+    fn created_item_group_requires_origin_destination_and_unique_identity() {
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeMap;
+        let home = ChunkPos { x: 0, z: 0 };
+        let remote = ChunkPos { x: 1, z: 0 };
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(0.5, 70.0, 0.5), stack);
+        let uuid = items.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([home]), &BTreeMap::new())
+                .is_ok()
+        );
+        assert!(
+            items
+                .validate_item_chunk_group(
+                    &BTreeSet::from([home]),
+                    &BTreeMap::from([(uuid, remote)])
+                )
+                .is_err()
+        );
+        items.set_player_uuid(Some(uuid));
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([home]), &BTreeMap::new())
+                .is_err()
+        );
+        items.set_player_uuid(None);
+        items.entities[0].item.position.x = 16.5;
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([home]), &BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([remote]), &BTreeMap::new())
+                .is_err()
+        );
+        let group = BTreeSet::from([home, remote]);
+        assert!(
+            items
+                .validate_item_chunk_group(&group, &BTreeMap::new())
+                .is_ok()
+        );
+        assert!(
+            items.draft_created_items_in_chunks(&group).is_err(),
+            "movement needs verified base state"
         );
     }
 

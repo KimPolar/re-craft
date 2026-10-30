@@ -91,7 +91,8 @@ public class SavedItemOracle {
             resistance.add(row); NbtIo.write(component,Path.of(args[0],"resistance-"+i+".nbt"));
         }
         Files.writeString(Path.of(args[0], "resistance.json"),new Gson().toJson(resistance));
-        if (args.length > 1) {
+        boolean liveOnly = args.length == 2 && args[1].equals("--live-only");
+        if (args.length > 1 && !liveOnly) {
             var in = new java.io.DataInputStream(Files.newInputStream(Path.of(args[1])));
             var tag = NbtIo.read((java.io.DataInput)in); in.close();
             var input = TagValueInput.create(ProblemReporter.DISCARDING, registry, tag);
@@ -126,8 +127,8 @@ public class SavedItemOracle {
                 input.getDoubleOr("fall_distance",0)!=2.5 || input.getShortOr("Air",(short)0)!=280 || input.getIntOr("PortalCooldown",0)!=7)
                 throw new AssertionError("new item document differs from Java decoding");
         }
-        if (args.length > 3) {
-            var tag = NbtIo.read(Path.of(args[3]));
+        if (args.length > 3 || liveOnly) {
+            var tag = NbtIo.read(liveOnly ? Path.of(args[0], "live-created-item.nbt") : Path.of(args[3]));
             var input = TagValueInput.create(ProblemReporter.DISCARDING, registry, tag);
             var item = (TestItem)unsafe.allocateInstance(TestItem.class); item.loadExtra(input);
             var uuid = net.minecraft.core.UUIDUtil.CODEC.parse(NbtOps.INSTANCE,tag.get("UUID")).getOrThrow();

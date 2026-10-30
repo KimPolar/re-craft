@@ -84,5 +84,16 @@ public class SavedFallingOracle {
          !input.read("Pos",Vec3.CODEC).orElseThrow().equals(new Vec3(16.5,64,-2.5)))
         throw new AssertionError("Rust new entity chunk differs from Java decoding");
     }
+    if(args.length > 4) {
+      var in=new DataInputStream(Files.newInputStream(Path.of(args[4]))); var tag=NbtIo.read((DataInput)in); in.close();
+      var input=TagValueInput.create(ProblemReporter.DISCARDING,registry,tag);
+      var entity=(Falling)unsafe.allocateInstance(Falling.class); entity.loadExtra(input);
+      if(entity.time!=7 || !entity.dropItem || cancelled.getBoolean(entity) || entity.getBlockState().getBlock()!=Blocks.GRAVEL ||
+         !input.read("Pos",Vec3.CODEC).orElseThrow().equals(new Vec3(3.5,5.0,3.5)) ||
+         !input.read("Motion",Vec3.CODEC).orElseThrow().equals(new Vec3(0,-0.25,0)) ||
+         input.getDoubleOr("fall_distance",-1)!=1.25 || input.getShortOr("Air",(short)0)!=300 ||
+         !java.util.Arrays.equals(tag.getIntArray("UUID").orElseThrow(),new int[]{1,2,3,4}))
+        throw new AssertionError("Rust created falling-block draft differs from Java decoding");
+    }
   }
 }

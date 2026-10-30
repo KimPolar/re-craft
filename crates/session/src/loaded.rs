@@ -353,6 +353,7 @@ pub struct LoadedSession {
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
+    player_uuid: Option<[i32; 4]>,
     uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
@@ -447,6 +448,78 @@ struct FallingSand {
     cancel_drop: bool,
     on_ground: bool,
     source: Option<Arc<native_persistence::nbt::Tag>>,
+    created: Option<CreatedFallingSand>,
+}
+
+#[derive(Clone, Debug)]
+struct CreatedFallingSand {
+    uuid: Option<[i32; 4]>,
+    origin: IVec3,
+    verified_position: DVec3,
+    visited: BTreeSet<ChunkPos>,
+    fall_distance: f64,
+    checked: bool,
+    valid: bool,
+}
+
+impl CreatedFallingSand {
+    fn new(origin: IVec3, position: DVec3) -> Self {
+        let mut bytes = [0_u8; 16];
+        let uuid = getrandom::fill(&mut bytes)
+            .ok()
+            .map(|_| crate::items::uuid_v4(bytes));
+        let chunk = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        Self {
+            uuid,
+            origin,
+            verified_position: position,
+            visited: BTreeSet::from([chunk]),
+            fall_distance: 0.0,
+            checked: false,
+            valid: true,
+        }
+    }
+    fn verify(&mut self, start: DVec3, end: DVec3, safe: bool) {
+        self.checked = true;
+        self.valid &= safe && self.verified_position == start;
+        if !self.valid {
+            return;
+        }
+        let to_chunk = |p: DVec3| -> Option<ChunkPos> {
+            (p.is_finite() && p.x.abs() <= 30_000_512.0 && p.z.abs() <= 30_000_512.0).then(|| {
+                ChunkPos {
+                    x: (p.x.floor() as i32).div_euclid(16),
+                    z: (p.z.floor() as i32).div_euclid(16),
+                }
+            })
+        };
+        let half = f64::from(0.98_f32) / 2.0;
+        let (Some(a), Some(b)) = (
+            to_chunk(start.min(end) - DVec3::new(half, 0.0, half)),
+            to_chunk(start.max(end) + DVec3::new(half, 0.0, half)),
+        ) else {
+            self.valid = false;
+            return;
+        };
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (z0, z1) = (a.z.min(b.z), a.z.max(b.z));
+        if (i64::from(x1) - i64::from(x0) + 1) * (i64::from(z1) - i64::from(z0) + 1) > 64 {
+            self.valid = false;
+            return;
+        }
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                self.visited.insert(ChunkPos { x, z });
+            }
+        }
+        if self.visited.len() > 4096 {
+            self.valid = false;
+        }
+        self.verified_position = end;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2252,6 +2325,7 @@ impl LoadedSession {
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
+            player_uuid: None,
             uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
             bounce_suppression_tag: None,
@@ -2620,6 +2694,7 @@ impl LoadedSession {
     /// Identity used for saved item ownership checks. Unknown identity never
     /// grants pickup of an item restricted to an owner.
     pub fn set_player_uuid(&mut self, uuid: Option<[i32; 4]>) {
+        self.player_uuid = uuid;
         self.dropped_items.set_player_uuid(uuid);
         self.experience_orbs.set_player_uuid(uuid);
     }
@@ -3174,6 +3249,7 @@ impl LoadedSession {
         &self,
         pos: ChunkPos,
     ) -> anyhow::Result<crate::saved_falling_block::FallingEntityChunkDraft> {
+        self.reject_created_falling_in_chunk(pos)?;
         let Some(SavedEntityData::Present(chunk)) = self.entity_chunks.get(&pos) else {
             anyhow::bail!("saved entity chunk is unavailable");
         };
@@ -3224,6 +3300,21 @@ impl LoadedSession {
         Ok(replacements)
     }
 
+    fn reject_created_falling_in_chunk(&self, pos: ChunkPos) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .falling_sand
+                .iter()
+                .chain(&self.removed_falling_sand)
+                .any(|entity| entity
+                    .created
+                    .as_ref()
+                    .is_some_and(|created| created.visited.contains(&pos))),
+            "created falling entity needs coordinated entity chunk drafts"
+        );
+        Ok(())
+    }
+
     fn reject_unsaved_orbs(
         &self,
         pos: ChunkPos,
@@ -3250,6 +3341,7 @@ impl LoadedSession {
     ) -> anyhow::Result<crate::saved_falling_block::FallingEntityChunkDraft> {
         use crate::saved_falling_block::EntityReplacement;
         use anyhow::Context;
+        self.reject_created_falling_in_chunk(pos)?;
         let Some(SavedEntityData::Present(chunk)) = self.entity_chunks.get(&pos) else {
             anyhow::bail!("saved entity chunk is unavailable");
         };
@@ -3345,6 +3437,13 @@ impl LoadedSession {
                 x: (position.x.floor() as i32).div_euclid(16),
                 z: (position.z.floor() as i32).div_euclid(16),
             });
+            if let Some(created) = &entity.created {
+                positions.extend(created.visited.iter().copied());
+                positions.insert(ChunkPos {
+                    x: created.origin.x.div_euclid(16),
+                    z: created.origin.z.div_euclid(16),
+                });
+            }
         }
         self.draft_existing_entity_chunks(&positions)
     }
@@ -3425,6 +3524,7 @@ impl LoadedSession {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
+        let mut created_falling_uuids = BTreeSet::new();
         for entity in self.falling_sand.iter().chain(&self.removed_falling_sand) {
             let position = entity.motion.position;
             ensure!(
@@ -3444,6 +3544,43 @@ impl LoadedSession {
                 .transpose()?
                 .flatten();
             let source = uuid.and_then(|uuid| self.saved_falling_uuids.get(&uuid).copied());
+            if let Some(created) = &entity.created {
+                let origin = ChunkPos {
+                    x: created.origin.x.div_euclid(16),
+                    z: created.origin.z.div_euclid(16),
+                };
+                if !positions.contains(&destination)
+                    && !positions.contains(&origin)
+                    && created.visited.is_disjoint(positions)
+                {
+                    continue;
+                }
+                let uuid = created
+                    .uuid
+                    .context("created falling entity has no stable UUID")?;
+                ensure!(
+                    entity.source.is_none()
+                        && created.checked
+                        && created.valid
+                        && created.verified_position == position,
+                    "created falling entity path is not verified"
+                );
+                ensure!(
+                    seen.insert(uuid) && created_falling_uuids.insert(uuid),
+                    "duplicate falling entity UUID"
+                );
+                ensure!(
+                    self.player_uuid != Some(uuid),
+                    "created falling entity UUID conflicts with player"
+                );
+                ensure!(
+                    positions.contains(&origin)
+                        && positions.contains(&destination)
+                        && created.visited.is_subset(positions),
+                    "created falling entity path chunks are unavailable"
+                );
+                continue;
+            }
             if !positions.contains(&destination)
                 && !source.is_some_and(|pos| positions.contains(&pos))
             {
@@ -3468,14 +3605,46 @@ impl LoadedSession {
             .dropped_items
             .draft_created_items_in_chunks(positions)?;
         let created_orbs = self.experience_orbs.draft_created_in_chunks(positions)?;
+        let created_falling: Vec<_> = self
+            .falling_sand
+            .iter()
+            .filter_map(|entity| {
+                entity
+                    .created
+                    .as_ref()
+                    .filter(|created| {
+                        created
+                            .uuid
+                            .is_some_and(|uuid| created_falling_uuids.contains(&uuid))
+                    })
+                    .map(|created| (entity, created))
+            })
+            .map(|(entity, created)| {
+                crate::saved_falling_block::draft_created(
+                    created.uuid.expect("validated UUID"),
+                    entity.kind.id(),
+                    created.fall_distance,
+                    crate::saved_falling_block::FallingSaveState {
+                        position: entity.motion.position,
+                        velocity: entity.motion.velocity,
+                        on_ground: entity.on_ground,
+                        no_gravity: entity.motion.no_gravity,
+                        time: entity.motion.age,
+                        drop_item: entity.drop_item,
+                        cancel_drop: entity.cancel_drop,
+                    },
+                )
+            })
+            .collect::<anyhow::Result<_>>()?;
         let created_removals = self.dropped_items.created_removal_effects(positions);
         let removed_created_orbs = self.experience_orbs.created_removal_effects(positions);
         if !created_items.is_empty()
             || !created_orbs.is_empty()
             || !created_removals.is_empty()
             || !removed_created_orbs.is_empty()
+            || !created_falling_uuids.is_empty()
         {
-            let mut created_uuids = BTreeSet::new();
+            let mut created_uuids = created_falling_uuids;
             for document in created_items
                 .iter()
                 .map(|item| item.document())
@@ -3514,7 +3683,7 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_falling_removals(
+        crate::saved_falling_block::draft_entity_chunks_with_created_falling(
             &originals,
             &replacements,
             &removed_falling,
@@ -3522,6 +3691,7 @@ impl LoadedSession {
             &removed_orbs,
             &created_items,
             &created_orbs,
+            &created_falling,
         )
     }
 
@@ -5031,6 +5201,7 @@ impl LoadedSession {
                     cancel_drop: saved.cancel_drop,
                     on_ground: saved.on_ground,
                     source: Some(saved.source),
+                    created: None,
                 });
             }
         }
@@ -6742,7 +6913,6 @@ impl LoadedSession {
                         key.x, key.y, key.z,
                     ));
                     if self.set(relative, self.states[0]) {
-                        self.uncoordinated_falling_lifecycle = true;
                         self.falling_sand.push(FallingSand {
                             previous: motion.position,
                             motion,
@@ -6751,6 +6921,10 @@ impl LoadedSession {
                             cancel_drop: false,
                             on_ground: false,
                             source: None,
+                            created: Some(CreatedFallingSand::new(
+                                IVec3::new(key.x, key.y, key.z),
+                                motion.position,
+                            )),
                         });
                     }
                 }
@@ -7071,6 +7245,23 @@ impl LoadedSession {
                 })
             });
             entity.on_ground = collision.on_ground;
+            if let Some(created) = &mut entity.created {
+                if entity.on_ground {
+                    created.fall_distance = 0.0;
+                } else if collision.actual.y < 0.0 {
+                    created.fall_distance -= f64::from(collision.actual.y as f32);
+                }
+                if created.valid {
+                    let safe = created_item_path_safe(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        probe.bounds(),
+                        collision.actual,
+                    );
+                    created.verify(entity.previous, entity.motion.position, safe);
+                }
+            }
             if collision.on_ground {
                 if entity.cancel_drop {
                     self.track_removed_falling_sand(entity);
@@ -7170,6 +7361,13 @@ impl LoadedSession {
                     .flatten()
             })
             .is_some()
+            || entity.created.as_ref().is_some_and(|created| {
+                entity.source.is_none()
+                    && created.uuid.is_some()
+                    && created.checked
+                    && created.valid
+                    && created.verified_position == entity.motion.position
+            })
         {
             self.removed_falling_sand.push(entity);
         }
@@ -9251,7 +9449,6 @@ fn created_item_region_safe(
     true
 }
 
-#[cfg(test)]
 fn created_item_path_safe(
     world: &World,
     origin: IVec3,
@@ -17218,6 +17415,162 @@ mod tests {
     }
 
     #[test]
+    fn created_falling_path_tracks_bounds_and_never_recovers_after_failure() {
+        let start = DVec3::new(15.5, 5.0, 3.5);
+        let end = DVec3::new(15.75, 4.9, 3.5);
+        let mut created = CreatedFallingSand::new(IVec3::new(15, 5, 3), start);
+        created.verify(start, end, true);
+        assert!(created.valid);
+        assert!(created.visited.contains(&ChunkPos { x: 0, z: 0 }));
+        assert!(created.visited.contains(&ChunkPos { x: 1, z: 0 }));
+        created.verify(end, end + DVec3::NEG_Y, false);
+        assert!(!created.valid);
+        created.verify(end, end, true);
+        assert!(!created.valid);
+    }
+
+    #[test]
+    fn created_falling_block_drafts_cover_spawn_and_landing() {
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::Tag,
+            palette::{self, BlockState},
+        };
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let relative = IVec3::new(3, 5, 3);
+        let absolute = session.origin + relative;
+        let gravel = session.intern_block(state("minecraft:gravel", &[]));
+        let chunk = Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        );
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[3 + 3 * 16 + 5 * 256] = gravel;
+        let block = |name: &str| BlockState {
+            name: name.into(),
+            properties: vec![],
+        };
+        let source = draft_chunk_blocks(
+            &fixture_chunk_document(home),
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[BlockChange {
+                x: absolute.x,
+                y: absolute.y,
+                z: absolute.z,
+                expected: block("minecraft:air"),
+                replacement: block("minecraft:gravel"),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        session.enqueue_saved_sand(&[SavedBlockTick {
+            block: "minecraft:gravel".into(),
+            position: absolute.to_array(),
+            delay: 0,
+            priority: 0,
+        }]);
+        session.advance_sand_ticks();
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        session.advance_falling_sand();
+        let uuid = session.falling_sand[0]
+            .created
+            .as_ref()
+            .unwrap()
+            .uuid
+            .unwrap();
+        let entity_drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = entity_drafts[&home]
+            .document()
+            .value
+            .get("Entities")
+            .unwrap()
+        else {
+            panic!()
+        };
+        let saved = crate::saved_falling_block::read(&values[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.uuid, Some(uuid));
+        assert_eq!(saved.block.name, "minecraft:gravel");
+        assert_eq!(saved.time, 1);
+        let original_tracking = session.falling_sand[0].created.clone();
+        session.falling_sand[0]
+            .created
+            .as_mut()
+            .unwrap()
+            .verified_position
+            .x += 1.0;
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        session.falling_sand[0].created = original_tracking.clone();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        session.falling_sand[0]
+            .created
+            .as_mut()
+            .unwrap()
+            .visited
+            .insert(neighbor);
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_err()
+        );
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        session.falling_sand[0].created = original_tracking;
+        let terrain = session.draft_changed_chunk(home, &source).unwrap();
+        let section = palette::decode_sections(&terrain.document().value)
+            .unwrap()
+            .remove(0)
+            .blocks
+            .unwrap();
+        assert_eq!(section.block(3, 5, 3).unwrap().name, "minecraft:air".into());
+        session.set_player_uuid(Some(uuid));
+        assert!(session.draft_tracked_entity_chunks().is_err());
+        session.set_player_uuid(None);
+        for _ in 0..40 {
+            session.advance_falling_sand();
+            if session.falling_sand.is_empty() {
+                break;
+            }
+        }
+        assert!(session.falling_sand.is_empty());
+        let entity_drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = entity_drafts[&home]
+            .document()
+            .value
+            .get("Entities")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(values.is_empty());
+        let terrain = session.draft_changed_chunk(home, &source).unwrap();
+        let section = palette::decode_sections(&terrain.document().value)
+            .unwrap()
+            .remove(0)
+            .blocks
+            .unwrap();
+        assert_eq!(section.block(3, 5, 3).unwrap().name, "minecraft:air".into());
+        assert_eq!(
+            section.block(3, 1, 3).unwrap().name,
+            "minecraft:gravel".into()
+        );
+        assert!(session.draft_existing_entity_chunk(home).is_err());
+    }
+
+    #[test]
     fn saved_falling_block_landing_joins_entity_and_terrain_drafts() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         use native_persistence::palette;
@@ -20861,6 +21214,7 @@ mod tests {
                 cancel_drop: false,
                 on_ground: false,
                 source: None,
+                created: None,
             });
             let old_items = session.dropped_items.snapshot();
             let old_orbs = session.experience_orbs.snapshot();
@@ -24382,6 +24736,7 @@ mod tests {
                 cancel_drop: false,
                 on_ground: false,
                 source: None,
+                created: None,
             });
             session.advance_falling_sand();
             assert_eq!(session.falling_sand.len(), 1);
@@ -24419,6 +24774,7 @@ mod tests {
                 cancel_drop: false,
                 on_ground: false,
                 source: None,
+                created: None,
             });
             for _ in 0..40 {
                 session.advance_falling_sand();
@@ -24456,6 +24812,7 @@ mod tests {
                 cancel_drop: false,
                 on_ground: false,
                 source: None,
+                created: None,
             });
             for _ in 0..40 {
                 session.advance_falling_sand();

@@ -43,6 +43,87 @@ pub struct FallingBlockDraft {
     document: NamedTag,
 }
 
+pub struct CreatedFallingBlockDraft {
+    document: NamedTag,
+}
+
+impl CreatedFallingBlockDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+}
+
+/// Construct an entity from the known ordinary falling-block state. Its source
+/// block removal, movement and other effects must be saved together.
+pub fn draft_created(
+    uuid: [i32; 4],
+    block: &str,
+    fall_distance: f64,
+    state: FallingSaveState,
+) -> Result<CreatedFallingBlockDraft> {
+    ensure!(
+        matches!(
+            block,
+            "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+        ),
+        "unsupported falling block"
+    );
+    ensure!(
+        state.position.is_finite()
+            && state.position.x.abs() <= 30_000_512.0
+            && state.position.z.abs() <= 30_000_512.0
+            && state.position.y.abs() <= 20_000_000.0,
+        "invalid position"
+    );
+    ensure!(
+        state.velocity.is_finite() && state.velocity.abs().max_element() <= 10.0,
+        "invalid velocity"
+    );
+    ensure!(
+        fall_distance.is_finite() && fall_distance >= 0.0,
+        "invalid fall distance"
+    );
+    let vector = |v: DVec3| Tag::List {
+        element_type: TagType::Double,
+        values: v.to_array().into_iter().map(Tag::Double).collect(),
+    };
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:falling_block".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ("Pos".into(), vector(state.position)),
+            ("Motion".into(), vector(state.velocity)),
+            (
+                "Rotation".into(),
+                Tag::List {
+                    element_type: TagType::Float,
+                    values: vec![Tag::Float(0.0), Tag::Float(0.0)],
+                },
+            ),
+            ("fall_distance".into(), Tag::Double(fall_distance)),
+            ("Air".into(), Tag::Short(300)),
+            ("Fire".into(), Tag::Short(0)),
+            ("PortalCooldown".into(), Tag::Int(0)),
+            ("OnGround".into(), Tag::Byte(i8::from(state.on_ground))),
+            ("NoGravity".into(), Tag::Byte(i8::from(state.no_gravity))),
+            ("BlockState".into(), Tag::String(block.into())),
+            ("Time".into(), Tag::Int(state.time)),
+            ("DropItem".into(), Tag::Byte(i8::from(state.drop_item))),
+            ("CancelDrop".into(), Tag::Byte(i8::from(state.cancel_drop))),
+            ("HurtEntities".into(), Tag::Byte(0)),
+            ("FallHurtAmount".into(), Tag::Float(0.0)),
+            ("FallHurtMax".into(), Tag::Int(40)),
+        ]),
+    };
+    ensure!(
+        read(&document.value)?.is_some(),
+        "cannot decode created falling block"
+    );
+    native_persistence::nbt::write(&document)?;
+    Ok(CreatedFallingBlockDraft { document })
+}
+
 impl FallingBlockDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -347,6 +428,29 @@ pub fn draft_entity_chunks_with_falling_removals(
     created_items: &[saved_item::CreatedItemDraft],
     created_orbs: &[saved_orb::CreatedOrbDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_created_falling(
+        originals,
+        replacements,
+        removed_falling,
+        removed_items,
+        removed_orbs,
+        created_items,
+        created_orbs,
+        &[],
+    )
+}
+
+/// Include newly spawned falling entities with all their related world changes.
+pub fn draft_entity_chunks_with_created_falling(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
+    replacements: &[EntityReplacement<'_>],
+    removed_falling: &[FallingBlockDraft],
+    removed_items: &[saved_item::ItemDraft],
+    removed_orbs: &[saved_orb::OrbDraft],
+    created_items: &[saved_item::CreatedItemDraft],
+    created_orbs: &[saved_orb::CreatedOrbDraft],
+    created_falling: &[CreatedFallingBlockDraft],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     let empty: BTreeMap<_, _> = originals
         .iter()
         .filter(|(_, source)| source.is_none())
@@ -387,6 +491,7 @@ pub fn draft_entity_chunks_with_falling_removals(
         .iter()
         .map(CreatedEntity::Item)
         .chain(created_orbs.iter().map(CreatedEntity::Orb))
+        .chain(created_falling.iter().map(CreatedEntity::Falling))
         .collect();
     let mut drafts =
         draft_entity_chunks_with_moves_and_removals(&complete, replacements, &removals, &created)?;
@@ -412,6 +517,7 @@ pub fn draft_entity_chunks_with_moves(
 enum CreatedEntity<'a> {
     Item(&'a saved_item::CreatedItemDraft),
     Orb(&'a saved_orb::CreatedOrbDraft),
+    Falling(&'a CreatedFallingBlockDraft),
 }
 
 impl CreatedEntity<'_> {
@@ -419,6 +525,7 @@ impl CreatedEntity<'_> {
         match self {
             Self::Item(value) => value.document(),
             Self::Orb(value) => value.document(),
+            Self::Falling(value) => value.document(),
         }
     }
     fn position(&self) -> Result<DVec3> {
@@ -428,6 +535,9 @@ impl CreatedEntity<'_> {
                 .position),
             Self::Orb(value) => Ok(saved_orb::read(&value.document().value)?
                 .context("created entity is not an orb")?
+                .position),
+            Self::Falling(value) => Ok(read(&value.document().value)?
+                .context("created entity is not a falling block")?
                 .position),
         }
     }

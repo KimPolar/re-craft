@@ -1667,6 +1667,27 @@ fn saved_falling_fields_match_java_entity() {
         native_persistence::nbt::write(moved_drafts[&target_pos].document()).unwrap(),
     )
     .unwrap();
+    let created = native_session::saved_falling_block::draft_created(
+        [1, 2, 3, 4],
+        "minecraft:gravel",
+        1.25,
+        native_session::saved_falling_block::FallingSaveState {
+            position: glam::DVec3::new(3.5, 5.0, 3.5),
+            velocity: glam::DVec3::new(0.0, -0.25, 0.0),
+            on_ground: false,
+            no_gravity: false,
+            time: 7,
+            drop_item: true,
+            cancel_drop: false,
+        },
+    )
+    .unwrap();
+    let created_file = temp.path().join("created-falling.nbt");
+    std::fs::write(
+        &created_file,
+        native_persistence::nbt::write(created.document()).unwrap(),
+    )
+    .unwrap();
     run(Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&cp)
@@ -1674,7 +1695,8 @@ fn saved_falling_fields_match_java_entity() {
         .arg(temp.path())
         .arg(draft_file)
         .arg(chunk_file)
-        .arg(moved_file));
+        .arg(moved_file)
+        .arg(created_file));
 }
 
 fn java_bin() -> PathBuf {

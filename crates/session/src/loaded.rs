@@ -1347,7 +1347,11 @@ impl LoadedSession {
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
         anyhow::ensure!(
             self.dirty_chunk_positions().contains(&position),
-            "chunk has no recorded block or scheduled-tick changes"
+            "chunk has no recorded changes"
+        );
+        anyhow::ensure!(
+            !matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)),
+            "chest inventory is still open"
         );
         let block_ticks = self.draft_block_ticks(position)?;
         let fluid_ticks = self.draft_fluid_ticks(position)?;
@@ -1362,6 +1366,9 @@ impl LoadedSession {
         };
         draft.replace_block_ticks(&block_ticks)?;
         draft.replace_fluid_ticks(&fluid_ticks)?;
+        if self.chest_dirty_chunks.contains(&position) {
+            self.stage_chest_inventories(position, original, &mut draft)?;
+        }
         Ok(draft)
     }
 
@@ -1509,6 +1516,17 @@ impl LoadedSession {
         position: ChunkPos,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        let mut draft = self.draft_unchanged_chunk(position, original)?;
+        self.stage_chest_inventories(position, original, &mut draft)?;
+        Ok(draft)
+    }
+
+    fn stage_chest_inventories(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        draft: &mut native_persistence::edit::ChunkDraft,
+    ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         use native_persistence::edit::BlockEntityChange;
         ensure!(
@@ -1519,7 +1537,10 @@ impl LoadedSession {
             !matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)),
             "chest inventory is still open"
         );
-        let mut draft = self.draft_unchanged_chunk(position, original)?;
+        ensure!(
+            draft.matches_source(original)?,
+            "chunk draft source differs"
+        );
         let chunk = self
             .world
             .chunks
@@ -1604,17 +1625,17 @@ impl LoadedSession {
                 replacement: edited,
             });
         }
-        ensure!(!changes.is_empty(), "no chest inventory changes remain");
         draft.replace_block_entities(&changes)?;
-        Ok(draft)
+        Ok(())
     }
 
-    /// Chunks whose block or currently modeled scheduled-tick data changed.
+    /// Chunks whose blocks, chest inventories, or modeled scheduled ticks changed.
     /// The set is retained until a coordinated world save acknowledges it.
     pub fn dirty_chunk_positions(&self) -> BTreeSet<ChunkPos> {
         self.dirty_chunks
             .union(&self.tick_dirty_chunks)
             .copied()
+            .chain(self.chest_dirty_chunks.iter().copied())
             .collect()
     }
 
@@ -2493,6 +2514,7 @@ impl LoadedSession {
         if let Some(other) = other {
             self.set_trapped_chest_open(other, false);
         }
+        let mut changed_chunks = BTreeSet::new();
         for (index, position) in [Some(position), other].into_iter().flatten().enumerate() {
             let key = (position.x, position.y, position.z);
             let chest = self
@@ -2502,10 +2524,21 @@ impl LoadedSession {
             let values = std::array::from_fn(|slot| slots[index * 27 + slot].clone());
             if chest.slots != values {
                 chest.slots = values;
-                self.chest_dirty_chunks.insert(ChunkPos {
+                changed_chunks.insert(ChunkPos {
                     x: position.x.div_euclid(16),
                     z: position.z.div_euclid(16),
                 });
+            }
+        }
+        for chunk in changed_chunks {
+            if self.chest_contents.values().any(|chest| {
+                chest.position.x.div_euclid(16) == chunk.x
+                    && chest.position.z.div_euclid(16) == chunk.z
+                    && chest.inventory_changed()
+            }) {
+                self.chest_dirty_chunks.insert(chunk);
+            } else {
+                self.chest_dirty_chunks.remove(&chunk);
             }
         }
     }
@@ -12119,6 +12152,75 @@ mod tests {
         assert!(
             matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
         );
+        assert!(session.dirty_chunk_positions().contains(&chunk));
+        let tags = test_heightmap_tags();
+        assert!(session.try_open_saved_chest(position - session.origin));
+        assert!(
+            session
+                .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                    chunk,
+                    &source,
+                    &tags,
+                    |_| unreachable!(),
+                )
+                .is_err()
+        );
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        let chest_only = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(chunk, &source, &tags, |_| {
+                unreachable!("no block changes")
+            })
+            .unwrap();
+        assert_eq!(
+            chest_only.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
+        let stone = IVec3::new(0, 0, 0);
+        assert!(session.set(stone, session.states[0]));
+        let fluid = session.origin + IVec3::new(5, 2, 5);
+        session.insert_fluid_tick(
+            FluidTickKey {
+                x: fluid.x,
+                y: fluid.y,
+                z: fluid.z,
+                kind: FluidKind::Water,
+                source: true,
+            },
+            5,
+            0,
+            0,
+        );
+        struct ChestHeightTags;
+        impl native_resources::packs::ResourceProvider for ChestHeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = ["minecraft:stone", "minecraft:chest", "minecraft:air"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let tags = HeightmapTags::load(&mut ChestHeightTags, &registry).unwrap();
+        let combined = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(chunk, &source, &tags, |state| {
+                Ok((state.name.matches("minecraft:air"), false))
+            })
+            .unwrap();
+        assert_eq!(combined.changed_blocks, 1);
+        assert!(combined.document().value.get("Heightmaps").is_some());
+        assert!(
+            matches!(combined.document().value.get("fluid_ticks"), Some(Tag::List { values, .. }) if values.len() == 1 && values[0].get("i") == Some(&Tag::String("minecraft:water".into())))
+        );
+        assert_eq!(
+            combined.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
         let mut stale = source.clone();
         let Tag::Compound(fields) = &mut stale.value else {
             unreachable!()
@@ -12151,6 +12253,34 @@ mod tests {
                 .unwrap()
                 .document(),
             draft.document()
+        );
+    }
+
+    #[test]
+    fn restoring_chest_contents_clears_its_dirty_chunk() {
+        use crate::inventory::{ClickButton, PlayerSlot};
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        let relative = position - session.origin;
+        assert!(session.try_open_saved_chest(relative));
+        let inventory = Arc::make_mut(&mut session.inventory);
+        assert!(inventory.click(PlayerSlot::Chest(3), ClickButton::Primary));
+        assert!(inventory.click(PlayerSlot::Storage(0), ClickButton::Primary));
+        assert!(inventory.toggle());
+        session.collect_closed_chest();
+        assert!(session.dirty_chest_chunk_positions().contains(&chunk));
+        assert!(session.try_open_saved_chest(relative));
+        let inventory = Arc::make_mut(&mut session.inventory);
+        assert!(inventory.click(PlayerSlot::Storage(0), ClickButton::Primary));
+        assert!(inventory.click(PlayerSlot::Chest(3), ClickButton::Primary));
+        assert!(inventory.toggle());
+        session.collect_closed_chest();
+        assert!(!session.dirty_chest_chunk_positions().contains(&chunk));
+        assert_eq!(
+            session.saved_chest(position).unwrap().unwrap().slots[3]
+                .as_ref()
+                .unwrap()
+                .count(),
+            5
         );
     }
 

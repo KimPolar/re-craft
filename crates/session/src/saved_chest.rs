@@ -27,6 +27,10 @@ impl SavedChest {
         self.source.get("CustomName")
     }
 
+    pub(crate) fn inventory_changed(&self) -> bool {
+        self.slots != self.original_slots
+    }
+
     /// Prepare a chest entity in memory. The source, player, chunk and all
     /// other affected world data must be checked and committed together before
     /// this can be used for a world save.

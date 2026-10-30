@@ -88,6 +88,89 @@ fn append(out: &mut Vec<Span>, text: &str, style: Style) {
     }
 }
 
+/// Equivalent to Java's StringDecomposer on one styled text fragment.
+fn append_formatted(out: &mut Vec<Span>, input: &[u16], base: Style) {
+    const COLORS: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [0, 0, 170],
+        [0, 170, 0],
+        [0, 170, 170],
+        [170, 0, 0],
+        [170, 0, 170],
+        [255, 170, 0],
+        [170, 170, 170],
+        [85, 85, 85],
+        [85, 85, 255],
+        [85, 255, 85],
+        [85, 255, 255],
+        [255, 85, 85],
+        [255, 85, 255],
+        [255, 255, 85],
+        [255, 255, 255],
+    ];
+    let mut style = base;
+    let mut buffer = String::new();
+    let mut index = 0;
+    while index < input.len() {
+        let code = input[index];
+        if code == 0x00a7 {
+            append(out, &buffer, style);
+            buffer.clear();
+            index += 1;
+            let Some(&next) = input.get(index) else { break };
+            let lower = if (b'A' as u16..=b'Z' as u16).contains(&next) {
+                next + 32
+            } else {
+                next
+            };
+            let color_index = match lower {
+                v if (b'0' as u16..=b'9' as u16).contains(&v) => Some((v - b'0' as u16) as usize),
+                v if (b'a' as u16..=b'f' as u16).contains(&v) => {
+                    Some((v - b'a' as u16 + 10) as usize)
+                }
+                _ => None,
+            };
+            if let Some(color_index) = color_index {
+                style.color = Some(COLORS[color_index]);
+                style.bold = false;
+                style.italic = false;
+                style.underlined = false;
+                style.strikethrough = false;
+                style.obfuscated = false;
+            } else {
+                match lower {
+                    0x6b => style.obfuscated = true,
+                    0x6c => style.bold = true,
+                    0x6d => style.strikethrough = true,
+                    0x6e => style.underlined = true,
+                    0x6f => style.italic = true,
+                    0x72 => style = base,
+                    _ => {}
+                }
+            }
+        } else if (0xd800..=0xdbff).contains(&code) {
+            if let Some(&low) = input.get(index + 1)
+                && (0xdc00..=0xdfff).contains(&low)
+            {
+                let scalar =
+                    0x10000 + ((u32::from(code) - 0xd800) << 10) + (u32::from(low) - 0xdc00);
+                buffer.push(char::from_u32(scalar).expect("valid surrogate pair"));
+                index += 1;
+            } else {
+                buffer.push('\u{fffd}');
+            }
+        } else {
+            buffer.push(char::from_u32(u32::from(code)).unwrap_or('\u{fffd}'));
+        }
+        index += 1;
+    }
+    append(out, &buffer, style);
+}
+
+fn append_formatted_str(out: &mut Vec<Span>, text: &str, style: Style) {
+    append_formatted(out, &text.encode_utf16().collect::<Vec<_>>(), style);
+}
+
 fn unwrap(tag: &Tag) -> &Tag {
     if let Tag::Compound(fields) = tag
         && fields.len() == 1
@@ -113,7 +196,7 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
             return None;
         }
         match unwrap(tag) {
-            Tag::String(value) => append(out, &String::from_utf16(&value.0).ok()?, parent),
+            Tag::String(value) => append_formatted(out, &value.0, parent),
             Tag::Int(value) => append(out, &value.to_string(), parent),
             Tag::Long(value) => append(out, &value.to_string(), parent),
             Tag::Float(value) if value.is_finite() => append(out, &value.to_string(), parent),
@@ -132,7 +215,7 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
             tag @ Tag::Compound(_) => {
                 let style = apply_style(tag, parent)?;
                 if let Some(Tag::String(value)) = tag.get("text") {
-                    append(out, &String::from_utf16(&value.0).ok()?, style);
+                    append_formatted(out, &value.0, style);
                 } else if let Some(Tag::String(key)) = tag.get("translate") {
                     let key = String::from_utf16(&key.0).ok()?;
                     let fallback = match tag.get("fallback") {
@@ -151,7 +234,9 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
                         let mut valid = true;
                         for part in parts {
                             match part {
-                                Part::Text(text) => append(&mut fragments, &text, style),
+                                Part::Text(text) => {
+                                    append_formatted_str(&mut fragments, &text, style)
+                                }
                                 Part::Argument(index) => {
                                     let Some(arg) = args.get(index) else {
                                         valid = false;
@@ -163,10 +248,10 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
                         }
                         if !valid {
                             fragments.clear();
-                            append(&mut fragments, &template, style);
+                            append_formatted_str(&mut fragments, &template, style);
                         }
                     } else {
-                        append(&mut fragments, &template, style);
+                        append_formatted_str(&mut fragments, &template, style);
                     }
                     for fragment in fragments {
                         append(out, &fragment.text, fragment.style);
@@ -291,6 +376,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codes_reset_to_component_style_and_drop_unknown_codes() {
+        let component = Tag::Compound(vec![
+            ("text".into(), Tag::String("§lBold§cRed§rBase§Z?§".into())),
+            ("color".into(), Tag::String("gold".into())),
+            ("italic".into(), Tag::Byte(1)),
+        ]);
+        let spans = resolve(&component, |_, fallback| fallback.into()).unwrap();
+        assert_eq!(
+            spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "BoldRedBase?"
+        );
+        assert!(spans[0].style.bold && spans[0].style.italic);
+        assert_eq!(spans[1].style.color, Some([255, 85, 85]));
+        assert!(!spans[1].style.bold && !spans[1].style.italic);
+        assert_eq!(spans[2].style.color, Some([255, 170, 0]));
+        assert!(spans[2].style.italic);
+    }
+
+    #[test]
+    fn malformed_surrogates_and_format_codes_match_java_replacement() {
+        let component = Tag::String(native_persistence::nbt::JavaString(vec![
+            b'a' as u16,
+            0xd800,
+            b'b' as u16,
+            0x00a7,
+            0xd83d,
+            0xde00,
+        ]));
+        let spans = resolve(&component, |_, fallback| fallback.into()).unwrap();
+        assert_eq!(
+            spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "a�b�"
+        );
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn title_components_match_java_text_and_styles() {
         use serde_json::Value;
@@ -342,7 +463,7 @@ mod tests {
         let rows: Vec<Value> =
             serde_json::from_slice(&std::fs::read(temp.path().join("expected.json")).unwrap())
                 .unwrap();
-        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.len(), 13);
         for (index, expected) in rows.iter().enumerate() {
             let nbt = native_persistence::nbt::read(
                 &std::fs::read(temp.path().join(format!("{index}.nbt"))).unwrap(),
@@ -351,6 +472,7 @@ mod tests {
             let spans = resolve(nbt.value.get("name").unwrap(), |key, fallback| match key {
                 "example.order" => "%2$s / %1$s %%!".into(),
                 "example.simple" => "Hello %s".into(),
+                "example.codes" => "Before §a%s after".into(),
                 _ => fallback.into(),
             })
             .unwrap_or_else(|| panic!("unsupported Java component {index}: {:?}", nbt.value));

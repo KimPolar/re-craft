@@ -571,6 +571,16 @@ fn pick_block_and_hotbar_selection_match_vanilla() {
             .map(|block| block.id()),
     );
     block_ids.extend(native_core::wood::Wood::all().map(|block| block.id()));
+    block_ids.extend(
+        native_core::button::Button::ALL
+            .into_iter()
+            .map(|block| block.id()),
+    );
+    block_ids.extend([
+        "minecraft:lever",
+        "minecraft:redstone_block",
+        "minecraft:redstone_lamp",
+    ]);
     for id in &block_ids {
         cases.push(json!({"cloneBlock": id}));
     }

@@ -6480,11 +6480,7 @@ impl LoadedSession {
                             hit.position,
                             self.states[0],
                         )
-                        && let Some(block) = self
-                            .world
-                            .state(id)
-                            .and_then(|state| Block::from_item_id(&state.name))
-                        && let Some(item) = crate::picked_block_item(block)
+                        && let Some(item) = self.world.state(id).and_then(picked_loaded_block_item)
                     {
                         Arc::make_mut(&mut self.inventory)
                             .pick_item(item, self.game_mode == GameMode::Creative);
@@ -8168,6 +8164,31 @@ fn is_vanilla_fence_gate(name: &str) -> bool {
             .and_then(|id| id.strip_suffix("_planks"))
             == Some(family)
     })
+}
+
+fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
+    if let Some(block) = Block::from_item_id(&block.name) {
+        return crate::picked_block_item(block);
+    }
+    let supported = if block.name == "minecraft:lever"
+        || native_core::button::Button::from_id(&block.name).is_some()
+    {
+        block_outline(block).is_some()
+    } else if block.name == "minecraft:redstone_lamp" {
+        redstone_lamp_lit(block).is_some()
+    } else {
+        block.name == "minecraft:redstone_block" && block.properties.is_empty()
+    };
+    if !supported {
+        return None;
+    }
+    let max = crate::inventory::ordinary_item_default_max(&block.name)?;
+    ItemStack::new(
+        block.name.clone(),
+        1,
+        max,
+        native_persistence::nbt::Tag::Compound(vec![]),
+    )
 }
 
 fn button_state(kind: native_core::button::Button, face: IVec3, yaw: f32) -> Option<BlockState> {
@@ -10644,6 +10665,77 @@ mod tests {
                 .id(),
             "minecraft:stone"
         );
+    }
+
+    #[test]
+    fn pick_block_selects_circuit_components_in_existing_worlds() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let mut states = Vec::new();
+        for button in native_core::button::Button::ALL {
+            for powered in [false, true] {
+                let mut block = button_state(button, IVec3::Z, 0.0).unwrap();
+                block
+                    .properties
+                    .insert("powered".into(), powered.to_string());
+                states.push(block);
+            }
+        }
+        for powered in [false, true] {
+            let mut lever = stone_button_state(IVec3::Z, 0.0).unwrap();
+            lever.name = "minecraft:lever".into();
+            lever
+                .properties
+                .insert("powered".into(), powered.to_string());
+            states.push(lever);
+            states.push(state(
+                "minecraft:redstone_lamp",
+                &[("lit", if powered { "true" } else { "false" })],
+            ));
+        }
+        states.push(state("minecraft:redstone_block", &[]));
+        for block in states {
+            for (mode, slot) in [
+                (GameMode::Survival, Some(5)),
+                (GameMode::Survival, None),
+                (GameMode::Adventure, Some(12)),
+                (GameMode::Creative, None),
+                (GameMode::Spectator, None),
+            ] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let relative = if block.name.ends_with("button") || block.name.ends_with("lever") {
+                    IVec3::new(8, 2, 7)
+                } else {
+                    IVec3::new(8, 2, 6)
+                };
+                let id = session.intern_block(block.clone());
+                assert!(session.set(relative, id));
+                let mut inventory = PlayerInventory::default();
+                if let Some(slot) = slot {
+                    inventory.set_slot(
+                        PlayerSlot::Storage(slot),
+                        ItemStack::new(block.name.clone(), 3, 64, Tag::Compound(vec![])),
+                    );
+                }
+                session.set_player_inventory(inventory);
+                assert_eq!(session.ray_hit().unwrap().position, relative, "{block:?}");
+                session.submit_command(PlayerCommand::PickBlock);
+                session.update(TICK);
+                let inventory = &session.snapshot().inventory;
+                let selected = inventory.slot(PlayerSlot::Storage(inventory.selected()));
+                if mode == GameMode::Spectator || (mode == GameMode::Survival && slot.is_none()) {
+                    assert!(selected.is_none());
+                } else {
+                    let selected = selected.unwrap();
+                    assert_eq!(selected.id(), block.name);
+                    assert_eq!(
+                        selected.count(),
+                        if mode == GameMode::Creative { 1 } else { 3 }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

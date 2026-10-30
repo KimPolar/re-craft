@@ -11,6 +11,19 @@ use crate::{
     loaded::{BlockPosition, BlockStateId, World},
 };
 
+/// Whether an edit can affect sky-light attenuation or occlusion. Unlike
+/// block light, direct sky light distinguishes opacity zero from opacity one.
+/// Unknown states must be retried rather than silently skipping the edit.
+pub fn sky_change_for_edit(
+    old: Option<&crate::loaded::BlockState>,
+    new: &crate::loaded::BlockState,
+) -> bool {
+    match (old.and_then(light_properties), light_properties(new)) {
+        (Some(old), Some(new)) => old.opacity != new.opacity || old.faces != new.faces,
+        _ => true,
+    }
+}
+
 /// Java represents an unobstructed source below the world with this sentinel.
 pub const UNBOUNDED_SKY_SOURCE: i32 = i32::MIN;
 
@@ -158,13 +171,50 @@ impl<'a> ColumnReader<'a> {
 
 fn scan(world: &World, bounds: LightBounds, x: i32, z: i32) -> Option<i32> {
     let mut reader = ColumnReader::new(world, bounds, x, z)?;
-    let mut above = 0;
-    for y in reader.range.clone().rev() {
-        let below = reader.get(y)?;
-        if reader.edge_occluded(above, below) {
-            return y.checked_add(1);
+    let chunk = world.chunks.get(
+        &BlockPosition {
+            x,
+            y: reader.range.start,
+            z,
         }
-        above = below;
+        .chunk(),
+    )?;
+    let mut above = 0;
+    for section_y in (reader.range.start.div_euclid(16)..reader.range.end.div_euclid(16)).rev() {
+        let section = chunk.sections.get(&i8::try_from(section_y).ok()?)?;
+        let blocks = section.blocks.as_ref()?;
+        // Java's fillFrom skips a section only when the entire section is
+        // air, and resets the previous shape without checking its top edge.
+        let first = *blocks.first()?;
+        let is_air = |id| -> Option<bool> {
+            Some(matches!(
+                world.state(id)?.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ))
+        };
+        let empty = if is_air(first)? {
+            let mut empty = true;
+            for &id in blocks.iter().skip(1) {
+                if id != first && !is_air(id)? {
+                    empty = false;
+                    break;
+                }
+            }
+            empty
+        } else {
+            false
+        };
+        if empty {
+            above = 0;
+            continue;
+        }
+        for y in (section_y * 16..section_y * 16 + 16).rev() {
+            let below = reader.get(y)?;
+            if reader.edge_occluded(above, below) {
+                return y.checked_add(1);
+            }
+            above = below;
+        }
     }
     Some(UNBOUNDED_SKY_SOURCE)
 }
@@ -185,13 +235,16 @@ mod tests {
         }
     }
     fn fixture() -> World {
+        fixture_range(0, 32)
+    }
+    fn fixture_range(min_y: i32, max_y: i32) -> World {
         let mut world = World::new("minecraft:overworld");
         let air = world.intern_state(state("air", &[]));
         let position = ChunkPos { x: 0, z: 0 };
-        let sections = (0..=1)
+        let sections = (min_y.div_euclid(16)..max_y.div_euclid(16))
             .map(|y| {
                 (
-                    y,
+                    i8::try_from(y).unwrap(),
                     Arc::new(Section {
                         blocks: Some(Box::new([air; BLOCK_COUNT])),
                         biomes: None,
@@ -256,6 +309,72 @@ mod tests {
             26,
             "failed scans retain the last known source"
         );
+    }
+
+    #[test]
+    fn lowest_slab_matches_java_incremental_boundary_behavior() {
+        let bounds = LightBounds::new(-64, 320).unwrap();
+        let mut world = fixture_range(-64, 320);
+        let mut incremental = SkyColumn::load(&world, bounds, 15, 15).unwrap();
+        put(
+            &mut world,
+            -64,
+            state(
+                "stone_slab",
+                &[("type", "bottom"), ("waterlogged", "false")],
+            ),
+        );
+        assert_eq!(incremental.update(&world, -64), Some(true));
+        assert_eq!(incremental.lowest_source_y(), -64);
+        assert_eq!(
+            SkyColumn::load(&world, bounds, 15, 15)
+                .unwrap()
+                .lowest_source_y(),
+            UNBOUNDED_SKY_SOURCE
+        );
+    }
+
+    #[test]
+    fn initial_scan_skips_only_entirely_air_sections() {
+        let bounds = LightBounds::new(-64, 320).unwrap();
+        let mut world = fixture_range(-64, 320);
+        put(&mut world, -64, state("stone", &[]));
+        put(
+            &mut world,
+            0,
+            state(
+                "stone_slab",
+                &[("type", "bottom"), ("waterlogged", "false")],
+            ),
+        );
+        put(&mut world, 319, state("torch", &[]));
+        assert_eq!(
+            SkyColumn::load(&world, bounds, 15, 15)
+                .unwrap()
+                .lowest_source_y(),
+            -63
+        );
+        let stone = world.intern_state(state("stone", &[]));
+        world.set_block_id(14, -1, 15, stone).unwrap();
+        assert_eq!(
+            SkyColumn::load(&world, bounds, 15, 15)
+                .unwrap()
+                .lowest_source_y(),
+            0
+        );
+    }
+
+    #[test]
+    fn sky_change_distinguishes_direct_attenuation_from_emission() {
+        let glass = state("glass", &[]);
+        let water = state("water", &[("level", "0")]);
+        let air = state("air", &[]);
+        let torch = state("torch", &[]);
+        let unknown = state("unrecognized", &[]);
+        assert!(sky_change_for_edit(Some(&glass), &water));
+        assert!(!sky_change_for_edit(Some(&air), &torch));
+        assert!(sky_change_for_edit(None, &air));
+        assert!(sky_change_for_edit(Some(&air), &unknown));
     }
 
     #[test]
@@ -444,7 +563,7 @@ mod tests {
             .arg(&input)
             .arg(&output)
             .arg("initial"));
-        let rows: Vec<i32> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let rows: Vec<i32> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(rows.len(), scenarios.len());
         for (blocks, expected) in scenarios.into_iter().zip(rows) {
             let mut world = fixture();
@@ -453,6 +572,94 @@ mod tests {
             }
             assert_eq!(
                 SkyColumn::load(&world, LightBounds::new(0, 32).unwrap(), 15, 15)
+                    .unwrap()
+                    .lowest_source_y(),
+                expected,
+                "initial blocks: {blocks:?}"
+            );
+        }
+
+        // Exercise the 26.3 overworld's full build range, including both
+        // boundaries and negative section coordinates.
+        let bounds = LightBounds::new(-64, 320).unwrap();
+        let mut actions = vec![(-64, 6), (-64, 0), (319, 7), (319, 0)];
+        for _ in 0..512 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let y = -64 + (random >> 16) as i32 % 384;
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            actions.push((y, (random as usize >> 16) % kinds.len()));
+        }
+        let entries: Vec<_> = actions
+            .iter()
+            .map(|(y, kind)| serde_json::json!({"y":y,"state":kinds[*kind].0}))
+            .collect();
+        std::fs::write(&input, serde_json::to_vec(&entries).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyColumnOracle")
+            .arg(&input)
+            .arg(&output)
+            .arg("changes")
+            .arg("-64")
+            .arg("384"));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(rows.len(), actions.len());
+        let mut world = fixture_range(-64, 320);
+        let mut sky = SkyColumn::load(&world, bounds, 15, 15).unwrap();
+        for ((y, kind), row) in actions.into_iter().zip(rows) {
+            put(&mut world, y, kinds[kind].1.clone());
+            assert_eq!(
+                sky.update(&world, y),
+                row[0].as_bool(),
+                "y={y}, state={}",
+                kinds[kind].0
+            );
+            assert_eq!(
+                i64::from(sky.lowest_source_y()),
+                row[1].as_i64().unwrap(),
+                "y={y}, state={}",
+                kinds[kind].0
+            );
+        }
+        let scenarios = vec![
+            vec![],
+            vec![(15, -64, 6)],
+            vec![(15, -64, 7)],
+            vec![(15, 319, 2)],
+            vec![(15, -64, 1), (15, 0, 6), (15, 319, 4)],
+            vec![(15, -64, 1), (15, 0, 6), (15, 319, 4), (14, -1, 1)],
+        ];
+        let entries: Vec<Vec<_>> = scenarios
+            .iter()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|(x, y, kind)| serde_json::json!({"x":x,"y":y,"state":kinds[*kind].0}))
+                    .collect()
+            })
+            .collect();
+        std::fs::write(&input, serde_json::to_vec(&entries).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyColumnOracle")
+            .arg(&input)
+            .arg(&output)
+            .arg("initial")
+            .arg("-64")
+            .arg("384"));
+        let rows: Vec<i32> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(rows.len(), scenarios.len());
+        for (blocks, expected) in scenarios.into_iter().zip(rows) {
+            let mut world = fixture_range(-64, 320);
+            for &(x, y, kind) in &blocks {
+                let id = world.intern_state(kinds[kind].1.clone());
+                world.set_block_id(x, y, 15, id).unwrap();
+            }
+            assert_eq!(
+                SkyColumn::load(&world, bounds, 15, 15)
                     .unwrap()
                     .lowest_source_y(),
                 expected,

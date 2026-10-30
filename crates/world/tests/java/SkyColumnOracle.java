@@ -18,9 +18,10 @@ import net.minecraft.world.level.chunk.*;
 public class SkyColumnOracle implements BlockGetter {
     static class FakeChunk extends ProtoChunk {
         LevelChunkSection[] sections;
+        int minY, height;
         FakeChunk() { super(null, null, null, null, null); }
-        @Override public int getMinY() { return 0; }
-        @Override public int getHeight() { return 32; }
+        @Override public int getMinY() { return minY; }
+        @Override public int getHeight() { return height; }
         @Override public LevelChunkSection getSection(int index) { return sections[index]; }
         @Override public int getHighestFilledSectionIndex() {
             for (int i = sections.length - 1; i >= 0; --i)
@@ -29,8 +30,9 @@ public class SkyColumnOracle implements BlockGetter {
         }
     }
     final Map<BlockPos, BlockState> blocks = new HashMap<>();
-    public int getHeight() { return 32; }
-    public int getMinY() { return 0; }
+    int minY = 0, height = 32;
+    public int getHeight() { return height; }
+    public int getMinY() { return minY; }
     public BlockEntity getBlockEntity(BlockPos p) { return null; }
     public BlockState getBlockState(BlockPos p) { return blocks.getOrDefault(p, Blocks.AIR.defaultBlockState()); }
     public FluidState getFluidState(BlockPos p) { return getBlockState(p).getFluidState(); }
@@ -59,6 +61,10 @@ public class SkyColumnOracle implements BlockGetter {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var input = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         var world = new SkyColumnOracle();
+        if (args.length > 4) {
+            world.minY = Integer.parseInt(args[3]);
+            world.height = Integer.parseInt(args[4]);
+        }
         if (args.length > 2 && args[2].equals("initial")) {
             var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
             field.setAccessible(true);
@@ -66,15 +72,18 @@ public class SkyColumnOracle implements BlockGetter {
             var result = new JsonArray();
             for (var scenario : input) {
                 var chunk = (FakeChunk)unsafe.allocateInstance(FakeChunk.class);
-                chunk.sections = new LevelChunkSection[2];
-                for (int i = 0; i < 2; ++i) {
+                chunk.minY = world.minY;
+                chunk.height = world.height;
+                chunk.sections = new LevelChunkSection[world.height / 16];
+                for (int i = 0; i < chunk.sections.length; ++i) {
                     var container = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
                     chunk.sections[i] = new LevelChunkSection(container, null);
                 }
                 for (var item : scenario.getAsJsonArray()) {
                     var entry = item.getAsJsonObject();
                     int y = entry.get("y").getAsInt();
-                    chunk.sections[y >> 4].setBlockState(15, y & 15, 15, state(entry.get("state").getAsString()));
+                    int x = entry.has("x") ? entry.get("x").getAsInt() : 15;
+                    chunk.sections[(y - world.minY) >> 4].setBlockState(x, y & 15, 15, state(entry.get("state").getAsString()));
                 }
                 var sources = new ChunkSkyLightSources(world);
                 sources.fillFrom(chunk);

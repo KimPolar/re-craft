@@ -13184,6 +13184,67 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 item registry"]
+    fn chest_lock_matches_custom_data_in_the_selected_hand() {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        session.set_item_registry(Arc::new(resources.vanilla_item_registry().unwrap()));
+        session.set_player_inventory(PlayerInventory::default());
+        let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        let mut data = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut data.value else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!()
+        };
+        fields.push((
+            "lock".into(),
+            Tag::Compound(vec![(
+                "predicates".into(),
+                Tag::Compound(vec![(
+                    "minecraft:custom_data".into(),
+                    Tag::String("{key:1b}".into()),
+                )]),
+            )]),
+        ));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
+            );
+        let relative = position - session.origin;
+        let key = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![
+                    ("key".into(), Tag::Byte(1)),
+                    ("extra".into(), Tag::Int(2)),
+                ]),
+            )]),
+        );
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Offhand, key.clone());
+        assert!(!session.try_open_saved_chest(relative));
+        assert!(session.locked_chest_message.is_some());
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Storage(0), key);
+        assert!(session.try_open_saved_chest(relative));
+    }
+
+    #[test]
     fn trapped_chest_signal_requires_known_block_entity_data() {
         use native_world::loaded::SavedBlockEntities;
         let (mut session, chest, chunk) = trapped_chest_fixture();

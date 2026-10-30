@@ -96,6 +96,39 @@ pub(crate) fn placed_item_components(components: &Tag) -> Result<(Option<&Tag>, 
     Ok((name, container))
 }
 
+// NbtUtils.compareNbt(pattern, value, true): compounds are subsets and
+// nonempty lists match without regard to order (but cannot be longer).
+fn matches_partial_nbt(pattern: &Tag, value: &Tag) -> bool {
+    match (pattern, value) {
+        (Tag::Compound(expected), Tag::Compound(actual)) => {
+            expected.iter().enumerate().all(|(i, (key, wanted))| {
+                expected[i + 1..].iter().any(|(later, _)| later == key)
+                    || actual
+                        .iter()
+                        .rev()
+                        .find(|(name, _)| name == key)
+                        .is_some_and(|(_, got)| matches_partial_nbt(wanted, got))
+            })
+        }
+        (
+            Tag::List {
+                values: expected, ..
+            },
+            Tag::List { values: actual, .. },
+        ) => {
+            if expected.is_empty() {
+                actual.is_empty()
+            } else {
+                expected.len() <= actual.len()
+                    && expected
+                        .iter()
+                        .all(|wanted| actual.iter().any(|got| matches_partial_nbt(wanted, got)))
+            }
+        }
+        _ => crate::inventory::equal_tag(pattern, value),
+    }
+}
+
 impl SavedChest {
     pub(crate) fn placed(
         position: IVec3,
@@ -152,7 +185,7 @@ impl SavedChest {
         self.source.get("CustomName")
     }
 
-    /// Interpret the known item/count subset of 26.3's lock item predicate.
+    /// Interpret the supported subset of 26.3's lock item predicate.
     /// Unknown predicates remain unavailable rather than being treated as open.
     pub(crate) fn can_unlock(
         &self,
@@ -171,9 +204,10 @@ impl SavedChest {
             bail!("unsupported lock predicate")
         };
         ensure!(
-            fields
-                .iter()
-                .all(|(name, _)| name.matches("items") || name.matches("count")),
+            fields.iter().all(|(name, _)| name.matches("items")
+                || name.matches("count")
+                || name.matches("components")
+                || name.matches("predicates")),
             "unsupported lock predicate field"
         );
         if let Some(items) = unique(lock, "items")? {
@@ -250,6 +284,70 @@ impl SavedChest {
             );
             if min.is_some_and(|min| count < min) || max.is_some_and(|max| count > max) {
                 return Ok(false);
+            }
+        }
+        let component = |name: &str| -> Result<Option<&Tag>> {
+            let Some(components) = unique(lock, name)? else {
+                return Ok(None);
+            };
+            let Tag::Compound(fields) = components else {
+                bail!("invalid lock {name}")
+            };
+            ensure!(
+                fields
+                    .iter()
+                    .all(|(key, _)| key.matches("minecraft:custom_data")),
+                "unsupported lock {name}"
+            );
+            let expected = unique(components, "minecraft:custom_data")?;
+            Ok(expected)
+        };
+        let exact = component("components")?;
+        ensure!(
+            exact.is_none_or(|value| matches!(value, Tag::Compound(_))),
+            "invalid exact custom data"
+        );
+        let partial = component("predicates")?
+            .map(|value| -> Result<std::borrow::Cow<'_, Tag>> {
+                match value {
+                    Tag::Compound(_) => Ok(std::borrow::Cow::Borrowed(value)),
+                    Tag::String(text) => Ok(std::borrow::Cow::Owned(
+                        native_persistence::snbt::parse_compound(text)?,
+                    )),
+                    _ => bail!("invalid custom data predicate"),
+                }
+            })
+            .transpose()?;
+        if exact.is_some() || partial.is_some() {
+            // Verified built-in prototypes have no custom_data; a patch can add
+            // or remove it. An unrecognized item has an unknown prototype.
+            let held = if let Some(item) = item {
+                let registry = registry.context("item registry is unavailable")?;
+                ensure!(registry.id(item.id()).is_some(), "unknown item prototype");
+                let value = unique(item.components(), "minecraft:custom_data")?;
+                let removed = unique(item.components(), "!minecraft:custom_data")?;
+                ensure!(
+                    value.is_none() || removed.is_none(),
+                    "conflicting custom data patch"
+                );
+                ensure!(
+                    value.is_none_or(|value| matches!(value, Tag::Compound(_))),
+                    "invalid item custom data"
+                );
+                value
+            } else {
+                None
+            };
+            if let Some(expected) = exact {
+                if !held.is_some_and(|value| crate::inventory::equal_tag(expected, value)) {
+                    return Ok(false);
+                }
+            }
+            if let Some(expected) = partial {
+                let empty = Tag::Compound(vec![]);
+                if !matches_partial_nbt(&expected, held.unwrap_or(&empty)) {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -449,6 +547,21 @@ pub fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_custom_data_uses_subset_and_unordered_list_matching() {
+        let parse = |text: &str| native_persistence::snbt::parse_compound(&text.into()).unwrap();
+        let actual = parse("{nested:{a:1,b:2},list:[2,1],other:1}");
+        assert!(matches_partial_nbt(
+            &parse("{nested:{a:1},list:[1,2]}"),
+            &actual
+        ));
+        assert!(matches_partial_nbt(&parse("{list:[1,1]}"), &actual));
+        assert!(!matches_partial_nbt(&parse("{list:[1,1,1]}"), &actual));
+        assert!(!matches_partial_nbt(&parse("{list:[]}"), &actual));
+        assert!(!matches_partial_nbt(&parse("{nested:{a:1b}}"), &actual));
+        assert!(matches_partial_nbt(&parse("{}"), &actual));
+    }
     use native_persistence::nbt::NamedTag;
     #[test]
     fn placed_container_rejects_ambiguous_or_unpreservable_items() {
@@ -685,7 +798,10 @@ mod tests {
         };
         fields.push((
             "lock".into(),
-            Tag::Compound(vec![("components".into(), Tag::Compound(vec![]))]),
+            Tag::Compound(vec![(
+                "components".into(),
+                Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(1))]),
+            )]),
         ));
         let unsupported = read(&payload(vec![unsupported]), chunk, position)
             .unwrap()
@@ -790,7 +906,10 @@ mod tests {
                 assert_eq!(
                     saved
                         .can_unlock(hand.as_ref(), false, Some(&recipes.tags), Some(&registry))
-                        .unwrap(),
+                        .unwrap_or_else(|error| panic!(
+                            "case {case}, lock {:?}: {error:#}",
+                            row.get("lock")
+                        )),
                     answer != 0,
                     "case {case} hand {hand:?}"
                 );
@@ -798,6 +917,48 @@ mod tests {
                     saved
                         .can_unlock(hand.as_ref(), true, Some(&recipes.tags), Some(&registry))
                         .unwrap()
+                );
+            }
+        }
+        let Tag::List { values: stacks, .. } = oracle.value.get("component_stacks").unwrap() else {
+            panic!()
+        };
+        let mut component_hands = vec![None];
+        component_hands.extend(
+            stacks
+                .iter()
+                .map(|stack| Some(crate::player_data::read_stack(stack).unwrap())),
+        );
+        let Tag::List { values: rows, .. } = oracle.value.get("component_cases").unwrap() else {
+            panic!()
+        };
+        for (case, row) in rows.iter().enumerate() {
+            let mut original = chest();
+            let Tag::Compound(fields) = &mut original else {
+                panic!()
+            };
+            fields.push(("lock".into(), row.get("lock").unwrap().clone()));
+            let saved = read(
+                &payload(vec![original]),
+                ChunkPos { x: -1, z: 2 },
+                IVec3::new(-1, 64, 32),
+            )
+            .unwrap()
+            .unwrap();
+            let Tag::ByteArray(expected) = row.get("answers").unwrap() else {
+                panic!()
+            };
+            for (hand, &answer) in component_hands.iter().zip(expected) {
+                assert_eq!(
+                    saved
+                        .can_unlock(hand.as_ref(), false, Some(&recipes.tags), Some(&registry))
+                        .unwrap_or_else(|error| panic!(
+                            "component case {case}, lock {:?}: {error:#}",
+                            row.get("lock")
+                        )),
+                    answer != 0,
+                    "component case {case} hand {hand:?}, lock {:?}",
+                    row.get("lock")
                 );
             }
         }

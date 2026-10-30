@@ -5,4 +5,5 @@ pub mod nbt;
 pub mod palette;
 pub mod save;
 mod save_transaction;
+pub mod snbt;
 pub mod world;

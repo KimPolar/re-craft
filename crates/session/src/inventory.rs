@@ -2670,7 +2670,7 @@ fn equal_compounds(a: &[(JavaString, Tag)], b: &[(JavaString, Tag)], ignore_max:
 
 // NBT compounds are maps in Java: field order is irrelevant and a duplicate key
 // resolves to the last value. Preserve list order and Java's float bit semantics.
-fn equal_tag(a: &Tag, b: &Tag) -> bool {
+pub(crate) fn equal_tag(a: &Tag, b: &Tag) -> bool {
     match (a, b) {
         (Tag::Compound(a), Tag::Compound(b)) => equal_compounds(a, b, false),
         (

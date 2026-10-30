@@ -283,6 +283,7 @@ struct ChestInventory {
     position: IVec3,
     other: Option<IVec3>,
     slots: Vec<Option<ItemStack>>,
+    title: Option<String>,
 }
 
 /// The player's saved recipe-book state; unknown recipe IDs remain preserved.
@@ -917,10 +918,25 @@ impl PlayerInventory {
             position,
             other,
             slots,
+            title: None,
         });
         self.menu = Some(InventoryMenu::Chest { position, other });
         self.revision = self.revision.wrapping_add(1);
         true
+    }
+    /// The selected saved chest name, if its text component is supported.
+    pub fn chest_title(&self) -> Option<&str> {
+        if !matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
+            return None;
+        }
+        self.chest.as_ref()?.title.as_deref()
+    }
+
+    pub(crate) fn set_chest_title(&mut self, title: Option<String>) {
+        if let Some(chest) = &mut self.chest {
+            chest.title = title;
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
     /// Return the chest to the session after closing, including on death.
     pub fn has_closed_chest(&self) -> bool {

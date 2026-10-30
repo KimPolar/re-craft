@@ -2029,8 +2029,28 @@ fn trapped_chest_signal_matches_vanilla() {
     )
     .unwrap()
     .unwrap();
+    assert_eq!(
+        saved.custom_name(),
+        Some(&native_persistence::nbt::Tag::String("보관함 ♠".into()))
+    );
     assert_eq!(saved.slots[4].as_ref().unwrap().id(), "minecraft:diamond");
     assert_eq!(saved.slots[4].as_ref().unwrap().count(), 3);
+    let titles: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(output.with_extension("json.titles.json")).unwrap())
+            .unwrap();
+    assert_eq!(titles.len(), 4);
+    for row in titles {
+        let first = row["first"].as_bool().unwrap();
+        let second = row["second"].as_bool().unwrap();
+        if first || second {
+            assert_eq!(
+                row["title"].as_str(),
+                Some(if first { "right" } else { "left" })
+            );
+        } else {
+            assert_eq!(row["default"].as_bool(), Some(true));
+        }
+    }
 }
 
 #[test]

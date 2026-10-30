@@ -22,6 +22,11 @@ impl SavedChest {
         &self.source
     }
 
+    /// Preserve the original text component, including forms not yet rendered.
+    pub fn custom_name(&self) -> Option<&Tag> {
+        self.source.get("CustomName")
+    }
+
     /// Prepare a chest entity in memory. The source, player, chunk and all
     /// other affected world data must be checked and committed together before
     /// this can be used for a world save.
@@ -167,6 +172,7 @@ pub fn read(
         matches!(unique(&entity, "id")?, Some(Tag::String(id)) if id.matches("minecraft:chest") || id.matches("chest") || id.matches("minecraft:trapped_chest") || id.matches("trapped_chest")),
         "saved block entity is not a chest"
     );
+    unique(&entity, "CustomName")?;
     ensure!(
         unique(&entity, "LootTable")?.is_none(),
         "chest loot table must be generated first"

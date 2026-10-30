@@ -1766,11 +1766,13 @@ impl GameUi {
                         Some(assets),
                         x + 8,
                         y + 6,
-                        if double_chest {
-                            assets.translate("container.chestDouble", "Large Chest")
-                        } else {
-                            assets.translate("container.chest", "Chest")
-                        },
+                        inventory.chest_title().unwrap_or_else(|| {
+                            if double_chest {
+                                assets.translate("container.chestDouble", "Large Chest")
+                            } else {
+                                assets.translate("container.chest", "Chest")
+                            }
+                        }),
                         [64, 64, 64],
                     );
                     canvas.text_without_shadow(

@@ -52,7 +52,22 @@ public class TrappedChestSignalOracle {
         for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
         var saved=new TrappedChestBlockEntity(BlockPos.ZERO,Blocks.TRAPPED_CHEST.defaultBlockState());
         saved.setItem(4,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND,3));
+        var nameField=net.minecraft.world.level.block.entity.BaseContainerBlockEntity.class.getDeclaredField("name"); nameField.setAccessible(true);
+        nameField.set(saved,net.minecraft.network.chat.Component.literal("\ubcf4\uad00\ud568 \u2660"));
         var tag=saved.saveWithFullMetadata(registries);
         try(var out=new DataOutputStream(Files.newOutputStream(Path.of(args[0]+".nbt")))) { net.minecraft.nbt.NbtIo.write(tag,(DataOutput)out); }
+        var combinerClass=Class.forName("net.minecraft.world.level.block.ChestBlock$2");
+        var constructor=combinerClass.getDeclaredConstructor(); constructor.setAccessible(true);
+        var accept=combinerClass.getDeclaredMethod("acceptDouble",ChestBlockEntity.class,ChestBlockEntity.class); accept.setAccessible(true);
+        var titleRows=new JsonArray();
+        for (boolean firstNamed : new boolean[]{false,true}) for (boolean secondNamed : new boolean[]{false,true}) {
+            var first=new ChestBlockEntity(BlockPos.ZERO,Blocks.CHEST.defaultBlockState());
+            var second=new ChestBlockEntity(BlockPos.ZERO,Blocks.CHEST.defaultBlockState());
+            if (firstNamed) nameField.set(first,net.minecraft.network.chat.Component.literal("right"));
+            if (secondNamed) nameField.set(second,net.minecraft.network.chat.Component.literal("left"));
+            var provider=(net.minecraft.world.MenuProvider)((java.util.Optional<?>)accept.invoke(constructor.newInstance(),first,second)).orElseThrow();
+            var row=new JsonObject(); row.addProperty("first",firstNamed); row.addProperty("second",secondNamed); row.addProperty("title",provider.getDisplayName().getString()); row.addProperty("default",provider.getDisplayName().equals(net.minecraft.network.chat.Component.translatable("container.chestDouble"))); titleRows.add(row);
+        }
+        Files.writeString(Path.of(args[0]+".titles.json"),titleRows.toString());
     }
 }

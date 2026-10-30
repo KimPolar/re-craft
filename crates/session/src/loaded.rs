@@ -384,6 +384,21 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
     }
 }
 
+/// Vanilla chooses the first (right) half's custom name before the second.
+/// Styled and translated components need the full text-component renderer.
+fn chest_title(
+    first: &crate::saved_chest::SavedChest,
+    second: Option<&crate::saved_chest::SavedChest>,
+) -> Option<String> {
+    let name = first
+        .custom_name()
+        .or_else(|| second.and_then(|chest| chest.custom_name()))?;
+    match name {
+        native_persistence::nbt::Tag::String(value) => String::from_utf16(&value.0).ok(),
+        _ => None,
+    }
+}
+
 fn fresh_breathing_seed() -> i64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2473,6 +2488,7 @@ impl LoadedSession {
             ) {
                 return false;
             }
+            Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&right, Some(&left)));
             self.chest_contents.insert(key(right_position), right);
             self.chest_contents.insert(key(left_position), left);
             self.push_chest_sound(right_position, Some(left_position), true);
@@ -2484,6 +2500,7 @@ impl LoadedSession {
             if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
                 return false;
             }
+            Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&chest, None));
             self.chest_contents.insert(key(position), chest);
             self.push_chest_sound(position, None, true);
             if self.game_mode != GameMode::Spectator {
@@ -11801,6 +11818,49 @@ mod tests {
     }
 
     #[test]
+    fn saved_single_chest_name_is_exposed_in_snapshot() {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk] else {
+            panic!("expected fixture payload")
+        };
+        let mut data = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut data.value else {
+            panic!("expected list")
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!("expected entity")
+        };
+        fields.push(("CustomName".into(), Tag::String("보관함 ♠".into())));
+        let unnamed = session.saved_chest(position).unwrap().unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
+            );
+        let named = session.saved_chest(position).unwrap().unwrap();
+        assert_eq!(
+            chest_title(&unnamed, Some(&named)).as_deref(),
+            Some("보관함 ♠")
+        );
+        assert_eq!(
+            chest_title(&named, Some(&unnamed)).as_deref(),
+            Some("보관함 ♠")
+        );
+        assert_eq!(chest_title(&unnamed, None), None);
+        assert!(session.try_open_saved_chest(position - session.origin));
+        session.update(TICK);
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.inventory.chest_title(), Some("보관함 ♠"));
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        assert_eq!(session.inventory.chest_title(), None);
+        assert_eq!(snapshot.inventory.chest_title(), Some("보관함 ♠"));
+    }
+
+    #[test]
     fn saved_chest_opens_moves_items_and_survives_streaming() {
         use crate::inventory::PlayerSlot;
         let (mut session, source, position, home) = saved_chest_fixture();
@@ -12023,8 +12083,13 @@ mod tests {
         let Tag::List { values, .. } = &mut document.value else {
             panic!("expected entity list")
         };
+        let Tag::Compound(left_fields) = &mut values[0] else {
+            panic!("expected chest entity")
+        };
+        left_fields.push(("CustomName".into(), Tag::String("left chest".into())));
         values.push(Tag::Compound(vec![
             ("id".into(), Tag::String("minecraft:chest".into())),
+            ("CustomName".into(), Tag::String("right chest".into())),
             ("x".into(), Tag::Int(right.x)),
             ("y".into(), Tag::Int(right.y)),
             ("z".into(), Tag::Int(right.z)),
@@ -12069,6 +12134,10 @@ mod tests {
                 position: right,
                 other: Some(left)
             })
+        );
+        assert_eq!(
+            session.snapshot().inventory.chest_title(),
+            Some("right chest")
         );
         let sounds = session.take_chest_sounds();
         assert_eq!(sounds.len(), 1);
@@ -12120,6 +12189,11 @@ mod tests {
         assert!(session.saved_chest(right).unwrap().unwrap().slots[0].is_none());
         assert!(session.chest_dirty_chunks.contains(&home));
         assert!(session.try_open_saved_chest(right - session.origin));
+        session.update(TICK);
+        assert_eq!(
+            session.snapshot().inventory.chest_title(),
+            Some("right chest")
+        );
         assert_eq!(
             session.inventory.menu(),
             Some(InventoryMenu::Chest {

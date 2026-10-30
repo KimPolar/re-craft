@@ -1333,7 +1333,7 @@ fn validate_max_health_for_draft(player: &NamedTag) -> Result<f32> {
     saved_max_health(player)
 }
 
-fn validate_original_stack(stack: &Tag, has_slot: bool) -> Result<()> {
+pub(crate) fn validate_original_stack(stack: &Tag, has_slot: bool) -> Result<()> {
     let Tag::Compound(entries) = stack else {
         bail!("saved item is not a compound")
     };

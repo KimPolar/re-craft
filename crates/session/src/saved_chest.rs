@@ -5,6 +5,7 @@ use crate::inventory::ItemStack;
 use anyhow::{Context, Result, bail, ensure};
 use glam::IVec3;
 use native_persistence::nbt::{self, Tag, TagType};
+use native_resources::packs::ResourceId;
 use native_world::loaded::{ChunkPos, SavedBlockEntities};
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -12,12 +13,96 @@ use std::{collections::BTreeSet, sync::Arc};
 pub struct SavedChest {
     pub position: IVec3,
     pub slots: [Option<ItemStack>; 27],
+    original_slots: [Option<ItemStack>; 27],
     source: Arc<Tag>,
 }
 
 impl SavedChest {
     pub fn source(&self) -> &Tag {
         &self.source
+    }
+
+    /// Prepare a chest entity in memory. The source, player, chunk and all
+    /// other affected world data must be checked and committed together before
+    /// this can be used for a world save.
+    pub fn draft_inventory(&self, slots: &[Option<ItemStack>; 27]) -> Result<Tag> {
+        if slots == &self.original_slots {
+            return Ok((*self.source).clone());
+        }
+        let original_items = match unique(&self.source, "Items")? {
+            Some(Tag::List { values, .. }) => values.as_slice(),
+            None => &[],
+            _ => bail!("chest Items is not a list"),
+        };
+        let mut source_by_slot: [Option<&Tag>; 27] = [None; 27];
+        for item in original_items {
+            let Some(Tag::Byte(slot)) = unique(item, "Slot")? else {
+                bail!("chest item slot is invalid")
+            };
+            let index = *slot as u8 as usize;
+            ensure!(
+                index < 27 && source_by_slot[index].is_none(),
+                "invalid or duplicate chest item slot"
+            );
+            source_by_slot[index] = Some(item);
+            if slots[index] != self.original_slots[index] {
+                ensure!(
+                    self.original_slots[index]
+                        .as_ref()
+                        .is_none_or(|item| item.max_count().is_some()),
+                    "an unresolved item would be lost or moved"
+                );
+                crate::player_data::validate_original_stack(item, true)?;
+            }
+        }
+        let mut values = Vec::new();
+        for (index, item) in slots.iter().enumerate() {
+            let Some(item) = item else { continue };
+            ensure!(
+                (1..=99).contains(&item.count()),
+                "item count is outside the saved codec range"
+            );
+            ResourceId::parse(item.id()).context("invalid saved item id")?;
+            ensure!(
+                matches!(item.components(), Tag::Compound(_)),
+                "item components are not a compound"
+            );
+            if item.max_count().is_none() {
+                ensure!(
+                    self.original_slots[index].as_ref() == Some(item),
+                    "an unresolved item was created or modified"
+                );
+            } else {
+                ensure!(
+                    crate::equippable::saved_inventory_max(item.id(), item.components())
+                        == item.max_count(),
+                    "item stack limit cannot be reconstructed from its saved components"
+                );
+            }
+            if self.original_slots[index].as_ref() == Some(item) {
+                values.push(
+                    source_by_slot[index]
+                        .context("unchanged item is missing from the source")?
+                        .clone(),
+                );
+            } else {
+                values.push(crate::player_data::encode_stack(item, Some(index as u8)));
+            }
+        }
+        let mut document = (*self.source).clone();
+        let Tag::Compound(fields) = &mut document else {
+            unreachable!()
+        };
+        let items = Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        if let Some((_, original)) = fields.iter_mut().find(|(name, _)| name.matches("Items")) {
+            *original = items;
+        } else {
+            fields.push(("Items".into(), items));
+        }
+        Ok(document)
     }
 }
 
@@ -119,6 +204,7 @@ pub fn read(
     }
     Ok(Some(SavedChest {
         position,
+        original_slots: slots.clone(),
         slots,
         source: Arc::new(entity),
     }))
@@ -195,6 +281,93 @@ mod tests {
         assert_eq!(unknown.id(), "example:unknown");
         assert!(unknown.max_count().is_none());
         assert!(saved.slots[1..26].iter().all(Option::is_none));
+    }
+    #[test]
+    fn drafts_changed_slots_preserving_other_fields_and_unchanged_items() {
+        let mut original = chest();
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Items"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(unknown_fields) = &mut values[1] else {
+            unreachable!()
+        };
+        unknown_fields.push(("future_item_field".into(), Tag::Int(44)));
+        let unchanged_unknown = values[1].clone();
+        let saved = read(
+            &payload(vec![original.clone()]),
+            ChunkPos { x: -1, z: 2 },
+            IVec3::new(-1, 64, 32),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(saved.draft_inventory(&saved.slots).unwrap(), original);
+        let mut changed = saved.slots.clone();
+        changed[5] = changed[0].take();
+        let draft = saved.draft_inventory(&changed).unwrap();
+        assert_eq!(draft.get("future"), original.get("future"));
+        let Tag::List { values, .. } = draft.get("Items").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("Slot"), Some(&Tag::Byte(5)));
+        assert_eq!(values[1], unchanged_unknown);
+        let reread = read(
+            &payload(vec![draft]),
+            ChunkPos { x: -1, z: 2 },
+            IVec3::new(-1, 64, 32),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reread.slots, changed);
+        changed[26] = None;
+        assert!(saved.draft_inventory(&changed).is_err());
+        changed[26] = saved.slots[26].clone();
+        changed[4] =
+            Some(ItemStack::unresolved("example:new".into(), 1, Tag::Compound(vec![])).unwrap());
+        assert!(saved.draft_inventory(&changed).is_err());
+    }
+
+    #[test]
+    fn rejects_changes_that_would_discard_extra_item_fields_or_invalid_stacks() {
+        let mut original = chest();
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Items"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(item) = &mut values[0] else {
+            unreachable!()
+        };
+        item.push(("future_item_field".into(), Tag::Int(44)));
+        let saved = read(
+            &payload(vec![original]),
+            ChunkPos { x: -1, z: 2 },
+            IVec3::new(-1, 64, 32),
+        )
+        .unwrap()
+        .unwrap();
+        let mut changed = saved.slots.clone();
+        changed[5] = changed[0].take();
+        assert!(saved.draft_inventory(&changed).is_err());
+        changed = saved.slots.clone();
+        changed[5] = ItemStack::new("minecraft:diamond".into(), 100, 64, Tag::Compound(vec![]));
+        assert!(saved.draft_inventory(&changed).is_err());
+        changed[5] = ItemStack::new("minecraft:diamond".into(), 1, 1, Tag::Compound(vec![]));
+        assert!(saved.draft_inventory(&changed).is_err());
     }
     #[test]
     fn rejects_unavailable_loot_locks_and_ambiguous_slots() {

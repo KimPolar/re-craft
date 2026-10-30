@@ -154,6 +154,15 @@ public class RegionWriteOracle {
             var blockEntity=chest.saveWithFullMetadata(registries); blockEntity.putLong("future_data",123); var list=new ListTag(); list.add(blockEntity); chunk.put("block_entities",list);
             try(var region=open(dir); var out=region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk,(DataOutput)out); }
             System.out.println("OK");
+        } else if (args[0].equals("verifyChestDraft")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            var lookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup(); var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(lookup);
+            for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+            try(var input=new DataInputStream(Files.newInputStream(world.resolve("chest-draft.nbt")))) {
+                var tag=NbtIo.read((DataInput)input); var block=net.minecraft.world.level.block.entity.BlockEntity.loadStatic(new net.minecraft.core.BlockPos(0,0,0),net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState(),tag,registries);
+                if(!(block instanceof net.minecraft.world.level.block.entity.ChestBlockEntity chest) || !chest.getItem(0).isEmpty() || !chest.getItem(26).is(net.minecraft.world.item.Items.DIAMOND) || chest.getItem(26).getCount()!=3 || tag.getLongOr("future_data",0)!=123) throw new AssertionError("draft chest contents");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("verifyBlockEntity")) {
             net.minecraft.server.Bootstrap.bootStrap();
             var lookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup(); var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(lookup);
@@ -399,6 +408,15 @@ fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
         chest.source().get("future_data"),
         Some(&nbt::Tag::Long(123))
     );
+    let mut slots = chest.slots.clone();
+    slots[26] = slots[0].take();
+    let entity = chest.draft_inventory(&slots).unwrap();
+    let draft = nbt::NamedTag {
+        name: "".into(),
+        value: entity,
+    };
+    std::fs::write(world.join("chest-draft.nbt"), nbt::write(&draft).unwrap()).unwrap();
+    invoke("verifyChestDraft");
     let prepare = |x, expected, replacement| {
         let change = BlockChange {
             x,

@@ -443,6 +443,8 @@ pub struct LockedChestSoundEvent {
 struct FallingSand {
     motion: crate::falling_block::AirborneMotion,
     previous: DVec3,
+    fall_distance: f64,
+    fall_distance_verified: bool,
     kind: FallingKind,
     drop_item: bool,
     cancel_drop: bool,
@@ -457,7 +459,6 @@ struct CreatedFallingSand {
     origin: IVec3,
     verified_position: DVec3,
     visited: BTreeSet<ChunkPos>,
-    fall_distance: f64,
     checked: bool,
     valid: bool,
 }
@@ -477,7 +478,6 @@ impl CreatedFallingSand {
             origin,
             verified_position: position,
             visited: BTreeSet::from([chunk]),
-            fall_distance: 0.0,
             checked: false,
             valid: true,
         }
@@ -3623,10 +3623,10 @@ impl LoadedSession {
                 crate::saved_falling_block::draft_created(
                     created.uuid.expect("validated UUID"),
                     entity.kind.id(),
-                    created.fall_distance,
                     crate::saved_falling_block::FallingSaveState {
                         position: entity.motion.position,
                         velocity: entity.motion.velocity,
+                        fall_distance: entity.fall_distance,
                         on_ground: entity.on_ground,
                         no_gravity: entity.motion.no_gravity,
                         time: entity.motion.age,
@@ -5196,6 +5196,8 @@ impl LoadedSession {
                         no_gravity: saved.no_gravity,
                     },
                     previous: saved.position,
+                    fall_distance: saved.fall_distance,
+                    fall_distance_verified: true,
                     kind,
                     drop_item: saved.drop_item,
                     cancel_drop: saved.cancel_drop,
@@ -6915,6 +6917,8 @@ impl LoadedSession {
                     if self.set(relative, self.states[0]) {
                         self.falling_sand.push(FallingSand {
                             previous: motion.position,
+                            fall_distance: 0.0,
+                            fall_distance_verified: true,
                             motion,
                             kind: key.kind,
                             drop_item: true,
@@ -7245,20 +7249,23 @@ impl LoadedSession {
                 })
             });
             entity.on_ground = collision.on_ground;
-            if let Some(created) = &mut entity.created {
-                if entity.on_ground {
-                    created.fall_distance = 0.0;
-                } else if collision.actual.y < 0.0 {
-                    created.fall_distance -= f64::from(collision.actual.y as f32);
-                }
-                if created.valid {
-                    let safe = created_item_path_safe(
-                        &self.world,
-                        self.origin,
-                        self.bounds,
-                        probe.bounds(),
-                        collision.actual,
+            if entity.fall_distance_verified {
+                let safe = created_item_path_safe(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    probe.bounds(),
+                    collision.actual,
+                );
+                entity.fall_distance_verified = safe;
+                if safe {
+                    entity.fall_distance = crate::falling_block::fall_distance_after_move(
+                        entity.fall_distance,
+                        collision.actual.y,
+                        entity.on_ground,
                     );
+                }
+                if let Some(created) = &mut entity.created {
                     created.verify(entity.previous, entity.motion.position, safe);
                 }
             }
@@ -9241,6 +9248,10 @@ fn draft_falling_sand(
     entity: &FallingSand,
 ) -> anyhow::Result<crate::saved_falling_block::FallingBlockDraft> {
     use anyhow::Context;
+    anyhow::ensure!(
+        entity.fall_distance_verified,
+        "falling entity movement effects were not verified"
+    );
     let source = entity
         .source
         .as_ref()
@@ -9252,6 +9263,7 @@ fn draft_falling_sand(
     let state = crate::saved_falling_block::FallingSaveState {
         position: entity.motion.position,
         velocity: entity.motion.velocity,
+        fall_distance: entity.fall_distance,
         on_ground: entity.on_ground,
         no_gravity: entity.motion.no_gravity,
         time: entity.motion.age,
@@ -17399,18 +17411,10 @@ mod tests {
                 session.dropped_items.snapshot().len(),
                 usize::from(drop_item && !cancel)
             );
-            let drafts = session.draft_tracked_entity_chunks().unwrap();
-            let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
-            else {
-                panic!()
-            };
-            assert_eq!(values.len(), usize::from(drop_item && !cancel));
-            if let Some(item) = values.first() {
-                assert_eq!(
-                    crate::saved_item::read(item).unwrap().unwrap().stack.id(),
-                    "minecraft:sand"
-                );
-            }
+            assert!(
+                session.draft_tracked_entity_chunks().is_err(),
+                "slab fall effects are not yet verified for saving"
+            );
         }
     }
 
@@ -17589,6 +17593,7 @@ mod tests {
             ),
             ("BlockState".into(), Tag::String("minecraft:sand".into())),
             ("Time".into(), Tag::Int(1)),
+            ("fall_distance".into(), Tag::Double(4.25)),
             ("DropItem".into(), Tag::Byte(1)),
         ]);
         let pig = Tag::Compound(vec![
@@ -17623,6 +17628,15 @@ mod tests {
             .set_initial_entity_chunk(home, make_chunk(Arc::clone(&original)))
             .unwrap();
         session.activate_saved_falling_sand();
+        session.advance_falling_sand();
+        let saved = session
+            .draft_saved_falling_entity([1, 2, 3, 4])
+            .unwrap()
+            .unwrap();
+        let saved = crate::saved_falling_block::read(&saved.document().value)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.fall_distance, 4.25 + f64::from(0.04_f32));
         for _ in 0..30 {
             session.advance_falling_sand();
             if session.falling_sand.is_empty() {
@@ -17732,19 +17746,9 @@ mod tests {
         assert!(session.falling_sand.is_empty());
         assert!(!session.uncoordinated_falling_lifecycle);
         assert_eq!(session.dropped_items.snapshot().len(), 1);
-        let draft = session.draft_tracked_entity_chunks().unwrap();
-        let Tag::List { values, .. } = draft[&home].document().value.get("Entities").unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(values.len(), 1);
-        assert_eq!(
-            crate::saved_item::read(&values[0])
-                .unwrap()
-                .unwrap()
-                .stack
-                .id(),
-            "minecraft:sand"
+        assert!(
+            session.draft_tracked_entity_chunks().is_err(),
+            "slab fall effects are not yet verified for saving"
         );
         session.update(TICK);
         assert!(
@@ -21208,6 +21212,8 @@ mod tests {
             };
             session.falling_sand.push(FallingSand {
                 previous: motion.position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
                 motion,
                 kind: FallingKind::Sand,
                 drop_item: true,
@@ -24725,6 +24731,8 @@ mod tests {
                 + DVec3::new(0.5, 0.0, 0.5);
             session.falling_sand.push(FallingSand {
                 previous: position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
                 motion: crate::falling_block::AirborneMotion {
                     position,
                     velocity: DVec3::ZERO,
@@ -24766,6 +24774,8 @@ mod tests {
                 (session.origin + IVec3::new(10, 4, 8)).as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
             session.falling_sand.push(FallingSand {
                 previous: position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
                 motion: crate::falling_block::AirborneMotion::from_block(
                     session.origin + IVec3::new(10, 4, 8),
                 ),
@@ -24801,6 +24811,8 @@ mod tests {
                 (session.origin + IVec3::new(10, 4, 8)).as_dvec3() + DVec3::new(0.1, 0.0, 0.5);
             session.falling_sand.push(FallingSand {
                 previous: position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
                 motion: crate::falling_block::AirborneMotion {
                     position,
                     velocity: DVec3::ZERO,

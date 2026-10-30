@@ -51,6 +51,7 @@ public class SavedFallingOracle {
       var input=TagValueInput.create(ProblemReporter.DISCARDING,registry,tag);
       var entity=(Falling)unsafe.allocateInstance(Falling.class); entity.loadExtra(input);
       if(entity.time != 101 || entity.dropItem || !cancelled.getBoolean(entity) || entity.getBlockState().getBlock()!=Blocks.SAND ||
+         input.getDoubleOr("fall_distance",-1)!=2.5 ||
          !input.read("Pos",Vec3.CODEC).orElseThrow().equals(new Vec3(-1.5,3,2.5)) ||
          !input.read("Motion",Vec3.CODEC).orElseThrow().equals(new Vec3(0.2,-0.4,0)))
         throw new AssertionError("Rust falling-block draft differs from Java decoding");

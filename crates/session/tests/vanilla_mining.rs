@@ -981,6 +981,50 @@ public class FallingCollisionOracle {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn falling_block_fall_distance_matches_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("FallingFallDistanceOracle.java");
+    std::fs::write(&source, include_str!("java/FallingFallDistanceOracle.java")).unwrap();
+    let mut cases = Vec::new();
+    for distance in [-100.0, -1.5, 0.0, 0.1, 5.25, 10_000.125] {
+        for y in [-3.141592653589793_f64, -0.04, -0.0000001, 0.0, 0.2, 1.0] {
+            cases.push((distance, y, false));
+            if distance - f64::from((y.min(0.0)) as f32) <= 0.0 {
+                cases.push((distance, y, true));
+            }
+        }
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases.iter().map(|(distance,y,ground)| serde_json::json!({"distance":distance,"y":y,"ground":ground})).collect::<Vec<_>>()).unwrap()).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("FallingFallDistanceOracle")
+        .arg(input)
+        .arg(&output));
+    let expected: Vec<f64> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(expected.len(), cases.len());
+    for ((distance, y, ground), expected) in cases.into_iter().zip(expected) {
+        assert_eq!(
+            native_session::falling_block::fall_distance_after_move(distance, y, ground),
+            expected
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn airborne_falling_block_motion_matches_java() {
     use native_session::falling_block::AirborneMotion;
     let game = std::env::var_os("MINECRAFT_DIR")
@@ -1528,6 +1572,7 @@ fn saved_falling_fields_match_java_entity() {
         native_session::saved_falling_block::FallingSaveState {
             position: glam::DVec3::new(-1.5, 3.0, 2.5),
             velocity: glam::DVec3::new(0.2, -0.4, 0.0),
+            fall_distance: 2.5,
             on_ground: false,
             no_gravity: true,
             time: 101,
@@ -1545,6 +1590,7 @@ fn saved_falling_fields_match_java_entity() {
     let chunk_state = native_session::saved_falling_block::FallingSaveState {
         position: glam::DVec3::new(3.5, 64.0, -2.5),
         velocity: glam::DVec3::new(0.2, -0.4, 0.0),
+        fall_distance: 0.0,
         on_ground: false,
         no_gravity: true,
         time: 101,
@@ -1670,10 +1716,10 @@ fn saved_falling_fields_match_java_entity() {
     let created = native_session::saved_falling_block::draft_created(
         [1, 2, 3, 4],
         "minecraft:gravel",
-        1.25,
         native_session::saved_falling_block::FallingSaveState {
             position: glam::DVec3::new(3.5, 5.0, 3.5),
             velocity: glam::DVec3::new(0.0, -0.25, 0.0),
+            fall_distance: 1.25,
             on_ground: false,
             no_gravity: false,
             time: 7,

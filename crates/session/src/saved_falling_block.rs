@@ -18,6 +18,7 @@ pub struct SavedFallingBlock {
     pub velocity: DVec3,
     pub on_ground: bool,
     pub no_gravity: bool,
+    pub fall_distance: f64,
     pub block: BlockState,
     /// String encoding denotes the registry's default state; resolve defaults
     /// before using properties for a block that has any.
@@ -31,6 +32,7 @@ pub struct SavedFallingBlock {
 pub struct FallingSaveState {
     pub position: DVec3,
     pub velocity: DVec3,
+    pub fall_distance: f64,
     pub on_ground: bool,
     pub no_gravity: bool,
     pub time: i32,
@@ -58,7 +60,6 @@ impl CreatedFallingBlockDraft {
 pub fn draft_created(
     uuid: [i32; 4],
     block: &str,
-    fall_distance: f64,
     state: FallingSaveState,
 ) -> Result<CreatedFallingBlockDraft> {
     ensure!(
@@ -80,7 +81,7 @@ pub fn draft_created(
         "invalid velocity"
     );
     ensure!(
-        fall_distance.is_finite() && fall_distance >= 0.0,
+        state.fall_distance.is_finite() && state.fall_distance >= 0.0,
         "invalid fall distance"
     );
     let vector = |v: DVec3| Tag::List {
@@ -101,7 +102,7 @@ pub fn draft_created(
                     values: vec![Tag::Float(0.0), Tag::Float(0.0)],
                 },
             ),
-            ("fall_distance".into(), Tag::Double(fall_distance)),
+            ("fall_distance".into(), Tag::Double(state.fall_distance)),
             ("Air".into(), Tag::Short(300)),
             ("Fire".into(), Tag::Short(0)),
             ("PortalCooldown".into(), Tag::Int(0)),
@@ -749,6 +750,7 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
         "UUID",
         "Pos",
         "Motion",
+        "fall_distance",
         "OnGround",
         "NoGravity",
         "BlockState",
@@ -804,6 +806,12 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
             "Time cannot be preserved safely"
         );
     }
+    if let Some(value) = original.value.get("fall_distance") {
+        ensure!(
+            matches!(value, Tag::Double(v) if v.is_finite()),
+            "fall distance cannot be preserved safely"
+        );
+    }
     let valid_position = |value: DVec3| {
         value.is_finite()
             && value.x.abs() <= 30_000_512.0
@@ -839,6 +847,10 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
         state.velocity.is_finite() && state.velocity.abs().max_element() <= 10.0,
         "entity velocity cannot be saved safely"
     );
+    ensure!(
+        state.fall_distance.is_finite(),
+        "fall distance cannot be saved safely"
+    );
     let source_nbt = native_persistence::nbt::write(original)?;
     let mut document = original.clone();
     let Tag::Compound(fields) = &mut document.value else {
@@ -851,6 +863,7 @@ pub fn draft(original: &NamedTag, state: FallingSaveState) -> Result<FallingBloc
     for (name, value) in [
         ("Pos", vector(state.position)),
         ("Motion", vector(state.velocity)),
+        ("fall_distance", Tag::Double(state.fall_distance)),
         ("OnGround", Tag::Byte(i8::from(state.on_ground))),
         ("NoGravity", Tag::Byte(i8::from(state.no_gravity))),
         ("Time", Tag::Int(state.time)),
@@ -945,6 +958,7 @@ pub fn read(entity: &Tag) -> Result<Option<SavedFallingBlock>> {
         velocity: motion.velocity,
         on_ground: motion.on_ground,
         no_gravity: flag("NoGravity", false),
+        fall_distance: motion.fall_distance,
         block,
         block_uses_default,
         time: entity
@@ -1013,6 +1027,7 @@ mod tests {
             FallingSaveState {
                 position: DVec3::new(17.0, 2.0, 3.0),
                 velocity: DVec3::ZERO,
+                fall_distance: 0.0,
                 on_ground: true,
                 no_gravity: false,
                 time: 12,
@@ -1038,6 +1053,7 @@ mod tests {
             FallingSaveState {
                 position: DVec3::new(17.0, 2.0, 3.0),
                 velocity: DVec3::ZERO,
+                fall_distance: 0.0,
                 on_ground: true,
                 no_gravity: false,
                 time: 12,
@@ -1074,6 +1090,7 @@ mod tests {
             FallingSaveState {
                 position: DVec3::new(17.0, 2.0, 3.0),
                 velocity: DVec3::ZERO,
+                fall_distance: 0.0,
                 on_ground: true,
                 no_gravity: false,
                 time: 12,
@@ -1403,6 +1420,7 @@ mod tests {
         let state = FallingSaveState {
             position: DVec3::new(-1.5, 3.0, 2.5),
             velocity: DVec3::new(0.2, -0.4, 0.0),
+            fall_distance: 2.5,
             on_ground: false,
             no_gravity: true,
             time: 101,
@@ -1419,6 +1437,7 @@ mod tests {
         let parsed = read(&draft.document().value).unwrap().unwrap();
         assert_eq!(parsed.position, state.position);
         assert_eq!(parsed.velocity, state.velocity);
+        assert_eq!(parsed.fall_distance, state.fall_distance);
         assert_eq!(parsed.time, 101);
         assert!(!parsed.drop_item && parsed.cancel_drop && parsed.no_gravity);
         let mut changed = original.clone();
@@ -1438,6 +1457,7 @@ mod tests {
         let state = FallingSaveState {
             position: DVec3::ZERO,
             velocity: DVec3::ZERO,
+            fall_distance: 0.0,
             on_ground: false,
             no_gravity: false,
             time: 0,
@@ -1459,6 +1479,28 @@ mod tests {
                     value: base()
                 },
                 fast
+            )
+            .is_err()
+        );
+        let mut duplicate = NamedTag {
+            name: "".into(),
+            value: base(),
+        };
+        let Tag::Compound(fields) = &mut duplicate.value else {
+            unreachable!()
+        };
+        fields.push(("fall_distance".into(), Tag::Double(1.0)));
+        fields.push(("fall_distance".into(), Tag::Double(2.0)));
+        assert!(draft(&duplicate, state).is_err());
+        let mut invalid = state;
+        invalid.fall_distance = f64::NAN;
+        assert!(
+            draft(
+                &NamedTag {
+                    name: "".into(),
+                    value: base()
+                },
+                invalid
             )
             .is_err()
         );
@@ -1494,6 +1536,7 @@ mod tests {
         let state = FallingSaveState {
             position: DVec3::new(4.5, 4.0, 5.5),
             velocity: DVec3::ZERO,
+            fall_distance: 0.0,
             on_ground: false,
             no_gravity: false,
             time: 7,
@@ -1587,6 +1630,7 @@ mod tests {
         let state = FallingSaveState {
             position: DVec3::new(16.0, 4.0, 5.0),
             velocity: DVec3::ZERO,
+            fall_distance: 0.0,
             on_ground: false,
             no_gravity: false,
             time: 0,
@@ -1697,6 +1741,7 @@ mod tests {
         let state = |x| FallingSaveState {
             position: DVec3::new(x, 2.0, 3.0),
             velocity: DVec3::ZERO,
+            fall_distance: 0.0,
             on_ground: false,
             no_gravity: false,
             time: 1,

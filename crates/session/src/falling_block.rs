@@ -122,6 +122,18 @@ pub struct AirborneMotion {
     pub no_gravity: bool,
 }
 
+/// Entity.checkFallDamage on an ordinary, dry movement path. Water and blocks
+/// with special fall hooks must be handled separately by the caller.
+pub fn fall_distance_after_move(distance: f64, actual_y: f64, on_ground: bool) -> f64 {
+    if on_ground {
+        0.0
+    } else if actual_y < 0.0 {
+        distance - f64::from(actual_y as f32)
+    } else {
+        distance
+    }
+}
+
 impl AirborneMotion {
     /// Java creates the falling entity at the horizontal center of the block.
     pub fn from_block(position: IVec3) -> Self {

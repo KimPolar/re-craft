@@ -981,6 +981,91 @@ public class FallingCollisionOracle {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn falling_block_landing_replacement_matches_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("FallingReplacementOracle.java");
+    std::fs::write(&source, include_str!("java/FallingReplacementOracle.java")).unwrap();
+    let output = temp.path().join("replacement.json");
+    let blocks = [
+        "air",
+        "cave_air",
+        "void_air",
+        "water",
+        "lava",
+        "fire",
+        "soul_fire",
+        "short_grass",
+        "fern",
+        "dead_bush",
+        "stone",
+        "dirt",
+        "grass_block",
+        "sand",
+        "red_sand",
+        "gravel",
+        "bedrock",
+        "cobblestone",
+        "kelp",
+        "kelp_plant",
+        "dandelion",
+        "poppy",
+        "blue_orchid",
+        "allium",
+        "azure_bluet",
+        "oxeye_daisy",
+        "cornflower",
+        "lily_of_the_valley",
+        "torch",
+        "wall_torch",
+        "soul_torch",
+        "soul_wall_torch",
+        "oak_sapling",
+        "spruce_sapling",
+        "birch_sapling",
+        "jungle_sapling",
+        "acacia_sapling",
+        "dark_oak_sapling",
+        "cherry_sapling",
+        "pale_oak_sapling",
+        "red_tulip",
+        "orange_tulip",
+        "white_tulip",
+        "pink_tulip",
+    ];
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let names: Vec<_> = blocks
+        .iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("FallingReplacementOracle")
+        .arg(&output)
+        .args(&names));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert!(rows.len() >= names.len());
+    for row in rows {
+        let id = row["id"].as_str().unwrap();
+        assert_eq!(
+            native_session::falling_block::known_landing_replaceable(id),
+            row["replace"].as_bool(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn falling_block_fall_distance_matches_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
@@ -1483,11 +1568,22 @@ fn falling_expiry_matches_java_entity_tick() {
         .arg("FallingExpiryOracle")
         .arg(&output));
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(rows.len(), 62);
+    assert_eq!(rows.len(), 94);
     for row in rows {
         if row.get("landing").is_some() {
             assert!(row["removed"].as_bool().unwrap(), "{row}");
-            assert_eq!(row["dropped"].as_bool(), row["drops"].as_bool(), "{row}");
+            assert_eq!(
+                row["dropped"].as_bool(),
+                Some(
+                    row["drops"].as_bool().unwrap()
+                        && row
+                            .get("drop_item")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true)
+                        && !row.get("cancel").and_then(Value::as_bool).unwrap_or(false)
+                ),
+                "{row}"
+            );
             continue;
         }
         let age = row["age"].as_i64().unwrap() as i32;

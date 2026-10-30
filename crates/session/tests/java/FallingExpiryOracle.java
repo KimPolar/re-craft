@@ -5,6 +5,7 @@ import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.MoverType;
@@ -20,11 +21,14 @@ import net.minecraft.world.phys.Vec3;
 public class FallingExpiryOracle {
   static class World extends ServerLevel {
     GameRules rules;
+    BlockState target;
     World() { super(null,null,null,null,null,null,false,0L,null,false); }
     @Override public GameRules getGameRules() { return rules; }
     @Override public int getMinY() { return -64; }
     @Override public int getHeight() { return 384; }
-    @Override public BlockState getBlockState(BlockPos pos) { return Blocks.AIR.defaultBlockState(); }
+    @Override public BlockState getBlockState(BlockPos pos) {
+      return target == null ? Blocks.AIR.defaultBlockState() : pos.getY()==1 ? target : Blocks.STONE.defaultBlockState();
+    }
   }
   static class Falling extends FallingBlockEntity {
     World world; BlockPos pos; Vec3 velocity; boolean removed; boolean dropped; boolean grounded;
@@ -47,6 +51,7 @@ public class FallingExpiryOracle {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     Field f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var unsafe=(sun.misc.Unsafe)f.get(null);
     Field block=FallingBlockEntity.class.getDeclaredField("blockState"); block.setAccessible(true);
+    Field cancel=FallingBlockEntity.class.getDeclaredField("cancelDrop"); cancel.setAccessible(true);
     var world=(World)unsafe.allocateInstance(World.class); world.rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
     var output=new JsonArray();
     for (int age : new int[]{0,99,100,599,600}) for (int y : new int[]{-65,-64,-63,0,319,320}) for (boolean drops : new boolean[]{false,true}) {
@@ -63,6 +68,15 @@ public class FallingExpiryOracle {
       var row=new JsonObject(); row.addProperty("landing",true); row.addProperty("drops",drops);
       row.addProperty("removed",e.removed); row.addProperty("dropped",e.dropped); output.add(row);
     }
+    for (var target : new net.minecraft.world.level.block.Block[]{Blocks.DANDELION, Blocks.POPPY, Blocks.TORCH, Blocks.OAK_SAPLING})
+      for (boolean drops : new boolean[]{false,true}) for(boolean dropItem : new boolean[]{false,true}) for(boolean cancelled : new boolean[]{false,true}) {
+        world.target=target.defaultBlockState(); world.rules.set(GameRules.ENTITY_DROPS,drops,null);
+        var e=(Falling)unsafe.allocateInstance(Falling.class); e.world=world; e.pos=new BlockPos(0,1,0); e.velocity=Vec3.ZERO;
+        e.grounded=true; e.dropItem=dropItem; cancel.setBoolean(e,cancelled); block.set(e,Blocks.SAND.defaultBlockState()); e.tick();
+        var row=new JsonObject(); row.addProperty("landing",true); row.addProperty("target",BuiltInRegistries.BLOCK.getKey(target).toString());
+        row.addProperty("drops",drops); row.addProperty("drop_item",dropItem); row.addProperty("cancel",cancelled);
+        row.addProperty("removed",e.removed); row.addProperty("dropped",e.dropped); output.add(row);
+      }
     Files.writeString(Path.of(args[0]),new Gson().toJson(output));
   }
 }

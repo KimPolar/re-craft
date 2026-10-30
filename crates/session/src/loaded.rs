@@ -7292,22 +7292,18 @@ impl LoadedSession {
                     remaining.push(entity);
                     continue;
                 };
-                let can_replace = self.world.state(current).is_some_and(|state| {
-                    matches!(
-                        state.name.as_str(),
-                        "minecraft:air"
-                            | "minecraft:cave_air"
-                            | "minecraft:void_air"
-                            | "minecraft:fire"
-                            | "minecraft:soul_fire"
-                            | "minecraft:short_grass"
-                            | "minecraft:fern"
-                            | "minecraft:dead_bush"
-                            | "minecraft:water"
-                            | "minecraft:lava"
-                    )
-                });
-                if can_replace {
+                let replaceable = self
+                    .world
+                    .state(current)
+                    .and_then(|state| crate::falling_block::known_landing_replaceable(&state.name))
+                    .or_else(|| {
+                        self.shapes
+                            .get(current.0 as usize)
+                            .and_then(Option::as_deref)
+                            .filter(|shape| crate::falling_block::known_collision_support(shape))
+                            .map(|_| false)
+                    });
+                if replaceable == Some(true) {
                     let Some(below) = add(target_relative, IVec3::NEG_Y) else {
                         remaining.push(entity);
                         continue;
@@ -7332,12 +7328,7 @@ impl LoadedSession {
                         self.track_removed_falling_sand(entity);
                         continue;
                     }
-                } else if self
-                    .shapes
-                    .get(current.0 as usize)
-                    .and_then(Option::as_deref)
-                    .is_some_and(crate::falling_block::known_collision_support)
-                {
+                } else if replaceable == Some(false) {
                     self.drop_falling_sand(&entity);
                     self.track_removed_falling_sand(entity);
                     continue;
@@ -24881,6 +24872,53 @@ mod tests {
             if drops {
                 assert_eq!(items[0].position, position);
                 assert_eq!(items[0].stack.id(), "minecraft:red_sand");
+            }
+        }
+    }
+
+    #[test]
+    fn sand_landing_inside_nonreplaceable_empty_blocks_drops() {
+        for block in [
+            "minecraft:dandelion",
+            "minecraft:poppy",
+            "minecraft:torch",
+            "minecraft:oak_sapling",
+        ] {
+            for (drops, drop_item, cancelled) in [false, true].into_iter().flat_map(|drops| {
+                [false, true].into_iter().flat_map(move |drop_item| {
+                    [false, true]
+                        .into_iter()
+                        .map(move |cancelled| (drops, drop_item, cancelled))
+                })
+            }) {
+                for falling in ["minecraft:sand", "minecraft:red_sand", "minecraft:gravel"] {
+                    let mut session = session();
+                    session.set_entity_drops(drops);
+                    let target = IVec3::new(10, 1, 8);
+                    let plant = session.intern_block(state(block, &[]));
+                    assert!(session.set(target, plant));
+                    let sand = session.intern_block(state(falling, &[]));
+                    assert!(session.set(IVec3::new(10, 4, 8), sand));
+                    session.tick = 2;
+                    session.advance_sand_ticks();
+                    assert_eq!(session.falling_sand.len(), 1);
+                    session.falling_sand[0].drop_item = drop_item;
+                    session.falling_sand[0].cancel_drop = cancelled;
+                    for _ in 0..50 {
+                        session.advance_falling_sand();
+                    }
+                    assert!(session.falling_sand.is_empty(), "{block}");
+                    assert!(
+                        matches!(cell(&session.world, session.origin, session.bounds, target, session.states[0]), Cell::State(id) if id == plant),
+                        "{block}"
+                    );
+                    let items = session.dropped_items.snapshot();
+                    let expect_drop = drops && drop_item && !cancelled;
+                    assert_eq!(items.len(), usize::from(expect_drop), "{block}");
+                    if expect_drop {
+                        assert_eq!(items[0].stack.id(), falling);
+                    }
+                }
             }
         }
     }

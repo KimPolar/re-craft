@@ -62,6 +62,15 @@ pub fn known_free_below(block: &str, is_fire: bool) -> Option<bool> {
     }
 }
 
+/// Replacement with the empty-handed downward placement context used by a
+/// falling block. Registry states not covered here require their own rules.
+pub fn known_landing_replaceable(block: &str) -> Option<bool> {
+    match block {
+        "minecraft:fire" | "minecraft:soul_fire" => Some(true),
+        _ => known_free_below(block, false),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Collision {
     pub actual: DVec3,

@@ -88,6 +88,18 @@ pub(crate) fn vertical_restitution(
     if velocity >= -gravity || restitution <= 0.0 {
         return 0.0;
     }
+    collision_restitution(velocity, actual_y, restitution, gravity)
+}
+
+pub(crate) fn collision_restitution(
+    velocity: f64,
+    actual_y: f64,
+    restitution: f64,
+    gravity: f64,
+) -> f64 {
+    if restitution <= 0.0 {
+        return 0.0;
+    }
     let ratio = actual_y / velocity;
     let air_drag = f64::from(0.98_f32);
     let drag = 1.0 + ratio * (air_drag - 1.0);
@@ -4271,13 +4283,13 @@ public class ItemMotionOracle {
         }
     }
     static class TestPlayer extends net.minecraft.world.entity.player.Player {
-        Vec3 velocity; boolean suppress;
+        Vec3 velocity; boolean suppress; double bounciness;
         TestPlayer() { super(null,null); }
         void setWorld(Level world) { setLevel(world); }
         @Override public Vec3 getDeltaMovement() { return velocity; }
         @Override public void setDeltaMovement(Vec3 v) { velocity=v; }
         @Override protected double getEffectiveGravity() { return 0.08; }
-        @Override protected double getEntityBounciness() { return 0.0; }
+        @Override protected double getEntityBounciness() { return bounciness; }
         @Override protected float getAirDrag() { return 0.98f; }
         @Override public boolean isSuppressingBounce() { return suppress; }
         @Override public void gameEvent(net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
@@ -4399,15 +4411,19 @@ public class ItemMotionOracle {
         JsonArray livingBounce = new JsonArray();
         for (String name : new String[]{"minecraft:stone","minecraft:slime_block","minecraft:red_bed","minecraft:shelf_mushroom"})
         for (boolean suppress : new boolean[]{false,true})
-        for (double velocity : new double[]{-0.08,-0.081,-0.1,-0.5,-2.0})
+        for (double entityBounce : new double[]{0.0,0.25,0.9})
+        for (boolean ceiling : new boolean[]{false,true})
+        for (double speed : new double[]{0.08,0.081,0.1,0.5,2.0})
         for (double ratio : new double[]{0,0.25,0.8}) {
+            double velocity=ceiling ? speed : -speed;
             var world = (TestLevel)unsafe.allocateInstance(TestLevel.class);
             world.ground=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse(name)).defaultBlockState();
             var player = (TestPlayer)unsafe.allocateInstance(TestPlayer.class);
-            player.setWorld(world); player.velocity=new Vec3(0,velocity,0); player.suppress=suppress;
-            player.verticalCollision=true; player.verticalCollisionBelow=true;
-            RESTITUTE.invoke(player,world.ground,false,false,new Vec3(0,velocity*ratio,0));
+            player.setWorld(world); player.velocity=new Vec3(0.3,velocity,-0.2); player.suppress=suppress; player.bounciness=entityBounce;
+            player.verticalCollision=true; player.verticalCollisionBelow=!ceiling;
+            RESTITUTE.invoke(player,world.ground,true,true,new Vec3(0,velocity*ratio,0));
             JsonObject row=new JsonObject(); row.addProperty("block",name); row.addProperty("suppress",suppress);
+            row.addProperty("entityBounce",entityBounce); row.addProperty("ceiling",ceiling); row.addProperty("x",player.velocity.x); row.addProperty("z",player.velocity.z);
             row.addProperty("velocity",velocity); row.addProperty("ratio",ratio); row.addProperty("result",player.velocity.y);
             livingBounce.add(row);
         }
@@ -4671,17 +4687,26 @@ public class ItemMotionOracle {
         }
         for row in expected[cases.len() + 6].as_array().unwrap() {
             let velocity = row["velocity"].as_f64().unwrap();
+            let entity_bounce = if row["suppress"].as_bool().unwrap() {
+                0.0
+            } else {
+                row["entityBounce"].as_f64().unwrap()
+            };
             let restitution = if row["suppress"].as_bool().unwrap() {
                 0.0
             } else {
-                f64::from(block_bounce_restitution(row["block"].as_str().unwrap()))
+                entity_bounce.max(f64::from(block_bounce_restitution(
+                    row["block"].as_str().unwrap(),
+                )))
             };
-            let result = vertical_restitution(
-                velocity,
-                velocity * row["ratio"].as_f64().unwrap(),
-                restitution,
-                0.08,
-            );
+            assert!((row["x"].as_f64().unwrap() + 0.3 * entity_bounce).abs() < 1e-12);
+            assert!((row["z"].as_f64().unwrap() - 0.2 * entity_bounce).abs() < 1e-12);
+            let actual_y = velocity * row["ratio"].as_f64().unwrap();
+            let result = if row["ceiling"].as_bool().unwrap() {
+                collision_restitution(velocity, actual_y, entity_bounce, 0.08)
+            } else {
+                vertical_restitution(velocity, actual_y, restitution, 0.08)
+            };
             assert!(
                 (result - row["result"].as_f64().unwrap()).abs() < 1e-12,
                 "living bounce {row}: {result}"

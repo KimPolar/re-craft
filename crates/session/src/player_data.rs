@@ -199,6 +199,11 @@ pub fn read_saved_oxygen_attribute(player: &NamedTag) -> Result<SavedAttribute> 
     saved_attribute(player, "oxygen_bonus", 0.0)
 }
 
+/// Persistent bounciness is combined with transient equipped-item modifiers.
+pub fn read_saved_bounciness_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "bounciness", 0.0)
+}
+
 /// Preserve persistent armor and toughness modifiers for equipment changes.
 pub fn read_saved_armor_attributes(player: &NamedTag) -> Result<(SavedAttribute, SavedAttribute)> {
     Ok((

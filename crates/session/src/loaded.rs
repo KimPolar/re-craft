@@ -153,6 +153,9 @@ pub struct LoadedSession {
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
     oxygen_valid: bool,
+    bounciness_attribute: crate::player_data::SavedAttribute,
+    bounciness_inventory_revision: Option<u64>,
+    bounciness: Option<f64>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -430,6 +433,7 @@ impl LoadedSession {
         self.oxygen_equipment = None;
         self.oxygen_inventory_revision = None;
         self.oxygen_valid = true;
+        self.bounciness_inventory_revision = None;
         Ok(())
     }
 
@@ -456,6 +460,7 @@ impl LoadedSession {
         Arc::make_mut(&mut self.snapshot).armor = self.armor.value();
         self.oxygen_equipment = Some((attribute, enchantments));
         self.oxygen_valid = true;
+        self.bounciness_inventory_revision = None;
         Ok(())
     }
 
@@ -474,6 +479,43 @@ impl LoadedSession {
             .configure(armor, toughness, enchantments, &self.inventory)?;
         Arc::make_mut(&mut self.snapshot).armor = self.armor.value();
         Ok(())
+    }
+
+    /// Restore persistent bounciness; equipment modifiers are applied at tick time.
+    pub fn set_saved_bounciness(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        let initial = attribute.value(0.0, 1.0)?;
+        self.bounciness_attribute = attribute;
+        self.bounciness = Some(initial);
+        self.bounciness_inventory_revision = None;
+        Ok(())
+    }
+
+    fn refresh_bounciness(&mut self) {
+        let revision = self.inventory.revision();
+        if self.bounciness_inventory_revision == Some(revision) {
+            return;
+        }
+        self.bounciness_inventory_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::bounciness(
+            &self.bounciness_attribute,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(value) => self.bounciness = Some(value),
+            Err(error) => {
+                self.bounciness = None;
+                self.stream_errors
+                    .push(format!("player bounciness: {error:#}"));
+            }
+        }
     }
 
     /// Restore the persistent fall attributes and active status effects.
@@ -946,6 +988,7 @@ impl LoadedSession {
         self.mining.release();
         self.first_person.invalidate_inventory();
         self.oxygen_inventory_revision = None;
+        self.bounciness_inventory_revision = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
             inventory.set_enchantments(Arc::clone(enchantments));
@@ -1105,6 +1148,9 @@ impl LoadedSession {
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
             oxygen_valid: true,
+            bounciness_attribute: crate::player_data::SavedAttribute::with_base(0.0),
+            bounciness_inventory_revision: None,
+            bounciness: Some(0.0),
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
@@ -2666,6 +2712,9 @@ impl LoadedSession {
         self.fall_distance = 0.0;
         self.ground_without_support = false;
         self.ground_support = None;
+        self.bounciness_attribute.clear_modifiers();
+        self.bounciness_inventory_revision = None;
+        self.bounciness = self.bounciness_attribute.value(0.0, 1.0).ok();
         self.fall.reset_after_death();
         self.breathing_effects = crate::survival::BreathingEffects::default();
         if let Some((attribute, _)) = &mut self.oxygen_equipment {
@@ -5329,6 +5378,7 @@ impl LoadedSession {
         let breathing_oxygen = self.oxygen_bonus;
         let breathing_oxygen_valid = self.oxygen_valid;
         self.refresh_equipment_oxygen();
+        self.refresh_bounciness();
         let friction = self.friction_below();
         let block_shape = |cell_pos| match cell(
             &self.world,
@@ -5559,13 +5609,32 @@ impl LoadedSession {
             let air = self.states[0];
             let no_previous_support = self.ground_without_support;
             let suppressed = &self.bounce_suppression_tag;
+            let entity_bounce = if sneak {
+                0.0
+            } else {
+                self.bounciness.unwrap_or(0.0)
+            };
             self.motion.tick_resolved_with_restitution(
                 input,
                 friction,
                 resolve,
                 |position, requested, actual| {
+                    if requested.y == actual.y {
+                        return (entity_bounce, 0.0);
+                    }
+                    if requested.y >= 0.0 {
+                        return (
+                            entity_bounce,
+                            crate::items::collision_restitution(
+                                requested.y,
+                                actual.y,
+                                entity_bounce,
+                                0.08,
+                            ),
+                        );
+                    }
                     if sneak {
-                        return 0.0;
+                        return (0.0, 0.0);
                     }
                     let support = crate::movement::supporting_block(
                         position,
@@ -5589,16 +5658,18 @@ impl LoadedSession {
                                 suppressed
                                     .as_ref()
                                     .filter(|tag| !tag.contains(&state.name))
-                                    .map(|_| crate::items::block_bounce_restitution(&state.name))
+                                    .map(|_| {
+                                        entity_bounce.max(f64::from(
+                                            crate::items::block_bounce_restitution(&state.name),
+                                        ))
+                                    })
                             })
                             .unwrap_or(0.0),
                         Cell::Missing => 0.0,
                     };
-                    crate::items::vertical_restitution(
-                        requested.y,
-                        actual.y,
-                        f64::from(bounce),
-                        0.08,
+                    (
+                        entity_bounce,
+                        crate::items::vertical_restitution(requested.y, actual.y, bounce, 0.08),
                     )
                 },
             )
@@ -6966,6 +7037,99 @@ mod tests {
             let landed = session.motion.position.y;
             session.update(TICK);
             assert_eq!(session.motion.position.y > landed + 1e-6, bounces, "{name}");
+        }
+    }
+
+    #[test]
+    fn player_bounciness_tracks_saved_and_equipped_modifiers() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "attributes".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:bounciness".into())),
+                        ("base".into(), Tag::Double(0.1)),
+                    ])],
+                },
+            )]),
+        };
+        let mut session = session();
+        session
+            .set_saved_bounciness(
+                crate::player_data::read_saved_bounciness_attribute(&document).unwrap(),
+            )
+            .unwrap();
+        let component = Tag::Compound(vec![(
+            "minecraft:attribute_modifiers".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("type".into(), Tag::String("minecraft:bounciness".into())),
+                    ("id".into(), Tag::String("example:bounce".into())),
+                    ("operation".into(), Tag::String("add_value".into())),
+                    ("amount".into(), Tag::Double(0.4)),
+                    ("slot".into(), Tag::String("head".into())),
+                ])],
+            },
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            crate::inventory::PlayerSlot::Armor(0),
+            ItemStack::unresolved("minecraft:iron_helmet".into(), 1, component),
+        );
+        session.set_player_inventory(inventory);
+        session.refresh_bounciness();
+        assert_eq!(session.bounciness, Some(0.5));
+        let mut replacement = PlayerInventory::default();
+        replacement.set_slot(
+            crate::inventory::PlayerSlot::Armor(0),
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        assert_eq!(replacement.revision(), session.inventory.revision());
+        session.set_player_inventory(replacement);
+        session.refresh_bounciness();
+        assert_eq!(session.bounciness, Some(0.1));
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(0), None);
+        session.refresh_bounciness();
+        assert_eq!(session.bounciness, Some(0.1));
+    }
+
+    #[test]
+    fn player_bounciness_reflects_from_solid_walls_and_ceilings() {
+        for (wall, direction) in [
+            (true, DVec3::new(0.5, 0.0, 0.0)),
+            (false, DVec3::new(0.0, 0.5, 0.0)),
+        ] {
+            let mut session = session();
+            session
+                .set_saved_bounciness(crate::player_data::SavedAttribute::with_base(0.5))
+                .unwrap();
+            let stone = session.states[3];
+            let collision = if wall {
+                IVec3::new(5, 2, 4)
+            } else {
+                IVec3::new(4, 4, 4)
+            };
+            assert!(session.set(collision, stone));
+            session.motion.position = if wall {
+                DVec3::new(4.5, 2.2, 4.5)
+            } else {
+                DVec3::new(4.5, 2.0, 4.5)
+            };
+            session.motion.velocity = direction;
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.update(TICK);
+            let component = if wall {
+                session.motion.velocity.x
+            } else {
+                session.motion.velocity.y
+            };
+            assert!(component < 0.0, "wall={wall}: {component}");
         }
     }
 

@@ -21,6 +21,14 @@ pub(crate) fn oxygen_bonus(
     equipped_attribute(saved, inventory, enchantments, "oxygen_bonus")?.value(0.0, 1024.0)
 }
 
+pub(crate) fn bounciness(
+    saved: &SavedAttribute,
+    inventory: &PlayerInventory,
+    enchantments: &OxygenEnchantments,
+) -> Result<f64> {
+    equipped_attribute(saved, inventory, enchantments, "bounciness")?.value(0.0, 1.0)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArmorValues {
     pub armor: f64,
@@ -360,6 +368,48 @@ mod tests {
             )]))),
         );
         assert!(oxygen_bonus(&saved, &inventory, &registry).is_err());
+    }
+
+    #[test]
+    fn data_pack_equipment_bounciness_combines_and_clamps() {
+        struct BounceData;
+        impl ResourceProvider for BounceData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "enchantment" {
+                    Ok(vec![ResourceId::parse("example:spring")?])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/example/enchantment/spring.json" {
+                    Ok(Some(br#"{"slots":["head"],"effects":{"minecraft:attributes":[{"id":"example:spring","attribute":"minecraft:bounciness","operation":"add_value","amount":0.75}]}}"#.to_vec()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let registry = OxygenEnchantments::load(&mut BounceData).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Armor(0),
+            Some(item(Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("example:spring".into(), Tag::Int(1))]),
+            )]))),
+        );
+        assert_eq!(
+            bounciness(&SavedAttribute::with_base(0.5), &inventory, &registry).unwrap(),
+            1.0
+        );
+        inventory.set_slot(PlayerSlot::Armor(0), None);
+        assert_eq!(
+            bounciness(&SavedAttribute::with_base(0.5), &inventory, &registry).unwrap(),
+            0.5
+        );
     }
 
     #[test]

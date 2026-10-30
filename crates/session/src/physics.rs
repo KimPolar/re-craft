@@ -234,7 +234,7 @@ impl MotionState {
         block_friction: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
-        self.tick_resolved_with_restitution(input, block_friction, collide, |_, _, _| 0.0)
+        self.tick_resolved_with_restitution(input, block_friction, collide, |_, _, _| (0.0, 0.0))
     }
 
     pub(crate) fn tick_resolved_with_restitution(
@@ -242,7 +242,7 @@ impl MotionState {
         input: MovementInput,
         block_friction: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
-        restitution: impl FnOnce(DVec3, DVec3, DVec3) -> f64,
+        restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
     ) -> (bool, DVec3) {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
@@ -305,20 +305,22 @@ impl MotionState {
         let horizontal_epsilon = f64::from(1.0e-5_f32);
         let blocked_x = (requested.x - actual.x).abs() >= horizontal_epsilon;
         let blocked_z = (requested.z - actual.z).abs() >= horizontal_epsilon;
-        if blocked_x {
-            self.velocity.x = 0.0;
-        }
-        if blocked_z {
-            self.velocity.z = 0.0;
-        }
         let vertical_collision = requested.y != actual.y;
         self.on_ground = vertical_collision && requested.y < 0.0;
-        if vertical_collision {
-            self.velocity.y = if self.on_ground {
+        let (horizontal_restitution, vertical_velocity) =
+            if blocked_x || blocked_z || vertical_collision {
                 restitution(self.position, requested, actual)
             } else {
-                0.0
+                (0.0, 0.0)
             };
+        if blocked_x {
+            self.velocity.x *= -horizontal_restitution;
+        }
+        if blocked_z {
+            self.velocity.z *= -horizontal_restitution;
+        }
+        if vertical_collision {
+            self.velocity.y = vertical_velocity;
         }
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);

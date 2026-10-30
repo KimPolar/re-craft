@@ -584,6 +584,7 @@ fn definition(value: &Value) -> Result<Definition> {
             || !matches!(
                 attribute.path.as_str(),
                 "oxygen_bonus"
+                    | "bounciness"
                     | "armor"
                     | "armor_toughness"
                     | "safe_fall_distance"

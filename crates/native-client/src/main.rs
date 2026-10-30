@@ -1013,6 +1013,12 @@ fn prepare_existing_world(
             let (safe, multiplier) =
                 native_session::player_data::read_saved_fall_attributes(player_data)
                     .context("cannot read saved fall attributes")?;
+            session
+                .set_saved_bounciness(
+                    native_session::player_data::read_saved_bounciness_attribute(player_data)
+                        .context("cannot read saved bounciness")?,
+                )
+                .context("cannot restore saved bounciness")?;
             let fall_effects = native_session::player_data::read_saved_fall_effects(player_data)
                 .context("cannot read saved fall effects")?;
             session

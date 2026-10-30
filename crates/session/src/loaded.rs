@@ -4055,23 +4055,45 @@ impl LoadedSession {
             return;
         };
         if self.set(relative, self.states[0]) {
-            let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
-                self.inventory.selected(),
-            ));
-            let damage = mining::Material::from_block_name(&name)
-                .and_then(|material| mining::mining_properties(material, hand))
-                .map_or(0, |properties| properties.damage_per_block);
+            let hand = self
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Storage(
+                    self.inventory.selected(),
+                ))
+                .cloned();
+            let properties = mining::Material::from_block_name(&name)
+                .and_then(|material| mining::mining_properties(material, hand.as_ref()));
+            let damage = properties.map_or(0, |properties| properties.damage_per_block);
+            if self.game_mode != GameMode::Creative && damage != 0 {
+                Arc::make_mut(&mut self.inventory)
+                    .damage_selected_tool(damage, &mut self.level_random);
+            }
             self.dropped_items.drop_block(
                 absolute,
                 &name,
-                hand,
+                hand.as_ref(),
                 self.game_mode,
                 self.block_drops,
                 self.loot.as_deref(),
             );
-            if self.game_mode != GameMode::Creative && damage != 0 {
-                Arc::make_mut(&mut self.inventory)
-                    .damage_selected_tool(damage, &mut self.level_random);
+            if self.game_mode != GameMode::Creative
+                && properties.is_some_and(|p| p.correct_for_drops)
+            {
+                let registry = self
+                    .oxygen_equipment
+                    .as_ref()
+                    .map(|(_, registry)| registry.as_ref());
+                match mining::ore_experience(&name, hand.as_ref(), registry, &mut self.level_random)
+                {
+                    Ok(Some(amount)) if self.block_drops && amount > 0 => {
+                        self.experience_orbs
+                            .award(absolute.as_dvec3() + glam::DVec3::splat(0.5), amount);
+                    }
+                    Ok(_) => {}
+                    Err(error) => self
+                        .stream_errors
+                        .push(format!("ore experience for {name}: {error:#}")),
+                }
             }
         }
     }
@@ -13814,6 +13836,149 @@ mod tests {
                 .iter()
                 .any(|item| item.stack.id() == "minecraft:sand")
         );
+    }
+
+    #[test]
+    fn ore_experience_obeys_tool_rule_and_active_data_pack() {
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data(i32);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if path == "enchantment" {
+                    vec![ResourceId::parse("minecraft:silk_touch")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/enchantment/silk_touch.json").then(|| format!(r#"{{"slots":["mainhand"],"effects":{{"minecraft:block_experience":[{{"effect":{{"type":"minecraft:set","value":{}}}}}]}}}}"#, self.0).into_bytes()))
+            }
+        }
+        for (tool, silk, effect, drops, mode, expected, samples, break_tool) in [
+            (
+                "iron_pickaxe",
+                false,
+                0,
+                true,
+                GameMode::Survival,
+                3,
+                true,
+                false,
+            ),
+            (
+                "iron_pickaxe",
+                true,
+                0,
+                true,
+                GameMode::Survival,
+                0,
+                true,
+                false,
+            ),
+            (
+                "iron_pickaxe",
+                true,
+                4,
+                true,
+                GameMode::Survival,
+                4,
+                true,
+                true,
+            ),
+            (
+                "iron_pickaxe",
+                false,
+                0,
+                false,
+                GameMode::Survival,
+                0,
+                true,
+                false,
+            ),
+            (
+                "iron_pickaxe",
+                false,
+                0,
+                true,
+                GameMode::Creative,
+                0,
+                false,
+                false,
+            ),
+            (
+                "stone_pickaxe",
+                false,
+                0,
+                true,
+                GameMode::Survival,
+                0,
+                false,
+                false,
+            ),
+        ] {
+            let mut session = session();
+            let mut components = Vec::new();
+            if silk {
+                components.push((
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("minecraft:silk_touch".into(), Tag::Int(1))]),
+                ));
+            }
+            if break_tool {
+                components.push(("minecraft:damage".into(), Tag::Int(249)));
+            }
+            let stack = crate::inventory::ItemStack::new(
+                format!("minecraft:{tool}"),
+                1,
+                1,
+                Tag::Compound(components),
+            )
+            .unwrap();
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Storage(0), Some(stack));
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::new(OxygenEnchantments::load(&mut Data(effect)).unwrap()),
+                )
+                .unwrap();
+            session.game_mode = mode;
+            session.set_block_drops(drops);
+            let relative = IVec3::new(8, 2, 6);
+            let ore = session.intern_block(state("minecraft:diamond_ore", &[]));
+            assert!(session.set(relative, ore));
+            session.level_random = LegacyRandom::new(1);
+            let mut expected_random = session.level_random.clone();
+            if samples {
+                expected_random.next_int_bound(5);
+            }
+            session.finish_breaking(session.origin + relative);
+            assert_eq!(
+                session
+                    .experience_orbs
+                    .snapshot()
+                    .iter()
+                    .map(|orb| orb.value)
+                    .sum::<i32>(),
+                expected,
+                "{tool} silk={silk} drops={drops} mode={mode:?}"
+            );
+            assert_eq!(session.level_random.next_int(), expected_random.next_int());
+            if break_tool {
+                assert!(
+                    session
+                        .inventory
+                        .slot(crate::inventory::PlayerSlot::Storage(0))
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]

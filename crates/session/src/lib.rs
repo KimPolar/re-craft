@@ -612,22 +612,23 @@ impl LocalSession {
         if self.set_block(position, Block::Air) {
             let hand = self
                 .inventory
-                .slot(PlayerSlot::Storage(self.inventory.selected()));
+                .slot(PlayerSlot::Storage(self.inventory.selected()))
+                .cloned();
             let damage = mining::Material::from_block_name(name)
-                .and_then(|material| mining::mining_properties(material, hand))
+                .and_then(|material| mining::mining_properties(material, hand.as_ref()))
                 .map_or(0, |properties| properties.damage_per_block);
-            self.dropped_items.drop_block(
-                position,
-                name,
-                hand,
-                self.game_mode,
-                true,
-                self.loot.as_deref(),
-            );
             if self.game_mode != GameMode::Creative && damage != 0 {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
             }
+            self.dropped_items.drop_block(
+                position,
+                name,
+                hand.as_ref(),
+                self.game_mode,
+                true,
+                self.loot.as_deref(),
+            );
         }
     }
 

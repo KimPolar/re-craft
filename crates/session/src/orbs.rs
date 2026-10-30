@@ -1,4 +1,4 @@
-//! Experience orbs from player deaths and supported saved entities. Entity IDs
+//! Experience orbs from block drops, player deaths and supported saved entities. Entity IDs
 //! and the world's exact RNG are not yet reproduced.
 //! Pickup is withheld when equipment repair effects cannot be resolved.
 
@@ -316,7 +316,11 @@ impl Orbs {
         if keep || mode == GameMode::Spectator {
             return;
         }
-        let mut amount = xp.level.wrapping_mul(7).min(100);
+        self.award(position, xp.level.wrapping_mul(7).min(100));
+    }
+
+    /// Split and merge newly awarded experience using Java's orb value tiers.
+    pub(crate) fn award(&mut self, position: DVec3, mut amount: i32) {
         while amount > 0 {
             let value = VALUES
                 .iter()

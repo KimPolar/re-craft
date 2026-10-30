@@ -4,6 +4,61 @@ use glam::IVec3;
 
 use crate::inventory::{ItemStack, ordinary_item_default_max, ordinary_return_supported};
 
+/// Vanilla 26.3's ore experience providers, including constant-zero providers.
+pub fn ore_experience_range(name: &str) -> Option<(i32, i32)> {
+    let name = name.strip_prefix("minecraft:")?;
+    let name = name.strip_prefix("deepslate_").unwrap_or(name);
+    Some(match name {
+        "coal_ore" => (0, 2),
+        "diamond_ore" | "emerald_ore" => (3, 7),
+        "lapis_ore" | "nether_quartz_ore" => (2, 5),
+        "redstone_ore" => (1, 5),
+        "nether_gold_ore" => (0, 1),
+        "iron_ore" | "gold_ore" | "copper_ore" => (0, 0),
+        _ => return None,
+    })
+}
+
+/// Sample ore XP before applying the held stack's active data-pack effects.
+pub fn ore_experience(
+    name: &str,
+    item: Option<&ItemStack>,
+    registry: Option<&native_resources::enchantments::OxygenEnchantments>,
+    random: &mut native_core::random::LegacyRandom,
+) -> anyhow::Result<Option<i32>> {
+    use anyhow::{Context, ensure};
+    let Some((min, max)) = ore_experience_range(name) else {
+        return Ok(None);
+    };
+    let mut next = random.clone();
+    let amount = if min == max {
+        min
+    } else {
+        min + next
+            .next_int_bound(max - min + 1)
+            .context("invalid experience range")?
+    };
+    let mut value = amount as f32;
+    let mut effects = 0;
+    if let Some(item) = item {
+        for (id, level) in crate::inventory::item_enchantments(item)? {
+            let registry = registry.context("active enchantment registry is unavailable")?;
+            let (result, active) =
+                registry.apply_block_experience(&id, level, item.id(), value, &mut || {
+                    next.next_float()
+                })?;
+            effects += usize::from(active);
+            ensure!(
+                effects <= 1,
+                "ordering of multiple block experience enchantments is not resolved"
+            );
+            value = result;
+        }
+    }
+    *random = next;
+    Ok(Some(value as i32))
+}
+
 /// Blocks whose destruction requires Java's game-master permission as well
 /// as creative abilities. The session must supply the player's permission.
 pub fn requires_game_master_permission(name: &str) -> bool {

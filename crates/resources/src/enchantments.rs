@@ -380,7 +380,7 @@ struct ItemDamageEffect {
     value: ItemDamageValue,
 }
 
-fn item_damage_effects(value: &Value) -> Result<Vec<ItemDamageEffect>> {
+fn item_filtered_effects(value: &Value, name: &str) -> Result<Vec<ItemDamageEffect>> {
     let Some(effects) = value.get("effects") else {
         return Ok(Vec::new());
     };
@@ -388,9 +388,13 @@ fn item_damage_effects(value: &Value) -> Result<Vec<ItemDamageEffect>> {
         .as_object()
         .context("enchantment effects are not an object")?;
     let mut selected = None;
-    for key in ["minecraft:item_damage", "item_damage", ":item_damage"] {
-        if let Some(value) = effects.get(key) {
-            ensure!(selected.is_none(), "duplicate item damage effect");
+    for key in [
+        format!("minecraft:{name}"),
+        name.to_owned(),
+        format!(":{name}"),
+    ] {
+        if let Some(value) = effects.get(&key) {
+            ensure!(selected.is_none(), "duplicate {name} effect");
             selected = Some(value);
         }
     }
@@ -781,6 +785,7 @@ pub struct OxygenEnchantments {
     protection: BTreeMap<ResourceId, std::result::Result<Vec<ProtectionEffect>, String>>,
     repair: BTreeMap<ResourceId, std::result::Result<Option<Vec<RepairValueEffect>>, String>>,
     item_damage: BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
+    block_experience: BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
     item_damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_types: BTreeSet<ResourceId>,
@@ -793,6 +798,7 @@ impl OxygenEnchantments {
         let mut protection = BTreeMap::new();
         let mut repair = BTreeMap::new();
         let mut item_damage = BTreeMap::new();
+        let mut block_experience = BTreeMap::new();
         let mut item_damage_tag_ids = BTreeSet::new();
         for id in provider.list_data("enchantment")? {
             let path = format!("data/{}/enchantment/{}.json", id.namespace, id.path);
@@ -818,9 +824,19 @@ impl OxygenEnchantments {
             let damage_effect = value
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
-                .and_then(item_damage_effects)
+                .and_then(|value| item_filtered_effects(value, "item_damage"))
+                .map_err(|error| format!("{error:#}"));
+            let experience_effect = value
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                .and_then(|value| item_filtered_effects(value, "block_experience"))
                 .map_err(|error| format!("{error:#}"));
             if let Ok(effects) = &damage_effect {
+                for effect in effects {
+                    effect.predicate.tags(&mut item_damage_tag_ids);
+                }
+            }
+            if let Ok(effects) = &experience_effect {
                 for effect in effects {
                     effect.predicate.tags(&mut item_damage_tag_ids);
                 }
@@ -828,6 +844,7 @@ impl OxygenEnchantments {
             protection.insert(id.clone(), protection_effect);
             repair.insert(id.clone(), repair_effect);
             item_damage.insert(id.clone(), damage_effect);
+            block_experience.insert(id.clone(), experience_effect);
             definitions.insert(id, parsed);
         }
         let damage_types = provider.list_data("damage_type")?.into_iter().collect();
@@ -883,6 +900,7 @@ impl OxygenEnchantments {
             protection,
             repair,
             item_damage,
+            block_experience,
             item_damage_tags,
             damage_tags,
             damage_types,
@@ -1008,12 +1026,35 @@ impl OxygenEnchantments {
         id: &ResourceId,
         level: u32,
         item: &str,
+        value: f32,
+        random: &mut impl FnMut() -> f32,
+    ) -> Result<(f32, bool)> {
+        self.apply_item_filtered(&self.item_damage, id, level, item, value, random)
+    }
+
+    /// Apply one enchantment's block-experience effects from the active data packs.
+    pub fn apply_block_experience(
+        &self,
+        id: &ResourceId,
+        level: u32,
+        item: &str,
+        value: f32,
+        random: &mut impl FnMut() -> f32,
+    ) -> Result<(f32, bool)> {
+        self.apply_item_filtered(&self.block_experience, id, level, item, value, random)
+    }
+
+    fn apply_item_filtered(
+        &self,
+        registry: &BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
+        id: &ResourceId,
+        level: u32,
+        item: &str,
         mut value: f32,
         random: &mut impl FnMut() -> f32,
     ) -> Result<(f32, bool)> {
         ensure!((1..=255).contains(&level), "invalid enchantment level");
-        let effects = self
-            .item_damage
+        let effects = registry
             .get(id)
             .context("enchantment is absent from the active registry")?
             .as_ref()

@@ -17,6 +17,101 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn ore_experience_and_silk_touch_match_vanilla() {
+    use native_core::random::LegacyRandom;
+    use native_resources::{enchantments::OxygenEnchantments, packs::ResourceStack};
+    use serde_json::json;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let registry = OxygenEnchantments::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("OreExperienceOracle.java");
+    std::fs::write(&source, include_str!("java/OreExperienceOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let ores = [
+        "coal_ore",
+        "deepslate_coal_ore",
+        "iron_ore",
+        "deepslate_iron_ore",
+        "copper_ore",
+        "deepslate_copper_ore",
+        "gold_ore",
+        "deepslate_gold_ore",
+        "diamond_ore",
+        "deepslate_diamond_ore",
+        "emerald_ore",
+        "deepslate_emerald_ore",
+        "lapis_ore",
+        "deepslate_lapis_ore",
+        "redstone_ore",
+        "deepslate_redstone_ore",
+        "nether_gold_ore",
+        "nether_quartz_ore",
+    ];
+    let mut cases = Vec::new();
+    for seed in -50..50 {
+        for block in ores {
+            for silk in [false, true] {
+                cases.push(json!({"seed":seed,"block":format!("minecraft:{block}"),"silk":silk}));
+            }
+        }
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("OreExperienceOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases.len());
+    let tool = ItemStack::new(
+        "minecraft:iron_pickaxe".into(),
+        1,
+        1,
+        Tag::Compound(vec![(
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("minecraft:silk_touch".into(), Tag::Int(1))]),
+        )]),
+    )
+    .unwrap();
+    for (case, row) in cases.iter().zip(rows) {
+        let mut random = LegacyRandom::new(case["seed"].as_i64().unwrap());
+        let block = case["block"].as_str().unwrap();
+        assert_eq!(
+            native_session::mining::ore_experience_range(block),
+            Some((
+                row[0].as_i64().unwrap() as i32,
+                row[1].as_i64().unwrap() as i32
+            )),
+            "{case}"
+        );
+        let item = case["silk"].as_bool().unwrap().then_some(&tool);
+        assert_eq!(
+            native_session::mining::ore_experience(block, item, Some(&registry), &mut random)
+                .unwrap(),
+            Some(row[2].as_i64().unwrap() as i32),
+            "{case}"
+        );
+        assert_eq!(random.next_int(), row[3].as_i64().unwrap() as i32, "{case}");
+    }
+    eprintln!(
+        "Compared {} ore experience cases with Minecraft 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn ore_loot_counts_and_random_stream_match_vanilla() {
     use native_core::random::LegacyRandom;
     use native_resources::{

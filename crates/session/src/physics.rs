@@ -37,6 +37,12 @@ pub struct FluidMovement {
     pub fluid_above: bool,
 }
 
+/// Java computes the jump impulse in float precision after reading attributes.
+pub fn jump_power(strength: f64, block_factor: f32, boost: Option<u8>) -> f32 {
+    let boost = boost.map_or(0.0, |amplifier| 0.1_f32 * (f32::from(amplifier) + 1.0));
+    strength as f32 * block_factor + boost
+}
+
 /// Minecraft applies the accumulated vertical wheel count in float precision.
 pub fn adjust_flight_speed(speed: f32, steps: i32) -> f32 {
     (speed + steps as f32 * 0.005_f32).clamp(0.0, 0.2)
@@ -203,8 +209,11 @@ impl MotionState {
         )
     }
 
-    fn jump_from_ground(&mut self, sprinting: bool, sine: f64, cosine: f64) {
-        self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
+    fn jump_from_ground(&mut self, sprinting: bool, sine: f64, cosine: f64, power: f32) {
+        if power <= 1.0e-5_f32 {
+            return;
+        }
+        self.velocity.y = self.velocity.y.max(f64::from(power));
         if sprinting {
             self.velocity.x -= sine * 0.2;
             self.velocity.z += cosine * 0.2;
@@ -212,11 +221,16 @@ impl MotionState {
     }
 
     pub fn start_flying_jump(&mut self, input: MovementInput) {
+        self.start_flying_jump_with_power(input, 0.42_f32);
+    }
+
+    pub fn start_flying_jump_with_power(&mut self, input: MovementInput, power: f32) {
         let radians = input.yaw_degrees * 0.017453292_f32;
         self.jump_from_ground(
             input.sprinting,
             f64::from(java_sin(f64::from(radians), false)),
             f64::from(java_sin(f64::from(radians), true)),
+            power,
         );
     }
 
@@ -243,13 +257,30 @@ impl MotionState {
         block_friction: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
-        self.tick_resolved_with_restitution(input, block_friction, collide, |_, _, _| (0.0, 0.0))
+        self.tick_resolved_with_power(input, block_friction, 0.42_f32, collide)
+    }
+
+    pub fn tick_resolved_with_power(
+        &mut self,
+        input: MovementInput,
+        block_friction: f32,
+        jump_power: f32,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
+        self.tick_resolved_with_restitution(
+            input,
+            block_friction,
+            jump_power,
+            collide,
+            |_, _, _| (0.0, 0.0),
+        )
     }
 
     pub(crate) fn tick_resolved_with_restitution(
         &mut self,
         input: MovementInput,
         block_friction: f32,
+        jump_power: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
     ) -> (bool, DVec3) {
@@ -266,11 +297,7 @@ impl MotionState {
         }
         if input.jump {
             if self.on_ground && self.jump_delay == 0 {
-                self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
-                if input.sprinting {
-                    self.velocity.x -= sine * 0.2;
-                    self.velocity.z += cosine * 0.2;
-                }
+                self.jump_from_ground(input.sprinting, sine, cosine, jump_power);
                 self.jump_delay = 10;
             }
         } else {
@@ -351,13 +378,21 @@ impl MotionState {
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
     ) -> (bool, DVec3) {
-        self.tick_fluid_with_restitution(input, fluid, collide, can_jump_out, |_, _, _| (0.0, 0.0))
+        self.tick_fluid_with_restitution(
+            input,
+            fluid,
+            0.42_f32,
+            collide,
+            can_jump_out,
+            |_, _, _| (0.0, 0.0),
+        )
     }
 
     pub(crate) fn tick_fluid_with_restitution(
         &mut self,
         input: MovementInput,
         fluid: FluidMovement,
+        jump_power: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
@@ -380,11 +415,7 @@ impl MotionState {
             if fluid.depth > 0.0 && (!self.on_ground || fluid.depth > 0.4) {
                 self.velocity.y += f64::from(0.04_f32);
             } else if self.on_ground && self.jump_delay == 0 {
-                self.velocity.y = self.velocity.y.max(f64::from(0.42_f32));
-                if input.sprinting {
-                    self.velocity.x -= sine * 0.2;
-                    self.velocity.z += cosine * 0.2;
-                }
+                self.jump_from_ground(input.sprinting, sine, cosine, jump_power);
                 self.jump_delay = 10;
             }
         } else {

@@ -5602,6 +5602,15 @@ impl LoadedSession {
             using_item: self.food_use.is_active(),
             moving_slowly,
         };
+        let jump_power = crate::physics::jump_power(
+            f64::from(0.42_f32),
+            1.0,
+            self.fall
+                .effects()
+                .jump_boost
+                .as_ref()
+                .map(|effect| effect.amplifier),
+        );
         let start_flight_jump = self.flight.update(
             self.game_mode,
             input.jump,
@@ -5609,7 +5618,7 @@ impl LoadedSession {
             self.motion.on_ground,
         );
         if start_flight_jump {
-            self.motion.start_flying_jump(input);
+            self.motion.start_flying_jump_with_power(input, jump_power);
         }
         let flying = self.flight.flying;
         let player_height = self.player.height();
@@ -5755,6 +5764,7 @@ impl LoadedSession {
             self.motion.tick_fluid_with_restitution(
                 input,
                 movement,
+                jump_power,
                 resolve,
                 |position, offset| {
                     let target = position + offset;
@@ -5765,8 +5775,13 @@ impl LoadedSession {
                 restitution,
             )
         } else {
-            self.motion
-                .tick_resolved_with_restitution(input, friction, resolve, restitution)
+            self.motion.tick_resolved_with_restitution(
+                input,
+                friction,
+                jump_power,
+                resolve,
+                restitution,
+            )
         };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
@@ -10384,6 +10399,42 @@ mod tests {
             .set_player_breathing(crate::survival::BreathingEffects::default(), 0.0)
             .unwrap();
         assert!(session.draft_player_state(&original).is_err());
+    }
+
+    #[test]
+    fn saved_jump_boost_changes_jump_and_expires_before_movement() {
+        let make = |duration| {
+            let mut session = session();
+            session.motion.on_ground = true;
+            session.player.on_ground = true;
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    jump_boost: Some(crate::survival::EffectDuration {
+                        amplifier: 1,
+                        duration,
+                        hidden: None,
+                    }),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session.submit_command(PlayerCommand::Move {
+                forward: 0.0,
+                strafe: 0.0,
+                jump: true,
+            });
+            session.update(TICK);
+            session
+        };
+        let boosted = make(2);
+        let expired = make(1);
+        let difference = boosted.motion.position.y - expired.motion.position.y;
+        assert!(
+            (difference - f64::from(0.2_f32)).abs() < 1e-6,
+            "{difference}"
+        );
     }
 
     #[test]

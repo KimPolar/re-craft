@@ -25,6 +25,7 @@ import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
@@ -57,6 +58,7 @@ public class PhysicsOracle {
         double wall;
         int delay;
         AttributeInstance speed;
+        MobEffectInstance jumpBoost;
         TestPlayer() { super(null, null); }
         void setup(TestLevel world, Vec3 position, Vec3 velocity, boolean ground, float rotation, double wallX) {
             setLevel(world); p = position; v = velocity; grounded = ground; yaw = rotation; wall = wallX; delay = 0;
@@ -67,14 +69,15 @@ public class PhysicsOracle {
         @Override public void setDeltaMovement(double x, double y, double z) { v = new Vec3(x, y, z); }
         @Override public float getYRot() { return yaw; }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
-        @Override protected float getJumpPower() { return 0.42f; }
+        @Override protected float getBlockJumpFactor() { return 1.0f; }
         @Override protected double getEffectiveGravity() { return 0.08; }
         @Override protected boolean omnidirectionalAirMover() { return false; }
         @Override public boolean shouldDiscardFriction() { return false; }
         @Override public boolean isSprinting() { return sprinting; }
         @Override public boolean onClimbable() { return false; }
-        @Override public double getAttributeValue(Holder<Attribute> attribute) { return attribute == Attributes.MOVEMENT_SPEED ? speed.getValue() : 1.0; }
-        @Override public MobEffectInstance getEffect(Holder<MobEffect> effect) { return null; }
+        @Override public double getAttributeValue(Holder<Attribute> attribute) { return attribute == Attributes.MOVEMENT_SPEED ? speed.getValue() : attribute == Attributes.JUMP_STRENGTH ? 0.42 : 1.0; }
+        @Override public boolean hasEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST && jumpBoost != null; }
+        @Override public MobEffectInstance getEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST ? jumpBoost : null; }
         @Override public BlockPos getBlockPosBelowThatAffectsMyMovement() { return BlockPos.ZERO; }
         @Override public HumanoidArm getMainArm() { return HumanoidArm.RIGHT; }
         @Override public void move(MoverType type, Vec3 requested) {
@@ -127,6 +130,8 @@ public class PhysicsOracle {
             var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse(scenario.get("block").getAsString()));
             level.ground = block.defaultBlockState();
             entity.setup(level, vec(scenario.getAsJsonArray("position")), vec(scenario.getAsJsonArray("velocity")), scenario.get("ground").getAsBoolean(), 0, scenario.get("wall").getAsDouble());
+            int boost = scenario.get("boost").getAsInt();
+            entity.jumpBoost = boost < 0 ? null : new MobEffectInstance(MobEffects.JUMP_BOOST, 1000, boost);
             JsonArray ticks = new JsonArray();
             for (var input : scenario.getAsJsonArray("inputs")) {
                 var i = input.getAsJsonObject();
@@ -385,7 +390,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             };
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s + t/20) % angles.len()],"jump":(35..65).contains(&t),"sprint":(s + t / 7) % 3 == 0,"slow":scenario >= 64 && (s + t / 9) % 3 == 0,"using":(s + t / 11) % 4 == 0}));
         }
-        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"inputs":inputs}));
     }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("PhysicsOracle.java");
@@ -441,9 +446,11 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                 using_item: input["using"].as_bool().unwrap(),
                 moving_slowly: input["slow"].as_bool().unwrap(),
             };
-            let major_collision = state.tick(
+            let boost = scenario["boost"].as_i64().unwrap();
+            let (major_collision, _) = state.tick_resolved_with_power(
                 command,
                 ground_friction(scenario["block"].as_str().unwrap()),
+                native_session::physics::jump_power(0.42, 1.0, u8::try_from(boost).ok()),
                 |position, requested, _| {
                     let mut actual = requested;
                     if actual.y < 0.0 && position.y + actual.y < 0.0 {
@@ -453,7 +460,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                     if actual.x > 0.0 && position.x + f64::from(0.3_f32) + actual.x > wall {
                         actual.x = (wall - position.x - f64::from(0.3_f32)).max(0.0);
                     }
-                    actual
+                    (requested, actual)
                 },
             );
             let horizontal = result["horizontal"].as_bool().unwrap();

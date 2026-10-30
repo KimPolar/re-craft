@@ -228,7 +228,7 @@ fn creative_flight_collision_matches_vanilla_air_movement() {
         .arg("CreativeFlightOracle")
         .arg(&output));
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(rows.len(), 16 * 64);
+    assert_eq!(rows.len(), 3 * 16 * 64);
     let mut motion = MotionState {
         position: DVec3::ZERO,
         velocity: DVec3::ZERO,
@@ -243,7 +243,7 @@ fn creative_flight_collision_matches_vanilla_air_movement() {
             motion.on_ground = seed % 2 == 0;
             motion.jump_delay = 0;
         }
-        motion.tick_flying(
+        motion.tick_flying_with_bounciness(
             MovementInput {
                 forward: row["forward"].as_f64().unwrap() as f32,
                 right: row["right"].as_f64().unwrap() as f32,
@@ -256,10 +256,18 @@ fn creative_flight_collision_matches_vanilla_air_movement() {
             row["down"].as_bool().unwrap(),
             row["speed"].as_f64().unwrap() as f32,
             0.6,
+            if row["down"].as_bool().unwrap() {
+                0.0
+            } else {
+                row["bounce"].as_f64().unwrap()
+            },
             |position, requested, _| {
                 let mut actual = requested;
                 if actual.y < 0.0 && position.y + actual.y < 0.0 {
                     actual.y = -position.y;
+                }
+                if actual.y > 0.0 && position.y + actual.y > 2.0 {
+                    actual.y = (2.0 - position.y).max(0.0);
                 }
                 if actual.x > 0.0 && position.x + 0.30000001192092896 + actual.x > 1.0 {
                     actual.x = (1.0 - position.x - 0.30000001192092896).max(0.0);

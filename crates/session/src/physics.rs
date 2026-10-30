@@ -121,6 +121,19 @@ impl MotionState {
         block_friction: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
+        self.tick_flying_with_bounciness(input, descend, flight_speed, block_friction, 0.0, collide)
+    }
+
+    /// Flight preserves the pre-collision vertical velocity but reflects blocked horizontal motion.
+    pub fn tick_flying_with_bounciness(
+        &mut self,
+        input: MovementInput,
+        descend: bool,
+        flight_speed: f32,
+        block_friction: f32,
+        bounciness: f64,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
         let vertical = i32::from(input.jump) - i32::from(descend);
         self.velocity.y += f64::from(vertical as f32 * flight_speed * 3.0_f32);
         self.jump_delay = self.jump_delay.saturating_sub(1);
@@ -179,10 +192,10 @@ impl MotionState {
         let blocked_z = (requested.z - actual.z).abs() >= epsilon;
         self.on_ground = requested.y != actual.y && requested.y < 0.0;
         if blocked_x {
-            self.velocity.x = 0.0;
+            self.velocity.x *= -bounciness;
         }
         if blocked_z {
-            self.velocity.z = 0.0;
+            self.velocity.z *= -bounciness;
         }
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         self.velocity.x *= f64::from(horizontal_drag);

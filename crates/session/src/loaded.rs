@@ -5627,11 +5627,12 @@ impl LoadedSession {
                     .tick_spectator(input, self.sneak, self.flight_speed),
             )
         } else if flying {
-            self.motion.tick_flying(
+            self.motion.tick_flying_with_bounciness(
                 input,
                 self.sneak,
                 self.flight_speed,
                 friction,
+                entity_bounce,
                 |position, requested, on_ground| {
                     (
                         requested,
@@ -9897,6 +9898,49 @@ mod tests {
         }
         assert!(session.motion.on_ground);
         assert!(!session.flight.flying);
+    }
+
+    #[test]
+    fn creative_flight_uses_saved_bounciness_and_shift_suppresses_it() {
+        for sneak in [false, true] {
+            for x_axis in [false, true] {
+                let mut session = session();
+                session.set_game_mode(GameMode::Creative);
+                session.flight.flying = true;
+                session
+                    .set_saved_bounciness(crate::player_data::SavedAttribute::with_base(0.5))
+                    .unwrap();
+                let collision = if x_axis {
+                    IVec3::new(5, 8, 4)
+                } else {
+                    IVec3::new(4, 8, 5)
+                };
+                assert!(session.set(collision, session.states[3]));
+                session.motion.position = DVec3::new(4.5, 8.2, 4.5);
+                session.motion.velocity = if x_axis {
+                    DVec3::X * 0.5
+                } else {
+                    DVec3::Z * 0.5
+                };
+                session.motion.on_ground = false;
+                session.player.position = session.motion.position.as_vec3();
+                session.submit_command(PlayerCommand::Sneak(sneak));
+                session.update(TICK);
+                let velocity = if x_axis {
+                    session.motion.velocity.x
+                } else {
+                    session.motion.velocity.z
+                };
+                if sneak {
+                    assert_eq!(velocity, 0.0, "x_axis={x_axis}");
+                } else {
+                    assert!(
+                        (velocity - (-0.25 * f64::from(0.91_f32))).abs() < 1e-12,
+                        "x_axis={x_axis}: {velocity}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

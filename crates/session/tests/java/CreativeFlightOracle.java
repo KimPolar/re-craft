@@ -13,6 +13,7 @@ import net.minecraft.core.Holder;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -25,6 +26,7 @@ import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 
 public class CreativeFlightOracle {
+    static Method restitute;
     static class World extends ClientLevel {
         World() { super(null, null, null, null, 0, 0, null, false, 0, 0); }
         @Override public boolean isClientSide() { return false; }
@@ -33,7 +35,8 @@ public class CreativeFlightOracle {
     static class Probe extends Player {
         Vec3 velocity = Vec3.ZERO, position = Vec3.ZERO;
         float yaw;
-        boolean sprint, grounded;
+        boolean sprint, grounded, suppress;
+        double bounce;
         int delay;
         Probe() { super(null, null); }
         void setWorld(World world) { setLevel(world); }
@@ -48,6 +51,10 @@ public class CreativeFlightOracle {
         @Override public boolean shouldDiscardFriction() { return false; }
         @Override protected boolean omnidirectionalAirMover() { return false; }
         @Override protected double getEffectiveGravity() { return 0.08; }
+        @Override protected double getEntityBounciness() { return bounce; }
+        @Override protected float getAirDrag() { return 0.98f; }
+        @Override public boolean isSuppressingBounce() { return suppress; }
+        @Override public void gameEvent(Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
         @Override protected float getJumpPower() { return 0.42f; }
         @Override public double getAttributeValue(Holder<Attribute> attribute) {
             return attribute == Attributes.MOVEMENT_SPEED ? (double)0.1f * (sprint ? 1.0 + (double)0.3f : 1.0) : 1.0;
@@ -57,6 +64,7 @@ public class CreativeFlightOracle {
         @Override public void move(MoverType type, Vec3 requested) {
             double x = requested.x, y = requested.y, z = requested.z;
             if (y < 0.0 && position.y + y < 0.0) y = -position.y;
+            if (y > 0.0 && position.y + y > 2.0) y = Math.max(0.0, 2.0 - position.y);
             if (x > 0.0 && position.x + 0.30000001192092896 + x > 1.0)
                 x = Math.max(0.0, 1.0 - position.x - 0.30000001192092896);
             boolean bx = Math.abs(x - requested.x) >= (double)1.0e-5f;
@@ -64,7 +72,10 @@ public class CreativeFlightOracle {
             boolean by = y != requested.y;
             position = position.add(x, y, z);
             grounded = by && requested.y < 0;
-            velocity = new Vec3(bx ? 0.0 : velocity.x, by ? 0.0 : velocity.y, bz ? 0.0 : velocity.z);
+            verticalCollision=by; verticalCollisionBelow=grounded;
+            if (bx || by || bz) try {
+                restitute.invoke(this, Blocks.STONE.defaultBlockState(), bx, bz, new Vec3(x,y,z));
+            } catch (Exception e) { throw new RuntimeException(e); }
         }
     }
     static class Input extends LocalPlayer {
@@ -84,9 +95,11 @@ public class CreativeFlightOracle {
         Field abilities = Player.class.getDeclaredField("abilities"); abilities.setAccessible(true);
         var fly = new Abilities(); fly.flying = true; abilities.set(player, fly);
         Method travel = LivingEntity.class.getDeclaredMethod("travelInAir", Vec3.class); travel.setAccessible(true);
+        restitute = Entity.class.getDeclaredMethod("restituteMovementAfterCollisions", BlockState.class, boolean.class, boolean.class, Vec3.class); restitute.setAccessible(true);
         Method modify = LocalPlayer.class.getDeclaredMethod("modifyInput", Vec2.class); modify.setAccessible(true);
         var rows = new JsonArray();
-        for (int seed = 0; seed < 16; seed++) {
+        for (double bounce : new double[]{0.0, 0.25, 0.8}) for (int seed = 0; seed < 16; seed++) {
+            player.bounce = bounce;
             fly.setFlyingSpeed(new float[]{0.0f, 0.01f, 0.05f, 0.1f, 0.2f}[seed % 5]);
             player.position = Vec3.ZERO;
             player.velocity = new Vec3(seed * 0.001, -0.02, 0.03);
@@ -94,6 +107,7 @@ public class CreativeFlightOracle {
             for (int tick = 0; tick < 64; tick++) {
                 float forward = (tick + seed) % 3 - 1, right = (tick / 3 + seed) % 3 - 1;
                 boolean jump = (tick + seed) % 5 == 0, down = (tick + seed) % 7 == 0;
+                player.suppress = down;
                 player.sprint = (tick / 8 + seed) % 2 == 0;
                 player.yaw = (tick * 37 + seed * 19) % 360 - 180;
                 player.velocity = player.velocity.add(0, ((jump ? 1 : 0) - (down ? 1 : 0)) * fly.getFlyingSpeed() * 3.0f, 0);
@@ -115,6 +129,7 @@ public class CreativeFlightOracle {
                 row.addProperty("jump", jump); row.addProperty("down", down);
                 row.addProperty("sprint", player.sprint); row.addProperty("yaw", player.yaw);
                 row.addProperty("speed", fly.getFlyingSpeed());
+                row.addProperty("bounce", bounce);
                 row.addProperty("ground", player.grounded); row.addProperty("delay", player.delay);
                 row.add("position", vec(player.position)); row.add("velocity", vec(player.velocity));
                 rows.add(row);

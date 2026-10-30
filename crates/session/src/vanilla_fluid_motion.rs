@@ -41,7 +41,7 @@ public class FluidMotionOracle {
         @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
     }
     static class TestPlayer extends Player {
-        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling; float yaw; double look,depth,wall,ceiling,bounce; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
+        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling,noGravity; float yaw; double look,depth,wall,ceiling,bounce,gravity; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
         TestPlayer(){super(null,null);}
         void setup(TestLevel level,Vec3 pos,Vec3 velocity,boolean grounded,double wallX) throws Exception {setLevel(level);p=pos;v=velocity;ground=grounded;wall=wallX;delay=0;positionField.set(this,p);}
         @Override public GameType gameMode(){return GameType.SURVIVAL;}
@@ -64,8 +64,8 @@ public class FluidMotionOracle {
         @Override public void setDeltaMovement(double x,double y,double z){v=new Vec3(x,y,z);}
         @Override public float getYRot(){return yaw;}
         @Override protected float getBlockJumpFactor(){return 1.0f;}
-        @Override public boolean isNoGravity(){return false;}
-        @Override protected double getDefaultGravity(){return 0.08;}
+        @Override public boolean isNoGravity(){return noGravity;}
+        @Override protected double getDefaultGravity(){return gravity;}
         @Override protected double getEntityBounciness(){return bounce;}
         @Override protected float getAirDrag(){return 0.98f;}
         @Override public boolean isSuppressingBounce(){return suppress;}
@@ -104,7 +104,7 @@ public class FluidMotionOracle {
         Method square=LocalPlayer.class.getDeclaredMethod("modifyInputSpeedForSquareMovement",Vec2.class);square.setAccessible(true);
         Field jumping=LivingEntity.class.getDeclaredField("jumping");jumping.setAccessible(true);
         JsonArray scenarios=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray(), results=new JsonArray();
-        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());int boost=s.has("boost")?s.get("boost").getAsInt():-1;entity.jumpBoost=boost<0?null:new MobEffectInstance(MobEffects.JUMP_BOOST,1000,boost);int levitation=s.has("levitation")?s.get("levitation").getAsInt():-1;entity.levitation=levitation<0?null:new MobEffectInstance(MobEffects.LEVITATION,1000,levitation);entity.slowFalling=s.has("slow_falling")&&s.get("slow_falling").getAsBoolean();entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
+        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());int boost=s.has("boost")?s.get("boost").getAsInt():-1;entity.jumpBoost=boost<0?null:new MobEffectInstance(MobEffects.JUMP_BOOST,1000,boost);int levitation=s.has("levitation")?s.get("levitation").getAsInt():-1;entity.levitation=levitation<0?null:new MobEffectInstance(MobEffects.LEVITATION,1000,levitation);entity.slowFalling=s.has("slow_falling")&&s.get("slow_falling").getAsBoolean();entity.gravity=s.has("gravity")?s.get("gravity").getAsDouble():0.08;entity.noGravity=s.has("no_gravity")&&s.get("no_gravity").getAsBoolean();entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
           for(var raw:s.getAsJsonArray("inputs")){var i=raw.getAsJsonObject();entity.water=i.get("water").getAsBoolean();entity.swim=i.get("swim").getAsBoolean();entity.sprint=i.get("sprint").getAsBoolean();entity.look=i.get("look").getAsDouble();entity.depth=i.get("depth").getAsDouble();entity.free=i.get("free").getAsBoolean();entity.yaw=i.get("yaw").getAsFloat();level.above=i.get("above").getAsBoolean();
             entity.speed.removeModifier(modifier.id());if(entity.sprint)entity.speed.addTransientModifier(modifier);
             if(entity.water&&i.get("descend").getAsBoolean())entity.down();
@@ -184,7 +184,7 @@ fn water_and_lava_motion_match_vanilla_player() {
             let swim = water && (s + t / 12) % 3 == 0;
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s+t/20)%angles.len()],"jump":(s+t/9)%3==0,"sprint":(s+t/11)%3==0,"slow":(s+t/13)%4==0,"water":water,"swim":swim,"descend":(s+t/7)%4==0,"look":([-0.8,-0.21,0.0,0.2,0.9][(s+t/8)%5]),"depth":([0.2,0.4,0.8,1.5][(s+t/10)%4]),"free":(s+t/6)%3==0,"above":(s+t/5)%2==0}));
         }
-        scenarios.push(json!({"position":[0.0,if s%2==0{0.0}else{2.0},0.0],"velocity":[if s%3==0{0.005}else{0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"boost":([-1,0,1,2,255][s%5]),"slow_falling":s%3==0,"levitation":([-1,0,1,127,255][(s/3)%5]),"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0,if s%2==0{0.0}else{2.0},0.0],"velocity":[if s%3==0{0.005}else{0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"boost":([-1,0,1,2,255][s%5]),"slow_falling":s%3==0,"levitation":([-1,0,1,127,255][(s/3)%5]),"gravity":([-1.0,-0.08,0.0,0.005,0.08,0.2,1.0][(s/2)%7]),"no_gravity":s%11==0,"inputs":inputs}));
     }
     for water in [false, true] {
         for bounce in [0.0, 0.25, 0.8] {
@@ -198,7 +198,14 @@ fn water_and_lava_motion_match_vanilla_player() {
                                 _ => ([0.0, 1.0, 0.0], [0.02, speed, 0.0], 10000.0, 1.05),
                             };
                             let input = json!({"forward":0.0,"right":0.0,"yaw":0.0,"jump":false,"sprint":false,"slow":false,"water":water,"swim":false,"descend":false,"look":0.0,"depth":1.0,"free":false,"above":true});
-                            scenarios.push(json!({"position":position,"velocity":velocity,"ground":false,"wall":wall,"ceiling":ceiling,"bounce":bounce,"block":block,"suppress":suppress,"inputs":[input]}));
+                            let gravity = if speed == 0.04 {
+                                0.0
+                            } else if speed == 0.15 {
+                                0.02
+                            } else {
+                                0.2
+                            };
+                            scenarios.push(json!({"position":position,"velocity":velocity,"ground":false,"wall":wall,"ceiling":ceiling,"bounce":bounce,"block":block,"suppress":suppress,"gravity":gravity,"slow_falling":block % 2 == 1,"inputs":[input]}));
                         }
                     }
                 }
@@ -282,6 +289,12 @@ fn water_and_lava_motion_match_vanilla_player() {
                     block_bounce,
                 )))
             };
+            let slow_falling = scenario["slow_falling"].as_bool().unwrap_or(false);
+            let gravity = if scenario["no_gravity"].as_bool().unwrap_or(false) {
+                0.0
+            } else {
+                scenario["gravity"].as_f64().unwrap_or(0.08)
+            };
             state.tick_fluid_with_restitution(
                 command,
                 fluid,
@@ -292,7 +305,8 @@ fn water_and_lava_motion_match_vanilla_player() {
                         .as_i64()
                         .and_then(|v| u8::try_from(v).ok()),
                 ),
-                scenario["slow_falling"].as_bool().unwrap_or(false),
+                gravity,
+                slow_falling,
                 |position, requested, _| {
                     let mut actual = requested;
                     if actual.y < 0.0 && position.y + actual.y < 0.0 {
@@ -315,14 +329,22 @@ fn water_and_lava_motion_match_vanilla_player() {
                             requested.y,
                             actual.y,
                             block_bounce,
-                            0.08,
+                            if slow_falling && requested.y <= 0.0 {
+                                gravity.min(0.01)
+                            } else {
+                                gravity
+                            },
                         )
                     } else {
                         crate::items::collision_restitution(
                             requested.y,
                             actual.y,
                             entity_bounce,
-                            0.08,
+                            if slow_falling && requested.y <= 0.0 {
+                                gravity.min(0.01)
+                            } else {
+                                gravity
+                            },
                         )
                     };
                     (entity_bounce, y)

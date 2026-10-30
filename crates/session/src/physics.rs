@@ -305,6 +305,7 @@ impl MotionState {
             block_friction,
             default_movement_speed(input.sprinting),
             jump_power,
+            0.08,
             false,
             None,
             collide,
@@ -317,6 +318,7 @@ impl MotionState {
         block_friction: f32,
         movement_speed: f32,
         jump_power: f32,
+        gravity: f64,
         slow_falling: bool,
         levitation: Option<u8>,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
@@ -326,6 +328,7 @@ impl MotionState {
             block_friction,
             movement_speed,
             jump_power,
+            gravity,
             slow_falling,
             levitation,
             collide,
@@ -339,6 +342,7 @@ impl MotionState {
         block_friction: f32,
         movement_speed: f32,
         jump_power: f32,
+        gravity: f64,
         slow_falling: bool,
         levitation: Option<u8>,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
@@ -420,9 +424,9 @@ impl MotionState {
             self.velocity.y + (0.05 * (f64::from(amplifier) + 1.0) - self.velocity.y) * 0.2
         } else {
             let gravity = if slow_falling && self.velocity.y <= 0.0 {
-                0.01
+                gravity.min(0.01)
             } else {
-                0.08
+                gravity
             };
             self.velocity.y - gravity
         };
@@ -447,6 +451,7 @@ impl MotionState {
             input,
             fluid,
             0.42_f32,
+            0.08,
             false,
             collide,
             can_jump_out,
@@ -459,6 +464,7 @@ impl MotionState {
         input: MovementInput,
         fluid: FluidMovement,
         jump_power: f32,
+        gravity: f64,
         slow_falling: bool,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
@@ -495,7 +501,11 @@ impl MotionState {
             }
         }
         let falling = self.velocity.y <= 0.0;
-        let gravity = if slow_falling && falling { 0.01 } else { 0.08 };
+        let gravity = if slow_falling && falling {
+            gravity.min(0.01)
+        } else {
+            gravity
+        };
         let (left, forward) = keyboard_input(
             -input.right,
             input.forward,
@@ -564,7 +574,7 @@ impl MotionState {
 }
 
 fn fluid_gravity(mut velocity: DVec3, falling: bool, sprinting: bool, gravity: f64) -> DVec3 {
-    if !sprinting {
+    if gravity != 0.0 && !sprinting {
         velocity.y = if falling
             && (velocity.y - 0.005).abs() >= 0.003
             && (velocity.y - gravity / 16.0).abs() < 0.003

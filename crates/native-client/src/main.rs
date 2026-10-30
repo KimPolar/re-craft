@@ -1026,6 +1026,13 @@ fn prepare_existing_world(
                         .context("cannot read saved jump strength")?,
                 )
                 .context("cannot restore saved jump strength")?;
+            session
+                .restore_saved_gravity(
+                    native_session::player_data::read_saved_gravity_attribute(player_data)
+                        .context("cannot read saved gravity")?,
+                    native_session::player_data::read_saved_no_gravity(player_data),
+                )
+                .context("cannot restore saved gravity")?;
             let fall_effects = native_session::player_data::read_saved_fall_effects(player_data)
                 .context("cannot read saved fall effects")?;
             session

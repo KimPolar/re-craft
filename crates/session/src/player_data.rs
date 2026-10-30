@@ -247,6 +247,18 @@ pub fn read_saved_jump_strength_attribute(player: &NamedTag) -> Result<SavedAttr
     saved_attribute(player, "jump_strength", f64::from(0.42_f32))
 }
 
+pub fn read_saved_gravity_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "gravity", 0.08)
+}
+
+pub fn read_saved_no_gravity(player: &NamedTag) -> bool {
+    player
+        .value
+        .get("NoGravity")
+        .and_then(numeric_byte)
+        .is_some_and(|value| value != 0)
+}
+
 pub fn read_saved_movement_speed_attribute(player: &NamedTag) -> Result<SavedAttribute> {
     saved_attribute(player, "movement_speed", f64::from(0.1_f32))
 }
@@ -1516,6 +1528,7 @@ pub fn draft_player_state(
         "fall_distance",
         "OnGround",
         "Dimension",
+        "NoGravity",
         "playerGameType",
         "Air",
         "Health",
@@ -1530,6 +1543,12 @@ pub fn draft_player_state(
         "Score",
     ] {
         unique_field(&original.value, field)?;
+    }
+    if let Some(tag) = unique_field(&original.value, "NoGravity")? {
+        ensure!(
+            numeric_byte(tag).is_some(),
+            "NoGravity cannot be preserved safely"
+        );
     }
     let validate_vector = |field: &str, element_type, length| -> Result<()> {
         if let Some(tag) = unique_field(&original.value, field)? {

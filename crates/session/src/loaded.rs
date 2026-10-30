@@ -161,6 +161,10 @@ pub struct LoadedSession {
     jump_strength_attribute: crate::player_data::SavedAttribute,
     jump_strength_inventory_revision: Option<u64>,
     jump_strength: Option<f64>,
+    gravity_attribute: crate::player_data::SavedAttribute,
+    gravity_inventory_revision: Option<u64>,
+    gravity: Option<f64>,
+    no_gravity: bool,
     movement_speed_attribute: crate::player_data::SavedAttribute,
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
@@ -246,6 +250,7 @@ struct EffectSaveTracking {
     breathing: crate::survival::BreathingEffects,
     fall: crate::survival::FallEffects,
     movement_speed: crate::player_data::SavedAttribute,
+    gravity: crate::player_data::SavedAttribute,
     ticks: u64,
 }
 
@@ -452,6 +457,7 @@ impl LoadedSession {
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.gravity_inventory_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -482,6 +488,7 @@ impl LoadedSession {
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.gravity_inventory_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -572,6 +579,47 @@ impl LoadedSession {
                 self.jump_strength = None;
                 self.stream_errors
                     .push(format!("player jump strength equipment: {error:#}"));
+            }
+        }
+    }
+
+    pub fn restore_saved_gravity(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+        no_gravity: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "gravity must be restored before the first tick"
+        );
+        self.gravity = Some(attribute.value(-1.0, 1.0)?);
+        self.gravity_attribute = attribute;
+        self.gravity_inventory_revision = None;
+        self.no_gravity = no_gravity;
+        Ok(())
+    }
+
+    fn refresh_gravity(&mut self) {
+        let revision = self.inventory.revision();
+        if self.gravity_inventory_revision == Some(revision) {
+            return;
+        }
+        self.gravity_inventory_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::gravity(
+            &self.gravity_attribute,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(value) => self.gravity = Some(value),
+            Err(error) => {
+                self.gravity = None;
+                self.stream_errors
+                    .push(format!("player gravity equipment: {error:#}"));
             }
         }
     }
@@ -783,6 +831,18 @@ impl LoadedSession {
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
+        );
+        anyhow::ensure!(
+            crate::player_data::read_saved_no_gravity(original) == self.no_gravity,
+            "saved no-gravity state does not match the session"
+        );
+        let initial_gravity = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(&self.gravity_attribute, |tracking| &tracking.gravity);
+        anyhow::ensure!(
+            crate::player_data::read_saved_gravity_attribute(original)? == *initial_gravity,
+            "saved gravity attribute does not match the initial session state"
         );
         let effect_draft = if self.tick != 0 {
             anyhow::ensure!(
@@ -1213,6 +1273,7 @@ impl LoadedSession {
         self.oxygen_inventory_revision = None;
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
+        self.gravity_inventory_revision = None;
         self.movement_speed_cache = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
@@ -1383,6 +1444,10 @@ impl LoadedSession {
             )),
             jump_strength_inventory_revision: None,
             jump_strength: Some(f64::from(0.42_f32)),
+            gravity_attribute: crate::player_data::SavedAttribute::with_base(0.08),
+            gravity_inventory_revision: None,
+            gravity: Some(0.08),
+            no_gravity: false,
             movement_speed_attribute: crate::player_data::SavedAttribute::with_base(f64::from(
                 0.1_f32,
             )),
@@ -2956,6 +3021,10 @@ impl LoadedSession {
         self.jump_strength_attribute.clear_modifiers();
         self.jump_strength_inventory_revision = None;
         self.jump_strength = self.jump_strength_attribute.value(0.0, 32.0).ok();
+        self.gravity_attribute.clear_modifiers();
+        self.gravity_inventory_revision = None;
+        self.gravity = self.gravity_attribute.value(-1.0, 1.0).ok();
+        self.no_gravity = false;
         self.movement_speed_attribute.clear_modifiers();
         self.movement_speed_cache = None;
         self.fall.reset_after_death();
@@ -5675,6 +5744,7 @@ impl LoadedSession {
         self.refresh_equipment_oxygen();
         self.refresh_bounciness();
         self.refresh_jump_strength();
+        self.refresh_gravity();
         let friction = self.friction_below();
         let fluid_view = FluidView {
             world: &self.world,
@@ -5740,6 +5810,7 @@ impl LoadedSession {
                 breathing: self.breathing_effects.clone(),
                 fall: self.fall.effects().clone(),
                 movement_speed: self.movement_speed_attribute.clone(),
+                gravity: self.gravity_attribute.clone(),
                 ticks: 0,
             });
         tracking.ticks = tracking.ticks.saturating_add(1);
@@ -5839,6 +5910,11 @@ impl LoadedSession {
                 .map(|effect| effect.amplifier),
         );
         let slow_falling = self.fall.effects().slow_falling.is_some();
+        let gravity = if self.no_gravity {
+            0.0
+        } else {
+            self.gravity.unwrap_or(0.08)
+        };
         let movement_speed = self.movement_speed(input.sprinting);
         let levitation = self
             .fall
@@ -5915,13 +5991,23 @@ impl LoadedSession {
             self.bounciness.unwrap_or(0.0)
         };
         let restitution = |position: DVec3, requested: DVec3, actual: DVec3| {
+            let collision_gravity = if slow_falling && requested.y <= 0.0 {
+                gravity.min(0.01)
+            } else {
+                gravity
+            };
             if requested.y == actual.y {
                 return (entity_bounce, 0.0);
             }
             if requested.y >= 0.0 {
                 return (
                     entity_bounce,
-                    crate::items::collision_restitution(requested.y, actual.y, entity_bounce, 0.08),
+                    crate::items::collision_restitution(
+                        requested.y,
+                        actual.y,
+                        entity_bounce,
+                        collision_gravity,
+                    ),
                 );
             }
             if sneak {
@@ -5960,7 +6046,12 @@ impl LoadedSession {
             };
             (
                 entity_bounce,
-                crate::items::vertical_restitution(requested.y, actual.y, bounce, 0.08),
+                crate::items::vertical_restitution(
+                    requested.y,
+                    actual.y,
+                    bounce,
+                    collision_gravity,
+                ),
             )
         };
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
@@ -6004,6 +6095,7 @@ impl LoadedSession {
                 input,
                 movement,
                 jump_power,
+                gravity,
                 slow_falling,
                 resolve,
                 |position, offset| {
@@ -6020,6 +6112,7 @@ impl LoadedSession {
                 friction,
                 movement_speed,
                 jump_power,
+                gravity,
                 slow_falling,
                 levitation,
                 resolve,
@@ -7946,6 +8039,100 @@ mod tests {
         assert_eq!(session.block_jump_factor(), 1.0);
         assert!(session.set(IVec3::new(8, 1, 8), honey));
         assert_eq!(session.block_jump_factor(), 0.5);
+    }
+
+    #[test]
+    fn saved_gravity_and_no_gravity_control_player_motion() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let source = |gravity: f64, disabled: bool| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("NoGravity".into(), Tag::Byte(i8::from(disabled))),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:gravity".into())),
+                            ("base".into(), Tag::Double(gravity)),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        for (base, disabled, expected) in
+            [(0.2, false, 0.2), (-0.08, false, -0.08), (0.2, true, 0.0)]
+        {
+            let original = source(base, disabled);
+            let mut session = session();
+            session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+            session.motion.velocity = DVec3::ZERO;
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session
+                .restore_saved_gravity(
+                    crate::player_data::read_saved_gravity_attribute(&original).unwrap(),
+                    crate::player_data::read_saved_no_gravity(&original),
+                )
+                .unwrap();
+            session.update(TICK);
+            assert!((session.motion.velocity.y + expected * f64::from(0.98_f32)).abs() < 1e-10);
+            assert!(session.draft_player_state(&original).is_ok());
+            assert!(
+                session
+                    .draft_player_state(&source(base + 0.01, disabled))
+                    .is_err()
+            );
+            assert!(
+                session
+                    .draft_player_state(&source(base, !disabled))
+                    .is_err()
+            );
+            assert!(
+                session
+                    .restore_saved_gravity(
+                        crate::player_data::SavedAttribute::with_base(0.08),
+                        false
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn gravity_refreshes_when_equipment_changes() {
+        use native_persistence::nbt::{Tag, TagType};
+        let mut session = session();
+        session
+            .restore_saved_gravity(crate::player_data::SavedAttribute::with_base(0.08), false)
+            .unwrap();
+        let component = Tag::Compound(vec![(
+            "minecraft:attribute_modifiers".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("type".into(), Tag::String("minecraft:gravity".into())),
+                    ("id".into(), Tag::String("example:gravity".into())),
+                    ("operation".into(), Tag::String("add_value".into())),
+                    ("amount".into(), Tag::Double(0.12)),
+                    ("slot".into(), Tag::String("feet".into())),
+                ])],
+            },
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            crate::inventory::PlayerSlot::Armor(3),
+            ItemStack::unresolved("minecraft:leather_boots".into(), 1, component),
+        );
+        session.set_player_inventory(inventory);
+        session.refresh_gravity();
+        assert_eq!(session.gravity, Some(0.2));
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(3), None);
+        session.refresh_gravity();
+        assert_eq!(session.gravity, Some(0.08));
     }
 
     #[test]

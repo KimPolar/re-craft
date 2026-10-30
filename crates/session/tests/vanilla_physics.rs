@@ -60,6 +60,8 @@ public class PhysicsOracle {
         AttributeInstance speed;
         AttributeMap attributes;
         AttributeInstance jumpStrength;
+        AttributeInstance gravity;
+        boolean noGravity;
         MobEffectInstance jumpBoost;
         MobEffectInstance levitation;
         boolean slowFalling;
@@ -73,8 +75,8 @@ public class PhysicsOracle {
         @Override public void setDeltaMovement(double x, double y, double z) { v = new Vec3(x, y, z); }
         @Override public float getYRot() { return yaw; }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
-        @Override public boolean isNoGravity() { return false; }
-        @Override protected double getDefaultGravity() { return 0.08; }
+        @Override public boolean isNoGravity() { return noGravity; }
+        @Override protected double getDefaultGravity() { return gravity.getValue(); }
         @Override protected boolean omnidirectionalAirMover() { return false; }
         @Override public boolean shouldDiscardFriction() { return false; }
         @Override public boolean isSprinting() { return sprinting; }
@@ -122,6 +124,7 @@ public class PhysicsOracle {
         entity.attributes = new AttributeMap(Player.createAttributes().build());
         entity.speed = entity.attributes.getInstance(Attributes.MOVEMENT_SPEED);
         entity.jumpStrength = new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.JUMP_STRENGTH);
+        entity.gravity = entity.attributes.getInstance(Attributes.GRAVITY);
         Field modifierField = LivingEntity.class.getDeclaredField("SPEED_MODIFIER_SPRINTING"); modifierField.setAccessible(true);
         AttributeModifier modifier = (AttributeModifier) modifierField.get(null);
         Method travel = LivingEntity.class.getDeclaredMethod("travelInAir", Vec3.class); travel.setAccessible(true);
@@ -140,6 +143,8 @@ public class PhysicsOracle {
             int boost = scenario.get("boost").getAsInt();
             entity.jumpBoost = boost < 0 ? null : new MobEffectInstance(MobEffects.JUMP_BOOST, 1000, boost);
             entity.jumpStrength.setBaseValue(scenario.get("strength").getAsDouble());
+            entity.gravity.setBaseValue(scenario.get("gravity").getAsDouble());
+            entity.noGravity = scenario.get("no_gravity").getAsBoolean();
             entity.slowFalling = scenario.get("slow_falling").getAsBoolean();
             int levitation = scenario.get("levitation").getAsInt();
             entity.levitation = levitation < 0 ? null : new MobEffectInstance(MobEffects.LEVITATION, 1000, levitation);
@@ -411,7 +416,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             };
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s + t/20) % angles.len()],"jump":(35..65).contains(&t),"sprint":(s + t / 7) % 3 == 0,"slow":scenario >= 64 && (s + t / 9) % 3 == 0,"using":(s + t / 11) % 4 == 0}));
         }
-        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"move_base":([-0.1,0.0,0.1,0.2,0.4][(scenario/2)%5]),"speed_effect":([-1,0,1,3][scenario%4]),"slowness_effect":([-1,0,1,3][(scenario/4)%4]),"slow_falling":scenario%3==0,"levitation":([-1,0,1,127,255][(scenario/3)%5]),"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"gravity":([-2.0,-0.08,0.0,0.005,0.08,0.2,2.0][(scenario/2)%7]),"no_gravity":scenario%11==0,"move_base":([-0.1,0.0,0.1,0.2,0.4][(scenario/2)%5]),"speed_effect":([-1,0,1,3][scenario%4]),"slowness_effect":([-1,0,1,3][(scenario/4)%4]),"slow_falling":scenario%3==0,"levitation":([-1,0,1,127,255][(scenario/3)%5]),"inputs":inputs}));
     }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("PhysicsOracle.java");
@@ -519,6 +524,11 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
                     native_session::physics::block_jump_factor(scenario["block"].as_str().unwrap()),
                     u8::try_from(boost).ok(),
                 ),
+                if scenario["no_gravity"].as_bool().unwrap() {
+                    0.0
+                } else {
+                    scenario["gravity"].as_f64().unwrap().clamp(-1.0, 1.0)
+                },
                 scenario["slow_falling"].as_bool().unwrap(),
                 scenario["levitation"]
                     .as_i64()

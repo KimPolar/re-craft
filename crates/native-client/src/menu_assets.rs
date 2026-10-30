@@ -22,6 +22,7 @@ pub struct MenuAssets {
     pub trim_registry: Arc<crate::equipment_visual::TrimRegistry>,
     pub main_hand_left: bool,
     pub font: RgbaImage,
+    pub nonlatin_font: BitmapFont,
     pub logo: RgbaImage,
     pub edition: RgbaImage,
     pub button: RgbaImage,
@@ -272,6 +273,72 @@ pub struct UnicodeGlyph {
     pub bits: u32,
 }
 
+/// The default non-Latin bitmap provider precedes unifont in vanilla's font stack.
+pub struct BitmapFont {
+    pub image: RgbaImage,
+    pub cells: HashMap<char, (u32, u32)>,
+}
+
+fn nonlatin_bitmap_font(definition: &[u8], image: RgbaImage) -> Result<BitmapFont> {
+    let definition: Value = serde_json::from_slice(definition)?;
+    let provider = definition["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers.iter().find(|p| {
+                p["type"] == "bitmap" && p["file"] == "minecraft:font/nonlatin_european.png"
+            })
+        })
+        .context("Missing non-Latin font provider")?;
+    let rows = provider["chars"].as_array().context("Missing font rows")?;
+    ensure!(!rows.is_empty(), "Empty font rows");
+    let columns = rows[0]
+        .as_str()
+        .context("Invalid font row")?
+        .chars()
+        .count();
+    ensure!(
+        columns > 0 && columns <= 1024 && rows.len() <= 1024,
+        "Invalid font grid"
+    );
+    ensure!(
+        provider.get("height").and_then(Value::as_u64).unwrap_or(8) == 8,
+        "Unsupported font height"
+    );
+    ensure!(
+        provider["ascent"].as_i64() == Some(7),
+        "Unsupported font ascent"
+    );
+    let mut cells = HashMap::new();
+    for (y, row) in rows.iter().enumerate() {
+        let row = row.as_str().context("Invalid font row")?;
+        ensure!(
+            row.chars().count() == columns,
+            "Inconsistent font row length"
+        );
+        for (x, ch) in row.chars().enumerate() {
+            if ch != '\0' {
+                cells.entry(ch).or_insert((x as u32 * 8, y as u32 * 8));
+            }
+        }
+    }
+    let width = columns as u32 * 8;
+    let height = rows.len() as u32 * 8;
+    ensure!(
+        image.width() >= width
+            && image.height() >= height
+            && image.width() % width == 0
+            && image.height() % height == 0
+            && image.width() / width == image.height() / height,
+        "Invalid font texture dimensions"
+    );
+    let image = if image.width() == width && image.height() == height {
+        image
+    } else {
+        image::imageops::resize(&image, width, height, image::imageops::FilterType::Nearest)
+    };
+    Ok(BitmapFont { image, cells })
+}
+
 impl MenuAssets {
     pub fn load(minecraft_dir: &Path, packs: &[std::path::PathBuf]) -> Result<Self> {
         let mut stack = ResourceStack::open(minecraft_dir)?;
@@ -330,6 +397,7 @@ impl MenuAssets {
                 .to_rgba8())
         };
         let font = image("assets/minecraft/textures/font/ascii.png")?;
+        let nonlatin_image = image("assets/minecraft/textures/font/nonlatin_european.png")?;
         ensure!(
             font.width() >= 128 && font.height() >= 128,
             "Invalid Minecraft font texture"
@@ -508,6 +576,14 @@ impl MenuAssets {
             destroy_stages.push(texture);
         }
 
+        let nonlatin_font = stack
+            .read_asset("assets/minecraft/font/include/default.json")?
+            .and_then(|definition| nonlatin_bitmap_font(&definition, nonlatin_image).ok())
+            .unwrap_or_else(|| BitmapFont {
+                image: RgbaImage::new(0, 0),
+                cells: HashMap::new(),
+            });
+
         // The client JAR contains one-pixel placeholders for the real panorama. Minecraft's
         // launcher installs these images in the content-addressed asset store instead.
         let index = AssetIndex::load(minecraft_dir)?;
@@ -584,6 +660,7 @@ impl MenuAssets {
             trim_registry,
             main_hand_left,
             font,
+            nonlatin_font,
             logo,
             edition,
             button,
@@ -709,6 +786,18 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_nonlatin_bitmap_grid_and_rejects_inconsistent_rows() {
+        let definition = br#"{"providers":[{"type":"bitmap","file":"minecraft:font/nonlatin_european.png","ascent":7,"chars":["\u03b1\u03b2","\u0000\u03b3"]}]}"#;
+        let font = nonlatin_bitmap_font(definition, RgbaImage::new(16, 16)).unwrap();
+        assert_eq!(font.cells.get(&'α'), Some(&(0, 0)));
+        assert_eq!(font.cells.get(&'β'), Some(&(8, 0)));
+        assert_eq!(font.cells.get(&'γ'), Some(&(8, 8)));
+        assert!(!font.cells.contains_key(&'\0'));
+        let invalid = br#"{"providers":[{"type":"bitmap","file":"minecraft:font/nonlatin_european.png","ascent":7,"chars":["ab","c"]}]}"#;
+        assert!(nonlatin_bitmap_font(invalid, RgbaImage::new(16, 16)).is_err());
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

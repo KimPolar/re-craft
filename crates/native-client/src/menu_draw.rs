@@ -729,7 +729,20 @@ impl Canvas {
         for ch in text.chars() {
             if ch != ' ' {
                 if let Some(assets) = assets {
-                    if let Some(glyph) = assets.unicode.get(&ch) {
+                    if let Some((image, sx, sy)) = bitmap_glyph(assets, ch) {
+                        for gy in 0..8 {
+                            for gx in 0..8 {
+                                let alpha = (u16::from(image.get_pixel(sx + gx, sy + gy).0[3])
+                                    * u16::from(opacity)
+                                    / 255) as u8;
+                                self.pixel(
+                                    x + gx as i32,
+                                    y + gy as i32,
+                                    [color[0], color[1], color[2], alpha],
+                                );
+                            }
+                        }
+                    } else if let Some(glyph) = assets.unicode.get(&ch) {
                         for gy in 0..8 {
                             for gx in 0..glyph.bits.div_ceil(2) {
                                 let mut on = false;
@@ -916,22 +929,30 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
         return 4;
     }
     if let Some(assets) = assets {
-        if let Some(glyph) = assets.unicode.get(&ch) {
-            return glyph.bits.div_ceil(2) as i32 + 1;
-        }
-        let c = if ch.is_ascii() {
-            ch as u32
-        } else {
-            u32::from('?')
-        };
-        let (sx, sy) = ((c % 16) * 8, (c / 16) * 8);
-        for x in (0..8).rev() {
-            if (0..8).any(|y| assets.font.get_pixel(sx + x, sy + y).0[3] != 0) {
-                return x as i32 + 2;
+        if let Some((image, sx, sy)) = bitmap_glyph(assets, ch) {
+            for x in (0..8).rev() {
+                if (0..8).any(|y| image.get_pixel(sx + x, sy + y).0[3] != 0) {
+                    return x as i32 + 2;
+                }
             }
+        } else if let Some(glyph) = assets.unicode.get(&ch) {
+            return glyph.bits.div_ceil(2) as i32 + 1;
+        } else {
+            return glyph_width(Some(assets), '?');
         }
     }
     6
+}
+
+fn bitmap_glyph(assets: &MenuAssets, ch: char) -> Option<(&RgbaImage, u32, u32)> {
+    if let Some(&(x, y)) = assets.nonlatin_font.cells.get(&ch) {
+        return Some((&assets.nonlatin_font.image, x, y));
+    }
+    if ch.is_ascii() {
+        let c = ch as u32;
+        return Some((&assets.font, (c % 16) * 8, (c / 16) * 8));
+    }
+    None
 }
 
 // Only used when the user's Minecraft installation cannot yet be found.
@@ -984,6 +1005,55 @@ fn fallback_glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn nonlatin_bitmap_precedes_unifont_for_drawing_and_width() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&directory, &[]).unwrap();
+        let (sx, sy) = assets.nonlatin_font.cells[&'α'];
+        for y in 0..8 {
+            for x in 0..8 {
+                assets.nonlatin_font.image.put_pixel(
+                    sx + x,
+                    sy + y,
+                    image::Rgba([255, 255, 255, 0]),
+                );
+            }
+        }
+        assets
+            .nonlatin_font
+            .image
+            .put_pixel(sx + 2, sy + 1, image::Rgba([255, 255, 255, 255]));
+        assets.unicode.insert(
+            'α',
+            crate::menu_assets::UnicodeGlyph {
+                rows: [u32::MAX; 16],
+                bits: 16,
+            },
+        );
+        let mut canvas = Canvas::new(16, 10);
+        assert_eq!(canvas.text_width(Some(&assets), "α"), 4);
+        canvas.text_without_shadow(Some(&assets), 0, 0, "α", [255, 255, 255]);
+        assert_eq!(canvas.pixels[16 + 2], 0xffff_ffff);
+        assert_eq!(canvas.pixels.iter().filter(|&&pixel| pixel != 0).count(), 1);
+        assert!(assets.unicode.contains_key(&'한'));
+        assert!(bitmap_glyph(&assets, '한').is_none());
+
+        let pack = tempfile::tempdir().unwrap();
+        let path = pack
+            .path()
+            .join("assets/minecraft/textures/font/nonlatin_european.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assets.nonlatin_font.image.save(path).unwrap();
+        let packed = MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap();
+        assert_eq!(canvas.text_width(Some(&packed), "α"), 4);
+        let mut packed_canvas = Canvas::new(16, 10);
+        packed_canvas.text_without_shadow(Some(&packed), 0, 0, "α", [255, 255, 255]);
+        assert_eq!(packed_canvas.pixels, canvas.pixels);
+    }
 
     #[test]
     fn bold_text_advances_each_glyph_and_fills_its_right_neighbor() {

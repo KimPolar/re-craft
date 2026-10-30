@@ -17,20 +17,131 @@ pub struct SavedChest {
     source: Arc<Tag>,
 }
 
+/// Validate item-carried contents without recursively resolving item prototypes.
+fn container_entries(container: &Tag) -> Result<Vec<(usize, &Tag)>> {
+    let Tag::List {
+        element_type,
+        values,
+    } = container
+    else {
+        bail!("container component is not a list")
+    };
+    ensure!(
+        *element_type == TagType::Compound || values.is_empty(),
+        "container entries are not compounds"
+    );
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for entry in values {
+        let Tag::Compound(fields) = entry else {
+            bail!("container entry is not a compound")
+        };
+        ensure!(
+            fields
+                .iter()
+                .all(|(name, _)| name.matches("slot") || name.matches("item")),
+            "unknown container entry field"
+        );
+        let index = match unique(entry, "slot")? {
+            Some(Tag::Int(value)) if (0..=255).contains(value) => *value as usize,
+            _ => bail!("invalid container slot"),
+        };
+        ensure!(seen.insert(index), "duplicate container slot");
+        let item = unique(entry, "item")?.context("container item is missing")?;
+        let Tag::Compound(fields) = item else {
+            bail!("container item is not a compound")
+        };
+        ensure!(
+            fields.iter().all(|(name, _)| ["id", "count", "components"]
+                .iter()
+                .any(|key| name.matches(key))),
+            "unknown container item field"
+        );
+        let Some(Tag::String(id)) = unique(item, "id")? else {
+            bail!("container item id is missing")
+        };
+        ResourceId::parse(&String::from_utf16(&id.0).context("invalid item id")?)?;
+        ensure!(
+            matches!(unique(item, "count")?, None | Some(Tag::Int(1..=99))),
+            "invalid container item count"
+        );
+        ensure!(
+            matches!(unique(item, "components")?, None | Some(Tag::Compound(_))),
+            "invalid container item components"
+        );
+        result.push((index, item));
+    }
+    Ok(result)
+}
+
+pub(crate) fn placed_item_components(components: &Tag) -> Result<(Option<&Tag>, Option<&Tag>)> {
+    let Tag::Compound(fields) = components else {
+        bail!("item components are not a compound")
+    };
+    let mut name = None;
+    let mut container = None;
+    for (key, value) in fields {
+        if key.matches("minecraft:custom_name")
+            && name.is_none()
+            && matches!(value, Tag::String(_) | Tag::Compound(_) | Tag::List { .. })
+        {
+            name = Some(value);
+        } else if key.matches("minecraft:container") && container.is_none() {
+            container_entries(value)?;
+            container = Some(value);
+        } else {
+            bail!("unsupported or duplicate chest item component")
+        }
+    }
+    Ok((name, container))
+}
+
 impl SavedChest {
-    pub(crate) fn placed(position: IVec3, id: &str) -> Self {
-        let slots = std::array::from_fn(|_| None);
-        Self {
+    pub(crate) fn placed(
+        position: IVec3,
+        id: &str,
+        custom_name: Option<Tag>,
+        container: Option<&Tag>,
+    ) -> Result<Self> {
+        let mut slots: [Option<ItemStack>; 27] = std::array::from_fn(|_| None);
+        let mut items = Vec::new();
+        if let Some(container) = container {
+            for (index, item) in container_entries(container)? {
+                let decoded = crate::player_data::read_stack(item)?;
+                if index < slots.len() {
+                    slots[index] = Some(decoded);
+                    let Tag::Compound(mut fields) = item.clone() else {
+                        unreachable!()
+                    };
+                    fields.push(("Slot".into(), Tag::Byte(index as i8)));
+                    items.push(Tag::Compound(fields));
+                }
+            }
+        }
+        let mut fields = vec![
+            ("id".into(), Tag::String(id.into())),
+            ("x".into(), Tag::Int(position.x)),
+            ("y".into(), Tag::Int(position.y)),
+            ("z".into(), Tag::Int(position.z)),
+        ];
+        if let Some(name) = custom_name {
+            fields.push(("CustomName".into(), name));
+        }
+        if !items.is_empty() {
+            fields.push((
+                "Items".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: items,
+                },
+            ));
+        }
+        Ok(Self {
             position,
             slots: slots.clone(),
             original_slots: slots,
-            source: Arc::new(Tag::Compound(vec![
-                ("id".into(), Tag::String(id.into())),
-                ("x".into(), Tag::Int(position.x)),
-                ("y".into(), Tag::Int(position.y)),
-                ("z".into(), Tag::Int(position.z)),
-            ])),
-        }
+            source: Arc::new(Tag::Compound(fields)),
+        })
     }
     pub fn source(&self) -> &Tag {
         &self.source
@@ -238,6 +349,52 @@ pub fn read(
 mod tests {
     use super::*;
     use native_persistence::nbt::NamedTag;
+    #[test]
+    fn placed_container_rejects_ambiguous_or_unpreservable_items() {
+        let item = Tag::Compound(vec![("id".into(), Tag::String("minecraft:stone".into()))]);
+        let entry = |slot: i32| {
+            Tag::Compound(vec![
+                ("slot".into(), Tag::Int(slot)),
+                ("item".into(), item.clone()),
+            ])
+        };
+        let component = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        for invalid in [
+            component(vec![entry(4), entry(4)]),
+            component(vec![entry(-1)]),
+            component(vec![entry(256)]),
+            component(vec![Tag::Compound(vec![
+                ("slot".into(), Tag::Int(4)),
+                ("item".into(), item.clone()),
+                ("future".into(), Tag::Int(1)),
+            ])]),
+            component(vec![Tag::Compound(vec![
+                ("slot".into(), Tag::Int(4)),
+                (
+                    "item".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:stone".into())),
+                        ("future".into(), Tag::Int(1)),
+                    ]),
+                ),
+            ])]),
+        ] {
+            assert!(
+                SavedChest::placed(IVec3::ZERO, "minecraft:chest", None, Some(&invalid)).is_err()
+            );
+        }
+        let outside = SavedChest::placed(
+            IVec3::ZERO,
+            "minecraft:chest",
+            None,
+            Some(&component(vec![entry(255)])),
+        )
+        .unwrap();
+        assert!(outside.slots.iter().all(Option::is_none));
+    }
     fn chest() -> Tag {
         Tag::Compound(vec![
             ("id".into(), Tag::String("minecraft:chest".into())),

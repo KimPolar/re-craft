@@ -33,6 +33,25 @@ public class ChestDropOracle {
         var copy=net.minecraft.world.level.storage.loot.functions.CopyComponentsFunction.copyComponentsFromBlockEntity(net.minecraft.world.level.storage.loot.parameters.LootContextParams.BLOCK_ENTITY).include(DataComponents.CUSTOM_NAME).build();
         var copied=copy.apply(new ItemStack(Items.CHEST),context);
         if(!copied.get(DataComponents.CUSTOM_NAME).getString().equals("treasure")) throw new AssertionError("chest custom name copy");
+        for(boolean trapped : new boolean[]{false,true}) for(boolean styled : new boolean[]{false,true}) {
+            var nameComponent=net.minecraft.network.chat.Component.literal("\ubcf4\uad00\ud568 \u2660");
+            if(styled) nameComponent.withStyle(net.minecraft.ChatFormatting.GOLD,net.minecraft.ChatFormatting.BOLD);
+            var item=new ItemStack(trapped ? Items.TRAPPED_CHEST : Items.CHEST);
+            item.set(DataComponents.CUSTOM_NAME,nameComponent);
+            var items=new ArrayList<ItemStack>(Collections.nCopies(30,ItemStack.EMPTY));
+            items.set(4,new ItemStack(Items.DIAMOND,3)); items.set(26,new ItemStack(Items.STONE,32)); items.set(29,new ItemStack(Items.DIAMOND,7));
+            item.set(DataComponents.CONTAINER,net.minecraft.world.item.component.ItemContainerContents.fromItems(items));
+            var block=trapped ? net.minecraft.world.level.block.Blocks.TRAPPED_CHEST : net.minecraft.world.level.block.Blocks.CHEST;
+            net.minecraft.world.level.block.entity.ChestBlockEntity placed=trapped
+                ? new net.minecraft.world.level.block.entity.TrappedChestBlockEntity(BlockPos.ZERO,block.defaultBlockState())
+                : new net.minecraft.world.level.block.entity.ChestBlockEntity(BlockPos.ZERO,block.defaultBlockState());
+            placed.applyComponentsFromItemStack(item);
+            if(!nameComponent.equals(placed.getCustomName())) throw new AssertionError("placed chest name");
+            var tag=placed.saveWithFullMetadata(registries);
+            try(var out=new java.io.DataOutputStream(Files.newOutputStream(Path.of(args[0]+"."+trapped+"."+styled+".nbt")))) { net.minecraft.nbt.NbtIo.write(tag,(java.io.DataOutput)out); }
+            var itemTag=(net.minecraft.nbt.CompoundTag)ItemStack.CODEC.encodeStart(registries.createSerializationContext(net.minecraft.nbt.NbtOps.INSTANCE),item).getOrThrow();
+            try(var out=new java.io.DataOutputStream(Files.newOutputStream(Path.of(args[0]+"."+trapped+"."+styled+".item.nbt")))) { net.minecraft.nbt.NbtIo.write(itemTag,(java.io.DataOutput)out); }
+        }
         Items.DIRT.builtInRegistryHolder().bindComponents(DataComponentMap.builder().set(DataComponents.MAX_STACK_SIZE,64).build());
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var unsafe=(sun.misc.Unsafe)f.get(null);
         var delay=ItemEntity.class.getDeclaredField("pickupDelay"); delay.setAccessible(true);

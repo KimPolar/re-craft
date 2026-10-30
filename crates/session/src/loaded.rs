@@ -4873,15 +4873,17 @@ impl LoadedSession {
     }
 
     fn place_chest(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
-        use native_persistence::nbt::Tag;
         let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
         if !matches!(held.id(), "minecraft:chest" | "minecraft:trapped_chest")
             || held.max_count().is_none()
-            || !matches!(held.components(), Tag::Compound(fields) if fields.is_empty())
         {
             return None;
         }
+        let (custom_name, container) =
+            crate::saved_chest::placed_item_components(held.components()).ok()?;
+        let custom_name = custom_name.cloned();
+        let container = container.cloned();
         let name = held.id().to_owned();
         let Cell::State(clicked) = cell(
             &self.world,
@@ -5010,10 +5012,16 @@ impl LoadedSession {
             );
             Some((pos, state))
         };
+        let chest_data = crate::saved_chest::SavedChest::placed(
+            absolute,
+            &name,
+            custom_name,
+            container.as_ref(),
+        )
+        .ok()?;
         let id = self.intern_block(placed);
         self.placed_chests.insert(key);
-        self.chest_contents
-            .insert(key, crate::saved_chest::SavedChest::placed(absolute, &name));
+        self.chest_contents.insert(key, chest_data);
         if !self.set(target, id) {
             self.placed_chests.remove(&key);
             self.chest_contents.remove(&key);
@@ -12129,6 +12137,140 @@ mod tests {
     }
 
     #[test]
+    fn placed_chests_preserve_literal_and_styled_names() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let names = [
+            Tag::String("보관함 ♠".into()),
+            Tag::Compound(vec![
+                ("text".into(), Tag::String("treasure".into())),
+                ("bold".into(), Tag::Byte(1)),
+            ]),
+        ];
+        for id in ["minecraft:chest", "minecraft:trapped_chest"] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for name in &names {
+                    let mut session = session();
+                    let chunk = session.player_chunk().unwrap();
+                    Arc::make_mut(&mut session.world)
+                        .saved_block_entities
+                        .insert(chunk, SavedBlockEntities::Empty);
+                    let mut inventory = PlayerInventory::default();
+                    let original = ItemStack::new(
+                        id.into(),
+                        1,
+                        64,
+                        Tag::Compound(vec![
+                            ("minecraft:custom_name".into(), name.clone()),
+                            (
+                                "minecraft:container".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("slot".into(), Tag::Int(4)),
+                                        (
+                                            "item".into(),
+                                            Tag::Compound(vec![
+                                                (
+                                                    "id".into(),
+                                                    Tag::String("minecraft:diamond".into()),
+                                                ),
+                                                ("count".into(), Tag::Int(3)),
+                                            ]),
+                                        ),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )
+                    .unwrap();
+                    let restored = crate::player_data::read_stack(
+                        &crate::player_data::encode_stack(&original, None),
+                    )
+                    .unwrap();
+                    assert_eq!(restored.max_count(), Some(64));
+                    inventory.set_slot(hand, Some(restored));
+                    session.set_player_inventory(inventory);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    let pos = session.origin + IVec3::new(8, 2, 7);
+                    assert_eq!(
+                        session.saved_chest(pos).unwrap().unwrap().custom_name(),
+                        Some(name)
+                    );
+                    assert!(session.inventory.slot(hand).is_none());
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    assert!(
+                        matches!(session.inventory.menu(), Some(InventoryMenu::Chest { position, .. }) if position == pos)
+                    );
+                    assert_eq!(
+                        session.inventory.slot(PlayerSlot::Chest(4)).unwrap().id(),
+                        "minecraft:diamond"
+                    );
+                    assert_eq!(
+                        session
+                            .inventory
+                            .slot(PlayerSlot::Chest(4))
+                            .unwrap()
+                            .count(),
+                        3
+                    );
+                    assert_eq!(
+                        session.inventory.chest_title(),
+                        if matches!(name, Tag::String(_)) {
+                            Some("보관함 ♠")
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_container_component_does_not_consume_chest() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        let stack = ItemStack::new(
+            "minecraft:chest".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:container".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![("slot".into(), Tag::Int(4))])],
+                },
+            )]),
+        )
+        .unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(stack.clone()));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let position = session.origin + IVec3::new(8, 2, 7);
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(session.inventory.slot(PlayerSlot::Storage(0)), Some(&stack));
+    }
+
+    #[test]
     fn placed_chest_waterlogging_streaming_and_missing_entity_data() {
         use crate::inventory::PlayerSlot;
         use native_persistence::nbt::Tag;
@@ -12226,6 +12368,7 @@ mod tests {
 
     #[test]
     fn breaking_chests_scatter_contents_and_use_active_block_loot() {
+        use crate::inventory::PlayerSlot;
         use native_persistence::nbt::{self, Tag};
         use native_resources::packs::ResourceProvider;
         use native_world::loaded::SavedBlockEntities;
@@ -12295,6 +12438,30 @@ mod tests {
                         .get("minecraft:custom_name"),
                     Some(&Tag::String("treasure".into()))
                 );
+                let named = chest.unwrap().stack.clone();
+                assert!(
+                    Arc::make_mut(&mut session.inventory)
+                        .set_slot(PlayerSlot::Storage(0), Some(named))
+                );
+                let target = position - session.origin;
+                assert!(session.set(target + IVec3::NEG_Y, session.states[3]));
+                let hit = ShapeRayHit {
+                    position: target + IVec3::NEG_Y,
+                    face: IVec3::Y,
+                    location: DVec3::ZERO,
+                    inside: false,
+                };
+                assert_eq!(session.place_chest(hit), Some(PlayerSlot::Storage(0)));
+                assert_eq!(
+                    session
+                        .saved_chest(position)
+                        .unwrap()
+                        .unwrap()
+                        .custom_name(),
+                    Some(&Tag::String("treasure".into()))
+                );
+                assert!(session.try_open_saved_chest(target));
+                assert_eq!(session.inventory.chest_title(), Some("treasure"));
             } else {
                 assert!(chest.is_none());
             }

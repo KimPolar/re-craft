@@ -4683,6 +4683,61 @@ mod tests {
             .arg(&cp)
             .arg("ChestDropOracle")
             .arg(&output));
+        for (trapped, id) in [
+            (false, "minecraft:chest"),
+            (true, "minecraft:trapped_chest"),
+        ] {
+            for styled in [false, true] {
+                let path = output.with_file_name(format!("drops.json.{trapped}.{styled}.nbt"));
+                let java_tag = native_persistence::nbt::read(&std::fs::read(path).unwrap())
+                    .unwrap()
+                    .value;
+                let item_path =
+                    output.with_file_name(format!("drops.json.{trapped}.{styled}.item.nbt"));
+                let item_tag = native_persistence::nbt::read(&std::fs::read(item_path).unwrap())
+                    .unwrap()
+                    .value;
+                let stack = crate::player_data::read_stack(&item_tag).unwrap();
+                assert_eq!(stack.max_count(), Some(64));
+                let name = stack
+                    .components()
+                    .get("minecraft:custom_name")
+                    .unwrap()
+                    .clone();
+                assert_eq!(java_tag.get("CustomName"), Some(&name));
+                if !styled {
+                    assert_eq!(name, Tag::String("보관함 ♠".into()));
+                }
+                let container = stack.components().get("minecraft:container").unwrap();
+                let chest = crate::saved_chest::SavedChest::placed(
+                    IVec3::ZERO,
+                    id,
+                    Some(name.clone()),
+                    Some(container),
+                )
+                .unwrap();
+                assert_eq!(chest.custom_name(), Some(&name));
+                assert_eq!(chest.source().get("id"), java_tag.get("id"));
+                let document = native_persistence::nbt::NamedTag {
+                    name: "".into(),
+                    value: Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![java_tag],
+                    },
+                };
+                let payload = native_world::loaded::SavedBlockEntities::Encoded(
+                    native_persistence::nbt::write(&document).unwrap().into(),
+                );
+                let java_chest = crate::saved_chest::read(
+                    &payload,
+                    native_world::loaded::ChunkPos { x: 0, z: 0 },
+                    IVec3::ZERO,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(chest.slots, java_chest.slots);
+            }
+        }
         let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(rows.len(), 32);
         for (seed, row) in rows.iter().enumerate() {

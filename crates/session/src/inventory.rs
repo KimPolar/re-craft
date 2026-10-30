@@ -2424,6 +2424,11 @@ pub fn ordinary_item_default_durability(id: &str) -> Option<u32> {
 /// known. Other component patches remain intact in an unresolved stack.
 pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
     let default = ordinary_item_default_max(id)?;
+    if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
+        && crate::saved_chest::placed_item_components(components).is_ok()
+    {
+        return Some(default);
+    }
     let Tag::Compound(entries) = components else {
         return None;
     };

@@ -4387,13 +4387,9 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
-        let old_ore_lit = original_state.as_ref().and_then(redstone_ore_lit);
-        let new_ore_lit = redstone_ore_lit(&replacement_state);
-        let relight = match (old_ore_lit, new_ore_lit) {
-            (Some(old_lit), Some(new_lit)) if old_lit != new_lit => Some(false),
-            (Some(true), None) => Some(true),
-            _ => None,
-        };
+        let relight = original_state
+            .as_ref()
+            .and_then(|old| native_world::block_light::light_change(old, &replacement_state));
         let world = Arc::make_mut(&mut self.world);
         let chunk = world.chunks.get_mut(&chunk_pos).expect("chunk was checked");
         let chunk = Arc::make_mut(chunk);
@@ -4460,15 +4456,15 @@ impl LoadedSession {
                 current: id,
             });
         self.dirty_chunks.insert(chunk_pos);
-        if let Some(opacity_changed) = relight {
-            if let Some(changed) = native_world::block_light::relight_redstone(
+        if let Some(light_change) = relight {
+            if let Some(changed) = native_world::block_light::relight_block(
                 Arc::make_mut(&mut self.world),
                 BlockPosition {
                     x: pos.x,
                     y: pos.y,
                     z: pos.z,
                 },
-                opacity_changed,
+                light_change,
             ) {
                 self.dirty_chunks.extend(changed);
             }
@@ -7872,6 +7868,25 @@ mod tests {
             z: origin_chunk.z
         }));
         assert!(session.set_redstone_ore_lit(relative, false));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(0)
+        );
+
+        let torch = session.intern_block(state("minecraft:torch", &[]));
+        let air = session.states[0];
+        assert!(session.set(relative, air));
+        assert!(session.set(relative, torch));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(13)
+        );
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(relative, stone));
         assert_eq!(
             session
                 .world

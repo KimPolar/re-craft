@@ -1,4 +1,4 @@
-//! Conservative block-light recomputation for redstone ore state changes.
+//! Conservative block-light recomputation for supported block state changes.
 //!
 //! Only complete neighborhoods of supported block states are accepted.
 //! Unknown states or light data leave the existing light arrays untouched.
@@ -200,16 +200,61 @@ fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
     })
 }
 
-/// Recompute light after a redstone ore changes. A change in opacity can
-/// affect light from a level-15 source up to fourteen blocks away.
+/// A validated change to a block's light emission or attenuation.
+#[derive(Clone, Copy, Debug)]
+pub struct LightChange {
+    radius: u8,
+    allow_dark_skip: bool,
+}
+
+/// Determine whether a supported change can affect block light. Both states
+/// must have known light behavior; identical behavior needs no recomputation.
+pub fn light_change(old: &BlockState, new: &BlockState) -> Option<LightChange> {
+    let (old_opacity, old_emission) = properties(old)?;
+    let (new_opacity, new_emission) = properties(new)?;
+    let old_opacity = old_opacity.max(1);
+    let new_opacity = new_opacity.max(1);
+    if old_opacity == new_opacity && old_emission == new_emission {
+        return None;
+    }
+    let radius = if old_opacity != new_opacity {
+        14
+    } else {
+        old_emission.max(new_emission).saturating_sub(1)
+    };
+    Some(LightChange {
+        radius,
+        allow_dark_skip: old_emission == 0 && new_emission == 0,
+    })
+}
+
+/// Recompute light after a supported block state change. A change in opacity
+/// can affect light from a level-15 source up to fourteen blocks away.
 /// Returns None if any necessary state or light array is unavailable.
 /// On success the returned chunks are exactly those whose light changed.
-pub fn relight_redstone(
+pub fn relight_block(
     world: &mut World,
     center: BlockPosition,
-    opacity_changed: bool,
+    change: LightChange,
 ) -> Option<BTreeSet<ChunkPos>> {
-    let radius: i32 = if opacity_changed { 14 } else { 8 };
+    // With no light at the changed cell or any of its neighbors, an
+    // emission-free opacity change cannot alter the surrounding block light.
+    if change.allow_dark_skip {
+        let dark = std::iter::once(center)
+            .chain(DIRECTIONS.into_iter().filter_map(|d| offset(center, d)))
+            .all(|p| {
+                world.chunks.get(&p.chunk()).is_some_and(|chunk| {
+                    chunk.status.as_deref() == Some("minecraft:full")
+                        && chunk.block_light_correct
+                        && world.light(p.x, p.y, p.z, false) == Some(0)
+                })
+            });
+        // At an integer coordinate limit, an absent neighbor is unknown.
+        if dark && DIRECTIONS.into_iter().all(|d| offset(center, d).is_some()) {
+            return Some(BTreeSet::new());
+        }
+    }
+    let radius = i32::from(change.radius);
     let mut cells = BTreeMap::new();
     for dx in -radius..=radius {
         for dy in -radius..=radius {
@@ -360,10 +405,26 @@ mod tests {
         set(&mut world, center, unlit);
         set(&mut world, other, lit);
         set(&mut world, wall, stone);
-        relight_redstone(&mut world, other, false).unwrap();
+        relight_block(
+            &mut world,
+            other,
+            LightChange {
+                radius: 8,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         let old = world.clone();
         set(&mut world, center, lit);
-        let changed = relight_redstone(&mut world, center, false).unwrap();
+        let changed = relight_block(
+            &mut world,
+            center,
+            LightChange {
+                radius: 8,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         assert!(changed.len() > 1, "light crosses chunk boundaries");
         assert_eq!(light(&world, center), 9);
         assert_eq!(light(&world, position(14, 15, 15)), 8);
@@ -375,7 +436,15 @@ mod tests {
         );
         assert_eq!(light(&old, center), 0);
         set(&mut world, center, unlit);
-        relight_redstone(&mut world, center, false).unwrap();
+        relight_block(
+            &mut world,
+            center,
+            LightChange {
+                radius: 8,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         assert_eq!(
             light(&world, position(16, 15, 15)),
             5,
@@ -392,7 +461,17 @@ mod tests {
         let unknown = world.intern_state(state("unknown_block", None));
         set(&mut world, position(14, 15, 15), unknown);
         let before = world.clone();
-        assert!(relight_redstone(&mut world, center, false).is_none());
+        assert!(
+            relight_block(
+                &mut world,
+                center,
+                LightChange {
+                    radius: 8,
+                    allow_dark_skip: false
+                }
+            )
+            .is_none()
+        );
         for (key, chunk) in &world.chunks {
             assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
         }
@@ -411,7 +490,19 @@ mod tests {
         set(&mut world, center, lit);
         let before = world.clone();
         assert_eq!(light(&world, center), 0);
-        assert!(relight_redstone(&mut world, center, false).unwrap().len() > 1);
+        assert!(
+            relight_block(
+                &mut world,
+                center,
+                LightChange {
+                    radius: 8,
+                    allow_dark_skip: false
+                }
+            )
+            .unwrap()
+            .len()
+                > 1
+        );
         assert_eq!(light(&world, position(16, 15, 15)), 8);
         assert_eq!(light(&before, position(16, 15, 15)), 0);
         assert!(
@@ -427,8 +518,39 @@ mod tests {
         Arc::make_mut(incomplete.chunks.get_mut(&neighbor).unwrap()).block_light_correct = false;
         set(&mut incomplete, center, lit);
         let before = incomplete.clone();
-        assert!(relight_redstone(&mut incomplete, center, false).is_none());
+        assert!(
+            relight_block(
+                &mut incomplete,
+                center,
+                LightChange {
+                    radius: 8,
+                    allow_dark_skip: false
+                }
+            )
+            .is_none()
+        );
         for (key, chunk) in &incomplete.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
+        }
+    }
+
+    #[test]
+    fn opaque_changes_in_complete_darkness_do_not_scan_unrelated_blocks() {
+        let (mut world, _, _, stone) = fixture();
+        let center = position(15, 15, 15);
+        let unknown = world.intern_state(state("unknown_block", None));
+        set(&mut world, position(20, 15, 15), unknown);
+        let old = world.block(center.x, center.y, center.z).unwrap().clone();
+        set(&mut world, center, stone);
+        let change =
+            light_change(&old, world.block(center.x, center.y, center.z).unwrap()).unwrap();
+        let before = world.clone();
+        assert!(
+            relight_block(&mut world, center, change)
+                .unwrap()
+                .is_empty()
+        );
+        for (key, chunk) in &world.chunks {
             assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
         }
     }
@@ -438,10 +560,26 @@ mod tests {
         let (mut world, _, lit, _) = fixture();
         let center = position(15, 15, 15);
         set(&mut world, center, lit);
-        relight_redstone(&mut world, center, false).unwrap();
+        relight_block(
+            &mut world,
+            center,
+            LightChange {
+                radius: 8,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         let air = world.intern_state(state("air", None));
         set(&mut world, center, air);
-        relight_redstone(&mut world, center, true).unwrap();
+        relight_block(
+            &mut world,
+            center,
+            LightChange {
+                radius: 14,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         assert_eq!(light(&world, center), 0);
         assert_eq!(light(&world, position(16, 15, 15)), 0);
     }
@@ -642,6 +780,13 @@ mod tests {
             (15, 15, 15, "unlit"),
             (15, 15, 15, "lit"),
             (15, 15, 15, "air"),
+            (15, 15, 15, "torch"),
+            (15, 15, 15, "air"),
+            (15, 15, 15, "stone"),
+            (15, 15, 15, "air"),
+            (15, 15, 15, "water"),
+            (15, 15, 15, "wet_pane"),
+            (15, 15, 15, "air"),
         ];
         let json = |items: &[(i32, i32, i32, &str)]| {
             items
@@ -703,12 +848,23 @@ mod tests {
         for (x, y, z, name) in initial {
             set(&mut world, position(x, y, z), id(name));
         }
-        relight_redstone(&mut world, position(15, 15, 15), true).unwrap();
+        relight_block(
+            &mut world,
+            position(15, 15, 15),
+            LightChange {
+                radius: 14,
+                allow_dark_skip: false,
+            },
+        )
+        .unwrap();
         assert_eq!(expected.len(), actions.len());
         for ((x, y, z, name), expected) in actions.into_iter().zip(expected) {
             let p = position(x, y, z);
+            let old = world.block(p.x, p.y, p.z).unwrap().clone();
             set(&mut world, p, id(name));
-            relight_redstone(&mut world, p, name == "air").unwrap();
+            if let Some(change) = light_change(&old, world.block(p.x, p.y, p.z).unwrap()) {
+                relight_block(&mut world, p, change).unwrap();
+            }
             assert_eq!(expected.len(), 31 * 31 * 31);
             for y in 0..31 {
                 for z in 0..31 {

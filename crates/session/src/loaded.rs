@@ -1495,7 +1495,7 @@ impl LoadedSession {
             || self.tick_dirty_chunks.contains(&position)
             || self.tick_chunks_needing_dirty.contains(&position)
             || self.chest_dirty_chunks.contains(&position)
-            || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p }) if p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)
+            || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z))
     }
 
     // Activated entity data is the source for drafts even when its terrain is
@@ -2261,7 +2261,7 @@ impl LoadedSession {
         self.entity_chunks.get(&pos)
     }
 
-    /// Inspect a loaded single chest without generating its loot or modifying it.
+    /// Inspect a loaded chest half without generating its loot or modifying it.
     pub fn saved_chest(
         &self,
         position: IVec3,
@@ -2294,8 +2294,11 @@ impl LoadedSession {
             "unsupported chest block state"
         );
         ensure!(
-            block.properties.get("type").map(String::as_str) == Some("single"),
-            "double chest is not yet supported"
+            matches!(
+                block.properties.get("type").map(String::as_str),
+                Some("single" | "left" | "right")
+            ),
+            "unsupported chest type"
         );
         let payload = self
             .world
@@ -2322,27 +2325,28 @@ impl LoadedSession {
         if !self.inventory.has_closed_chest() {
             return;
         }
-        let Some((position, slots)) = Arc::make_mut(&mut self.inventory).take_closed_chest() else {
+        let Some((position, other, slots)) = Arc::make_mut(&mut self.inventory).take_closed_chest()
+        else {
             return;
         };
-        let key = (position.x, position.y, position.z);
-        let chest = self
-            .chest_contents
-            .get_mut(&key)
-            .expect("opened chest has an owner");
-        if chest.slots != slots {
-            chest.slots = slots;
-            self.chest_dirty_chunks.insert(ChunkPos {
-                x: position.x.div_euclid(16),
-                z: position.z.div_euclid(16),
-            });
+        for (index, position) in [Some(position), other].into_iter().flatten().enumerate() {
+            let key = (position.x, position.y, position.z);
+            let chest = self
+                .chest_contents
+                .get_mut(&key)
+                .expect("opened chest has an owner");
+            let values = std::array::from_fn(|slot| slots[index * 27 + slot].clone());
+            if chest.slots != values {
+                chest.slots = values;
+                self.chest_dirty_chunks.insert(ChunkPos {
+                    x: position.x.div_euclid(16),
+                    z: position.z.div_euclid(16),
+                });
+            }
         }
     }
 
-    fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
-        let Some(position) = add(self.origin, relative) else {
-            return false;
-        };
+    fn chest_unblocked(&self, relative: IVec3) -> bool {
         let Some(above) = add(relative, IVec3::Y) else {
             return false;
         };
@@ -2354,20 +2358,89 @@ impl LoadedSession {
             return false;
         };
         // Unknown conductor behavior must not be treated as open space.
-        if !matches!(
+        matches!(
             crate::redstone::source(above, IVec3::Y),
             Some((_, _, false))
-        ) {
+        )
+    }
+
+    fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
+        let Some(position) = add(self.origin, relative) else {
+            return false;
+        };
+        if !self.chest_unblocked(relative) {
             return false;
         }
+        let Some(block) = self.world.block(position.x, position.y, position.z) else {
+            return false;
+        };
+        let kind = block.properties.get("type").map(String::as_str);
         let Ok(Some(chest)) = self.saved_chest(position) else {
             return false;
         };
-        let key = (position.x, position.y, position.z);
-        if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
-            return false;
+        let pair = match kind {
+            Some("single") => None,
+            Some("left" | "right") => {
+                let Some(direction) = native_world::collision::chest_connection(block) else {
+                    return false;
+                };
+                let Some(other_position) = add(position, direction) else {
+                    return false;
+                };
+                let Some(other_relative) = subtract(other_position, self.origin) else {
+                    return false;
+                };
+                if !self.chest_unblocked(other_relative) {
+                    return false;
+                }
+                let Some(other_block) =
+                    self.world
+                        .block(other_position.x, other_position.y, other_position.z)
+                else {
+                    return false;
+                };
+                let expected = if kind == Some("left") {
+                    "right"
+                } else {
+                    "left"
+                };
+                if other_block.name != block.name
+                    || other_block.properties.get("facing") != block.properties.get("facing")
+                    || other_block.properties.get("type").map(String::as_str) != Some(expected)
+                    || native_world::collision::chest_connection(other_block) != Some(-direction)
+                {
+                    return false;
+                }
+                let Ok(Some(other)) = self.saved_chest(other_position) else {
+                    return false;
+                };
+                Some((other_position, other))
+            }
+            _ => return false,
+        };
+        let key = |p: IVec3| (p.x, p.y, p.z);
+        if let Some((other_position, other)) = pair {
+            let (right_position, right, left_position, left) = if kind == Some("right") {
+                (position, chest, other_position, other)
+            } else {
+                (other_position, other, position, chest)
+            };
+            if !Arc::make_mut(&mut self.inventory).open_double_chest(
+                right_position,
+                left_position,
+                right.slots.clone(),
+                left.slots.clone(),
+            ) {
+                return false;
+            }
+            self.chest_contents.insert(key(right_position), right);
+            self.chest_contents.insert(key(left_position), left);
+        } else {
+            if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
+                return false;
+            }
+            self.chest_contents.insert(key(position), chest);
         }
-        self.chest_contents.insert(key, chest);
         true
     }
 
@@ -7524,14 +7597,19 @@ impl LoadedSession {
             self.inventory.menu()
         {
             let position = match menu {
-                InventoryMenu::CraftingTable { position } | InventoryMenu::Chest { position } => {
-                    position
-                }
+                InventoryMenu::CraftingTable { position }
+                | InventoryMenu::Chest { position, .. } => position,
                 InventoryMenu::Player => unreachable!(),
             };
             let relative = subtract(position, self.origin);
             let valid = relative.is_some_and(|relative| {
-                matches!(cell(&self.world, self.origin, self.bounds, relative, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| match menu { InventoryMenu::CraftingTable { .. } => state.name == "minecraft:crafting_table", InventoryMenu::Chest { .. } => matches!(state.name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") && state.properties.get("type").is_some_and(|value| value == "single"), InventoryMenu::Player => false }))
+                matches!(cell(&self.world, self.origin, self.bounds, relative, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| match menu { InventoryMenu::CraftingTable { .. } => state.name == "minecraft:crafting_table", InventoryMenu::Chest { other: None, .. } => matches!(state.name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") && state.properties.get("type").is_some_and(|value| value == "single"), InventoryMenu::Chest { other: Some(other), .. } => {
+                    let connected = native_world::collision::chest_connection(state);
+                    state.properties.get("type").is_some_and(|value| value == "right")
+                        && connected.and_then(|direction| add(position, direction)) == Some(other)
+                        && self.world.block(other.x, other.y, other.z).is_some_and(|half| half.name == state.name && half.properties.get("facing") == state.properties.get("facing") && half.properties.get("type").is_some_and(|value| value == "left") && native_world::collision::chest_connection(half) == connected.map(|direction| -direction))
+                        && subtract(other, self.origin).is_some_and(|relative| within_crafting_range(self.motion.position, self.player.pose, relative, self.game_mode))
+                }, InventoryMenu::Player => false }))
                     && within_crafting_range(self.motion.position, self.player.pose, relative, self.game_mode)
             });
             if !valid && let Some(drops) = Arc::make_mut(&mut self.inventory).toggle_with_drops() {
@@ -11248,7 +11326,10 @@ mod tests {
         session.update(TICK);
         assert_eq!(
             session.inventory.menu(),
-            Some(InventoryMenu::Chest { position })
+            Some(InventoryMenu::Chest {
+                position,
+                other: None
+            })
         );
         let old = session.snapshot();
         session.submit_command(PlayerCommand::InventoryQuickMove {
@@ -11292,7 +11373,10 @@ mod tests {
         session.update(TICK);
         assert_eq!(
             session.inventory.menu(),
-            Some(InventoryMenu::Chest { position })
+            Some(InventoryMenu::Chest {
+                position,
+                other: None
+            })
         );
         assert!(session.inventory.slot(PlayerSlot::Chest(3)).is_none());
         assert_eq!(
@@ -11351,6 +11435,247 @@ mod tests {
         );
         assert!(session.saved_chest(position).unwrap().unwrap().slots[3].is_none());
         assert!(session.chest_dirty_chunks.contains(&home));
+    }
+
+    #[test]
+    fn double_chest_opens_from_either_half_and_keeps_each_inventory() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{self, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, _, left, home) = saved_chest_fixture();
+        let right = left + IVec3::X;
+        let left_state = session.intern_block(state(
+            "minecraft:chest",
+            &[
+                ("facing", "north"),
+                ("type", "left"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let right_state = session.intern_block(state(
+            "minecraft:chest",
+            &[
+                ("facing", "north"),
+                ("type", "right"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set(left - session.origin, left_state));
+        assert!(session.set(right - session.origin, right_state));
+        let payload = session.world.saved_block_entities.get(&home).unwrap();
+        let SavedBlockEntities::Encoded(bytes) = payload else {
+            panic!("expected fixture payload")
+        };
+        let mut document = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut document.value else {
+            panic!("expected entity list")
+        };
+        values.push(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(right.x)),
+            ("y".into(), Tag::Int(right.y)),
+            ("z".into(), Tag::Int(right.z)),
+            (
+                "Items".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("Slot".into(), Tag::Byte(0)),
+                        ("id".into(), Tag::String("minecraft:diamond".into())),
+                        ("count".into(), Tag::Int(3)),
+                    ])],
+                },
+            ),
+        ]));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                home,
+                SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+            );
+        session.set_player_inventory(PlayerInventory::default());
+        assert!(session.set(right - session.origin + IVec3::Y, session.states[3]));
+        assert!(!session.try_open_saved_chest(left - session.origin));
+        assert!(session.set(right - session.origin + IVec3::Y, session.states[0]));
+        let wrong = session.intern_block(state(
+            "minecraft:chest",
+            &[
+                ("facing", "south"),
+                ("type", "right"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        assert!(session.set(right - session.origin, wrong));
+        assert!(!session.try_open_saved_chest(left - session.origin));
+        assert!(session.set(right - session.origin, right_state));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest {
+                position: right,
+                other: Some(left)
+            })
+        );
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Chest(0))
+                .unwrap()
+                .count(),
+            3
+        );
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Chest(30))
+                .unwrap()
+                .count(),
+            5
+        );
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(30),
+        });
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(0),
+        });
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            8
+        );
+        assert!(session.saved_chest(left).unwrap().unwrap().slots[3].is_none());
+        assert!(session.saved_chest(right).unwrap().unwrap().slots[0].is_none());
+        assert!(session.chest_dirty_chunks.contains(&home));
+        assert!(session.try_open_saved_chest(right - session.origin));
+        assert_eq!(
+            session.inventory.menu(),
+            Some(InventoryMenu::Chest {
+                position: right,
+                other: Some(left)
+            })
+        );
+        assert!(session.inventory.slot(PlayerSlot::Chest(0)).is_none());
+        assert!(session.inventory.slot(PlayerSlot::Chest(30)).is_none());
+    }
+
+    #[test]
+    fn double_chest_changes_survive_when_both_chunks_are_streamed_out() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut world, origin, player) = fixture();
+        let left = origin + IVec3::new(15, 2, 6);
+        let right = left + IVec3::X;
+        let left_chunk = ChunkPos {
+            x: left.x.div_euclid(16),
+            z: left.z.div_euclid(16),
+        };
+        let right_chunk = ChunkPos {
+            x: right.x.div_euclid(16),
+            z: right.z.div_euclid(16),
+        };
+        let air = world.intern_state(state("minecraft:air", &[]));
+        world.chunks.insert(
+            right_chunk,
+            Arc::new(Chunk {
+                position: right_chunk,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([air; BLOCK_COUNT])),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        for (position, chunk, kind, count) in [
+            (left, left_chunk, "left", 5),
+            (right, right_chunk, "right", 3),
+        ] {
+            let block = world.intern_state(state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", kind),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            world
+                .set_block_id(position.x, position.y, position.z, block)
+                .unwrap();
+            let entity = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(position.x)),
+                ("y".into(), Tag::Int(position.y)),
+                ("z".into(), Tag::Int(position.z)),
+                (
+                    "Items".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("Slot".into(), Tag::Byte(0)),
+                            ("id".into(), Tag::String("minecraft:diamond".into())),
+                            ("count".into(), Tag::Int(count)),
+                        ])],
+                    },
+                ),
+            ]);
+            let payload = nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity],
+                },
+            })
+            .unwrap();
+            world
+                .saved_block_entities
+                .insert(chunk, SavedBlockEntities::Encoded(payload.into()));
+        }
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_player_inventory(PlayerInventory::default());
+        assert!(session.try_open_saved_chest(left - origin));
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(0),
+        });
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(27),
+        });
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        assert!(session.chest_dirty_chunks.contains(&left_chunk));
+        assert!(session.chest_dirty_chunks.contains(&right_chunk));
+        let remote = ChunkPos {
+            x: left_chunk.x + 5,
+            z: left_chunk.z,
+        };
+        session.queue_chunk_window(remote, 0);
+        session.apply_streaming();
+        assert!(session.parked_chunks.contains_key(&left_chunk));
+        assert!(session.parked_chunks.contains_key(&right_chunk));
+        session.queue_chunk_window(left_chunk, 1);
+        session.apply_streaming();
+        assert!(session.saved_chest(left).unwrap().unwrap().slots[0].is_none());
+        assert!(session.saved_chest(right).unwrap().unwrap().slots[0].is_none());
     }
 
     #[test]

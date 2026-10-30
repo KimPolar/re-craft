@@ -251,7 +251,7 @@ pub enum PlayerSlot {
     CraftResult,
     Armor(u8),
     Offhand,
-    /// Slot in the open single chest.
+    /// Slot in the open single or double chest.
     Chest(u8),
 }
 
@@ -274,13 +274,15 @@ pub enum InventoryMenu {
     },
     Chest {
         position: IVec3,
+        other: Option<IVec3>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct ChestInventory {
     position: IVec3,
-    slots: [Option<ItemStack>; 27],
+    other: Option<IVec3>,
+    slots: Vec<Option<ItemStack>>,
 }
 
 /// The player's saved recipe-book state; unknown recipe IDs remain preserved.
@@ -717,7 +719,11 @@ impl PlayerInventory {
             }
             PlayerSlot::CraftResult => false,
             PlayerSlot::Chest(index) => {
-                matches!(self.menu, Some(InventoryMenu::Chest { .. })) && index < 27
+                matches!(self.menu, Some(InventoryMenu::Chest { .. }))
+                    && self
+                        .chest
+                        .as_ref()
+                        .is_some_and(|chest| usize::from(index) < chest.slots.len())
             }
         };
         if !valid || !basic_pickup_supported(carried) {
@@ -877,6 +883,29 @@ impl PlayerInventory {
     /// Open a chest whose contents have been loaded by the session. A closed
     /// chest must be taken by its owner before another one can be opened.
     pub fn open_chest(&mut self, position: IVec3, slots: [Option<ItemStack>; 27]) -> bool {
+        self.open_chest_slots(position, None, Vec::from(slots))
+    }
+    /// A double chest presents the right half first, followed by the left half.
+    pub fn open_double_chest(
+        &mut self,
+        right: IVec3,
+        left: IVec3,
+        right_slots: [Option<ItemStack>; 27],
+        left_slots: [Option<ItemStack>; 27],
+    ) -> bool {
+        if right == left {
+            return false;
+        }
+        let mut slots = Vec::from(right_slots);
+        slots.extend(left_slots);
+        self.open_chest_slots(right, Some(left), slots)
+    }
+    fn open_chest_slots(
+        &mut self,
+        position: IVec3,
+        other: Option<IVec3>,
+        slots: Vec<Option<ItemStack>>,
+    ) -> bool {
         if self.is_open()
             || self.chest.is_some()
             || self.cursor.is_some()
@@ -884,8 +913,12 @@ impl PlayerInventory {
         {
             return false;
         }
-        self.chest = Some(ChestInventory { position, slots });
-        self.menu = Some(InventoryMenu::Chest { position });
+        self.chest = Some(ChestInventory {
+            position,
+            other,
+            slots,
+        });
+        self.menu = Some(InventoryMenu::Chest { position, other });
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -893,13 +926,13 @@ impl PlayerInventory {
     pub fn has_closed_chest(&self) -> bool {
         !self.is_open() && self.chest.is_some()
     }
-    pub fn take_closed_chest(&mut self) -> Option<(IVec3, [Option<ItemStack>; 27])> {
+    pub fn take_closed_chest(&mut self) -> Option<(IVec3, Option<IVec3>, Vec<Option<ItemStack>>)> {
         if !self.has_closed_chest() {
             return None;
         }
         let chest = self.chest.take()?;
         self.revision = self.revision.wrapping_add(1);
-        Some((chest.position, chest.slots))
+        Some((chest.position, chest.other, chest.slots))
     }
     pub fn open_crafting_table(&mut self, position: IVec3) -> bool {
         if self.is_open()
@@ -1088,7 +1121,7 @@ impl PlayerInventory {
             && !matches!(source, PlayerSlot::Crafting(index) if (index as usize) < self.crafting_len())
             && !matches!(source, PlayerSlot::Armor(0..=3))
             && !(matches!(self.menu, Some(InventoryMenu::Chest { .. }))
-                && matches!(source, PlayerSlot::Chest(0..=26)))
+                && matches!(source, PlayerSlot::Chest(index) if self.chest.as_ref().is_some_and(|chest| usize::from(index) < chest.slots.len())))
         {
             return None;
         }
@@ -1828,12 +1861,13 @@ impl PlayerInventory {
         let Some(chest) = self.chest.as_mut() else {
             return false;
         };
+        let chest_len = chest.slots.len();
         let (source, destination, indexes): (
             &mut Option<ItemStack>,
             &mut [Option<ItemStack>],
             Vec<usize>,
         ) = match slot {
-            PlayerSlot::Chest(index) if index < 27 => (
+            PlayerSlot::Chest(index) if usize::from(index) < chest_len => (
                 &mut chest.slots[index as usize],
                 &mut self.storage,
                 (0..9).rev().chain((9..36).rev()).collect(),
@@ -1841,7 +1875,7 @@ impl PlayerInventory {
             PlayerSlot::Storage(index) if index < 36 => (
                 &mut self.storage[index as usize],
                 &mut chest.slots,
-                (0..27).collect(),
+                (0..chest_len).collect(),
             ),
             _ => return false,
         };
@@ -3474,8 +3508,9 @@ mod tests {
         assert!(!inventory.ready_for_player_save());
         assert!(!inventory.open_chest(position, std::array::from_fn(|_| None)));
         assert!(!inventory.toggle());
-        let (returned_position, slots) = inventory.take_closed_chest().unwrap();
+        let (returned_position, other, slots) = inventory.take_closed_chest().unwrap();
         assert_eq!(returned_position, position);
+        assert_eq!(other, None);
         assert_eq!(slots[0].as_ref().unwrap().count(), 4);
         assert!(inventory.ready_for_player_save());
     }

@@ -1373,12 +1373,21 @@ mod tests {
                 }
                 self.0.read_asset(path)
             }
-            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> { self.0.read_data(path) }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0.read_data(path)
+            }
         }
-        let pack_scene = PreviewScene::prepare(&world, &mut Override(&mut resources), IVec3::ZERO, 1024).unwrap();
+        let pack_scene =
+            PreviewScene::prepare(&world, &mut Override(&mut resources), IVec3::ZERO, 1024)
+                .unwrap();
         assert!(pack_scene.warnings.is_empty(), "{:?}", pack_scene.warnings);
         assert_eq!(pack_scene.opaque_len(), 2 * 18 * 6 + 36);
-        assert!(pack_scene.atlas.rectangle(&ResourceId::parse("minecraft:block/stone").unwrap()).is_some());
+        assert!(
+            pack_scene
+                .atlas
+                .rectangle(&ResourceId::parse("minecraft:block/stone").unwrap())
+                .is_some()
+        );
     }
 
     #[test]

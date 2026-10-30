@@ -48,6 +48,10 @@ public class CollisionOracle {
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             JsonObject record = new JsonObject();
             record.addProperty("id", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+            if (state.getBlock() instanceof net.minecraft.world.level.block.ChestBlock) {
+                record.addProperty("chestDirection", net.minecraft.world.level.block.ChestBlock.getConnectedDirection(state).getName());
+                record.addProperty("chestOrder", net.minecraft.world.level.block.ChestBlock.getBlockType(state).name());
+            }
             record.addProperty("solid", state.isSolid());
             record.addProperty("slab_stair", state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock);
             record.addProperty("replaceable", state.canBeReplaced());
@@ -324,6 +328,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut button_states_checked = 0usize;
     let mut lever_states_checked = 0usize;
     let mut single_chest_states_checked = 0usize;
+    let mut double_chest_states_checked = 0usize;
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
@@ -389,6 +394,32 @@ fn implemented_collision_shapes_match_vanilla_states() {
                 .is_some_and(|value| value == "single")
         {
             single_chest_states_checked += 1;
+        }
+        if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
+            && matches!(
+                state.properties.get("type").map(String::as_str),
+                Some("left" | "right")
+            )
+        {
+            double_chest_states_checked += 1;
+            let direction = native_world::collision::chest_connection(&state).unwrap();
+            let expected = match entry["chestDirection"].as_str().unwrap() {
+                "north" => glam::IVec3::NEG_Z,
+                "south" => glam::IVec3::Z,
+                "west" => glam::IVec3::NEG_X,
+                "east" => glam::IVec3::X,
+                other => panic!("invalid chest direction {other}"),
+            };
+            assert_eq!(direction, expected, "{state:?}");
+            assert_eq!(
+                entry["chestOrder"].as_str(),
+                Some(if state.properties["type"] == "right" {
+                    "FIRST"
+                } else {
+                    "SECOND"
+                }),
+                "{state:?}"
+            );
         }
         let short_id = id.strip_prefix("minecraft:").unwrap();
         if matches!(
@@ -515,6 +546,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert_eq!(
         single_chest_states_checked, 16,
         "single chest states missing from Java oracle"
+    );
+    assert_eq!(
+        double_chest_states_checked, 32,
+        "double chest states missing from Java oracle"
     );
     assert!(fire_checked >= 2, "fire states missing from Java oracle");
     assert!(plant_checked >= 3, "plant states missing from Java oracle");

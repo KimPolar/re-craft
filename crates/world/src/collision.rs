@@ -183,20 +183,43 @@ mod face_tests {
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
     if matches!(id, "chest" | "trapped_chest") {
-        return (state.properties.len() == 3
+        if !(state.properties.len() == 3
             && matches!(
                 state.properties.get("facing").map(String::as_str),
                 Some("north" | "south" | "west" | "east")
             )
-            && state
-                .properties
-                .get("type")
-                .is_some_and(|value| value == "single")
+            && matches!(
+                state.properties.get("type").map(String::as_str),
+                Some("single" | "left" | "right")
+            )
             && matches!(
                 state.properties.get("waterlogged").map(String::as_str),
                 Some("true" | "false")
             ))
-        .then(|| SINGLE_CHEST.to_vec());
+        {
+            return None;
+        }
+        let mut shape = SINGLE_CHEST[0];
+        if state
+            .properties
+            .get("type")
+            .is_some_and(|value| value != "single")
+        {
+            let direction = chest_connection(state)?;
+            if direction.x < 0 {
+                shape.min.x = 0.0;
+            }
+            if direction.x > 0 {
+                shape.max.x = 1.0;
+            }
+            if direction.z < 0 {
+                shape.min.z = 0.0;
+            }
+            if direction.z > 0 {
+                shape.max.z = 1.0;
+            }
+        }
+        return Some(vec![shape]);
     }
     if id == "lever" {
         lever_outline(state)?;
@@ -345,6 +368,33 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         return Some(FULL.to_vec());
     }
     None
+}
+
+/// Direction from one double chest half toward the other, as in ChestBlock.
+pub fn chest_connection(state: &BlockState) -> Option<IVec3> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:chest" | "minecraft:trapped_chest"
+    ) || state.properties.len() != 3
+        || !matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    let facing = match state.properties.get("facing")?.as_str() {
+        "north" => IVec3::NEG_Z,
+        "south" => IVec3::Z,
+        "west" => IVec3::NEG_X,
+        "east" => IVec3::X,
+        _ => return None,
+    };
+    match state.properties.get("type")?.as_str() {
+        "left" => Some(IVec3::new(-facing.z, 0, facing.x)),
+        "right" => Some(IVec3::new(facing.z, 0, -facing.x)),
+        _ => None,
+    }
 }
 
 /// Java's cached `isSolid` for verified vanilla slab and stair states.

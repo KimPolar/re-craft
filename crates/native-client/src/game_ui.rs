@@ -1334,13 +1334,14 @@ impl GameUi {
         let scale = gui_scale(self.size.0, self.size.1).max(1);
         let w = (self.size.0 / scale) as i32;
         let h = (self.size.1 / scale) as i32;
-        if matches!(self.inventory_menu, Some(InventoryMenu::Chest { .. })) {
-            let (x, y) = ((w - 176) / 2, (h - 168) / 2);
+        if let Some(InventoryMenu::Chest { other, .. }) = self.inventory_menu {
+            let height = if other.is_some() { 222 } else { 168 };
+            let (x, y) = ((w - 176) / 2, (h - height) / 2);
             return !Rect {
                 x,
                 y,
                 w: 176,
-                h: 168,
+                h: height,
             }
             .contains(self.cursor.0, self.cursor.1);
         }
@@ -1706,9 +1707,13 @@ impl GameUi {
         if let Some(menu) = inventory.menu() {
             canvas.fill(Rect { x: 0, y: 0, w, h }, [0, 0, 0, 100]);
             let chest_menu = matches!(menu, InventoryMenu::Chest { .. });
+            let double_chest = matches!(menu, InventoryMenu::Chest { other: Some(_), .. });
             let book_open = !chest_menu && self.recipe_book.is_open();
             let (x, y) = if chest_menu {
-                ((w - 176) / 2, (h - 168) / 2)
+                (
+                    (w - 176) / 2,
+                    (h - if double_chest { 222 } else { 168 }) / 2,
+                )
             } else {
                 inventory_origin(w, h, book_open)
             };
@@ -1717,13 +1722,20 @@ impl GameUi {
                     match menu {
                         InventoryMenu::Player => &assets.inventory,
                         InventoryMenu::CraftingTable { .. } => &assets.crafting_table,
-                        InventoryMenu::Chest { .. } => &assets.chest,
+                        InventoryMenu::Chest { other: None, .. } => &assets.chest,
+                        InventoryMenu::Chest { other: Some(_), .. } => &assets.double_chest,
                     },
                     Rect {
                         x,
                         y,
                         w: 176,
-                        h: if chest_menu { 167 } else { 166 },
+                        h: if double_chest {
+                            221
+                        } else if chest_menu {
+                            167
+                        } else {
+                            166
+                        },
                     },
                 );
                 if player_menu {
@@ -1754,13 +1766,17 @@ impl GameUi {
                         Some(assets),
                         x + 8,
                         y + 6,
-                        assets.translate("container.chest", "Chest"),
+                        if double_chest {
+                            assets.translate("container.chestDouble", "Large Chest")
+                        } else {
+                            assets.translate("container.chest", "Chest")
+                        },
                         [64, 64, 64],
                     );
                     canvas.text_without_shadow(
                         Some(assets),
                         x + 8,
-                        y + 74,
+                        y + if double_chest { 128 } else { 74 },
                         assets.translate("container.inventory", "Inventory"),
                         [64, 64, 64],
                     );
@@ -1845,7 +1861,7 @@ impl GameUi {
                     }
                 }
                 if chest_menu {
-                    for index in 0..27_u8 {
+                    for index in 0..if double_chest { 54_u8 } else { 27_u8 } {
                         let slot = PlayerSlot::Chest(index);
                         let (sx, sy) = menu_slot_position(slot, menu).expect("chest slot");
                         inventory_slot_icon(
@@ -2493,14 +2509,14 @@ fn menu_slot_position(slot: PlayerSlot, menu: InventoryMenu) -> Option<(i32, i32
             PlayerSlot::CraftResult => Some((124, 35)),
             _ => None,
         },
-        InventoryMenu::Chest { .. } => match slot {
-            PlayerSlot::Chest(index) if index < 27 => Some((
+        InventoryMenu::Chest { other, .. } => match slot {
+            PlayerSlot::Chest(index) if index < if other.is_some() { 54 } else { 27 } => Some((
                 8 + i32::from(index % 9) * 18,
                 18 + i32::from(index / 9) * 18,
             )),
             PlayerSlot::Storage(index) if index < 36 => {
                 let (x, y) = storage_slot_position(index);
-                Some((x, y + 1))
+                Some((x, y + if other.is_some() { 55 } else { 1 }))
             }
             _ => None,
         },
@@ -2523,8 +2539,11 @@ fn inventory_slot_at(
     if book_open && w < 379 {
         return None;
     }
-    let origin = if matches!(menu, InventoryMenu::Chest { .. }) {
-        ((w - 176) / 2, (h - 168) / 2)
+    let origin = if let InventoryMenu::Chest { other, .. } = menu {
+        (
+            (w - 176) / 2,
+            (h - if other.is_some() { 222 } else { 168 }) / 2,
+        )
     } else {
         inventory_origin(w, h, book_open)
     };
@@ -2534,7 +2553,7 @@ fn inventory_slot_at(
         .chain(std::iter::once(PlayerSlot::CraftResult))
         .chain((0..4).map(PlayerSlot::Armor))
         .chain(std::iter::once(PlayerSlot::Offhand))
-        .chain((0..27).map(PlayerSlot::Chest))
+        .chain((0..54).map(PlayerSlot::Chest))
         .find(|&slot| {
             if matches!(menu, InventoryMenu::Player) && matches!(slot, PlayerSlot::Crafting(4..)) {
                 return false;
@@ -3870,6 +3889,7 @@ mod inventory_tests {
         let size = (1280, 720);
         let menu = InventoryMenu::Chest {
             position: glam::IVec3::ZERO,
+            other: None,
         };
         let origin = ((1280 / 3 - 176) / 2, (720 / 3 - 168) / 2);
         for slot in (0..27)
@@ -3899,6 +3919,61 @@ mod inventory_tests {
             Some((8, 143))
         );
         assert_eq!(menu_slot_position(PlayerSlot::CraftResult, menu), None);
+    }
+
+    #[test]
+    fn double_chest_slots_use_vanilla_coordinates() {
+        let size = (1280, 720);
+        let menu = InventoryMenu::Chest {
+            position: glam::IVec3::ZERO,
+            other: Some(glam::IVec3::X),
+        };
+        let origin = ((1280 / 3 - 176) / 2, (720 / 3 - 222) / 2);
+        for slot in (0..54)
+            .map(PlayerSlot::Chest)
+            .chain((0..36).map(PlayerSlot::Storage))
+        {
+            let (x, y) = menu_slot_position(slot, menu).unwrap();
+            assert_eq!(
+                inventory_slot_at(size, (origin.0 + x + 8, origin.1 + y + 8), menu, true),
+                Some(slot)
+            );
+        }
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Chest(53), menu),
+            Some((152, 108))
+        );
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Storage(9), menu),
+            Some((8, 139))
+        );
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Storage(0), menu),
+            Some((8, 197))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn double_chest_composes_using_vanilla_texture() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut inventory = PlayerInventory::demo();
+        assert!(inventory.open_double_chest(
+            glam::IVec3::ZERO,
+            glam::IVec3::X,
+            std::array::from_fn(|_| None),
+            std::array::from_fn(|_| None)
+        ));
+        let canvas = ui.compose((1280, 720), &inventory, 0).unwrap();
+        let origin = ((canvas.width - 176) / 2, (canvas.height - 222) / 2);
+        let pixel =
+            |x: i32, y: i32| canvas.pixels[((origin.1 + y) * canvas.width + origin.0 + x) as usize];
+        assert_ne!(pixel(4, 4) & 0x00ff_ffff, 0);
+        assert_eq!(pixel(8, 18), pixel(8, 108));
     }
 
     #[test]

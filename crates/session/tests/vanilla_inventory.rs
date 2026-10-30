@@ -222,15 +222,16 @@ public class InventoryOracle {
                 var spec=input.getAsJsonObject("chestMove");
                 player.testInventory=new Inventory(player,new EntityEquipment());
                 for(int i=0;i<36;i++) player.testInventory.setItem(i,stack(spec.getAsJsonArray("slots").get(i).getAsJsonArray()));
-                var contents=new SimpleContainer(27);
-                for(int i=0;i<27;i++) contents.setItem(i,stack(spec.getAsJsonArray("chest").get(i).getAsJsonArray()));
-                var menu=net.minecraft.world.inventory.ChestMenu.threeRows(0,player.testInventory,contents);
+                int count=spec.getAsJsonArray("chest").size();
+                var contents=new SimpleContainer(count);
+                for(int i=0;i<count;i++) contents.setItem(i,stack(spec.getAsJsonArray("chest").get(i).getAsJsonArray()));
+                var menu=count==27 ? net.minecraft.world.inventory.ChestMenu.threeRows(0,player.testInventory,contents) : net.minecraft.world.inventory.ChestMenu.sixRows(0,player.testInventory,contents);
                 int source=spec.get("source").getAsInt();
-                int slot=source>=36 ? source-36 : source<9 ? 54+source : 27+source-9;
+                int slot=source>=36 ? source-36 : source<9 ? count+27+source : count+source-9;
                 menu.clicked(slot,0,ContainerInput.QUICK_MOVE,player);
                 JsonArray result=new JsonArray(), slots=new JsonArray(), chest=new JsonArray();
                 for(int i=0;i<36;i++) slots.add(output(player.testInventory.getItem(i)));
-                for(int i=0;i<27;i++) chest.add(output(contents.getItem(i)));
+                for(int i=0;i<count;i++) chest.add(output(contents.getItem(i)));
                 result.add(slots); result.add(chest); results.add(result); continue;
             }
             if (input.has("tableResult")) {
@@ -980,21 +981,23 @@ fn chest_shift_clicks_match_vanilla() {
         [6, 90],
     ];
     let mut cases = Vec::new();
-    for seed in 0..40_usize {
-        for source in (0..63).step_by(3) {
-            let mut slots: Vec<_> = (0..36)
-                .map(|i| choices[(seed * 7 + i * 3) % choices.len()])
-                .collect();
-            let mut chest: Vec<_> = (0..27)
-                .map(|i| choices[(seed * 5 + i * 7) % choices.len()])
-                .collect();
-            let item = choices[1 + seed % (choices.len() - 1)];
-            if source < 36 {
-                slots[source] = item;
-            } else {
-                chest[source - 36] = item;
+    for chest_size in [27, 54] {
+        for seed in 0..40_usize {
+            for source in 0..36 + chest_size {
+                let mut slots: Vec<_> = (0..36)
+                    .map(|i| choices[(seed * 7 + i * 3) % choices.len()])
+                    .collect();
+                let mut chest: Vec<_> = (0..chest_size)
+                    .map(|i| choices[(seed * 5 + i * 7) % choices.len()])
+                    .collect();
+                let item = choices[1 + seed % (choices.len() - 1)];
+                if source < 36 {
+                    slots[source] = item;
+                } else {
+                    chest[source - 36] = item;
+                }
+                cases.push(json!({"chestMove":{"slots":slots,"chest":chest,"source":source}}));
             }
-            cases.push(json!({"chestMove":{"slots":slots,"chest":chest,"source":source}}));
         }
     }
     let temp = tempfile::tempdir().unwrap();
@@ -1029,8 +1032,18 @@ fn chest_shift_clicks_match_vanilla() {
     for (case, expected) in cases.iter().zip(&expected) {
         let spec = &case["chestMove"];
         let mut inventory = PlayerInventory::default();
+        let count = spec["chest"].as_array().unwrap().len();
         let chest = std::array::from_fn(|i| parse(&spec["chest"][i]));
-        assert!(inventory.open_chest(glam::IVec3::ZERO, chest));
+        if count == 27 {
+            assert!(inventory.open_chest(glam::IVec3::ZERO, chest));
+        } else {
+            assert!(inventory.open_double_chest(
+                glam::IVec3::ZERO,
+                glam::IVec3::X,
+                chest,
+                std::array::from_fn(|i| parse(&spec["chest"][i + 27]))
+            ));
+        }
         for (i, item) in spec["slots"].as_array().unwrap().iter().enumerate() {
             inventory.set_slot(PlayerSlot::Storage(i as u8), parse(item));
         }
@@ -1043,7 +1056,7 @@ fn chest_shift_clicks_match_vanilla() {
         let slots: Vec<_> = (0..36)
             .map(|i| output(&inventory.slot(PlayerSlot::Storage(i)).cloned()))
             .collect();
-        let chest: Vec<_> = (0..27)
+        let chest: Vec<_> = (0..count as u8)
             .map(|i| output(&inventory.slot(PlayerSlot::Chest(i)).cloned()))
             .collect();
         assert_eq!(&json!([slots, chest]), expected, "case {case}");

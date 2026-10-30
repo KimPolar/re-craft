@@ -45,6 +45,7 @@ pub struct MenuAssets {
     pub inventory: RgbaImage,
     pub crafting_table: RgbaImage,
     pub chest: RgbaImage,
+    pub double_chest: RgbaImage,
     pub recipe_book_button: RgbaImage,
     pub recipe_book_button_highlighted: RgbaImage,
     pub recipe_book: RecipeBookAssets,
@@ -407,6 +408,27 @@ impl MenuAssets {
             0,
             top as i64,
         );
+        let double_top = chest_image.height() * 125 / 256;
+        let mut double_chest = RgbaImage::new(width, double_top + bottom);
+        image::imageops::replace(
+            &mut double_chest,
+            &image::imageops::crop_imm(&chest_image, 0, 0, width, double_top).to_image(),
+            0,
+            0,
+        );
+        image::imageops::replace(
+            &mut double_chest,
+            &image::imageops::crop_imm(
+                &chest_image,
+                0,
+                chest_image.height() * 126 / 256,
+                width,
+                bottom,
+            )
+            .to_image(),
+            0,
+            double_top as i64,
+        );
         let recipe_book_button =
             image("assets/minecraft/textures/gui/sprites/recipe_book/button.png")?;
         let recipe_book_button_highlighted =
@@ -585,6 +607,7 @@ impl MenuAssets {
             inventory,
             crafting_table,
             chest,
+            double_chest,
             recipe_book_button,
             recipe_book_button_highlighted,
             recipe_book,

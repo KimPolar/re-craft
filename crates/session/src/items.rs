@@ -346,6 +346,21 @@ struct RemovedSavedItem {
     entity: ItemEntity,
 }
 
+/// How a newly created item stopped existing in the in-memory simulation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreatedRemovalCause {
+    /// A player collected the remainder; player inventory must be saved too.
+    Pickup,
+    /// The item reached its expiration age.
+    Expired,
+}
+
+struct RemovedCreatedItem {
+    uuid: [i32; 4],
+    chunks: BTreeSet<native_world::loaded::ChunkPos>,
+    cause: CreatedRemovalCause,
+}
+
 struct SavedMergeParticipant {
     source: Arc<Tag>,
     position: DVec3,
@@ -463,6 +478,7 @@ pub(crate) struct ItemEntities {
     entities: Vec<ItemEntity>,
     // Retain actual removals separately from chunks that failed to load.
     removed_saved: Vec<RemovedSavedItem>,
+    removed_created: Vec<RemovedCreatedItem>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -480,6 +496,7 @@ impl Default for ItemEntities {
         Self {
             entities: Vec::new(),
             removed_saved: Vec::new(),
+            removed_created: Vec::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -706,6 +723,15 @@ impl ItemEntities {
             !self.uncoordinated_saved_merge,
             "saved item merge effects need coordinated saving"
         );
+        ensure!(
+            !self.invalid_removed_created_position
+                && !self.removed_created_chunks.contains(&pos)
+                && self
+                    .removed_created
+                    .iter()
+                    .all(|item| !item.chunks.contains(&pos)),
+            "created item removals require coordinated chunk drafts"
+        );
         self.validate_saved_merges(&BTreeSet::from([pos]), saved_uuids)?;
         let mut seen = BTreeSet::new();
         for entity in &self.entities {
@@ -923,6 +949,39 @@ impl ItemEntities {
             "removed created item needs coordinated lifecycle saving"
         );
         let mut seen = BTreeSet::new();
+        let live_created: BTreeSet<_> = if self.removed_created.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.entities
+                .iter()
+                .filter_map(|entity| entity.created.as_ref()?.uuid)
+                .collect()
+        };
+        for removed in &self.removed_created {
+            if removed.chunks.is_disjoint(positions) {
+                continue;
+            }
+            ensure!(
+                removed.chunks.is_subset(positions),
+                "removed created item requires every visited chunk"
+            );
+            ensure!(
+                seen.insert(removed.uuid),
+                "duplicate removed created item UUID"
+            );
+            ensure!(
+                !saved_uuids.contains_key(&removed.uuid),
+                "removed created item UUID conflicts with a saved item"
+            );
+            ensure!(
+                self.player_uuid != Some(removed.uuid),
+                "removed created item UUID conflicts with the player"
+            );
+            ensure!(
+                !live_created.contains(&removed.uuid),
+                "removed created item UUID is still live"
+            );
+        }
         let mut live = BTreeSet::new();
         if !self.removed_saved.is_empty() {
             for entity in &self.entities {
@@ -967,6 +1026,19 @@ impl ItemEntities {
             );
         }
         Ok(())
+    }
+
+    /// These effects must be coordinated with player and world changes before
+    /// the corresponding entity-chunk drafts can be written.
+    pub(crate) fn created_removal_effects(
+        &self,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> Vec<([i32; 4], CreatedRemovalCause)> {
+        self.removed_created
+            .iter()
+            .filter(|item| !item.chunks.is_disjoint(positions))
+            .map(|item| (item.uuid, item.cause))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1538,6 +1610,7 @@ impl ItemEntities {
         let active_chunks = &self.active_chunks;
         let damage_rules = &self.damage_rules;
         let mut removed = vec![false; self.entities.len()];
+        let mut created_removal_causes = vec![None; self.entities.len()];
         // For large populations, index the horizontal block cell. A one-cell
         // halo contains every possible merge candidate; section traversal
         // order is applied after the spatial search.
@@ -1802,6 +1875,7 @@ impl ItemEntities {
             );
             if entity.lifetime >= 6000 {
                 removed[index] = true;
+                created_removal_causes[index] = Some(CreatedRemovalCause::Expired);
                 continue;
             }
             let bounds = item_bounds(entity.item.position - origin.as_dvec3());
@@ -1817,6 +1891,7 @@ impl ItemEntities {
                     entity.item.stack = remainder;
                 } else {
                     removed[index] = true;
+                    created_removal_causes[index] = Some(CreatedRemovalCause::Pickup);
                     continue;
                 }
             }
@@ -1831,8 +1906,27 @@ impl ItemEntities {
                     entity: entity.clone(),
                 }),
         );
-        for (entity, removed) in self.entities.iter().zip(&removed) {
+        for (index, (entity, removed)) in self.entities.iter().zip(&removed).enumerate() {
             if *removed && let Some(created) = &entity.created {
+                if let (Some(cause), Some(uuid), Some(origin), Some(destination)) = (
+                    created_removal_causes[index],
+                    created.uuid,
+                    created_chunk(created.origin),
+                    created_chunk(entity.item.position),
+                ) && created.base_valid
+                    && created.verified_position == entity.item.position
+                    && created.thrower != CreatedThrower::Unknown
+                {
+                    let mut chunks = created.visited.clone();
+                    chunks.insert(origin);
+                    chunks.insert(destination);
+                    self.removed_created.push(RemovedCreatedItem {
+                        uuid,
+                        chunks,
+                        cause,
+                    });
+                    continue;
+                }
                 self.removed_created_chunks
                     .extend(created.visited.iter().copied());
                 for position in [created.origin, entity.item.position] {
@@ -1953,7 +2047,12 @@ impl ItemEntities {
                             position: source.item.position,
                         },
                     }),
-                    (None, None) => {}
+                    (None, None) => {
+                        // A partial merge can leave both new entities alive in
+                        // different chunks. Until their histories are linked,
+                        // saving either chunk independently could duplicate items.
+                        changes.unresolved |= target.created.is_some() || source.created.is_some();
+                    }
                     _ => changes.unresolved = true,
                 }
             }
@@ -2375,6 +2474,129 @@ mod tests {
         assert_eq!(
             items.entities[0].created.as_ref().unwrap().fall_distance,
             0.0
+        );
+    }
+
+    #[test]
+    fn verified_created_pickup_and_expiry_require_complete_path_groups() {
+        use native_world::loaded::ChunkPos;
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let group = BTreeSet::from([left, right]);
+        let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        let mut items = ItemEntities::default();
+        items.spawn_from_entity(DVec3::new(15.75, 5.0, 2.0), stack.clone());
+        let uuid = items.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        items.entities[0].velocity = DVec3::new(1.0, 0.0, 0.0);
+        items.entities[0].pickup_delay = 0;
+        let mut inventory = Arc::new(PlayerInventory::default());
+        items.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        let player = items.entities[0].item.position;
+        items.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            player,
+            PlayerPose::Standing,
+            GameMode::Survival,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        assert!(items.entities.is_empty());
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            3
+        );
+        assert_eq!(
+            items.created_removal_effects(&group),
+            vec![(uuid, CreatedRemovalCause::Pickup)]
+        );
+        assert!(
+            items
+                .validate_removed_item_chunk_group(&BTreeSet::from([left]), &Default::default())
+                .is_err()
+        );
+        assert!(
+            items
+                .validate_removed_item_chunk_group(&BTreeSet::from([right]), &Default::default())
+                .is_err()
+        );
+        assert!(
+            items
+                .validate_removed_item_chunk_group(&group, &Default::default())
+                .is_ok()
+        );
+        assert!(
+            items
+                .validate_item_chunk_ownership(left, &Default::default())
+                .is_err(),
+            "single chunk drafts must not omit coordinated removals"
+        );
+        assert!(
+            items
+                .validate_removed_item_chunk_group(
+                    &group,
+                    &std::collections::BTreeMap::from([(uuid, left)])
+                )
+                .is_err()
+        );
+        items.set_player_uuid(Some(uuid));
+        assert!(
+            items
+                .validate_removed_item_chunk_group(&group, &Default::default())
+                .is_err()
+        );
+
+        let mut expired = ItemEntities::default();
+        expired.spawn_from_entity(DVec3::new(0.5, 5.0, 0.5), stack);
+        let expired_uuid = expired.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        expired.entities[0].lifetime = 5999;
+        expired.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        assert!(expired.entities.is_empty());
+        assert_eq!(
+            expired.created_removal_effects(&BTreeSet::from([left])),
+            vec![(expired_uuid, CreatedRemovalCause::Expired)]
+        );
+        assert!(
+            expired
+                .validate_removed_item_chunk_group(&BTreeSet::from([left]), &Default::default())
+                .is_ok()
         );
     }
 
@@ -3042,6 +3264,48 @@ mod tests {
                 .validate_item_chunk_group(&BTreeSet::from([left, right, farther]), &owners)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn partial_merge_of_created_items_blocks_independent_chunk_drafts() {
+        use native_world::loaded::ChunkPos;
+        let mut items = ItemEntities::default();
+        for (x, count) in [(15.8, 60), (16.2, 20)] {
+            let components = Tag::Compound(vec![("minecraft:max_stack_size".into(), Tag::Int(99))]);
+            let stack = ItemStack::new("minecraft:stone".into(), count, 99, components).unwrap();
+            items.spawn_from_entity(DVec3::new(x, 5.0, 2.0), stack);
+            let entity = items.entities.last_mut().unwrap();
+            entity.velocity = DVec3::ZERO;
+            entity.no_gravity = true;
+            entity.pickup_delay = 0;
+        }
+        let mut inventory = Arc::new(PlayerInventory::default());
+        for _ in 0..40 {
+            items.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| None,
+                |_, _| true,
+            );
+        }
+        assert_eq!(items.entities.len(), 2, "partial merge keeps both entities");
+        assert!(items.uncoordinated_saved_merge);
+        for pos in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }] {
+            assert!(
+                items
+                    .validate_item_chunk_group(&BTreeSet::from([pos]), &Default::default())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -4475,9 +4739,10 @@ public class ItemMotionOracle {
                    RESTITUTE=Entity.class.getDeclaredMethod("restituteMovementAfterCollisions", BlockState.class, boolean.class, boolean.class, Vec3.class); RESTITUTE.setAccessible(true); }
              catch (Exception e) { throw new RuntimeException(e); } }
     static class TestLevel extends ClientLevel {
-        BlockState ground; boolean supportGrid; boolean twoBlocks;
+        BlockState ground; boolean supportGrid; boolean twoBlocks; boolean server;
         TestLevel() { super(null,null,null,null,0,0,null,false,0L,0); }
-        @Override public boolean isClientSide() { return true; }
+        @Override public boolean isClientSide() { return !server; }
+        @Override public boolean noCollision(Entity entity, AABB box) { return true; }
         @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
         @Override public BlockState getBlockState(BlockPos pos) {
             if (!supportGrid) return ground;
@@ -4561,6 +4826,7 @@ public class ItemMotionOracle {
         for (var value : cases) {
             var input = value.getAsJsonObject();
             var world = (TestLevel) unsafe.allocateInstance(TestLevel.class);
+            world.server = input.has("server") && input.get("server").getAsBoolean();
             int block = input.get("block").getAsInt();
             world.ground = (block==1 ? Blocks.SLIME_BLOCK : block==2 ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")) :
                 block==3 ? Blocks.SHELF_MUSHROOM : input.get("ice").getAsBoolean() ? Blocks.ICE : Blocks.STONE).defaultBlockState();
@@ -4571,6 +4837,7 @@ public class ItemMotionOracle {
             age.setInt(item,input.get("age").getAsInt());
             delay.setInt(item,input.get("delay").getAsInt());
             var p = input.getAsJsonArray("p"); item.pos(new Vec3(p.get(0).getAsDouble(),p.get(1).getAsDouble(),p.get(2).getAsDouble()));
+            if (world.server) item.setBoundingBox(new AABB(item.getX()-.125,item.getY(),item.getZ()-.125,item.getX()+.125,item.getY()+.25,item.getZ()+.125));
             var v = input.getAsJsonArray("v"); item.velocity = new Vec3(v.get(0).getAsDouble(),v.get(1).getAsDouble(),v.get(2).getAsDouble());
             item.grounded = input.get("ground").getAsBoolean();
             JsonArray ticks = new JsonArray();
@@ -4579,7 +4846,8 @@ public class ItemMotionOracle {
                 JsonObject tick = new JsonObject(); tick.add("p", vector(new Vec3(item.getX(),item.getY(),item.getZ())));
                 tick.add("v",vector(item.velocity)); tick.addProperty("ground",item.grounded);
                 tick.addProperty("fall",item.fallDistance);
-                tick.addProperty("age",age.getInt(item)); tick.addProperty("delay",delay.getInt(item)); ticks.add(tick);
+                tick.addProperty("age",age.getInt(item)); tick.addProperty("delay",delay.getInt(item)); tick.addProperty("removed", item.removed); ticks.add(tick);
+                if (item.removed) break;
             }
             output.add(ticks);
         }
@@ -4724,7 +4992,10 @@ public class ItemMotionOracle {
         let source = temp.path().join("ItemMotionOracle.java");
         let input = temp.path().join("input.json");
         let output = temp.path().join("output.json");
-        let cases: Vec<_> = (0..64).map(|i| json!({"id":i, "p":[0.5, if i % 3 == 0 {0.0} else {2.0}, 0.5], "v":[(i as f64 % 5.0) * 0.012, if i % 4 == 0 {0.2} else {0.0}, -0.02], "ground":i%3==0, "ice":i%2==0, "block":(i/4)%4, "no_gravity":i%2==0, "age":([-32768,-2,0,42][i%4]), "delay":([32767,-1,0,3][(i/4)%4]), "fluid":i%3})).collect();
+        let mut cases: Vec<_> = (0..64).map(|i| json!({"id":i, "p":[0.5, if i % 3 == 0 {0.0} else {2.0}, 0.5], "v":[(i as f64 % 5.0) * 0.012, if i % 4 == 0 {0.2} else {0.0}, -0.02], "ground":i%3==0, "ice":i%2==0, "block":(i/4)%4, "no_gravity":i%2==0, "age":([-32768,-2,0,42][i%4]), "delay":([32767,-1,0,3][(i/4)%4]), "fluid":i%3})).collect();
+        for age in [5998, 5999, -32768] {
+            cases.push(json!({"id":65, "p":[0.5,2.0,0.5], "v":[0.0,0.0,0.0], "ground":false, "ice":false, "block":0, "no_gravity":true, "age":age, "delay":32767, "fluid":0, "server":true}));
+        }
         std::fs::write(&source, JAVA).unwrap();
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         let cp = classpath(&game, temp.path());
@@ -5055,6 +5326,19 @@ public class ItemMotionOracle {
                     |_, _, _| None,
                     |_, _| true,
                 );
+                if oracle["removed"].as_bool() == Some(true) {
+                    assert!(
+                        items.entities.is_empty(),
+                        "Java expired item must be removed"
+                    );
+                    assert_eq!(
+                        items.created_removal_effects(&BTreeSet::from([
+                            native_world::loaded::ChunkPos { x: 0, z: 0 }
+                        ])),
+                        vec![([1, 2, 3, 4], CreatedRemovalCause::Expired)]
+                    );
+                    break;
+                }
                 let actual = &items.entities[0];
                 let position_error = (actual.item.position - vec(&oracle["p"]))
                     .abs()

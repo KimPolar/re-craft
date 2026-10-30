@@ -2138,6 +2138,15 @@ impl LoadedSession {
         self.dropped_items.draft_created_items_in_chunk(pos)
     }
 
+    /// Expose the outcomes that a future coordinated world save must include.
+    /// This list is not, by itself, authorization to write any file.
+    pub fn created_item_removal_effects(
+        &self,
+        positions: &BTreeSet<ChunkPos>,
+    ) -> Vec<([i32; 4], crate::items::CreatedRemovalCause)> {
+        self.dropped_items.created_removal_effects(positions)
+    }
+
     /// Draft a still-live restored falling entity by UUID. Chunk migration,
     /// removals, newly spawned entities and coordinated saving remain separate.
     pub fn draft_saved_falling_entity(
@@ -2411,11 +2420,15 @@ impl LoadedSession {
         let created_items = self
             .dropped_items
             .draft_created_items_in_chunks(positions)?;
-        if !created_items.is_empty() {
+        let created_removals = self.dropped_items.created_removal_effects(positions);
+        if !created_items.is_empty() || !created_removals.is_empty() {
             let mut created_uuids = BTreeSet::new();
             for item in &created_items {
                 let uuid = crate::saved_item::optional_uuid(&item.document().value, "UUID")?
                     .context("created item has no stable UUID")?;
+                ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
+            }
+            for (uuid, _) in created_removals {
                 ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
             }
             // Check known source chunks outside this group as well. Unloaded
@@ -10967,6 +10980,82 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn picked_up_created_item_is_omitted_from_chunk_draft_and_reports_player_effect() {
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_player_inventory(PlayerInventory::default());
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.9, 8.5);
+        let stack = ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        session.dropped_items.spawn_from_entity(position, stack);
+        let original = session.draft_created_item_entities(home).unwrap();
+        let uuid = crate::saved_item::read(&original[0].document().value)
+            .unwrap()
+            .unwrap()
+            .uuid
+            .unwrap();
+        for _ in 0..30 {
+            session.update(TICK);
+            if session.snapshot().dropped_items.is_empty() {
+                break;
+            }
+        }
+        assert!(session.snapshot().dropped_items.is_empty());
+        let group = BTreeSet::from([home]);
+        assert_eq!(
+            session.created_item_removal_effects(&group),
+            vec![(uuid, crate::items::CreatedRemovalCause::Pickup)]
+        );
+        assert_eq!(
+            session
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            3
+        );
+        let drafts = session.draft_existing_entity_chunks(&group).unwrap();
+        let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities") else {
+            panic!("missing entities")
+        };
+        assert!(values.is_empty());
+        let conflict = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:pig".into())),
+                            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        session.entity_chunks.insert(
+            home,
+            SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                position: native_persistence::world::ChunkPos {
+                    x: home.x,
+                    z: home.z,
+                },
+                document: Arc::new(conflict),
+            })),
+        );
+        assert!(
+            session.draft_existing_entity_chunks(&group).is_err(),
+            "a removed created UUID must not match any known saved entity"
+        );
     }
 
     #[test]

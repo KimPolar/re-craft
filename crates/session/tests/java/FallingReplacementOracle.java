@@ -31,6 +31,7 @@ public class FallingReplacementOracle {
         world.state=state;
         var context=new DirectionalPlaceContext(world,BlockPos.ZERO,Direction.DOWN,ItemStack.EMPTY,Direction.UP);
         var row=new JsonObject(); row.addProperty("id",args[i]); row.addProperty("replace",state.canBeReplaced(context));
+        row.addProperty("fallingFree",net.minecraft.world.level.block.FallingBlock.isFree(state));
         var properties=new JsonObject(); state.getValues().forEach(value -> properties.addProperty(value.property().getName(),value.valueName()));
         row.add("properties",properties); result.add(row);
       }

@@ -7164,15 +7164,13 @@ impl LoadedSession {
         };
         let state = self.world.state(id)?;
         let fire = self.falling_fire_tag.as_ref()?;
-        crate::falling_block::known_free_below(&state.name, fire.contains(&state.name)).or_else(
-            || {
-                self.shapes
-                    .get(id.0 as usize)
-                    .and_then(Option::as_deref)
-                    .filter(|shape| crate::falling_block::known_collision_support(shape))
-                    .map(|_| false)
-            },
-        )
+        crate::falling_block::known_falling_free(state, fire.contains(&state.name)).or_else(|| {
+            self.shapes
+                .get(id.0 as usize)
+                .and_then(Option::as_deref)
+                .filter(|shape| crate::falling_block::known_collision_support(shape))
+                .map(|_| false)
+        })
     }
 
     fn advance_falling_sand(&mut self) {
@@ -7295,7 +7293,7 @@ impl LoadedSession {
                 let replaceable = self
                     .world
                     .state(current)
-                    .and_then(|state| crate::falling_block::known_landing_replaceable(&state.name))
+                    .and_then(crate::falling_block::known_landing_replaceable)
                     .or_else(|| {
                         self.shapes
                             .get(current.0 as usize)
@@ -9958,6 +9956,9 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
 /// These default block behaviors were checked with a stone-button placement
 /// context. Other replaceable states can have item-specific rules.
 fn button_can_replace(block: &BlockState) -> Option<bool> {
+    if block.name == "minecraft:snow" {
+        return native_world::collision::snow_layers(block).map(|layers| layers == 1);
+    }
     if matches!(
         block.name.as_str(),
         "minecraft:chest" | "minecraft:trapped_chest"
@@ -24877,6 +24878,79 @@ mod tests {
     }
 
     #[test]
+    fn falling_blocks_interact_with_all_snow_layer_states() {
+        for layers in 1..=8 {
+            for falling in ["minecraft:sand", "minecraft:red_sand", "minecraft:gravel"] {
+                let mut session = session();
+                let target = IVec3::new(10, 1, 8);
+                let snow = session
+                    .intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+                assert!(session.set(target, snow));
+                let block = session.intern_block(state(falling, &[]));
+                assert!(session.set(IVec3::new(10, 2, 8), block));
+                session.tick = 2;
+                session.advance_sand_ticks();
+                assert_eq!(session.falling_sand.len(), 1, "{layers} layers: {falling}");
+                for _ in 0..40 {
+                    session.advance_falling_sand();
+                }
+                assert!(
+                    session.falling_sand.is_empty(),
+                    "{layers} layers: {falling}"
+                );
+                let actual = session
+                    .world
+                    .block(
+                        session.origin.x + target.x,
+                        target.y,
+                        session.origin.z + target.z,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual.name,
+                    if layers == 1 {
+                        falling
+                    } else {
+                        "minecraft:snow"
+                    }
+                );
+                let items = session.dropped_items.snapshot();
+                assert_eq!(items.len(), usize::from(layers != 1));
+                if layers != 1 {
+                    assert_eq!(items[0].stack.id(), falling);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn player_lands_at_snow_collision_height() {
+        for layers in 1..=8 {
+            let mut session = session();
+            let snow =
+                session.intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+            assert!(session.set(IVec3::new(4, 1, 4), snow));
+            session.motion.position = DVec3::new(4.5, 3.0, 4.5);
+            session.motion.velocity = DVec3::new(0.0, -1.5, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            for _ in 0..5 {
+                session.update(TICK);
+                if session.motion.on_ground {
+                    break;
+                }
+            }
+            assert!(session.motion.on_ground, "{layers} layers");
+            assert!(
+                (session.motion.position.y - (1.0 + f64::from(layers - 1) / 8.0)).abs() < 1e-7,
+                "{layers} layers: {}",
+                session.motion.position.y
+            );
+        }
+    }
+
+    #[test]
     fn sand_landing_inside_nonreplaceable_empty_blocks_drops() {
         for block in [
             "minecraft:dandelion",
@@ -26629,6 +26703,58 @@ mod tests {
             session.world.state(id),
             Some(&stone_button_state(-directions[2], session.player.yaw).unwrap())
         );
+    }
+
+    #[test]
+    fn button_replaces_only_one_snow_layer() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for layers in 1..=8 {
+            let mut session = session();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:stone_button".into(),
+                    2,
+                    64,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            let support = IVec3::new(8, 2, 6);
+            let target = support + IVec3::Z;
+            let snow =
+                session.intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+            assert!(session.set(target, snow));
+            let hit = ShapeRayHit {
+                position: support,
+                face: IVec3::Z,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(
+                session.place_button(hit).is_some(),
+                layers == 1,
+                "{layers} layers"
+            );
+            let target_state = session
+                .world
+                .block(
+                    session.origin.x + target.x,
+                    target.y,
+                    session.origin.z + target.z,
+                )
+                .unwrap();
+            assert_eq!(
+                target_state.name,
+                if layers == 1 {
+                    "minecraft:stone_button"
+                } else {
+                    "minecraft:snow"
+                }
+            );
+        }
     }
 
     #[test]

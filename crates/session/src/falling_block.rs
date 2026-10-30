@@ -5,8 +5,9 @@ use glam::{DVec3, IVec3};
 use native_world::movement::BoundingBox;
 
 /// Only use this fallback for collision shapes supplied by the native block
-/// registry. The supported 26.3 states with nonempty shapes are checked against
-/// FallingBlock.isFree; active fire tags must be checked first.
+/// registry. Known exceptions such as snow and active fire tags must be
+/// checked first; the remaining supported 26.3 shapes are checked against
+/// FallingBlock.isFree.
 pub fn known_collision_support(shape: &[native_world::collision::Aabb]) -> bool {
     !shape.is_empty()
 }
@@ -62,12 +63,26 @@ pub fn known_free_below(block: &str, is_fire: bool) -> Option<bool> {
     }
 }
 
+/// `FallingBlock.isFree` for state-dependent snow and the known block subset.
+pub fn known_falling_free(state: &native_world::loaded::BlockState, is_fire: bool) -> Option<bool> {
+    if is_fire {
+        return Some(true);
+    }
+    if state.name == "minecraft:snow" {
+        return native_world::collision::snow_layers(state).map(|_| true);
+    }
+    known_free_below(&state.name, false)
+}
+
 /// Replacement with the empty-handed downward placement context used by a
 /// falling block. Registry states not covered here require their own rules.
-pub fn known_landing_replaceable(block: &str) -> Option<bool> {
-    match block {
+pub fn known_landing_replaceable(state: &native_world::loaded::BlockState) -> Option<bool> {
+    if state.name == "minecraft:snow" {
+        return native_world::collision::snow_layers(state).map(|layers| layers == 1);
+    }
+    match state.name.as_str() {
         "minecraft:fire" | "minecraft:soul_fire" => Some(true),
-        _ => known_free_below(block, false),
+        block => known_free_below(block, false),
     }
 }
 

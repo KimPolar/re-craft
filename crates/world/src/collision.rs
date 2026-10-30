@@ -66,6 +66,10 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
         return None;
     }
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "snow" {
+        let layers = snow_layers(state)?;
+        return Some(direction == IVec3::NEG_Y || layers == 8);
+    }
     if matches!(id, "air" | "cave_air" | "void_air") {
         return Some(false);
     }
@@ -177,11 +181,42 @@ mod face_tests {
         assert!(!merged_face_occludes(EMPTY, TOP_SLAB, IVec3::Y));
         assert!(merged_face_occludes(EMPTY, TOP_SLAB, IVec3::NEG_Y));
     }
+
+    #[test]
+    fn snow_shapes_reject_invalid_layer_properties() {
+        for value in ["0", "9", "01", "-1", "x"] {
+            let state = BlockState {
+                name: "minecraft:snow".into(),
+                properties: [("layers".into(), value.into())].into(),
+            };
+            assert!(block_shape(&state).is_none());
+            assert!(block_outline(&state).is_none());
+            assert!(button_support_face(&state, IVec3::Y).is_none());
+            assert!(button_support_face(&state, IVec3::NEG_Y).is_none());
+        }
+        let state = BlockState {
+            name: "minecraft:snow".into(),
+            properties: [
+                ("layers".into(), "1".into()),
+                ("extra".into(), "true".into()),
+            ]
+            .into(),
+        };
+        assert!(block_shape(&state).is_none());
+    }
 }
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "snow" {
+        let layers = snow_layers(state)?;
+        return Some(if layers == 1 {
+            Vec::new()
+        } else {
+            vec![cuboid(0.0, 0.0, 0.0, 1.0, f32::from(layers - 1) / 8.0, 1.0)]
+        });
+    }
     if matches!(id, "chest" | "trapped_chest") {
         if !(state.properties.len() == 3
             && matches!(
@@ -436,6 +471,9 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "snow" {
+        return snow_outline(state);
+    }
     if id == "lever" {
         return lever_outline(state);
     }
@@ -507,6 +545,35 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     let shape = block_shape(state)?;
     if shape.is_empty() { None } else { Some(shape) }
+}
+
+/// The eight vanilla snow-layer states, rejecting malformed or extra properties.
+pub fn snow_layers(state: &BlockState) -> Option<u8> {
+    if state.name != "minecraft:snow" || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("layers")?.as_str() {
+        "1" => Some(1),
+        "2" => Some(2),
+        "3" => Some(3),
+        "4" => Some(4),
+        "5" => Some(5),
+        "6" => Some(6),
+        "7" => Some(7),
+        "8" => Some(8),
+        _ => None,
+    }
+}
+
+fn snow_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    Some(vec![cuboid(
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        f32::from(snow_layers(state)?) / 8.0,
+        1.0,
+    )])
 }
 
 fn lever_outline(state: &BlockState) -> Option<Vec<Aabb>> {

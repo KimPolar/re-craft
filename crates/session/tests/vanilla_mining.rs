@@ -1035,6 +1035,7 @@ fn falling_block_landing_replacement_matches_java() {
         "orange_tulip",
         "white_tulip",
         "pink_tulip",
+        "snow",
     ];
     let cp = classpath(&game, temp.path());
     let java = java_bin();
@@ -1056,11 +1057,27 @@ fn falling_block_landing_replacement_matches_java() {
     assert!(rows.len() >= names.len());
     for row in rows {
         let id = row["id"].as_str().unwrap();
+        let state = native_world::loaded::BlockState {
+            name: id.into(),
+            properties: row["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+                .collect(),
+        };
         assert_eq!(
-            native_session::falling_block::known_landing_replaceable(id),
+            native_session::falling_block::known_landing_replaceable(&state),
             row["replace"].as_bool(),
             "{row}"
         );
+        if id == "minecraft:snow" {
+            assert_eq!(
+                native_session::falling_block::known_falling_free(&state, false),
+                row["fallingFree"].as_bool(),
+                "{row}"
+            );
+        }
     }
 }
 

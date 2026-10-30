@@ -335,6 +335,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut liquid_checked = 0usize;
     let mut soil_cover_checked = 0usize;
     let mut partial_support_checked = 0usize;
+    let mut snow_checked = 0usize;
     let mut failures = Vec::new();
     for entry in records.as_array().unwrap() {
         let id = entry["id"].as_str().unwrap();
@@ -364,6 +365,21 @@ fn implemented_collision_shapes_match_vanilla_states() {
             name: id.to_owned(),
             properties,
         };
+        if id == "minecraft:snow" {
+            let layers = native_world::collision::snow_layers(&state).unwrap();
+            assert_eq!(entry["fallingFree"].as_bool(), Some(true), "{state:?}");
+            assert_eq!(
+                entry["landingReplaceable"].as_bool(),
+                Some(layers == 1),
+                "{state:?}"
+            );
+            assert_eq!(
+                entry["buttonReplaceable"].as_bool(),
+                Some(layers == 1),
+                "{state:?}"
+            );
+            snow_checked += 1;
+        }
         if id == "minecraft:lever" {
             assert!(
                 block_shape(&state).is_some() && block_outline(&state).is_some(),
@@ -453,7 +469,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
             button_states_checked += 1;
         }
         checked += 1;
-        if !actual.is_empty() {
+        if !actual.is_empty() && id != "minecraft:snow" {
             assert_eq!(
                 entry["landingReplaceable"].as_bool(),
                 Some(false),
@@ -523,6 +539,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
         }
     }
     assert!(checked > 1000, "only {checked} states were checked");
+    assert_eq!(snow_checked, 8);
     assert!(
         soil_cover_checked > 1000,
         "only {soil_cover_checked} slab and stair states"

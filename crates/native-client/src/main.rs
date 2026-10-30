@@ -1397,6 +1397,7 @@ struct App {
     session: LocalSession,
     visual_look: visual_look::VisualLook,
     input: InputState,
+    mouse_bindings: toggle_key::MouseBindings,
     hotbar_scroll: mouse_scroll::HotbarScroll,
     captured: bool,
     ui: Option<GameUi>,
@@ -1464,6 +1465,7 @@ impl App {
             session,
             visual_look: visual_look::VisualLook::default(),
             input: InputState::default(),
+            mouse_bindings: toggle_key::MouseBindings::default(),
             hotbar_scroll: mouse_scroll::HotbarScroll::default(),
             captured: false,
             ui,
@@ -1500,6 +1502,7 @@ impl App {
 
     fn capture(&mut self, enabled: bool) {
         if !enabled {
+            self.mouse_bindings.reset();
             self.session.submit_command(PlayerCommand::StopBreak);
             self.session.submit_command(PlayerCommand::StopUse);
         }
@@ -2004,10 +2007,18 @@ impl ApplicationHandler for App {
                             },
                         ));
                     }
-                } else {
+                } else if self.captured && !self.ui.as_ref().is_some_and(GameUi::paused) {
                     match button {
-                        MouseButton::Left => self.session.submit_command(PlayerCommand::StopBreak),
-                        MouseButton::Right => self.session.submit_command(PlayerCommand::StopUse),
+                        MouseButton::Left => self.mouse_bindings.attack(
+                            &mut self.session,
+                            false,
+                            self.video.toggle_attack,
+                        ),
+                        MouseButton::Right => self.mouse_bindings.use_item(
+                            &mut self.session,
+                            false,
+                            self.video.toggle_use,
+                        ),
                         _ => {}
                     }
                 }
@@ -2115,13 +2126,20 @@ impl ApplicationHandler for App {
                     self.capture(true);
                 } else {
                     match button {
-                        MouseButton::Left => self.session.submit_command(PlayerCommand::Break),
+                        MouseButton::Left => self.mouse_bindings.attack(
+                            &mut self.session,
+                            true,
+                            self.video.toggle_attack,
+                        ),
                         MouseButton::Middle => {
                             self.session.submit_command(PlayerCommand::PickBlock)
                         }
                         MouseButton::Right => {
-                            self.session.submit_command(PlayerCommand::UseHeld(true));
-                            self.session.submit_command(PlayerCommand::Place);
+                            self.mouse_bindings.use_item(
+                                &mut self.session,
+                                true,
+                                self.video.toggle_use,
+                            );
                         }
                         _ => {}
                     }

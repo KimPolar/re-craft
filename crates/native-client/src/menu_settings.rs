@@ -239,6 +239,8 @@ pub struct VideoSettings {
     pub sprint_window: u8,
     pub toggle_sneak: bool,
     pub toggle_sprint: bool,
+    pub toggle_attack: bool,
+    pub toggle_use: bool,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
     pub inactivity_fps_limit: InactivityFpsLimit,
 }
@@ -281,6 +283,8 @@ impl Default for VideoSettings {
             sprint_window: 7,
             toggle_sneak: false,
             toggle_sprint: false,
+            toggle_attack: false,
+            toggle_use: false,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }

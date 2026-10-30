@@ -27,8 +27,6 @@ pub fn draw_controls_placeholders(canvas: &mut Canvas, assets: &MenuAssets) {
     let width = canvas.width;
     for (column, row, key, fallback) in [
         (1, 0, "controls.keybinds", "Key Binds..."),
-        (0, 2, "key.attack", "Attack"),
-        (1, 2, "key.use", "Use Item"),
         (0, 3, "options.autoJump", "Auto-Jump"),
         (0, 4, "options.quitShortcuts", "Quit Shortcuts"),
         (1, 4, "options.operatorItemsTab", "Operator Items Tab"),
@@ -49,33 +47,41 @@ pub fn draw_controls_placeholders(canvas: &mut Canvas, assets: &MenuAssets) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MovementToggle {
+pub enum ControlToggle {
     Sneak,
     Sprint,
+    Attack,
+    Use,
 }
 
-pub fn movement_toggle_rect(width: i32, toggle: MovementToggle) -> Rect {
+pub fn control_toggle_rect(width: i32, toggle: ControlToggle) -> Rect {
     Rect {
         x: width / 2 - 155
-            + if toggle == MovementToggle::Sprint {
+            + if matches!(toggle, ControlToggle::Sprint | ControlToggle::Use) {
                 160
             } else {
                 0
             },
-        y: 59,
+        y: if matches!(toggle, ControlToggle::Attack | ControlToggle::Use) {
+            83
+        } else {
+            59
+        },
         w: 150,
         h: 20,
     }
 }
 
-pub fn movement_toggle_label(
+pub fn control_toggle_label(
     assets: &MenuAssets,
-    toggle: MovementToggle,
+    toggle: ControlToggle,
     settings: VideoSettings,
 ) -> String {
     let (key, fallback, enabled) = match toggle {
-        MovementToggle::Sneak => ("key.sneak", "Sneak", settings.toggle_sneak),
-        MovementToggle::Sprint => ("key.sprint", "Sprint", settings.toggle_sprint),
+        ControlToggle::Sneak => ("key.sneak", "Sneak", settings.toggle_sneak),
+        ControlToggle::Sprint => ("key.sprint", "Sprint", settings.toggle_sprint),
+        ControlToggle::Attack => ("key.attack", "Attack/Destroy", settings.toggle_attack),
+        ControlToggle::Use => ("key.use", "Use Item/Place Block", settings.toggle_use),
     };
     let value = if enabled {
         assets.translate("options.key.toggle", "Toggle")

@@ -236,6 +236,7 @@ fn run_inner(
         window: None,
         renderer: None,
         input: Input::default(),
+        mouse_bindings: crate::toggle_key::MouseBindings::default(),
         hotbar_scroll: crate::mouse_scroll::HotbarScroll::default(),
         captured: false,
         occluded: false,
@@ -308,6 +309,7 @@ struct Viewer {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     input: Input,
+    mouse_bindings: crate::toggle_key::MouseBindings,
     hotbar_scroll: crate::mouse_scroll::HotbarScroll,
     captured: bool,
     occluded: bool,
@@ -408,9 +410,12 @@ impl Viewer {
     }
 
     fn capture(&mut self, enabled: bool) {
-        if !enabled && let Some(play) = &mut self.play {
-            play.session.submit_command(PlayerCommand::StopBreak);
-            play.session.submit_command(PlayerCommand::StopUse);
+        if !enabled {
+            self.mouse_bindings.reset();
+            if let Some(play) = &mut self.play {
+                play.session.submit_command(PlayerCommand::StopBreak);
+                play.session.submit_command(PlayerCommand::StopUse);
+            }
         }
         if let Some(window) = &self.window {
             if enabled {
@@ -1203,10 +1208,21 @@ impl ApplicationHandler for Viewer {
                             },
                         ));
                     }
-                } else if let Some(play) = &mut self.play {
+                } else if self.captured
+                    && !self.ui.as_ref().is_some_and(GameUi::paused)
+                    && let Some(play) = &mut self.play
+                {
                     match button {
-                        MouseButton::Left => play.session.submit_command(PlayerCommand::StopBreak),
-                        MouseButton::Right => play.session.submit_command(PlayerCommand::StopUse),
+                        MouseButton::Left => self.mouse_bindings.attack(
+                            &mut play.session,
+                            false,
+                            self.video.toggle_attack,
+                        ),
+                        MouseButton::Right => self.mouse_bindings.use_item(
+                            &mut play.session,
+                            false,
+                            self.video.toggle_use,
+                        ),
                         _ => {}
                     }
                 }
@@ -1324,13 +1340,20 @@ impl ApplicationHandler for Viewer {
                     }
                 } else if let Some(play) = &mut self.play {
                     match button {
-                        MouseButton::Left => play.session.submit_command(PlayerCommand::Break),
+                        MouseButton::Left => self.mouse_bindings.attack(
+                            &mut play.session,
+                            true,
+                            self.video.toggle_attack,
+                        ),
                         MouseButton::Middle => {
                             play.session.submit_command(PlayerCommand::PickBlock)
                         }
                         MouseButton::Right => {
-                            play.session.submit_command(PlayerCommand::UseHeld(true));
-                            play.session.submit_command(PlayerCommand::Place);
+                            self.mouse_bindings.use_item(
+                                &mut play.session,
+                                true,
+                                self.video.toggle_use,
+                            );
                         }
                         _ => {}
                     }

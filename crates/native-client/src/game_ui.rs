@@ -19,7 +19,7 @@ use crate::{
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
     menu_settings::{SoundCategory, SoundSettings, VideoSettings},
-    mouse_ui::{self, MouseControl, MouseUi, MovementToggle, SprintWindowUi},
+    mouse_ui::{self, ControlToggle, MouseControl, MouseUi, SprintWindowUi},
     recipe_book_ui::{BookAction, RecipeBookUi, inventory_origin},
     renderer::Renderer,
     sound_ui::SoundUi,
@@ -56,6 +56,8 @@ enum PauseButton {
     SprintWindow,
     ToggleSneak,
     ToggleSprint,
+    ToggleAttack,
+    ToggleUse,
     MouseSensitivity,
     MouseWheelSensitivity,
     MouseDiscreteScroll,
@@ -555,10 +557,14 @@ impl GameUi {
             PausePage::Controls => {
                 if hit(mouse_ui::controls_mouse_button(w)) {
                     Some(PauseButton::MouseSettings)
-                } else if hit(mouse_ui::movement_toggle_rect(w, MovementToggle::Sneak)) {
+                } else if hit(mouse_ui::control_toggle_rect(w, ControlToggle::Sneak)) {
                     Some(PauseButton::ToggleSneak)
-                } else if hit(mouse_ui::movement_toggle_rect(w, MovementToggle::Sprint)) {
+                } else if hit(mouse_ui::control_toggle_rect(w, ControlToggle::Sprint)) {
                     Some(PauseButton::ToggleSprint)
+                } else if hit(mouse_ui::control_toggle_rect(w, ControlToggle::Attack)) {
+                    Some(PauseButton::ToggleAttack)
+                } else if hit(mouse_ui::control_toggle_rect(w, ControlToggle::Use)) {
+                    Some(PauseButton::ToggleUse)
                 } else if hit(SprintWindowUi::rect(w)) {
                     Some(PauseButton::SprintWindow)
                 } else if hit(Rect {
@@ -688,6 +694,16 @@ impl GameUi {
             }
             PauseButton::ToggleSprint => {
                 self.video.toggle_sprint = !self.video.toggle_sprint;
+                self.video_dirty = true;
+                PauseAction::None
+            }
+            PauseButton::ToggleAttack => {
+                self.video.toggle_attack = !self.video.toggle_attack;
+                self.video_dirty = true;
+                PauseAction::None
+            }
+            PauseButton::ToggleUse => {
+                self.video.toggle_use = !self.video.toggle_use;
                 self.video_dirty = true;
                 PauseAction::None
             }
@@ -1051,6 +1067,8 @@ impl GameUi {
                     PauseButton::MouseSettings,
                     PauseButton::ToggleSneak,
                     PauseButton::ToggleSprint,
+                    PauseButton::ToggleAttack,
+                    PauseButton::ToggleUse,
                     PauseButton::SprintWindow,
                     PauseButton::Done,
                 ],
@@ -2100,15 +2118,17 @@ impl GameUi {
                 );
                 mouse_ui::draw_controls_placeholders(&mut canvas, assets);
                 for (toggle, button) in [
-                    (MovementToggle::Sneak, PauseButton::ToggleSneak),
-                    (MovementToggle::Sprint, PauseButton::ToggleSprint),
+                    (ControlToggle::Sneak, PauseButton::ToggleSneak),
+                    (ControlToggle::Sprint, PauseButton::ToggleSprint),
+                    (ControlToggle::Attack, PauseButton::ToggleAttack),
+                    (ControlToggle::Use, PauseButton::ToggleUse),
                 ] {
                     canvas.button(
                         Some(assets),
-                        mouse_ui::movement_toggle_rect(w, toggle),
+                        mouse_ui::control_toggle_rect(w, toggle),
                         true,
                         hover == Some(button) || self.pause_focus == Some(button),
-                        &mouse_ui::movement_toggle_label(assets, toggle, self.video),
+                        &mouse_ui::control_toggle_label(assets, toggle, self.video),
                     );
                 }
                 self.sprint_window_ui.draw(
@@ -3299,10 +3319,12 @@ mod inventory_tests {
         assert_eq!(ui.click(), PauseAction::None);
         assert_eq!(ui.pause_page, PausePage::Controls);
         for (toggle, button) in [
-            (MovementToggle::Sneak, PauseButton::ToggleSneak),
-            (MovementToggle::Sprint, PauseButton::ToggleSprint),
+            (ControlToggle::Sneak, PauseButton::ToggleSneak),
+            (ControlToggle::Sprint, PauseButton::ToggleSprint),
+            (ControlToggle::Attack, PauseButton::ToggleAttack),
+            (ControlToggle::Use, PauseButton::ToggleUse),
         ] {
-            let rect = mouse_ui::movement_toggle_rect(w, toggle);
+            let rect = mouse_ui::control_toggle_rect(w, toggle);
             ui.cursor_moved(
                 f64::from(rect.x + 10) * scale,
                 f64::from(rect.y + 10) * scale,
@@ -3310,9 +3332,14 @@ mod inventory_tests {
             assert_eq!(ui.click(), PauseAction::None);
             assert_eq!(ui.pause_focus, Some(button));
         }
-        assert!(ui.video.toggle_sneak && ui.video.toggle_sprint);
+        assert!(
+            ui.video.toggle_sneak
+                && ui.video.toggle_sprint
+                && ui.video.toggle_attack
+                && ui.video.toggle_use
+        );
         ui.pause_key(KeyCode::Space, false);
-        assert!(!ui.video.toggle_sprint);
+        assert!(!ui.video.toggle_use);
         let sprint = SprintWindowUi::rect(w);
         ui.cursor_moved(
             f64::from(sprint.x + sprint.w - 4) * scale,

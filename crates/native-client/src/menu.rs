@@ -30,7 +30,7 @@ use crate::{
     menu_gpu_worker::{MenuFrame, MenuGpuWorker, MenuOverlay},
     menu_settings::{self, Settings, SoundCategory, SoundSettings, VideoSettings},
     menu_software_worker::{MenuSoftwareWorker, SoftwareFrame},
-    mouse_ui::{self, MouseControl, MouseUi, MovementToggle, SprintWindowUi},
+    mouse_ui::{self, ControlToggle, MouseControl, MouseUi, SprintWindowUi},
     sound_ui::SoundUi,
     video_ui::{VideoControl, VideoUi},
 };
@@ -67,6 +67,8 @@ enum ButtonId {
     SprintWindow,
     ToggleSneak,
     ToggleSprint,
+    ToggleAttack,
+    ToggleUse,
     MouseSensitivity,
     MouseWheelSensitivity,
     MouseDiscreteScroll,
@@ -1525,27 +1527,36 @@ impl<'a> Menu<'a> {
                     String::new(),
                     true,
                 );
-                for (id, toggle, fallback) in [
-                    (ButtonId::ToggleSneak, MovementToggle::Sneak, "Sneak"),
-                    (ButtonId::ToggleSprint, MovementToggle::Sprint, "Sprint"),
+                for (id, toggle, fallback, enabled) in [
+                    (
+                        ButtonId::ToggleSneak,
+                        ControlToggle::Sneak,
+                        "Sneak",
+                        self.state.video.toggle_sneak,
+                    ),
+                    (
+                        ButtonId::ToggleSprint,
+                        ControlToggle::Sprint,
+                        "Sprint",
+                        self.state.video.toggle_sprint,
+                    ),
+                    (
+                        ButtonId::ToggleAttack,
+                        ControlToggle::Attack,
+                        "Attack/Destroy",
+                        self.state.video.toggle_attack,
+                    ),
+                    (
+                        ButtonId::ToggleUse,
+                        ControlToggle::Use,
+                        "Use Item/Place Block",
+                        self.state.video.toggle_use,
+                    ),
                 ] {
-                    let rect = mouse_ui::movement_toggle_rect(w, toggle);
+                    let rect = mouse_ui::control_toggle_rect(w, toggle);
                     let label = self.state.assets.as_deref().map_or_else(
-                        || {
-                            format!(
-                                "{fallback}: {}",
-                                if if toggle == MovementToggle::Sneak {
-                                    self.state.video.toggle_sneak
-                                } else {
-                                    self.state.video.toggle_sprint
-                                } {
-                                    "Toggle"
-                                } else {
-                                    "Hold"
-                                }
-                            )
-                        },
-                        |assets| mouse_ui::movement_toggle_label(assets, toggle, self.state.video),
+                        || format!("{fallback}: {}", if enabled { "Toggle" } else { "Hold" }),
+                        |assets| mouse_ui::control_toggle_label(assets, toggle, self.state.video),
                     );
                     add(id, rect.x, rect.y, rect.w, label, true);
                 }
@@ -1768,6 +1779,14 @@ impl<'a> Menu<'a> {
                 self.state.video.toggle_sprint = !self.state.video.toggle_sprint;
                 self.state.video_dirty = true;
             }
+            ButtonId::ToggleAttack => {
+                self.state.video.toggle_attack = !self.state.video.toggle_attack;
+                self.state.video_dirty = true;
+            }
+            ButtonId::ToggleUse => {
+                self.state.video.toggle_use = !self.state.video.toggle_use;
+                self.state.video_dirty = true;
+            }
             ButtonId::MouseSettings => {
                 self.mouse_ui = MouseUi::default();
                 self.state.screen = Screen::Mouse;
@@ -1987,6 +2006,8 @@ impl<'a> Menu<'a> {
                 id,
                 ButtonId::ToggleSneak
                     | ButtonId::ToggleSprint
+                    | ButtonId::ToggleAttack
+                    | ButtonId::ToggleUse
                     | ButtonId::SprintWindow
                     | ButtonId::VideoFps
                     | ButtonId::VideoBlur
@@ -2887,6 +2908,8 @@ impl ApplicationHandler for Menu<'_> {
                             button.id,
                             ButtonId::ToggleSneak
                                 | ButtonId::ToggleSprint
+                                | ButtonId::ToggleAttack
+                                | ButtonId::ToggleUse
                                 | ButtonId::SprintWindow
                                 | ButtonId::VideoFps
                                 | ButtonId::VideoBlur
@@ -4435,7 +4458,14 @@ mod tests {
                 self.menu.redraw().unwrap();
                 click(&mut self.menu, event_loop, ButtonId::ToggleSneak, false);
                 click(&mut self.menu, event_loop, ButtonId::ToggleSprint, false);
-                assert!(self.menu.state.video.toggle_sneak && self.menu.state.video.toggle_sprint);
+                click(&mut self.menu, event_loop, ButtonId::ToggleAttack, false);
+                click(&mut self.menu, event_loop, ButtonId::ToggleUse, false);
+                assert!(
+                    self.menu.state.video.toggle_sneak
+                        && self.menu.state.video.toggle_sprint
+                        && self.menu.state.video.toggle_attack
+                        && self.menu.state.video.toggle_use
+                );
                 click(&mut self.menu, event_loop, ButtonId::SprintWindow, true);
                 assert_eq!(self.menu.state.video.sprint_window, 10);
                 assert_eq!(self.menu.focused, Some(ButtonId::SprintWindow));
@@ -4446,7 +4476,12 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(saved.video.sprint_window, 10);
-                assert!(saved.video.toggle_sneak && saved.video.toggle_sprint);
+                assert!(
+                    saved.video.toggle_sneak
+                        && saved.video.toggle_sprint
+                        && saved.video.toggle_attack
+                        && saved.video.toggle_use
+                );
                 click(&mut self.menu, event_loop, ButtonId::VideoSettings, false);
                 assert_eq!(self.menu.state.screen, Screen::Video);
                 self.menu.redraw().unwrap();
@@ -4462,6 +4497,8 @@ mod tests {
                         sprint_window: 10,
                         toggle_sneak: true,
                         toggle_sprint: true,
+                        toggle_attack: true,
+                        toggle_use: true,
                         view_bobbing: true,
                         inactivity_fps_limit: menu_settings::InactivityFpsLimit::Minimized,
                         ..VideoSettings::default()

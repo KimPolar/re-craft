@@ -8,6 +8,54 @@ pub struct ToggleKey {
     released_by_screen: bool,
 }
 
+/// Mouse mappings are never restored after a screen closes in vanilla.
+#[derive(Default)]
+pub struct MouseBindings {
+    attack: ToggleKey,
+    use_key: ToggleKey,
+}
+
+impl MouseBindings {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn attack<S: native_session::GameSession>(
+        &mut self,
+        session: &mut S,
+        pressed: bool,
+        toggle: bool,
+    ) {
+        use native_session::PlayerCommand;
+        self.attack.set(true, pressed, false, toggle);
+        if pressed {
+            session.submit_command(PlayerCommand::Break);
+        }
+        if !self.attack.down() {
+            session.submit_command(PlayerCommand::StopBreak);
+        }
+    }
+
+    pub fn use_item<S: native_session::GameSession>(
+        &mut self,
+        session: &mut S,
+        pressed: bool,
+        toggle: bool,
+    ) {
+        use native_session::PlayerCommand;
+        self.use_key.set(true, pressed, false, toggle);
+        if pressed && self.use_key.down() {
+            session.submit_command(PlayerCommand::UseHeld(true));
+            session.submit_command(PlayerCommand::Place);
+        } else if pressed && session.snapshot().first_person.item_use.is_none() {
+            session.submit_command(PlayerCommand::Place);
+            session.submit_command(PlayerCommand::StopUse);
+        } else if !self.use_key.down() {
+            session.submit_command(PlayerCommand::StopUse);
+        }
+    }
+}
+
 impl ToggleKey {
     pub fn down(&self) -> bool {
         self.down
@@ -111,6 +159,67 @@ mod tests {
     }
 
     #[test]
+    fn mouse_toggle_keeps_use_held_until_the_next_click() {
+        use native_session::{GameSession, LocalSession, PlayerCommand};
+        use native_world::{Block, World};
+        use std::time::Duration;
+        let mut world = World::demo();
+        world.set_block(glam::IVec3::new(0, 4, 1), Block::Stone);
+        let mut session = LocalSession::new(world);
+        let mut mouse = super::MouseBindings::default();
+        session.submit_command(PlayerCommand::Select(Block::Dirt));
+        mouse.use_item(&mut session, true, true);
+        mouse.use_item(&mut session, false, true);
+        session.update(Duration::from_millis(50));
+        assert_eq!(
+            session
+                .snapshot()
+                .world
+                .demo()
+                .unwrap()
+                .block(glam::IVec3::new(0, 4, 2)),
+            Block::Dirt
+        );
+        session.update(Duration::from_millis(200));
+        assert_eq!(
+            session
+                .snapshot()
+                .world
+                .demo()
+                .unwrap()
+                .block(glam::IVec3::new(0, 4, 3)),
+            Block::Dirt
+        );
+        mouse.use_item(&mut session, true, true);
+        mouse.use_item(&mut session, false, true);
+        session.update(Duration::from_millis(50));
+        let revision = session.snapshot().world_revision;
+        session.update(Duration::from_millis(250));
+        assert_eq!(session.snapshot().world_revision, revision);
+    }
+
+    #[test]
+    fn mouse_attack_toggle_keeps_mining_until_clicked_again() {
+        use native_session::{GameSession, LocalSession};
+        use native_world::{Block, World};
+        use std::time::Duration;
+        let mut world = World::demo();
+        world.set_block(glam::IVec3::new(0, 4, 3), Block::Dirt);
+        let mut session = LocalSession::new(world);
+        let mut mouse = super::MouseBindings::default();
+        mouse.attack(&mut session, true, true);
+        mouse.attack(&mut session, false, true);
+        session.update(Duration::from_millis(50));
+        assert!(session.snapshot().breaking.is_some());
+        session.update(Duration::from_millis(150));
+        assert!(session.snapshot().breaking.is_some());
+        mouse.attack(&mut session, true, true);
+        mouse.attack(&mut session, false, true);
+        session.update(Duration::from_millis(50));
+        assert!(session.snapshot().breaking.is_none());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn toggle_mapping_matches_installed_java() {
         use std::{ffi::OsString, path::PathBuf, process::Command};
@@ -119,9 +228,11 @@ import java.nio.file.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.ToggleKeyMapping;
 import net.minecraft.client.KeyMapping;
+import com.mojang.blaze3d.platform.InputConstants;
 public class ToggleOracle {
     static class Key extends ToggleKeyMapping {
         Key(AtomicBoolean toggle) { super("test.toggle", 340, KeyMapping.Category.MOVEMENT, toggle::get, true); }
+        Key(AtomicBoolean toggle, boolean restore) { super("test.mouse", InputConstants.Type.MOUSE, 0, KeyMapping.Category.GAMEPLAY, toggle::get, restore); }
         void screen() { release(); }
     }
     public static void main(String[] args) throws Exception {
@@ -135,6 +246,8 @@ public class ToggleOracle {
                 case "down" -> key.setDown(true);
                 case "up" -> key.setDown(false);
                 case "repeat" -> { }
+                case "mouse_attack" -> key = new Key(toggle, true);
+                case "mouse_use" -> key = new Key(toggle, false);
                 case "screen" -> key.screen();
                 case "restore" -> { if (key.shouldRestoreStateOnScreenClosed()) key.setDown(true); }
                 default -> throw new AssertionError(line);
@@ -157,9 +270,38 @@ public class ToggleOracle {
         let input = temp.path().join("input.txt");
         let output = temp.path().join("output.txt");
         let operations = [
-            "toggle", "down", "repeat", "up", "screen", "screen", "restore", "down", "up", "hold",
-            "down", "screen", "restore", "up", "toggle", "down", "up", "screen", "hold", "restore",
+            "toggle",
+            "down",
+            "repeat",
             "up",
+            "screen",
+            "screen",
+            "restore",
+            "down",
+            "up",
+            "hold",
+            "down",
+            "screen",
+            "restore",
+            "up",
+            "toggle",
+            "down",
+            "up",
+            "screen",
+            "hold",
+            "restore",
+            "up",
+            "toggle",
+            "mouse_attack",
+            "down",
+            "up",
+            "screen",
+            "restore",
+            "mouse_use",
+            "down",
+            "up",
+            "screen",
+            "restore",
         ];
         std::fs::write(&source, JAVA).unwrap();
         std::fs::write(&input, operations.join("\n")).unwrap();
@@ -197,6 +339,7 @@ public class ToggleOracle {
         let expected = std::fs::read_to_string(output).unwrap();
         let mut key = ToggleKey::default();
         let mut toggle = false;
+        let mut mouse = false;
         for (operation, expected) in operations.into_iter().zip(expected.lines()) {
             match operation {
                 "toggle" => toggle = true,
@@ -204,7 +347,13 @@ public class ToggleOracle {
                 "down" => key.set(true, true, false, toggle),
                 "up" => key.set(true, false, false, toggle),
                 "repeat" => key.set(true, true, true, toggle),
+                "mouse_attack" | "mouse_use" => {
+                    mouse = true;
+                    key = ToggleKey::default();
+                }
+                "screen" if mouse => key = ToggleKey::default(),
                 "screen" => key.release_for_screen(toggle),
+                "restore" if mouse => {}
                 "restore" => key.restore_after_screen(toggle),
                 _ => unreachable!(),
             }

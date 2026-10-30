@@ -1695,6 +1695,15 @@ fn dropped_stack_pickup_matches_vanilla_inventory_add() {
         let offhand = choices[(random >> 16) as usize % choices.len()];
         cases.push(json!({"slots":slots, "selected":selected, "offhand":offhand, "pickup":drops[seed as usize % drops.len()], "creative":seed % 2 == 0}));
     }
+    // In particular, a partly filled inventory makes Java return false in
+    // survival even though it moved items, but discard the remainder in creative.
+    for creative in [false, true] {
+        for first_count in [63, 64] {
+            let mut slots = vec![[2, 64]; 36];
+            slots[0] = [1, first_count];
+            cases.push(json!({"slots":slots, "selected":0, "offhand":[2,64], "pickup":[1,3], "creative":creative}));
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("InventoryOracle.java");
     let input = temp.path().join("input.json");

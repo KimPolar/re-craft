@@ -1215,12 +1215,22 @@ impl PlayerInventory {
     /// Add a supported dropped stack using Java's selected-slot, offhand,
     /// other-stack, then empty-slot order. The remainder stays in `source`.
     pub fn pickup_stack(&mut self, source: &mut Option<ItemStack>, creative: bool) -> bool {
+        self.pickup_stack_with_transfer(source, creative).0
+    }
+
+    /// Return Java's success flag and the amount actually inserted. Creative
+    /// mode can clear a remainder without inserting it into the inventory.
+    pub(crate) fn pickup_stack_with_transfer(
+        &mut self,
+        source: &mut Option<ItemStack>,
+        creative: bool,
+    ) -> (bool, u32) {
         let Some(mut item) = source.take() else {
-            return false;
+            return (false, 0);
         };
         if !basic_pickup_supported(&item) {
             *source = Some(item);
-            return false;
+            return (false, 0);
         }
         let original = item.count;
         let max = item.max_count.expect("resolved stack");
@@ -1266,7 +1276,8 @@ impl PlayerInventory {
                 break;
             }
         }
-        if item.count < original {
+        let transferred = original - item.count;
+        if transferred > 0 {
             self.revision = self.revision.wrapping_add(1);
         }
         let success = item.count == 0 || creative;
@@ -1274,7 +1285,7 @@ impl PlayerInventory {
             item.count = 0;
         }
         *source = (item.count != 0).then_some(item);
-        success
+        (success, transferred)
     }
 
     /// Toggle without an item-entity sink. A close that needs drops is refused.

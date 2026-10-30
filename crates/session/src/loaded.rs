@@ -2147,8 +2147,8 @@ impl LoadedSession {
         self.dropped_items.created_removal_effects(positions)
     }
 
-    /// Verified partial and full pickups; save the player inventory together
-    /// with all affected entity and world changes.
+    /// Verified inventory transfers and successful pickup attempts; the caller
+    /// must coordinate the player inventory and all affected world changes.
     pub fn created_item_pickup_effects(
         &self,
         positions: &BTreeSet<ChunkPos>,
@@ -11028,7 +11028,9 @@ mod tests {
             vec![crate::items::CreatedItemPickup {
                 uuid,
                 original_stack: stack,
-                transferred: 3
+                transferred: 3,
+                discarded: 0,
+                pickup_succeeded: true,
             }]
         );
         assert_eq!(

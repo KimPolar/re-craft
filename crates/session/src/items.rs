@@ -355,13 +355,17 @@ pub enum CreatedRemovalCause {
     Expired,
 }
 
-/// A verified transfer from a newly spawned item into the player inventory.
-/// Java's pickup statistic uses the pre-transfer count, even for partial pickup.
+/// A verified inventory change or successful Java pickup for a created item.
+/// Java awards a statistic only on success, using the pre-transfer count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreatedItemPickup {
     pub uuid: [i32; 4],
     pub original_stack: ItemStack,
     pub transferred: u32,
+    /// Creative mode may discard a remainder when the inventory is full.
+    pub discarded: u32,
+    /// Whether Java's `Inventory.add` reports success and triggers pickup effects.
+    pub pickup_succeeded: bool,
 }
 
 struct CreatedPickupRecord {
@@ -1057,8 +1061,8 @@ impl ItemEntities {
             .collect()
     }
 
-    /// Only verified pickup events are reported; a caller must still validate
-    /// the complete chunk drafts and coordinate the player save.
+    /// Only verified changes and successful pickup attempts are reported; a
+    /// caller must still validate complete chunk drafts and coordinate saves.
     pub(crate) fn created_pickup_effects(
         &self,
         positions: &BTreeSet<native_world::loaded::ChunkPos>,
@@ -1914,11 +1918,13 @@ impl ItemEntities {
                 && bounds.max.cmpgt(pickup.min).all()
                 && bounds.min.cmplt(pickup.max).all()
             {
-                let before_count = entity.item.stack.count();
                 let mut stack = Some(entity.item.stack.clone());
-                Arc::make_mut(inventory).pickup_stack(&mut stack, mode == GameMode::Creative);
-                let taken = before_count.saturating_sub(stack.as_ref().map_or(0, |s| s.count()));
-                if taken > 0
+                let (pickup_succeeded, transferred) = Arc::make_mut(inventory)
+                    .pickup_stack_with_transfer(&mut stack, mode == GameMode::Creative);
+                let discarded = entity.item.stack.count()
+                    - transferred
+                    - stack.as_ref().map_or(0, |s| s.count());
+                if (transferred > 0 || pickup_succeeded)
                     && let Some(created) = &entity.created
                     && created.base_valid
                     && created.verified_position == entity.item.position
@@ -1936,7 +1942,9 @@ impl ItemEntities {
                         effect: CreatedItemPickup {
                             uuid,
                             original_stack: entity.item.stack.clone(),
-                            transferred: taken,
+                            transferred,
+                            discarded,
+                            pickup_succeeded,
                         },
                         chunks,
                     });
@@ -2592,7 +2600,9 @@ mod tests {
             vec![CreatedItemPickup {
                 uuid,
                 original_stack: stack.clone(),
-                transferred: 3
+                transferred: 3,
+                discarded: 0,
+                pickup_succeeded: true,
             }]
         );
         assert!(
@@ -2714,7 +2724,9 @@ mod tests {
             vec![CreatedItemPickup {
                 uuid,
                 original_stack: stack.clone(),
-                transferred: 1
+                transferred: 1,
+                discarded: 0,
+                pickup_succeeded: false,
             }]
         );
         let draft = items.draft_created_items_in_chunks(&group).unwrap();
@@ -2741,12 +2753,16 @@ mod tests {
                 CreatedItemPickup {
                     uuid,
                     original_stack: stack.clone(),
-                    transferred: 1
+                    transferred: 1,
+                    discarded: 0,
+                    pickup_succeeded: false,
                 },
                 CreatedItemPickup {
                     uuid,
                     original_stack: stack.with_count(2).unwrap(),
-                    transferred: 2
+                    transferred: 2,
+                    discarded: 0,
+                    pickup_succeeded: true,
                 }
             ]
         );
@@ -2759,6 +2775,68 @@ mod tests {
                 .validate_removed_item_chunk_group(&group, &Default::default())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn creative_pickup_records_inserted_and_discarded_counts() {
+        use crate::inventory::PlayerSlot;
+        use native_world::loaded::ChunkPos;
+        for inserted in [0, 1] {
+            let mut inventory = PlayerInventory::default();
+            for slot in 0..36 {
+                let (id, count) = if slot == 0 {
+                    ("minecraft:stone", 64 - inserted)
+                } else {
+                    ("minecraft:dirt", 64)
+                };
+                assert!(inventory.set_slot(
+                    PlayerSlot::Storage(slot),
+                    Some(ItemStack::new(id.into(), count, 64, Tag::Compound(vec![])).unwrap())
+                ));
+            }
+            let mut inventory = Arc::new(inventory);
+            let mut items = ItemEntities::default();
+            let position = DVec3::new(1.5, 2.0, 3.5);
+            let stack =
+                ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+            items.spawn_from_entity(position, stack.clone());
+            items.entities[0].velocity = DVec3::ZERO;
+            items.entities[0].no_gravity = true;
+            items.entities[0].pickup_delay = 0;
+            let uuid = items.entities[0].created.as_ref().unwrap().uuid.unwrap();
+            items.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                position,
+                PlayerPose::Standing,
+                GameMode::Creative,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| None,
+                |_, _| true,
+            );
+            let group = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+            assert!(items.entities.is_empty());
+            assert_eq!(inventory.slot(PlayerSlot::Storage(0)).unwrap().count(), 64);
+            assert_eq!(
+                items.created_pickup_effects(&group),
+                vec![CreatedItemPickup {
+                    uuid,
+                    original_stack: stack,
+                    transferred: inserted,
+                    discarded: 3 - inserted,
+                    pickup_succeeded: true,
+                }]
+            );
+            assert_eq!(
+                items.created_removal_effects(&group),
+                vec![(uuid, CreatedRemovalCause::Pickup)]
+            );
+        }
     }
 
     #[test]

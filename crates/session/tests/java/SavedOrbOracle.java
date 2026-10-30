@@ -44,6 +44,19 @@ public class SavedOrbOracle {
           !input.getBooleanOr("OnGround",false) || input.getBooleanOr("NoGravity",true) ||
           !LongTag.valueOf(987654321L).equals(tag.get("unknown_plugin_field")))
         throw new AssertionError("Rust orb draft differs from Java decoding");
+      var partial = NbtIo.read(Path.of(args[0], "partial-orb-chunk.nbt"));
+      var remaining = (ListTag)partial.get("Entities");
+      if (remaining.size()!=2) throw new AssertionError("partial entity count");
+      var partialOrb=(CompoundTag)remaining.get(0);
+      var partialInput=TagValueInput.create(ProblemReporter.DISCARDING,registry,partialOrb);
+      if (partialInput.read("Count",ExtraCodecs.POSITIVE_INT).orElse(-1)!=2 ||
+          partialInput.getShortOr("Value",(short)-1)!=7 ||
+          !LongTag.valueOf(987654321L).equals(partialOrb.get("unknown_plugin_field")))
+        throw new AssertionError("partial orb contents");
+      var removed=NbtIo.read(Path.of(args[0], "removed-orb-chunk.nbt"));
+      var after=(ListTag)removed.get("Entities");
+      if (after.size()!=1 || !StringTag.valueOf("minecraft:pig").equals(((CompoundTag)after.get(0)).get("id")))
+        throw new AssertionError("removed orb or unrelated entity");
     }
   }
 }

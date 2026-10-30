@@ -3355,6 +3355,7 @@ impl LoadedSession {
         let mut items = Vec::new();
         let mut removed_items = Vec::new();
         let mut orbs = Vec::new();
+        let mut removed_orbs = Vec::new();
         for &pos in positions {
             let chunk = match self.entity_chunks.get(&pos) {
                 Some(SavedEntityData::Present(chunk)) => chunk,
@@ -3387,10 +3388,15 @@ impl LoadedSession {
                     }
                 } else if let Some(saved) = crate::saved_orb::read(entity)? {
                     let uuid = saved.uuid.context("experience orb has no stable UUID")?;
-                    orbs.push(
-                        self.draft_saved_orb_entity(uuid)?
-                            .context("experience orb was removed or could not be simulated")?,
-                    );
+                    if let Some(orb) = self.draft_saved_orb_entity(uuid)? {
+                        orbs.push(orb);
+                    } else {
+                        removed_orbs.push(
+                            self.experience_orbs
+                                .draft_removed(uuid)?
+                                .context("experience orb was removed or could not be simulated")?,
+                        );
+                    }
                 }
             }
         }
@@ -3471,10 +3477,11 @@ impl LoadedSession {
             .chain(items.iter().map(EntityReplacement::Item))
             .chain(orbs.iter().map(EntityReplacement::Orb))
             .collect();
-        crate::saved_falling_block::draft_entity_chunks_with_item_changes(
+        crate::saved_falling_block::draft_entity_chunks_with_item_and_orb_changes(
             &originals,
             &replacements,
             &removed_items,
+            &removed_orbs,
             &created_items,
         )
     }
@@ -15181,13 +15188,27 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.experience.total, 7);
         assert_eq!(session.snapshot().experience_orbs.len(), 1);
-        assert!(session.draft_tracked_entity_chunks().is_err());
+        let partial = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = partial[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        let saved = crate::saved_orb::read(&values[0]).unwrap().unwrap();
+        assert_eq!(saved.count, 2);
+        assert_eq!(saved.source.get("unknown"), Some(&Tag::Int(123)));
         for _ in 0..4 {
             session.update(TICK);
         }
         assert_eq!(session.experience.total, 21);
         assert!(session.snapshot().experience_orbs.is_empty());
-        assert!(session.draft_tracked_entity_chunks().is_err());
+        let completed = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = completed[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("UUID"), item.get("UUID"));
+        assert_eq!(values[0].get("Item"), item.get("Item"));
         assert!(session.draft_existing_entity_chunk(home).is_err());
         assert_eq!(
             document.value.get("Entities").unwrap(),
@@ -15505,6 +15526,129 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn combined_draft_includes_saved_orb_pickup_and_player_experience() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let home = session.player_chunk().unwrap();
+        let position = session.origin.as_dvec3() + session.motion.position;
+        let orb = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:experience_orb".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: position.to_array().into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("NoGravity".into(), Tag::Byte(1)),
+            ("Value".into(), Tag::Short(7)),
+            ("Count".into(), Tag::Int(2)),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![orb],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document,
+                })),
+            )
+            .unwrap();
+        let tags = test_heightmap_tags();
+        session.update(TICK);
+        let partial = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &tags,
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_experience(partial.player_and_terrain.player()).total,
+            7
+        );
+        assert_eq!(
+            partial.player_and_terrain.player().value.get("Score"),
+            Some(&Tag::Int(7))
+        );
+        let Tag::List { values, .. } = partial.entity_chunks[&home]
+            .document()
+            .value
+            .get("Entities")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            crate::saved_orb::read(&values[0]).unwrap().unwrap().count,
+            1
+        );
+        for _ in 0..2 {
+            session.update(TICK);
+        }
+        let done = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &tags,
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_experience(done.player_and_terrain.player()).total,
+            14
+        );
+        assert_eq!(
+            done.player_and_terrain.player().value.get("Score"),
+            Some(&Tag::Int(14))
+        );
+        let Tag::List { values, .. } = done.entity_chunks[&home]
+            .document()
+            .value
+            .get("Entities")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(values.is_empty());
     }
 
     #[test]

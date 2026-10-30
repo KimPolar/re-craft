@@ -290,6 +290,24 @@ pub fn draft_entity_chunks_with_item_changes(
     removed_items: &[saved_item::ItemDraft],
     created_items: &[saved_item::CreatedItemDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
+    draft_entity_chunks_with_item_and_orb_changes(
+        originals,
+        replacements,
+        removed_items,
+        &[],
+        created_items,
+    )
+}
+
+/// Coordinate tracked saved-orb pickups with item and entity changes. The
+/// caller must include player experience and equipment effects in the same save.
+pub fn draft_entity_chunks_with_item_and_orb_changes(
+    originals: &BTreeMap<native_world::loaded::ChunkPos, Option<&NamedTag>>,
+    replacements: &[EntityReplacement<'_>],
+    removed_items: &[saved_item::ItemDraft],
+    removed_orbs: &[saved_orb::OrbDraft],
+    created_items: &[saved_item::CreatedItemDraft],
+) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     let empty: BTreeMap<_, _> = originals
         .iter()
         .filter(|(_, source)| source.is_none())
@@ -320,10 +338,15 @@ pub fn draft_entity_chunks_with_item_changes(
         .iter()
         .map(|(&pos, source)| (pos, source.unwrap_or_else(|| &empty[&pos])))
         .collect();
+    let removals: Vec<_> = removed_items
+        .iter()
+        .map(EntityReplacement::Item)
+        .chain(removed_orbs.iter().map(EntityReplacement::Orb))
+        .collect();
     let mut drafts = draft_entity_chunks_with_moves_and_removals(
         &complete,
         replacements,
-        removed_items,
+        &removals,
         created_items,
     )?;
     for pos in empty.keys() {
@@ -348,7 +371,7 @@ pub fn draft_entity_chunks_with_moves(
 fn draft_entity_chunks_with_moves_and_removals(
     originals: &BTreeMap<native_world::loaded::ChunkPos, &NamedTag>,
     replacements: &[EntityReplacement<'_>],
-    removed_items: &[saved_item::ItemDraft],
+    removed_entities: &[EntityReplacement<'_>],
     created_items: &[saved_item::CreatedItemDraft],
 ) -> Result<BTreeMap<native_world::loaded::ChunkPos, FallingEntityChunkDraft>> {
     use std::collections::BTreeSet;
@@ -395,27 +418,25 @@ fn draft_entity_chunks_with_moves_and_removals(
         );
     }
     let mut removals = BTreeMap::new();
-    for removal in removed_items {
+    for removal in removed_entities {
         let uuid = saved_item::optional_uuid(&removal.document().value, "UUID")?
-            .context("removed item has no UUID")?;
+            .context("removed entity has no UUID")?;
         ensure!(
             !requested.contains_key(&uuid) && removals.insert(uuid, removal).is_none(),
             "duplicate entity change UUID"
         );
         ensure!(
             owners.contains_key(&uuid),
-            "removed item is missing from source chunks"
+            "removed entity is missing from source chunks"
         );
-        let position = saved_item::read(&removal.document().value)?
-            .context("removed entity is not an item")?
-            .position;
+        let position = removal.position(&removal.document().value)?;
         let destination = native_world::loaded::ChunkPos {
             x: (position.x.floor() as i32).div_euclid(16),
             z: (position.z.floor() as i32).div_euclid(16),
         };
         ensure!(
             originals.contains_key(&destination),
-            "removed item's final chunk is unavailable"
+            "removed entity's final chunk is unavailable"
         );
     }
 
@@ -464,9 +485,7 @@ fn draft_entity_chunks_with_moves_and_removals(
                     removal.matches_source(&source)?,
                     "removed item source changed"
                 );
-                let position_in_source = saved_item::read(entity)?
-                    .context("removed source is not an item")?
-                    .position;
+                let position_in_source = removal.position(entity)?;
                 ensure!(
                     (position_in_source.x.floor() as i32).div_euclid(16) == position.x
                         && (position_in_source.z.floor() as i32).div_euclid(16) == position.z,

@@ -400,6 +400,80 @@ mod tests {
         assert_eq!(original_values, &[original.value]);
     }
 
+    #[test]
+    fn removed_orb_requires_unchanged_source_and_destination_chunk() {
+        use crate::saved_falling_block::draft_entity_chunks_with_item_and_orb_changes;
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeMap;
+        let home = ChunkPos { x: 0, z: -1 };
+        let target = ChunkPos { x: 1, z: -1 };
+        let original = original();
+        let other = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+        ]);
+        let make_chunk = |orb: Tag| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![orb, other.clone()],
+                    },
+                ),
+            ]),
+        };
+        let chunk = make_chunk(original.value.clone());
+        let removal = draft(
+            &original,
+            OrbSaveState {
+                position: DVec3::new(17.0, 63.0, -2.0),
+                ..state()
+            },
+        )
+        .unwrap();
+        let removed = [removal];
+        assert!(
+            draft_entity_chunks_with_item_and_orb_changes(
+                &BTreeMap::from([(home, Some(&chunk))]),
+                &[],
+                &[],
+                &removed,
+                &[]
+            )
+            .is_err()
+        );
+        let sources = BTreeMap::from([(home, Some(&chunk)), (target, None)]);
+        let drafts =
+            draft_entity_chunks_with_item_and_orb_changes(&sources, &[], &[], &removed, &[])
+                .unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values, &[other.clone()]);
+        assert!(drafts[&target].source_was_absent());
+        let mut changed = original.value.clone();
+        let Tag::Compound(fields) = &mut changed else {
+            panic!()
+        };
+        fields.push(("extra".into(), Tag::Int(1)));
+        let stale = make_chunk(changed);
+        assert!(
+            draft_entity_chunks_with_item_and_orb_changes(
+                &BTreeMap::from([(home, Some(&stale)), (target, None)]),
+                &[],
+                &[],
+                &removed,
+                &[]
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -448,6 +522,62 @@ mod tests {
             native_persistence::nbt::write(draft.document()).unwrap(),
         )
         .unwrap();
+        use crate::saved_falling_block::{
+            EntityReplacement, draft_entity_chunks_with_item_and_orb_changes,
+        };
+        use native_world::loaded::ChunkPos;
+        use std::collections::BTreeMap;
+        let home = ChunkPos { x: 0, z: -1 };
+        let chunk = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            original().value,
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:pig".into())),
+                                ("UUID".into(), Tag::IntArray(vec![5, 6, 7, 8])),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        let pickup = super::draft(
+            &original(),
+            OrbSaveState {
+                count: 2,
+                ..state()
+            },
+        )
+        .unwrap();
+        let sources = BTreeMap::from([(home, Some(&chunk))]);
+        let partial = draft_entity_chunks_with_item_and_orb_changes(
+            &sources,
+            &[EntityReplacement::Orb(&pickup)],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let removed =
+            draft_entity_chunks_with_item_and_orb_changes(&sources, &[], &[], &[pickup], &[])
+                .unwrap();
+        for (name, drafts) in [
+            ("partial-orb-chunk.nbt", partial),
+            ("removed-orb-chunk.nbt", removed),
+        ] {
+            std::fs::write(
+                temp.path().join(name),
+                native_persistence::nbt::write(drafts[&home].document()).unwrap(),
+            )
+            .unwrap();
+        }
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)

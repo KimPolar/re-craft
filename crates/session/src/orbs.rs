@@ -3,7 +3,7 @@
 //! Pickup is withheld when equipment repair effects cannot be resolved.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -83,6 +83,8 @@ pub(crate) struct Orbs {
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
     damage_tags: Option<Arc<OxygenEnchantments>>,
     uncoordinated_lifecycle: bool,
+    saved_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
+    removed_saved: Vec<Orb>,
 }
 
 impl Default for Orbs {
@@ -100,6 +102,8 @@ impl Default for Orbs {
             active_chunks: None,
             damage_tags: None,
             uncoordinated_lifecycle: false,
+            saved_pickups: BTreeMap::new(),
+            removed_saved: Vec::new(),
         }
     }
 }
@@ -128,6 +132,14 @@ impl Orbs {
                 x: (position.x.floor() as i32).div_euclid(16),
                 z: (position.z.floor() as i32).div_euclid(16),
             });
+        }
+        chunks.extend(
+            self.saved_pickups
+                .values()
+                .flat_map(|positions| positions.iter().copied()),
+        );
+        for position in self.removed_saved.iter().map(|orb| orb.visual.position) {
+            chunks.insert(orb_chunk(position)?);
         }
         self.validate_chunk_group(&chunks, saved_uuids)?;
         Ok(chunks)
@@ -276,28 +288,26 @@ impl Orbs {
             if crate::saved_item::optional_uuid(source, "UUID")? != Some(uuid) {
                 continue;
             }
-            anyhow::ensure!(
-                !orb.save_unresolved,
-                "experience-orb damage effects are not simulated"
-            );
-            let original = native_persistence::nbt::NamedTag {
-                name: "".into(),
-                value: (**source).clone(),
-            };
-            let state = crate::saved_orb::OrbSaveState {
-                position: orb.visual.position,
-                velocity: orb.velocity,
-                on_ground: orb.on_ground,
-                no_gravity: orb.no_gravity,
-                age: orb.lifetime,
-                value: orb.visual.value,
-                count: orb.count,
-                health: orb.damage.health,
-                fire_ticks: orb.damage.fire_ticks,
-                invulnerable: orb.damage.invulnerable,
-                invulnerable_time: orb.damage.invulnerable_time,
-            };
-            return Ok(Some(crate::saved_orb::draft(&original, state)?));
+            return Ok(Some(draft_orb(orb)?));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn draft_removed(
+        &self,
+        uuid: [i32; 4],
+    ) -> anyhow::Result<Option<crate::saved_orb::OrbDraft>> {
+        for orb in &self.removed_saved {
+            if orb
+                .source
+                .as_ref()
+                .map(|source| crate::saved_item::optional_uuid(source, "UUID"))
+                .transpose()?
+                .flatten()
+                == Some(uuid)
+            {
+                return Ok(Some(draft_orb(orb)?));
+            }
         }
         Ok(None)
     }
@@ -308,8 +318,12 @@ impl Orbs {
         saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
+        ensure!(
+            !self.uncoordinated_lifecycle,
+            "experience-orb lifecycle effects need coordinated saving"
+        );
         let mut seen = BTreeSet::new();
-        for orb in &self.entities {
+        for orb in self.entities.iter().chain(&self.removed_saved) {
             let position = orb.visual.position;
             ensure!(
                 position.is_finite()
@@ -343,6 +357,21 @@ impl Orbs {
                 positions.contains(&destination),
                 "experience-orb destination chunk is unavailable"
             );
+        }
+        for (uuid, pickup_chunks) in &self.saved_pickups {
+            let source = *saved_uuids
+                .get(uuid)
+                .context("picked-up orb source chunk is unavailable")?;
+            if positions.contains(&source) || !positions.is_disjoint(pickup_chunks) {
+                ensure!(
+                    positions.contains(&source) && pickup_chunks.is_subset(positions),
+                    "orb pickup requires source and pickup chunks"
+                );
+                ensure!(
+                    seen.contains(uuid),
+                    "picked-up orb final state is unavailable"
+                );
+            }
         }
         Ok(())
     }
@@ -486,6 +515,7 @@ impl Orbs {
         let active_chunks = &self.active_chunks;
         let damage_tags = self.damage_tags.as_deref();
         let mut removed = vec![false; self.entities.len()];
+        let removals_before = self.removed_saved.len();
         let mut spatial = None;
         for index in 0..self.entities.len() {
             if removed[index] || !Self::active(active_chunks, self.entities[index].visual.position)
@@ -679,7 +709,20 @@ impl Orbs {
                         *xp = next_xp;
                         *score = next_score;
                         *player_random = random;
-                        self.uncoordinated_lifecycle = true;
+                        if let Some((uuid, position)) = entity
+                            .source
+                            .as_ref()
+                            .and_then(|source| {
+                                crate::saved_item::optional_uuid(source, "UUID")
+                                    .ok()
+                                    .flatten()
+                            })
+                            .zip(orb_chunk(entity.visual.position).ok())
+                        {
+                            self.saved_pickups.entry(uuid).or_default().insert(position);
+                        } else {
+                            self.uncoordinated_lifecycle = true;
+                        }
                         self.pickup_delay = 2;
                         let silent = entity
                             .source
@@ -696,13 +739,20 @@ impl Orbs {
                         entity.count = entity.count.wrapping_sub(1);
                         if entity.count == 0 {
                             removed[index] = true;
+                            if entity.source.is_some() {
+                                let mut last = entity.clone();
+                                last.count = 1;
+                                self.removed_saved.push(last);
+                            }
                         }
                         continue;
                     }
                 }
             }
         }
-        if removed.iter().any(|&value| value) {
+        if removed.iter().filter(|&&removed| removed).count()
+            != self.removed_saved.len() - removals_before
+        {
             self.uncoordinated_lifecycle = true;
         }
         let mut index = 0;
@@ -713,6 +763,49 @@ impl Orbs {
         });
         self.update_snapshot();
     }
+}
+
+fn orb_chunk(position: DVec3) -> anyhow::Result<native_world::loaded::ChunkPos> {
+    anyhow::ensure!(
+        position.is_finite()
+            && position.x.abs() <= 30_000_512.0
+            && position.z.abs() <= 30_000_512.0,
+        "experience orb has an invalid position"
+    );
+    Ok(native_world::loaded::ChunkPos {
+        x: (position.x.floor() as i32).div_euclid(16),
+        z: (position.z.floor() as i32).div_euclid(16),
+    })
+}
+
+fn draft_orb(orb: &Orb) -> anyhow::Result<crate::saved_orb::OrbDraft> {
+    use anyhow::Context;
+    anyhow::ensure!(
+        !orb.save_unresolved,
+        "experience-orb damage effects are not simulated"
+    );
+    let source = orb
+        .source
+        .as_ref()
+        .context("experience orb has no saved source")?;
+    let original = native_persistence::nbt::NamedTag {
+        name: "".into(),
+        value: (**source).clone(),
+    };
+    let state = crate::saved_orb::OrbSaveState {
+        position: orb.visual.position,
+        velocity: orb.velocity,
+        on_ground: orb.on_ground,
+        no_gravity: orb.no_gravity,
+        age: orb.lifetime,
+        value: orb.visual.value,
+        count: orb.count,
+        health: orb.damage.health,
+        fire_ticks: orb.damage.fire_ticks,
+        invulnerable: orb.damage.invulnerable,
+        invulnerable_time: orb.damage.invulnerable_time,
+    };
+    crate::saved_orb::draft(&original, state)
 }
 
 fn orb_hurt(
@@ -1125,6 +1218,34 @@ mod tests {
         );
         assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
         orbs.entities[0].visual.position.x = f64::NAN;
+        assert!(orbs.affected_orb_chunks(&owners).is_err());
+    }
+
+    #[test]
+    fn picked_up_orb_requires_source_pickup_and_final_chunks() {
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::ChunkPos;
+        let uuid = [1, 2, 3, 4];
+        let source = ChunkPos { x: -1, z: 0 };
+        let pickup = ChunkPos { x: 0, z: 0 };
+        let final_chunk = ChunkPos { x: 1, z: 0 };
+        let mut orb = test_orb(1, DVec3::new(16.5, 2.0, 0.5), 3, 0, 1);
+        orb.source = Some(Arc::new(Tag::Compound(vec![(
+            "UUID".into(),
+            Tag::IntArray(uuid.to_vec()),
+        )])));
+        let mut orbs = Orbs::default();
+        orbs.removed_saved.push(orb);
+        orbs.saved_pickups.insert(uuid, BTreeSet::from([pickup]));
+        let owners = BTreeMap::from([(uuid, source)]);
+        let all = BTreeSet::from([source, pickup, final_chunk]);
+        assert_eq!(orbs.affected_orb_chunks(&owners).unwrap(), all);
+        for missing in [source, pickup, final_chunk] {
+            let mut incomplete = all.clone();
+            incomplete.remove(&missing);
+            assert!(orbs.validate_chunk_group(&incomplete, &owners).is_err());
+        }
+        orbs.uncoordinated_lifecycle = true;
         assert!(orbs.affected_orb_chunks(&owners).is_err());
     }
 

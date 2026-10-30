@@ -7179,6 +7179,9 @@ impl LoadedSession {
         let before = self.falling_sand.len();
         let removed_before = self.removed_falling_sand.len();
         let mut remaining = Vec::new();
+        // Landing can change the world during this loop. Reuse area checks
+        // only until the next block change, and always recheck start overlap.
+        let mut path_cache = ItemPathRegionCache::default();
         for mut entity in std::mem::take(&mut self.falling_sand) {
             entity.previous = entity.motion.position;
             let relative = entity.motion.position - self.origin.as_dvec3();
@@ -7250,7 +7253,7 @@ impl LoadedSession {
             });
             entity.on_ground = collision.on_ground;
             if entity.fall_distance_verified {
-                let safe = created_item_path_safe(
+                let safe = path_cache.safe(
                     &self.world,
                     self.origin,
                     self.bounds,
@@ -7323,7 +7326,9 @@ impl LoadedSession {
                     }
                     let name = entity.kind.id();
                     let id = self.intern_block(state(name, &[]));
-                    if self.set(target_relative, id) {
+                    let placed = self.set(target_relative, id);
+                    path_cache.clear();
+                    if placed {
                         self.track_removed_falling_sand(entity);
                         continue;
                     }
@@ -9355,7 +9360,41 @@ struct CreatedItemPathProof<'a> {
     world: &'a World,
     origin: IVec3,
     build: BuildBounds,
-    cache: HashMap<(IVec3, IVec3), bool>,
+    cache: ItemPathRegionCache,
+}
+
+#[derive(Default)]
+struct ItemPathRegionCache {
+    regions: HashMap<(IVec3, IVec3), bool>,
+}
+
+impl ItemPathRegionCache {
+    fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    fn safe(
+        &mut self,
+        world: &World,
+        origin: IVec3,
+        build: BuildBounds,
+        bounds: BoundingBox,
+        actual: DVec3,
+    ) -> bool {
+        let Some(region) = created_item_path_region(bounds, actual) else {
+            return false;
+        };
+        let region_safe = if let Some(result) = self.regions.get(&region) {
+            *result
+        } else {
+            let result = created_item_region_safe(world, origin, build, region.0, region.1);
+            if self.regions.len() < 4096 {
+                self.regions.insert(region, result);
+            }
+            result
+        };
+        region_safe && created_item_start_clear(world, origin, bounds)
+    }
 }
 
 impl<'a> CreatedItemPathProof<'a> {
@@ -9364,25 +9403,13 @@ impl<'a> CreatedItemPathProof<'a> {
             world,
             origin,
             build,
-            cache: HashMap::new(),
+            cache: ItemPathRegionCache::default(),
         }
     }
 
     fn safe(&mut self, bounds: BoundingBox, actual: DVec3) -> bool {
-        let Some(region) = created_item_path_region(bounds, actual) else {
-            return false;
-        };
-        let region_safe = if let Some(result) = self.cache.get(&region) {
-            *result
-        } else {
-            let result =
-                created_item_region_safe(self.world, self.origin, self.build, region.0, region.1);
-            if self.cache.len() < 4096 {
-                self.cache.insert(region, result);
-            }
-            result
-        };
-        region_safe && created_item_start_clear(self.world, self.origin, bounds)
+        self.cache
+            .safe(self.world, self.origin, self.build, bounds, actual)
     }
 }
 
@@ -9461,6 +9488,7 @@ fn created_item_region_safe(
     true
 }
 
+#[cfg(test)]
 fn created_item_path_safe(
     world: &World,
     origin: IVec3,
@@ -16758,6 +16786,103 @@ mod tests {
         assert!(session.set(IVec3::new(3, 3, 3), portal));
         let mut proof = CreatedItemPathProof::new(&session.world, session.origin, session.bounds);
         assert!(!proof.safe(bounds, DVec3::ZERO));
+    }
+
+    #[test]
+    fn falling_path_cache_rechecks_overlap_and_world_changes() {
+        let mut session = session();
+        let bounds = BoundingBox {
+            min: DVec3::new(3.01, 3.0, 3.01),
+            max: DVec3::new(3.99, 3.98, 3.99),
+        };
+        let actual = DVec3::new(0.0, -0.04, 0.0);
+        let mut cache = ItemPathRegionCache::default();
+        assert!(cache.safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            bounds,
+            actual
+        ));
+        let stone = session.states[3];
+        assert!(session.set(IVec3::new(3, 3, 3), stone));
+        // The area remains a valid ordinary-block region, but the exact
+        // starting box must be checked again even when the region is cached.
+        assert!(!cache.safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            bounds,
+            actual
+        ));
+        let portal = session.intern_block(state("minecraft:nether_portal", &[("axis", "x")]));
+        assert!(session.set(IVec3::new(3, 3, 3), session.states[0]));
+        assert!(session.set(IVec3::new(4, 3, 3), portal));
+        cache.clear();
+        assert!(!cache.safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            bounds,
+            actual
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual synthetic CPU benchmark"]
+    fn benchmark_falling_block_path_cache() {
+        use std::{hint::black_box, time::Instant};
+        let session = session();
+        let boxes: Vec<_> = (0..1000)
+            .map(|i| {
+                let position = DVec3::new(
+                    3.5 + f64::from(i % 16) * 0.5,
+                    5.0,
+                    3.5 + f64::from((i / 16) % 16) * 0.5,
+                );
+                crate::falling_block::AirborneMotion {
+                    position,
+                    velocity: DVec3::ZERO,
+                    age: 0,
+                    no_gravity: false,
+                }
+                .bounds()
+            })
+            .collect();
+        let movement = DVec3::new(0.0, -0.04, 0.0);
+        for cached in [false, true] {
+            let mut samples = Vec::new();
+            for _ in 0..30 {
+                let mut cache = ItemPathRegionCache::default();
+                let start = Instant::now();
+                for &bounds in &boxes {
+                    let valid = if cached {
+                        cache.safe(
+                            &session.world,
+                            session.origin,
+                            session.bounds,
+                            bounds,
+                            movement,
+                        )
+                    } else {
+                        created_item_path_safe(
+                            &session.world,
+                            session.origin,
+                            session.bounds,
+                            bounds,
+                            movement,
+                        )
+                    };
+                    assert!(black_box(valid));
+                }
+                samples.push(start.elapsed());
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "1000 falling paths (cached={cached}): median {:?}, p95 {:?}",
+                samples[15], samples[28]
+            );
+        }
     }
 
     #[test]

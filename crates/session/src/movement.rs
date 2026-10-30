@@ -160,6 +160,20 @@ pub(super) fn legacy_on_block(
     }
 }
 
+/// Resolve Java's getBlockPosBelowThatAffectsMyMovement from a support cell.
+pub(super) fn movement_on_block(
+    position: DVec3,
+    support: Option<IVec3>,
+    keep_support_height: impl FnOnce(IVec3) -> bool,
+) -> IVec3 {
+    let y = (position.y - f64::from(0.500001_f32)).floor() as i32;
+    match support {
+        Some(cell) if keep_support_height(cell) => cell,
+        Some(cell) => IVec3::new(cell.x, y, cell.z),
+        None => IVec3::new(position.x.floor() as i32, y, position.z.floor() as i32),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn back_off<'a>(
     position: DVec3,

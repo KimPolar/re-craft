@@ -41,6 +41,7 @@ struct Orb {
     visual: ExperienceOrb,
     velocity: DVec3,
     on_ground: bool,
+    ground_without_support: bool,
     no_gravity: bool,
     lifetime: i32,
     count: i32,
@@ -171,6 +172,7 @@ impl Orbs {
                 let entity = &mut self.entities[index];
                 entity.visual.age = 0;
                 entity.visual.previous_position = entity.visual.position;
+                entity.ground_without_support = false;
                 entity.id = self.next_entity_id;
                 self.next_entity_id = self.next_entity_id.wrapping_add(1);
                 entity.section_sequence = self.next_section_sequence;
@@ -197,6 +199,7 @@ impl Orbs {
             },
             velocity: saved.velocity,
             on_ground: saved.on_ground,
+            ground_without_support: false,
             no_gravity: saved.no_gravity,
             lifetime: saved.age,
             count: saved.count,
@@ -354,6 +357,7 @@ impl Orbs {
                 },
                 velocity,
                 on_ground: false,
+                ground_without_support: false,
                 no_gravity: false,
                 lifetime: 0,
                 count: 1,
@@ -395,6 +399,7 @@ impl Orbs {
             score,
             shape,
             friction,
+            |_| false,
             |_, _| (Default::default(), false),
             false,
             |_, _, _| Some(Vec::new()),
@@ -415,6 +420,7 @@ impl Orbs {
         score: &mut i32,
         mut shape: impl FnMut(IVec3) -> &'a [Aabb],
         mut friction: impl FnMut(IVec3) -> f32,
+        mut keep_support_height: impl FnMut(IVec3) -> bool,
         mut fluid: impl FnMut(BoundingBox, DVec3) -> (native_world::fluid::FluidContacts, bool),
         fast_lava: bool,
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
@@ -569,16 +575,31 @@ impl Orbs {
             }
             let hit_y = requested.y != actual.y;
             entity.on_ground = hit_y && requested.y < 0.0;
+            let relative_position = entity.visual.position - origin.as_dvec3();
+            let support = if entity.on_ground {
+                let found = movement::supporting_box(
+                    relative_position,
+                    0.25,
+                    actual,
+                    entity.ground_without_support,
+                    &mut shape,
+                );
+                entity.ground_without_support = found.is_none();
+                found
+            } else {
+                entity.ground_without_support = false;
+                None
+            };
             if hit_y {
                 entity.velocity.y = 0.0;
             }
             let mut drag = 0.98_f32;
             if entity.on_ground {
-                let below = (entity.visual.position
-                    - origin.as_dvec3()
-                    - DVec3::Y * f64::from(0.999999_f32))
-                .floor()
-                .as_ivec3();
+                let below = movement::movement_on_block(
+                    relative_position,
+                    support,
+                    &mut keep_support_height,
+                );
                 drag *= friction(below);
             }
             entity.velocity *= f64::from(drag);
@@ -898,6 +919,7 @@ mod tests {
                 &mut score,
                 |_| &[],
                 |_| 0.6,
+                |_| false,
                 |_, _| (Default::default(), false),
                 false,
                 |_, _, _| Some(effects.clone()),
@@ -1007,6 +1029,7 @@ mod tests {
             },
             velocity: DVec3::ZERO,
             on_ground: false,
+            ground_without_support: false,
             no_gravity: false,
             lifetime: age,
             count,
@@ -1115,6 +1138,7 @@ mod tests {
             &mut score,
             |_| &[],
             |_| 0.6,
+            |_| false,
             |_, _| (Default::default(), false),
             false,
             |_, _, _| None,

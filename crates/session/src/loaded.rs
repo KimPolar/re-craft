@@ -5861,6 +5861,10 @@ impl LoadedSession {
                     .map_or(0.6, |state| crate::physics::ground_friction(&state.name)),
                 Cell::Missing => 0.6,
             },
+            |pos| match cell(world, origin, bounds, pos, air) {
+                Cell::State(id) => world.state(id).is_some_and(|state| state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")),
+                Cell::Missing => false,
+            },
             |orb_bounds, position| {
                 if !fluid_view.chunks_loaded(orb_bounds) {
                     return (Default::default(), false);
@@ -12052,6 +12056,47 @@ mod tests {
                 expected_bounce,
                 "{name} x={x}: {landed} -> {next}"
             );
+        }
+    }
+
+    #[test]
+    fn loaded_orb_uses_support_friction_at_block_edges() {
+        for (name, friction) in [
+            ("minecraft:slime_block", 0.8_f32),
+            ("minecraft:stone", 0.6_f32),
+        ] {
+            let mut session = session();
+            session.set_game_mode(GameMode::Spectator);
+            let block = session.intern_block(state(name, &[]));
+            assert!(session.set(IVec3::new(4, 1, 4), block));
+            let position = session.origin.as_dvec3() + DVec3::new(5.05, 2.2, 4.5);
+            session
+                .experience_orbs
+                .spawn_saved(crate::saved_orb::SavedOrb {
+                    source: Arc::new(native_persistence::nbt::Tag::Compound(vec![])),
+                    uuid: None,
+                    position,
+                    velocity: DVec3::new(0.02, -0.5, 0.0),
+                    on_ground: false,
+                    no_gravity: false,
+                    age: 0,
+                    value: 7,
+                    count: 1,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                });
+            session.update(TICK);
+            let landed = session.snapshot().experience_orbs[0].position;
+            session.update(TICK);
+            let next = session.snapshot().experience_orbs[0].position;
+            let expected_dx = 0.02 * f64::from(0.98_f32 * friction);
+            assert!(
+                (next.x - landed.x - expected_dx).abs() < 1.0e-8,
+                "{name}: {landed:?} -> {next:?}"
+            );
+            assert!(next.y > landed.y, "{name}: {landed:?} -> {next:?}");
         }
     }
 

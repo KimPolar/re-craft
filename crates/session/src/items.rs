@@ -1521,17 +1521,11 @@ impl ItemEntities {
                     entity.ground_without_support = false;
                     None
                 };
-                let below = match support {
-                    Some(cell) if keep_support_height(cell) => cell,
-                    Some(cell) => IVec3::new(
-                        cell.x,
-                        (relative_position.y - f64::from(0.500001_f32)).floor() as i32,
-                        cell.z,
-                    ),
-                    None => (relative_position - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
-                        .floor()
-                        .as_ivec3(),
-                };
+                let below = movement::movement_on_block(
+                    relative_position,
+                    support,
+                    &mut keep_support_height,
+                );
                 if let Some(created) = &mut entity.created {
                     if entity.on_ground {
                         created.fall_distance = 0.0;
@@ -4367,12 +4361,12 @@ public class ItemMotionOracle {
         });
         output.add(afterReturn);
         JsonArray supportResults = new JsonArray();
-        for (int mode=0;mode<2;mode++) for (double x : new double[]{0.8,0.9,1.0,1.02,1.12,1.2}) {
+        for (double half : new double[]{0.125,0.25}) for (int mode=0;mode<2;mode++) for (double x : new double[]{0.8,0.9,1.0,1.02,1.12,1.2}) {
             var world = (TestLevel)unsafe.allocateInstance(TestLevel.class);
             world.supportGrid=true; world.twoBlocks=mode==1;
             var item = (TestItem)unsafe.allocateInstance(TestItem.class); item.world=world;
             item.pos(new Vec3(x,1,0.5));
-            var support = world.findSupportingBlock(item,new AABB(x-0.125,1-1.0e-6,0.375,x+0.125,1,0.625));
+            var support = world.findSupportingBlock(item,new AABB(x-half,1-1.0e-6,0.5-half,x+half,1,0.5+half));
             supportResults.add(support.map(BlockPos::getX).orElse(-99));
         }
         output.add(supportResults);
@@ -4608,27 +4602,29 @@ public class ItemMotionOracle {
         assert_eq!(order, returned_order);
         let support_results = expected[cases.len() + 5].as_array().unwrap();
         let mut support_index = 0;
-        for mode in 0..2 {
-            for x in [0.8, 0.9, 1.0, 1.02, 1.12, 1.2] {
-                let support = movement::supporting_box(
-                    DVec3::new(x, 1.0, 0.5),
-                    0.125,
-                    DVec3::ZERO,
-                    true,
-                    |pos| {
-                        if pos.y == 0 && pos.z == 0 && (pos.x == 0 || mode == 1 && pos.x == 1) {
-                            native_world::collision::unknown_barrier()
-                        } else {
-                            &[]
-                        }
-                    },
-                );
-                assert_eq!(
-                    support.map_or(-99, |pos| pos.x),
-                    support_results[support_index].as_i64().unwrap() as i32,
-                    "support mode={mode}, x={x}"
-                );
-                support_index += 1;
+        for half in [0.125, 0.25] {
+            for mode in 0..2 {
+                for x in [0.8, 0.9, 1.0, 1.02, 1.12, 1.2] {
+                    let support = movement::supporting_box(
+                        DVec3::new(x, 1.0, 0.5),
+                        half,
+                        DVec3::ZERO,
+                        true,
+                        |pos| {
+                            if pos.y == 0 && pos.z == 0 && (pos.x == 0 || mode == 1 && pos.x == 1) {
+                                native_world::collision::unknown_barrier()
+                            } else {
+                                &[]
+                            }
+                        },
+                    );
+                    assert_eq!(
+                        support.map_or(-99, |pos| pos.x),
+                        support_results[support_index].as_i64().unwrap() as i32,
+                        "support half={half}, mode={mode}, x={x}"
+                    );
+                    support_index += 1;
+                }
             }
         }
         for (index, case) in cases.iter().enumerate() {

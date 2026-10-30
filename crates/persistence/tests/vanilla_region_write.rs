@@ -148,6 +148,8 @@ public class RegionWriteOracle {
             var chunk=chunk(0); var section=chunk.getListOrEmpty("sections").getCompoundOrEmpty(0); var states=section.getCompoundOrEmpty("block_states");
             states.getListOrEmpty("palette").add(StringTag.valueOf("minecraft:chest")); long[] words=new long[256]; words[0]=1; states.putLongArray("data",words);
             var chest=new net.minecraft.world.level.block.entity.ChestBlockEntity(new net.minecraft.core.BlockPos(0,0,0),net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState());
+            var state=chest.getBlockState();
+            if(state.getValue(net.minecraft.world.level.block.ChestBlock.FACING)!=net.minecraft.core.Direction.NORTH || state.getValue(net.minecraft.world.level.block.ChestBlock.TYPE)!=net.minecraft.world.level.block.state.properties.ChestType.SINGLE || state.getValue(net.minecraft.world.level.block.ChestBlock.WATERLOGGED)) throw new AssertionError("unexpected default chest state");
             chest.setItem(0,new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND,3));
             var blockEntity=chest.saveWithFullMetadata(registries); blockEntity.putLong("future_data",123); var list=new ListTag(); list.add(blockEntity); chunk.put("block_entities",list);
             try(var region=open(dir); var out=region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk,(DataOutput)out); }
@@ -353,6 +355,50 @@ fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
         .read_chunk(0, 0)
         .unwrap()
         .unwrap();
+    let mut reader = WorldReader::open(&world, DimensionId::parse("overworld").unwrap()).unwrap();
+    let area = reader.read_area(ChunkPos { x: 0, z: 0 }, 0).unwrap();
+    let defaults = std::collections::BTreeMap::from([(
+        "minecraft:chest".into(),
+        std::collections::BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("type".into(), "single".into()),
+            ("waterlogged".into(), "false".into()),
+        ]),
+    )]);
+    let runtime = area
+        .materialize_with_defaults(&DimensionId::parse("overworld").unwrap(), &defaults)
+        .unwrap();
+    drop(reader);
+    let player = native_session::PlayerState {
+        position: glam::Vec3::new(0.5, 1.0, 0.5),
+        yaw: 0.0,
+        pitch: 0.0,
+        vertical_velocity: 0.0,
+        on_ground: true,
+        pose: native_session::PlayerPose::Standing,
+    };
+    let session = native_session::loaded::LoadedSession::new(
+        runtime,
+        glam::IVec3::ZERO,
+        native_session::loaded::BuildBounds {
+            min_y: 0,
+            max_y: 16,
+        },
+        player,
+    )
+    .unwrap();
+    let chest = session.saved_chest(glam::IVec3::ZERO).unwrap().unwrap();
+    assert_eq!(
+        (
+            chest.slots[0].as_ref().unwrap().id(),
+            chest.slots[0].as_ref().unwrap().count()
+        ),
+        ("minecraft:diamond", 3)
+    );
+    assert_eq!(
+        chest.source().get("future_data"),
+        Some(&nbt::Tag::Long(123))
+    );
     let prepare = |x, expected, replacement| {
         let change = BlockChange {
             x,

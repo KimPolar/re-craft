@@ -35,6 +35,7 @@ pub mod physics;
 pub mod player_data;
 pub mod redstone;
 pub mod respawn;
+pub mod saved_chest;
 pub mod saved_falling_block;
 pub mod saved_item;
 pub mod saved_orb;

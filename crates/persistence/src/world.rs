@@ -495,8 +495,50 @@ impl ChunkArea {
             if !ticks.is_empty() {
                 world.saved_block_ticks.insert(position, ticks);
             }
+            world
+                .saved_block_entities
+                .insert(position, saved_block_entity_payload(&chunk.document.value));
         }
         Ok(world)
+    }
+}
+
+fn saved_block_entity_payload(chunk: &Tag) -> native_world::loaded::SavedBlockEntities {
+    use native_world::loaded::SavedBlockEntities;
+    let Tag::Compound(fields) = chunk else {
+        return SavedBlockEntities::Unavailable;
+    };
+    let mut entries = fields
+        .iter()
+        .filter(|(name, _)| name.matches("block_entities"));
+    let first = entries.next();
+    if entries.next().is_some() {
+        return SavedBlockEntities::Unavailable;
+    }
+    match first.map(|(_, tag)| tag) {
+        None => SavedBlockEntities::Empty,
+        Some(Tag::List {
+            element_type,
+            values,
+        }) if values.is_empty() => {
+            let _ = element_type;
+            SavedBlockEntities::Empty
+        }
+        Some(
+            tag @ Tag::List {
+                element_type: crate::nbt::TagType::Compound,
+                ..
+            },
+        ) => {
+            match crate::nbt::write(&crate::nbt::NamedTag {
+                name: "".into(),
+                value: tag.clone(),
+            }) {
+                Ok(bytes) => SavedBlockEntities::Encoded(bytes.into()),
+                Err(_) => SavedBlockEntities::Unavailable,
+            }
+        }
+        _ => SavedBlockEntities::Unavailable,
     }
 }
 
@@ -1508,6 +1550,43 @@ fn decode_chunk(document: NamedTag, expected: ChunkPos) -> Result<LoadedChunk> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_entity_payload_distinguishes_empty_data_and_ambiguous_sources() {
+        use super::*;
+        use native_world::loaded::SavedBlockEntities;
+        let empty = Tag::Compound(vec![]);
+        assert_eq!(
+            saved_block_entity_payload(&empty),
+            SavedBlockEntities::Empty
+        );
+        let list = Tag::List {
+            element_type: crate::nbt::TagType::Compound,
+            values: vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:chest".into()),
+            )])],
+        };
+        let chunk = Tag::Compound(vec![("block_entities".into(), list.clone())]);
+        let SavedBlockEntities::Encoded(bytes) = saved_block_entity_payload(&chunk) else {
+            panic!("encoded payload expected")
+        };
+        assert_eq!(crate::nbt::read(&bytes).unwrap().value, list);
+        let duplicate = Tag::Compound(vec![
+            ("block_entities".into(), list.clone()),
+            ("block_entities".into(), list),
+        ]);
+        assert_eq!(
+            saved_block_entity_payload(&duplicate),
+            SavedBlockEntities::Unavailable
+        );
+        assert_eq!(
+            saved_block_entity_payload(&Tag::Compound(vec![(
+                "block_entities".into(),
+                Tag::Int(1)
+            )])),
+            SavedBlockEntities::Unavailable
+        );
+    }
     use std::io::Write;
 
     use super::*;

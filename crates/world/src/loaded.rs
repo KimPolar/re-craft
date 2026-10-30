@@ -151,6 +151,15 @@ pub struct SavedBlockTick {
     pub priority: i32,
 }
 
+/// Encoded source block entities are opaque to the renderer and shared across
+/// world snapshots. The session decodes them only when needed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedBlockEntities {
+    Empty,
+    Encoded(Arc<[u8]>),
+    Unavailable,
+}
+
 #[derive(Clone, Debug)]
 pub struct Section {
     /// Absent data is not treated as air.
@@ -182,6 +191,7 @@ pub struct World {
     pub missing_chunks: BTreeSet<ChunkPos>,
     pub saved_fluid_ticks: BTreeMap<ChunkPos, Vec<SavedFluidTick>>,
     pub saved_block_ticks: BTreeMap<ChunkPos, Vec<SavedBlockTick>>,
+    pub saved_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
     block_edits: Arc<BTreeMap<BlockPosition, BlockEdit>>,
 }
 
@@ -393,6 +403,11 @@ impl World {
         } else {
             self.saved_block_ticks.remove(&pos);
         }
+        if let Some(entities) = source.saved_block_entities.get(&pos) {
+            self.saved_block_entities.insert(pos, entities.clone());
+        } else {
+            self.saved_block_entities.remove(&pos);
+        }
         Ok(true)
     }
 
@@ -550,6 +565,9 @@ mod tests {
         });
         let forest = source.intern_biome("minecraft:forest".into());
         let pos = ChunkPos { x: -2, z: 4 };
+        source
+            .saved_block_entities
+            .insert(pos, SavedBlockEntities::Encoded(Arc::from([1u8, 2, 3])));
         source.saved_block_ticks.insert(
             pos,
             vec![SavedBlockTick {
@@ -587,6 +605,10 @@ mod tests {
         dest.missing_chunks.insert(pos);
         assert!(dest.import_chunk(&source, pos).unwrap());
         assert!(dest.chunks[&pos].block_light_correct);
+        assert_eq!(
+            dest.saved_block_entities.get(&pos),
+            source.saved_block_entities.get(&pos)
+        );
         assert_eq!(
             dest.saved_block_ticks.get(&pos),
             source.saved_block_ticks.get(&pos)

@@ -2251,6 +2251,50 @@ impl LoadedSession {
         self.entity_chunks.get(&pos)
     }
 
+    /// Inspect a loaded single chest without generating its loot or modifying it.
+    pub fn saved_chest(
+        &self,
+        position: IVec3,
+    ) -> anyhow::Result<Option<crate::saved_chest::SavedChest>> {
+        use anyhow::{Context, ensure};
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let block = self
+            .world
+            .block(position.x, position.y, position.z)
+            .context("chest block is not loaded")?;
+        if !matches!(
+            block.name.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest"
+        ) {
+            return Ok(None);
+        }
+        ensure!(
+            block.properties.len() == 3
+                && matches!(
+                    block.properties.get("facing").map(String::as_str),
+                    Some("north" | "south" | "west" | "east")
+                )
+                && matches!(
+                    block.properties.get("waterlogged").map(String::as_str),
+                    Some("true" | "false")
+                ),
+            "unsupported chest block state"
+        );
+        ensure!(
+            block.properties.get("type").map(String::as_str) == Some("single"),
+            "double chest is not yet supported"
+        );
+        let payload = self
+            .world
+            .saved_block_entities
+            .get(&chunk)
+            .context("block entity chunk is unavailable")?;
+        crate::saved_chest::read(payload, chunk, position)
+    }
+
     /// Draft an existing saved item; this does not authorize a world write.
     pub fn draft_saved_item_entity(
         &self,
@@ -3615,6 +3659,7 @@ impl LoadedSession {
                         self.parked_chunks.insert(pos, chunk);
                         respawn_changed = true;
                     } else {
+                        world.saved_block_entities.remove(&pos);
                         if !retained_entities.contains(&pos)
                             && self.entity_chunks.remove(&pos).is_some()
                         {
@@ -3680,6 +3725,9 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
+            Arc::make_mut(&mut self.world)
+                .saved_block_entities
+                .remove(&pos);
             if !self.retain_entity_chunk(pos) {
                 self.entity_chunks.remove(&pos);
             }
@@ -10996,6 +11044,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn saved_single_chest_follows_chunk_unload_and_reload() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut world, origin, player) = fixture();
+        let position = origin + IVec3::new(8, 2, 6);
+        let home = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let block = world.intern_state(state(
+            "minecraft:chest",
+            &[
+                ("facing", "north"),
+                ("type", "single"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        world
+            .set_block_id(position.x, position.y, position.z, block)
+            .unwrap();
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(position.x)),
+            ("y".into(), Tag::Int(position.y)),
+            ("z".into(), Tag::Int(position.z)),
+            (
+                "Items".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("Slot".into(), Tag::Byte(3)),
+                        ("id".into(), Tag::String("minecraft:diamond".into())),
+                        ("count".into(), Tag::Int(5)),
+                    ])],
+                },
+            ),
+        ]);
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity],
+            },
+        })
+        .unwrap();
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Encoded(bytes.into()));
+        let source = world.clone();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let read = |session: &LoadedSession| {
+            session.saved_chest(position).unwrap().unwrap().slots[3]
+                .as_ref()
+                .unwrap()
+                .count()
+        };
+        assert_eq!(read(&session), 5);
+        let remote = ChunkPos {
+            x: home.x + 3,
+            z: home.z,
+        };
+        session.queue_chunk_window(remote, 0);
+        session.apply_streaming();
+        assert!(session.saved_chest(position).is_err());
+        assert!(!session.world.saved_block_entities.contains_key(&home));
+        session.queue_chunk_window(home, 0);
+        session.queue_loaded_chunk(home, source);
+        session.apply_streaming();
+        assert_eq!(read(&session), 5);
     }
 
     #[test]

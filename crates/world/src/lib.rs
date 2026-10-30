@@ -12,6 +12,7 @@ pub mod loaded;
 pub mod movement;
 pub mod raycast;
 pub mod sky_light;
+pub mod sky_propagation;
 
 pub const SECTION_SIZE: i32 = 16;
 const SECTION_VOLUME: usize = (SECTION_SIZE * SECTION_SIZE * SECTION_SIZE) as usize;

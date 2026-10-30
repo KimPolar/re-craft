@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-const DIRECTIONS: [(i32, i32, i32); 6] = [
+pub(crate) const DIRECTIONS: [(i32, i32, i32); 6] = [
     (1, 0, 0),
     (-1, 0, 0),
     (0, 1, 0),
@@ -581,6 +581,10 @@ impl LightBounds {
 
     pub(crate) fn build_range(self) -> std::ops::Range<i32> {
         self.min_y..self.max_y
+    }
+
+    pub(crate) fn light_range(self) -> std::ops::Range<i32> {
+        self.min_light_y..self.max_light_y
     }
 }
 

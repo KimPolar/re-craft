@@ -181,7 +181,7 @@ fn repair_damage(item: &ItemStack) -> anyhow::Result<Option<i32>> {
     Ok(Some(damage.min(max)))
 }
 
-fn item_enchantments(item: &ItemStack) -> anyhow::Result<Vec<(ResourceId, u32)>> {
+pub(crate) fn item_enchantments(item: &ItemStack) -> anyhow::Result<Vec<(ResourceId, u32)>> {
     use anyhow::{Context, ensure};
     let Some(enchantments) = item.components.get("minecraft:enchantments") else {
         return Ok(Vec::new());
@@ -2247,6 +2247,10 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                     1
                 } else if name.matches("minecraft:unbreaking") {
                     2
+                } else if name.matches("minecraft:silk_touch") {
+                    4
+                } else if name.matches("minecraft:fortune") {
+                    8
                 } else {
                     return None;
                 };

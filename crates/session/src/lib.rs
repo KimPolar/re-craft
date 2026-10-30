@@ -1706,9 +1706,15 @@ fn interaction_drops(
         return Some(Vec::new());
     };
     let item = inventory.slot(hand);
+    let enchantments = item
+        .map(inventory::item_enchantments)
+        .transpose()
+        .ok()?
+        .unwrap_or_default();
     let tool = native_resources::loot::BasicTool {
         item: item.map(inventory::ItemStack::id),
         count: item.map_or(0, inventory::ItemStack::count),
+        enchantments: &enchantments,
     };
     tables?.interaction_drops(id, tool).ok()
 }

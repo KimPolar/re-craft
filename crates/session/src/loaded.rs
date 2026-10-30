@@ -13817,6 +13817,82 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn loaded_enchanted_tools_apply_real_loot_and_durability() {
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let enchantments = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for (block, item, enchantment, level, expected) in [
+            ("stone", "iron_pickaxe", "silk_touch", 1, "stone"),
+            ("gravel", "iron_shovel", "fortune", 3, "flint"),
+        ] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            let components = Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![(
+                    format!("minecraft:{enchantment}").as_str().into(),
+                    Tag::Int(level),
+                )]),
+            )]);
+            let tool =
+                crate::inventory::ItemStack::new(format!("minecraft:{item}"), 1, 1, components)
+                    .unwrap();
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Storage(0), Some(tool));
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&enchantments),
+                )
+                .unwrap();
+            let relative = IVec3::new(8, 2, 6);
+            let id = session.intern_block(state(&format!("minecraft:{block}"), &[]));
+            assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
+            session.set(relative, id);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id)
+            );
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            for _ in 0..40 {
+                session.update(TICK);
+                if session
+                    .snapshot()
+                    .dropped_items
+                    .iter()
+                    .any(|drop| drop.stack.id() == format!("minecraft:{expected}"))
+                {
+                    break;
+                }
+            }
+            assert!(
+                session
+                    .snapshot()
+                    .dropped_items
+                    .iter()
+                    .any(|drop| drop.stack.id() == format!("minecraft:{expected}")),
+                "{block}"
+            );
+            let tool = session
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap();
+            assert_eq!(
+                tool.components().get("minecraft:damage"),
+                Some(&Tag::Int(1)),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
     fn loaded_gravel_mining_uses_data_pack_random_loot() {
         use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
         struct LootSource;

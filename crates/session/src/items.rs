@@ -1200,9 +1200,17 @@ impl ItemEntities {
             return;
         }
         let Some(tables) = tables else { return };
+        let enchantments = match hand.map(crate::inventory::item_enchantments).transpose() {
+            Ok(enchantments) => enchantments.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("unsupported loot enchantments for {name}: {error:#}");
+                return;
+            }
+        };
         let tool = BasicTool {
             item: hand.map(ItemStack::id),
             count: hand.map_or(0, ItemStack::count),
+            enchantments: &enchantments,
         };
         let drops =
             match tables.drops_with_random(name, tool, Some(&mut || self.random.next_float())) {
@@ -1230,6 +1238,7 @@ impl ItemEntities {
         let tool = BasicTool {
             item: None,
             count: 0,
+            enchantments: &[],
         };
         match tables.drops_with_random(name, tool, Some(&mut || self.random.next_float())) {
             Ok(drops) => self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops),

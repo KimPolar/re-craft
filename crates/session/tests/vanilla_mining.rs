@@ -17,6 +17,82 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn enchanted_gravel_loot_conditions_match_vanilla() {
+    use native_core::random::LegacyRandom;
+    use native_resources::{
+        loot::{BasicTool, BlockLootTables},
+        packs::{ResourceId, ResourceStack},
+    };
+    use serde_json::json;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let tables = BlockLootTables::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("EnchantedLootOracle.java");
+    std::fs::write(&source, include_str!("java/EnchantedLootOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let mut cases = Vec::new();
+    for seed in -100..100 {
+        for fortune in [0, 1, 2, 3, 10, 255] {
+            for silk in [0, 1] {
+                cases.push(json!({"seed":seed,"fortune":fortune,"silk":silk}));
+            }
+        }
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("EnchantedLootOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases.len());
+    for (case, row) in cases.iter().zip(rows) {
+        let mut random = LegacyRandom::new(case["seed"].as_i64().unwrap());
+        let mut enchants = Vec::new();
+        for name in ["fortune", "silk"] {
+            let level = case[name].as_u64().unwrap() as u32;
+            if level != 0 {
+                enchants.push((
+                    ResourceId::parse(if name == "silk" {
+                        "minecraft:silk_touch"
+                    } else {
+                        "minecraft:fortune"
+                    })
+                    .unwrap(),
+                    level,
+                ));
+            }
+        }
+        let tool = BasicTool {
+            item: Some("minecraft:iron_shovel"),
+            count: 1,
+            enchantments: &enchants,
+        };
+        let drops = tables
+            .drops_with_random("minecraft:gravel", tool, Some(&mut || random.next_float()))
+            .unwrap();
+        assert_eq!(drops[0].item.path, row[0].as_str().unwrap(), "{case}");
+        assert_eq!(random.next_int(), row[1].as_i64().unwrap() as i32, "{case}");
+    }
+    eprintln!(
+        "Compared {} enchanted gravel cases with Minecraft 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn unbreaking_effect_matches_vanilla_and_consumes_the_same_random_values() {
     use native_core::random::LegacyRandom;
     use native_resources::{

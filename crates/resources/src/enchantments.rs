@@ -632,7 +632,7 @@ fn tag_contains(
 
 /// Follow just the tags needed by a behavior, including nested and replaced
 /// entries, without loading the entire entity-type tag registry.
-fn load_single_tag(
+pub(crate) fn load_single_tag(
     provider: &mut impl ResourceProvider,
     folder: &str,
     root: &ResourceId,

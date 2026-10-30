@@ -1,4 +1,4 @@
-//! A data-pack aware subset of 26.3 block loot for ordinary unenchanted items.
+//! A data-pack aware subset of 26.3 block loot.
 //!
 //! Unsupported conditions, random rolls and functions return an error instead of
 //! inventing a drop. The evaluator will be extended alongside item components.
@@ -41,7 +41,7 @@ enum Condition {
     All(Vec<Condition>),
     Any(Vec<Condition>),
     Not(Box<Condition>),
-    UnenchantedTableBonus(f32),
+    TableBonus(ResourceId, Vec<f32>),
     Unsupported(String),
 }
 
@@ -50,8 +50,15 @@ struct ToolPredicate {
     items: Option<Vec<ResourceId>>,
     min_count: Option<u32>,
     max_count: Option<u32>,
-    requires_enchantment: bool,
+    enchantments: Vec<EnchantmentPredicate>,
     unsupported: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct EnchantmentPredicate {
+    ids: Option<BTreeSet<ResourceId>>,
+    min_level: Option<i32>,
+    max_level: Option<i32>,
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +66,8 @@ pub struct BasicTool<'a> {
     /// An empty hand is represented as `None` with count zero.
     pub item: Option<&'a str>,
     pub count: u32,
+    /// The stack's stored enchantments and their levels.
+    pub enchantments: &'a [(ResourceId, u32)],
 }
 
 impl Condition {
@@ -86,9 +95,21 @@ impl Condition {
                 }
                 if predicate.min_count.is_some_and(|min| tool.count < min)
                     || predicate.max_count.is_some_and(|max| tool.count > max)
-                    || predicate.requires_enchantment
                 {
                     return Ok(false);
+                }
+                for predicate in &predicate.enchantments {
+                    if !tool.enchantments.iter().any(|(id, level)| {
+                        predicate.ids.as_ref().is_none_or(|ids| ids.contains(id))
+                            && predicate
+                                .min_level
+                                .is_none_or(|min| i64::from(*level) >= i64::from(min))
+                            && predicate
+                                .max_level
+                                .is_none_or(|max| i64::from(*level) <= i64::from(max))
+                    }) {
+                        return Ok(false);
+                    }
                 }
                 Ok(true)
             }
@@ -109,11 +130,17 @@ impl Condition {
                 Ok(false)
             }
             Self::Not(condition) => Ok(!condition.test(tool, random)?),
-            Self::UnenchantedTableBonus(chance) => {
+            Self::TableBonus(enchantment, chances) => {
+                let level = tool
+                    .enchantments
+                    .iter()
+                    .find(|(id, _)| id == enchantment)
+                    .map_or(0, |(_, level)| *level as usize);
+                let chance = chances[level.min(chances.len() - 1)];
                 let random = random
                     .as_mut()
                     .context("random loot requires a random source")?;
-                Ok(random() < *chance)
+                Ok(random() < chance)
             }
             Self::Unsupported(reason) => bail!("unsupported loot condition: {reason}"),
         }
@@ -323,7 +350,7 @@ impl BlockLootTables {
         self.drops_with_random(block, tool, None)
     }
 
-    /// Random source is session-local; enchanted tool components are not yet supported.
+    /// Random source is session-local and is not yet the world's named loot sequence.
     pub fn drops_with_random(
         &self,
         block: &str,
@@ -564,10 +591,14 @@ fn parse_condition(
         .context("loot condition has no type")?;
     Ok(match kind {
         "minecraft:survives_explosion" => Condition::Always,
-        "minecraft:match_tool" => Condition::Tool(parse_tool(value.get("predicate"))?),
-        "minecraft:table_bonus"
-            if value.get("enchantment").and_then(Value::as_str) == Some("minecraft:fortune") =>
-        {
+        "minecraft:match_tool" => Condition::Tool(parse_tool(value.get("predicate"), provider)?),
+        "minecraft:table_bonus" => {
+            let enchantment = ResourceId::parse(
+                value
+                    .get("enchantment")
+                    .and_then(Value::as_str)
+                    .context("table bonus has no enchantment")?,
+            )?;
             let chances = value
                 .get("chances")
                 .and_then(Value::as_array)
@@ -576,9 +607,14 @@ fn parse_condition(
                 !chances.is_empty() && chances.len() <= 128,
                 "invalid table bonus chances"
             );
-            let first = chances[0].as_f64().context("invalid table bonus chance")?;
-            ensure!((0.0..=1.0).contains(&first), "invalid table bonus chance");
-            Condition::UnenchantedTableBonus(first as f32)
+            let chances = chances
+                .iter()
+                .map(|value| {
+                    let chance = value.as_f64().context("invalid table bonus chance")?;
+                    Ok(chance as f32)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Condition::TableBonus(enchantment, chances)
         }
         "minecraft:all_of" | "minecraft:any_of" => {
             let terms = value
@@ -608,7 +644,10 @@ fn parse_condition(
     })
 }
 
-fn parse_tool(value: Option<&Value>) -> Result<ToolPredicate> {
+fn parse_tool(
+    value: Option<&Value>,
+    provider: &mut impl ResourceProvider,
+) -> Result<ToolPredicate> {
     let Some(value) = value else {
         return Ok(ToolPredicate::default());
     };
@@ -680,15 +719,69 @@ fn parse_tool(value: Option<&Value>) -> Result<ToolPredicate> {
                 .as_array()
                 .context("enchantment predicate must be an array")?;
             for enchantment in enchantments {
-                let min = enchantment
-                    .get("levels")
-                    .and_then(|levels| levels.get("min"))
-                    .and_then(Value::as_u64);
-                if min.is_some_and(|min| min > 0) {
-                    result.requires_enchantment = true;
-                } else {
-                    result.unsupported = Some("enchantment level predicate".into());
+                let object = enchantment
+                    .as_object()
+                    .context("enchantment predicate is not an object")?;
+                if object
+                    .keys()
+                    .any(|key| key != "enchantments" && key != "levels")
+                {
+                    result.unsupported = Some("enchantment predicate field".into());
+                    continue;
                 }
+                let ids = if let Some(value) = object.get("enchantments") {
+                    let values: Vec<&Value> = match value {
+                        Value::Array(values) => values.iter().collect(),
+                        _ => vec![value],
+                    };
+                    let mut ids = BTreeSet::new();
+                    for value in values {
+                        let name = value.as_str().context("invalid enchantment selector")?;
+                        if let Some(tag) = name.strip_prefix('#') {
+                            for id in crate::enchantments::load_single_tag(
+                                provider,
+                                "enchantment",
+                                &ResourceId::parse(tag)?,
+                            )? {
+                                ids.insert(ResourceId::parse(&id)?);
+                            }
+                        } else {
+                            ids.insert(ResourceId::parse(name)?);
+                        }
+                    }
+                    Some(ids)
+                } else {
+                    None
+                };
+                let mut min_level = None;
+                let mut max_level = None;
+                if let Some(levels) = object.get("levels") {
+                    let bound = |value: &Value| -> Result<i32> {
+                        Ok(i32::try_from(
+                            value.as_i64().context("invalid enchantment level")?,
+                        )?)
+                    };
+                    if levels.is_number() {
+                        let level = bound(levels)?;
+                        min_level = Some(level);
+                        max_level = Some(level);
+                    } else {
+                        let bounds = levels
+                            .as_object()
+                            .context("invalid enchantment level bounds")?;
+                        ensure!(
+                            bounds.keys().all(|key| key == "min" || key == "max"),
+                            "unknown enchantment level bound"
+                        );
+                        min_level = bounds.get("min").map(bound).transpose()?;
+                        max_level = bounds.get("max").map(bound).transpose()?;
+                    }
+                }
+                result.enchantments.push(EnchantmentPredicate {
+                    ids,
+                    min_level,
+                    max_level,
+                });
             }
         }
     }
@@ -729,6 +822,7 @@ mod tests {
         let pick = |id| BasicTool {
             item: id,
             count: u32::from(id.is_some()),
+            enchantments: &[],
         };
         assert_eq!(
             tables.drops("minecraft:dirt", pick(None)).unwrap(),
@@ -760,7 +854,8 @@ mod tests {
                     "minecraft:dirt",
                     BasicTool {
                         item: None,
-                        count: 0
+                        count: 0,
+                        enchantments: &[],
                     }
                 )
                 .unwrap()
@@ -774,11 +869,115 @@ mod tests {
                     "minecraft:dirt",
                     BasicTool {
                         item: None,
-                        count: 0
+                        count: 0,
+                        enchantments: &[],
                     }
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn enchantment_predicates_honor_tags_bounds_and_other_enchantments() {
+        let mut source = Memory::default();
+        source.put(
+            "data/example/tags/enchantment/special.json",
+            r#"{"values":["minecraft:fortune", "minecraft:efficiency"]}"#,
+        );
+        source.put("data/minecraft/loot_table/blocks/dirt.json", r##"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:stone","condition":{"type":"minecraft:match_tool","predicate":{"predicates":{"minecraft:enchantments":[{"enchantments":"#example:special","levels":{"min":2,"max":3}}]}}}},{"type":"minecraft:item","name":"minecraft:dirt"}]}]}]}"##);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        for (name, level, expected) in [
+            ("minecraft:fortune", 1, "minecraft:dirt"),
+            ("minecraft:fortune", 2, "minecraft:stone"),
+            ("minecraft:efficiency", 3, "minecraft:stone"),
+            ("minecraft:efficiency", 4, "minecraft:dirt"),
+            ("minecraft:unbreaking", 2, "minecraft:dirt"),
+        ] {
+            let enchantments = [(ResourceId::parse(name).unwrap(), level)];
+            let tool = BasicTool {
+                item: Some("minecraft:iron_pickaxe"),
+                count: 1,
+                enchantments: &enchantments,
+            };
+            assert_eq!(
+                tables.drops("minecraft:dirt", tool).unwrap()[0].item,
+                ResourceId::parse(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_loot_uses_silk_touch_and_fortune_levels() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut provider = crate::packs::ResourceStack::open(&game).unwrap();
+        let tables = BlockLootTables::load(&mut provider).unwrap();
+        let silk = [(ResourceId::parse("minecraft:silk_touch").unwrap(), 1)];
+        let tool = BasicTool {
+            item: Some("minecraft:iron_pickaxe"),
+            count: 1,
+            enchantments: &silk,
+        };
+        for block in ["stone", "grass_block", "gravel"] {
+            let mut calls = 0;
+            let drops = tables
+                .drops_with_random(
+                    &format!("minecraft:{block}"),
+                    tool,
+                    Some(&mut || {
+                        calls += 1;
+                        0.0
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                drops[0].item,
+                ResourceId::parse(&format!("minecraft:{block}")).unwrap()
+            );
+            assert_eq!(
+                calls, 0,
+                "silk touch must short-circuit gravel's random condition"
+            );
+        }
+        for (level, random, expected) in [
+            (0, 0.099_f32, "flint"),
+            (0, 0.1, "gravel"),
+            (1, 0.14, "flint"),
+            (1, 0.15, "gravel"),
+            (2, 0.249, "flint"),
+            (2, 0.25, "gravel"),
+            (3, 0.999, "flint"),
+            (255, 0.999, "flint"),
+        ] {
+            let enchantments = if level == 0 {
+                vec![]
+            } else {
+                vec![(ResourceId::parse("minecraft:fortune").unwrap(), level)]
+            };
+            let tool = BasicTool {
+                item: Some("minecraft:iron_shovel"),
+                count: 1,
+                enchantments: &enchantments,
+            };
+            let mut calls = 0;
+            let drops = tables
+                .drops_with_random(
+                    "minecraft:gravel",
+                    tool,
+                    Some(&mut || {
+                        calls += 1;
+                        random
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                drops[0].item,
+                ResourceId::parse(&format!("minecraft:{expected}")).unwrap()
+            );
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]
@@ -793,6 +992,7 @@ mod tests {
         let tool = BasicTool {
             item: None,
             count: 0,
+            enchantments: &[],
         };
         for (random, expected) in [(0.099_f32, "minecraft:flint"), (0.1, "minecraft:gravel")] {
             let mut calls = 0;

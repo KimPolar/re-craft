@@ -370,7 +370,7 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
         let b = if axis == 2 { 1 } else { 2 };
         let grid = |value: f32| -> Option<usize> {
             let scaled = value * 16.0;
-            (scaled >= 0.0 && scaled <= 16.0 && scaled.fract() == 0.0).then_some(scaled as usize)
+            ((0.0..=16.0).contains(&scaled) && scaled.fract() == 0.0).then_some(scaled as usize)
         };
         for bb in &boxes {
             if !(if high {
@@ -390,8 +390,8 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
                 return None;
             }
             let bits = (((1u32 << (b1 - b0)) - 1) << b0) as u16;
-            for i in a0..a1 {
-                masks[index][i] |= bits;
+            for row in &mut masks[index][a0..a1] {
+                *row |= bits;
             }
         }
     }
@@ -427,6 +427,24 @@ fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
         y: p.y.checked_add(d.1)?,
         z: p.z.checked_add(d.2)?,
     })
+}
+
+#[derive(Clone, Copy)]
+struct LightCell {
+    behavior: u32,
+    previous: u8,
+    value: u8,
+}
+
+fn dense_index(x: i32, y: i32, z: i32, radius: i32, side: usize) -> usize {
+    ((x + radius) as usize * side + (y + radius) as usize) * side + (z + radius) as usize
+}
+
+fn dense_offset(index: usize, radius: i32, side: usize) -> (i32, i32, i32) {
+    let x = index / (side * side);
+    let y = index / side % side;
+    let z = index % side;
+    (x as i32 - radius, y as i32 - radius, z as i32 - radius)
 }
 
 /// A validated change to a block's light emission or attenuation.
@@ -484,17 +502,27 @@ pub fn relight_block(
         }
     }
     let radius = i32::from(change.radius);
-    let mut cells = BTreeMap::new();
+    let side = (radius * 2 + 1) as usize;
+    let mut cells = vec![
+        LightCell {
+            behavior: u32::MAX,
+            previous: 0,
+            value: 0
+        };
+        side * side * side
+    ];
     let mut cache = BTreeMap::new();
     let mut behaviors: Vec<LightProperties> = Vec::new();
     let behavior =
-        |p: BlockPosition, cache: &mut BTreeMap<_, usize>, behaviors: &mut Vec<LightProperties>| {
+        |p: BlockPosition, cache: &mut BTreeMap<_, u32>, behaviors: &mut Vec<LightProperties>| {
             let id = world.block_id(p.x, p.y, p.z)?;
             if let Some(&index) = cache.get(&id) {
                 return Some(index);
             }
             let value = light_properties(world.state(id)?)?;
-            let index = behaviors.len();
+            let index = u32::try_from(behaviors.len())
+                .ok()
+                .filter(|&i| i != u32::MAX)?;
             behaviors.push(value);
             cache.insert(id, index);
             Some(index)
@@ -512,72 +540,86 @@ pub fn relight_block(
                 }
                 let value = behavior(p, &mut cache, &mut behaviors)?;
                 let previous = world.light(p.x, p.y, p.z, false)?;
-                cells.insert(p, (value, previous, behaviors[value].emission));
+                let index = dense_index(dx, dy, dz, radius, side);
+                cells[index] = LightCell {
+                    behavior: value,
+                    previous,
+                    value: behaviors[value as usize].emission,
+                };
             }
         }
     }
     let mut queue = BinaryHeap::new();
-    for (&p, cell) in &mut cells {
+    for (index, cell) in cells.iter_mut().enumerate() {
+        if cell.behavior == u32::MAX {
+            continue;
+        }
+        let (dx, dy, dz) = dense_offset(index, radius, side);
+        let p = offset(center, (dx, dy, dz))?;
         for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
-            let next = offset(p, direction)?;
-            if (next.x - center.x).abs() + (next.y - center.y).abs() + (next.z - center.z).abs()
-                <= radius
-            {
+            let (nx, ny, nz) = (dx + direction.0, dy + direction.1, dz + direction.2);
+            if nx.abs() + ny.abs() + nz.abs() <= radius {
                 continue;
             }
+            let next = offset(p, direction)?;
             let chunk = world.chunks.get(&next.chunk())?;
             if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
             let other = behavior(next, &mut cache, &mut behaviors)?;
-            if (behaviors[cell.0].has_faces || behaviors[other].has_faces)
+            if (behaviors[cell.behavior as usize].has_faces || behaviors[other as usize].has_faces)
                 && faces_occlude(
-                    &behaviors[cell.0].faces[direction_index],
-                    &behaviors[other].faces[direction_index ^ 1],
+                    &behaviors[cell.behavior as usize].faces[direction_index],
+                    &behaviors[other as usize].faces[direction_index ^ 1],
                 )
             {
                 continue;
             }
             let boundary = world.light(next.x, next.y, next.z, false)?;
-            cell.2 = cell
-                .2
-                .max(boundary.saturating_sub(behaviors[cell.0].opacity.max(1)));
+            cell.value = cell
+                .value
+                .max(boundary.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1)));
         }
-        if cell.2 > 0 {
-            queue.push((cell.2, p));
+        if cell.value > 0 {
+            queue.push((cell.value, index));
         }
     }
-    while let Some((level, p)) = queue.pop() {
-        if cells.get(&p)?.2 != level {
+    while let Some((level, index)) = queue.pop() {
+        if cells[index].value != level {
             continue;
         }
-        let from = cells.get(&p)?.0;
+        let from = cells[index].behavior;
+        let (dx, dy, dz) = dense_offset(index, radius, side);
         for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
-            let next = offset(p, direction)?;
-            let Some(cell) = cells.get_mut(&next) else {
+            let (nx, ny, nz) = (dx + direction.0, dy + direction.1, dz + direction.2);
+            if nx.abs() + ny.abs() + nz.abs() > radius {
                 continue;
-            };
-            if (behaviors[from].has_faces || behaviors[cell.0].has_faces)
+            }
+            let next = dense_index(nx, ny, nz, radius, side);
+            let cell = &mut cells[next];
+            debug_assert_ne!(cell.behavior, u32::MAX);
+            if (behaviors[from as usize].has_faces || behaviors[cell.behavior as usize].has_faces)
                 && faces_occlude(
-                    &behaviors[from].faces[direction_index],
-                    &behaviors[cell.0].faces[direction_index ^ 1],
+                    &behaviors[from as usize].faces[direction_index],
+                    &behaviors[cell.behavior as usize].faces[direction_index ^ 1],
                 )
             {
                 continue;
             }
-            let value = level.saturating_sub(behaviors[cell.0].opacity.max(1));
-            if value > cell.2 {
-                cell.2 = value;
+            let value = level.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1));
+            if value > cell.value {
+                cell.value = value;
                 queue.push((value, next));
             }
         }
     }
     // All reads and validation have completed before the first mutation.
     let mut changed = BTreeSet::new();
-    for (p, (_, previous, value)) in cells {
-        if previous == value {
+    for (index, cell) in cells.into_iter().enumerate() {
+        if cell.behavior == u32::MAX || cell.previous == cell.value {
             continue;
         }
+        let p = offset(center, dense_offset(index, radius, side))?;
         let chunk_pos = p.chunk();
         let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
         let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
@@ -589,10 +631,10 @@ pub fn relight_block(
             + p.z.rem_euclid(16) as usize * 16
             + p.y.rem_euclid(16) as usize * 256;
         let byte = &mut data[index / 2];
-        if index % 2 == 0 {
-            *byte = (*byte & 0xf0) | value;
+        if index.is_multiple_of(2) {
+            *byte = (*byte & 0xf0) | cell.value;
         } else {
-            *byte = (*byte & 0x0f) | (value << 4);
+            *byte = (*byte & 0x0f) | (cell.value << 4);
         }
         changed.insert(chunk_pos);
     }

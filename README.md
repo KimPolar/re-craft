@@ -172,6 +172,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+블록빛 재계산의 CPU 시간을 반복 측정하려면 다음 개발용 예제를 실행합니다. 합성 월드의 레드스톤·횃불·불투명 블록 변경에 대해 중앙값과 95백분위수를 출력하며, GPU·프레임 시간이나 실제 월드 성능을 나타내지는 않습니다. 이 예제는 클라이언트 실행 파일에 포함되지 않습니다.
+
+```powershell
+cargo run --release -p native-world --example light_benchmark
+```
+
 다음 선택적 테스트는 창을 열지 않고 GPU 파노라마와 메뉴 합성을 검사하며, 로컬 26.3 자산을 이용해 오프스크린 프레임 시간도 측정합니다. 기본 백엔드는 Vulkan이며 `NATIVE_TEST_GPU_BACKEND=dx12`로 DirectX 12를 선택할 수 있습니다. 이 측정에는 창 표시와 수직 동기화 시간이 포함되지 않습니다.
 
 ```powershell

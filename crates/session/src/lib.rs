@@ -625,7 +625,8 @@ impl LocalSession {
                 self.loot.as_deref(),
             );
             if self.game_mode != GameMode::Creative && damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_selected_tool(damage);
+                Arc::make_mut(&mut self.inventory)
+                    .damage_selected_tool(damage, &mut self.level_random);
             }
         }
     }
@@ -690,7 +691,11 @@ impl LocalSession {
                     .drop_interaction(position, face, *strategy, drops, true);
             }
             if self.game_mode != GameMode::Creative && result.damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_held_tool(hand, result.damage);
+                Arc::make_mut(&mut self.inventory).damage_held_tool(
+                    hand,
+                    result.damage,
+                    &mut self.level_random,
+                );
             }
             let swing = if hand == PlayerSlot::Offhand {
                 animation::Hand::Off

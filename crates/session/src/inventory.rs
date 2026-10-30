@@ -1092,12 +1092,60 @@ impl PlayerInventory {
     }
 
     /// Damage one supported ordinary tool, preserving its other components.
-    pub(crate) fn damage_selected_tool(&mut self, amount: u32) -> bool {
-        self.damage_held_tool(PlayerSlot::Storage(self.selected), amount)
+    pub(crate) fn damage_selected_tool(&mut self, amount: u32, random: &mut LegacyRandom) -> bool {
+        self.damage_held_tool(PlayerSlot::Storage(self.selected), amount, random)
     }
 
     /// Damage the selected main-hand or offhand tool after a successful use.
-    pub(crate) fn damage_held_tool(&mut self, hand: PlayerSlot, amount: u32) -> bool {
+    pub(crate) fn damage_held_tool(
+        &mut self,
+        hand: PlayerSlot,
+        amount: u32,
+        random: &mut LegacyRandom,
+    ) -> bool {
+        if amount == 0 {
+            return false;
+        }
+        if !matches!(hand, PlayerSlot::Offhand)
+            && !matches!(hand, PlayerSlot::Storage(index) if index == self.selected)
+        {
+            return false;
+        }
+        let Some(item) = self.slot(hand) else {
+            return false;
+        };
+        if item.count != 1 || !ordinary_return_supported(item) {
+            return false;
+        }
+        let Ok(enchantments) = item_enchantments(item) else {
+            return false;
+        };
+        let mut next_random = random.clone();
+        let mut damage = amount as f32;
+        let mut effect_count = 0;
+        for (id, level) in enchantments {
+            let Some(registry) = &self.enchantments else {
+                return false;
+            };
+            let Ok((next, has_effect)) =
+                registry.apply_item_damage(&id, level, item.id(), damage, &mut || {
+                    next_random.next_float()
+                })
+            else {
+                return false;
+            };
+            if has_effect {
+                effect_count += 1;
+            }
+            // The Java enchantment map determines the order of multiple
+            // independently effective enchantments; it is not NBT order.
+            if effect_count > 1 {
+                return false;
+            }
+            damage = next;
+        }
+        let amount = damage as i32;
+        *random = next_random;
         if amount == 0 {
             return false;
         }
@@ -1121,9 +1169,9 @@ impl PlayerInventory {
             .components
             .get("minecraft:damage")
             .and_then(Tag::as_java_int)
-            .unwrap_or(0) as u64;
-        let next = damage + u64::from(amount);
-        if next >= u64::from(maximum) {
+            .unwrap_or(0) as i64;
+        let next = (damage + i64::from(amount)).max(0);
+        if next >= i64::from(maximum) {
             *slot = None;
         } else if let Tag::Compound(components) = &mut item.components {
             if let Some((_, value)) = components
@@ -2190,13 +2238,22 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {
-            // Efficiency has no durability side effects. Other enchantments,
-            // such as Unbreaking, need their own item-damage behavior first.
-            if !matches!(value, Tag::Compound(fields) if fields.len() == 1
-                && fields[0].0.matches("minecraft:efficiency")
-                && matches!(fields[0].1, Tag::Int(1..=255)))
-            {
+            let Tag::Compound(fields) = value else {
                 return None;
+            };
+            let mut enchantments = 0_u8;
+            for (name, level) in fields {
+                let flag = if name.matches("minecraft:efficiency") {
+                    1
+                } else if name.matches("minecraft:unbreaking") {
+                    2
+                } else {
+                    return None;
+                };
+                if !matches!(level, Tag::Int(1..=255)) || enchantments & flag != 0 {
+                    return None;
+                }
+                enchantments |= flag;
             }
             32
         } else {
@@ -2399,6 +2456,24 @@ mod tests {
 
     #[test]
     fn efficiency_tool_retains_enchantment_when_damaged() {
+        struct Data;
+        impl native_resources::packs::ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if path == "enchantment" {
+                    vec![ResourceId::parse("minecraft:efficiency")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path
+                    .ends_with("/enchantment/efficiency.json")
+                    .then(|| br#"{"slots":["mainhand"],"effects":{}}"#.to_vec()))
+            }
+        }
         let components = Tag::Compound(vec![(
             "minecraft:enchantments".into(),
             Tag::Compound(vec![("minecraft:efficiency".into(), Tag::Int(5))]),
@@ -2410,8 +2485,9 @@ mod tests {
         let tool =
             ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, components.clone()).unwrap();
         let mut inventory = PlayerInventory::default();
+        inventory.set_enchantments(Arc::new(OxygenEnchantments::load(&mut Data).unwrap()));
         inventory.set_slot(PlayerSlot::Storage(0), Some(tool));
-        assert!(inventory.damage_selected_tool(1));
+        assert!(inventory.damage_selected_tool(1, &mut LegacyRandom::new(0)));
         let after = inventory.slot(PlayerSlot::Storage(0)).unwrap();
         assert_eq!(
             after.components().get("minecraft:enchantments"),
@@ -2425,7 +2501,80 @@ mod tests {
             "minecraft:enchantments".into(),
             Tag::Compound(vec![("minecraft:unbreaking".into(), Tag::Int(1))]),
         )]);
-        assert_eq!(saved_item_max("minecraft:iron_pickaxe", &unbreaking), None);
+        assert_eq!(
+            saved_item_max("minecraft:iron_pickaxe", &unbreaking),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn tool_damage_uses_active_pack_effects_and_world_random() {
+        struct Data(f32);
+        impl native_resources::packs::ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if path == "enchantment" {
+                    vec![
+                        ResourceId::parse("minecraft:efficiency")?,
+                        ResourceId::parse("minecraft:unbreaking")?,
+                    ]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path.ends_with("/enchantment/efficiency.json") {
+                    Some(br#"{"slots":["mainhand"],"effects":{}}"#.to_vec())
+                } else if path.ends_with("/enchantment/unbreaking.json") {
+                    Some(format!(r#"{{"slots":["any"],"effects":{{"minecraft:item_damage":[{{"effect":{{"type":"minecraft:remove_binomial","chance":{}}}}}]}}}}"#, self.0).into_bytes())
+                } else {
+                    None
+                })
+            }
+        }
+        for chance in [0.0, 1.0] {
+            let components = Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![
+                    ("minecraft:efficiency".into(), Tag::Int(5)),
+                    ("minecraft:unbreaking".into(), Tag::Int(3)),
+                ]),
+            )]);
+            assert_eq!(
+                saved_item_max("minecraft:iron_pickaxe", &components),
+                Some(1)
+            );
+            let tool =
+                ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, components.clone()).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_enchantments(Arc::new(
+                OxygenEnchantments::load(&mut Data(chance)).unwrap(),
+            ));
+            inventory.set_slot(PlayerSlot::Storage(0), Some(tool));
+            let mut random = LegacyRandom::new(123);
+            let mut expected = random.clone();
+            expected.next_float();
+            assert_eq!(
+                inventory.damage_selected_tool(1, &mut random),
+                chance == 0.0
+            );
+            assert_eq!(random.next_int(), expected.next_int());
+            let item = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+            assert_eq!(
+                item.components().get("minecraft:enchantments"),
+                components.get("minecraft:enchantments")
+            );
+            assert_eq!(
+                item.components().get("minecraft:damage"),
+                if chance == 0.0 {
+                    Some(&Tag::Int(1))
+                } else {
+                    None
+                }
+            );
+        }
     }
 
     #[test]

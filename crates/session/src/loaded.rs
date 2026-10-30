@@ -4070,7 +4070,8 @@ impl LoadedSession {
                 self.loot.as_deref(),
             );
             if self.game_mode != GameMode::Creative && damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_selected_tool(damage);
+                Arc::make_mut(&mut self.inventory)
+                    .damage_selected_tool(damage, &mut self.level_random);
             }
         }
     }
@@ -4176,7 +4177,11 @@ impl LoadedSession {
                 );
             }
             if self.game_mode != GameMode::Creative && result.damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_held_tool(hand, result.damage);
+                Arc::make_mut(&mut self.inventory).damage_held_tool(
+                    hand,
+                    result.damage,
+                    &mut self.level_random,
+                );
             }
             let swing = if hand == crate::inventory::PlayerSlot::Offhand {
                 crate::animation::Hand::Off
@@ -13661,6 +13666,74 @@ mod tests {
                 assert!((item.position.x - f64::from(absolute.x)).abs() < 1.0);
                 assert!((item.position.z - f64::from(absolute.z)).abs() < 1.0);
             }
+        }
+    }
+
+    #[test]
+    fn loaded_mining_applies_data_pack_tool_durability() {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data(f32);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if path == "enchantment" {
+                    vec![ResourceId::parse("minecraft:unbreaking")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/enchantment/unbreaking.json").then(|| format!(r#"{{"slots":["any"],"effects":{{"minecraft:item_damage":[{{"effect":{{"type":"minecraft:remove_binomial","chance":{}}}}}]}}}}"#, self.0).into_bytes()))
+            }
+        }
+        for chance in [0.0, 1.0] {
+            let mut session = session();
+            let tool = crate::inventory::ItemStack::new(
+                "minecraft:iron_shovel".into(),
+                1,
+                1,
+                native_persistence::nbt::Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    native_persistence::nbt::Tag::Compound(vec![(
+                        "minecraft:unbreaking".into(),
+                        native_persistence::nbt::Tag::Int(3),
+                    )]),
+                )]),
+            )
+            .unwrap();
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Storage(0), Some(tool));
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::new(OxygenEnchantments::load(&mut Data(chance)).unwrap()),
+                )
+                .unwrap();
+            let relative = IVec3::new(8, 2, 6);
+            let dirt = session.intern_block(state("minecraft:dirt", &[]));
+            assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
+            assert!(session.set(relative, dirt));
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            session.update(TICK * 10);
+            assert!(
+                !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == dirt)
+            );
+            let tool = session
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap();
+            assert_eq!(
+                tool.components().get("minecraft:damage"),
+                if chance == 0.0 {
+                    Some(&native_persistence::nbt::Tag::Int(1))
+                } else {
+                    None
+                }
+            );
         }
     }
 

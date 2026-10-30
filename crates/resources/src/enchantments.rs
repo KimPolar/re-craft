@@ -289,6 +289,147 @@ fn repair_effects(value: &Value) -> Result<Option<Vec<RepairValueEffect>>> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum ItemDamagePredicate {
+    Any,
+    Item(ResourceId),
+    Tag(ResourceId),
+    Not(Box<Self>),
+}
+
+impl ItemDamagePredicate {
+    fn parse(value: Option<&Value>, depth: usize) -> Result<Self> {
+        ensure!(depth <= 32, "item damage predicate is too deeply nested");
+        let Some(value) = value.filter(|value| !value.is_null()) else {
+            return Ok(Self::Any);
+        };
+        let object = value
+            .as_object()
+            .context("item damage predicate is not an object")?;
+        let kind = ResourceId::parse(
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing predicate type")?,
+        )?;
+        ensure!(
+            kind.namespace == "minecraft",
+            "unsupported item damage predicate"
+        );
+        match kind.path.as_str() {
+            "inverted" => {
+                ensure!(object.len() == 2, "unsupported inverted predicate fields");
+                Ok(Self::Not(Box::new(Self::parse(
+                    Some(object.get("term").context("missing predicate term")?),
+                    depth + 1,
+                )?)))
+            }
+            "match_tool" => {
+                ensure!(object.len() == 2, "unsupported tool predicate fields");
+                let predicate = object
+                    .get("predicate")
+                    .and_then(Value::as_object)
+                    .context("missing tool predicate")?;
+                ensure!(predicate.len() == 1, "unsupported item predicate fields");
+                let id = predicate
+                    .get("items")
+                    .and_then(Value::as_str)
+                    .context("unsupported item selector")?;
+                if let Some(tag) = id.strip_prefix('#') {
+                    Ok(Self::Tag(ResourceId::parse(tag)?))
+                } else {
+                    Ok(Self::Item(ResourceId::parse(id)?))
+                }
+            }
+            _ => bail!("unsupported item damage predicate {}", kind.path),
+        }
+    }
+
+    fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
+        match self {
+            Self::Tag(id) => {
+                tags.insert(id.clone());
+            }
+            Self::Not(inner) => inner.tags(tags),
+            _ => {}
+        }
+    }
+
+    fn matches(
+        &self,
+        item: &ResourceId,
+        tags: &BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
+    ) -> Result<bool> {
+        Ok(match self {
+            Self::Any => true,
+            Self::Item(id) => id == item,
+            Self::Tag(id) => tag_contains(tags, id, &format!("{}:{}", item.namespace, item.path))?,
+            Self::Not(inner) => !inner.matches(item, tags)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ItemDamageValue {
+    Deterministic(RepairValueEffect),
+    RemoveBinomial(LevelValue),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ItemDamageEffect {
+    predicate: ItemDamagePredicate,
+    value: ItemDamageValue,
+}
+
+fn item_damage_effects(value: &Value) -> Result<Vec<ItemDamageEffect>> {
+    let Some(effects) = value.get("effects") else {
+        return Ok(Vec::new());
+    };
+    let effects = effects
+        .as_object()
+        .context("enchantment effects are not an object")?;
+    let mut selected = None;
+    for key in ["minecraft:item_damage", "item_damage", ":item_damage"] {
+        if let Some(value) = effects.get(key) {
+            ensure!(selected.is_none(), "duplicate item damage effect");
+            selected = Some(value);
+        }
+    }
+    let Some(entries) = selected else {
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .context("item damage effects are not a list")?;
+    ensure!(entries.len() <= 256, "too many item damage effects");
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry
+                .as_object()
+                .context("item damage effect is not an object")?;
+            let effect = entry.get("effect").context("missing item damage effect")?;
+            let kind = effect
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing item damage effect type")?;
+            let kind = ResourceId::parse(kind)?;
+            let value = if kind.namespace == "minecraft" && kind.path == "remove_binomial" {
+                ItemDamageValue::RemoveBinomial(LevelValue::parse(
+                    effect.get("chance").context("missing binomial chance")?,
+                    0,
+                )?)
+            } else {
+                ItemDamageValue::Deterministic(RepairValueEffect::parse(effect, 0)?)
+            };
+            Ok(ItemDamageEffect {
+                predicate: ItemDamagePredicate::parse(entry.get("requirements"), 0)?,
+                value,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct EnchantmentEffect {
     attribute: ResourceId,
     id: ResourceId,
@@ -639,6 +780,8 @@ pub struct OxygenEnchantments {
     definitions: BTreeMap<ResourceId, std::result::Result<Definition, String>>,
     protection: BTreeMap<ResourceId, std::result::Result<Vec<ProtectionEffect>, String>>,
     repair: BTreeMap<ResourceId, std::result::Result<Option<Vec<RepairValueEffect>>, String>>,
+    item_damage: BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
+    item_damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_types: BTreeSet<ResourceId>,
     fall_immune_entities: Option<std::result::Result<BTreeSet<String>, String>>,
@@ -649,6 +792,8 @@ impl OxygenEnchantments {
         let mut definitions = BTreeMap::new();
         let mut protection = BTreeMap::new();
         let mut repair = BTreeMap::new();
+        let mut item_damage = BTreeMap::new();
+        let mut item_damage_tag_ids = BTreeSet::new();
         for id in provider.list_data("enchantment")? {
             let path = format!("data/{}/enchantment/{}.json", id.namespace, id.path);
             let Some(bytes) = provider.read_data(&path)? else {
@@ -670,8 +815,19 @@ impl OxygenEnchantments {
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
                 .and_then(repair_effects)
                 .map_err(|error| format!("{error:#}"));
+            let damage_effect = value
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                .and_then(item_damage_effects)
+                .map_err(|error| format!("{error:#}"));
+            if let Ok(effects) = &damage_effect {
+                for effect in effects {
+                    effect.predicate.tags(&mut item_damage_tag_ids);
+                }
+            }
             protection.insert(id.clone(), protection_effect);
             repair.insert(id.clone(), repair_effect);
+            item_damage.insert(id.clone(), damage_effect);
             definitions.insert(id, parsed);
         }
         let damage_types = provider.list_data("damage_type")?.into_iter().collect();
@@ -710,6 +866,14 @@ impl OxygenEnchantments {
             damage_tags.insert(id, Err(error));
         }
         let immune_id = ResourceId::parse("minecraft:fall_damage_immune")?;
+        let item_damage_tags = item_damage_tag_ids
+            .into_iter()
+            .map(|id| {
+                let result =
+                    load_single_tag(provider, "item", &id).map_err(|error| format!("{error:#}"));
+                (id, result)
+            })
+            .collect();
         let fall_immune_entities = Some(
             load_single_tag(provider, "entity_type", &immune_id)
                 .map_err(|error| format!("{error:#}")),
@@ -718,6 +882,8 @@ impl OxygenEnchantments {
             definitions,
             protection,
             repair,
+            item_damage,
+            item_damage_tags,
             damage_tags,
             damage_types,
             fall_immune_entities,
@@ -834,6 +1000,54 @@ impl OxygenEnchantments {
                     .iter()
                     .fold(value, |value, effect| effect.apply(level, value))
             }))
+    }
+
+    /// Apply the active pack's item-filtered durability effects in their declared order.
+    pub fn apply_item_damage(
+        &self,
+        id: &ResourceId,
+        level: u32,
+        item: &str,
+        mut value: f32,
+        random: &mut impl FnMut() -> f32,
+    ) -> Result<(f32, bool)> {
+        ensure!((1..=255).contains(&level), "invalid enchantment level");
+        let effects = self
+            .item_damage
+            .get(id)
+            .context("enchantment is absent from the active registry")?
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("unsupported item damage effect: {error}"))?;
+        let item = ResourceId::parse(item)?;
+        for effect in effects {
+            if !effect.predicate.matches(&item, &self.item_damage_tags)? {
+                continue;
+            }
+            value = match &effect.value {
+                ItemDamageValue::Deterministic(effect) => effect.apply(level, value),
+                ItemDamageValue::RemoveBinomial(chance) => {
+                    let chance = chance.calculate(level);
+                    ensure!(
+                        value.is_finite() && value <= 1_000_000.0,
+                        "item damage value is too large"
+                    );
+                    ensure!(
+                        value <= 128.0 || value * chance < 20.0 || value * (1.0 - chance) < 20.0,
+                        "Gaussian item damage effects are not supported yet"
+                    );
+                    let mut removed = 0;
+                    let mut i = 0;
+                    while (i as f32) < value {
+                        if random() < chance {
+                            removed += 1;
+                        }
+                        i += 1;
+                    }
+                    value - removed as f32
+                }
+            };
+        }
+        Ok((value, !effects.is_empty()))
     }
 
     /// Resolve the world's current damage-type tags, including data-pack overrides.

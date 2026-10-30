@@ -17,6 +17,83 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn unbreaking_effect_matches_vanilla_and_consumes_the_same_random_values() {
+    use native_core::random::LegacyRandom;
+    use native_resources::{
+        enchantments::OxygenEnchantments,
+        packs::{ResourceId, ResourceStack},
+    };
+    use serde_json::json;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let registry = OxygenEnchantments::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("UnbreakingOracle.java");
+    std::fs::write(&source, include_str!("java/UnbreakingOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let mut cases = Vec::new();
+    for seed in -50..50 {
+        for armor in [false, true] {
+            for level in [1, 2, 3, 10, 255] {
+                for amount in [1, 2, 10, 40] {
+                    cases.push(
+                        json!({"seed": seed, "armor": armor, "level": level, "amount": amount}),
+                    );
+                }
+            }
+        }
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("UnbreakingOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases.len());
+    let id = ResourceId::parse("minecraft:unbreaking").unwrap();
+    for (case, row) in cases.iter().zip(rows) {
+        let mut random = LegacyRandom::new(case["seed"].as_i64().unwrap());
+        let item = if case["armor"].as_bool().unwrap() {
+            "minecraft:iron_helmet"
+        } else {
+            "minecraft:iron_pickaxe"
+        };
+        let (value, active) = registry
+            .apply_item_damage(
+                &id,
+                case["level"].as_u64().unwrap() as u32,
+                item,
+                case["amount"].as_f64().unwrap() as f32,
+                &mut || random.next_float(),
+            )
+            .unwrap();
+        assert!(active);
+        assert_eq!(
+            value.to_bits(),
+            row[0].as_i64().unwrap() as i32 as u32,
+            "{case}"
+        );
+        assert_eq!(random.next_int(), row[1].as_i64().unwrap() as i32, "{case}");
+    }
+    eprintln!(
+        "Compared {} Unbreaking cases with Minecraft 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn mining_effects_and_attributes_match_vanilla() {
     use native_session::mining::{MiningContext, destroy_speed, tool_progress_with_context};
     use serde_json::json;

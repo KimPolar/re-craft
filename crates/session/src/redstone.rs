@@ -107,6 +107,11 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
             Some((0, 0, false))
         }
         "minecraft:redstone_block" if empty => Some((15, 0, false)),
+        "minecraft:water" | "minecraft:lava" if state.properties.len() == 1 => {
+            let level = state.properties.get("level")?;
+            let value = level.parse::<u8>().ok()?;
+            (value <= 15 && value.to_string() == *level).then_some((0, 0, false))
+        }
         "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
             if state.properties.len() == 1
                 && matches!(

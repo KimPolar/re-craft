@@ -86,6 +86,8 @@ pub enum Material {
     StoneBricks,
     StoneButton,
     WoodButton,
+    RedstoneLamp,
+    RedstoneBlock,
     Cobblestone,
     /// Vanilla ore hardness and the minimum harvest tier: wood, stone or iron.
     Ore {
@@ -114,6 +116,8 @@ impl Material {
             "minecraft:stone" => Some(Self::Stone),
             "minecraft:stone_bricks" => Some(Self::StoneBricks),
             "minecraft:stone_button" => Some(Self::StoneButton),
+            "minecraft:redstone_lamp" => Some(Self::RedstoneLamp),
+            "minecraft:redstone_block" => Some(Self::RedstoneBlock),
             "minecraft:cobblestone" => Some(Self::Cobblestone),
             "minecraft:coal_ore" | "minecraft:nether_gold_ore" | "minecraft:nether_quartz_ore" => {
                 Some(Self::Ore {
@@ -188,6 +192,8 @@ impl Material {
             Self::Grass | Self::Gravel => 0.6,
             Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton => 0.5,
             Self::DirtPath => 0.65,
+            Self::RedstoneLamp => 0.3,
+            Self::RedstoneBlock => 5.0,
             Self::Stone | Self::StoneBricks => 1.5,
             Self::Planks | Self::Cobblestone | Self::Wood => 2.0,
             Self::CraftingTable => 2.5,
@@ -205,7 +211,11 @@ impl Material {
     pub fn needs_tool(self) -> bool {
         matches!(
             self,
-            Self::Stone | Self::StoneBricks | Self::Cobblestone | Self::Ore { .. }
+            Self::Stone
+                | Self::StoneBricks
+                | Self::Cobblestone
+                | Self::RedstoneBlock
+                | Self::Ore { .. }
         )
     }
 }
@@ -302,6 +312,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::StoneBricks
                 | Material::Cobblestone
                 | Material::StoneButton
+                | Material::RedstoneBlock
                 | Material::Ore { .. }
         ),
         "axe" => matches!(

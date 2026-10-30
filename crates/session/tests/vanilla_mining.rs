@@ -1841,6 +1841,8 @@ fn supported_redstone_conductors_match_java_states() {
         "air",
         "cave_air",
         "void_air",
+        "water",
+        "lava",
         "glass",
         "ice",
         "honey_block",
@@ -2057,6 +2059,8 @@ fn ordinary_tool_mining_matches_vanilla() {
             "red_sand",
             "gravel",
             "stone_button",
+            "redstone_lamp",
+            "redstone_block",
         ])
         .args(
             native_core::button::Button::ALL
@@ -2067,7 +2071,7 @@ fn ordinary_tool_mining_matches_vanilla() {
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
     assert_eq!(
         rows.len(),
-        7 * 5 * (17 + native_core::wood::Wood::all().count() + 14) * 4
+        7 * 5 * (19 + native_core::wood::Wood::all().count() + 14) * 4
     );
     for row in &rows {
         let id = row[0].as_str().unwrap();
@@ -2115,6 +2119,10 @@ fn ordinary_tool_mining_matches_vanilla() {
             && !row[3].as_bool().unwrap()
             && row[1].as_str().unwrap() != "minecraft:gravel"
             && native_core::button::Button::from_id(row[1].as_str().unwrap()).is_none()
+            && !matches!(
+                row[1].as_str().unwrap(),
+                "minecraft:redstone_lamp" | "minecraft:redstone_block"
+            )
         {
             let block = Block::from_item_id(row[1].as_str().unwrap()).unwrap();
             let target = glam::IVec3::new(0, 4, 3);

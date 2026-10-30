@@ -4146,6 +4146,79 @@ impl LoadedSession {
         None
     }
 
+    /// Place the currently supported full-cube redstone items. A lamp's
+    /// initial lit state depends on all known neighboring signals.
+    fn place_redstone(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        use crate::inventory::PlayerSlot;
+        let main = PlayerSlot::Storage(self.inventory.selected());
+        let hand = if self.inventory.slot(main).is_some() {
+            main
+        } else {
+            PlayerSlot::Offhand
+        };
+        let held = self.inventory.slot(hand)?;
+        if held.max_count().is_none() {
+            return None;
+        }
+        let is_lamp = match held.id() {
+            "minecraft:redstone_lamp" => true,
+            "minecraft:redstone_block" => false,
+            _ => return None,
+        };
+        let Cell::State(clicked_id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let replace_clicked = button_can_replace(self.world.state(clicked_id)?)?;
+        let target = if replace_clicked {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        if self.world.state(id).and_then(button_can_replace) != Some(true)
+            || player_intersects_block(self.player, target, Block::Stone)
+        {
+            return None;
+        }
+        let block = if is_lamp {
+            // In the hypothetical placement the replaced block contributes no
+            // direct signal to adjacent conductors; an air placeholder has the
+            // same direct signal as the lamp itself.
+            let air = self.world.state(self.states[0])?;
+            let lit = crate::redstone::neighbor_signal(target, |pos| {
+                if pos == target {
+                    return Some(air);
+                }
+                match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+                    Cell::State(id) => self.world.state(id),
+                    Cell::Missing => None,
+                }
+            })?;
+            state(
+                "minecraft:redstone_lamp",
+                &[("lit", if lit { "true" } else { "false" })],
+            )
+        } else {
+            state("minecraft:redstone_block", &[])
+        };
+        let id = self.intern_block(block);
+        self.set(target, id).then_some(hand)
+    }
+
     fn ray_hit(&self) -> Option<ShapeRayHit> {
         raycast_shapes(
             self.player.eye(),
@@ -6420,6 +6493,10 @@ impl LoadedSession {
                         let block_item = main.is_some_and(|item| {
                             Block::from_item_id(item.id()).is_some()
                                 || native_core::button::Button::from_id(item.id()).is_some()
+                                || matches!(
+                                    item.id(),
+                                    "minecraft:redstone_lamp" | "minecraft:redstone_block"
+                                )
                         });
                         let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
                             matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).and_then(button_can_replace) == Some(true))
@@ -6457,7 +6534,8 @@ impl LoadedSession {
                             {
                                 handled = true;
                             } else if self.game_mode.allows_basic_building()
-                                && let Some(hand) = self.place_button(hit)
+                                && let Some(hand) =
+                                    self.place_button(hit).or_else(|| self.place_redstone(hit))
                             {
                                 handled = true;
                                 let swing = if hand == crate::inventory::PlayerSlot::Offhand {
@@ -8540,6 +8618,102 @@ mod tests {
     }
 
     #[test]
+    fn redstone_items_place_with_correct_hand_mode_and_initial_power() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for item in ["minecraft:redstone_lamp", "minecraft:redstone_block"] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for mode in [
+                    GameMode::Survival,
+                    GameMode::Creative,
+                    GameMode::Adventure,
+                    GameMode::Spectator,
+                ] {
+                    for powered in [false, true] {
+                        let mut session = session();
+                        session.set_game_mode(mode);
+                        let target = IVec3::new(8, 2, 7);
+                        if powered {
+                            let source =
+                                session.intern_block(state("minecraft:redstone_block", &[]));
+                            session.set(target + IVec3::X, source);
+                        }
+                        let mut inventory = PlayerInventory::default();
+                        inventory.set_slot(
+                            hand,
+                            ItemStack::new(item.into(), 2, 64, Tag::Compound(vec![])),
+                        );
+                        session.set_player_inventory(inventory);
+                        session.submit_command(PlayerCommand::Place);
+                        session.update(TICK);
+                        let absolute = session.origin + target;
+                        let placed = session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap();
+                        if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                            assert_eq!(
+                                placed.name, item,
+                                "{item} {hand:?} {mode:?} power={powered}"
+                            );
+                            if item == "minecraft:redstone_lamp" {
+                                assert_eq!(redstone_lamp_lit(placed), Some(powered));
+                            }
+                            assert_eq!(
+                                session.inventory.slot(hand).unwrap().count(),
+                                if mode == GameMode::Survival { 1 } else { 2 }
+                            );
+                        } else {
+                            assert_eq!(placed.name, "minecraft:air");
+                            assert_eq!(session.inventory.slot(hand).unwrap().count(), 2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lamp_placement_waits_if_neighbor_signal_is_unknown() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let target = IVec3::new(8, 2, 7);
+        let unknown = session.intern_block(state("minecraft:unknown_signal", &[]));
+        assert!(session.set(target + IVec3::X, unknown));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:redstone_lamp".into(),
+                2,
+                64,
+                Tag::Compound(vec![]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let absolute = session.origin + target;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn lamp_stays_on_when_repowered_or_signal_is_unknown() {
         let mut session = session();
         session.set_random_tick_speed(0);
@@ -8697,8 +8871,8 @@ mod tests {
             .arg(&result));
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
-        assert_eq!(rows.len(), 8);
-        for row in rows {
+        assert_eq!(rows.len(), 10);
+        for row in rows.iter().take(8) {
             let tick = row[0].as_bool().unwrap();
             let lit = row[1].as_bool().unwrap();
             let power = row[2].as_bool().unwrap();
@@ -8742,6 +8916,45 @@ mod tests {
                 });
             assert_eq!(delay, row[4].as_i64().unwrap(), "{row}");
             assert!(matches!(row[5].as_i64().unwrap(), -1 | 2), "{row}");
+        }
+        for row in rows.iter().skip(8) {
+            use crate::inventory::PlayerSlot;
+            use native_persistence::nbt::Tag;
+            let powered = row[0].as_bool().unwrap();
+            let mut session = session();
+            let target = IVec3::new(8, 5, 8);
+            let support = target + IVec3::NEG_Z;
+            session.set(support, session.states[3]);
+            if powered {
+                let source = session.intern_block(state("minecraft:redstone_block", &[]));
+                session.set(target + IVec3::X, source);
+            }
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:redstone_lamp".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: support,
+                face: IVec3::Z,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(session.place_redstone(hit), Some(PlayerSlot::Storage(0)));
+            let absolute = session.origin + target;
+            let got = redstone_lamp_lit(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap(),
+            );
+            assert_eq!(got, row[1].as_bool(), "{row}");
         }
     }
 
@@ -20727,6 +20940,100 @@ mod tests {
         assert_eq!(steady, irregular);
         assert_eq!(steady.len(), 2);
         assert_eq!((steady[0].tick, steady[1].tick), (0, 20));
+    }
+
+    #[test]
+    fn redstone_blocks_use_tools_and_data_pack_loot() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path.ends_with("/redstone_lamp.json") || path.ends_with("/redstone_block.json"))
+                    .then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut LootSource).unwrap());
+        for (block, tool, mode, expected_drop) in [
+            ("minecraft:redstone_lamp", None, GameMode::Survival, true),
+            ("minecraft:redstone_block", None, GameMode::Survival, false),
+            (
+                "minecraft:redstone_block",
+                Some("minecraft:wooden_pickaxe"),
+                GameMode::Survival,
+                true,
+            ),
+            ("minecraft:redstone_block", None, GameMode::Creative, false),
+        ] {
+            let mut session = session();
+            session.set_game_mode(mode);
+            session.set_block_loot(Arc::clone(&loot));
+            let mut inventory = PlayerInventory::default();
+            if let Some(tool) = tool {
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![])),
+                );
+            }
+            session.set_player_inventory(inventory);
+            let target = IVec3::new(8, 2, 7);
+            let properties: &[(&str, &str)] = if block.ends_with("lamp") {
+                &[("lit", "false")]
+            } else {
+                &[]
+            };
+            let id = session.intern_block(state(block, properties));
+            assert!(session.set(target, id));
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            for _ in 0..1000 {
+                session.update(TICK);
+                let absolute = session.origin + target;
+                if session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name
+                    == "minecraft:air"
+                {
+                    break;
+                }
+            }
+            let absolute = session.origin + target;
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air",
+                "{block} {tool:?} {mode:?}"
+            );
+            let items = session.dropped_items.snapshot();
+            assert_eq!(
+                items.len(),
+                usize::from(expected_drop),
+                "{block} {tool:?} {mode:?}"
+            );
+            if expected_drop {
+                assert_eq!(items[0].stack.id(), "minecraft:diamond");
+            }
+            if tool.is_some() {
+                assert_eq!(
+                    session
+                        .inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage"),
+                    Some(&Tag::Int(1))
+                );
+            }
+        }
     }
 
     #[test]

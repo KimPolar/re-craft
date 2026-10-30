@@ -10,6 +10,8 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RedstoneLampBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.item.context.BlockPlaceContext;
 
 public class RedstoneLampOracle {
     static class World extends ServerLevel {
@@ -22,10 +24,17 @@ public class RedstoneLampOracle {
             result = state.getValue(RedstoneLampBlock.LIT); this.flags = flags; return true;
         }
     }
+    static class Context extends BlockPlaceContext {
+        World world;
+        Context() { super(null,null,null,null,null); }
+        @Override public Level getLevel() { return world; }
+        @Override public BlockPos getClickedPos() { return BlockPos.ZERO; }
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
-        var world = (World)((sun.misc.Unsafe)field.get(null)).allocateInstance(World.class);
+        var unsafe = (sun.misc.Unsafe)field.get(null);
+        var world = (World)unsafe.allocateInstance(World.class);
         var rows = new JsonArray();
         for (var tick : new boolean[]{false,true}) for (var lit : new boolean[]{false,true}) for (var power : new boolean[]{false,true}) {
             world.power = power; world.result = lit; world.delay = -1; world.flags = -1;
@@ -34,6 +43,12 @@ public class RedstoneLampOracle {
             else state.handleNeighborChanged(world, BlockPos.ZERO, Blocks.STONE, null, false);
             var row = new JsonArray(); row.add(tick); row.add(lit); row.add(power);
             row.add(world.result); row.add(world.delay); row.add(world.flags); rows.add(row);
+        }
+        var context = (Context)unsafe.allocateInstance(Context.class); context.world = world;
+        for (var power : new boolean[]{false,true}) {
+            world.power = power;
+            var placed = Blocks.REDSTONE_LAMP.getStateForPlacement(context);
+            var row = new JsonArray(); row.add(power); row.add(placed.getValue(RedstoneLampBlock.LIT)); rows.add(row);
         }
         Files.writeString(Path.of(args[0]), rows.toString());
     }

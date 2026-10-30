@@ -297,7 +297,7 @@ fn session_lighting_and_block_changes_survive_java_region_round_trip() {
         save::{WorldSavePlan, WorldWriteGuard},
         world::WorldReader,
     };
-    use native_session::{SessionWorld, inventory::PlayerInventory};
+    use native_session::SessionWorld;
     let (game, java) = game_and_java();
     let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
     let registry = resources.vanilla_block_ids().unwrap();
@@ -418,7 +418,9 @@ public class LightRegionOracle {
         player,
     )
     .unwrap();
-    session.set_player_inventory(PlayerInventory::default());
+    session
+        .restore_saved_player_inventory(&player_source)
+        .unwrap();
     session.set_world_clocks(
         BTreeMap::from([(
             dimension.clone(),
@@ -468,24 +470,39 @@ public class LightRegionOracle {
     std::fs::write(&sample_path, &samples).unwrap();
     let dirty = session.dirty_chunk_positions();
     assert!(dirty.len() > 1, "light should cross chunk boundaries");
-    let make_plan = || {
-        let mut plan = WorldSavePlan::new();
-        for &position in &dirty {
+    let sources = dirty
+        .iter()
+        .map(|&position| {
             let source = &area.chunks[&ChunkPos {
                 x: position.x,
                 z: position.z,
             }]
                 .document;
-            let draft = session
-                .draft_dirty_chunk_with_lighting(position, source, &tags, |state| {
-                    Ok((state.name.matches("minecraft:air"), false))
-                })
-                .unwrap();
+            (position, source.as_ref())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut incomplete = sources.clone();
+    incomplete.pop_first();
+    assert!(
+        session
+            .draft_player_and_dirty_chunks(&player_source, &incomplete, &tags, |_| Ok((
+                true, false
+            )))
+            .is_err()
+    );
+    let make_plan = || {
+        let mut plan = WorldSavePlan::new();
+        let combined = session
+            .draft_player_and_dirty_chunks(&player_source, &sources, &tags, |state| {
+                Ok((state.name.matches("minecraft:air"), false))
+            })
+            .unwrap();
+        assert_eq!(combined.chunks().len(), dirty.len());
+        let (player, chunks) = combined.into_parts();
+        for (_, draft) in chunks {
             plan.add_chunk(dimension.clone(), draft, 1_777_777).unwrap();
         }
-        session
-            .draft_player_state(&player_source)
-            .unwrap()
+        player
             .add_to_save_plan(&mut plan, [0, 0, 0, 1], &player_source)
             .unwrap();
         plan.add_world_clocks(&clock_source, &session.world_clocks())

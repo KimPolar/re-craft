@@ -111,6 +111,34 @@ pub struct PlayerChestDraft {
     chests: BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>,
 }
 
+/// Player and terrain drafts from one session tick. Entity regions, clocks,
+/// and other world effects are not included and must be coordinated separately.
+pub struct PlayerWorldDraft {
+    player: crate::player_data::PlayerStateDraft,
+    chunks: BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>,
+}
+
+impl PlayerWorldDraft {
+    pub fn player(&self) -> &native_persistence::nbt::NamedTag {
+        self.player.document()
+    }
+
+    pub fn chunks(&self) -> &BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft> {
+        &self.chunks
+    }
+
+    /// These drafts are still partial; persistence independently checks each
+    /// draft and does not authorize uncoordinated block-entity changes.
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::player_data::PlayerStateDraft,
+        BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>,
+    ) {
+        (self.player, self.chunks)
+    }
+}
+
 impl PlayerChestDraft {
     pub fn player(&self) -> &native_persistence::nbt::NamedTag {
         self.player.document()
@@ -1080,13 +1108,7 @@ impl LoadedSession {
         player: &native_persistence::nbt::NamedTag,
         chunks: &BTreeMap<ChunkPos, native_persistence::nbt::NamedTag>,
     ) -> anyhow::Result<PlayerChestDraft> {
-        let initial = self.saved_player_inventory_source.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("saved player inventory source was not captured at session start")
-        })?;
-        anyhow::ensure!(
-            native_persistence::nbt::write(player)? == *initial,
-            "saved player source differs from the session source"
-        );
+        self.validate_player_draft_source(player)?;
         anyhow::ensure!(
             chunks.len() == self.chest_dirty_chunks.len()
                 && self
@@ -1101,6 +1123,55 @@ impl LoadedSession {
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let player = self.draft_player_state_inner(player)?;
         Ok(PlayerChestDraft { player, chests })
+    }
+
+    /// Stage the player and every dirty terrain chunk, including known block,
+    /// heightmap, scheduled tick, chest inventory and completed light changes.
+    /// Entity regions, clocks and unsupported effects are still separate.
+    pub fn draft_player_and_dirty_chunks(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        sources: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        mut air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PlayerWorldDraft> {
+        self.validate_player_draft_source(player)?;
+        anyhow::ensure!(
+            self.pending_light.is_empty() && self.sky_lighting.settled(),
+            "lighting updates are not complete"
+        );
+        let dirty = self.dirty_chunk_positions();
+        anyhow::ensure!(
+            sources.len() == dirty.len() && dirty.iter().all(|pos| sources.contains_key(pos)),
+            "all dirty terrain chunks must be supplied exactly once"
+        );
+        let player = self.draft_player_state_inner(player)?;
+        let chunks = sources
+            .iter()
+            .map(|(&pos, source)| {
+                Ok((
+                    pos,
+                    self.draft_dirty_chunk_with_lighting(pos, source, tags, &mut air_and_fluid)?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        Ok(PlayerWorldDraft { player, chunks })
+    }
+
+    fn validate_player_draft_source(
+        &self,
+        source: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<()> {
+        let initial = self.saved_player_inventory_source.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("saved player inventory source was not captured at session start")
+        })?;
+        anyhow::ensure!(
+            native_persistence::nbt::write(source)? == *initial,
+            "saved player source differs from the session source"
+        );
+        Ok(())
     }
 
     fn draft_player_state_inner(
@@ -13019,6 +13090,40 @@ mod tests {
         assert!(session.draft_player_and_chests(&original, &chunks).is_err());
         session.restore_saved_player_inventory(&original).unwrap();
         assert!(session.draft_player_and_chests(&original, &chunks).is_ok());
+        let tags = test_heightmap_tags();
+        assert!(
+            session
+                .draft_player_and_dirty_chunks(
+                    &original,
+                    &BTreeMap::new(),
+                    &tags,
+                    |_| unreachable!()
+                )
+                .is_ok()
+        );
+        let pending = BlockPosition {
+            x: session.origin.x,
+            y: 4,
+            z: session.origin.z,
+        };
+        session.pending_light.insert(
+            pending,
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(
+            session
+                .draft_player_and_dirty_chunks(
+                    &original,
+                    &BTreeMap::new(),
+                    &tags,
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+        session.pending_light.remove(&pending);
         let mut changed = original.clone();
         let Tag::Compound(fields) = &mut changed.value else {
             panic!()
@@ -13171,6 +13276,26 @@ mod tests {
         );
         assert!(session.dirty_chunk_positions().contains(&chunk));
         let tags = test_heightmap_tags();
+        assert!(
+            session
+                .draft_player_and_dirty_chunks(&player, &BTreeMap::new(), &tags, |_| unreachable!())
+                .is_err()
+        );
+        let borrowed_sources = originals
+            .iter()
+            .map(|(&pos, source)| (pos, source))
+            .collect();
+        let whole = session
+            .draft_player_and_dirty_chunks(&player, &borrowed_sources, &tags, |_| unreachable!())
+            .unwrap();
+        assert_eq!(whole.player(), combined.player());
+        assert_eq!(
+            whole.chunks()[&chunk]
+                .document()
+                .value
+                .get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
         assert!(session.try_open_saved_chest(position - session.origin));
         assert!(
             session

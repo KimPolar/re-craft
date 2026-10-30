@@ -807,6 +807,30 @@ impl PlayerStateDraft {
         self.0.matches_source(current)
     }
 
+    /// Add this player to a partial transaction after checking the exact draft
+    /// source and player identity. Other world and player effects still need
+    /// coordinated validation before a gameplay save can be committed.
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut native_persistence::save::WorldSavePlan,
+        uuid: [i32; 4],
+        source: &NamedTag,
+    ) -> Result<()> {
+        let matches_uuid = |document: &NamedTag| -> Result<bool> {
+            Ok(
+                matches!(unique_field(&document.value, "UUID")?, Some(Tag::IntArray(words)) if words.as_slice() == uuid),
+            )
+        };
+        plan.add_player_data(uuid, source, self.document(), |source, replacement| {
+            ensure!(self.matches_source(source)?, "player draft source differs");
+            ensure!(
+                matches_uuid(source)? && matches_uuid(replacement)?,
+                "player UUID does not match save target"
+            );
+            Ok(())
+        })
+    }
+
     pub(crate) fn set_effects(&mut self, effects: Option<Tag>) -> Result<()> {
         set_field(&mut self.0.document.value, "active_effects", effects)?;
         native_persistence::nbt::write(&self.0.document)
@@ -2447,6 +2471,36 @@ mod tests {
                     ]),
                 ),
             ]),
+        }
+    }
+
+    #[test]
+    fn player_plan_rejects_missing_malformed_and_duplicate_identity() {
+        let uuid = [1, 2, 3, 4];
+        for tags in [
+            vec![],
+            vec![("UUID".into(), Tag::IntArray(vec![1, 2, 3]))],
+            vec![
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ],
+        ] {
+            let mut source = player_with_inventory();
+            let Tag::Compound(fields) = &mut source.value else {
+                unreachable!()
+            };
+            fields.extend(tags);
+            let inventory = read_saved_player(&source).unwrap();
+            let draft = PlayerStateDraft(draft_player_inventory(&source, &inventory).unwrap());
+            assert!(
+                draft
+                    .add_to_save_plan(
+                        &mut native_persistence::save::WorldSavePlan::new(),
+                        uuid,
+                        &source
+                    )
+                    .is_err()
+            );
         }
     }
 

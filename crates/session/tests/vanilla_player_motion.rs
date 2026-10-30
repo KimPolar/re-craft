@@ -698,6 +698,9 @@ public class PlayerSaveOracle {
             var xpOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, lookup);
             player.saveWithoutId(xpOutput);
             var xpReference = xpOutput.buildResult();
+            if (!(xpReference.get("UUID") instanceof net.minecraft.nbt.IntArrayTag uuid)
+                || !java.util.Arrays.equals(uuid.getAsIntArray(), net.minecraft.core.UUIDUtil.uuidToIntArray(player.getUUID())))
+                throw new AssertionError("saved player UUID");
             for (String field : xpFields) reference.put(field, xpReference.get(field));
             NbtIo.write(reference, Path.of(args[0], "java-" + i + ".nbt"));
             var rust = NbtIo.read(Path.of(args[0], "rust-" + i + ".nbt"));

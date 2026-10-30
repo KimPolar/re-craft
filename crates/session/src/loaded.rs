@@ -15243,6 +15243,167 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn player_draft_joins_recoverable_clock_transaction() {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag},
+            save::{WorldSavePlan, WorldWriteGuard},
+            world::{DimensionId, SavedClock},
+        };
+        use std::{fs, io::Write, path::Path};
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/session-save-test-temp");
+        fs::create_dir_all(&base).unwrap();
+        let world = tempfile::Builder::new()
+            .prefix("world-")
+            .tempdir_in(base)
+            .unwrap();
+        let write = |path: &Path, document: &NamedTag| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(document).unwrap()).unwrap();
+            fs::write(path, encoder.finish().unwrap()).unwrap();
+        };
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            )]),
+        };
+        write(&world.path().join("level.dat"), &level);
+        let uuid = [0, 0, 0, 1];
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                (
+                    "Dimension".into(),
+                    Tag::String("minecraft:overworld".into()),
+                ),
+                (
+                    "future_data".into(),
+                    Tag::Compound(vec![("value".into(), Tag::Long(42))]),
+                ),
+            ]),
+        };
+        let path = world
+            .path()
+            .join("players/data/00000000-0000-0000-0000-000000000001.dat");
+        write(&path, &original);
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:overworld".into(),
+                        Tag::Compound(vec![
+                            ("total_ticks".into(), Tag::Long(10)),
+                            ("future".into(), Tag::Int(7)),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let clock_path = world.path().join("data/minecraft/world_clocks.dat");
+        write(&clock_path, &clock);
+        let mut session = session();
+        session.update(TICK);
+        let draft = session.draft_player_state(&original).unwrap();
+        let mut changed = original.clone();
+        let Tag::Compound(fields) = &mut changed.value else {
+            unreachable!()
+        };
+        fields.push(("new_field".into(), Tag::Int(1)));
+        assert!(
+            draft
+                .add_to_save_plan(&mut WorldSavePlan::new(), uuid, &changed)
+                .is_err()
+        );
+        assert!(
+            draft
+                .add_to_save_plan(&mut WorldSavePlan::new(), [0, 0, 0, 2], &original)
+                .is_err()
+        );
+        let mut stale_plan = WorldSavePlan::new();
+        draft
+            .add_to_save_plan(&mut stale_plan, uuid, &original)
+            .unwrap();
+        stale_plan
+            .add_world_clocks(
+                &clock,
+                &BTreeMap::from([(
+                    DimensionId::parse("minecraft:overworld").unwrap(),
+                    SavedClock {
+                        total_ticks: 11,
+                        ..SavedClock::default()
+                    },
+                )]),
+            )
+            .unwrap();
+        write(&path, &changed);
+        let stale_bytes = fs::read(&path).unwrap();
+        let clock_bytes = fs::read(&clock_path).unwrap();
+        assert!(
+            WorldWriteGuard::acquire(world.path())
+                .unwrap()
+                .write_plan(stale_plan, |_, _| Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), stale_bytes);
+        assert_eq!(fs::read(&clock_path).unwrap(), clock_bytes);
+        write(&path, &original);
+        let mut plan = WorldSavePlan::new();
+        draft.add_to_save_plan(&mut plan, uuid, &original).unwrap();
+        assert!(draft.add_to_save_plan(&mut plan, uuid, &original).is_err());
+        plan.add_world_clocks(
+            &clock,
+            &BTreeMap::from([(
+                DimensionId::parse("minecraft:overworld").unwrap(),
+                SavedClock {
+                    total_ticks: 11,
+                    ..SavedClock::default()
+                },
+            )]),
+        )
+        .unwrap();
+        let result = WorldWriteGuard::acquire(world.path())
+            .unwrap()
+            .write_plan(plan, |_, _| anyhow::bail!("no blocks should change"))
+            .unwrap();
+        let written = nbt::read_gzip(fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            nbt::write(&written).unwrap(),
+            nbt::write(draft.document()).unwrap()
+        );
+        assert_eq!(
+            written.value.get("future_data"),
+            original.value.get("future_data")
+        );
+        let backup = result
+            .backup_directory
+            .join("players")
+            .join(path.file_name().unwrap());
+        assert_eq!(
+            nbt::read_gzip(fs::File::open(backup).unwrap()).unwrap(),
+            original
+        );
+        let written_clock = nbt::read_gzip(fs::File::open(clock_path).unwrap()).unwrap();
+        let overworld = written_clock
+            .value
+            .get("data")
+            .unwrap()
+            .get("minecraft:overworld")
+            .unwrap();
+        assert_eq!(overworld.get("total_ticks"), Some(&Tag::Long(11)));
+        assert_eq!(overworld.get("future"), Some(&Tag::Int(7)));
+    }
+
+    #[test]
     fn player_save_draft_uses_completed_ticks_and_absolute_rebased_position() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let (world, origin, mut player) = fixture();

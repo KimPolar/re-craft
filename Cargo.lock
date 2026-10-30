@@ -1118,6 +1118,7 @@ name = "native-session"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "getrandom",
  "glam",
  "native-core",

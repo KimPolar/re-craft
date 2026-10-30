@@ -175,6 +175,11 @@ pub struct LoadedSession {
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
+    random_tick_speed: u32,
+    random_block_position: native_core::random::BlockRandomPosition,
+    random_tick_revision: Option<u64>,
+    random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, usize)>,
+    active_random_tick_sections: Vec<(ChunkPos, i8, usize)>,
     flight_speed: f32,
     walking_speed: f32,
     flight: crate::physics::FlightState,
@@ -447,6 +452,10 @@ impl LoadedSession {
 
     pub fn set_survival_rules(&mut self, rules: crate::survival::SurvivalRules) {
         self.survival_rules = rules;
+    }
+
+    pub fn set_random_tick_speed(&mut self, speed: u32) {
+        self.random_tick_speed = speed;
     }
 
     /// Restore the effects and persistent oxygen attribute from the saved player.
@@ -1611,6 +1620,13 @@ impl LoadedSession {
             movement_speed_cache: None,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            random_tick_speed: 3,
+            random_block_position: native_core::random::BlockRandomPosition::new(
+                fresh_breathing_seed() as i32,
+            ),
+            random_tick_revision: None,
+            random_tick_sections: BTreeMap::new(),
+            active_random_tick_sections: Vec::new(),
             flight_speed: 0.05,
             walking_speed: 0.1,
             flight: crate::physics::FlightState::default(),
@@ -4019,6 +4035,118 @@ impl LoadedSession {
         )
     }
 
+    fn set_redstone_ore_lit(&mut self, relative: IVec3, lit: bool) -> bool {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(current) = self.world.state(id) else {
+            return false;
+        };
+        if redstone_ore_lit(current) != Some(!lit) {
+            return false;
+        }
+        let mut replacement = current.clone();
+        replacement.properties.insert("lit".into(), lit.to_string());
+        let id = self.intern_block(replacement);
+        self.set(relative, id)
+    }
+
+    /// Cache only sections containing a currently lit redstone ore. Unchanged
+    /// sections are reused across world revisions, including streamed chunks.
+    fn refresh_random_tick_sections(&mut self) {
+        if self.random_tick_revision == Some(self.revision) {
+            return;
+        }
+        let lit_ids: Vec<_> = (0..self.world.state_count())
+            .filter_map(|index| {
+                let id = BlockStateId(u32::try_from(index).ok()?);
+                (self.world.state(id).and_then(redstone_ore_lit) == Some(true)).then_some(id)
+            })
+            .collect();
+        if lit_ids.is_empty() {
+            self.random_tick_sections.clear();
+            self.active_random_tick_sections.clear();
+            self.random_tick_revision = Some(self.revision);
+            return;
+        }
+        let mut present = BTreeSet::new();
+        for (&chunk_pos, chunk) in &self.world.chunks {
+            if chunk.status.as_deref() != Some("minecraft:full") {
+                continue;
+            }
+            for (&section_y, section) in &chunk.sections {
+                let key = (chunk_pos, section_y);
+                present.insert(key);
+                let same = self
+                    .random_tick_sections
+                    .get(&key)
+                    .and_then(|(previous, _)| previous.upgrade())
+                    .is_some_and(|previous| Arc::ptr_eq(&previous, section));
+                if same {
+                    continue;
+                }
+                let active = section.blocks.as_ref().map_or(0, |blocks| {
+                    blocks.iter().filter(|id| lit_ids.contains(id)).count()
+                });
+                self.random_tick_sections
+                    .insert(key, (Arc::downgrade(section), active));
+            }
+        }
+        self.random_tick_sections
+            .retain(|key, _| present.contains(key));
+        self.active_random_tick_sections = self
+            .random_tick_sections
+            .iter()
+            .filter_map(|(&(chunk, section), (_, active))| {
+                (*active > 0).then_some((chunk, section, *active))
+            })
+            .collect();
+        self.random_tick_revision = Some(self.revision);
+    }
+
+    fn advance_random_block_ticks(&mut self) {
+        if self.random_tick_speed == 0 {
+            return;
+        }
+        self.refresh_random_tick_sections();
+        let sections = self.active_random_tick_sections.clone();
+        for (chunk, section, mut active) in sections {
+            let Some(x) = chunk.x.checked_mul(16) else {
+                continue;
+            };
+            let Some(z) = chunk.z.checked_mul(16) else {
+                continue;
+            };
+            let y = i32::from(section) * 16;
+            for index in 0..self.random_tick_speed {
+                let [dx, dy, dz] = self.random_block_position.next_section_offset();
+                let Some(absolute) = x
+                    .checked_add(dx)
+                    .zip(z.checked_add(dz))
+                    .map(|(x, z)| IVec3::new(x, y + dy, z))
+                else {
+                    continue;
+                };
+                if let Some(relative) = subtract(absolute, self.origin) {
+                    if self.set_redstone_ore_lit(relative, false) {
+                        active -= 1;
+                        if active == 0 {
+                            self.random_block_position
+                                .skip(self.random_tick_speed - index - 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn mining_target(&self) -> Option<mining::Candidate> {
         let hit = self.ray_hit()?;
         let Cell::State(id) = cell(
@@ -5422,6 +5550,7 @@ impl LoadedSession {
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
         self.advance_fluid_ticks();
+        self.advance_random_block_ticks();
         self.advance_falling_sand();
         if self.death.is_some() {
             let requested = self
@@ -5779,6 +5908,11 @@ impl LoadedSession {
                 {
                     self.first_person.swing.start(crate::animation::Hand::Main);
                     let target = self.mining_target();
+                    if let Some(relative) =
+                        target.and_then(|target| subtract(target.position, self.origin))
+                    {
+                        self.set_redstone_ore_lit(relative, true);
+                    }
                     let context = self.mining_context();
                     let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
                         self.inventory.selected(),
@@ -5821,68 +5955,86 @@ impl LoadedSession {
                         let off = self.inventory.slot(crate::inventory::PlayerSlot::Offhand);
                         let bypass = self.sneak && (main.is_some() || off.is_some());
                         let table = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:crafting_table"));
-                        if self.game_mode != GameMode::Spectator
-                            && !bypass
-                            && self.use_stone_button(hit.position)
-                        {
-                            handled = true;
-                        } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
-                            handled = true;
-                            self.mining.release();
-                            if let Some(position) = add(self.origin, hit.position)
-                                && Arc::make_mut(&mut self.inventory).open_crafting_table(position)
-                                && self.game_mode != GameMode::Spectator
-                            {
+                        let ore = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).and_then(redstone_ore_lit).is_some());
+                        let block_item = main.is_some_and(|item| {
+                            Block::from_item_id(item.id()).is_some()
+                                || item.id() == "minecraft:stone_button"
+                        });
+                        let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
+                            matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).and_then(stone_button_can_replace) == Some(true))
+                        });
+                        if ore && !bypass && self.game_mode != GameMode::Spectator {
+                            self.set_redstone_ore_lit(hit.position, true);
+                            if !can_place {
+                                handled = true;
                                 self.first_person.swing.start(crate::animation::Hand::Main);
                             }
-                        } else if self.food_use.start_hand(
-                            &self.inventory,
-                            main_hand,
-                            self.vitals,
-                            self.game_mode,
-                        ) || (self.game_mode.allows_basic_building()
-                            && self.use_tool(hit.position, hit.face))
-                        {
-                            handled = true;
-                        } else if self.game_mode.allows_basic_building()
-                            && let Some(hand) = self.place_stone_button(hit)
-                        {
-                            handled = true;
-                            let swing = if hand == crate::inventory::PlayerSlot::Offhand {
-                                crate::animation::Hand::Off
-                            } else {
-                                crate::animation::Hand::Main
-                            };
-                            self.first_person.swing.start(swing);
-                            if self.game_mode.consumes_placed_item() {
-                                Arc::make_mut(&mut self.inventory).consume_held(hand);
-                            }
-                            if self.inventory.slot(hand).is_some() {
-                                self.first_person.used(swing);
-                            }
-                        } else if self.game_mode.allows_basic_building()
-                            && let Some((hand, block)) = placement_hand(&self.inventory)
-                            && let Some(target) = add(hit.position, hit.face)
-                            && matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")))
-                            && let Some(block) = self.placement_block(target, block)
-                            && !player_intersects_block(self.player, target, block)
-                            && {
-                                let id = self.placement_id(block.orient_for_face(hit.face));
-                                self.set(target, id)
-                            }
-                        {
-                            handled = true;
-                            let swing_hand = if hand == crate::inventory::PlayerSlot::Offhand {
-                                crate::animation::Hand::Off
-                            } else {
-                                crate::animation::Hand::Main
-                            };
-                            self.first_person.swing.start(swing_hand);
-                            if self.game_mode.consumes_placed_item() {
-                                Arc::make_mut(&mut self.inventory).consume_held(hand);
-                            }
-                            if self.inventory.slot(hand).is_some() {
-                                self.first_person.used(swing_hand);
+                        }
+                        if !handled {
+                            if self.game_mode != GameMode::Spectator
+                                && !bypass
+                                && self.use_stone_button(hit.position)
+                            {
+                                handled = true;
+                            } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
+                                handled = true;
+                                self.mining.release();
+                                if let Some(position) = add(self.origin, hit.position)
+                                    && Arc::make_mut(&mut self.inventory)
+                                        .open_crafting_table(position)
+                                    && self.game_mode != GameMode::Spectator
+                                {
+                                    self.first_person.swing.start(crate::animation::Hand::Main);
+                                }
+                            } else if self.food_use.start_hand(
+                                &self.inventory,
+                                main_hand,
+                                self.vitals,
+                                self.game_mode,
+                            ) || (self.game_mode.allows_basic_building()
+                                && self.use_tool(hit.position, hit.face))
+                            {
+                                handled = true;
+                            } else if self.game_mode.allows_basic_building()
+                                && let Some(hand) = self.place_stone_button(hit)
+                            {
+                                handled = true;
+                                let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+                                    crate::animation::Hand::Off
+                                } else {
+                                    crate::animation::Hand::Main
+                                };
+                                self.first_person.swing.start(swing);
+                                if self.game_mode.consumes_placed_item() {
+                                    Arc::make_mut(&mut self.inventory).consume_held(hand);
+                                }
+                                if self.inventory.slot(hand).is_some() {
+                                    self.first_person.used(swing);
+                                }
+                            } else if self.game_mode.allows_basic_building()
+                                && let Some((hand, block)) = placement_hand(&self.inventory)
+                                && let Some(target) = add(hit.position, hit.face)
+                                && matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")))
+                                && let Some(block) = self.placement_block(target, block)
+                                && !player_intersects_block(self.player, target, block)
+                                && {
+                                    let id = self.placement_id(block.orient_for_face(hit.face));
+                                    self.set(target, id)
+                                }
+                            {
+                                handled = true;
+                                let swing_hand = if hand == crate::inventory::PlayerSlot::Offhand {
+                                    crate::animation::Hand::Off
+                                } else {
+                                    crate::animation::Hand::Main
+                                };
+                                self.first_person.swing.start(swing_hand);
+                                if self.game_mode.consumes_placed_item() {
+                                    Arc::make_mut(&mut self.inventory).consume_held(hand);
+                                }
+                                if self.inventory.slot(hand).is_some() {
+                                    self.first_person.used(swing_hand);
+                                }
                             }
                         }
                     }
@@ -6445,6 +6597,9 @@ impl LoadedSession {
                     respawn_pending: false,
                     can_respawn: false,
                 });
+            }
+            if self.game_mode != GameMode::Spectator && !self.sneak {
+                self.set_redstone_ore_lit(legacy, true);
             }
             self.fall_distance = 0.0;
         } else {
@@ -7349,6 +7504,21 @@ fn stone_button_support_direction(button: &BlockState) -> Option<IVec3> {
             "east" => Some(IVec3::NEG_X),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn redstone_ore_lit(state: &BlockState) -> Option<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
+    ) || state.properties.len() != 1
+    {
+        return None;
+    }
+    match state.properties.get("lit")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
         _ => None,
     }
 }
@@ -13801,6 +13971,281 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn redstone_ore_transitions_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("RedstoneOreOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RedstoneOreOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let mut cases = Vec::new();
+        for block in ["minecraft:redstone_ore", "minecraft:deepslate_redstone_ore"] {
+            for lit in [false, true] {
+                for action in ["attack", "use", "step", "sneak", "random"] {
+                    cases.push(serde_json::json!({"block":block,"lit":lit,"action":action}));
+                }
+            }
+        }
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RedstoneOreOracle")
+            .arg(&input)
+            .arg(&output));
+        let rows: Vec<bool> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (case, expected) in cases.iter().zip(rows) {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let action = case["action"].as_str().unwrap();
+            let relative = if action == "random" {
+                IVec3::from_array(
+                    native_core::random::BlockRandomPosition::new(123).next_section_offset(),
+                )
+            } else if matches!(action, "step" | "sneak") {
+                IVec3::new(8, 0, 8)
+            } else {
+                IVec3::new(8, 2, 6)
+            };
+            let ore = session.intern_block(state(
+                case["block"].as_str().unwrap(),
+                &[(
+                    "lit",
+                    if case["lit"].as_bool().unwrap() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )],
+            ));
+            session.set(relative, ore);
+            match action {
+                "attack" => {
+                    session.submit_command(PlayerCommand::Break);
+                    session.update(TICK);
+                }
+                "use" => {
+                    session.set_player_inventory(PlayerInventory::default());
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                }
+                "step" | "sneak" => {
+                    session.submit_command(PlayerCommand::Sneak(action == "sneak"));
+                    session.update(TICK * 3);
+                }
+                "random" => {
+                    session.random_block_position =
+                        native_core::random::BlockRandomPosition::new(123);
+                    session.set_random_tick_speed(1);
+                    session.advance_random_block_ticks();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(expected)),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn redstone_ore_attack_and_use_match_player_interactions() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for name in ["minecraft:redstone_ore", "minecraft:deepslate_redstone_ore"] {
+            for (hand, sneak, mode, expected_lit, expected_block) in [
+                (None, false, GameMode::Survival, true, false),
+                (
+                    Some((PlayerSlot::Storage(0), "minecraft:stick")),
+                    false,
+                    GameMode::Survival,
+                    true,
+                    false,
+                ),
+                (
+                    Some((PlayerSlot::Storage(0), "minecraft:stone")),
+                    false,
+                    GameMode::Survival,
+                    true,
+                    true,
+                ),
+                (
+                    Some((PlayerSlot::Offhand, "minecraft:stone")),
+                    false,
+                    GameMode::Survival,
+                    true,
+                    false,
+                ),
+                (
+                    Some((PlayerSlot::Storage(0), "minecraft:stone")),
+                    true,
+                    GameMode::Survival,
+                    false,
+                    true,
+                ),
+                (None, false, GameMode::Spectator, false, false),
+            ] {
+                let mut session = session();
+                session.set_random_tick_speed(0);
+                session.set_game_mode(mode);
+                let mut inventory = PlayerInventory::default();
+                if let Some((slot, id)) = hand {
+                    inventory.set_slot(
+                        slot,
+                        ItemStack::new(id.into(), 2, 64, Tag::Compound(vec![])),
+                    );
+                }
+                session.set_player_inventory(inventory);
+                let relative = IVec3::new(8, 2, 6);
+                let target = relative + IVec3::Z;
+                let ore = session.intern_block(state(name, &[("lit", "false")]));
+                assert!(session.set(relative, ore));
+                session.submit_command(PlayerCommand::Sneak(sneak));
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let state = match cell(
+                    &session.world,
+                    session.origin,
+                    session.bounds,
+                    relative,
+                    session.states[0],
+                ) {
+                    Cell::State(id) => session.world.state(id).unwrap(),
+                    Cell::Missing => panic!(),
+                };
+                assert_eq!(
+                    redstone_ore_lit(state),
+                    Some(expected_lit),
+                    "{name} {hand:?} sneak={sneak} {mode:?}"
+                );
+                let placed = matches!(cell(&session.world, session.origin, session.bounds, target, session.states[0]), Cell::State(id) if session.world.state(id).is_some_and(|state| state.name == "minecraft:stone"));
+                assert_eq!(
+                    placed, expected_block,
+                    "{name} {hand:?} sneak={sneak} {mode:?}"
+                );
+            }
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let relative = IVec3::new(8, 2, 6);
+            let ore = session.intern_block(state(name, &[("lit", "false")]));
+            assert!(session.set(relative, ore));
+            session.submit_command(PlayerCommand::Break);
+            session.update(TICK);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(true))
+            );
+        }
+    }
+
+    #[test]
+    fn redstone_ore_step_and_random_tick_respect_sneaking_and_game_rule() {
+        for (sneak, mode, lit) in [
+            (false, GameMode::Survival, true),
+            (true, GameMode::Survival, false),
+            (false, GameMode::Spectator, false),
+        ] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_game_mode(mode);
+            let ore = session.intern_block(state("minecraft:redstone_ore", &[("lit", "false")]));
+            assert!(session.set(IVec3::new(8, 0, 8), ore));
+            session.submit_command(PlayerCommand::Sneak(sneak));
+            session.update(TICK * 3);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, IVec3::new(8,0,8), session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(lit)),
+                "{mode:?} sneak={sneak}"
+            );
+        }
+        let mut session = session();
+        let seed = 123;
+        let mut generator = native_core::random::BlockRandomPosition::new(seed);
+        let relative = IVec3::from_array(generator.next_section_offset());
+        let lit = session.intern_block(state("minecraft:redstone_ore", &[("lit", "true")]));
+        session.set(relative, lit);
+        let old_world = Arc::clone(&session.world);
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(0);
+        session.advance_random_block_ticks();
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(true))
+        );
+        session.set_random_tick_speed(1);
+        session.advance_random_block_ticks();
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(false))
+        );
+        let absolute = session.origin + relative;
+        assert_eq!(
+            old_world
+                .block(absolute.x, absolute.y, absolute.z)
+                .and_then(redstone_ore_lit),
+            Some(true)
+        );
+        assert!(
+            session
+                .draft_block_ticks(session.player_chunk().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        // A large random-tick rule still advances the unused coordinates
+        // after the only lit ore goes out, without a long fixed-tick loop.
+        let mut session = self::session();
+        let mut expected = native_core::random::BlockRandomPosition::new(seed);
+        let relative = IVec3::from_array(expected.next_section_offset());
+        let lit = session.intern_block(state("minecraft:redstone_ore", &[("lit", "true")]));
+        session.set(relative, lit);
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(i32::MAX as u32);
+        expected.skip(i32::MAX as u32 - 1);
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected.next_section_offset()
+        );
+    }
+
+    #[test]
     fn loaded_mining_applies_haste_and_fatigue() {
         fn ticks_to_break(haste: bool, fatigue: bool) -> usize {
             let mut session = session();
@@ -14093,20 +14538,26 @@ mod tests {
                 )
                 .unwrap();
             let relative = IVec3::new(8, 2, 6);
-            let id = session.intern_block(state(&format!("minecraft:{block}"), &[]));
+            let properties: &[(&str, &str)] = if block.ends_with("redstone_ore") {
+                &[("lit", "false")]
+            } else {
+                &[]
+            };
+            let id = session.intern_block(state(&format!("minecraft:{block}"), properties));
+            session.set_random_tick_speed(0);
             assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
             assert!(session.set(relative, id));
             session.update(TICK * 3);
             session.submit_command(PlayerCommand::Break);
             for _ in 0..100 {
                 session.update(TICK);
-                if !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id)
+                if matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == session.states[0])
                 {
                     break;
                 }
             }
             assert!(
-                !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id),
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == session.states[0]),
                 "{block}"
             );
             let snapshot = session.snapshot();

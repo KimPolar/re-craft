@@ -973,6 +973,7 @@ fn prepare_existing_world(
             natural_health_regeneration: rules.natural_health_regeneration,
             fall_damage: rules.fall_damage,
         });
+        session.set_random_tick_speed(rules.random_tick_speed as u32);
         session.set_death_rules(native_session::DeathRules {
             keep_inventory: rules.keep_inventory,
             immediate_respawn: rules.immediate_respawn,

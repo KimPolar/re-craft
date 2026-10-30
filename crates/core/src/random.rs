@@ -3,6 +3,47 @@
 const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SILVER: u64 = 0x6a09_e667_f3bc_c909;
 
+/// Per-level coordinate generator used by `Level.getBlockRandomPos`.
+/// This is distinct from the level's regular `RandomSource`.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockRandomPosition {
+    value: i32,
+}
+
+impl BlockRandomPosition {
+    pub fn new(value: i32) -> Self {
+        Self { value }
+    }
+
+    pub fn next_section_offset(&mut self) -> [i32; 3] {
+        self.value = self.value.wrapping_mul(3).wrapping_add(1_013_904_223);
+        let value = self.value >> 2;
+        [value & 15, (value >> 16) & 15, (value >> 8) & 15]
+    }
+
+    /// Advance the affine generator without enumerating coordinates.
+    pub fn skip(&mut self, mut count: u32) {
+        let mut multiplier = 3_u32;
+        let mut increment = 1_013_904_223_u32;
+        let mut accumulated_multiplier = 1_u32;
+        let mut accumulated_increment = 0_u32;
+        while count != 0 {
+            if count & 1 != 0 {
+                accumulated_increment = accumulated_increment
+                    .wrapping_mul(multiplier)
+                    .wrapping_add(increment);
+                accumulated_multiplier = accumulated_multiplier.wrapping_mul(multiplier);
+            }
+            increment = increment.wrapping_mul(multiplier.wrapping_add(1));
+            multiplier = multiplier.wrapping_mul(multiplier);
+            count >>= 1;
+        }
+        self.value = (self.value as u32)
+            .wrapping_mul(accumulated_multiplier)
+            .wrapping_add(accumulated_increment) as i32;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LegacyRandom {
     seed: u64,
@@ -134,6 +175,31 @@ fn mix_stafford13(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_block_positions_match_iterated_and_composed_sequences() {
+        for seed in [0, 1, -1, i32::MIN, i32::MAX] {
+            for count in [0, 1, 2, 3, 63, 4096, 65537] {
+                let mut iterated = BlockRandomPosition::new(seed);
+                for _ in 0..count {
+                    iterated.next_section_offset();
+                }
+                let mut skipped = BlockRandomPosition::new(seed);
+                skipped.skip(count);
+                assert_eq!(
+                    skipped.next_section_offset(),
+                    iterated.next_section_offset(),
+                    "{seed} {count}"
+                );
+            }
+            let mut combined = BlockRandomPosition::new(seed);
+            combined.skip(i32::MAX as u32);
+            let mut split = BlockRandomPosition::new(seed);
+            split.skip(1_000_000_000);
+            split.skip(i32::MAX as u32 - 1_000_000_000);
+            assert_eq!(combined.next_section_offset(), split.next_section_offset());
+        }
+    }
 
     #[test]
     fn deterministic_and_bounded_for_both_generators() {

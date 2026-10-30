@@ -17,6 +17,48 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn random_block_positions_match_vanilla() {
+    use native_core::random::BlockRandomPosition;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("RandomBlockPositionOracle.java");
+    std::fs::write(&source, include_str!("java/RandomBlockPositionOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let seeds: Vec<i32> = (-40..40).chain([i32::MIN, i32::MAX]).collect();
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&seeds).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("RandomBlockPositionOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Vec<[i32; 3]>> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), seeds.len());
+    for (seed, expected) in seeds.iter().zip(rows) {
+        let mut generator = BlockRandomPosition::new(*seed);
+        for position in expected {
+            assert_eq!(generator.next_section_offset(), position, "seed {seed}");
+        }
+    }
+    eprintln!(
+        "Compared {} random block coordinates with Minecraft 26.3",
+        seeds.len() * 64
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn ore_placement_defaults_match_vanilla() {
     use native_core::ore::Ore;
     let game = std::env::var_os("MINECRAFT_DIR")

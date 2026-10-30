@@ -574,6 +574,7 @@ pub struct DataPackSettings {
 /// The 26.3 game rules currently consumed by the in-memory simulation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FluidGameRules {
+    pub random_tick_speed: i32,
     pub advance_time: bool,
     pub water_source_conversion: bool,
     pub lava_source_conversion: bool,
@@ -590,6 +591,7 @@ pub struct FluidGameRules {
 impl Default for FluidGameRules {
     fn default() -> Self {
         Self {
+            random_tick_speed: 3,
             advance_time: true,
             water_source_conversion: true,
             lava_source_conversion: false,
@@ -1223,7 +1225,21 @@ impl WorldReader {
                 radius
             }
         };
+        let random_tick_speed = match data
+            .get("minecraft:random_tick_speed")
+            .or_else(|| data.get("random_tick_speed"))
+        {
+            None => 3,
+            Some(value) => {
+                let speed = value
+                    .as_java_int()
+                    .context("random_tick_speed must be a number")?;
+                ensure!(speed >= 0, "random_tick_speed must not be negative");
+                speed
+            }
+        };
         Ok(FluidGameRules {
+            random_tick_speed,
             advance_time: read("advance_time", true)?,
             water_source_conversion: read("water_source_conversion", true)?,
             lava_source_conversion: read("lava_source_conversion", false)?,
@@ -2017,6 +2033,7 @@ mod tests {
                         ("minecraft:immediate_respawn".into(), Tag::Byte(1)),
                         ("minecraft:show_death_messages".into(), Tag::Byte(0)),
                         ("minecraft:respawn_radius".into(), Tag::Int(7)),
+                        ("minecraft:random_tick_speed".into(), Tag::Int(9)),
                         ("minecraft:advance_time".into(), Tag::Byte(0)),
                     ]),
                 ),
@@ -2031,6 +2048,7 @@ mod tests {
             assert_eq!(
                 reader.fluid_game_rules().unwrap(),
                 FluidGameRules {
+                    random_tick_speed: 9,
                     advance_time: false,
                     water_source_conversion: false,
                     lava_source_conversion: true,

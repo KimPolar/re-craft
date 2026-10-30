@@ -3,7 +3,7 @@
 //! Only complete neighborhoods of supported block states are accepted.
 //! Unknown states or light data leave the existing light arrays untouched.
 
-use crate::loaded::{BlockPosition, BlockState, ChunkPos, World};
+use crate::loaded::{BlockPosition, BlockState, ChunkPos, LIGHT_BYTES, Section, World};
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     sync::Arc,
@@ -540,6 +540,127 @@ fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
     })
 }
 
+/// Java keeps one extra light section above and below the build range.
+#[derive(Clone, Copy, Debug)]
+pub struct LightBounds {
+    min_y: i32,
+    max_y: i32,
+    min_light_y: i32,
+    max_light_y: i32,
+}
+
+impl LightBounds {
+    pub fn new(min_y: i32, max_y: i32) -> Option<Self> {
+        if min_y >= max_y || min_y.rem_euclid(16) != 0 || max_y.rem_euclid(16) != 0 {
+            return None;
+        }
+        let min_light_y = min_y.checked_sub(16)?;
+        let max_light_y = max_y.checked_add(16)?;
+        i8::try_from(min_light_y.div_euclid(16)).ok()?;
+        i8::try_from((max_light_y - 1).div_euclid(16)).ok()?;
+        Some(Self {
+            min_y,
+            max_y,
+            min_light_y,
+            max_light_y,
+        })
+    }
+
+    fn is_padding(self, y: i32) -> bool {
+        (self.min_light_y..self.max_light_y).contains(&y) && !(self.min_y..self.max_y).contains(&y)
+    }
+}
+
+fn light_at(world: &World, p: BlockPosition, bounds: Option<LightBounds>) -> Option<u8> {
+    if bounds.is_some_and(|b| !(b.min_light_y..b.max_light_y).contains(&p.y)) {
+        return None;
+    }
+    if let Some(light) = world.light(p.x, p.y, p.z, false) {
+        return Some(light);
+    }
+    if bounds.is_some_and(|b| b.is_padding(p.y)) {
+        i8::try_from(p.y.div_euclid(16)).ok()?;
+        let chunk = world.chunks.get(&p.chunk())?;
+        if chunk.status.as_deref() == Some("minecraft:full") && chunk.block_light_correct {
+            return Some(0);
+        }
+    }
+    None
+}
+
+fn behavior_at(
+    world: &World,
+    p: BlockPosition,
+    bounds: Option<LightBounds>,
+    cache: &mut BTreeMap<Option<crate::loaded::BlockStateId>, u32>,
+    behaviors: &mut Vec<LightProperties>,
+) -> Option<u32> {
+    if bounds.is_some_and(|b| !(b.min_light_y..b.max_light_y).contains(&p.y)) {
+        return None;
+    }
+    let key = if bounds.is_some_and(|b| b.is_padding(p.y)) {
+        None
+    } else {
+        Some(world.block_id(p.x, p.y, p.z)?)
+    };
+    if let Some(&index) = cache.get(&key) {
+        return Some(index);
+    }
+    let value = match key {
+        Some(id) => light_properties(world.state(id)?)?,
+        None => LightProperties {
+            opacity: 0,
+            emission: 0,
+            faces: [[0; 16]; 6],
+            has_faces: false,
+        },
+    };
+    let index = u32::try_from(behaviors.len())
+        .ok()
+        .filter(|&i| i != u32::MAX)?;
+    behaviors.push(value);
+    cache.insert(key, index);
+    Some(index)
+}
+
+fn write_light(
+    world: &mut World,
+    p: BlockPosition,
+    value: u8,
+    bounds: Option<LightBounds>,
+) -> Option<()> {
+    let chunk = Arc::make_mut(world.chunks.get_mut(&p.chunk())?);
+    let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
+    let section = match chunk.sections.entry(section_y) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            if !bounds.is_some_and(|b| b.is_padding(p.y)) {
+                return None;
+            }
+            entry.insert(Arc::new(Section {
+                blocks: None,
+                biomes: None,
+                block_light: None,
+                sky_light: None,
+            }))
+        }
+    };
+    let section = Arc::make_mut(section);
+    let data = section
+        .block_light
+        .get_or_insert_with(|| Box::new([0; LIGHT_BYTES]));
+    let index = p.x.rem_euclid(16) as usize
+        + p.z.rem_euclid(16) as usize * 16
+        + p.y.rem_euclid(16) as usize * 256;
+    let byte = &mut data[index / 2];
+    if index.is_multiple_of(2) {
+        *byte = (*byte & 0xf0) | value;
+    } else {
+        *byte = (*byte & 0x0f) | (value << 4);
+    }
+    Some(())
+}
+
 #[derive(Clone, Copy)]
 struct LightCell {
     behavior: u32,
@@ -631,6 +752,18 @@ pub fn relight_block(
     center: BlockPosition,
     change: LightChange,
 ) -> Option<BTreeSet<ChunkPos>> {
+    relight_block_with_bounds(world, center, change, None)
+}
+
+fn relight_block_with_bounds(
+    world: &mut World,
+    center: BlockPosition,
+    change: LightChange,
+    bounds: Option<LightBounds>,
+) -> Option<BTreeSet<ChunkPos>> {
+    if bounds.is_some_and(|b| !(b.min_y..b.max_y).contains(&center.y)) {
+        return None;
+    }
     // With no light at the changed cell or any of its neighbors, an
     // emission-free opacity change cannot alter the surrounding block light.
     if change.allow_dark_skip {
@@ -640,7 +773,7 @@ pub fn relight_block(
                 world.chunks.get(&p.chunk()).is_some_and(|chunk| {
                     chunk.status.as_deref() == Some("minecraft:full")
                         && chunk.block_light_correct
-                        && world.light(p.x, p.y, p.z, false) == Some(0)
+                        && light_at(world, p, bounds) == Some(0)
                 })
             });
         // At an integer coordinate limit, an absent neighbor is unknown.
@@ -660,20 +793,6 @@ pub fn relight_block(
     ];
     let mut cache = BTreeMap::new();
     let mut behaviors: Vec<LightProperties> = Vec::new();
-    let behavior =
-        |p: BlockPosition, cache: &mut BTreeMap<_, u32>, behaviors: &mut Vec<LightProperties>| {
-            let id = world.block_id(p.x, p.y, p.z)?;
-            if let Some(&index) = cache.get(&id) {
-                return Some(index);
-            }
-            let value = light_properties(world.state(id)?)?;
-            let index = u32::try_from(behaviors.len())
-                .ok()
-                .filter(|&i| i != u32::MAX)?;
-            behaviors.push(value);
-            cache.insert(id, index);
-            Some(index)
-        };
     for dx in -radius..=radius {
         for dy in -radius..=radius {
             for dz in -radius..=radius {
@@ -685,8 +804,8 @@ pub fn relight_block(
                 if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                     return None;
                 }
-                let value = behavior(p, &mut cache, &mut behaviors)?;
-                let previous = world.light(p.x, p.y, p.z, false)?;
+                let value = behavior_at(world, p, bounds, &mut cache, &mut behaviors)?;
+                let previous = light_at(world, p, bounds)?;
                 let index = dense_index(dx, dy, dz, radius, side);
                 cells[index] = LightCell {
                     behavior: value,
@@ -713,7 +832,7 @@ pub fn relight_block(
             if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
-            let other = behavior(next, &mut cache, &mut behaviors)?;
+            let other = behavior_at(world, next, bounds, &mut cache, &mut behaviors)?;
             if (behaviors[cell.behavior as usize].has_faces || behaviors[other as usize].has_faces)
                 && faces_occlude(
                     &behaviors[cell.behavior as usize].faces[direction_index],
@@ -722,7 +841,7 @@ pub fn relight_block(
             {
                 continue;
             }
-            let boundary = world.light(next.x, next.y, next.z, false)?;
+            let boundary = light_at(world, next, bounds)?;
             cell.value = cell
                 .value
                 .max(boundary.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1)));
@@ -768,21 +887,7 @@ pub fn relight_block(
         }
         let p = offset(center, dense_offset(index, radius, side))?;
         let chunk_pos = p.chunk();
-        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
-        let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
-        let section = Arc::make_mut(chunk.sections.get_mut(&section_y)?);
-        let data = section
-            .block_light
-            .get_or_insert_with(|| Box::new([0; crate::loaded::LIGHT_BYTES]));
-        let index = p.x.rem_euclid(16) as usize
-            + p.z.rem_euclid(16) as usize * 16
-            + p.y.rem_euclid(16) as usize * 256;
-        let byte = &mut data[index / 2];
-        if index.is_multiple_of(2) {
-            *byte = (*byte & 0xf0) | cell.value;
-        } else {
-            *byte = (*byte & 0x0f) | (cell.value << 4);
-        }
+        write_light(world, p, cell.value, bounds)?;
         changed.insert(chunk_pos);
     }
     Some(changed)
@@ -794,31 +899,40 @@ pub fn relight_changes(
     world: &mut World,
     changes: &[(BlockPosition, LightChange)],
 ) -> Option<BTreeSet<ChunkPos>> {
+    relight_changes_with_bounds(world, changes, None)
+}
+
+pub fn relight_changes_in_bounds(
+    world: &mut World,
+    changes: &[(BlockPosition, LightChange)],
+    bounds: LightBounds,
+) -> Option<BTreeSet<ChunkPos>> {
+    relight_changes_with_bounds(world, changes, Some(bounds))
+}
+
+fn relight_changes_with_bounds(
+    world: &mut World,
+    changes: &[(BlockPosition, LightChange)],
+    bounds: Option<LightBounds>,
+) -> Option<BTreeSet<ChunkPos>> {
     if changes.is_empty() {
         return Some(BTreeSet::new());
     }
+    if bounds.is_some_and(|b| {
+        changes
+            .iter()
+            .any(|(p, _)| !(b.min_y..b.max_y).contains(&p.y))
+    }) {
+        return None;
+    }
     if let [(position, change)] = changes {
-        return relight_block(world, *position, *change);
+        return relight_block_with_bounds(world, *position, *change, bounds);
     }
 
     let mut indices = HashMap::new();
     let mut cells: Vec<(BlockPosition, LightCell)> = Vec::new();
     let mut cache = BTreeMap::new();
     let mut behaviors: Vec<LightProperties> = Vec::new();
-    let behavior =
-        |p: BlockPosition, cache: &mut BTreeMap<_, u32>, behaviors: &mut Vec<LightProperties>| {
-            let id = world.block_id(p.x, p.y, p.z)?;
-            if let Some(&index) = cache.get(&id) {
-                return Some(index);
-            }
-            let value = light_properties(world.state(id)?)?;
-            let index = u32::try_from(behaviors.len())
-                .ok()
-                .filter(|&i| i != u32::MAX)?;
-            behaviors.push(value);
-            cache.insert(id, index);
-            Some(index)
-        };
     for &(center, change) in changes {
         let radius = change.radius();
         for dx in -radius..=radius {
@@ -837,8 +951,8 @@ pub fn relight_changes(
                     {
                         return None;
                     }
-                    let value = behavior(p, &mut cache, &mut behaviors)?;
-                    let previous = world.light(p.x, p.y, p.z, false)?;
+                    let value = behavior_at(world, p, bounds, &mut cache, &mut behaviors)?;
+                    let previous = light_at(world, p, bounds)?;
                     indices.insert(p, cells.len());
                     cells.push((
                         p,
@@ -863,7 +977,7 @@ pub fn relight_changes(
             if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
-            let other = behavior(next, &mut cache, &mut behaviors)?;
+            let other = behavior_at(world, next, bounds, &mut cache, &mut behaviors)?;
             if (behaviors[cell.behavior as usize].has_faces || behaviors[other as usize].has_faces)
                 && faces_occlude(
                     &behaviors[cell.behavior as usize].faces[direction_index],
@@ -872,7 +986,7 @@ pub fn relight_changes(
             {
                 continue;
             }
-            let boundary = world.light(next.x, next.y, next.z, false)?;
+            let boundary = light_at(world, next, bounds)?;
             cell.value = cell
                 .value
                 .max(boundary.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1)));
@@ -913,21 +1027,7 @@ pub fn relight_changes(
             continue;
         }
         let chunk_pos = p.chunk();
-        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
-        let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
-        let section = Arc::make_mut(chunk.sections.get_mut(&section_y)?);
-        let data = section
-            .block_light
-            .get_or_insert_with(|| Box::new([0; crate::loaded::LIGHT_BYTES]));
-        let index = p.x.rem_euclid(16) as usize
-            + p.z.rem_euclid(16) as usize * 16
-            + p.y.rem_euclid(16) as usize * 256;
-        let byte = &mut data[index / 2];
-        if index.is_multiple_of(2) {
-            *byte = (*byte & 0xf0) | cell.value;
-        } else {
-            *byte = (*byte & 0x0f) | (cell.value << 4);
-        }
+        write_light(world, p, cell.value, bounds)?;
         changed.insert(chunk_pos);
     }
     Some(changed)
@@ -1244,6 +1344,148 @@ mod tests {
         set(&mut world, center, air_id);
         relight_block(&mut world, center, light_change(&mushroom, &air).unwrap()).unwrap();
         assert_eq!(light(&world, center), 0);
+    }
+
+    #[test]
+    fn light_updates_in_the_padding_above_and_below_build_bounds() {
+        let (mut world, _, _, _) = fixture();
+        let air = state("air", None);
+        let torch = state("torch", None);
+        let air_id = world.intern_state(air.clone());
+        let torch_id = world.intern_state(torch.clone());
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let add = light_change(&air, &torch).unwrap();
+        let remove = light_change(&torch, &air).unwrap();
+        for center in [position(15, 0, 15), position(15, 31, 15)] {
+            let above = center.y == 31;
+            set(&mut world, center, torch_id);
+            let old = world.clone();
+            relight_changes_in_bounds(&mut world, &[(center, add)], bounds).unwrap();
+            let outside_y = if above { 32 } else { -1 };
+            assert_eq!(world.light(center.x, outside_y, center.z, false), Some(13));
+            assert_eq!(old.light(center.x, outside_y, center.z, false), None);
+            let chunk = &world.chunks[&center.chunk()];
+            assert!(
+                chunk.sections[&i8::try_from(outside_y.div_euclid(16)).unwrap()]
+                    .blocks
+                    .is_none()
+            );
+            set(&mut world, center, air_id);
+            relight_changes_in_bounds(&mut world, &[(center, remove)], bounds).unwrap();
+            assert_eq!(world.light(center.x, outside_y, center.z, false), Some(0));
+        }
+        assert!(LightBounds::new(1, 32).is_none());
+        assert!(LightBounds::new(0, 31).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn build_height_padding_matches_vanilla_light_engine() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BlockLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BlockLightEngineOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actions = [
+            (0, "torch", false),
+            (31, "torch", false),
+            (0, "air", false),
+            (31, "air", false),
+            (0, "torch", true),
+            (31, "torch", false),
+            (0, "air", true),
+            (31, "air", false),
+        ];
+        let entries: Vec<_> = actions.iter().map(|(y,state,defer)| serde_json::json!({"x":15,"y":y,"z":15,"state":state,"defer":defer})).collect();
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(&input, serde_json::to_vec(&serde_json::json!({"min_y":0,"height":32,"sample_min_y":-15,"sample_height":62,"initial":[],"actions":entries})).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BlockLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 6);
+        let (mut world, _, _, _) = fixture();
+        let air = world.intern_state(state("air", None));
+        let torch = world.intern_state(state("torch", None));
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut pending = Vec::new();
+        let mut expected = expected.into_iter();
+        for (y, name, defer) in actions {
+            let p = position(15, y, 15);
+            let id = if name == "torch" { torch } else { air };
+            let change = light_change(
+                world.block(p.x, p.y, p.z).unwrap(),
+                world.state(id).unwrap(),
+            )
+            .unwrap();
+            set(&mut world, p, id);
+            pending.push((p, change));
+            if defer {
+                continue;
+            }
+            relight_changes_in_bounds(&mut world, &pending, bounds).unwrap();
+            pending.clear();
+            let expected = expected.next().unwrap();
+            assert_eq!(expected.len(), 62 * 31 * 31);
+            for y in -15..47 {
+                for z in 0..31 {
+                    for x in 0..31 {
+                        let index = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                        assert_eq!(
+                            world.light(x, y, z, false).unwrap_or(0),
+                            expected[index],
+                            "after {name} at {p:?}, checking {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(expected.next().is_none());
     }
 
     #[test]

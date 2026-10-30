@@ -4396,7 +4396,19 @@ impl LoadedSession {
             .iter()
             .map(|&position| (position, self.pending_light[&position].change))
             .collect();
-        match native_world::block_light::relight_changes(Arc::make_mut(&mut self.world), &changes) {
+        let bounds =
+            native_world::block_light::LightBounds::new(self.bounds.min_y, self.bounds.max_y);
+        let result = match bounds {
+            Some(bounds) => native_world::block_light::relight_changes_in_bounds(
+                Arc::make_mut(&mut self.world),
+                &changes,
+                bounds,
+            ),
+            None => {
+                native_world::block_light::relight_changes(Arc::make_mut(&mut self.world), &changes)
+            }
+        };
+        match result {
             Some(changed) => {
                 for position in group {
                     self.pending_light.remove(&position);
@@ -8148,6 +8160,65 @@ mod tests {
         assert!(session.set(b, air));
         session.update(TICK);
         assert!(session.pending_light.is_empty());
+    }
+
+    #[test]
+    fn session_updates_block_light_at_both_build_height_limits() {
+        let mut session = session();
+        let air = session.states[0];
+        let origin_chunk = BlockPosition {
+            x: session.origin.x,
+            y: 0,
+            z: session.origin.z,
+        }
+        .chunk();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let pos = ChunkPos {
+                    x: origin_chunk.x + x,
+                    z: origin_chunk.z + z,
+                };
+                let sections = (0..=1)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let torch = session.intern_block(state("minecraft:torch", &[]));
+        for y in [0, 31] {
+            let relative = IVec3::new(15, y, 15);
+            let absolute = session.origin + relative;
+            let outside = if y == 0 { -1 } else { 32 };
+            assert!(session.set(relative, torch));
+            assert!(session.pending_light.is_empty());
+            assert_eq!(
+                session.world.light(absolute.x, outside, absolute.z, false),
+                Some(13)
+            );
+            assert!(session.set(relative, air));
+            assert_eq!(
+                session.world.light(absolute.x, outside, absolute.z, false),
+                Some(0)
+            );
+        }
     }
 
     #[test]

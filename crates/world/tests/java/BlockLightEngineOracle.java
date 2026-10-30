@@ -20,8 +20,10 @@ import net.minecraft.world.level.material.FluidState;
 // A small in-memory block world; propagation itself is performed by Java 26.3.
 public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
     private final Map<BlockPos, BlockState> blocks = new HashMap<>();
-    public int getHeight() { return 64; }
-    public int getMinY() { return -16; }
+    private int height = 64;
+    private int minY = -16;
+    public int getHeight() { return height; }
+    public int getMinY() { return minY; }
     public LightChunk getChunkForLighting(int x, int z) { return this; }
     public BlockGetter getLevel() { return this; }
     public BlockEntity getBlockEntity(BlockPos p) { return null; }
@@ -64,6 +66,10 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var input = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
         var world = new BlockLightEngineOracle();
+        if (input.has("min_y")) world.minY = input.get("min_y").getAsInt();
+        if (input.has("height")) world.height = input.get("height").getAsInt();
+        int sampleMinY = input.has("sample_min_y") ? input.get("sample_min_y").getAsInt() : 0;
+        int sampleHeight = input.has("sample_height") ? input.get("sample_height").getAsInt() : 31;
         var engine = new LevelLightEngine(world, true, false);
         for (int x = -1; x <= 2; x++) for (int z = -1; z <= 2; z++) {
             for (int y = -1; y <= 2; y++) engine.updateSectionStatus(SectionPos.of(x, y, z), false);
@@ -86,7 +92,7 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
             while (engine.hasLightWork()) engine.runLightUpdates();
             var grid = new JsonArray();
             var listener = engine.getLayerListener(LightLayer.BLOCK);
-            for (int y = 0; y < 31; y++) for (int z = 0; z < 31; z++) for (int x = 0; x < 31; x++)
+            for (int y = sampleMinY; y < sampleMinY + sampleHeight; y++) for (int z = 0; z < 31; z++) for (int x = 0; x < 31; x++)
                 grid.add(listener.getLightValue(new BlockPos(x, y, z)));
             results.add(grid);
         }

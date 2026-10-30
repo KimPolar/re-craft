@@ -112,17 +112,24 @@ struct OrbDamageState {
     invulnerable_time: i32,
 }
 
-struct SavedOrbMerge {
+struct OrbMerge {
     receiver: [i32; 4],
     donor: [i32; 4],
     receiver_position: DVec3,
     donor_position: DVec3,
 }
 
+struct OrbAwardMerge {
+    receiver: [i32; 4],
+    award_position: DVec3,
+    receiver_position: DVec3,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CreatedOrbRemovalCause {
     Pickup,
     Expired,
+    Merged,
 }
 
 struct RemovedCreatedOrb {
@@ -156,7 +163,8 @@ pub(crate) struct Orbs {
     damage_tags: Option<Arc<OxygenEnchantments>>,
     uncoordinated_lifecycle: bool,
     saved_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
-    saved_merges: Vec<SavedOrbMerge>,
+    merges: Vec<OrbMerge>,
+    award_merges: Vec<OrbAwardMerge>,
     removed_saved: Vec<Orb>,
     created_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
     removed_created: Vec<RemovedCreatedOrb>,
@@ -179,7 +187,8 @@ impl Default for Orbs {
             damage_tags: None,
             uncoordinated_lifecycle: false,
             saved_pickups: BTreeMap::new(),
-            saved_merges: Vec::new(),
+            merges: Vec::new(),
+            award_merges: Vec::new(),
             removed_saved: Vec::new(),
             created_pickups: BTreeMap::new(),
             removed_created: Vec::new(),
@@ -224,9 +233,13 @@ impl Orbs {
         for position in self.removed_saved.iter().map(|orb| orb.visual.position) {
             chunks.insert(orb_chunk(position)?);
         }
-        for merge in &self.saved_merges {
+        for merge in &self.merges {
             chunks.insert(orb_chunk(merge.receiver_position)?);
             chunks.insert(orb_chunk(merge.donor_position)?);
+        }
+        for merge in &self.award_merges {
+            chunks.insert(orb_chunk(merge.award_position)?);
+            chunks.insert(orb_chunk(merge.receiver_position)?);
         }
         chunks.extend(
             self.created_pickups
@@ -536,45 +549,71 @@ impl Orbs {
                 );
             }
         }
-        if !self.saved_merges.is_empty() {
-            let mut final_chunks = BTreeMap::new();
+        if !self.merges.is_empty() || !self.award_merges.is_empty() {
+            let mut anchors = BTreeMap::<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>::new();
             for orb in self.entities.iter().chain(&self.removed_saved) {
-                let uuid = orb
-                    .source
-                    .as_ref()
-                    .map(|source| crate::saved_item::optional_uuid(source, "UUID"))
-                    .transpose()?
-                    .flatten();
+                let uuid = orb_uuid(orb)?;
                 if let Some(uuid) = uuid {
+                    let mut chunks = BTreeSet::from([orb_chunk(orb.visual.position)?]);
+                    if let Some(created) = &orb.created {
+                        chunks.extend(created.visited.iter().copied());
+                        chunks.insert(orb_chunk(created.origin)?);
+                    } else {
+                        chunks.insert(
+                            *saved_uuids
+                                .get(&uuid)
+                                .context("orb source is unavailable")?,
+                        );
+                    }
+                    ensure!(anchors.insert(uuid, chunks).is_none(), "duplicate orb UUID");
+                }
+            }
+            for removed in &self.removed_created {
+                ensure!(
+                    anchors
+                        .insert(removed.uuid, removed.visited.clone())
+                        .is_none(),
+                    "duplicate orb UUID"
+                );
+            }
+            for merge in &self.merges {
+                let receiver = anchors
+                    .get(&merge.receiver)
+                    .context("orb merge receiver state is unavailable")?;
+                let donor = anchors
+                    .get(&merge.donor)
+                    .context("orb merge donor state is unavailable")?;
+                let receiver_chunk = orb_chunk(merge.receiver_position)?;
+                let donor_chunk = orb_chunk(merge.donor_position)?;
+                if !receiver.is_disjoint(positions)
+                    || !donor.is_disjoint(positions)
+                    || positions.contains(&receiver_chunk)
+                    || positions.contains(&donor_chunk)
+                {
                     ensure!(
-                        final_chunks
-                            .insert(uuid, orb_chunk(orb.visual.position)?)
-                            .is_none(),
-                        "duplicate orb UUID"
+                        receiver.is_subset(positions)
+                            && donor.is_subset(positions)
+                            && positions.contains(&receiver_chunk)
+                            && positions.contains(&donor_chunk),
+                        "orb merge requires all affected chunks"
                     );
                 }
             }
-            for merge in &self.saved_merges {
-                let affected = [
-                    *saved_uuids
-                        .get(&merge.receiver)
-                        .context("orb merge receiver source is unavailable")?,
-                    *saved_uuids
-                        .get(&merge.donor)
-                        .context("orb merge donor source is unavailable")?,
-                    *final_chunks
-                        .get(&merge.receiver)
-                        .context("orb merge receiver final state is unavailable")?,
-                    *final_chunks
-                        .get(&merge.donor)
-                        .context("orb merge donor final state is unavailable")?,
-                    orb_chunk(merge.receiver_position)?,
-                    orb_chunk(merge.donor_position)?,
-                ];
-                if affected.iter().any(|pos| positions.contains(pos)) {
+            for merge in &self.award_merges {
+                let receiver = anchors
+                    .get(&merge.receiver)
+                    .context("orb award receiver state is unavailable")?;
+                let award = orb_chunk(merge.award_position)?;
+                let receiver_chunk = orb_chunk(merge.receiver_position)?;
+                if !receiver.is_disjoint(positions)
+                    || positions.contains(&award)
+                    || positions.contains(&receiver_chunk)
+                {
                     ensure!(
-                        affected.iter().all(|pos| positions.contains(pos)),
-                        "orb merge requires all affected chunks"
+                        receiver.is_subset(positions)
+                            && positions.contains(&award)
+                            && positions.contains(&receiver_chunk),
+                        "orb award merge requires all affected chunks"
                     );
                 }
             }
@@ -654,8 +693,21 @@ impl Orbs {
                 position,
                 value,
                 &mut self.award_random,
+                |orb| {
+                    if let Some(uuid) = orb_uuid(orb).ok().flatten()
+                        && orb_chunk(position).is_ok()
+                        && orb_chunk(orb.visual.position).is_ok()
+                    {
+                        self.award_merges.push(OrbAwardMerge {
+                            receiver: uuid,
+                            award_position: position,
+                            receiver_position: orb.visual.position,
+                        });
+                    } else {
+                        self.uncoordinated_lifecycle = true;
+                    }
+                },
             ) {
-                self.uncoordinated_lifecycle = true;
                 continue;
             }
             // The Java constructor also consumes a random yaw before its
@@ -875,23 +927,41 @@ impl Orbs {
                     index,
                     candidates.as_deref(),
                     |receiver, donor| {
-                        let uuid = |orb: &Orb| {
-                            orb.source.as_ref().and_then(|source| {
-                                crate::saved_item::optional_uuid(source, "UUID")
-                                    .ok()
-                                    .flatten()
-                            })
-                        };
-                        if let Some((receiver_uuid, donor_uuid)) =
-                            uuid(receiver).zip(uuid(donor)).filter(|(a, b)| a != b)
+                        if let Some((receiver_uuid, donor_uuid)) = orb_uuid(receiver)
+                            .ok()
+                            .flatten()
+                            .zip(orb_uuid(donor).ok().flatten())
+                            .filter(|(a, b)| a != b)
                         {
-                            self.saved_merges.push(SavedOrbMerge {
-                                receiver: receiver_uuid,
-                                donor: donor_uuid,
-                                receiver_position: receiver.visual.position,
-                                donor_position: donor.visual.position,
-                            });
-                            self.removed_saved.push(donor.clone());
+                            let mut final_donor = donor.clone();
+                            if let Some(created) = &mut final_donor.created
+                                && !created.checked
+                            {
+                                let bounds = orb_bounds(donor.visual.position - origin.as_dvec3());
+                                let supported = !donor.save_unresolved
+                                    && donor.damage.fire_ticks == 0
+                                    && safe(bounds, DVec3::ZERO);
+                                created.verify(
+                                    donor.visual.position,
+                                    donor.visual.position,
+                                    supported,
+                                );
+                            }
+                            let before = self.removed_saved.len() + self.removed_created.len();
+                            record_removed_orb(
+                                &final_donor,
+                                CreatedOrbRemovalCause::Merged,
+                                &mut self.removed_saved,
+                                &mut self.removed_created,
+                            );
+                            if self.removed_saved.len() + self.removed_created.len() > before {
+                                self.merges.push(OrbMerge {
+                                    receiver: receiver_uuid,
+                                    donor: donor_uuid,
+                                    receiver_position: receiver.visual.position,
+                                    donor_position: donor.visual.position,
+                                });
+                            }
                         }
                     },
                 );
@@ -1143,6 +1213,18 @@ fn record_removed_orb(
     }
 }
 
+fn orb_uuid(orb: &Orb) -> anyhow::Result<Option<[i32; 4]>> {
+    anyhow::ensure!(
+        orb.source.is_none() || orb.created.is_none(),
+        "orb has conflicting identities"
+    );
+    if let Some(source) = &orb.source {
+        crate::saved_item::optional_uuid(source, "UUID")
+    } else {
+        Ok(orb.created.as_ref().and_then(|created| created.uuid))
+    }
+}
+
 fn orb_chunk(position: DVec3) -> anyhow::Result<native_world::loaded::ChunkPos> {
     anyhow::ensure!(
         position.is_finite()
@@ -1245,6 +1327,7 @@ fn try_merge_award(
     position: DVec3,
     value: i32,
     random: &mut LegacyRandom,
+    mut record: impl FnMut(&Orb),
 ) -> bool {
     let id = random.next_int_bound(40).expect("positive bound");
     let query = BoundingBox {
@@ -1273,6 +1356,7 @@ fn try_merge_award(
         })
         .map(|(index, _)| index);
     if let Some(index) = first {
+        record(&entities[index]);
         entities[index].count = entities[index].count.wrapping_add(1);
         entities[index].lifetime = 0;
         true
@@ -1793,6 +1877,260 @@ mod tests {
     }
 
     #[test]
+    fn merges_coordinate_saved_and_created_orbs_in_each_direction() {
+        use crate::saved_falling_block::{
+            EntityReplacement, draft_entity_chunks_with_created_orbs,
+        };
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use native_world::loaded::ChunkPos;
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let ids = [[1, 2, 3, 4], [5, 6, 7, 8]];
+        let positions = [DVec3::new(15.8, 5.0, 0.5), DVec3::new(16.2, 5.0, 0.5)];
+        for (first_saved, second_saved) in [(true, false), (false, true), (false, false)] {
+            let saved_flags = [first_saved, second_saved];
+            let mut orbs = Orbs::default();
+            let mut original = Vec::new();
+            let mut owners = BTreeMap::new();
+            for i in 0..2 {
+                let source = Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:experience_orb".into())),
+                    ("UUID".into(), Tag::IntArray(ids[i].to_vec())),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: TagType::Double,
+                            values: positions[i]
+                                .to_array()
+                                .into_iter()
+                                .map(Tag::Double)
+                                .collect(),
+                        },
+                    ),
+                    ("NoGravity".into(), Tag::Byte(1)),
+                    ("Value".into(), Tag::Short(7)),
+                    ("Count".into(), Tag::Int((i + 2) as i32)),
+                ]);
+                let mut orb = test_orb(1 + 40 * i as i32, positions[i], 7, 0, (i + 2) as i32);
+                orb.no_gravity = true;
+                if saved_flags[i] {
+                    orb.source = Some(Arc::new(source.clone()));
+                    owners.insert(ids[i], [left, right][i]);
+                    original.push(vec![source]);
+                } else {
+                    let mut created = CreatedOrb::new(positions[i], 45.0);
+                    created.uuid = Some(ids[i]);
+                    orb.created = Some(created);
+                    original.push(vec![]);
+                }
+                orbs.entities.push(orb);
+            }
+            let chunk = |pos: ChunkPos, entities: Vec<Tag>| NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Position".into(), Tag::IntArray(vec![pos.x, pos.z])),
+                    (
+                        "Entities".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: entities,
+                        },
+                    ),
+                ]),
+            };
+            let left_chunk = chunk(left, original.remove(0));
+            let right_chunk = chunk(right, original.remove(0));
+            let mut inventory = Arc::new(PlayerInventory::default());
+            let mut rng = LegacyRandom::new(0);
+            let mut xp = Experience::default();
+            let mut score = 0;
+            let mut tick = |orbs: &mut Orbs, player| {
+                orbs.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    player,
+                    PlayerPose::Standing,
+                    GameMode::Survival,
+                    true,
+                    &mut inventory,
+                    &mut rng,
+                    &mut xp,
+                    &mut score,
+                    |_| &[],
+                    |_| 0.6,
+                    |_| false,
+                    |_, _| (Default::default(), false),
+                    false,
+                    |_, _, _| Some(Vec::new()),
+                    |_, _| true,
+                )
+            };
+            tick(&mut orbs, DVec3::splat(100.0));
+            let group = BTreeSet::from([left, right]);
+            assert_eq!(
+                orbs.affected_orb_chunks(&owners).unwrap(),
+                group,
+                "{saved_flags:?}"
+            );
+            assert!(
+                orbs.validate_chunk_group(&BTreeSet::from([left]), &owners)
+                    .is_err()
+            );
+            assert_eq!(orbs.entities.len(), 1);
+            assert_eq!(orbs.entities[0].count, 5);
+            let saved = orbs.draft_saved(ids[0]).unwrap();
+            let removed = orbs.draft_removed(ids[1]).unwrap();
+            let replacements: Vec<_> = saved.iter().map(EntityReplacement::Orb).collect();
+            let removed: Vec<_> = removed.into_iter().collect();
+            let created = orbs.draft_created_in_chunks(&group).unwrap();
+            let drafts = draft_entity_chunks_with_created_orbs(
+                &BTreeMap::from([(left, Some(&left_chunk)), (right, Some(&right_chunk))]),
+                &replacements,
+                &[],
+                &removed,
+                &[],
+                &created,
+            )
+            .unwrap();
+            let Tag::List { values, .. } = drafts[&left].document().value.get("Entities").unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                crate::saved_orb::read(&values[0]).unwrap().unwrap().count,
+                5
+            );
+            let Tag::List { values, .. } = drafts[&right].document().value.get("Entities").unwrap()
+            else {
+                panic!()
+            };
+            assert!(values.is_empty());
+            for _ in 0..10 {
+                tick(&mut orbs, DVec3::new(15.8, 5.0, 0.5));
+            }
+            assert!(orbs.entities.is_empty());
+            assert_eq!(orbs.affected_orb_chunks(&owners).unwrap(), group);
+            drop(tick);
+            assert_eq!(xp.total, 35);
+        }
+    }
+
+    #[test]
+    fn award_merge_tracks_award_chunk_and_receiver_identity() {
+        use native_persistence::nbt::{Tag, TagType};
+        use native_world::loaded::ChunkPos;
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let uuid = [1, 2, 3, 4];
+        let position = DVec3::new(15.8, 5.0, 0.5);
+        for saved in [true, false] {
+            let mut orbs = Orbs::default();
+            let id = orbs.award_random.clone().next_int_bound(40).unwrap() + 40;
+            let mut orb = test_orb(id, position, 7, 20, 1);
+            orb.no_gravity = true;
+            let mut owners = BTreeMap::new();
+            if saved {
+                orb.source = Some(Arc::new(Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:experience_orb".into())),
+                    ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: TagType::Double,
+                            values: position.to_array().into_iter().map(Tag::Double).collect(),
+                        },
+                    ),
+                    ("NoGravity".into(), Tag::Byte(1)),
+                    ("Value".into(), Tag::Short(7)),
+                ])));
+                owners.insert(uuid, left);
+            } else {
+                let mut created = CreatedOrb::new(position, 0.0);
+                created.uuid = Some(uuid);
+                created.verify(position, position, true);
+                orb.created = Some(created);
+            }
+            orbs.entities.push(orb);
+            orbs.award(DVec3::new(16.1, 5.0, 0.5), 7);
+            assert_eq!(orbs.entities.len(), 1);
+            assert_eq!((orbs.entities[0].count, orbs.entities[0].lifetime), (2, 0));
+            let all = BTreeSet::from([left, right]);
+            assert_eq!(orbs.affected_orb_chunks(&owners).unwrap(), all);
+            for pos in [left, right] {
+                assert!(
+                    orbs.validate_chunk_group(&BTreeSet::from([pos]), &owners)
+                        .is_err()
+                );
+            }
+            if saved {
+                assert_eq!(
+                    crate::saved_orb::read(
+                        &orbs.draft_saved(uuid).unwrap().unwrap().document().value
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .count,
+                    2
+                );
+            } else {
+                assert_eq!(
+                    crate::saved_orb::read(
+                        &orbs.draft_created_in_chunks(&all).unwrap()[0]
+                            .document()
+                            .value
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .count,
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_created_merge_and_unknown_award_remain_uncoordinated() {
+        let mut orbs = Orbs::default();
+        let position = DVec3::new(2.0, 5.0, 2.0);
+        let mut receiver = test_orb(1, position, 7, 0, 1);
+        let mut receiver_id = CreatedOrb::new(position, 0.0);
+        receiver_id.uuid = Some([1, 2, 3, 4]);
+        receiver.created = Some(receiver_id);
+        let mut donor = test_orb(41, position + DVec3::X * 0.2, 7, 0, 1);
+        let mut donor_id = CreatedOrb::new(donor.visual.position, 0.0);
+        donor_id.uuid = Some([5, 6, 7, 8]);
+        donor.created = Some(donor_id);
+        orbs.entities = vec![receiver, donor];
+        orbs.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            true,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(0),
+            &mut Experience::default(),
+            &mut 0,
+            |_| &[],
+            |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| false,
+        );
+        assert_eq!(orbs.entities.len(), 1);
+        assert!(orbs.affected_orb_chunks(&BTreeMap::new()).is_err());
+        let mut unknown = Orbs::default();
+        let id = unknown.award_random.clone().next_int_bound(40).unwrap() + 40;
+        unknown.entities.push(test_orb(id, position, 7, 0, 1));
+        unknown.award(position, 7);
+        assert!(unknown.affected_orb_chunks(&BTreeMap::new()).is_err());
+        unknown.entities.clear();
+        assert!(unknown.affected_orb_chunks(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
     fn newly_awarded_orb_remains_uncoordinated_even_if_no_longer_live() {
         let mut orbs = Orbs::default();
         orbs.award(DVec3::ZERO, 1);
@@ -2300,7 +2638,8 @@ mod tests {
             &None,
             DVec3::new(16.0, 4.0, 0.0),
             7,
-            &mut random
+            &mut random,
+            |_| {}
         ));
         assert_eq!((orbs[0].count, orbs[0].lifetime), (1, 100));
         assert_eq!((orbs[1].count, orbs[1].lifetime), (4, 0));
@@ -2395,7 +2734,7 @@ mod tests {
                             "value":orb.visual.value, "age":orb.lifetime, "count":orb.count})
                             })
                             .collect();
-                        let merged = try_merge_award(&mut orbs, &None, p, 7, &mut rng);
+                        let merged = try_merge_award(&mut orbs, &None, p, 7, &mut rng, |_| {});
                         expected.push((
                             merged,
                             rng.next_int(),

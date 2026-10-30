@@ -15335,6 +15335,85 @@ mod tests {
     }
 
     #[test]
+    fn created_orb_absorbing_saved_orb_is_drafted_by_session() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        let home = session.player_chunk().unwrap();
+        let base = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        let entities: Vec<_> = (0..40)
+            .map(|i| {
+                let pos = base
+                    + if i == 0 {
+                        DVec3::ZERO
+                    } else {
+                        DVec3::new(0.0, 20.0 + f64::from(i) * 2.0, 0.0)
+                    };
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:experience_orb".into())),
+                    ("UUID".into(), Tag::IntArray(vec![i + 1, 2, 3, 4])),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: TagType::Double,
+                            values: pos.to_array().into_iter().map(Tag::Double).collect(),
+                        },
+                    ),
+                    ("NoGravity".into(), Tag::Byte(1)),
+                    ("Value".into(), Tag::Short(7)),
+                ])
+            })
+            .collect();
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: entities,
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::clone(&document),
+                })),
+            )
+            .unwrap();
+        session.update(TICK);
+        session.experience_orbs.award(base, 7);
+        session.update(TICK);
+        let drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(values.len(), 40);
+        assert!(
+            values
+                .iter()
+                .all(|entity| entity.get("UUID") != Some(&Tag::IntArray(vec![1, 2, 3, 4])))
+        );
+        let merged: Vec<_> = values
+            .iter()
+            .filter_map(|value| crate::saved_orb::read(value).unwrap())
+            .filter(|orb| orb.count == 2)
+            .collect();
+        assert_eq!(merged.len(), 1);
+        assert!(drafts[&home].matches_source(&document).unwrap());
+    }
+
+    #[test]
     fn entity_source_survives_clean_terrain_eviction_and_failed_reload() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let mut session = session();

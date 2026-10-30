@@ -751,6 +751,10 @@ impl Viewer {
         if let (Some(renderer), Some(play), Some(snapshot)) =
             (&mut self.renderer, &self.play, &render_snapshot)
         {
+            renderer.set_chest_lids(
+                Arc::clone(&snapshot.chest_lids),
+                play.session.partial_tick(),
+            );
             renderer.set_fov_modifier(snapshot.camera.fov_modifier(play.session.partial_tick()));
             renderer.set_camera_bob(&snapshot.camera, play.session.partial_tick());
             if let Err(error) = renderer.update_experience_orbs(
@@ -1726,6 +1730,7 @@ mod tests {
                                         Arc::new(crate::preview::ChunkMesh {
                                             opaque: opaque.into(),
                                             translucent: translucent.into(),
+                                            chest_lids: Arc::from([]),
                                         }),
                                     )
                                 })
@@ -1908,6 +1913,41 @@ mod tests {
                                 .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
                                 .unwrap();
                             assert!(chunked != without_item, "the dropped item must be visible");
+                            let before_lid = renderer.preview_upload_counts();
+                            renderer.set_chest_lids(
+                                Arc::from([native_session::chest_lid::ChestLidVisual {
+                                    position: glam::IVec3::new(7, 4, 8),
+                                    previous: 1.0,
+                                    current: 1.0,
+                                }]),
+                                0.5,
+                            );
+                            renderer
+                                .render_preview(&mut self.scene, eye, Vec3::NEG_Z, 30, None, &[])
+                                .unwrap();
+                            let opened = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert!(
+                                opened != without_item,
+                                "opening a chest must change rendered pixels"
+                            );
+                            assert_eq!(
+                                renderer.preview_upload_counts(),
+                                before_lid,
+                                "lid animation must not reupload a whole chunk"
+                            );
+                            renderer.set_chest_lids(Arc::from([]), 0.0);
+                            renderer
+                                .render_preview(&mut self.scene, eye, Vec3::NEG_Z, 30, None, &[])
+                                .unwrap();
+                            let closed = renderer
+                                .preview_readback(&self.scene, eye, Vec3::NEG_Z, true)
+                                .unwrap();
+                            assert_eq!(
+                                closed, without_item,
+                                "closing must restore the exact original mesh"
+                            );
                         }
                     }
                     if result.revision == 2 {
@@ -2061,12 +2101,21 @@ mod tests {
             name: "minecraft:water".into(),
             properties: BTreeMap::from([("level".into(), "0".into())]),
         });
+        let chest = world.intern_state(BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        });
         for x in -1..=1 {
             for z in -1..=1 {
                 let mut blocks = Box::new([air; BLOCK_COUNT]);
                 blocks[8 + 8 * 16] = stone;
                 if x == 0 && z == 0 {
                     blocks[2 + 2 * 16 + 256] = water;
+                    blocks[7 + 8 * 16 + 4 * 256] = chest;
                 }
                 let pos = ChunkPos { x, z };
                 world.chunks.insert(
@@ -2144,6 +2193,7 @@ mod tests {
             sprinting: previous.sprinting,
             selected_block: previous.selected_block,
             inventory: Arc::clone(&previous.inventory),
+            chest_lids: Arc::clone(&previous.chest_lids),
             first_person: previous.first_person.clone(),
             breaking: previous.breaking,
             dropped_items: Arc::clone(&previous.dropped_items),

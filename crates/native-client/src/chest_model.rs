@@ -302,7 +302,7 @@ mod tests {
             .arg("ChestModelOracle")
             .arg(&output));
         let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         let mut index = 0;
         for kind in ["single", "left", "right"] {
             for facing in ["south", "north", "west", "east"] {
@@ -345,5 +345,77 @@ mod tests {
         }
         assert_eq!(index, rows.len());
         assert_eq!(index, 192);
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("ChestModelOracle")
+            .arg(&output)
+            .arg("animated"));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let mut index = 0;
+        for openness in [0.0_f32, 0.1, 0.25, 0.5, 0.75, 1.0] {
+            for kind in ["single", "left", "right"] {
+                for facing in ["south", "north", "west", "east"] {
+                    let baked = bake(&state(kind, facing)).unwrap().unwrap();
+                    let quads = &baked.groups[0][0].model.quads;
+                    let body_faces = if kind == "single" { 6 } else { 5 };
+                    let base: Vec<crate::mesh::Vertex> = quads[body_faces..]
+                        .iter()
+                        .flat_map(|quad| quad.vertices)
+                        .map(|vertex| crate::mesh::Vertex {
+                            position: vertex.position,
+                            uv: vertex.uv,
+                            shade: 1.0,
+                            tint: [1.0; 3],
+                            light: 0,
+                        })
+                        .collect();
+                    let lid = crate::preview::ChestLidMesh {
+                        position: glam::IVec3::ZERO,
+                        local_origin: glam::Vec3::ZERO,
+                        facing: facing.into(),
+                        start: 0,
+                        end: base.len(),
+                    };
+                    let visual = native_session::chest_lid::ChestLidVisual {
+                        position: glam::IVec3::ZERO,
+                        previous: openness,
+                        current: openness,
+                    };
+                    let animated = lid.animated_vertices(&base, visual.angle(0.5));
+                    for face in 0..quads.len() {
+                        let row = &rows[index];
+                        index += 1;
+                        assert_eq!(row["kind"], kind);
+                        assert_eq!(row["facing"], facing);
+                        if face < body_faces {
+                            continue;
+                        }
+                        for (vertex, expected) in animated
+                            [(face - body_faces) * 4..(face - body_faces + 1) * 4]
+                            .iter()
+                            .zip(row["vertices"].as_array().unwrap())
+                        {
+                            for (actual, expected) in vertex
+                                .position
+                                .into_iter()
+                                .chain(vertex.uv)
+                                .zip(expected.as_array().unwrap())
+                            {
+                                assert!(
+                                    (f64::from(actual) - expected.as_f64().unwrap()).abs()
+                                        < 0.000002,
+                                    "animated {openness} {kind} {facing} {row}: {:?}",
+                                    vertex.position
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(index, 1152);
+        assert_eq!(index, rows.len());
     }
 }

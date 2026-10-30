@@ -160,6 +160,47 @@ struct PreviewMaterials {
 pub struct ChunkMesh {
     pub opaque: Arc<[Vertex]>,
     pub translucent: Arc<[TransparentQuad]>,
+    pub chest_lids: Arc<[ChestLidMesh]>,
+}
+
+#[derive(Clone)]
+pub struct ChestLidMesh {
+    pub position: IVec3,
+    pub local_origin: Vec3,
+    pub facing: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ChestLidMesh {
+    pub fn animated_vertices(&self, base: &[Vertex], angle: f32) -> Vec<Vertex> {
+        let mut vertices = base[self.start..self.end].to_vec();
+        if angle == 0.0 {
+            return vertices;
+        }
+        let (sin, cos) = angle.sin_cos();
+        for vertex in &mut vertices {
+            let point = Vec3::from_array(vertex.position) - self.local_origin;
+            let (x, z) = match self.facing.as_str() {
+                "north" => (1.0 - point.x, 1.0 - point.z),
+                "west" => (point.z, 1.0 - point.x),
+                "east" => (1.0 - point.z, point.x),
+                _ => (point.x, point.z),
+            };
+            let y = point.y - 9.0 / 16.0;
+            let z = z - 1.0 / 16.0;
+            let next_y = y * cos - z * sin + 9.0 / 16.0;
+            let next_z = y * sin + z * cos + 1.0 / 16.0;
+            let (x, z) = match self.facing.as_str() {
+                "north" => (1.0 - x, 1.0 - next_z),
+                "west" => (1.0 - next_z, x),
+                "east" => (next_z, 1.0 - x),
+                _ => (x, next_z),
+            };
+            vertex.position = (self.local_origin + Vec3::new(x, next_y, z)).to_array();
+        }
+        vertices
+    }
 }
 
 impl ChunkMesh {
@@ -387,6 +428,7 @@ impl PreviewMaterials {
         } = self;
         let mut opaque = Vec::new();
         let mut translucent = Vec::new();
+        let mut chest_lids = Vec::new();
         let base_x = chunk
             .position
             .x
@@ -502,8 +544,22 @@ impl PreviewMaterials {
                             position.x, position.y, position.z,
                         ))?;
                 for (group, selected) in block.baked.groups.iter().zip(selections) {
-                    let model = &group.get(selected).context("invalid selected model")?.model;
-                    for quad in &model.quads {
+                    let weighted = group.get(selected).context("invalid selected model")?;
+                    let model = &weighted.model;
+                    let chest_model = weighted.choice.model.namespace == "native"
+                        && weighted.choice.model.path == "entity/chest";
+                    let body_faces = if state.properties.get("type").is_some_and(|v| v == "single")
+                    {
+                        6
+                    } else {
+                        5
+                    };
+                    let mut lid_start = None;
+                    let mut lid_translucent = false;
+                    for (quad_index, quad) in model.quads.iter().enumerate() {
+                        if chest_model && quad_index == body_faces {
+                            lid_start = Some(opaque.len());
+                        }
                         if let Some(face) = quad.cullface {
                             let offset = direction_offset(face);
                             if let Some(neighbor) = checked_add(position, offset)
@@ -551,6 +607,9 @@ impl PreviewMaterials {
                         let transparent = quad.texture.force_translucent
                             || atlas.transparency(&quad.texture.sprite)
                                 == Some(Transparency::Translucent);
+                        if chest_model && quad_index >= body_faces && transparent {
+                            lid_translucent = true;
+                        }
                         if transparent {
                             let center = vertices.iter().fold(Vec3::ZERO, |sum, vertex| {
                                 sum + Vec3::from_array(vertex.position)
@@ -564,12 +623,26 @@ impl PreviewMaterials {
                             "chunk exceeds the {MAX_VERTICES_PER_CHUNK} vertex rendering limit"
                         );
                     }
+                    if chest_model
+                        && !lid_translucent
+                        && let (Some(start), Some(facing)) =
+                            (lid_start, state.properties.get("facing"))
+                    {
+                        chest_lids.push(ChestLidMesh {
+                            position,
+                            local_origin: relative_position(position, origin),
+                            facing: facing.clone(),
+                            start,
+                            end: opaque.len(),
+                        });
+                    }
                 }
             }
         }
         Ok(ChunkMesh {
             opaque: opaque.into(),
             translucent: translucent.into(),
+            chest_lids: chest_lids.into(),
         })
     }
 }
@@ -1347,6 +1420,24 @@ mod tests {
         assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
         assert_eq!(scene.opaque_len(), 2 * 18 * 6);
         assert_eq!(scene.translucent_len(), 0);
+        let mesh = &scene.chunks[&pos];
+        assert_eq!(mesh.chest_lids.len(), 2);
+        for lid in mesh.chest_lids.iter() {
+            assert_eq!(lid.end - lid.start, 12 * 6);
+            let closed = lid.animated_vertices(&mesh.opaque, 0.0);
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&closed),
+                bytemuck::cast_slice::<Vertex, u8>(&mesh.opaque[lid.start..lid.end])
+            );
+            let opened = lid.animated_vertices(&mesh.opaque, -std::f32::consts::FRAC_PI_2);
+            assert!(
+                opened
+                    .iter()
+                    .zip(&closed)
+                    .any(|(a, b)| a.position != b.position)
+            );
+            assert!(opened.iter().zip(&closed).all(|(a, b)| a.uv == b.uv));
+        }
         for name in ["normal", "trapped"] {
             let id = ResourceId::parse(&format!("minecraft:entity/chest/{name}")).unwrap();
             let rect = scene.atlas.rectangle(&id).unwrap();
@@ -1730,6 +1821,7 @@ mod tests {
         let mesh = Arc::new(ChunkMesh {
             opaque: vec![vertex; 10_000].into(),
             translucent: Arc::from([]),
+            chest_lids: Arc::from([]),
         });
         for cached in cache.chunks.values_mut() {
             cached.mesh = Arc::clone(&mesh);

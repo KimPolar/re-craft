@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -87,6 +87,8 @@ struct PreviewChunkGpu {
     buffer: Option<wgpu::Buffer>,
     capacity: usize,
     count: u32,
+    chest_lids: Arc<[crate::preview::ChestLidMesh]>,
+    animated_lids: BTreeMap<(i32, i32, i32), u32>,
 }
 
 impl Default for PreviewChunkGpu {
@@ -97,6 +99,8 @@ impl Default for PreviewChunkGpu {
             buffer: None,
             capacity: 0,
             count: 0,
+            chest_lids: Arc::from([]),
+            animated_lids: BTreeMap::new(),
         }
     }
 }
@@ -134,6 +138,7 @@ impl PreviewChunkGpu {
         let mut uploaded = false;
         let mut draw_changed = false;
         if opaque_changed {
+            self.animated_lids.clear();
             let previous_count = self.count;
             self.count = u32::try_from(mesh.opaque.len()).context("too many chunk vertices")?;
             draw_changed = previous_count != self.count;
@@ -172,6 +177,7 @@ impl PreviewChunkGpu {
         if transparent_changed {
             self.translucent = Arc::clone(&mesh.translucent);
         }
+        self.chest_lids = Arc::clone(&mesh.chest_lids);
         Ok((uploaded, transparent_changed, draw_changed))
     }
 }
@@ -251,6 +257,9 @@ pub struct Renderer {
     preview_uploaded: bool,
     preview_mode: bool,
     preview_chunks: BTreeMap<ChunkPos, PreviewChunkGpu>,
+    chest_visuals: Arc<[native_session::chest_lid::ChestLidVisual]>,
+    chest_partial: f32,
+    animated_chest_chunks: BTreeSet<ChunkPos>,
     preview_bundle: Option<wgpu::RenderBundle>,
     preview_bundle_dirty: bool,
     translucent_eye: Option<Vec3>,
@@ -1221,6 +1230,9 @@ impl Renderer {
             preview_uploaded: false,
             preview_mode: false,
             preview_chunks: BTreeMap::new(),
+            chest_visuals: Arc::from([]),
+            chest_partial: 0.0,
+            animated_chest_chunks: BTreeSet::new(),
             preview_bundle: None,
             preview_bundle_dirty: true,
             translucent_eye: None,
@@ -1597,6 +1609,7 @@ impl Renderer {
             self.sync_preview_chunks(scene)?;
             self.preview_uploaded = true;
         }
+        self.update_chest_lids()?;
         if scene.atlas.needs_update(tick) {
             Arc::make_mut(&mut scene.atlas).update(tick);
             let atlas = &scene.atlas.texture;
@@ -1679,6 +1692,88 @@ impl Renderer {
         }
         self.prepare_fallback_items(dropped_items, scene.origin)?;
         self.render_frame(eye, direction)
+    }
+
+    pub fn set_chest_lids(
+        &mut self,
+        lids: Arc<[native_session::chest_lid::ChestLidVisual]>,
+        partial: f32,
+    ) {
+        self.chest_visuals = lids;
+        self.chest_partial = partial;
+    }
+
+    fn update_chest_lids(&mut self) -> Result<()> {
+        let mut targets: BTreeMap<ChunkPos, BTreeMap<(i32, i32, i32), f32>> = BTreeMap::new();
+        for lid in self.chest_visuals.iter().copied() {
+            let angle = lid.angle(self.chest_partial);
+            if angle == 0.0 {
+                continue;
+            }
+            let p = lid.position;
+            targets
+                .entry(ChunkPos {
+                    x: p.x.div_euclid(16),
+                    z: p.z.div_euclid(16),
+                })
+                .or_default()
+                .insert((p.x, p.y, p.z), angle);
+        }
+        let affected: BTreeSet<_> = self
+            .animated_chest_chunks
+            .iter()
+            .copied()
+            .chain(targets.keys().copied())
+            .collect();
+        self.animated_chest_chunks.clear();
+        for position in affected {
+            let Some(chunk) = self.preview_chunks.get_mut(&position) else {
+                continue;
+            };
+            let target = targets.get(&position);
+            let keys: BTreeSet<_> = chunk
+                .animated_lids
+                .keys()
+                .copied()
+                .chain(target.into_iter().flat_map(|values| values.keys().copied()))
+                .collect();
+            for key in keys {
+                let angle = target
+                    .and_then(|values| values.get(&key))
+                    .copied()
+                    .unwrap_or(0.0);
+                if chunk.animated_lids.get(&key).copied() == Some(angle.to_bits()) {
+                    continue;
+                }
+                let Some(lid) = chunk
+                    .chest_lids
+                    .iter()
+                    .find(|lid| (lid.position.x, lid.position.y, lid.position.z) == key)
+                else {
+                    chunk.animated_lids.remove(&key);
+                    continue;
+                };
+                let Some(buffer) = &chunk.buffer else {
+                    continue;
+                };
+                let vertices = lid.animated_vertices(&chunk.opaque, angle);
+                let offset = lid
+                    .start
+                    .checked_mul(std::mem::size_of::<Vertex>())
+                    .context("chest vertex offset overflow")?;
+                self.queue
+                    .write_buffer(buffer, offset as u64, bytemuck::cast_slice(&vertices));
+                if angle == 0.0 {
+                    chunk.animated_lids.remove(&key);
+                } else {
+                    chunk.animated_lids.insert(key, angle.to_bits());
+                }
+            }
+            if !chunk.animated_lids.is_empty() {
+                self.animated_chest_chunks.insert(position);
+            }
+        }
+        Ok(())
     }
 
     fn sync_preview_chunks(&mut self, scene: &PreviewScene) -> Result<()> {

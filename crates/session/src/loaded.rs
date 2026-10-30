@@ -226,6 +226,7 @@ pub struct LoadedSession {
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
+    chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
     tick_dirty_chunks: BTreeSet<ChunkPos>,
     tick_chunks_needing_dirty: BTreeSet<ChunkPos>,
@@ -1622,6 +1623,7 @@ impl LoadedSession {
             sprinting: self.sprint.active,
             selected_block: self.selected,
             inventory: Arc::clone(&self.inventory),
+            chest_lids: self.chest_lids.snapshot(),
             first_person: self.first_person.clone(),
             breaking: None,
             dropped_items: self.dropped_items.snapshot(),
@@ -1688,6 +1690,7 @@ impl LoadedSession {
             sprinting: false,
             selected_block: Block::Grass,
             inventory: Arc::clone(&inventory),
+            chest_lids: Arc::from([]),
             first_person: crate::animation::FirstPersonState::default(),
             breaking: None,
             dropped_items: Arc::from([]),
@@ -1821,6 +1824,7 @@ impl LoadedSession {
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
+            chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
             tick_dirty_chunks: BTreeSet::new(),
             tick_chunks_needing_dirty: BTreeSet::new(),
@@ -7875,6 +7879,7 @@ impl GameSession for LoadedSession {
         while self.accumulated >= TICK && processed < MAX_TICKS_PER_UPDATE {
             self.accumulated -= TICK;
             self.advance_tick();
+            self.chest_lids.tick(self.inventory.menu());
             crate::collect_pickup_sounds(
                 &mut self.pickup_sounds,
                 &mut self.dropped_items,
@@ -7896,6 +7901,7 @@ impl GameSession for LoadedSession {
                 sprinting: self.sprint.active,
                 selected_block: self.selected,
                 inventory: Arc::clone(&self.inventory),
+                chest_lids: self.chest_lids.snapshot(),
                 first_person: self.first_person.clone(),
                 breaking: self.mining.progress(),
                 dropped_items: self.dropped_items.snapshot(),
@@ -11331,6 +11337,9 @@ mod tests {
                 other: None
             })
         );
+        assert_eq!(session.snapshot().chest_lids.len(), 1);
+        assert_eq!(session.snapshot().chest_lids[0].position, position);
+        assert_eq!(session.snapshot().chest_lids[0].current, 0.1);
         let old = session.snapshot();
         session.submit_command(PlayerCommand::InventoryQuickMove {
             slot: PlayerSlot::Chest(3),
@@ -11386,6 +11395,28 @@ mod tests {
                 .unwrap()
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn chest_lid_ticks_do_not_depend_on_frame_cadence() {
+        fn run(frame: Duration, frames_per_phase: usize) -> Vec<crate::chest_lid::ChestLidVisual> {
+            let (mut session, _, _, _) = saved_chest_fixture();
+            session.submit_command(PlayerCommand::Place);
+            for _ in 0..frames_per_phase {
+                session.update(frame);
+            }
+            let open = session.snapshot().chest_lids[0];
+            session.submit_command(PlayerCommand::ToggleInventory);
+            for _ in 0..frames_per_phase {
+                session.update(frame);
+            }
+            let closed = session.snapshot().chest_lids[0];
+            vec![open, closed]
+        }
+        assert_eq!(
+            run(Duration::from_millis(50), 8),
+            run(Duration::from_millis(10), 40)
         );
     }
 

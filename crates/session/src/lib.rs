@@ -18,6 +18,7 @@ use native_world::{Block, World};
 
 pub mod animation;
 pub mod camera;
+pub mod chest_lid;
 mod equipment_attributes;
 pub use equipment_attributes::ArmorValues;
 pub mod equippable;
@@ -349,6 +350,7 @@ pub struct WorldSnapshot {
     pub sprinting: bool,
     pub selected_block: Block,
     pub inventory: Arc<PlayerInventory>,
+    pub chest_lids: Arc<[chest_lid::ChestLidVisual]>,
     pub first_person: animation::FirstPersonState,
     pub breaking: Option<mining::BreakingProgress>,
     pub dropped_items: Arc<[items::DroppedItem]>,
@@ -465,6 +467,7 @@ impl LocalSession {
             sprinting: false,
             selected_block: Block::Grass,
             inventory: Arc::clone(&inventory),
+            chest_lids: Arc::from([]),
             first_person: animation::FirstPersonState::default(),
             breaking: None,
             dropped_items: Arc::from([]),
@@ -621,6 +624,7 @@ impl LocalSession {
             sprinting: self.sprint.active,
             selected_block: self.selected_block,
             inventory: Arc::clone(&self.inventory),
+            chest_lids: Arc::from([]),
             first_person: self.first_person.clone(),
             breaking: None,
             dropped_items: self.dropped_items.snapshot(),
@@ -1623,6 +1627,7 @@ impl GameSession for LocalSession {
                 sprinting: self.sprint.active,
                 selected_block: self.selected_block,
                 inventory: Arc::clone(&self.inventory),
+                chest_lids: Arc::from([]),
                 first_person: self.first_person.clone(),
                 breaking: self.mining.progress(),
                 dropped_items: self.dropped_items.snapshot(),

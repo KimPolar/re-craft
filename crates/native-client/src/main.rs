@@ -2269,15 +2269,11 @@ impl ApplicationHandler for App {
                     audio.set_listener(eye, yaw);
                     self.audio_listener = Some((eye, yaw));
                 }
-                for position in self.session.take_item_pickup_sounds() {
-                    audio.item_pickup(position);
-                }
-                for position in self.session.take_experience_pickup_sounds() {
-                    audio.experience_pickup(position);
+                for sound in self.session.take_pickup_sounds() {
+                    audio.play_pickup(sound);
                 }
             } else {
-                self.session.take_item_pickup_sounds();
-                self.session.take_experience_pickup_sounds();
+                self.session.take_pickup_sounds();
             }
             self.last_update = now;
             let size = window.inner_size();

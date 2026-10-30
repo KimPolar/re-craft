@@ -142,6 +142,12 @@ impl UiAudio {
     pub fn experience_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Experience);
     }
+    pub fn play_pickup(&self, event: native_session::PickupSound) {
+        match event {
+            native_session::PickupSound::Item(position) => self.item_pickup(position),
+            native_session::PickupSound::Experience(position) => self.experience_pickup(position),
+        }
+    }
     fn pickup(&self, position: glam::DVec3, kind: PickupSound) {
         let _ = self.audio.commands.try_send(Command::Pickup(
             Resources {
@@ -691,6 +697,22 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_pickup_commands_keep_session_order() {
+        let (audio, probe) = Audio::test_channel();
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        let a = glam::DVec3::new(1.0, 2.0, 3.0);
+        let b = glam::DVec3::new(4.0, 5.0, 6.0);
+        ui.play_pickup(native_session::PickupSound::Experience(a));
+        ui.play_pickup(native_session::PickupSound::Item(b));
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Pickup(_, position, PickupSound::Experience)) if position == a)
+        );
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Pickup(_, position, PickupSound::Item)) if position == b)
+        );
+        assert!(probe.receiver.try_recv().is_err());
+    }
     #[test]
     fn mixer_resamples_and_finishes_multiple_voices() {
         let clip = Arc::new(Clip {

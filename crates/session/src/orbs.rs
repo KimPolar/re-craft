@@ -138,8 +138,13 @@ impl Orbs {
         self.pickup_delay = 0;
     }
 
-    pub(crate) fn take_pickup_sounds(&mut self) -> Vec<DVec3> {
-        self.pickup_sounds.drain(..).collect()
+    pub(crate) fn drain_pickup_sounds(&mut self) -> impl Iterator<Item = DVec3> + '_ {
+        self.pickup_sounds.drain(..)
+    }
+
+    #[cfg(test)]
+    fn take_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.drain_pickup_sounds().collect()
     }
 
     pub fn set_damage_tags(&mut self, tags: Arc<OxygenEnchantments>) {

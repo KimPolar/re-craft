@@ -136,6 +136,7 @@ pub struct LoadedSession {
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
+    pickup_sounds: VecDeque<crate::PickupSound>,
     block_drops: bool,
     entity_drops: bool,
     game_mode: GameMode,
@@ -361,14 +362,9 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
-    /// Drain one-shot item pickup sounds after advancing the session.
-    pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
-        self.dropped_items.take_pickup_sounds()
-    }
-
-    /// Drain one-shot experience-orb pickup sounds after advancing the session.
-    pub fn take_experience_pickup_sounds(&mut self) -> Vec<DVec3> {
-        self.experience_orbs.take_pickup_sounds()
+    /// Drain one-shot pickup sounds in simulated order after updating.
+    pub fn take_pickup_sounds(&mut self) -> Vec<crate::PickupSound> {
+        self.pickup_sounds.drain(..).collect()
     }
     /// Restore health and food before play begins. World files remain untouched.
     pub fn set_player_vitals(&mut self, vitals: crate::survival::PlayerVitals) {
@@ -1600,6 +1596,7 @@ impl LoadedSession {
             vanilla_block_ids: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
+            pickup_sounds: VecDeque::new(),
             block_drops: true,
             entity_drops: true,
             game_mode: GameMode::default(),
@@ -7137,6 +7134,11 @@ impl GameSession for LoadedSession {
         while self.accumulated >= TICK && processed < MAX_TICKS_PER_UPDATE {
             self.accumulated -= TICK;
             self.advance_tick();
+            crate::collect_pickup_sounds(
+                &mut self.pickup_sounds,
+                &mut self.dropped_items,
+                &mut self.experience_orbs,
+            );
             processed += 1;
         }
         if processed > 0 {
@@ -11027,8 +11029,11 @@ mod tests {
             }
         }
         assert!(session.snapshot().dropped_items.is_empty());
-        assert_eq!(session.take_item_pickup_sounds().len(), 1);
-        assert!(session.take_item_pickup_sounds().is_empty());
+        assert!(matches!(
+            session.take_pickup_sounds().as_slice(),
+            [crate::PickupSound::Item(_)]
+        ));
+        assert!(session.take_pickup_sounds().is_empty());
         let group = BTreeSet::from([home]);
         assert_eq!(
             session.created_item_removal_effects(&group),
@@ -11088,6 +11093,74 @@ mod tests {
             session.draft_existing_entity_chunks(&group).is_err(),
             "a removed created UUID must not match any known saved entity"
         );
+    }
+
+    #[test]
+    fn loaded_pickup_sounds_keep_tick_order_across_frame_cadences() {
+        use native_persistence::nbt::Tag;
+        fn prepare() -> LoadedSession {
+            let mut session = session();
+            session.set_player_inventory(PlayerInventory::default());
+            let position =
+                session.origin.as_dvec3() + session.motion.position + DVec3::new(0.0, 0.5, 0.0);
+            session
+                .dropped_items
+                .spawn_saved(crate::saved_item::SavedItemState {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    pickup_delay: 2,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]))
+                        .unwrap(),
+                });
+            session
+                .experience_orbs
+                .spawn_saved(crate::saved_orb::SavedOrb {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    value: 1,
+                    count: 2,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                });
+            session
+        }
+        let mut batched = prepare();
+        let mut frequent = prepare();
+        batched.update(TICK * 3);
+        let batched_sounds = batched.take_pickup_sounds();
+        let mut frequent_sounds = Vec::new();
+        for _ in 0..3 {
+            frequent.update(TICK);
+            frequent_sounds.extend(frequent.take_pickup_sounds());
+        }
+        assert_eq!(batched_sounds, frequent_sounds);
+        assert!(matches!(
+            batched_sounds.as_slice(),
+            [
+                crate::PickupSound::Experience(_),
+                crate::PickupSound::Item(_),
+                crate::PickupSound::Experience(_)
+            ]
+        ));
+        assert!(batched.take_pickup_sounds().is_empty());
     }
 
     #[test]

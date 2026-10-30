@@ -64,6 +64,30 @@ pub trait GameSession {
     fn partial_tick(&self) -> f32;
 }
 
+/// Pickup sounds in the order in which this session simulated them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickupSound {
+    Item(DVec3),
+    Experience(DVec3),
+}
+
+fn collect_pickup_sounds(
+    queue: &mut VecDeque<PickupSound>,
+    items: &mut items::ItemEntities,
+    orbs: &mut orbs::Orbs,
+) {
+    for event in items
+        .drain_pickup_sounds()
+        .map(PickupSound::Item)
+        .chain(orbs.drain_pickup_sounds().map(PickupSound::Experience))
+    {
+        if queue.len() == 4096 {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
+}
+
 /// The saved Java game mode. Other mode-specific abilities remain incomplete.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GameMode {
@@ -373,6 +397,7 @@ pub struct LocalSession {
     soil_ticks: VecDeque<(u64, IVec3, SoilKind)>,
     dropped_items: items::ItemEntities,
     experience_orbs: orbs::Orbs,
+    pickup_sounds: VecDeque<PickupSound>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -405,14 +430,9 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
-    /// Drain one-shot item pickup sounds after advancing the session.
-    pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
-        self.dropped_items.take_pickup_sounds()
-    }
-
-    /// Drain one-shot experience-orb pickup sounds after advancing the session.
-    pub fn take_experience_pickup_sounds(&mut self) -> Vec<DVec3> {
-        self.experience_orbs.take_pickup_sounds()
+    /// Drain one-shot pickup sounds in simulated order after updating.
+    pub fn take_pickup_sounds(&mut self) -> Vec<PickupSound> {
+        self.pickup_sounds.drain(..).collect()
     }
     pub fn demo() -> Self {
         Self::new(World::demo())
@@ -473,6 +493,7 @@ impl LocalSession {
             soil_ticks: VecDeque::new(),
             dropped_items: items::ItemEntities::default(),
             experience_orbs: orbs::Orbs::default(),
+            pickup_sounds: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,
@@ -1579,6 +1600,11 @@ impl GameSession for LocalSession {
         while self.accumulated >= TICK && processed < MAX_TICKS_PER_UPDATE {
             self.accumulated -= TICK;
             self.advance_tick();
+            collect_pickup_sounds(
+                &mut self.pickup_sounds,
+                &mut self.dropped_items,
+                &mut self.experience_orbs,
+            );
             processed += 1;
         }
         if processed > 0 {
@@ -2065,6 +2091,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pickup_sounds_keep_tick_order_across_frame_cadences() {
+        use native_persistence::nbt::Tag;
+        fn prepare() -> LocalSession {
+            let mut session = LocalSession::demo();
+            let position = session.motion.position + DVec3::new(0.0, 0.5, 0.0);
+            session
+                .dropped_items
+                .spawn_saved(saved_item::SavedItemState {
+                    source: Arc::new(Tag::Compound(vec![])),
+                    uuid: None,
+                    position,
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    no_gravity: true,
+                    age: 0,
+                    pickup_delay: 2,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: inventory::ItemStack::new(
+                        "minecraft:stone".into(),
+                        1,
+                        64,
+                        Tag::Compound(vec![]),
+                    )
+                    .unwrap(),
+                });
+            session.experience_orbs.spawn_saved(saved_orb::SavedOrb {
+                source: Arc::new(Tag::Compound(vec![])),
+                uuid: None,
+                position,
+                velocity: DVec3::ZERO,
+                on_ground: false,
+                no_gravity: true,
+                age: 0,
+                value: 1,
+                count: 2,
+                health: 5,
+                fire_ticks: 0,
+                invulnerable: false,
+                invulnerable_time: 0,
+            });
+            session
+        }
+        let mut batched = prepare();
+        let mut frequent = prepare();
+        batched.update(TICK * 3);
+        let batched_sounds = batched.take_pickup_sounds();
+        let mut frequent_sounds = Vec::new();
+        for _ in 0..3 {
+            frequent.update(TICK);
+            frequent_sounds.extend(frequent.take_pickup_sounds());
+        }
+        assert_eq!(batched_sounds, frequent_sounds);
+        assert!(matches!(
+            batched_sounds.as_slice(),
+            [
+                PickupSound::Experience(_),
+                PickupSound::Item(_),
+                PickupSound::Experience(_)
+            ]
+        ));
+        assert!(batched.take_pickup_sounds().is_empty());
+    }
+
+    #[test]
     fn death_experience_is_recovered_after_respawn_at_different_frame_rates() {
         fn prepare() -> LocalSession {
             let mut session = LocalSession::demo();
@@ -2116,8 +2211,8 @@ mod tests {
         assert_eq!(first.experience, second.experience);
         assert_eq!(a.score, b.score);
         assert_eq!(dead.experience_orbs.len(), 4);
-        let sound_a = a.take_experience_pickup_sounds();
-        let sound_b = b.take_experience_pickup_sounds();
+        let sound_a = a.take_pickup_sounds();
+        let sound_b = b.take_pickup_sounds();
         assert_eq!(sound_a.len(), 4);
         assert_eq!(sound_a, sound_b);
     }

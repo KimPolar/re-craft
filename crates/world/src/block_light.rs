@@ -1,6 +1,6 @@
 //! Conservative block-light recomputation for redstone ore state changes.
 //!
-//! Only complete neighborhoods of known, full-cube/air states are accepted.
+//! Only complete neighborhoods of supported block states are accepted.
 //! Unknown states or light data leave the existing light arrays untouched.
 
 use crate::loaded::{BlockPosition, BlockState, ChunkPos, World};
@@ -19,6 +19,23 @@ const DIRECTIONS: [(i32, i32, i32); 6] = [
 ];
 
 fn properties(state: &BlockState) -> Option<(u8, u8)> {
+    let boolean = |name: &str| match state.properties.get(name)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    let facing = || {
+        matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+    };
+    let axis = || {
+        matches!(
+            state.properties.get("axis").map(String::as_str),
+            Some("x" | "y" | "z")
+        )
+    };
     let pair = match state.name.as_str() {
         "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
             if state.properties.is_empty() =>
@@ -35,6 +52,99 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             };
             (15, emission)
         }
+        "minecraft:torch" if state.properties.is_empty() => (0, 14),
+        "minecraft:soul_torch" if state.properties.is_empty() => (0, 10),
+        "minecraft:wall_torch" if state.properties.len() == 1 && facing() => (0, 14),
+        "minecraft:soul_wall_torch" if state.properties.len() == 1 && facing() => (0, 10),
+        "minecraft:redstone_torch" if state.properties.len() == 1 => {
+            (0, if boolean("lit")? { 7 } else { 0 })
+        }
+        "minecraft:redstone_wall_torch" if state.properties.len() == 2 && facing() => {
+            (0, if boolean("lit")? { 7 } else { 0 })
+        }
+        "minecraft:lantern" | "minecraft:soul_lantern" if state.properties.len() == 2 => {
+            boolean("hanging")?;
+            (
+                u8::from(boolean("waterlogged")?),
+                if state.name == "minecraft:lantern" {
+                    15
+                } else {
+                    10
+                },
+            )
+        }
+        "minecraft:water" | "minecraft:lava" if state.properties.len() == 1 => {
+            let level = state.properties.get("level")?;
+            let parsed: u8 = level.parse().ok()?;
+            if parsed > 15 || parsed.to_string() != *level {
+                return None;
+            }
+            (
+                1,
+                if state.name == "minecraft:lava" {
+                    15
+                } else {
+                    0
+                },
+            )
+        }
+        "minecraft:glass" | "minecraft:short_grass" | "minecraft:fern"
+            if state.properties.is_empty() =>
+        {
+            (0, 0)
+        }
+        "minecraft:glass_pane" if state.properties.len() == 5 => {
+            for direction in ["north", "south", "east", "west"] {
+                boolean(direction)?;
+            }
+            (u8::from(boolean("waterlogged")?), 0)
+        }
+        "minecraft:vine" if state.properties.len() == 5 => {
+            for direction in ["north", "south", "east", "west", "up"] {
+                boolean(direction)?;
+            }
+            (0, 0)
+        }
+        "minecraft:pointed_dripstone" if state.properties.len() == 3 => {
+            if !matches!(
+                state.properties.get("thickness").map(String::as_str),
+                Some("tip_merge" | "tip" | "frustum" | "middle" | "base")
+            ) || !matches!(
+                state
+                    .properties
+                    .get("vertical_direction")
+                    .map(String::as_str),
+                Some("up" | "down")
+            ) {
+                return None;
+            }
+            (u8::from(boolean("waterlogged")?), 0)
+        }
+        "minecraft:cobweb" if state.properties.is_empty() => (1, 0),
+        "minecraft:oak_leaves" if state.properties.len() == 3 => {
+            boolean("persistent")?;
+            boolean("waterlogged")?;
+            if !matches!(
+                state.properties.get("distance").map(String::as_str),
+                Some("1" | "2" | "3" | "4" | "5" | "6" | "7")
+            ) {
+                return None;
+            }
+            (1, 0)
+        }
+        "minecraft:oak_log" | "minecraft:basalt" if state.properties.len() == 1 && axis() => {
+            (15, 0)
+        }
+        "minecraft:grass_block" if state.properties.len() == 1 => {
+            boolean("snowy")?;
+            (15, 0)
+        }
+        "minecraft:glowstone" | "minecraft:sea_lantern" | "minecraft:shroomlight"
+            if state.properties.is_empty() =>
+        {
+            (15, 15)
+        }
+        "minecraft:magma_block" if state.properties.is_empty() => (15, 3),
         "minecraft:stone"
         | "minecraft:deepslate"
         | "minecraft:dirt"
@@ -56,6 +166,23 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:deepslate_lapis_ore"
         | "minecraft:emerald_ore"
         | "minecraft:deepslate_emerald_ore"
+        | "minecraft:gravel"
+        | "minecraft:sand"
+        | "minecraft:red_sand"
+        | "minecraft:bedrock"
+        | "minecraft:obsidian"
+        | "minecraft:netherrack"
+        | "minecraft:blackstone"
+        | "minecraft:nether_quartz_ore"
+        | "minecraft:nether_gold_ore"
+        | "minecraft:ancient_debris"
+        | "minecraft:tinted_glass"
+        | "minecraft:moss_block"
+        | "minecraft:clay"
+        | "minecraft:mud"
+        | "minecraft:calcite"
+        | "minecraft:dripstone_block"
+        | "minecraft:oak_planks"
             if state.properties.is_empty() =>
         {
             (15, 0)
@@ -257,7 +384,7 @@ mod tests {
         let (mut world, _, lit, _) = fixture();
         let center = position(15, 15, 15);
         set(&mut world, center, lit);
-        let unknown = world.intern_state(state("glass", None));
+        let unknown = world.intern_state(state("unknown_block", None));
         set(&mut world, position(14, 15, 15), unknown);
         let before = world.clone();
         assert!(relight_redstone(&mut world, center, false).is_none());
@@ -278,6 +405,280 @@ mod tests {
         relight_redstone(&mut world, center, true).unwrap();
         assert_eq!(light(&world, center), 0);
         assert_eq!(light(&world, position(16, 15, 15)), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn all_extended_light_states_match_vanilla() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BlockLightStatesOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BlockLightStatesOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let names = [
+            "torch",
+            "wall_torch",
+            "soul_torch",
+            "soul_wall_torch",
+            "redstone_torch",
+            "redstone_wall_torch",
+            "lantern",
+            "soul_lantern",
+            "glowstone",
+            "sea_lantern",
+            "shroomlight",
+            "glass",
+            "tinted_glass",
+            "glass_pane",
+            "water",
+            "lava",
+            "gravel",
+            "sand",
+            "red_sand",
+            "bedrock",
+            "obsidian",
+            "netherrack",
+            "basalt",
+            "blackstone",
+            "nether_quartz_ore",
+            "nether_gold_ore",
+            "ancient_debris",
+            "magma_block",
+            "grass_block",
+            "moss_block",
+            "clay",
+            "mud",
+            "calcite",
+            "dripstone_block",
+            "pointed_dripstone",
+            "short_grass",
+            "fern",
+            "vine",
+            "cobweb",
+            "oak_log",
+            "oak_planks",
+            "oak_leaves",
+        ];
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &input,
+            serde_json::to_vec(
+                &names
+                    .iter()
+                    .map(|n| format!("minecraft:{n}"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BlockLightStatesOracle")
+            .arg(&input)
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert!(rows.len() > names.len());
+        for row in rows {
+            let s = BlockState {
+                name: row["name"].as_str().unwrap().into(),
+                properties: row["properties"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap().into()))
+                    .collect(),
+            };
+            let (opacity, emission) =
+                properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
+            assert_eq!(row["opacity"], opacity, "{s:?}");
+            assert_eq!(row["emission"], emission, "{s:?}");
+            assert_eq!(row["shaped"], false, "{s:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn propagation_matches_vanilla_light_engine() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BlockLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BlockLightEngineOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let initial = [
+            (15, 15, 15, "unlit"),
+            (20, 15, 15, "unlit"),
+            (15, 16, 15, "stone"),
+            (16, 16, 15, "stone"),
+            (16, 15, 16, "stone"),
+            (16, 15, 15, "torch"),
+            (15, 15, 16, "water"),
+            (14, 15, 15, "wet_pane"),
+        ];
+        let actions = [
+            (20, 15, 15, "lit"),
+            (15, 15, 15, "lit"),
+            (15, 15, 15, "unlit"),
+            (15, 15, 15, "lit"),
+            (15, 15, 15, "air"),
+        ];
+        let json = |items: &[(i32, i32, i32, &str)]| {
+            items
+                .iter()
+                .map(|(x, y, z, state)| serde_json::json!({"x":x,"y":y,"z":z,"state":state}))
+                .collect::<Vec<_>>()
+        };
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &input,
+            serde_json::to_vec(
+                &serde_json::json!({"initial":json(&initial),"actions":json(&actions)}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BlockLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let (mut world, unlit, lit, stone) = fixture();
+        let air = world.intern_state(state("air", None));
+        let torch = world.intern_state(state("torch", None));
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: [("level".into(), "0".into())].into(),
+        });
+        let wet_pane = world.intern_state(BlockState {
+            name: "minecraft:glass_pane".into(),
+            properties: [
+                ("north".into(), "false".into()),
+                ("south".into(), "false".into()),
+                ("east".into(), "false".into()),
+                ("west".into(), "false".into()),
+                ("waterlogged".into(), "true".into()),
+            ]
+            .into(),
+        });
+        let id = |name: &str| match name {
+            "air" => air,
+            "stone" => stone,
+            "unlit" => unlit,
+            "lit" => lit,
+            "torch" => torch,
+            "water" => water,
+            "wet_pane" => wet_pane,
+            _ => unreachable!(),
+        };
+        for (x, y, z, name) in initial {
+            set(&mut world, position(x, y, z), id(name));
+        }
+        relight_redstone(&mut world, position(15, 15, 15), true).unwrap();
+        assert_eq!(expected.len(), actions.len());
+        for ((x, y, z, name), expected) in actions.into_iter().zip(expected) {
+            let p = position(x, y, z);
+            set(&mut world, p, id(name));
+            relight_redstone(&mut world, p, name == "air").unwrap();
+            assert_eq!(expected.len(), 31 * 31 * 31);
+            for y in 0..31 {
+                for z in 0..31 {
+                    for x in 0..31 {
+                        let index = (y * 31 * 31 + z * 31 + x) as usize;
+                        assert_eq!(
+                            light(&world, position(x, y, z)),
+                            expected[index],
+                            "after {name} at {p:?}, checking {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

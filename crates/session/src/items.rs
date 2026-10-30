@@ -1212,14 +1212,13 @@ impl ItemEntities {
             count: hand.map_or(0, ItemStack::count),
             enchantments: &enchantments,
         };
-        let drops =
-            match tables.drops_with_random(name, tool, Some(&mut || self.random.next_float())) {
-                Ok(drops) => drops,
-                Err(error) => {
-                    eprintln!("unsupported loot for {name}: {error:#}");
-                    return;
-                }
-            };
+        let drops = match tables.drops_with_random(name, tool, Some(&mut self.random)) {
+            Ok(drops) => drops,
+            Err(error) => {
+                eprintln!("unsupported loot for {name}: {error:#}");
+                return;
+            }
+        };
         self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops);
     }
 
@@ -1240,7 +1239,7 @@ impl ItemEntities {
             count: 0,
             enchantments: &[],
         };
-        match tables.drops_with_random(name, tool, Some(&mut || self.random.next_float())) {
+        match tables.drops_with_random(name, tool, Some(&mut self.random)) {
             Ok(drops) => self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops),
             Err(error) => eprintln!("unsupported loot for {name}: {error:#}"),
         }

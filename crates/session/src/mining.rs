@@ -31,6 +31,11 @@ pub enum Material {
     StoneBricks,
     StoneButton,
     Cobblestone,
+    /// Vanilla ore hardness and the minimum harvest tier: wood, stone or iron.
+    Ore {
+        deepslate: bool,
+        tier: u8,
+    },
     Wood,
     Planks,
     CraftingTable,
@@ -54,6 +59,42 @@ impl Material {
             "minecraft:stone_bricks" => Some(Self::StoneBricks),
             "minecraft:stone_button" => Some(Self::StoneButton),
             "minecraft:cobblestone" => Some(Self::Cobblestone),
+            "minecraft:coal_ore" | "minecraft:nether_gold_ore" | "minecraft:nether_quartz_ore" => {
+                Some(Self::Ore {
+                    deepslate: false,
+                    tier: 0,
+                })
+            }
+            "minecraft:iron_ore" | "minecraft:copper_ore" | "minecraft:lapis_ore" => {
+                Some(Self::Ore {
+                    deepslate: false,
+                    tier: 1,
+                })
+            }
+            "minecraft:gold_ore"
+            | "minecraft:diamond_ore"
+            | "minecraft:emerald_ore"
+            | "minecraft:redstone_ore" => Some(Self::Ore {
+                deepslate: false,
+                tier: 2,
+            }),
+            "minecraft:deepslate_coal_ore" => Some(Self::Ore {
+                deepslate: true,
+                tier: 0,
+            }),
+            "minecraft:deepslate_iron_ore"
+            | "minecraft:deepslate_copper_ore"
+            | "minecraft:deepslate_lapis_ore" => Some(Self::Ore {
+                deepslate: true,
+                tier: 1,
+            }),
+            "minecraft:deepslate_gold_ore"
+            | "minecraft:deepslate_diamond_ore"
+            | "minecraft:deepslate_emerald_ore"
+            | "minecraft:deepslate_redstone_ore" => Some(Self::Ore {
+                deepslate: true,
+                tier: 2,
+            }),
             "minecraft:crafting_table" => Some(Self::CraftingTable),
             "minecraft:bedrock"
             | "minecraft:moving_piston"
@@ -84,12 +125,22 @@ impl Material {
             Self::Stone | Self::StoneBricks => 1.5,
             Self::Planks | Self::Cobblestone | Self::Wood => 2.0,
             Self::CraftingTable => 2.5,
+            Self::Ore { deepslate, .. } => {
+                if deepslate {
+                    4.5
+                } else {
+                    3.0
+                }
+            }
             Self::Unbreakable => -1.0,
         }
     }
 
     pub fn needs_tool(self) -> bool {
-        matches!(self, Self::Stone | Self::StoneBricks | Self::Cobblestone)
+        matches!(
+            self,
+            Self::Stone | Self::StoneBricks | Self::Cobblestone | Self::Ore { .. }
+        )
     }
 }
 
@@ -181,7 +232,11 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
         ),
         "pickaxe" => matches!(
             material,
-            Material::Stone | Material::StoneBricks | Material::Cobblestone | Material::StoneButton
+            Material::Stone
+                | Material::StoneBricks
+                | Material::Cobblestone
+                | Material::StoneButton
+                | Material::Ore { .. }
         ),
         "axe" => matches!(
             material,
@@ -192,7 +247,20 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
     };
     Some(MiningProperties {
         speed: if effective { speed } else { 1.0 },
-        correct_for_drops: !material.needs_tool() || (kind == "pickaxe" && effective),
+        correct_for_drops: !material.needs_tool()
+            || (kind == "pickaxe"
+                && effective
+                && match material {
+                    Material::Ore { tier: required, .. } => {
+                        let harvest_tier = match tier {
+                            "wooden" | "golden" => 0,
+                            "stone" | "copper" => 1,
+                            _ => 2,
+                        };
+                        harvest_tier >= required
+                    }
+                    _ => true,
+                }),
         damage_per_block: if kind == "sword" { 2 } else { 1 },
         can_destroy_in_creative: kind != "sword",
     })

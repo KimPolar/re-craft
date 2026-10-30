@@ -17,6 +17,87 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn ore_loot_counts_and_random_stream_match_vanilla() {
+    use native_core::random::LegacyRandom;
+    use native_resources::{
+        loot::{BasicTool, BlockLootTables},
+        packs::{ResourceId, ResourceStack},
+    };
+    use serde_json::json;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let tables = BlockLootTables::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("OreLootOracle.java");
+    std::fs::write(&source, include_str!("java/OreLootOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let mut cases = Vec::new();
+    for seed in -50..50 {
+        for block in [
+            "coal_ore",
+            "iron_ore",
+            "diamond_ore",
+            "copper_ore",
+            "lapis_ore",
+            "redstone_ore",
+            "nether_gold_ore",
+        ] {
+            for level in [0, 1, 2, 3, 10, 255] {
+                for silk in [false, true] {
+                    cases.push(json!({"seed":seed,"block":block,"level":level,"silk":silk}));
+                }
+            }
+        }
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("OreLootOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases.len());
+    for (case, row) in cases.iter().zip(rows) {
+        let mut random = LegacyRandom::new(case["seed"].as_i64().unwrap());
+        let mut enchants = Vec::new();
+        let level = case["level"].as_u64().unwrap() as u32;
+        if level > 0 {
+            enchants.push((ResourceId::parse("minecraft:fortune").unwrap(), level));
+        }
+        if case["silk"].as_bool().unwrap() {
+            enchants.push((ResourceId::parse("minecraft:silk_touch").unwrap(), 1));
+        }
+        let tool = BasicTool {
+            item: Some("minecraft:iron_pickaxe"),
+            count: 1,
+            enchantments: &enchants,
+        };
+        let block = format!("minecraft:{}", case["block"].as_str().unwrap());
+        let drops = tables
+            .drops_with_random(&block, tool, Some(&mut random))
+            .unwrap();
+        assert_eq!(drops.len(), 1, "{case}");
+        assert_eq!(drops[0].count, row[0].as_u64().unwrap() as u32, "{case}");
+        assert_eq!(random.next_int(), row[1].as_i64().unwrap() as i32, "{case}");
+    }
+    eprintln!(
+        "Compared {} ore loot cases with Minecraft 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn enchanted_gravel_loot_conditions_match_vanilla() {
     use native_core::random::LegacyRandom;
     use native_resources::{
@@ -1341,6 +1422,91 @@ fn run(command: &mut Command) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn ore_mining_and_harvest_tiers_match_vanilla() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("ToolMiningOracle.java");
+    let result = temp.path().join("ore.json");
+    std::fs::write(&source, TOOL_ORACLE).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let ores = [
+        "coal_ore",
+        "deepslate_coal_ore",
+        "iron_ore",
+        "deepslate_iron_ore",
+        "copper_ore",
+        "deepslate_copper_ore",
+        "gold_ore",
+        "deepslate_gold_ore",
+        "diamond_ore",
+        "deepslate_diamond_ore",
+        "emerald_ore",
+        "deepslate_emerald_ore",
+        "lapis_ore",
+        "deepslate_lapis_ore",
+        "redstone_ore",
+        "deepslate_redstone_ore",
+        "nether_gold_ore",
+        "nether_quartz_ore",
+    ];
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ToolMiningOracle")
+        .arg(&result)
+        .arg(game.join("versions/26.3/26.3.jar"))
+        .args(ores));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+    let mut checked = 0;
+    for row in rows {
+        let name = row[1].as_str().unwrap();
+        if !ores.iter().any(|ore| name == format!("minecraft:{ore}")) {
+            continue;
+        }
+        let material = Material::from_block_name(name).unwrap();
+        let item =
+            ItemStack::new(row[0].as_str().unwrap().into(), 1, 1, Tag::Compound(vec![])).unwrap();
+        let properties = mining_properties(material, Some(&item)).unwrap();
+        assert_eq!(
+            properties.speed.to_bits(),
+            row[4].as_i64().unwrap() as i32 as u32,
+            "{row}"
+        );
+        assert_eq!(
+            properties.correct_for_drops,
+            row[5].as_bool().unwrap(),
+            "{row}"
+        );
+        assert_eq!(
+            tool_progress(
+                material,
+                Some(&item),
+                row[2].as_bool().unwrap(),
+                row[3].as_bool().unwrap()
+            )
+            .unwrap()
+            .to_bits(),
+            row[6].as_i64().unwrap() as i32 as u32,
+            "{row}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, ores.len() * 7 * 5 * 4);
+    eprintln!("Compared {checked} ore/tool cases with Minecraft 26.3");
 }
 
 #[test]

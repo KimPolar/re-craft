@@ -13818,6 +13818,113 @@ mod tests {
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn ore_mining_drops_fortune_and_silk_touch_items_with_harvest_tiers() {
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for (block, tool_id, enchantment, expected, min, max) in [
+            (
+                "diamond_ore",
+                "iron_pickaxe",
+                Some(("fortune", 3)),
+                Some("diamond"),
+                1,
+                4,
+            ),
+            (
+                "copper_ore",
+                "stone_pickaxe",
+                Some(("fortune", 3)),
+                Some("raw_copper"),
+                2,
+                20,
+            ),
+            (
+                "redstone_ore",
+                "iron_pickaxe",
+                Some(("fortune", 3)),
+                Some("redstone"),
+                4,
+                8,
+            ),
+            (
+                "deepslate_diamond_ore",
+                "iron_pickaxe",
+                Some(("silk_touch", 1)),
+                Some("deepslate_diamond_ore"),
+                1,
+                1,
+            ),
+            ("diamond_ore", "stone_pickaxe", None, None, 0, 0),
+        ] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            let components = match enchantment {
+                Some((name, level)) => Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![(
+                        format!("minecraft:{name}").as_str().into(),
+                        Tag::Int(level),
+                    )]),
+                )]),
+                None => Tag::Compound(vec![]),
+            };
+            let tool =
+                crate::inventory::ItemStack::new(format!("minecraft:{tool_id}"), 1, 1, components)
+                    .unwrap();
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Storage(0), Some(tool));
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&registry),
+                )
+                .unwrap();
+            let relative = IVec3::new(8, 2, 6);
+            let id = session.intern_block(state(&format!("minecraft:{block}"), &[]));
+            assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
+            assert!(session.set(relative, id));
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            for _ in 0..100 {
+                session.update(TICK);
+                if !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id)
+                {
+                    break;
+                }
+            }
+            assert!(
+                !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id),
+                "{block}"
+            );
+            let snapshot = session.snapshot();
+            if let Some(expected) = expected {
+                let stack = &snapshot
+                    .dropped_items
+                    .iter()
+                    .find(|drop| drop.stack.id() == format!("minecraft:{expected}"))
+                    .expect(block)
+                    .stack;
+                assert!(
+                    (min..=max).contains(&stack.count()),
+                    "{block}: {}",
+                    stack.count()
+                );
+                assert_eq!(stack.max_count(), Some(64), "{block}");
+            } else {
+                assert!(snapshot.dropped_items.is_empty(), "{block}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn loaded_enchanted_tools_apply_real_loot_and_durability() {
         use native_persistence::nbt::Tag;
         use native_resources::{loot::BlockLootTables, packs::ResourceStack};

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 15] = [
+const BASIC_BLOCKS: [&str; 33] = [
     "grass_block",
     "dirt",
     "sand",
@@ -26,7 +26,59 @@ const BASIC_BLOCKS: [&str; 15] = [
     "dirt_path",
     "farmland",
     "stone_button",
+    "coal_ore",
+    "deepslate_coal_ore",
+    "iron_ore",
+    "deepslate_iron_ore",
+    "copper_ore",
+    "deepslate_copper_ore",
+    "gold_ore",
+    "deepslate_gold_ore",
+    "diamond_ore",
+    "deepslate_diamond_ore",
+    "emerald_ore",
+    "deepslate_emerald_ore",
+    "lapis_ore",
+    "deepslate_lapis_ore",
+    "redstone_ore",
+    "deepslate_redstone_ore",
+    "nether_gold_ore",
+    "nether_quartz_ore",
 ];
+
+/// Loot functions consume both floating-point and bounded integer random values.
+pub trait LootRandom {
+    fn next_float(&mut self) -> f32;
+    fn next_int(&mut self, bound: i32) -> Option<i32>;
+}
+
+impl LootRandom for native_core::random::LegacyRandom {
+    fn next_float(&mut self) -> f32 {
+        self.next_float()
+    }
+    fn next_int(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+}
+
+impl LootRandom for native_core::random::XoroshiroRandom {
+    fn next_float(&mut self) -> f32 {
+        self.next_float()
+    }
+    fn next_int(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+}
+
+// Existing callers that only supply floats can still evaluate float-only tables.
+impl<F: FnMut() -> f32> LootRandom for F {
+    fn next_float(&mut self) -> f32 {
+        self()
+    }
+    fn next_int(&mut self, _: i32) -> Option<i32> {
+        None
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Drop {
@@ -71,11 +123,7 @@ pub struct BasicTool<'a> {
 }
 
 impl Condition {
-    fn test(
-        &self,
-        tool: BasicTool<'_>,
-        random: &mut Option<&mut dyn FnMut() -> f32>,
-    ) -> Result<bool> {
+    fn test(&self, tool: BasicTool<'_>, random: &mut Option<&mut dyn LootRandom>) -> Result<bool> {
         match self {
             Self::Always => Ok(true),
             Self::Tool(predicate) => {
@@ -140,7 +188,7 @@ impl Condition {
                 let random = random
                     .as_mut()
                     .context("random loot requires a random source")?;
-                Ok(random() < chance)
+                Ok(random.next_float() < chance)
             }
             Self::Unsupported(reason) => bail!("unsupported loot condition: {reason}"),
         }
@@ -156,6 +204,9 @@ struct Modifier {
 #[derive(Clone, Debug)]
 enum ModifierKind {
     SetCount(u32, bool),
+    UniformCount(i32, i32, bool),
+    OreDrops(ResourceId),
+    UniformBonus(ResourceId, i32),
     ExplosionDecay,
     Unsupported(String),
 }
@@ -165,7 +216,7 @@ impl Modifier {
         &self,
         drop: &mut Drop,
         tool: BasicTool<'_>,
-        random: &mut Option<&mut dyn FnMut() -> f32>,
+        random: &mut Option<&mut dyn LootRandom>,
     ) -> Result<()> {
         if !self.condition.test(tool, random)? {
             return Ok(());
@@ -177,6 +228,62 @@ impl Modifier {
                 } else {
                     *count
                 };
+            }
+            ModifierKind::UniformCount(min, max, add) => {
+                let count = if min >= max {
+                    *min
+                } else {
+                    let bound = max
+                        .checked_sub(*min)
+                        .and_then(|value| value.checked_add(1))
+                        .context("invalid uniform loot count")?;
+                    random
+                        .as_mut()
+                        .context("random loot requires a random source")?
+                        .next_int(bound)
+                        .context("loot random source does not support bounded integers")?
+                        + min
+                };
+                drop.count = if *add {
+                    drop.count.saturating_add(count.max(0) as u32)
+                } else {
+                    count.max(0) as u32
+                };
+            }
+            ModifierKind::OreDrops(enchantment) => {
+                let level = tool
+                    .enchantments
+                    .iter()
+                    .find(|(id, _)| id == enchantment)
+                    .map_or(0, |(_, level)| *level);
+                if level > 0 {
+                    let bound = i32::try_from(level)?
+                        .checked_add(2)
+                        .context("fortune level overflow")?;
+                    let n = random
+                        .as_mut()
+                        .context("random loot requires a random source")?
+                        .next_int(bound)
+                        .context("loot random source does not support bounded integers")?;
+                    drop.count = drop.count.saturating_mul((n - 1).max(0) as u32 + 1);
+                }
+            }
+            ModifierKind::UniformBonus(enchantment, multiplier) => {
+                let level = tool
+                    .enchantments
+                    .iter()
+                    .find(|(id, _)| id == enchantment)
+                    .map_or(0, |(_, level)| *level);
+                let bound = multiplier
+                    .checked_mul(i32::try_from(level)?)
+                    .and_then(|n| n.checked_add(1))
+                    .context("invalid uniform bonus")?;
+                let bonus = random
+                    .as_mut()
+                    .context("random loot requires a random source")?
+                    .next_int(bound)
+                    .context("loot random source does not support bounded integers")?;
+                drop.count = drop.count.saturating_add(bonus as u32);
             }
             // Normal player mining does not have an explosion radius.
             ModifierKind::ExplosionDecay => {}
@@ -207,7 +314,7 @@ impl Entry {
     fn expand(
         &self,
         tool: BasicTool<'_>,
-        random: &mut Option<&mut dyn FnMut() -> f32>,
+        random: &mut Option<&mut dyn LootRandom>,
     ) -> Result<Option<(u32, Option<Drop>)>> {
         if !self.condition.test(tool, random)? {
             return Ok(None);
@@ -355,7 +462,7 @@ impl BlockLootTables {
         &self,
         block: &str,
         tool: BasicTool<'_>,
-        random: Option<&mut dyn FnMut() -> f32>,
+        random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
         let block = ResourceId::parse(block)?;
         let id = ResourceId {
@@ -372,7 +479,7 @@ impl BlockLootTables {
     fn evaluate(
         table: &Table,
         tool: BasicTool<'_>,
-        mut random: Option<&mut dyn FnMut() -> f32>,
+        mut random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
         let mut drops = Vec::new();
         for pool in &table.pools {
@@ -542,8 +649,52 @@ fn parse_modifiers(
                             .transpose()?
                             .unwrap_or(false),
                     ),
-                    _ => ModifierKind::Unsupported("non-constant set_count".into()),
+                    _ => {
+                        let count = modifier.get("count").context("missing set_count value")?;
+                        if count.get("type").and_then(Value::as_str) == Some("minecraft:uniform") {
+                            let min = i32::try_from(
+                                count
+                                    .get("min")
+                                    .and_then(Value::as_i64)
+                                    .context("invalid uniform minimum")?,
+                            )?;
+                            let max = i32::try_from(
+                                count
+                                    .get("max")
+                                    .and_then(Value::as_i64)
+                                    .context("invalid uniform maximum")?,
+                            )?;
+                            let add = modifier
+                                .get("add")
+                                .map(|value| value.as_bool().context("invalid set_count add flag"))
+                                .transpose()?
+                                .unwrap_or(false);
+                            ModifierKind::UniformCount(min, max, add)
+                        } else {
+                            ModifierKind::Unsupported("non-constant set_count".into())
+                        }
+                    }
                 },
+                "minecraft:apply_bonus" => {
+                    let id = ResourceId::parse(
+                        modifier
+                            .get("enchantment")
+                            .and_then(Value::as_str)
+                            .context("missing bonus enchantment")?,
+                    )?;
+                    match modifier.get("formula").and_then(Value::as_str) {
+                        Some("minecraft:ore_drops") => ModifierKind::OreDrops(id),
+                        Some("minecraft:uniform_bonus_count") => {
+                            let multiplier = modifier
+                                .get("parameters")
+                                .and_then(|value| value.get("bonusMultiplier"))
+                                .and_then(Value::as_i64)
+                                .context("missing bonus multiplier")?;
+                            ModifierKind::UniformBonus(id, i32::try_from(multiplier)?)
+                        }
+                        _ => ModifierKind::Unsupported("unsupported apply_bonus formula".into()),
+                    }
+                }
                 "minecraft:explosion_decay" => ModifierKind::ExplosionDecay,
                 other => ModifierKind::Unsupported(other.into()),
             };

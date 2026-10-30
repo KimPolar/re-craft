@@ -2031,7 +2031,25 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:farmland"
         | "minecraft:stone"
         | "minecraft:stone_bricks"
-        | "minecraft:stone_button" => Some(64),
+        | "minecraft:stone_button"
+        | "minecraft:coal_ore"
+        | "minecraft:deepslate_coal_ore"
+        | "minecraft:iron_ore"
+        | "minecraft:deepslate_iron_ore"
+        | "minecraft:copper_ore"
+        | "minecraft:deepslate_copper_ore"
+        | "minecraft:gold_ore"
+        | "minecraft:deepslate_gold_ore"
+        | "minecraft:diamond_ore"
+        | "minecraft:deepslate_diamond_ore"
+        | "minecraft:emerald_ore"
+        | "minecraft:deepslate_emerald_ore"
+        | "minecraft:lapis_ore"
+        | "minecraft:deepslate_lapis_ore"
+        | "minecraft:redstone_ore"
+        | "minecraft:deepslate_redstone_ore"
+        | "minecraft:nether_gold_ore"
+        | "minecraft:nether_quartz_ore" => Some(64),
         _ => None,
     }
 }
@@ -2101,6 +2119,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "raw_copper",
     "iron_ingot",
     "gold_ingot",
+    "gold_nugget",
     "copper_ingot",
     "netherite_ingot",
     "netherite_scrap",

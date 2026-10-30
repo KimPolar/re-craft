@@ -8,6 +8,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 flate2.workspace = true
 lz4-java-wrc = "0.2"
+native-core = { path = "../core" }
 native-world = { path = "../world" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 base64 = "0.22"
 glam.workspace = true
-native-core = { path = "../core" }
 native-session = { path = "../session" }
 serde_json.workspace = true

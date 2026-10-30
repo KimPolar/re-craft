@@ -86,7 +86,7 @@ impl ChunkDraft {
         self.replace_block_ticks_inner(ticks, false)
     }
 
-    /// Replace supported falling-block, stone-button, and soil ticks.
+    /// Replace supported falling-block, button, lamp, and soil ticks.
     /// Other chunk data, including lighting and entities, remains unvalidated.
     pub fn replace_block_ticks(
         &mut self,
@@ -98,7 +98,7 @@ impl ChunkDraft {
     fn replace_block_ticks_inner(
         &mut self,
         ticks: &[native_world::loaded::SavedBlockTick],
-        include_buttons: bool,
+        include_simulated: bool,
     ) -> Result<()> {
         let supported = |name: &str| {
             matches!(
@@ -109,16 +109,17 @@ impl ChunkDraft {
                     | "red_sand"
                     | "minecraft:gravel"
                     | "gravel"
-            ) || (include_buttons
-                && matches!(
-                    name,
-                    "minecraft:stone_button"
-                        | "stone_button"
-                        | "minecraft:dirt_path"
-                        | "dirt_path"
-                        | "minecraft:farmland"
-                        | "farmland"
-                ))
+            ) || (include_simulated
+                && (native_core::button::Button::from_id(name).is_some()
+                    || matches!(
+                        name,
+                        "minecraft:redstone_lamp"
+                            | "redstone_lamp"
+                            | "minecraft:dirt_path"
+                            | "dirt_path"
+                            | "minecraft:farmland"
+                            | "farmland"
+                    )))
         };
         let source = crate::nbt::read(&self.source_nbt)?;
         if let Some(list) = unique_field(&source.value, "block_ticks")? {
@@ -689,6 +690,52 @@ mod tests {
         };
         assert!(draft.replace_falling_block_ticks(&[bad]).is_err());
         assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn all_simulated_button_and_lamp_ticks_round_trip_without_widening_falling_only() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let original = fixture(1, false);
+        let mut ticks = Vec::new();
+        for (index, button) in native_core::button::Button::ALL.into_iter().enumerate() {
+            for id in [button.id(), button.id().strip_prefix("minecraft:").unwrap()] {
+                ticks.push(native_world::loaded::SavedBlockTick {
+                    block: id.into(),
+                    position: [-16 + (index as i32 % 16), 64, 33],
+                    delay: index as i32 - 8,
+                    priority: index as i32 % 7 - 3,
+                });
+            }
+        }
+        for id in ["minecraft:redstone_lamp", "redstone_lamp"] {
+            ticks.push(native_world::loaded::SavedBlockTick {
+                block: id.into(),
+                position: [-1, 65, 33],
+                delay: 4,
+                priority: 0,
+            });
+        }
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        draft.replace_block_ticks(&ticks).unwrap();
+        let source = draft.document().clone();
+        let mut next = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        next.replace_block_ticks(&ticks).unwrap();
+        assert_eq!(
+            source.value.get("block_ticks"),
+            next.document().value.get("block_ticks")
+        );
+        let before = crate::nbt::write(next.document()).unwrap();
+        let mut unsupported = ticks.clone();
+        unsupported.push(native_world::loaded::SavedBlockTick {
+            block: "example:oak_button".into(),
+            position: [-1, 65, 33],
+            delay: 4,
+            priority: 0,
+        });
+        assert!(next.replace_block_ticks(&unsupported).is_err());
+        assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
+        assert!(next.replace_falling_block_ticks(&[]).is_err());
+        assert_eq!(crate::nbt::write(next.document()).unwrap(), before);
     }
 
     #[test]

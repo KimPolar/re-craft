@@ -18887,6 +18887,59 @@ mod tests {
     }
 
     #[test]
+    fn button_and_lamp_schedules_reach_combined_chunk_draft() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let original = fixture_chunk_document(home);
+        let ticks: Vec<_> = native_core::button::Button::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SavedBlockTick {
+                block: kind.id().into(),
+                position: (session.origin + IVec3::new(i as i32, 5, 8)).to_array(),
+                delay: i as i32 + 1,
+                priority: i as i32 % 7 - 3,
+            })
+            .chain(std::iter::once(SavedBlockTick {
+                block: "minecraft:redstone_lamp".into(),
+                position: (session.origin + IVec3::new(8, 6, 8)).to_array(),
+                delay: 4,
+                priority: 0,
+            }))
+            .collect();
+        let mut source = native_persistence::edit::draft_chunk_blocks(
+            &original,
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        source.replace_block_ticks(&ticks).unwrap();
+        let source = source.document().clone();
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, ticks.clone());
+        session.enqueue_saved_buttons(&ticks);
+        session.enqueue_saved_lamps(&ticks);
+        session.mark_tick_chunk_dirty(home.x * 16, home.z * 16);
+        let draft = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                home,
+                &source,
+                &test_heightmap_tags(),
+                |_| anyhow::bail!("tick-only draft must not rebuild heightmaps"),
+            )
+            .unwrap();
+        assert_eq!(
+            draft.document().value.get("block_ticks"),
+            source.value.get("block_ticks")
+        );
+        assert!(draft.matches_source(&source).unwrap());
+    }
+
+    #[test]
     fn mixed_block_tick_draft_keeps_saved_subtick_order() {
         let mut session = session();
         let home = session.player_chunk().unwrap();

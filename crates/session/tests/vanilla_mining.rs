@@ -646,12 +646,19 @@ public class SavedTickOrderOracle {
     var input=new DataInputStream(Files.newInputStream(Path.of(args[0])));
     var root=NbtIo.read((DataInput)input); input.close();
     var actual=SavedTick.codec(BuiltInRegistries.BLOCK.byNameCodec()).listOf().parse(NbtOps.INSTANCE,root.get("block_ticks")).getOrThrow();
-    if(actual.size()!=5 || actual.get(0).type()!=Blocks.GRAVEL || actual.get(0).delay()!=3 || actual.get(0).priority()!=TickPriority.HIGH || !actual.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
+    if(actual.size()!=21 || actual.get(0).type()!=Blocks.GRAVEL || actual.get(0).delay()!=3 || actual.get(0).priority()!=TickPriority.HIGH || !actual.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
        actual.get(1).type()!=Blocks.STONE_BUTTON || actual.get(1).delay()!=7 || actual.get(1).priority()!=TickPriority.NORMAL || !actual.get(1).pos().equals(new BlockPos(-14,-60,33)) ||
        actual.get(2).type()!=Blocks.SAND || actual.get(2).delay()!=-2 || actual.get(2).priority()!=TickPriority.NORMAL || !actual.get(2).pos().equals(new BlockPos(-14,-61,33)) ||
        actual.get(3).type()!=Blocks.DIRT_PATH || actual.get(3).delay()!=-3 || actual.get(3).priority()!=TickPriority.NORMAL || !actual.get(3).pos().equals(new BlockPos(-13,-61,33)) ||
        actual.get(4).type()!=Blocks.FARMLAND || actual.get(4).delay()!=5 || actual.get(4).priority()!=TickPriority.HIGH || !actual.get(4).pos().equals(new BlockPos(-12,-61,33)))
       throw new AssertionError("Rust NBT tick draft differs from Java codec");
+    var names = List.of("stone_button", "polished_blackstone_button", "oak_button", "spruce_button", "birch_button", "jungle_button", "acacia_button", "dark_oak_button", "pale_oak_button", "mangrove_button", "cherry_button", "bamboo_button", "crimson_button", "warped_button", "poplar_button", "redstone_lamp");
+    for (int i=0; i<names.size(); i++) {
+      var tick = actual.get(5+i);
+      var block = BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.withDefaultNamespace(names.get(i)));
+      if (tick.type()!=block || tick.delay()!=i-7 || tick.priority()!=TickPriority.NORMAL || !tick.pos().equals(new BlockPos(-16+i,60,34)))
+        throw new AssertionError("wrong saved tick " + names.get(i));
+    }
     var fluid=SavedTick.codec(BuiltInRegistries.FLUID.byNameCodec()).listOf().parse(NbtOps.INSTANCE,root.get("fluid_ticks")).getOrThrow();
     if(fluid.size()!=2 || fluid.get(0).type()!=Fluids.FLOWING_LAVA || fluid.get(0).delay()!=3 || fluid.get(0).priority()!=TickPriority.HIGH || !fluid.get(0).pos().equals(new BlockPos(-15,-60,33)) ||
        fluid.get(1).type()!=Fluids.WATER || fluid.get(1).delay()!=-2 || fluid.get(1).priority()!=TickPriority.NORMAL || !fluid.get(1).pos().equals(new BlockPos(-14,-61,33)))
@@ -677,40 +684,52 @@ public class SavedTickOrderOracle {
         &[],
     )
     .unwrap();
-    draft
-        .replace_block_ticks(&[
-            native_world::loaded::SavedBlockTick {
-                block: "minecraft:gravel".into(),
-                position: [-15, -60, 33],
-                delay: 3,
-                priority: -1,
-            },
-            native_world::loaded::SavedBlockTick {
-                block: "minecraft:stone_button".into(),
-                position: [-14, -60, 33],
-                delay: 7,
+    let mut block_ticks = vec![
+        native_world::loaded::SavedBlockTick {
+            block: "minecraft:gravel".into(),
+            position: [-15, -60, 33],
+            delay: 3,
+            priority: -1,
+        },
+        native_world::loaded::SavedBlockTick {
+            block: "minecraft:stone_button".into(),
+            position: [-14, -60, 33],
+            delay: 7,
+            priority: 0,
+        },
+        native_world::loaded::SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: [-14, -61, 33],
+            delay: -2,
+            priority: 0,
+        },
+        native_world::loaded::SavedBlockTick {
+            block: "minecraft:dirt_path".into(),
+            position: [-13, -61, 33],
+            delay: -3,
+            priority: 0,
+        },
+        native_world::loaded::SavedBlockTick {
+            block: "minecraft:farmland".into(),
+            position: [-12, -61, 33],
+            delay: 5,
+            priority: -1,
+        },
+    ];
+    block_ticks.extend(
+        native_core::button::Button::ALL
+            .into_iter()
+            .map(|button| button.id())
+            .chain(std::iter::once("minecraft:redstone_lamp"))
+            .enumerate()
+            .map(|(index, id)| native_world::loaded::SavedBlockTick {
+                block: id.into(),
+                position: [-16 + index as i32, 60, 34],
+                delay: index as i32 - 7,
                 priority: 0,
-            },
-            native_world::loaded::SavedBlockTick {
-                block: "minecraft:sand".into(),
-                position: [-14, -61, 33],
-                delay: -2,
-                priority: 0,
-            },
-            native_world::loaded::SavedBlockTick {
-                block: "minecraft:dirt_path".into(),
-                position: [-13, -61, 33],
-                delay: -3,
-                priority: 0,
-            },
-            native_world::loaded::SavedBlockTick {
-                block: "minecraft:farmland".into(),
-                position: [-12, -61, 33],
-                delay: 5,
-                priority: -1,
-            },
-        ])
-        .unwrap();
+            }),
+    );
+    draft.replace_block_ticks(&block_ticks).unwrap();
     draft
         .replace_fluid_ticks(&[
             native_world::loaded::SavedFluidTick {

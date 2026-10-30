@@ -2187,6 +2187,18 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             16
+        } else if name.matches("minecraft:enchantments")
+            && ordinary_item_default_durability(id).is_some()
+        {
+            // Efficiency has no durability side effects. Other enchantments,
+            // such as Unbreaking, need their own item-damage behavior first.
+            if !matches!(value, Tag::Compound(fields) if fields.len() == 1
+                && fields[0].0.matches("minecraft:efficiency")
+                && matches!(fields[0].1, Tag::Int(1..=255)))
+            {
+                return None;
+            }
+            32
         } else {
             return None;
         };
@@ -2384,6 +2396,37 @@ fn equal_tag(a: &Tag, b: &Tag) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn efficiency_tool_retains_enchantment_when_damaged() {
+        let components = Tag::Compound(vec![(
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("minecraft:efficiency".into(), Tag::Int(5))]),
+        )]);
+        assert_eq!(
+            saved_item_max("minecraft:iron_pickaxe", &components),
+            Some(1)
+        );
+        let tool =
+            ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, components.clone()).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(tool));
+        assert!(inventory.damage_selected_tool(1));
+        let after = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        assert_eq!(
+            after.components().get("minecraft:enchantments"),
+            components.get("minecraft:enchantments")
+        );
+        assert_eq!(
+            after.components().get("minecraft:damage"),
+            Some(&Tag::Int(1))
+        );
+        let unbreaking = Tag::Compound(vec![(
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("minecraft:unbreaking".into(), Tag::Int(1))]),
+        )]);
+        assert_eq!(saved_item_max("minecraft:iron_pickaxe", &unbreaking), None);
+    }
 
     #[test]
     fn pick_item_preserves_enchanted_slots_and_unresolved_items() {

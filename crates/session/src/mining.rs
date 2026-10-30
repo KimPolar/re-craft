@@ -118,6 +118,34 @@ pub struct MiningProperties {
     pub can_destroy_in_creative: bool,
 }
 
+/// Player attributes and effects used by Java's block destroy calculation.
+#[derive(Clone, Copy, Debug)]
+pub struct MiningContext {
+    pub on_ground: bool,
+    pub eyes_in_water: bool,
+    pub mining_efficiency: f64,
+    pub block_break_speed: f64,
+    pub submerged_mining_speed: f64,
+    pub haste: Option<u8>,
+    pub conduit_power: Option<u8>,
+    pub mining_fatigue: Option<u8>,
+}
+
+impl Default for MiningContext {
+    fn default() -> Self {
+        Self {
+            on_ground: true,
+            eyes_in_water: false,
+            mining_efficiency: 0.0,
+            block_break_speed: 1.0,
+            submerged_mining_speed: 0.2,
+            haste: None,
+            conduit_power: None,
+            mining_fatigue: None,
+        }
+    }
+}
+
 pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option<MiningProperties> {
     if basic_hand(item) {
         return Some(MiningProperties {
@@ -177,17 +205,27 @@ pub fn tool_progress(
     on_ground: bool,
     eyes_in_water: bool,
 ) -> Option<f32> {
+    tool_progress_with_context(
+        material,
+        item,
+        MiningContext {
+            on_ground,
+            eyes_in_water,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn tool_progress_with_context(
+    material: Material,
+    item: Option<&ItemStack>,
+    context: MiningContext,
+) -> Option<f32> {
     if material == Material::Unbreakable {
         return Some(0.0);
     }
     let properties = mining_properties(material, item)?;
-    let mut speed = properties.speed;
-    if eyes_in_water {
-        speed *= 0.2;
-    }
-    if !on_ground {
-        speed /= 5.0;
-    }
+    let speed = destroy_speed(properties.speed, context);
     Some(
         speed
             / material.hardness()
@@ -197,6 +235,27 @@ pub fn tool_progress(
                 100.0
             },
     )
+}
+
+pub fn destroy_speed(base_speed: f32, context: MiningContext) -> f32 {
+    let mut speed = base_speed;
+    if speed > 1.0 {
+        speed += context.mining_efficiency as f32;
+    }
+    if let Some(amplifier) = context.haste.into_iter().chain(context.conduit_power).max() {
+        speed *= 1.0_f32 + (f32::from(amplifier) + 1.0) * 0.2_f32;
+    }
+    if let Some(amplifier) = context.mining_fatigue {
+        speed *= 0.3_f64.powf(f64::from(amplifier) + 1.0) as f32;
+    }
+    speed *= context.block_break_speed as f32;
+    if context.eyes_in_water {
+        speed *= context.submerged_mining_speed as f32;
+    }
+    if !context.on_ground {
+        speed /= 5.0;
+    }
+    speed
 }
 
 /// Items with unresolved components may have tool, enchantment or mining overrides.
@@ -262,8 +321,18 @@ impl Mining {
         hand: Option<&ItemStack>,
         creative: bool,
     ) -> Option<IVec3> {
+        self.press_with_context(target, hand, creative, MiningContext::default())
+    }
+
+    pub fn press_with_context(
+        &mut self,
+        target: Option<Candidate>,
+        hand: Option<&ItemStack>,
+        creative: bool,
+        context: MiningContext,
+    ) -> Option<IVec3> {
         self.held = true;
-        let broken = self.begin(target, hand, creative);
+        let broken = self.begin(target, hand, creative, context);
         // A held, non-instant attack continues during this client tick.
         self.started_this_tick = broken.is_some();
         broken
@@ -274,6 +343,7 @@ impl Mining {
         target: Option<Candidate>,
         hand: Option<&ItemStack>,
         creative: bool,
+        context: MiningContext,
     ) -> Option<IVec3> {
         self.active = None;
         let target = target?;
@@ -298,6 +368,14 @@ impl Mining {
             self.cooldown = 5;
             return Some(target.position);
         }
+        if target
+            .material
+            .and_then(|material| tool_progress_with_context(material, hand, context))
+            .is_some_and(|progress| progress >= 1.0)
+        {
+            self.cooldown = 5;
+            return Some(target.position);
+        }
         self.active = Some(Active {
             candidate: target,
             hand: hand.cloned(),
@@ -313,6 +391,25 @@ impl Mining {
         creative: bool,
         on_ground: bool,
         eyes_in_water: bool,
+    ) -> Option<IVec3> {
+        self.tick_with_context(
+            target,
+            hand,
+            creative,
+            MiningContext {
+                on_ground,
+                eyes_in_water,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn tick_with_context(
+        &mut self,
+        target: Option<Candidate>,
+        hand: Option<&ItemStack>,
+        creative: bool,
+        context: MiningContext,
     ) -> Option<IVec3> {
         if !self.held {
             return None;
@@ -330,7 +427,7 @@ impl Mining {
             return None;
         }
         if creative {
-            return self.begin(target, hand, true);
+            return self.begin(target, hand, true, context);
         }
         if target.is_some_and(|target| target.material == Some(Material::Unbreakable)) {
             self.active = None;
@@ -345,21 +442,17 @@ impl Mining {
                 }
         });
         if !same {
-            return self.begin(target, hand, false);
+            return self.begin(target, hand, false, context);
         }
         let target = target.expect("same target has a candidate");
         if target.material.is_none() {
-            return self.begin(Some(target), hand, false);
+            return self.begin(Some(target), hand, false, context);
         }
         let active = self.active.as_mut().expect("same target has active state");
         active.candidate = target;
-        active.progress += tool_progress(
-            target.material.expect("known material"),
-            hand,
-            on_ground,
-            eyes_in_water,
-        )
-        .expect("active tool has supported mining properties");
+        active.progress +=
+            tool_progress_with_context(target.material.expect("known material"), hand, context)
+                .expect("active tool has supported mining properties");
         if active.progress >= 1.0 {
             let position = active.candidate.position;
             self.active = None;
@@ -389,6 +482,35 @@ mod tests {
             position,
             material: Some(material),
         }
+    }
+
+    #[test]
+    fn mining_context_enables_instant_break_and_respects_fatigue() {
+        let target = candidate(IVec3::ZERO, Material::Dirt);
+        let fast = MiningContext {
+            block_break_speed: 15.0,
+            ..Default::default()
+        };
+        let mut mining = Mining::default();
+        assert_eq!(
+            mining.press_with_context(Some(target), None, false, fast),
+            Some(IVec3::ZERO)
+        );
+        let fatigued = MiningContext {
+            mining_fatigue: Some(0),
+            ..fast
+        };
+        let mut mining = Mining::default();
+        assert_eq!(
+            mining.press_with_context(Some(target), None, false, fatigued),
+            None
+        );
+        assert!(
+            mining
+                .tick_with_context(Some(target), None, false, fatigued)
+                .is_none()
+        );
+        assert!(mining.progress().is_some());
     }
 
     #[test]

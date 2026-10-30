@@ -17,6 +17,90 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn mining_effects_and_attributes_match_vanilla() {
+    use native_session::mining::{MiningContext, destroy_speed, tool_progress_with_context};
+    use serde_json::json;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("MiningEffectsOracle.java");
+    std::fs::write(&source, include_str!("java/MiningEffectsOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let effects = [-1_i32, 0, 1, 2, 10, 255];
+    let mut cases = Vec::new();
+    for i in 0..2880 {
+        cases.push(json!({
+            "stone": i % 2 == 0, "tool": (i / 2) % 2 == 0,
+            "ground": (i / 4) % 2 == 0, "water": (i / 8) % 2 == 0,
+            "efficiency": ([-1.0, 0.0, 2.0, 25.0, 2000.0][(i / 16) % 5]),
+            "break_speed": ([-1.0, 0.5, 1.0, 3.0][(i / 80) % 4]),
+            "submerged": ([-1.0, 0.2, 1.0, 30.0][(i / 320) % 4]),
+            "haste": effects[(i / 3) % effects.len()],
+            "conduit": effects[(i / 11) % effects.len()],
+            "fatigue": effects[(i / 23) % effects.len()],
+        }));
+    }
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("MiningEffectsOracle")
+        .arg(&input)
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases.len());
+    for (i, (case, row)) in cases.iter().zip(&rows).enumerate() {
+        let material = if case["stone"].as_bool().unwrap() {
+            Material::Stone
+        } else {
+            Material::Dirt
+        };
+        let tool = case["tool"].as_bool().unwrap().then(|| {
+            ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![])).unwrap()
+        });
+        let status = |key: &str| case[key].as_i64().and_then(|v| u8::try_from(v).ok());
+        let context = MiningContext {
+            on_ground: case["ground"].as_bool().unwrap(),
+            eyes_in_water: case["water"].as_bool().unwrap(),
+            mining_efficiency: case["efficiency"].as_f64().unwrap().clamp(0.0, 1024.0),
+            block_break_speed: case["break_speed"].as_f64().unwrap().clamp(0.0, 1024.0),
+            submerged_mining_speed: case["submerged"].as_f64().unwrap().clamp(0.0, 20.0),
+            haste: status("haste"),
+            conduit_power: status("conduit"),
+            mining_fatigue: status("fatigue"),
+        };
+        let properties = mining_properties(material, tool.as_ref()).unwrap();
+        assert_eq!(
+            destroy_speed(properties.speed, context).to_bits(),
+            row[0].as_i64().unwrap() as i32 as u32,
+            "destroy speed case {i}: {case}"
+        );
+        assert_eq!(
+            tool_progress_with_context(material, tool.as_ref(), context)
+                .unwrap()
+                .to_bits(),
+            row[1].as_i64().unwrap() as i32 as u32,
+            "progress case {i}: {case}"
+        );
+    }
+    println!(
+        "Compared {} mining attribute/effect cases with Minecraft 26.3",
+        cases.len()
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn falling_block_render_origin_matches_java_pose_stack() {
     use native_session::falling_block::FallingBlockVisual;
     let game = std::env::var_os("MINECRAFT_DIR")

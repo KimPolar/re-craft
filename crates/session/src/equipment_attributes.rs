@@ -53,6 +53,36 @@ pub(crate) fn water_movement_efficiency(
     equipped_attribute(saved, inventory, enchantments, "water_movement_efficiency")?.value(0.0, 1.0)
 }
 
+pub(crate) fn mining_attributes(
+    saved: &crate::player_data::SavedMiningAttributes,
+    inventory: &PlayerInventory,
+    enchantments: &OxygenEnchantments,
+) -> Result<[f64; 3]> {
+    Ok([
+        equipped_attribute(
+            &saved.efficiency,
+            inventory,
+            enchantments,
+            "mining_efficiency",
+        )?
+        .value(0.0, 1024.0)?,
+        equipped_attribute(
+            &saved.block_break_speed,
+            inventory,
+            enchantments,
+            "block_break_speed",
+        )?
+        .value(0.0, 1024.0)?,
+        equipped_attribute(
+            &saved.submerged_speed,
+            inventory,
+            enchantments,
+            "submerged_mining_speed",
+        )?
+        .value(0.0, 20.0)?,
+    ])
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArmorValues {
     pub armor: f64,
@@ -461,6 +491,63 @@ mod tests {
             let expected = (f64::from(0.33333334_f32 * level as f32)).min(1.0);
             assert_eq!(actual, expected, "Depth Strider {level}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 assets"]
+    fn efficiency_and_aqua_affinity_use_installed_enchantment_data() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut resources).unwrap();
+        let enchantment = |name: &str, level| {
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![(name.into(), Tag::Int(level))]),
+            )])
+        };
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:iron_pickaxe".into(),
+                1,
+                1,
+                enchantment("minecraft:efficiency", 5),
+            ),
+        );
+        inventory.set_slot(
+            PlayerSlot::Armor(0),
+            ItemStack::unresolved(
+                "minecraft:iron_helmet".into(),
+                1,
+                enchantment("minecraft:aqua_affinity", 1),
+            ),
+        );
+        let values = mining_attributes(
+            &crate::player_data::SavedMiningAttributes::default(),
+            &inventory,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(values, [26.0, 1.0, 1.0]);
+        let tool = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        let context = crate::mining::MiningContext {
+            mining_efficiency: values[0],
+            submerged_mining_speed: values[2],
+            eyes_in_water: true,
+            ..Default::default()
+        };
+        let progress = crate::mining::tool_progress_with_context(
+            crate::mining::Material::Stone,
+            Some(tool),
+            context,
+        )
+        .unwrap();
+        assert_eq!(progress, 32.0_f32 / 1.5 / 30.0);
     }
 
     #[test]

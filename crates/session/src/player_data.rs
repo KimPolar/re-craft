@@ -259,6 +259,46 @@ pub fn read_saved_water_movement_efficiency_attribute(player: &NamedTag) -> Resu
     saved_attribute(player, "water_movement_efficiency", 0.0)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedMiningAttributes {
+    pub efficiency: SavedAttribute,
+    pub block_break_speed: SavedAttribute,
+    pub submerged_speed: SavedAttribute,
+}
+
+impl Default for SavedMiningAttributes {
+    fn default() -> Self {
+        Self {
+            efficiency: SavedAttribute::with_base(0.0),
+            block_break_speed: SavedAttribute::with_base(1.0),
+            submerged_speed: SavedAttribute::with_base(0.2),
+        }
+    }
+}
+
+impl SavedMiningAttributes {
+    pub(crate) fn values(&self) -> Result<[f64; 3]> {
+        Ok([
+            self.efficiency.value(0.0, 1024.0)?,
+            self.block_break_speed.value(0.0, 1024.0)?,
+            self.submerged_speed.value(0.0, 20.0)?,
+        ])
+    }
+    pub(crate) fn clear_modifiers(&mut self) {
+        self.efficiency.clear_modifiers();
+        self.block_break_speed.clear_modifiers();
+        self.submerged_speed.clear_modifiers();
+    }
+}
+
+pub fn read_saved_mining_attributes(player: &NamedTag) -> Result<SavedMiningAttributes> {
+    Ok(SavedMiningAttributes {
+        efficiency: saved_attribute(player, "mining_efficiency", 0.0)?,
+        block_break_speed: saved_attribute(player, "block_break_speed", 1.0)?,
+        submerged_speed: saved_attribute(player, "submerged_mining_speed", 0.2)?,
+    })
+}
+
 pub fn read_saved_no_gravity(player: &NamedTag) -> bool {
     player
         .value
@@ -351,6 +391,8 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "speed") => &mut effects.speed,
             ("minecraft", "slowness") => &mut effects.slowness,
             ("minecraft", "dolphins_grace") => &mut effects.dolphins_grace,
+            ("minecraft", "haste") => &mut effects.haste,
+            ("minecraft", "mining_fatigue") => &mut effects.mining_fatigue,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1926,6 +1968,10 @@ mod tests {
             ])
         };
         assert!(advance_saved_effects(&player(vec![effect("minecraft:weakness")]), 1).is_err());
+        // Both also change attack speed; do not write them until those changes are tracked.
+        for name in ["minecraft:haste", "minecraft:mining_fatigue"] {
+            assert!(advance_saved_effects(&player(vec![effect(name)]), 1).is_err());
+        }
         assert!(
             advance_saved_effects(
                 &player(vec![effect("minecraft:resistance"), effect("resistance")]),

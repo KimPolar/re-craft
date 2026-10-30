@@ -593,6 +593,9 @@ fn definition(value: &Value) -> Result<Definition> {
                     | "gravity"
                     | "jump_strength"
                     | "water_movement_efficiency"
+                    | "mining_efficiency"
+                    | "block_break_speed"
+                    | "submerged_mining_speed"
             )
         {
             continue;

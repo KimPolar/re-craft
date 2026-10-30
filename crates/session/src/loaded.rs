@@ -168,6 +168,9 @@ pub struct LoadedSession {
     water_efficiency_attribute: crate::player_data::SavedAttribute,
     water_efficiency_inventory_revision: Option<u64>,
     water_efficiency: Option<f64>,
+    mining_attributes: crate::player_data::SavedMiningAttributes,
+    mining_attribute_revision: Option<u64>,
+    mining_attribute_values: [f64; 3],
     movement_speed_attribute: crate::player_data::SavedAttribute,
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
@@ -256,6 +259,7 @@ struct EffectSaveTracking {
     movement_speed: crate::player_data::SavedAttribute,
     gravity: crate::player_data::SavedAttribute,
     water_efficiency: crate::player_data::SavedAttribute,
+    mining_attributes: crate::player_data::SavedMiningAttributes,
     ticks: u64,
 }
 
@@ -464,6 +468,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -496,6 +501,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -668,6 +674,72 @@ impl LoadedSession {
                     "player water movement efficiency equipment: {error:#}"
                 ));
             }
+        }
+    }
+
+    pub fn restore_saved_mining_attributes(
+        &mut self,
+        attributes: crate::player_data::SavedMiningAttributes,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "mining attributes must be restored before the first tick"
+        );
+        self.mining_attribute_values = attributes.values()?;
+        self.mining_attributes = attributes;
+        self.mining_attribute_revision = None;
+        Ok(())
+    }
+
+    fn refresh_mining_attributes(&mut self) {
+        let revision = self.inventory.revision();
+        if self.mining_attribute_revision == Some(revision) {
+            return;
+        }
+        self.mining_attribute_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::mining_attributes(
+            &self.mining_attributes,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(values) => self.mining_attribute_values = values,
+            Err(error) => {
+                self.mining_attribute_values = [0.0, 1.0, 0.2];
+                self.stream_errors
+                    .push(format!("player mining equipment: {error:#}"));
+            }
+        }
+    }
+
+    fn mining_context(&self) -> crate::mining::MiningContext {
+        crate::mining::MiningContext {
+            on_ground: self.player.on_ground,
+            eyes_in_water: self.previous_eye_in_water,
+            mining_efficiency: self.mining_attribute_values[0],
+            block_break_speed: self.mining_attribute_values[1],
+            submerged_mining_speed: self.mining_attribute_values[2],
+            haste: self
+                .fall
+                .effects()
+                .haste
+                .as_ref()
+                .map(|effect| effect.amplifier),
+            conduit_power: self
+                .breathing_effects
+                .conduit_power
+                .as_ref()
+                .map(|effect| effect.amplifier),
+            mining_fatigue: self
+                .fall
+                .effects()
+                .mining_fatigue
+                .as_ref()
+                .map(|effect| effect.amplifier),
         }
     }
 
@@ -927,6 +999,16 @@ impl LoadedSession {
             crate::player_data::read_saved_water_movement_efficiency_attribute(original)?
                 == *initial_water_efficiency,
             "saved water movement efficiency does not match the initial session state"
+        );
+        let initial_mining = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(&self.mining_attributes, |tracking| {
+                &tracking.mining_attributes
+            });
+        anyhow::ensure!(
+            crate::player_data::read_saved_mining_attributes(original)? == *initial_mining,
+            "saved mining attributes do not match the initial session state"
         );
         let effect_draft = if self.tick != 0 {
             anyhow::ensure!(
@@ -1342,6 +1424,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
@@ -1519,6 +1602,9 @@ impl LoadedSession {
             water_efficiency_attribute: crate::player_data::SavedAttribute::with_base(0.0),
             water_efficiency_inventory_revision: None,
             water_efficiency: Some(0.0),
+            mining_attributes: crate::player_data::SavedMiningAttributes::default(),
+            mining_attribute_revision: None,
+            mining_attribute_values: [0.0, 1.0, 0.2],
             movement_speed_attribute: crate::player_data::SavedAttribute::with_base(f64::from(
                 0.1_f32,
             )),
@@ -3100,6 +3186,9 @@ impl LoadedSession {
         self.water_efficiency_attribute.clear_modifiers();
         self.water_efficiency_inventory_revision = None;
         self.water_efficiency = self.water_efficiency_attribute.value(0.0, 1.0).ok();
+        self.mining_attributes.clear_modifiers();
+        self.mining_attribute_revision = None;
+        self.mining_attribute_values = self.mining_attributes.values().unwrap_or([0.0, 1.0, 0.2]);
         self.movement_speed_attribute.clear_modifiers();
         self.movement_speed_cache = None;
         self.fall.reset_after_death();
@@ -5659,13 +5748,16 @@ impl LoadedSession {
                 {
                     self.first_person.swing.start(crate::animation::Hand::Main);
                     let target = self.mining_target();
+                    let context = self.mining_context();
                     let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
                         self.inventory.selected(),
                     ));
-                    if let Some(position) =
-                        self.mining
-                            .press(target, hand, self.game_mode == GameMode::Creative)
-                    {
+                    if let Some(position) = self.mining.press_with_context(
+                        target,
+                        hand,
+                        self.game_mode == GameMode::Creative,
+                        context,
+                    ) {
                         self.finish_breaking(position);
                     }
                 }
@@ -5796,15 +5888,15 @@ impl LoadedSession {
             if target.is_some() {
                 self.first_person.swing.start(crate::animation::Hand::Main);
             }
+            let context = self.mining_context();
             let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
                 self.inventory.selected(),
             ));
-            if let Some(position) = self.mining.tick(
+            if let Some(position) = self.mining.tick_with_context(
                 target,
                 hand,
                 self.game_mode == GameMode::Creative,
-                self.player.on_ground,
-                self.previous_eye_in_water,
+                context,
             ) {
                 self.finish_breaking(position);
             }
@@ -5823,6 +5915,7 @@ impl LoadedSession {
         self.refresh_jump_strength();
         self.refresh_gravity();
         self.refresh_water_movement_efficiency();
+        self.refresh_mining_attributes();
         let friction = self.friction_below();
         let fluid_view = FluidView {
             world: &self.world,
@@ -5890,6 +5983,7 @@ impl LoadedSession {
                 movement_speed: self.movement_speed_attribute.clone(),
                 gravity: self.gravity_attribute.clone(),
                 water_efficiency: self.water_efficiency_attribute.clone(),
+                mining_attributes: self.mining_attributes.clone(),
                 ticks: 0,
             });
         tracking.ticks = tracking.ticks.saturating_add(1);
@@ -13568,6 +13662,46 @@ mod tests {
                 assert!((item.position.z - f64::from(absolute.z)).abs() < 1.0);
             }
         }
+    }
+
+    #[test]
+    fn loaded_mining_applies_haste_and_fatigue() {
+        fn ticks_to_break(haste: bool, fatigue: bool) -> usize {
+            let mut session = session();
+            let relative = IVec3::new(8, 2, 6);
+            let dirt = session.intern_block(state("minecraft:dirt", &[]));
+            assert!(session.set(relative + IVec3::NEG_Y, session.states[3]));
+            assert!(session.set(relative, dirt));
+            session.update(TICK * 3);
+            let effect = || crate::survival::EffectDuration {
+                amplifier: 0,
+                duration: 1000,
+                hidden: None,
+            };
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    haste: haste.then(effect),
+                    mining_fatigue: fatigue.then(effect),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session.submit_command(PlayerCommand::Break);
+            for tick in 1..=100 {
+                session.update(TICK);
+                if !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == dirt)
+                {
+                    return tick;
+                }
+            }
+            panic!("block was not broken")
+        }
+        let normal = ticks_to_break(false, false);
+        let fast = ticks_to_break(true, false);
+        let slow = ticks_to_break(false, true);
+        assert!(fast < normal && normal < slow, "{fast} < {normal} < {slow}");
     }
 
     #[test]

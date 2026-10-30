@@ -58,6 +58,7 @@ public class PhysicsOracle {
         double wall;
         int delay;
         AttributeInstance speed;
+        AttributeInstance jumpStrength;
         MobEffectInstance jumpBoost;
         TestPlayer() { super(null, null); }
         void setup(TestLevel world, Vec3 position, Vec3 velocity, boolean ground, float rotation, double wallX) {
@@ -69,16 +70,16 @@ public class PhysicsOracle {
         @Override public void setDeltaMovement(double x, double y, double z) { v = new Vec3(x, y, z); }
         @Override public float getYRot() { return yaw; }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
-        @Override protected float getBlockJumpFactor() { return 1.0f; }
         @Override protected double getEffectiveGravity() { return 0.08; }
         @Override protected boolean omnidirectionalAirMover() { return false; }
         @Override public boolean shouldDiscardFriction() { return false; }
         @Override public boolean isSprinting() { return sprinting; }
         @Override public boolean onClimbable() { return false; }
-        @Override public double getAttributeValue(Holder<Attribute> attribute) { return attribute == Attributes.MOVEMENT_SPEED ? speed.getValue() : attribute == Attributes.JUMP_STRENGTH ? 0.42 : 1.0; }
+        @Override public double getAttributeValue(Holder<Attribute> attribute) { return attribute == Attributes.MOVEMENT_SPEED ? speed.getValue() : attribute == Attributes.JUMP_STRENGTH ? jumpStrength.getValue() : 1.0; }
         @Override public boolean hasEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST && jumpBoost != null; }
         @Override public MobEffectInstance getEffect(Holder<MobEffect> effect) { return effect == MobEffects.JUMP_BOOST ? jumpBoost : null; }
         @Override public BlockPos getBlockPosBelowThatAffectsMyMovement() { return BlockPos.ZERO; }
+        @Override public BlockPos blockPosition() { return BlockPos.ZERO; }
         @Override public HumanoidArm getMainArm() { return HumanoidArm.RIGHT; }
         @Override public void move(MoverType type, Vec3 requested) {
             double x = requested.x, y = requested.y, z = requested.z;
@@ -115,6 +116,7 @@ public class PhysicsOracle {
         TestPlayer entity = (TestPlayer) unsafe.allocateInstance(TestPlayer.class);
         Field abilities = Player.class.getDeclaredField("abilities"); abilities.setAccessible(true); abilities.set(entity, new Abilities());
         entity.speed = new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.MOVEMENT_SPEED);
+        entity.jumpStrength = new AttributeMap(Player.createAttributes().build()).getInstance(Attributes.JUMP_STRENGTH);
         Field modifierField = LivingEntity.class.getDeclaredField("SPEED_MODIFIER_SPRINTING"); modifierField.setAccessible(true);
         AttributeModifier modifier = (AttributeModifier) modifierField.get(null);
         Method travel = LivingEntity.class.getDeclaredMethod("travelInAir", Vec3.class); travel.setAccessible(true);
@@ -132,6 +134,7 @@ public class PhysicsOracle {
             entity.setup(level, vec(scenario.getAsJsonArray("position")), vec(scenario.getAsJsonArray("velocity")), scenario.get("ground").getAsBoolean(), 0, scenario.get("wall").getAsDouble());
             int boost = scenario.get("boost").getAsInt();
             entity.jumpBoost = boost < 0 ? null : new MobEffectInstance(MobEffects.JUMP_BOOST, 1000, boost);
+            entity.jumpStrength.setBaseValue(scenario.get("strength").getAsDouble());
             JsonArray ticks = new JsonArray();
             for (var input : scenario.getAsJsonArray("inputs")) {
                 var i = input.getAsJsonObject();
@@ -160,7 +163,9 @@ public class PhysicsOracle {
         }
         JsonObject frictions = new JsonObject();
         for (var block : BuiltInRegistries.BLOCK) frictions.addProperty(BuiltInRegistries.BLOCK.getKey(block).toString(), block.getFriction());
-        JsonObject output = new JsonObject(); output.add("results", results); output.add("frictions", frictions);
+        JsonObject jumpFactors = new JsonObject();
+        for (var block : BuiltInRegistries.BLOCK) jumpFactors.addProperty(BuiltInRegistries.BLOCK.getKey(block).toString(), block.getJumpFactor());
+        JsonObject output = new JsonObject(); output.add("results", results); output.add("frictions", frictions); output.add("jump_factors", jumpFactors);
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }
 }
@@ -373,6 +378,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
         "minecraft:ice",
         "minecraft:blue_ice",
         "minecraft:slime_block",
+        "minecraft:honey_block",
     ];
     let angles = [0.0_f32, 45.0, -90.0, 113.0, 180.0, -179.9, 12.5, 270.0];
     let mut scenarios = Vec::new();
@@ -390,7 +396,7 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             };
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s + t/20) % angles.len()],"jump":(35..65).contains(&t),"sprint":(s + t / 7) % 3 == 0,"slow":scenario >= 64 && (s + t / 9) % 3 == 0,"using":(s + t / 11) % 4 == 0}));
         }
-        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0, if s%2==0 {0.0} else {2.0}, 0.0],"velocity":[if s%3==0 {0.005} else {0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"block":blocks[s%blocks.len()],"boost": ([-1, 0, 1, 2, 255][scenario % 5]),"strength":([-1.0, 0.0, 0.42, 0.7, 2.0, 40.0][scenario % 6]),"inputs":inputs}));
     }
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("PhysicsOracle.java");
@@ -423,6 +429,15 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             ));
         }
     }
+    for (id, value) in expected["jump_factors"].as_object().unwrap() {
+        let java = value.as_f64().unwrap() as f32;
+        if native_session::physics::block_jump_factor(id).to_bits() != java.to_bits() {
+            errors.push(format!(
+                "{id} jump factor: native {}, Java {java}",
+                native_session::physics::block_jump_factor(id)
+            ));
+        }
+    }
     let results = expected["results"].as_array().unwrap();
     let mut collision_counts = [0, 0];
     assert_eq!(results.len(), scenarios.len());
@@ -450,7 +465,11 @@ fn walking_and_sprinting_air_and_ground_motion_match_vanilla() {
             let (major_collision, _) = state.tick_resolved_with_power(
                 command,
                 ground_friction(scenario["block"].as_str().unwrap()),
-                native_session::physics::jump_power(0.42, 1.0, u8::try_from(boost).ok()),
+                native_session::physics::jump_power(
+                    scenario["strength"].as_f64().unwrap().clamp(0.0, 32.0),
+                    native_session::physics::block_jump_factor(scenario["block"].as_str().unwrap()),
+                    u8::try_from(boost).ok(),
+                ),
                 |position, requested, _| {
                     let mut actual = requested;
                     if actual.y < 0.0 && position.y + actual.y < 0.0 {

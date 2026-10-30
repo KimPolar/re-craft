@@ -29,6 +29,14 @@ pub(crate) fn bounciness(
     equipped_attribute(saved, inventory, enchantments, "bounciness")?.value(0.0, 1.0)
 }
 
+pub(crate) fn jump_strength(
+    saved: &SavedAttribute,
+    inventory: &PlayerInventory,
+    enchantments: &OxygenEnchantments,
+) -> Result<f64> {
+    equipped_attribute(saved, inventory, enchantments, "jump_strength")?.value(0.0, 32.0)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArmorValues {
     pub armor: f64,

@@ -204,6 +204,11 @@ pub fn read_saved_bounciness_attribute(player: &NamedTag) -> Result<SavedAttribu
     saved_attribute(player, "bounciness", 0.0)
 }
 
+/// Persistent jump strength; transient equipment modifiers are applied later.
+pub fn read_saved_jump_strength_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "jump_strength", f64::from(0.42_f32))
+}
+
 /// Preserve persistent armor and toughness modifiers for equipment changes.
 pub fn read_saved_armor_attributes(player: &NamedTag) -> Result<(SavedAttribute, SavedAttribute)> {
     Ok((

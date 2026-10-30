@@ -43,6 +43,15 @@ pub fn jump_power(strength: f64, block_factor: f32, boost: Option<u8>) -> f32 {
     strength as f32 * block_factor + boost
 }
 
+/// Vanilla block jump factors are independent of block state.
+pub fn block_jump_factor(block: &str) -> f32 {
+    if block == "minecraft:honey_block" {
+        0.5
+    } else {
+        1.0
+    }
+}
+
 /// Minecraft applies the accumulated vertical wheel count in float precision.
 pub fn adjust_flight_speed(speed: f32, steps: i32) -> f32 {
     (speed + steps as f32 * 0.005_f32).clamp(0.0, 0.2)

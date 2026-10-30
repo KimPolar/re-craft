@@ -158,6 +158,9 @@ pub struct LoadedSession {
     bounciness_attribute: crate::player_data::SavedAttribute,
     bounciness_inventory_revision: Option<u64>,
     bounciness: Option<f64>,
+    jump_strength_attribute: crate::player_data::SavedAttribute,
+    jump_strength_inventory_revision: Option<u64>,
+    jump_strength: Option<f64>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -445,6 +448,7 @@ impl LoadedSession {
         self.oxygen_inventory_revision = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
+        self.jump_strength_inventory_revision = None;
         Ok(())
     }
 
@@ -473,6 +477,7 @@ impl LoadedSession {
         self.oxygen_equipment = Some((attribute, enchantments));
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
+        self.jump_strength_inventory_revision = None;
         Ok(())
     }
 
@@ -526,6 +531,42 @@ impl LoadedSession {
                 self.bounciness = None;
                 self.stream_errors
                     .push(format!("player bounciness: {error:#}"));
+            }
+        }
+    }
+
+    /// Restore persistent jump strength; equipment modifiers are applied at tick time.
+    pub fn set_saved_jump_strength(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        self.jump_strength = Some(attribute.value(0.0, 32.0)?);
+        self.jump_strength_attribute = attribute;
+        self.jump_strength_inventory_revision = None;
+        Ok(())
+    }
+
+    fn refresh_jump_strength(&mut self) {
+        let revision = self.inventory.revision();
+        if self.jump_strength_inventory_revision == Some(revision) {
+            return;
+        }
+        self.jump_strength_inventory_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::jump_strength(
+            &self.jump_strength_attribute,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(value) => self.jump_strength = Some(value),
+            Err(error) => {
+                self.jump_strength = None;
+                self.stream_errors
+                    .push(format!("player jump strength equipment: {error:#}"));
             }
         }
     }
@@ -1040,6 +1081,7 @@ impl LoadedSession {
         self.first_person.invalidate_inventory();
         self.oxygen_inventory_revision = None;
         self.bounciness_inventory_revision = None;
+        self.jump_strength_inventory_revision = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
             inventory.set_enchantments(Arc::clone(enchantments));
@@ -1204,6 +1246,11 @@ impl LoadedSession {
             bounciness_attribute: crate::player_data::SavedAttribute::with_base(0.0),
             bounciness_inventory_revision: None,
             bounciness: Some(0.0),
+            jump_strength_attribute: crate::player_data::SavedAttribute::with_base(f64::from(
+                0.42_f32,
+            )),
+            jump_strength_inventory_revision: None,
+            jump_strength: Some(f64::from(0.42_f32)),
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
@@ -2770,6 +2817,9 @@ impl LoadedSession {
         self.bounciness_attribute.clear_modifiers();
         self.bounciness_inventory_revision = None;
         self.bounciness = self.bounciness_attribute.value(0.0, 1.0).ok();
+        self.jump_strength_attribute.clear_modifiers();
+        self.jump_strength_inventory_revision = None;
+        self.jump_strength = self.jump_strength_attribute.value(0.0, 32.0).ok();
         self.fall.reset_after_death();
         self.breathing_effects = crate::survival::BreathingEffects::default();
         self.effect_save_invalid = true;
@@ -3377,25 +3427,44 @@ impl LoadedSession {
         self.outlines.iter().filter(|shape| shape.is_none()).count()
     }
 
-    fn friction_below(&self) -> f32 {
+    fn movement_below(&self) -> IVec3 {
         let support = self
             .ground_support
             .and_then(|absolute| subtract(absolute, self.origin));
-        let pos =
-            crate::movement::movement_on_block(self.motion.position, support, |pos| {
-                match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
-                    Cell::State(id) => self.world.state(id).is_some_and(|state| {
-                        state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
-                    }),
-                    Cell::Missing => false,
-                }
-            });
+        crate::movement::movement_on_block(self.motion.position, support, |pos| {
+            match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+                Cell::State(id) => self.world.state(id).is_some_and(|state| {
+                    state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                }),
+                Cell::Missing => false,
+            }
+        })
+    }
+
+    fn friction_below(&self) -> f32 {
+        let pos = self.movement_below();
         match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
             Cell::State(id) => self
                 .world
                 .state(id)
                 .map_or(0.6, |state| crate::physics::ground_friction(&state.name)),
             Cell::Missing => 0.6,
+        }
+    }
+
+    fn block_jump_factor(&self) -> f32 {
+        let factor = |pos| match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+            Cell::State(id) => self
+                .world
+                .state(id)
+                .map_or(1.0, |state| crate::physics::block_jump_factor(&state.name)),
+            Cell::Missing => 1.0,
+        };
+        let at_feet = factor(self.motion.position.floor().as_ivec3());
+        if at_feet == 1.0 {
+            factor(self.movement_below())
+        } else {
+            at_feet
         }
     }
 
@@ -5465,6 +5534,7 @@ impl LoadedSession {
         let breathing_oxygen_valid = self.oxygen_valid;
         self.refresh_equipment_oxygen();
         self.refresh_bounciness();
+        self.refresh_jump_strength();
         let friction = self.friction_below();
         let block_shape = |cell_pos| match cell(
             &self.world,
@@ -5603,8 +5673,8 @@ impl LoadedSession {
             moving_slowly,
         };
         let jump_power = crate::physics::jump_power(
-            f64::from(0.42_f32),
-            1.0,
+            self.jump_strength.unwrap_or(f64::from(0.42_f32)),
+            self.block_jump_factor(),
             self.fall
                 .effects()
                 .jump_boost
@@ -7205,6 +7275,104 @@ mod tests {
             .set_slot(crate::inventory::PlayerSlot::Armor(0), None);
         session.refresh_bounciness();
         assert_eq!(session.bounciness, Some(0.1));
+    }
+
+    #[test]
+    fn jump_strength_tracks_saved_and_equipped_modifiers() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "attributes".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:jump_strength".into())),
+                        ("base".into(), Tag::Double(0.3)),
+                    ])],
+                },
+            )]),
+        };
+        let mut session = session();
+        session
+            .set_saved_jump_strength(
+                crate::player_data::read_saved_jump_strength_attribute(&document).unwrap(),
+            )
+            .unwrap();
+        let component = Tag::Compound(vec![(
+            "minecraft:attribute_modifiers".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("type".into(), Tag::String("minecraft:jump_strength".into())),
+                    ("id".into(), Tag::String("example:jump".into())),
+                    ("operation".into(), Tag::String("add_value".into())),
+                    ("amount".into(), Tag::Double(0.4)),
+                    ("slot".into(), Tag::String("head".into())),
+                ])],
+            },
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            crate::inventory::PlayerSlot::Armor(0),
+            ItemStack::unresolved("minecraft:leather_helmet".into(), 1, component),
+        );
+        session.set_player_inventory(inventory);
+        session.refresh_jump_strength();
+        assert!((session.jump_strength.unwrap() - 0.7).abs() < 1e-12);
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(0), None);
+        session.refresh_jump_strength();
+        assert_eq!(session.jump_strength, Some(0.3));
+    }
+
+    #[test]
+    fn jump_factor_uses_feet_then_movement_support() {
+        let mut session = session();
+        session.motion.position = DVec3::new(8.5, 1.0, 8.5);
+        let honey = session.intern_block(state("minecraft:honey_block", &[]));
+        assert!(session.set(IVec3::new(8, 0, 8), honey));
+        assert_eq!(session.block_jump_factor(), 0.5);
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(IVec3::new(8, 0, 8), stone));
+        assert_eq!(session.block_jump_factor(), 1.0);
+        assert!(session.set(IVec3::new(8, 1, 8), honey));
+        assert_eq!(session.block_jump_factor(), 0.5);
+    }
+
+    #[test]
+    fn jump_combines_strength_honey_and_effect_in_the_session() {
+        let mut session = session();
+        let honey = session.intern_block(state("minecraft:honey_block", &[]));
+        assert!(session.set(IVec3::new(8, 0, 8), honey));
+        session.motion.position = DVec3::new(8.5, 0.9375, 8.5);
+        session.player.position = session.motion.position.as_vec3();
+        session.motion.on_ground = true;
+        session.player.on_ground = true;
+        session
+            .set_saved_jump_strength(crate::player_data::SavedAttribute::with_base(0.8))
+            .unwrap();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                jump_boost: Some(crate::survival::EffectDuration {
+                    amplifier: 0,
+                    duration: 2,
+                    hidden: None,
+                }),
+                ..Default::default()
+            },
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        session.update(TICK);
+        let expected = f64::from(0.8_f32 * 0.5_f32 + 0.1_f32);
+        assert!((session.motion.position.y - 0.9375 - expected).abs() < 1e-7);
     }
 
     #[test]

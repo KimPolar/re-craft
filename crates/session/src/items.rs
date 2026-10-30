@@ -534,6 +534,49 @@ impl Default for ItemEntities {
 }
 
 impl ItemEntities {
+    /// Conservative closure of all known item sources, destinations, movement
+    /// paths and merge/removal effects. Other entity kinds are not covered.
+    pub(crate) fn affected_item_chunks(
+        &self,
+        saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
+    ) -> anyhow::Result<BTreeSet<native_world::loaded::ChunkPos>> {
+        use anyhow::Context;
+        let mut chunks: BTreeSet<_> = saved_uuids.values().copied().collect();
+        for entity in self
+            .entities
+            .iter()
+            .chain(self.removed_saved.iter().map(|removed| &removed.entity))
+        {
+            chunks.insert(
+                created_chunk(entity.item.position).context("item has an invalid position")?,
+            );
+            if let Some(created) = &entity.created {
+                chunks.insert(
+                    created_chunk(created.origin).context("created item has an invalid origin")?,
+                );
+                chunks.extend(created.visited.iter().copied());
+            }
+        }
+        for merge in &self.saved_merges {
+            for participant in [&merge.first, &merge.second] {
+                chunks.insert(
+                    created_chunk(participant.position)
+                        .context("merged item has an invalid position")?,
+                );
+            }
+        }
+        chunks.extend(self.removed_created_chunks.iter().copied());
+        for removed in &self.removed_created {
+            chunks.extend(removed.chunks.iter().copied());
+        }
+        for pickup in &self.created_pickups {
+            chunks.extend(pickup.chunks.iter().copied());
+        }
+        self.validate_item_chunk_group(&chunks, saved_uuids)?;
+        self.validate_removed_item_chunk_group(&chunks, saved_uuids)?;
+        Ok(chunks)
+    }
+
     pub(crate) fn has_in_chunk(&self, pos: native_world::loaded::ChunkPos) -> bool {
         let chunk = BTreeSet::from([pos]);
         self.entities
@@ -2752,6 +2795,10 @@ mod tests {
         );
         assert!(items.entities.is_empty());
         assert_eq!(
+            items.affected_item_chunks(&Default::default()).unwrap(),
+            group
+        );
+        assert_eq!(
             inventory
                 .slot(crate::inventory::PlayerSlot::Storage(0))
                 .unwrap()
@@ -2828,6 +2875,10 @@ mod tests {
             |_, _| true,
         );
         assert!(expired.entities.is_empty());
+        assert_eq!(
+            expired.affected_item_chunks(&Default::default()).unwrap(),
+            BTreeSet::from([left])
+        );
         assert_eq!(
             expired.created_removal_effects(&BTreeSet::from([left])),
             vec![(expired_uuid, CreatedRemovalCause::Expired)]
@@ -3689,6 +3740,10 @@ mod tests {
         let right = ChunkPos { x: 1, z: 0 };
         let farther = ChunkPos { x: 2, z: 0 };
         let owners = std::collections::BTreeMap::from([(a, left), (b, right)]);
+        assert_eq!(
+            items.affected_item_chunks(&owners).unwrap(),
+            BTreeSet::from([left, right])
+        );
         assert!(
             items
                 .validate_item_chunk_group(&BTreeSet::from([left]), &owners)
@@ -3705,6 +3760,10 @@ mod tests {
                 .is_ok()
         );
         items.entities[0].item.position.x = 32.2;
+        assert_eq!(
+            items.affected_item_chunks(&owners).unwrap(),
+            BTreeSet::from([left, right, farther])
+        );
         assert!(
             items
                 .validate_item_chunk_group(&BTreeSet::from([left, right]), &owners)
@@ -3750,6 +3809,7 @@ mod tests {
         }
         assert_eq!(items.entities.len(), 2, "partial merge keeps both entities");
         assert!(items.uncoordinated_saved_merge);
+        assert!(items.affected_item_chunks(&Default::default()).is_err());
         for pos in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }] {
             assert!(
                 items

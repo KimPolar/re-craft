@@ -496,21 +496,25 @@ public class LightRegionOracle {
     let make_plan = || {
         let mut plan = WorldSavePlan::new();
         let combined = session
-            .draft_player_and_dirty_chunks(&player_source, &sources, &tags, |state| {
-                Ok((state.name.matches("minecraft:air"), false))
-            })
+            .draft_player_terrain_items_and_clocks(
+                &player_source,
+                &sources,
+                &clock_source,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+            )
             .unwrap();
-        assert_eq!(combined.chunks().len(), dirty.len());
-        let (player, chunks) = combined.into_parts();
+        assert!(combined.item_entities.is_empty());
+        assert_eq!(combined.player_and_terrain.chunks().len(), dirty.len());
+        let (player, chunks) = combined.player_and_terrain.into_parts();
         for (_, draft) in chunks {
             plan.add_chunk(dimension.clone(), draft, 1_777_777).unwrap();
         }
         player
             .add_to_save_plan(&mut plan, [0, 0, 0, 1], &player_source)
             .unwrap();
-        session
-            .draft_world_clocks(&clock_source)
-            .unwrap()
+        combined
+            .clocks
             .add_to_save_plan(&mut plan, &clock_source)
             .unwrap();
         plan

@@ -166,6 +166,8 @@ pub struct GameUi {
     experience: crate::experience_hud::Display,
     death: Option<DeathScreen>,
     system_messages: Arc<[native_session::SystemMessage]>,
+    snapshot_messages: Arc<[native_session::SystemMessage]>,
+    local_messages: Vec<native_session::SystemMessage>,
 }
 
 impl GameUi {
@@ -217,6 +219,8 @@ impl GameUi {
             ),
             death: None,
             system_messages: Arc::from([]),
+            snapshot_messages: Arc::from([]),
+            local_messages: Vec::new(),
         }
     }
 
@@ -282,6 +286,30 @@ impl GameUi {
 
     pub fn video_settings(&self) -> VideoSettings {
         self.video
+    }
+
+    pub fn debug_focus_pause(&mut self, enabled: bool, tick: u64) {
+        self.video.pause_on_lost_focus = enabled;
+        self.video_dirty = true;
+        self.local_messages.push(native_session::SystemMessage {
+            kind: native_session::SystemMessageKind::DebugFocusPause(enabled),
+            tick,
+        });
+        if self.local_messages.len() > 100 {
+            self.local_messages.remove(0);
+        }
+        self.merge_chat_messages();
+    }
+
+    fn merge_chat_messages(&mut self) {
+        let mut messages = self.snapshot_messages.to_vec();
+        messages.extend_from_slice(&self.local_messages);
+        messages.sort_by_key(|message| message.tick);
+        if messages.len() > 100 {
+            messages.drain(..messages.len() - 100);
+        }
+        self.system_messages = messages.into();
+        self.last_draw = None;
     }
 
     pub fn advance_video_settings(&mut self, now: std::time::Instant) {
@@ -1414,9 +1442,9 @@ impl GameUi {
         partial: f32,
     ) -> Result<()> {
         self.sync_death(snapshot);
-        if !Arc::ptr_eq(&self.system_messages, &snapshot.system_messages) {
-            self.system_messages = Arc::clone(&snapshot.system_messages);
-            self.last_draw = None;
+        if !Arc::ptr_eq(&self.snapshot_messages, &snapshot.system_messages) {
+            self.snapshot_messages = Arc::clone(&snapshot.system_messages);
+            self.merge_chat_messages();
         }
         let inventory = &snapshot.inventory;
         let tick = snapshot.tick;
@@ -2959,6 +2987,36 @@ mod inventory_tests {
                 std::fs::read(player).unwrap(),
                 std::fs::read(region).unwrap()
             ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn debug_focus_message_survives_session_messages_and_updates_setting() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        ui.debug_focus_pause(false, 12);
+        assert!(!ui.video_settings().pause_on_lost_focus);
+        assert!(ui.video_needs_save());
+        ui.snapshot_messages = Arc::from([native_session::SystemMessage {
+            kind: native_session::SystemMessageKind::MissingRespawnBlock,
+            tick: 10,
+        }]);
+        ui.merge_chat_messages();
+        assert_eq!(ui.system_messages.len(), 2);
+        assert_eq!(
+            ui.system_messages[1].kind,
+            native_session::SystemMessageKind::DebugFocusPause(false)
+        );
+        let canvas = ui
+            .compose((1280, 720), &PlayerInventory::default(), 12)
+            .unwrap();
+        assert!(
+            canvas.pixels.iter().any(|pixel| *pixel == 0xffff_ff55),
+            "debug prefix should use the Java yellow"
         );
     }
 

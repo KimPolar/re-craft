@@ -991,6 +991,27 @@ impl ApplicationHandler for Viewer {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let snapshot = self.play.as_ref().map(|play| play.session.snapshot());
+                    let screen_open = self.ui.is_none()
+                        || snapshot.is_none()
+                        || self.inventory_wait.is_some()
+                        || snapshot
+                            .as_ref()
+                            .is_some_and(|s| s.inventory.is_open() || s.death.is_some())
+                        || self.ui.as_ref().is_some_and(GameUi::paused);
+                    if self
+                        .focus_pause
+                        .key(code, event.state == ElementState::Pressed, screen_open)
+                    {
+                        self.video.pause_on_lost_focus = !self.video.pause_on_lost_focus;
+                        if let (Some(ui), Some(snapshot)) = (&mut self.ui, snapshot) {
+                            ui.debug_focus_pause(self.video.pause_on_lost_focus, snapshot.tick);
+                            crate::save_game_video(Some(ui));
+                        }
+                        return;
+                    }
+                }
                 if let Some(snapshot) = self.play.as_ref().map(|play| play.session.snapshot())
                     && snapshot.death.is_some()
                 {
@@ -1396,7 +1417,9 @@ impl ApplicationHandler for Viewer {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if self.ui.is_some()
-            && self.focus_pause.should_pause(now, false)
+            && self
+                .focus_pause
+                .should_pause(now, false, self.video.pause_on_lost_focus)
             && let Some(play) = &self.play
         {
             let screen_open =
@@ -1404,7 +1427,10 @@ impl ApplicationHandler for Viewer {
                     let snapshot = play.session.snapshot();
                     snapshot.inventory.is_open() || snapshot.death.is_some()
                 };
-            if self.focus_pause.should_pause(now, screen_open) {
+            if self
+                .focus_pause
+                .should_pause(now, screen_open, self.video.pause_on_lost_focus)
+            {
                 self.ui.as_mut().unwrap().toggle_pause();
                 self.capture(false);
             }

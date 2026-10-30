@@ -274,6 +274,7 @@ pub struct DeathInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemMessageKind {
     MissingRespawnBlock,
+    DebugFocusPause(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1632,6 +1632,19 @@ impl App {
 
     fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, event_loop: &ActiveEventLoop) {
         let snapshot = self.session.snapshot();
+        let screen_open = self.ui.is_none()
+            || self.inventory_wait.is_some()
+            || snapshot.inventory.is_open()
+            || snapshot.death.is_some()
+            || self.ui.as_ref().is_some_and(GameUi::paused);
+        if self.focus_pause.key(code, pressed, screen_open) {
+            self.video.pause_on_lost_focus = !self.video.pause_on_lost_focus;
+            if let Some(ui) = &mut self.ui {
+                ui.debug_focus_pause(self.video.pause_on_lost_focus, snapshot.tick);
+                save_game_video(Some(ui));
+            }
+            return;
+        }
         if snapshot.death.is_some() {
             if let Some(ui) = &mut self.ui {
                 ui.sync_death(&snapshot);
@@ -2220,13 +2233,20 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        if self.ui.is_some() && self.focus_pause.should_pause(now, false) {
+        if self.ui.is_some()
+            && self
+                .focus_pause
+                .should_pause(now, false, self.video.pause_on_lost_focus)
+        {
             let snapshot = self.session.snapshot();
             let screen_open = self.ui.as_ref().is_some_and(GameUi::paused)
                 || snapshot.inventory.is_open()
                 || snapshot.death.is_some()
                 || self.inventory_wait.is_some();
-            if self.focus_pause.should_pause(now, screen_open) {
+            if self
+                .focus_pause
+                .should_pause(now, screen_open, self.video.pause_on_lost_focus)
+            {
                 self.ui.as_mut().unwrap().toggle_pause();
                 self.capture(false);
             }

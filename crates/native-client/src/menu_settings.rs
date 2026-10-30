@@ -241,6 +241,8 @@ pub struct VideoSettings {
     pub toggle_sprint: bool,
     pub toggle_attack: bool,
     pub toggle_use: bool,
+    /// Java's F3+P setting, saved alongside the other client options.
+    pub pause_on_lost_focus: bool,
     /// Whether to reduce the frame rate after inactivity, or only while minimized.
     pub inactivity_fps_limit: InactivityFpsLimit,
 }
@@ -285,6 +287,7 @@ impl Default for VideoSettings {
             toggle_sprint: false,
             toggle_attack: false,
             toggle_use: false,
+            pause_on_lost_focus: true,
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }
@@ -422,6 +425,25 @@ pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_pause_defaults_on_and_survives_unrelated_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.json");
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.video.pause_on_lost_focus);
+        let video = VideoSettings {
+            pause_on_lost_focus: false,
+            ..old.video
+        };
+        save_video_to(&path, video).unwrap();
+        save_sound_to(&path, SoundSettings::default()).unwrap();
+        let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!loaded.video.pause_on_lost_focus);
+        save_to(&path, &loaded).unwrap();
+        let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!loaded.video.pause_on_lost_focus);
+    }
 
     #[test]
     fn all_save_paths_preserve_unknown_fields_and_reject_invalid_files() {

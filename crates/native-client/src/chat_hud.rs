@@ -207,31 +207,58 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
         ) else {
             continue;
         };
-        let key = match message.kind {
-            SystemMessageKind::MissingRespawnBlock => "block.minecraft.spawn.not_valid",
+        let (message, debug_prefix) = match message.kind {
+            SystemMessageKind::MissingRespawnBlock => (
+                assets
+                    .translate(
+                        "block.minecraft.spawn.not_valid",
+                        "block.minecraft.spawn.not_valid",
+                    )
+                    .to_owned(),
+                None,
+            ),
+            SystemMessageKind::DebugFocusPause(enabled) => {
+                let key = if enabled {
+                    "debug.pause_focus.on"
+                } else {
+                    "debug.pause_focus.off"
+                };
+                let fallback = if enabled {
+                    "Pause on lost focus: enabled"
+                } else {
+                    "Pause on lost focus: disabled"
+                };
+                let prefix = assets.translate("debug.prefix", "[Debug]:");
+                (
+                    format!("{} {}", prefix, assets.translate(key, fallback)),
+                    Some(prefix),
+                )
+            }
         };
-        let message = assets.translate(key, key);
-        for text in wrap(canvas, assets, message, layout.width.max(1))
+        for text in wrap(canvas, assets, &message, layout.width.max(1))
             .into_iter()
             .rev()
         {
             if lines.len() >= base.max_lines {
                 break;
             }
-            lines.push((text, layout));
+            let prefix_len = debug_prefix
+                .filter(|prefix| text.starts_with(prefix))
+                .map_or(0, str::len);
+            lines.push((text, layout, prefix_len));
         }
         if lines.len() >= base.max_lines {
             break;
         }
     }
-    for (index, (_, layout)) in lines.iter().enumerate() {
+    for (index, (_, layout, _)) in lines.iter().enumerate() {
         let bottom = layout.bottom - index as i32 * layout.line_height;
         canvas.fill(
             layout.rect(-4, bottom - layout.line_height, layout.width + 8, bottom),
             [0, 0, 0, layout.background_alpha],
         );
     }
-    for (index, (text, layout)) in lines.iter().enumerate() {
+    for (index, (text, layout, prefix_len)) in lines.iter().enumerate() {
         let bottom = layout.bottom - index as i32 * layout.line_height;
         let opacity = (layout.text_opacity * 255.0) as u8;
         canvas.fill(
@@ -240,12 +267,18 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
         );
         let x = (4.0 * layout.scale).floor() as i32;
         let y = ((bottom - layout.text_offset) as f32 * layout.scale).floor() as i32;
+        let draw_text = |canvas: &mut Canvas, x, y| {
+            let (prefix, rest) = text.split_at(*prefix_len);
+            canvas.text_alpha(Some(assets), x, y, prefix, [255, 255, 85], opacity);
+            let offset = canvas.text_width(Some(assets), prefix);
+            canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
+        };
         if layout.scale == 1.0 {
-            canvas.text_alpha(Some(assets), x, y, text, [255, 255, 255], opacity);
+            draw_text(canvas, x, y);
         } else {
             let width = canvas.text_width(Some(assets), text).clamp(1, 32768) as u32 + 2;
             let mut source = Canvas::new(width, 10);
-            source.text_alpha(Some(assets), 0, 0, text, [255, 255, 255], opacity);
+            draw_text(&mut source, 0, 0);
             let w = (source.width as f32 * layout.scale).ceil() as i32;
             let h = (source.height as f32 * layout.scale).ceil() as i32;
             for dy in 0..h {

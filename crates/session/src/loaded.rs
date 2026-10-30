@@ -103,6 +103,24 @@ struct PendingLight {
     last_attempt: Option<u64>,
 }
 
+/// A partial, in-memory snapshot of a player's state and every changed chest.
+/// It does not authorize a world write: all other world effects still need to
+/// be checked and committed in the same transaction.
+pub struct PlayerChestDraft {
+    player: crate::player_data::PlayerStateDraft,
+    chests: BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft>,
+}
+
+impl PlayerChestDraft {
+    pub fn player(&self) -> &native_persistence::nbt::NamedTag {
+        self.player.document()
+    }
+
+    pub fn chest_chunks(&self) -> &BTreeMap<ChunkPos, native_persistence::edit::ChunkDraft> {
+        &self.chests
+    }
+}
+
 fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> bool {
     (i64::from(a.x) - i64::from(b.x)).abs()
         + (i64::from(a.y) - i64::from(b.y)).abs()
@@ -1048,12 +1066,42 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
         anyhow::ensure!(
-            self.commands.is_empty(),
-            "pending player commands have not reached a tick"
-        );
-        anyhow::ensure!(
             self.chest_dirty_chunks.is_empty(),
             "changed chest inventories require a coordinated world save"
+        );
+        self.draft_player_state_inner(original)
+    }
+
+    /// Build player and all changed chest drafts together. Chunk drafts here
+    /// cover inventory only and remain ineligible for a durable world write.
+    pub fn draft_player_and_chests(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        chunks: &BTreeMap<ChunkPos, native_persistence::nbt::NamedTag>,
+    ) -> anyhow::Result<PlayerChestDraft> {
+        anyhow::ensure!(
+            chunks.len() == self.chest_dirty_chunks.len()
+                && self
+                    .chest_dirty_chunks
+                    .iter()
+                    .all(|pos| chunks.contains_key(pos)),
+            "all changed chest chunks must be supplied exactly once"
+        );
+        let chests = chunks
+            .iter()
+            .map(|(&pos, source)| Ok((pos, self.draft_chest_inventory_chunk(pos, source)?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let player = self.draft_player_state_inner(player)?;
+        Ok(PlayerChestDraft { player, chests })
+    }
+
+    fn draft_player_state_inner(
+        &self,
+        original: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
         );
         anyhow::ensure!(
             crate::player_data::read_saved_walking_speed(original)? == self.walking_speed,
@@ -12924,6 +12972,7 @@ mod tests {
         };
         use native_world::loaded::SavedBlockEntities;
         let (mut session, source_world, position, chunk) = saved_chest_fixture();
+        session.set_player_inventory(PlayerInventory::default());
         let base = fixture_chunk_document(chunk);
         let state = |name: &str, properties: &[(&str, &str)]| BlockState {
             name: name.into(),
@@ -12975,6 +13024,39 @@ mod tests {
         session.update(TICK);
         let draft = session.draft_chest_inventory_chunk(chunk, &source).unwrap();
         assert!(draft.matches_source(&source).unwrap());
+        let player = nbt::NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("future_player_data".into(), Tag::Int(42)),
+            ]),
+        };
+        let originals = BTreeMap::from([(chunk, source.clone())]);
+        assert!(session.draft_player_state(&player).is_err());
+        assert!(
+            session
+                .draft_player_and_chests(&player, &BTreeMap::new())
+                .is_err()
+        );
+        let combined = session
+            .draft_player_and_chests(&player, &originals)
+            .unwrap();
+        assert_eq!(
+            combined.player().value.get("future_player_data"),
+            Some(&Tag::Int(42))
+        );
+        let Some(Tag::List { values, .. }) = combined.player().value.get("Inventory") else {
+            panic!("missing player inventory")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("count"), Some(&Tag::Int(5)));
+        assert_eq!(
+            combined.chest_chunks()[&chunk]
+                .document()
+                .value
+                .get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
         assert_eq!(
             draft.document().value.get("unknown_chunk_data"),
             source.value.get("unknown_chunk_data")
@@ -12988,6 +13070,11 @@ mod tests {
         assert!(session.dirty_chunk_positions().contains(&chunk));
         let tags = test_heightmap_tags();
         assert!(session.try_open_saved_chest(position - session.origin));
+        assert!(
+            session
+                .draft_player_and_chests(&player, &originals)
+                .is_err()
+        );
         assert!(
             session
                 .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
@@ -13071,6 +13158,11 @@ mod tests {
         };
         fields.push(("future".into(), Tag::Int(1)));
         assert!(session.draft_chest_inventory_chunk(chunk, &stale).is_err());
+        assert!(
+            session
+                .draft_player_and_chests(&player, &BTreeMap::from([(chunk, stale)]))
+                .is_err()
+        );
         session.queue_chunk_window(
             ChunkPos {
                 x: chunk.x + 3,
@@ -13464,6 +13556,50 @@ mod tests {
                 .saved_block_entities
                 .insert(chunk, SavedBlockEntities::Encoded(payload.into()));
         }
+        let mut originals = BTreeMap::new();
+        for (position, chunk, kind) in [(left, left_chunk, "left"), (right, right_chunk, "right")] {
+            let state =
+                |name: &str, properties: &[(&str, &str)]| native_persistence::palette::BlockState {
+                    name: name.into(),
+                    properties: properties
+                        .iter()
+                        .map(|(k, v)| ((*k).into(), (*v).into()))
+                        .collect(),
+                };
+            let change = native_persistence::edit::BlockChange {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                expected: state("minecraft:air", &[]),
+                replacement: state(
+                    "minecraft:chest",
+                    &[
+                        ("facing", "north"),
+                        ("type", kind),
+                        ("waterlogged", "false"),
+                    ],
+                ),
+            };
+            let mut source = native_persistence::edit::draft_chunk_blocks(
+                &fixture_chunk_document(chunk),
+                native_persistence::world::ChunkPos {
+                    x: chunk.x,
+                    z: chunk.z,
+                },
+                &[change],
+            )
+            .unwrap()
+            .document()
+            .clone();
+            let SavedBlockEntities::Encoded(bytes) = &world.saved_block_entities[&chunk] else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut source.value else {
+                panic!()
+            };
+            fields.push(("block_entities".into(), nbt::read(bytes).unwrap().value));
+            originals.insert(chunk, source);
+        }
         let mut session = LoadedSession::new(
             world,
             origin,
@@ -13486,6 +13622,18 @@ mod tests {
         session.update(TICK);
         assert!(session.chest_dirty_chunks.contains(&left_chunk));
         assert!(session.chest_dirty_chunks.contains(&right_chunk));
+        let player_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        assert!(
+            session
+                .draft_player_and_chests(
+                    &player_source,
+                    &BTreeMap::from([(left_chunk, originals[&left_chunk].clone())])
+                )
+                .is_err()
+        );
         let remote = ChunkPos {
             x: left_chunk.x + 5,
             z: left_chunk.z,
@@ -13494,6 +13642,27 @@ mod tests {
         session.apply_streaming();
         assert!(session.parked_chunks.contains_key(&left_chunk));
         assert!(session.parked_chunks.contains_key(&right_chunk));
+        let draft = session
+            .draft_player_and_chests(&player_source, &originals)
+            .unwrap();
+        assert_eq!(draft.chest_chunks().len(), 2);
+        for chunk in [left_chunk, right_chunk] {
+            let Some(Tag::List { values, .. }) = draft.chest_chunks()[&chunk]
+                .document()
+                .value
+                .get("block_entities")
+            else {
+                panic!()
+            };
+            assert!(
+                matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+            );
+        }
+        let Some(Tag::List { values, .. }) = draft.player().value.get("Inventory") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("count"), Some(&Tag::Int(8)));
         session.queue_chunk_window(left_chunk, 1);
         session.apply_streaming();
         assert!(session.saved_chest(left).unwrap().unwrap().slots[0].is_none());

@@ -987,6 +987,13 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_farmland_maintainers(Arc::new(tag)),
                     Err(error) => eprintln!("Farmland maintenance tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::SnowSupportTags::load(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tags) => session.set_snow_support_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Snow support tags are unavailable: {error:#}"),
+                }
             }
             Err(error) => eprintln!("Block tags are unavailable: {error:#}"),
         }

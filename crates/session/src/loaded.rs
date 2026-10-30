@@ -356,6 +356,7 @@ pub struct LoadedSession {
     player_uuid: Option<[i32; 4]>,
     uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
+    snow_support_tags: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
@@ -1972,6 +1973,13 @@ impl LoadedSession {
         self.sand_deferred_revision = None;
     }
 
+    pub fn set_snow_support_tags(
+        &mut self,
+        tags: Arc<native_resources::respawn_tags::SnowSupportTags>,
+    ) {
+        self.snow_support_tags = Some(tags);
+    }
+
     pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.bounce_suppression_tag = Some(tag);
     }
@@ -2328,6 +2336,7 @@ impl LoadedSession {
             player_uuid: None,
             uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
+            snow_support_tags: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             saved_clock_source: None,
@@ -5344,6 +5353,97 @@ impl LoadedSession {
         Some(placed_soil(block, blocked))
     }
 
+    /// Snow uses the active support tags before testing the upper collision face.
+    fn snow_can_survive(&self, target: IVec3) -> Option<bool> {
+        let tags = self.snow_support_tags.as_ref()?;
+        let below = add(target, IVec3::NEG_Y)?;
+        let Cell::State(id) = cell(&self.world, self.origin, self.bounds, below, self.states[0])
+        else {
+            return None;
+        };
+        let support = self.world.state(id)?;
+        if let Some(result) = tags.support_override(&support.name) {
+            return Some(result);
+        }
+        if support.name == "minecraft:snow" {
+            return native_world::collision::snow_layers(support).map(|layers| layers == 8);
+        }
+        let shape = self.shapes.get(id.0 as usize)?.as_deref()?;
+        Some(native_world::collision::covers_full_face(shape, IVec3::Y))
+    }
+
+    /// Place or add one snow layer using BlockPlaceContext's clicked-face rules.
+    fn place_snow(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if held.id() != "minecraft:snow" || held.max_count().is_none() {
+            return None;
+        }
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let clicked = self.world.state(clicked)?;
+        let replace_clicked = if clicked.name == "minecraft:snow" {
+            native_world::collision::snow_layers(clicked)? < 8 && hit.face == IVec3::Y
+        } else {
+            button_can_replace(clicked)?
+        };
+        let target = if replace_clicked {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let existing = self.world.state(existing)?;
+        let layers = if existing.name == "minecraft:snow" {
+            let layers = native_world::collision::snow_layers(existing)?;
+            if layers >= 8 || (replace_clicked && hit.face != IVec3::Y) {
+                return None;
+            }
+            layers + 1
+        } else {
+            if button_can_replace(existing) != Some(true) {
+                return None;
+            }
+            1
+        };
+        if self.snow_can_survive(target) != Some(true) {
+            return None;
+        }
+        let placed = state("minecraft:snow", &[("layers", &layers.to_string())]);
+        let shape = block_shape(&placed)?;
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(placed);
+        self.set(target, id).then_some(hand)
+    }
+
     /// Test candidate supports in Java's view-dependent order. An unknown
     /// earlier support cannot safely be skipped in favour of a later one.
     fn place_button(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -7441,6 +7541,15 @@ impl LoadedSession {
             ) else {
                 continue;
             };
+            if self
+                .world
+                .state(id)
+                .is_some_and(|state| state.name == "minecraft:snow")
+                && self.snow_can_survive(neighbor) == Some(false)
+                && self.set(neighbor, self.states[0])
+            {
+                continue;
+            }
             if self.world.state(id).and_then(redstone_lamp_lit).is_some() {
                 self.update_lamp(neighbor);
             }
@@ -8189,6 +8298,7 @@ impl LoadedSession {
                                     "minecraft:redstone_lamp"
                                         | "minecraft:redstone_block"
                                         | "minecraft:lever"
+                                        | "minecraft:snow"
                                         | "minecraft:chest"
                                         | "minecraft:trapped_chest"
                                 )
@@ -8240,6 +8350,7 @@ impl LoadedSession {
                                 && let Some(hand) = self
                                     .place_button(hit)
                                     .or_else(|| self.place_redstone(hit))
+                                    .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_chest(hit))
                             {
                                 handled = true;
@@ -10384,6 +10495,406 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    fn fixture_snow_tags(
+        cannot: &[&str],
+        can: &[&str],
+    ) -> Arc<native_resources::respawn_tags::SnowSupportTags> {
+        struct Provider {
+            cannot: Vec<u8>,
+            can: Vec<u8>,
+        }
+        impl native_resources::packs::ResourceProvider for Provider {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                if path.ends_with("/cannot_support_snow_layer.json") {
+                    Ok(vec![self.cannot.clone()])
+                } else if path.ends_with("/support_override_snow_layer.json") {
+                    Ok(vec![self.can.clone()])
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+        let mut provider = Provider {
+            cannot: serde_json::to_vec(&serde_json::json!({"values":cannot})).unwrap(),
+            can: serde_json::to_vec(&serde_json::json!({"values":can})).unwrap(),
+        };
+        let registry: BTreeSet<String> = [
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:ice",
+            "minecraft:oak_leaves",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        Arc::new(
+            native_resources::respawn_tags::SnowSupportTags::load(&mut provider, &registry)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn snow_places_and_stacks_using_click_face() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:snow".into(), 32, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        let pos = IVec3::new(4, 1, 4);
+        let hit = |position, face| ShapeRayHit {
+            position,
+            face,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        assert_eq!(
+            session.place_snow(hit(pos + IVec3::NEG_Y, IVec3::Y)),
+            Some(PlayerSlot::Storage(0))
+        );
+        for layers in 2..=8 {
+            assert_eq!(
+                session.place_snow(hit(pos, IVec3::Y)),
+                Some(PlayerSlot::Storage(0))
+            );
+            let snow = session
+                .world
+                .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                .unwrap();
+            assert_eq!(native_world::collision::snow_layers(snow), Some(layers));
+        }
+        assert_eq!(
+            session.place_snow(hit(pos, IVec3::Y)),
+            Some(PlayerSlot::Storage(0))
+        );
+        let above = session
+            .world
+            .block(
+                session.origin.x + pos.x,
+                pos.y + 1,
+                session.origin.z + pos.z,
+            )
+            .unwrap();
+        assert_eq!(native_world::collision::snow_layers(above), Some(1));
+        assert!(session.place_snow(hit(pos, IVec3::X)).is_some());
+        let side = session
+            .world
+            .block(
+                session.origin.x + pos.x + 1,
+                pos.y,
+                session.origin.z + pos.z,
+            )
+            .unwrap();
+        assert_eq!(native_world::collision::snow_layers(side), Some(1));
+        assert!(session.set(pos, session.states[0]));
+        assert_eq!(
+            session
+                .world
+                .block(
+                    session.origin.x + pos.x,
+                    pos.y + 1,
+                    session.origin.z + pos.z
+                )
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+    }
+
+    #[test]
+    fn snow_support_obeys_tags_and_collision_faces() {
+        let mut session = session();
+        let pos = IVec3::new(4, 1, 4);
+        assert_eq!(session.snow_can_survive(pos), None);
+        session.set_snow_support_tags(fixture_snow_tags(
+            &["minecraft:stone"],
+            &["minecraft:stone", "minecraft:ice"],
+        ));
+        assert_eq!(session.snow_can_survive(pos), Some(false));
+        let ice = session.intern_block(state("minecraft:ice", &[]));
+        assert!(session.set(pos + IVec3::NEG_Y, ice));
+        assert_eq!(session.snow_can_survive(pos), Some(true));
+        session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+        for (kind, expected) in [("bottom", false), ("top", true), ("double", true)] {
+            let slab = session.intern_block(state(
+                "minecraft:oak_slab",
+                &[("type", kind), ("waterlogged", "false")],
+            ));
+            assert!(session.set(pos + IVec3::NEG_Y, slab));
+            assert_eq!(session.snow_can_survive(pos), Some(expected), "{kind}");
+        }
+        for layers in 1..=8 {
+            let snow =
+                session.intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+            assert!(session.set(pos + IVec3::NEG_Y, snow));
+            assert_eq!(session.snow_can_survive(pos), Some(layers == 8));
+        }
+    }
+
+    #[test]
+    fn snow_placement_respects_player_collision_after_first_layer() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:snow".into(), 3, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        let pos = IVec3::new(4, 1, 4);
+        session.player.position = Vec3::new(4.5, 1.0, 4.5);
+        let hit = |position| ShapeRayHit {
+            position,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        assert!(session.place_snow(hit(pos + IVec3::NEG_Y)).is_some());
+        assert!(session.place_snow(hit(pos)).is_none());
+        let state = session
+            .world
+            .block(session.origin.x + 4, 1, session.origin.z + 4)
+            .unwrap();
+        assert_eq!(native_world::collision::snow_layers(state), Some(1));
+    }
+
+    #[test]
+    fn snow_item_uses_either_hand_and_game_mode_consumption() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:snow".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let placed = matches!(mode, GameMode::Survival | GameMode::Creative);
+                let target = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                assert_eq!(
+                    target.name,
+                    if placed {
+                        "minecraft:snow"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn snow_placement_matches_java_contexts() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SnowPlacementOracle.java");
+        let output = temp.path().join("snow.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SnowPlacementOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SnowPlacementOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "snow oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 270);
+        for row in rows {
+            let clicked = row["clicked"].as_u64().unwrap() as u8;
+            let adjacent = row["adjacent"].as_u64().unwrap() as u8;
+            let face = match row["face"].as_str().unwrap() {
+                "down" => IVec3::NEG_Y,
+                "up" => IVec3::Y,
+                "north" => IVec3::NEG_Z,
+                "south" => IVec3::Z,
+                "west" => IVec3::NEG_X,
+                "east" => IVec3::X,
+                _ => unreachable!(),
+            };
+            let mut session = session();
+            let at = IVec3::new(4, 4, 4);
+            let neighbor = at + face;
+            for below in [at + IVec3::NEG_Y, neighbor + IVec3::NEG_Y] {
+                if below != at && below != neighbor {
+                    session.set(below, session.states[3]);
+                }
+            }
+            let clicked_id = if clicked == 0 {
+                session.states[3]
+            } else {
+                session.intern_block(state("minecraft:snow", &[("layers", &clicked.to_string())]))
+            };
+            let adjacent_id = if adjacent == 0 {
+                session.states[0]
+            } else {
+                session.intern_block(state(
+                    "minecraft:snow",
+                    &[("layers", &adjacent.to_string())],
+                ))
+            };
+            session.set(at, clicked_id);
+            session.set(neighbor, adjacent_id);
+            session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:snow".into(), 1, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: at,
+                face,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            let placed = session.place_snow(hit).is_some();
+            assert_eq!(placed, row["place"].as_bool().unwrap(), "{row}");
+            if placed {
+                let offset = IVec3::new(
+                    row["x"].as_i64().unwrap() as i32,
+                    row["y"].as_i64().unwrap() as i32,
+                    row["z"].as_i64().unwrap() as i32,
+                );
+                let absolute = session.origin + at + offset;
+                let state = session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap();
+                assert_eq!(
+                    native_world::collision::snow_layers(state),
+                    Some(row["layers"].as_u64().unwrap() as u8),
+                    "{row}"
+                );
+            }
+        }
+        let source = temp.path().join("SnowSupportOracle.java");
+        let output = temp.path().join("snow-support.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SnowSupportOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SnowSupportOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "snow support oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert!(rows.len() >= 30);
+        for row in rows {
+            let state = BlockState {
+                name: row["id"].as_str().unwrap().to_owned(),
+                properties: row["properties"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+                    .collect(),
+            };
+            let mut session = session();
+            let support = session.intern_block(state);
+            session.set(IVec3::new(4, 0, 4), support);
+            session.set_snow_support_tags(fixture_snow_tags(
+                &["minecraft:stone"],
+                &["minecraft:stone", "minecraft:ice"],
+            ));
+            assert_eq!(
+                row["can_survive"].as_bool(),
+                row["kept_after_update"].as_bool(),
+                "{row}"
+            );
+            assert_eq!(
+                session.snow_can_survive(IVec3::new(4, 1, 4)),
+                row["can_survive"].as_bool(),
+                "{row}"
+            );
+        }
     }
 
     #[test]

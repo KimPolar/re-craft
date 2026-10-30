@@ -83,6 +83,43 @@ pub fn load_farmland_maintainers(
     .context("cannot resolve farmland maintenance tag")
 }
 
+/// Active data-pack overrides used by SnowLayerBlock.canSurvive.
+#[derive(Clone, Debug)]
+pub struct SnowSupportTags {
+    cannot: BTreeSet<String>,
+    can: BTreeSet<String>,
+}
+
+impl SnowSupportTags {
+    pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
+        let cannot = ResourceId::parse("minecraft:cannot_support_snow_layer")?;
+        let can = ResourceId::parse("minecraft:support_override_snow_layer")?;
+        let mut raw = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        for id in [&cannot, &can] {
+            read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
+        }
+        let mut cache = BTreeMap::new();
+        Ok(Self {
+            cannot: resolve(&cannot, &raw, registry, &mut cache, &mut BTreeSet::new())
+                .context("cannot resolve snow exclusion tag")?,
+            can: resolve(&can, &raw, registry, &mut cache, &mut BTreeSet::new())
+                .context("cannot resolve snow support tag")?,
+        })
+    }
+
+    /// Java checks the exclusion tag first when a block belongs to both.
+    pub fn support_override(&self, block: &str) -> Option<bool> {
+        if self.cannot.contains(block) {
+            Some(false)
+        } else if self.can.contains(block) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
 impl RespawnBlockTags {
     pub fn load(provider: &mut impl ResourceProvider, registry: BTreeSet<String>) -> Result<Self> {
         ensure!(!registry.is_empty(), "block registry is empty");
@@ -292,6 +329,49 @@ mod tests {
             load_farmland_maintainers(&mut provider, &registry).unwrap(),
             BTreeSet::from(["minecraft:stone".into()])
         );
+    }
+
+    #[test]
+    fn snow_support_tags_apply_pack_replacement_and_exclusion_first() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/cannot_support_snow_layer.json".into(),
+                vec![
+                    br#"{"values":["minecraft:dirt"]}"#.to_vec(),
+                    br#"{"replace":true,"values":["minecraft:stone"]}"#.to_vec(),
+                ],
+            ),
+            (
+                "data/minecraft/tags/block/support_override_snow_layer.json".into(),
+                vec![br##"{"values":["#minecraft:extra_snow"]}"##.to_vec()],
+            ),
+            (
+                "data/minecraft/tags/block/extra_snow.json".into(),
+                vec![br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from([
+            "minecraft:stone".into(),
+            "minecraft:dirt".into(),
+            "minecraft:air".into(),
+        ]);
+        let tags = SnowSupportTags::load(&mut provider, &registry).unwrap();
+        assert_eq!(tags.support_override("minecraft:stone"), Some(false));
+        assert_eq!(tags.support_override("minecraft:dirt"), Some(true));
+        assert_eq!(tags.support_override("minecraft:air"), None);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_snow_support_tags_load() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = source.vanilla_block_ids().unwrap();
+        let tags = SnowSupportTags::load(&mut source, &registry).unwrap();
+        assert_eq!(tags.support_override("minecraft:ice"), Some(false));
+        assert_eq!(tags.support_override("minecraft:stone"), None);
     }
 
     #[test]

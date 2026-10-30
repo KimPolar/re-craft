@@ -4361,7 +4361,7 @@ public class ItemMotionOracle {
         });
         output.add(afterReturn);
         JsonArray supportResults = new JsonArray();
-        for (double half : new double[]{0.125,0.25}) for (int mode=0;mode<2;mode++) for (double x : new double[]{0.8,0.9,1.0,1.02,1.12,1.2}) {
+        for (double half : new double[]{0.125,0.25,(double)0.3f}) for (int mode=0;mode<2;mode++) for (double x : new double[]{0.8,0.9,1.0,1.02,1.12,1.2}) {
             var world = (TestLevel)unsafe.allocateInstance(TestLevel.class);
             world.supportGrid=true; world.twoBlocks=mode==1;
             var item = (TestItem)unsafe.allocateInstance(TestItem.class); item.world=world;
@@ -4602,7 +4602,7 @@ public class ItemMotionOracle {
         assert_eq!(order, returned_order);
         let support_results = expected[cases.len() + 5].as_array().unwrap();
         let mut support_index = 0;
-        for half in [0.125, 0.25] {
+        for half in [0.125, 0.25, f64::from(crate::PLAYER_HALF_WIDTH)] {
             for mode in 0..2 {
                 for x in [0.8, 0.9, 1.0, 1.02, 1.12, 1.2] {
                     let support = movement::supporting_box(

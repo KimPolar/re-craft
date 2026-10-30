@@ -170,6 +170,8 @@ pub struct LoadedSession {
     swimming: bool,
     fall_distance: f64,
     ground_without_support: bool,
+    // Absolute coordinates survive streaming origin changes.
+    ground_support: Option<IVec3>,
     fall: crate::fall::FallTracker,
     accumulated: Duration,
     tick: u64,
@@ -531,6 +533,8 @@ impl LoadedSession {
             return Err("invalid saved player motion");
         }
         self.motion.position = position;
+        self.ground_support = None;
+        self.ground_without_support = false;
         self.motion.velocity = saved.velocity;
         self.motion.on_ground = saved.on_ground;
         self.fall_distance = saved.fall_distance;
@@ -1118,6 +1122,7 @@ impl LoadedSession {
             swimming: false,
             fall_distance: 0.0,
             ground_without_support: false,
+            ground_support: None,
             fall: crate::fall::FallTracker::default(),
             accumulated: Duration::ZERO,
             tick: 0,
@@ -2660,6 +2665,7 @@ impl LoadedSession {
         self.swimming = false;
         self.fall_distance = 0.0;
         self.ground_without_support = false;
+        self.ground_support = None;
         self.fall.reset_after_death();
         self.breathing_effects = crate::survival::BreathingEffects::default();
         if let Some((attribute, _)) = &mut self.oxygen_equipment {
@@ -3266,14 +3272,19 @@ impl LoadedSession {
     }
 
     fn friction_below(&self) -> f32 {
-        let pos = self.motion.position - DVec3::Y * f64::from(0.500001_f32);
-        match cell(
-            &self.world,
-            self.origin,
-            self.bounds,
-            pos.floor().as_ivec3(),
-            self.states[0],
-        ) {
+        let support = self
+            .ground_support
+            .and_then(|absolute| subtract(absolute, self.origin));
+        let pos =
+            crate::movement::movement_on_block(self.motion.position, support, |pos| {
+                match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+                    Cell::State(id) => self.world.state(id).is_some_and(|state| {
+                        state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                    }),
+                    Cell::Missing => false,
+                }
+            });
+        match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
             Cell::State(id) => self
                 .world
                 .state(id)
@@ -5587,6 +5598,7 @@ impl LoadedSession {
                 block_shape,
             );
             self.ground_without_support = support.is_none();
+            self.ground_support = support.and_then(|relative| add(self.origin, relative));
             let legacy = crate::movement::legacy_on_block(self.motion.position, support, |pos| {
                 match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
                     Cell::State(id) => self.world.state(id).is_some_and(|state| {
@@ -5661,6 +5673,7 @@ impl LoadedSession {
             self.fall_distance = 0.0;
         } else {
             self.ground_without_support = false;
+            self.ground_support = None;
         }
         let block_shape = |cell_pos| match cell(
             &self.world,
@@ -6827,6 +6840,41 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn player_friction_tracks_support_at_edges_and_across_rebase() {
+        let mut session = session();
+        let ice = session.intern_block(state("minecraft:ice", &[]));
+        assert!(session.set(IVec3::new(4, 0, 4), ice));
+        assert!(session.set(IVec3::new(5, 0, 4), session.states[0]));
+        session.motion.position = DVec3::new(5.05, 1.0, 4.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = false;
+        session.update(TICK * 2);
+        assert!(session.motion.on_ground);
+        assert_eq!(
+            session.ground_support,
+            Some(session.origin + IVec3::new(4, 0, 4))
+        );
+        assert_eq!(session.friction_below(), 0.98);
+        session.motion.velocity.z = 0.1;
+        session.update(TICK);
+        let expected = 0.1 * f64::from(0.98_f32 * 0.91_f32);
+        assert!((session.motion.velocity.z - expected).abs() < 1.0e-10);
+
+        let slime = session.intern_block(state("minecraft:slime_block", &[]));
+        assert!(session.set(IVec3::new(4, 0, 4), slime));
+        assert_eq!(session.friction_below(), 0.8);
+        assert!(session.set(IVec3::new(4, 0, 4), ice));
+
+        let support = session.ground_support;
+        session.origin.x += 16;
+        session.motion.position.x -= 16.0;
+        assert_eq!(session.ground_support, support);
+        assert_eq!(session.friction_below(), 0.98);
     }
 
     #[test]

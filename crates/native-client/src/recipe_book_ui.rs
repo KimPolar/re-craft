@@ -398,6 +398,9 @@ impl RecipeBookUi {
         button: ClickButton,
         use_max: bool,
     ) -> BookAction {
+        if matches!(menu, InventoryMenu::Chest { .. }) {
+            return BookAction::None;
+        }
         if self.open
             && let Some(overlay) = &self.overlay
         {
@@ -427,6 +430,7 @@ impl RecipeBookUi {
         let button_position = match menu {
             InventoryMenu::Player => (mx + 104, h / 2 - 22),
             InventoryMenu::CraftingTable { .. } => (mx + 5, h / 2 - 49),
+            InventoryMenu::Chest { .. } => unreachable!("handled above"),
         };
         if button == ClickButton::Primary
             && !(self.open && w < 379)

@@ -44,6 +44,7 @@ pub struct MenuAssets {
     pub hud: HudSprites,
     pub inventory: RgbaImage,
     pub crafting_table: RgbaImage,
+    pub chest: RgbaImage,
     pub recipe_book_button: RgbaImage,
     pub recipe_book_button_highlighted: RgbaImage,
     pub recipe_book: RecipeBookAssets,
@@ -378,6 +379,34 @@ impl MenuAssets {
             crafting_image.height() * 166 / 256,
         )
         .to_image();
+        let chest_image = image("assets/minecraft/textures/gui/container/generic_54.png")?;
+        ensure!(
+            chest_image.width() >= 256 && chest_image.height() >= 256,
+            "Invalid chest texture"
+        );
+        let width = chest_image.width() * 176 / 256;
+        let top = chest_image.height() * 71 / 256;
+        let bottom = chest_image.height() * 96 / 256;
+        let mut chest = RgbaImage::new(width, top + bottom);
+        image::imageops::replace(
+            &mut chest,
+            &image::imageops::crop_imm(&chest_image, 0, 0, width, top).to_image(),
+            0,
+            0,
+        );
+        image::imageops::replace(
+            &mut chest,
+            &image::imageops::crop_imm(
+                &chest_image,
+                0,
+                chest_image.height() * 126 / 256,
+                width,
+                bottom,
+            )
+            .to_image(),
+            0,
+            top as i64,
+        );
         let recipe_book_button =
             image("assets/minecraft/textures/gui/sprites/recipe_book/button.png")?;
         let recipe_book_button_highlighted =
@@ -555,6 +584,7 @@ impl MenuAssets {
             hud,
             inventory,
             crafting_table,
+            chest,
             recipe_book_button,
             recipe_book_button_highlighted,
             recipe_book,

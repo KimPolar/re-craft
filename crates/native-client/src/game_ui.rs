@@ -260,7 +260,8 @@ impl GameUi {
     }
 
     pub fn recipe_book_captures_text(&self) -> bool {
-        self.recipe_book.captures_text()
+        !matches!(self.inventory_menu, Some(InventoryMenu::Chest { .. }))
+            && self.recipe_book.captures_text()
     }
     pub fn recipe_book_backspace(&mut self) {
         self.recipe_book.backspace();
@@ -1333,6 +1334,16 @@ impl GameUi {
         let scale = gui_scale(self.size.0, self.size.1).max(1);
         let w = (self.size.0 / scale) as i32;
         let h = (self.size.1 / scale) as i32;
+        if matches!(self.inventory_menu, Some(InventoryMenu::Chest { .. })) {
+            let (x, y) = ((w - 176) / 2, (h - 168) / 2);
+            return !Rect {
+                x,
+                y,
+                w: 176,
+                h: 168,
+            }
+            .contains(self.cursor.0, self.cursor.1);
+        }
         inventory_outside_at(self.size, self.cursor, self.recipe_book.is_open())
             && !self.recipe_book.contains(w, h, self.cursor)
     }
@@ -1401,6 +1412,7 @@ impl GameUi {
         let (x, y) = match menu {
             InventoryMenu::Player => (x + 104, y + 61),
             InventoryMenu::CraftingTable { .. } => (x + 5, y + 34),
+            InventoryMenu::Chest { .. } => return false,
         };
         Rect { x, y, w: 20, h: 18 }.contains(self.cursor.0, self.cursor.1)
     }
@@ -1693,19 +1705,25 @@ impl GameUi {
         }
         if let Some(menu) = inventory.menu() {
             canvas.fill(Rect { x: 0, y: 0, w, h }, [0, 0, 0, 100]);
-            let book_open = self.recipe_book.is_open();
-            let (x, y) = inventory_origin(w, h, book_open);
+            let chest_menu = matches!(menu, InventoryMenu::Chest { .. });
+            let book_open = !chest_menu && self.recipe_book.is_open();
+            let (x, y) = if chest_menu {
+                ((w - 176) / 2, (h - 168) / 2)
+            } else {
+                inventory_origin(w, h, book_open)
+            };
             if !(book_open && w < 379) {
                 canvas.image(
                     match menu {
                         InventoryMenu::Player => &assets.inventory,
                         InventoryMenu::CraftingTable { .. } => &assets.crafting_table,
+                        InventoryMenu::Chest { .. } => &assets.chest,
                     },
                     Rect {
                         x,
                         y,
                         w: 176,
-                        h: 166,
+                        h: if chest_menu { 167 } else { 166 },
                     },
                 );
                 if player_menu {
@@ -1729,6 +1747,21 @@ impl GameUi {
                         x + 97,
                         y + 8,
                         assets.translate("container.crafting", "Crafting"),
+                        [64, 64, 64],
+                    );
+                } else if chest_menu {
+                    canvas.text_without_shadow(
+                        Some(assets),
+                        x + 8,
+                        y + 6,
+                        assets.translate("container.chest", "Chest"),
+                        [64, 64, 64],
+                    );
+                    canvas.text_without_shadow(
+                        Some(assets),
+                        x + 8,
+                        y + 74,
+                        assets.translate("container.inventory", "Inventory"),
                         [64, 64, 64],
                     );
                 } else {
@@ -1758,16 +1791,19 @@ impl GameUi {
                     w: 20,
                     h: 18,
                 };
-                canvas.image(
-                    if button.contains(self.cursor.0, self.cursor.1) {
-                        &assets.recipe_book_button_highlighted
-                    } else {
-                        &assets.recipe_book_button
-                    },
-                    button,
-                );
+                if !chest_menu {
+                    canvas.image(
+                        if button.contains(self.cursor.0, self.cursor.1) {
+                            &assets.recipe_book_button_highlighted
+                        } else {
+                            &assets.recipe_book_button
+                        },
+                        button,
+                    );
+                }
                 for index in 0..36_u8 {
-                    let (sx, sy) = storage_slot_position(index);
+                    let (sx, sy) =
+                        menu_slot_position(PlayerSlot::Storage(index), menu).expect("storage slot");
                     inventory_slot_icon(
                         &mut canvas,
                         assets,
@@ -1778,7 +1814,13 @@ impl GameUi {
                         quick_preview.as_ref(),
                     );
                 }
-                let crafting_len = if player_menu { 4 } else { 9 };
+                let crafting_len = if chest_menu {
+                    0
+                } else if player_menu {
+                    4
+                } else {
+                    9
+                };
                 for index in 0..crafting_len {
                     let (sx, sy) = menu_slot_position(PlayerSlot::Crafting(index), menu)
                         .expect("crafting slot");
@@ -1799,6 +1841,21 @@ impl GameUi {
                             x + 8,
                             y + 8 + i32::from(index) * 18,
                             item,
+                        );
+                    }
+                }
+                if chest_menu {
+                    for index in 0..27_u8 {
+                        let slot = PlayerSlot::Chest(index);
+                        let (sx, sy) = menu_slot_position(slot, menu).expect("chest slot");
+                        inventory_slot_icon(
+                            &mut canvas,
+                            assets,
+                            &mut self.held_models,
+                            (x + sx, y + sy),
+                            inventory,
+                            slot,
+                            quick_preview.as_ref(),
                         );
                     }
                 }
@@ -1825,7 +1882,7 @@ impl GameUi {
                         quick_preview.as_ref(),
                     );
                 }
-                if let Some((recipe, recipes)) = self.recipe_book.ghost(inventory) {
+                if !chest_menu && let Some((recipe, recipes)) = self.recipe_book.ghost(inventory) {
                     let width = if player_menu { 2 } else { 3 };
                     if let Some(layout) = recipe.book_layout(width, width) {
                         for (index, ingredient) in layout.iter().enumerate() {
@@ -1898,13 +1955,15 @@ impl GameUi {
                     );
                 }
             }
-            self.recipe_book.draw(
-                &mut canvas,
-                assets,
-                &mut self.held_models,
-                self.cursor,
-                tick,
-            );
+            if !chest_menu {
+                self.recipe_book.draw(
+                    &mut canvas,
+                    assets,
+                    &mut self.held_models,
+                    self.cursor,
+                    tick,
+                );
+            }
             let cursor_item = quick_preview
                 .as_ref()
                 .map_or_else(|| inventory.cursor(), |preview| preview.carried.as_ref());
@@ -2415,12 +2474,16 @@ fn player_slot_position(slot: PlayerSlot) -> (i32, i32) {
         PlayerSlot::CraftResult => (154, 28),
         PlayerSlot::Armor(index) => (8, 8 + i32::from(index) * 18),
         PlayerSlot::Offhand => (77, 62),
+        PlayerSlot::Chest(_) => unreachable!("chest slots are not in the player menu"),
     }
 }
 
 fn menu_slot_position(slot: PlayerSlot, menu: InventoryMenu) -> Option<(i32, i32)> {
     match menu {
-        InventoryMenu::Player => Some(player_slot_position(slot)),
+        InventoryMenu::Player if !matches!(slot, PlayerSlot::Chest(_)) => {
+            Some(player_slot_position(slot))
+        }
+        InventoryMenu::Player => None,
         InventoryMenu::CraftingTable { .. } => match slot {
             PlayerSlot::Storage(index) if index < 36 => Some(storage_slot_position(index)),
             PlayerSlot::Crafting(index) if index < 9 => Some((
@@ -2428,6 +2491,17 @@ fn menu_slot_position(slot: PlayerSlot, menu: InventoryMenu) -> Option<(i32, i32
                 17 + i32::from(index / 3) * 18,
             )),
             PlayerSlot::CraftResult => Some((124, 35)),
+            _ => None,
+        },
+        InventoryMenu::Chest { .. } => match slot {
+            PlayerSlot::Chest(index) if index < 27 => Some((
+                8 + i32::from(index % 9) * 18,
+                18 + i32::from(index / 9) * 18,
+            )),
+            PlayerSlot::Storage(index) if index < 36 => {
+                let (x, y) = storage_slot_position(index);
+                Some((x, y + 1))
+            }
             _ => None,
         },
     }
@@ -2445,16 +2519,22 @@ fn inventory_slot_at(
     let scale = gui_scale(size.0, size.1);
     let w = (size.0 / scale) as i32;
     let h = (size.1 / scale) as i32;
+    let book_open = book_open && !matches!(menu, InventoryMenu::Chest { .. });
     if book_open && w < 379 {
         return None;
     }
-    let origin = inventory_origin(w, h, book_open);
+    let origin = if matches!(menu, InventoryMenu::Chest { .. }) {
+        ((w - 176) / 2, (h - 168) / 2)
+    } else {
+        inventory_origin(w, h, book_open)
+    };
     (0..36)
         .map(PlayerSlot::Storage)
         .chain((0..9).map(PlayerSlot::Crafting))
         .chain(std::iter::once(PlayerSlot::CraftResult))
         .chain((0..4).map(PlayerSlot::Armor))
         .chain(std::iter::once(PlayerSlot::Offhand))
+        .chain((0..27).map(PlayerSlot::Chest))
         .find(|&slot| {
             if matches!(menu, InventoryMenu::Player) && matches!(slot, PlayerSlot::Crafting(4..)) {
                 return false;
@@ -3783,6 +3863,62 @@ mod inventory_tests {
             inventory_slot_at(size, (origin.0 + 7, origin.1 + 42), menu, false),
             None
         );
+    }
+
+    #[test]
+    fn single_chest_slots_use_vanilla_coordinates_even_with_recipe_book_open() {
+        let size = (1280, 720);
+        let menu = InventoryMenu::Chest {
+            position: glam::IVec3::ZERO,
+        };
+        let origin = ((1280 / 3 - 176) / 2, (720 / 3 - 168) / 2);
+        for slot in (0..27)
+            .map(PlayerSlot::Chest)
+            .chain((0..36).map(PlayerSlot::Storage))
+        {
+            let (x, y) = menu_slot_position(slot, menu).unwrap();
+            assert_eq!(
+                inventory_slot_at(size, (origin.0 + x + 8, origin.1 + y + 8), menu, true),
+                Some(slot)
+            );
+        }
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Chest(0), menu),
+            Some((8, 18))
+        );
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Chest(26), menu),
+            Some((152, 54))
+        );
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Storage(9), menu),
+            Some((8, 85))
+        );
+        assert_eq!(
+            menu_slot_position(PlayerSlot::Storage(0), menu),
+            Some((8, 143))
+        );
+        assert_eq!(menu_slot_position(PlayerSlot::CraftResult, menu), None);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn single_chest_composes_using_vanilla_texture() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut inventory = PlayerInventory::demo();
+        assert!(inventory.open_chest(glam::IVec3::ZERO, std::array::from_fn(|_| None)));
+        let canvas = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert_eq!((canvas.width, canvas.height), (426, 240));
+        let origin = ((canvas.width - 176) / 2, (canvas.height - 168) / 2);
+        let pixel =
+            |x: i32, y: i32| canvas.pixels[((origin.1 + y) * canvas.width + origin.0 + x) as usize];
+        assert_ne!(pixel(4, 4) & 0x00ff_ffff, 0);
+        assert_eq!(pixel(8, 18), pixel(26, 18));
+        assert!(!ui.recipe_book_captures_text());
     }
 
     #[test]

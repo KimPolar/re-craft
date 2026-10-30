@@ -251,6 +251,8 @@ pub enum PlayerSlot {
     CraftResult,
     Armor(u8),
     Offhand,
+    /// Slot in the open single chest.
+    Chest(u8),
 }
 
 fn armor_slot(index: u8) -> Option<EquipmentSlot> {
@@ -270,6 +272,15 @@ pub enum InventoryMenu {
     CraftingTable {
         position: IVec3,
     },
+    Chest {
+        position: IVec3,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ChestInventory {
+    position: IVec3,
+    slots: [Option<ItemStack>; 27],
 }
 
 /// The player's saved recipe-book state; unknown recipe IDs remain preserved.
@@ -329,6 +340,7 @@ pub struct PlayerInventory {
     craft_result: Option<ItemStack>,
     armor: [Option<ItemStack>; 4],
     offhand: Option<ItemStack>,
+    chest: Option<ChestInventory>,
     cursor: Option<ItemStack>,
     selected: u8,
     menu: Option<InventoryMenu>,
@@ -355,6 +367,7 @@ impl Default for PlayerInventory {
             craft_result: None,
             armor: std::array::from_fn(|_| None),
             offhand: None,
+            chest: None,
             cursor: None,
             selected: 0,
             menu: None,
@@ -559,6 +572,10 @@ impl PlayerInventory {
             PlayerSlot::CraftResult => self.craft_result.as_ref(),
             PlayerSlot::Armor(index) => self.armor.get(index as usize)?.as_ref(),
             PlayerSlot::Offhand => self.offhand.as_ref(),
+            PlayerSlot::Chest(index) if matches!(self.menu, Some(InventoryMenu::Chest { .. })) => {
+                self.chest.as_ref()?.slots.get(index as usize)?.as_ref()
+            }
+            PlayerSlot::Chest(_) => None,
         }
     }
 
@@ -573,6 +590,7 @@ impl PlayerInventory {
             && self.crafting.iter().all(Option::is_none)
             && self.craft_result.is_none()
             && self.pointer.is_none()
+            && self.chest.is_none()
     }
     pub fn selected(&self) -> u8 {
         self.selected
@@ -698,6 +716,9 @@ impl PlayerInventory {
                     && self.armor_can_accept(index, carried)
             }
             PlayerSlot::CraftResult => false,
+            PlayerSlot::Chest(index) => {
+                matches!(self.menu, Some(InventoryMenu::Chest { .. })) && index < 27
+            }
         };
         if !valid || !basic_pickup_supported(carried) {
             return false;
@@ -847,10 +868,42 @@ impl PlayerInventory {
         }
     }
     fn crafting_len(&self) -> usize {
-        self.crafting_width().pow(2)
+        if matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
+            0
+        } else {
+            self.crafting_width().pow(2)
+        }
+    }
+    /// Open a chest whose contents have been loaded by the session. A closed
+    /// chest must be taken by its owner before another one can be opened.
+    pub fn open_chest(&mut self, position: IVec3, slots: [Option<ItemStack>; 27]) -> bool {
+        if self.is_open()
+            || self.chest.is_some()
+            || self.cursor.is_some()
+            || self.crafting.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        self.chest = Some(ChestInventory { position, slots });
+        self.menu = Some(InventoryMenu::Chest { position });
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+    /// Return the chest to the session after closing, including on death.
+    pub fn take_closed_chest(&mut self) -> Option<(IVec3, [Option<ItemStack>; 27])> {
+        if self.is_open() {
+            return None;
+        }
+        let chest = self.chest.take()?;
+        self.revision = self.revision.wrapping_add(1);
+        Some((chest.position, chest.slots))
     }
     pub fn open_crafting_table(&mut self, position: IVec3) -> bool {
-        if self.is_open() || self.cursor.is_some() || self.crafting.iter().any(Option::is_some) {
+        if self.is_open()
+            || self.chest.is_some()
+            || self.cursor.is_some()
+            || self.crafting.iter().any(Option::is_some)
+        {
             return false;
         }
         self.menu = Some(InventoryMenu::CraftingTable { position });
@@ -960,6 +1013,10 @@ impl PlayerInventory {
                 self.armor.get_mut(index as usize)
             }
             PlayerSlot::Armor(_) | PlayerSlot::CraftResult => None,
+            PlayerSlot::Chest(index) if matches!(self.menu, Some(InventoryMenu::Chest { .. })) => {
+                self.chest.as_mut()?.slots.get_mut(index as usize)
+            }
+            PlayerSlot::Chest(_) => None,
         }
     }
 
@@ -1027,6 +1084,8 @@ impl PlayerInventory {
         if !matches!(source, PlayerSlot::Storage(0..=35) | PlayerSlot::Offhand)
             && !matches!(source, PlayerSlot::Crafting(index) if (index as usize) < self.crafting_len())
             && !matches!(source, PlayerSlot::Armor(0..=3))
+            && !(matches!(self.menu, Some(InventoryMenu::Chest { .. }))
+                && matches!(source, PlayerSlot::Chest(0..=26)))
         {
             return None;
         }
@@ -1305,6 +1364,9 @@ impl PlayerInventory {
     /// is returned to the session so it can be spawned as item entities.
     pub fn toggle_with_drops(&mut self) -> Option<Vec<ItemStack>> {
         if !self.is_open() {
+            if self.chest.is_some() {
+                return None;
+            }
             self.menu = Some(InventoryMenu::Player);
             self.revision = self.revision.wrapping_add(1);
             return Some(Vec::new());
@@ -1491,6 +1553,11 @@ impl PlayerInventory {
         if !self.is_open() || self.cursor.is_some() {
             return None;
         }
+        if !matches!(self.menu, Some(InventoryMenu::Player))
+            && matches!(slot, PlayerSlot::Offhand | PlayerSlot::Armor(_))
+        {
+            return None;
+        }
         if let PlayerSlot::Armor(index) = slot
             && (!matches!(self.menu, Some(InventoryMenu::Player))
                 || !self.can_take_equipment(self.armor.get(index as usize)?.as_ref(), creative))
@@ -1507,6 +1574,10 @@ impl PlayerInventory {
             PlayerSlot::Offhand => Some(&mut self.offhand),
             PlayerSlot::Armor(index) => self.armor.get_mut(index as usize),
             PlayerSlot::CraftResult => None,
+            PlayerSlot::Chest(index) if matches!(self.menu, Some(InventoryMenu::Chest { .. })) => {
+                self.chest.as_mut()?.slots.get_mut(index as usize)
+            }
+            PlayerSlot::Chest(_) => None,
         }?;
         let item = split_supported(target, all)?;
         self.revision = self.revision.wrapping_add(1);
@@ -1535,6 +1606,12 @@ impl PlayerInventory {
             PlayerSlot::CraftResult => None,
             PlayerSlot::Armor(index) => self.armor.get_mut(index as usize),
             PlayerSlot::Offhand => Some(&mut self.offhand),
+            PlayerSlot::Chest(index) if matches!(self.menu, Some(InventoryMenu::Chest { .. })) => {
+                self.chest
+                    .as_mut()
+                    .and_then(|chest| chest.slots.get_mut(index as usize))
+            }
+            PlayerSlot::Chest(_) => None,
         };
         let Some(target) = target else {
             return false;
@@ -1593,6 +1670,12 @@ impl PlayerInventory {
             PlayerSlot::CraftResult => None,
             PlayerSlot::Offhand => Some(&mut self.offhand),
             PlayerSlot::Armor(index) => self.armor.get_mut(index as usize),
+            PlayerSlot::Chest(index) if matches!(self.menu, Some(InventoryMenu::Chest { .. })) => {
+                self.chest
+                    .as_mut()
+                    .and_then(|chest| chest.slots.get_mut(index as usize))
+            }
+            PlayerSlot::Chest(_) => None,
         };
         let Some(target) = target else {
             return false;
@@ -1625,6 +1708,9 @@ impl PlayerInventory {
         if !self.is_open() {
             return false;
         }
+        if matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
+            return self.quick_move_chest(slot);
+        }
         let table = matches!(self.menu, Some(InventoryMenu::CraftingTable { .. }));
         if table && matches!(slot, PlayerSlot::Offhand | PlayerSlot::Armor(_)) {
             return false;
@@ -1647,6 +1733,7 @@ impl PlayerInventory {
             PlayerSlot::CraftResult => None,
             PlayerSlot::Offhand => Some(&mut self.offhand),
             PlayerSlot::Armor(index) => self.armor.get_mut(index as usize),
+            PlayerSlot::Chest(_) => None,
         };
         let Some(source) = source else {
             return false;
@@ -1706,6 +1793,7 @@ impl PlayerInventory {
                 (9..36).chain(0..9).collect()
             }
             PlayerSlot::CraftResult => unreachable!(),
+            PlayerSlot::Chest(_) => unreachable!(),
         };
         let craft_indexes: Vec<usize> = (0..crafting_len).collect();
         loop {
@@ -1723,6 +1811,7 @@ impl PlayerInventory {
             PlayerSlot::Offhand => &mut self.offhand,
             PlayerSlot::Armor(index) => &mut self.armor[index as usize],
             PlayerSlot::CraftResult => unreachable!(),
+            PlayerSlot::Chest(_) => unreachable!(),
         };
         let changed = item.count != before;
         *source = (item.count != 0).then_some(item);
@@ -1732,8 +1821,47 @@ impl PlayerInventory {
         changed
     }
 
+    fn quick_move_chest(&mut self, slot: PlayerSlot) -> bool {
+        let Some(chest) = self.chest.as_mut() else {
+            return false;
+        };
+        let (source, destination, indexes): (
+            &mut Option<ItemStack>,
+            &mut [Option<ItemStack>],
+            Vec<usize>,
+        ) = match slot {
+            PlayerSlot::Chest(index) if index < 27 => (
+                &mut chest.slots[index as usize],
+                &mut self.storage,
+                (0..9).rev().chain((9..36).rev()).collect(),
+            ),
+            PlayerSlot::Storage(index) if index < 36 => (
+                &mut self.storage[index as usize],
+                &mut chest.slots,
+                (0..27).collect(),
+            ),
+            _ => return false,
+        };
+        let Some(mut item) = source.take() else {
+            return false;
+        };
+        if !basic_pickup_supported(&item) {
+            *source = Some(item);
+            return false;
+        }
+        let changed = move_stack_to(destination, &indexes, &mut item);
+        *source = (item.count != 0).then_some(item);
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
+    }
+
     /// Refresh a result only where input and output item behavior is known.
     pub fn refresh_crafting(&mut self, recipes: &CraftingRecipes) {
+        if matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
+            return;
+        }
         let width = self.crafting_width();
         let grid = &self.crafting[..width * width];
         let safe = grid
@@ -1775,7 +1903,10 @@ impl PlayerInventory {
         recipes: &CraftingRecipes,
         use_max: bool,
     ) -> RecipeBookPlacement {
-        if !self.is_open() || !self.recipe_book.known.contains(&recipe.id) {
+        if !self.is_open()
+            || matches!(self.menu, Some(InventoryMenu::Chest { .. }))
+            || !self.recipe_book.known.contains(&recipe.id)
+        {
             return RecipeBookPlacement::Unchanged;
         }
         let width = self.crafting_width();
@@ -1896,7 +2027,7 @@ impl PlayerInventory {
 
     /// A vanilla result slot yields the whole output even for a secondary click.
     pub fn take_crafting_result(&mut self, recipes: &CraftingRecipes) -> bool {
-        if !self.is_open() {
+        if !self.is_open() || matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
             return false;
         }
         self.refresh_crafting(recipes);
@@ -1934,7 +2065,7 @@ impl PlayerInventory {
     /// Shift-click the result of an open crafting menu, including partial
     /// output that vanilla drops when the inventory cannot accept it all.
     pub fn quick_crafting_result(&mut self, recipes: &CraftingRecipes) -> Option<Vec<ItemStack>> {
-        if !self.is_open() {
+        if !self.is_open() || matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
             return None;
         }
         self.refresh_crafting(recipes);
@@ -3323,6 +3454,27 @@ mod tests {
 
     fn stack(id: &str, count: u32) -> Option<ItemStack> {
         ItemStack::new(id.into(), count, 64, Tag::Compound(vec![]))
+    }
+
+    #[test]
+    fn chest_clicks_and_close_preserve_contents_until_returned() {
+        let mut inventory = PlayerInventory::default();
+        let mut chest = std::array::from_fn(|_| None);
+        chest[0] = stack("minecraft:stone", 8);
+        let position = IVec3::new(2, 64, -3);
+        assert!(inventory.open_chest(position, chest));
+        assert!(inventory.click(PlayerSlot::Chest(0), ClickButton::Secondary));
+        assert_eq!(inventory.cursor().unwrap().count(), 4);
+        assert!(inventory.click(PlayerSlot::Storage(3), ClickButton::Primary));
+        assert_eq!(inventory.slot(PlayerSlot::Storage(3)).unwrap().count(), 4);
+        assert!(inventory.toggle());
+        assert!(!inventory.ready_for_player_save());
+        assert!(!inventory.open_chest(position, std::array::from_fn(|_| None)));
+        assert!(!inventory.toggle());
+        let (returned_position, slots) = inventory.take_closed_chest().unwrap();
+        assert_eq!(returned_position, position);
+        assert_eq!(slots[0].as_ref().unwrap().count(), 4);
+        assert!(inventory.ready_for_player_save());
     }
 
     #[test]

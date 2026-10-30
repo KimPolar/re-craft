@@ -218,6 +218,21 @@ public class InventoryOracle {
                 for(int i=0;i<9;i++) craft.add(output(menu.getSlot(1+i).getItem()));
                 result.add(slots); result.add(craft); results.add(result); continue;
             }
+            if (input.has("chestMove")) {
+                var spec=input.getAsJsonObject("chestMove");
+                player.testInventory=new Inventory(player,new EntityEquipment());
+                for(int i=0;i<36;i++) player.testInventory.setItem(i,stack(spec.getAsJsonArray("slots").get(i).getAsJsonArray()));
+                var contents=new SimpleContainer(27);
+                for(int i=0;i<27;i++) contents.setItem(i,stack(spec.getAsJsonArray("chest").get(i).getAsJsonArray()));
+                var menu=net.minecraft.world.inventory.ChestMenu.threeRows(0,player.testInventory,contents);
+                int source=spec.get("source").getAsInt();
+                int slot=source>=36 ? source-36 : source<9 ? 54+source : 27+source-9;
+                menu.clicked(slot,0,ContainerInput.QUICK_MOVE,player);
+                JsonArray result=new JsonArray(), slots=new JsonArray(), chest=new JsonArray();
+                for(int i=0;i<36;i++) slots.add(output(player.testInventory.getItem(i)));
+                for(int i=0;i<27;i++) chest.add(output(contents.getItem(i)));
+                result.add(slots); result.add(chest); results.add(result); continue;
+            }
             if (input.has("tableResult")) {
                 var spec=input.getAsJsonObject("tableResult");
                 player.testInventory=new Inventory(player,new EntityEquipment());
@@ -946,6 +961,93 @@ fn craft_result_shortcut_matches_vanilla_result_slot() {
         "Compared {} result-slot shortcuts with vanilla 26.3",
         cases.len()
     );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn chest_shift_clicks_match_vanilla() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let choices = [
+        [0, 0],
+        [1, 1],
+        [1, 32],
+        [1, 64],
+        [2, 8],
+        [2, 64],
+        [5, 63],
+        [6, 90],
+    ];
+    let mut cases = Vec::new();
+    for seed in 0..40_usize {
+        for source in (0..63).step_by(3) {
+            let mut slots: Vec<_> = (0..36)
+                .map(|i| choices[(seed * 7 + i * 3) % choices.len()])
+                .collect();
+            let mut chest: Vec<_> = (0..27)
+                .map(|i| choices[(seed * 5 + i * 7) % choices.len()])
+                .collect();
+            let item = choices[1 + seed % (choices.len() - 1)];
+            if source < 36 {
+                slots[source] = item;
+            } else {
+                chest[source - 36] = item;
+            }
+            cases.push(json!({"chestMove":{"slots":slots,"chest":chest,"source":source}}));
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source_file = temp.path().join("InventoryOracle.java");
+    let input = temp.path().join("input.json");
+    let output_file = temp.path().join("output.json");
+    std::fs::write(&source_file, ORACLE).unwrap();
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source_file));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("InventoryOracle")
+        .arg(&input)
+        .arg(&output_file));
+    let expected: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(output_file).unwrap()).unwrap();
+    assert_eq!(expected.len(), cases.len());
+    let parse = |value: &Value| {
+        stack([
+            value[0].as_u64().unwrap() as u32,
+            value[1].as_u64().unwrap() as u32,
+        ])
+    };
+    for (case, expected) in cases.iter().zip(&expected) {
+        let spec = &case["chestMove"];
+        let mut inventory = PlayerInventory::default();
+        let chest = std::array::from_fn(|i| parse(&spec["chest"][i]));
+        assert!(inventory.open_chest(glam::IVec3::ZERO, chest));
+        for (i, item) in spec["slots"].as_array().unwrap().iter().enumerate() {
+            inventory.set_slot(PlayerSlot::Storage(i as u8), parse(item));
+        }
+        let source = spec["source"].as_u64().unwrap() as u8;
+        inventory.quick_move(if source < 36 {
+            PlayerSlot::Storage(source)
+        } else {
+            PlayerSlot::Chest(source - 36)
+        });
+        let slots: Vec<_> = (0..36)
+            .map(|i| output(&inventory.slot(PlayerSlot::Storage(i)).cloned()))
+            .collect();
+        let chest: Vec<_> = (0..27)
+            .map(|i| output(&inventory.slot(PlayerSlot::Chest(i)).cloned()))
+            .collect();
+        assert_eq!(&json!([slots, chest]), expected, "case {case}");
+    }
 }
 
 #[test]

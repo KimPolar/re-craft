@@ -126,5 +126,19 @@ public class SavedItemOracle {
                 input.getDoubleOr("fall_distance",0)!=2.5 || input.getShortOr("Air",(short)0)!=280 || input.getIntOr("PortalCooldown",0)!=7)
                 throw new AssertionError("new item document differs from Java decoding");
         }
+        if (args.length > 3) {
+            var tag = NbtIo.read(Path.of(args[3]));
+            var input = TagValueInput.create(ProblemReporter.DISCARDING, registry, tag);
+            var item = (TestItem)unsafe.allocateInstance(TestItem.class); item.loadExtra(input);
+            var uuid = net.minecraft.core.UUIDUtil.CODEC.parse(NbtOps.INSTANCE,tag.get("UUID")).getOrThrow();
+            var rotation = input.read("Rotation",net.minecraft.world.phys.Vec2.CODEC).orElseThrow();
+            if (uuid.version()!=4 || uuid.variant()!=2 || rotation.x<0 || rotation.x>=360 || rotation.y!=0 ||
+                !input.read("Pos",net.minecraft.world.phys.Vec3.CODEC).orElseThrow().equals(new net.minecraft.world.phys.Vec3(2,63,-2)) ||
+                input.getDoubleOr("fall_distance",-1)!=0 || input.getShortOr("Air",(short)0)!=300 ||
+                input.getIntOr("PortalCooldown",-1)!=0 || age.getInt(item)!=0 || delay.getInt(item)!=10 ||
+                health.getInt(item)!=5 || item.getItem().getItem()!=Items.STONE || item.getItem().getCount()!=3 ||
+                tag.contains("Thrower") || tag.contains("Owner"))
+                throw new AssertionError("live-created item differs from initial Java item state");
+        }
     }
 }

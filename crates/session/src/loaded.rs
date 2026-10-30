@@ -1564,6 +1564,18 @@ impl LoadedSession {
         self.dropped_items.draft_saved_item(uuid)
     }
 
+    /// Prepare newly spawned, unticked items; world save coordination is separate.
+    pub fn draft_created_item_entities(
+        &self,
+        pos: ChunkPos,
+    ) -> anyhow::Result<Vec<crate::saved_item::CreatedItemDraft>> {
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
+        );
+        self.dropped_items.draft_created_items_in_chunk(pos)
+    }
+
     /// Draft a still-live restored falling entity by UUID. Chunk migration,
     /// removals, newly spawned entities and coordinated saving remain separate.
     pub fn draft_saved_falling_entity(

@@ -197,6 +197,8 @@ struct CreatedItemIdentity {
     uuid: Option<[i32; 4]>,
     origin: DVec3,
     thrower: CreatedThrower,
+    yaw: f32,
+    ticked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,13 +215,15 @@ pub(crate) enum PlayerDropOrigin {
 }
 
 impl CreatedItemIdentity {
-    fn new(origin: DVec3, thrower: CreatedThrower) -> Self {
+    fn new(origin: DVec3, thrower: CreatedThrower, yaw: f32) -> Self {
         let mut bytes = [0_u8; 16];
         let uuid = getrandom::fill(&mut bytes).ok().map(|_| uuid_v4(bytes));
         Self {
             uuid,
             origin,
             thrower,
+            yaw,
+            ticked: false,
         }
     }
 }
@@ -611,6 +615,85 @@ impl ItemEntities {
         Ok(None)
     }
 
+    /// Produce documents only for fresh entities whose base fields are still
+    /// known. A chunk transaction must separately validate UUIDs and effects.
+    pub(crate) fn draft_created_items_in_chunk(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> anyhow::Result<Vec<crate::saved_item::CreatedItemDraft>> {
+        use anyhow::{Context, ensure};
+        let mut result = Vec::new();
+        let mut seen = BTreeSet::new();
+        let positions = BTreeSet::from([pos]);
+        for entity in &self.entities {
+            let Some(created) = &entity.created else {
+                continue;
+            };
+            ensure!(
+                created.origin.is_finite() && entity.item.position.is_finite(),
+                "created item position is invalid"
+            );
+            let in_origin = Self::active_in(&positions, created.origin);
+            let in_current = Self::active_in(&positions, entity.item.position);
+            if !in_origin && !in_current {
+                continue;
+            }
+            ensure!(
+                in_origin && in_current,
+                "created item crossed a chunk boundary"
+            );
+            ensure!(
+                !created.ticked && entity.item.position == created.origin,
+                "created item base fields require tick simulation"
+            );
+            let uuid = created.uuid.context("created item UUID is unavailable")?;
+            ensure!(seen.insert(uuid), "duplicate created item UUID");
+            let CreatedThrower::Known(thrower) = created.thrower else {
+                anyhow::bail!("created item thrower is unknown")
+            };
+            let state = crate::saved_item::ItemSaveState {
+                position: entity.item.position,
+                velocity: entity.velocity,
+                on_ground: entity.on_ground,
+                no_gravity: entity.no_gravity,
+                age: entity
+                    .lifetime
+                    .try_into()
+                    .context("item age cannot be saved as a short")?,
+                pickup_delay: entity
+                    .pickup_delay
+                    .try_into()
+                    .context("pickup delay cannot be saved as a short")?,
+                health: entity
+                    ._damage_state
+                    .health
+                    .try_into()
+                    .context("item health cannot be saved as a short")?,
+                fire_ticks: entity
+                    ._damage_state
+                    .fire_ticks
+                    .try_into()
+                    .context("fire duration cannot be saved as a short")?,
+                invulnerable: entity._damage_state.invulnerable,
+                invulnerable_time: entity._damage_state.invulnerable_time,
+                stack: &entity.item.stack,
+            };
+            result.push(crate::saved_item::draft_created(
+                uuid,
+                entity.owner,
+                thrower,
+                crate::saved_item::CreatedItemBase {
+                    rotation: [created.yaw, 0.0],
+                    fall_distance: 0.0,
+                    air: 300,
+                    portal_cooldown: 0,
+                },
+                state,
+            )?);
+        }
+        Ok(result)
+    }
+
     fn draft_item_entity(entity: &ItemEntity) -> anyhow::Result<crate::saved_item::ItemDraft> {
         use anyhow::{Context, ensure};
         let source = entity
@@ -830,7 +913,7 @@ impl ItemEntities {
 
     pub fn spawn_saved(&mut self, saved: crate::saved_item::SavedItemState) {
         let position = saved.position;
-        let bob_offset = self.bob_offset();
+        let (bob_offset, _) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 position,
@@ -868,7 +951,7 @@ impl ItemEntities {
             0.2,
             self.random.next_double() * 0.2 - 0.1,
         );
-        let bob_offset = self.bob_offset();
+        let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 position,
@@ -887,6 +970,7 @@ impl ItemEntities {
             created: Some(CreatedItemIdentity::new(
                 position,
                 CreatedThrower::Known(None),
+                yaw,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -896,11 +980,14 @@ impl ItemEntities {
         self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
     }
 
-    fn bob_offset(&self) -> f32 {
+    fn item_visuals(&self) -> (f32, f32) {
         // Keep visual randomness independent of the incomplete loot/physics RNG.
         let mut seed = native_core::random::XoroshiroRandom::new(i64::from(self.next_id));
         let mut random = LegacyRandom::new(seed.next_long());
-        random.next_float() * std::f32::consts::PI * 2.0
+        (
+            random.next_float() * std::f32::consts::PI * 2.0,
+            random.next_float() * 360.0,
+        )
     }
 
     pub fn snapshot(&self) -> Arc<[DroppedItem]> {
@@ -929,7 +1016,7 @@ impl ItemEntities {
         let position = origin.as_dvec3()
             + feet
             + DVec3::Y * (f64::from(player.pose.eye_height()) - f64::from(0.3_f32));
-        let bob_offset = self.bob_offset();
+        let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 position,
@@ -948,6 +1035,7 @@ impl ItemEntities {
             created: Some(CreatedItemIdentity::new(
                 position,
                 CreatedThrower::Known(None),
+                yaw,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -988,7 +1076,7 @@ impl ItemEntities {
                 f64::from(player.pose.eye_height()) - f64::from(0.3_f32),
                 0.0,
             );
-        let bob_offset = self.bob_offset();
+        let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 position,
@@ -1014,6 +1102,7 @@ impl ItemEntities {
                     }
                     PlayerDropOrigin::ContainerReturn => CreatedThrower::Known(None),
                 },
+                yaw,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -1162,7 +1251,7 @@ impl ItemEntities {
                         (location, DVec3::new(vx, vy, vz))
                     }
                 };
-                let bob_offset = self.bob_offset();
+                let (bob_offset, yaw) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         position: location,
@@ -1181,6 +1270,7 @@ impl ItemEntities {
                     created: Some(CreatedItemIdentity::new(
                         location,
                         CreatedThrower::Known(None),
+                        yaw,
                     )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
@@ -1274,6 +1364,9 @@ impl ItemEntities {
             let entity = &mut self.entities[index];
             if !Self::active(active_chunks, entity.item.position) {
                 continue;
+            }
+            if let Some(created) = &mut entity.created {
+                created.ticked = true;
             }
             if entity._damage_state.invulnerable_time > 0 {
                 entity._damage_state.invulnerable_time -= 1;
@@ -1803,6 +1896,61 @@ mod tests {
                 CreatedThrower::Known(None)
             ]
         );
+    }
+
+    #[test]
+    fn created_item_draft_tracks_fresh_state_and_rejects_after_tick_or_unknown_thrower() {
+        use native_world::loaded::ChunkPos;
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(0.5, 70.0, 0.5), stack.clone());
+        let identity = items.entities[0].created.clone().unwrap();
+        let drafts = items.draft_created_items_in_chunk(pos).unwrap();
+        let saved = crate::saved_item::read(&drafts[0].document().value)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.uuid, identity.uuid);
+        assert_eq!(saved.position, identity.origin);
+        assert_eq!(saved.pickup_delay, 10);
+        assert_eq!(
+            drafts[0].document().value.get("Rotation"),
+            Some(&Tag::List {
+                element_type: native_persistence::nbt::TagType::Float,
+                values: vec![Tag::Float(identity.yaw), Tag::Float(0.0)],
+            })
+        );
+        items.tick(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            &mut Arc::new(PlayerInventory::default()),
+            |_| &[],
+            |_| 0.6,
+        );
+        assert!(items.draft_created_items_in_chunk(pos).is_err());
+        items.set_active_chunks(BTreeSet::new());
+        items.set_active_chunks(BTreeSet::from([pos]));
+        assert_eq!(items.entities[0].item.age, 0);
+        assert!(items.draft_created_items_in_chunk(pos).is_err());
+        let mut unknown = ItemEntities::default();
+        let player = PlayerState {
+            position: glam::Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: true,
+            pose: PlayerPose::Standing,
+        };
+        unknown.drop_player(
+            stack,
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::Direct,
+        );
+        assert!(unknown.draft_created_items_in_chunk(pos).is_err());
     }
 
     #[test]
@@ -3382,6 +3530,9 @@ public class PlayerDropOracle {
       random.set(player,new LegacyRandomSource(c.get("seed").getAsLong()));
       player.setUUID(new java.util.UUID(0x0000000100000002L,0x0000000300000004L));
       var item = player.createItemStackToDrop(new ItemStack(Items.DIRT),false,c.get("trace").getAsBoolean());
+      if (item.fallDistance != 0 || item.getAirSupply() != 300 || item.getPortalCooldown() != 0 ||
+          item.getYRot() < 0 || item.getYRot() >= 360 || item.getXRot() != 0)
+        throw new AssertionError("unexpected initial item base fields");
       var result = new JsonObject(); result.add("position",vec(new Vec3(item.getX(),item.getY(),item.getZ())));
       var ref = (net.minecraft.world.entity.EntityReference<?>)thrower.get(item);
       result.addProperty("thrower",ref == null ? "" : ref.getUUID().toString());

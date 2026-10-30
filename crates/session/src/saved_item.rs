@@ -872,13 +872,29 @@ mod tests {
             native_persistence::nbt::write(created.document()).unwrap(),
         )
         .unwrap();
+        let mut live = crate::items::ItemEntities::default();
+        live.spawn_from_entity(
+            DVec3::new(2.0, 63.0, -2.0),
+            ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap(),
+        );
+        let live_drafts = live
+            .draft_created_items_in_chunk(native_world::loaded::ChunkPos { x: 0, z: -1 })
+            .unwrap();
+        assert_eq!(live_drafts.len(), 1);
+        let live_path = temp.path().join("live-created-item.nbt");
+        std::fs::write(
+            &live_path,
+            native_persistence::nbt::write(live_drafts[0].document()).unwrap(),
+        )
+        .unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)
             .arg("SavedItemOracle")
             .arg(temp.path())
             .arg(draft_path)
-            .arg(created_path));
+            .arg(created_path)
+            .arg(live_path));
         let resistance: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(temp.path().join("resistance.json")).unwrap())
                 .unwrap();

@@ -114,7 +114,8 @@ public class CameraOracle {
                 entity.xo = entity.getX(); entity.yo = entity.getY(); entity.zo = entity.getZ();
                 entity.setPos(position.get(0).getAsDouble(), position.get(1).getAsDouble(), position.get(2).getAsDouble());
                 entityEye.setFloat(entity, step.get("eye").getAsFloat());
-                player.speed = step.get("sprinting").getAsBoolean() ? 0.1 * 1.3 : 0.1;
+                player.speed = step.get("movement_speed").getAsFloat();
+                player.abilities.setWalkingSpeed(step.get("walking_speed").getAsFloat());
                 player.abilities.flying = step.get("flying").getAsBoolean();
                 field(OptionInstance.class, "value").set(effect, Double.valueOf(step.get("effect").getAsDouble()));
                 camera.tick();
@@ -207,13 +208,24 @@ fn position_and_eye_height_match_vanilla_camera() {
             let sprinting = (scenario + tick / 4) % 3 == 0;
             let flying = (scenario + tick / 6) % 2 == 0;
             let effect = [0.0_f32, 0.5, 1.0][((scenario + tick / 5) % 3) as usize];
-            camera.tick(position, target_eye, sprinting, flying, effect);
+            let walking_speed =
+                [0.0_f32, 0.05, 0.1, 0.25, -0.1][((scenario + tick / 8) % 5) as usize];
+            let movement_speed =
+                [0.0_f32, 0.05, 0.1, 0.25, 0.5][((scenario + tick / 3) % 5) as usize];
+            camera.tick_with_speed(
+                position,
+                target_eye,
+                movement_speed,
+                walking_speed,
+                flying,
+                effect,
+            );
             expected.extend(
                 partials
                     .iter()
                     .map(|&partial| (camera.eye(partial), camera.fov_modifier(partial))),
             );
-            steps.push(json!({ "position": position.to_array(), "eye": target_eye, "partials": partials, "sprinting": sprinting, "flying": flying, "effect": effect }));
+            steps.push(json!({ "position": position.to_array(), "eye": target_eye, "partials": partials, "sprinting": sprinting, "flying": flying, "effect": effect, "walking_speed": walking_speed, "movement_speed": movement_speed }));
         }
         scenarios.push(json!({ "start": start.to_array(), "eye": initial_eye, "steps": steps }));
     }

@@ -173,6 +173,7 @@ pub struct LoadedSession {
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
+    walking_speed: f32,
     flight: crate::physics::FlightState,
     fov_effect_scale: f32,
     food_use: crate::survival::FoodUse,
@@ -859,6 +860,17 @@ impl LoadedSession {
         Ok(())
     }
 
+    pub fn restore_saved_walking_speed(&mut self, speed: f32) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("saved walking speed must be restored before the first tick");
+        }
+        if !speed.is_finite() {
+            return Err("invalid saved walking speed");
+        }
+        self.walking_speed = speed;
+        Ok(())
+    }
+
     pub fn restore_saved_flying(&mut self, flying: bool) -> Result<(), &'static str> {
         if self.tick != 0 || self.accumulated != Duration::ZERO {
             return Err("saved flight state must be restored before the first tick");
@@ -877,6 +889,21 @@ impl LoadedSession {
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
+        );
+        anyhow::ensure!(
+            crate::player_data::read_saved_walking_speed(original)? == self.walking_speed,
+            "saved walking speed does not match the session"
+        );
+        let initial_movement = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(&self.movement_speed_attribute, |tracking| {
+                &tracking.movement_speed
+            });
+        anyhow::ensure!(
+            crate::player_data::read_loaded_movement_speed_attribute(original)?
+                == *initial_movement,
+            "saved movement attribute does not match the initial session state"
         );
         anyhow::ensure!(
             crate::player_data::read_saved_no_gravity(original) == self.no_gravity,
@@ -915,21 +942,6 @@ impl LoadedSession {
                     && crate::player_data::read_saved_fall_effects(original)? == *initial_fall,
                 "saved player effects do not match the initial session state"
             );
-            let movement = if initial_fall.speed.is_some() || initial_fall.slowness.is_some() {
-                let initial = self
-                    .effect_save_tracking
-                    .as_ref()
-                    .map_or(&self.movement_speed_attribute, |tracking| {
-                        &tracking.movement_speed
-                    });
-                anyhow::ensure!(
-                    crate::player_data::read_saved_movement_speed_attribute(original)? == *initial,
-                    "saved movement speed does not match the initial session state"
-                );
-                Some(initial)
-            } else {
-                None
-            };
             let effects = crate::player_data::advance_saved_effects(original, effect_ticks)?;
             let advanced = native_persistence::nbt::NamedTag {
                 name: "".into(),
@@ -948,7 +960,7 @@ impl LoadedSession {
                         == *self.fall.effects(),
                 "saved effect draft does not match the current session state"
             );
-            Some((effects, movement))
+            Some(effects)
         } else {
             None
         };
@@ -991,16 +1003,14 @@ impl LoadedSession {
         };
         let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
         draft.set_flying(original, self.flight.flying)?;
-        if let Some((effects, movement)) = effect_draft {
+        if let Some(effects) = effect_draft {
             draft.set_effects(effects)?;
-            if let Some(initial) = movement {
-                draft.set_movement_effect_modifiers(
-                    original,
-                    initial,
-                    &self.movement_speed_attribute,
-                )?;
-            }
         }
+        draft.set_movement_effect_modifiers(
+            original,
+            initial_movement,
+            &self.movement_speed_attribute,
+        )?;
         Ok(draft)
     }
 
@@ -1516,6 +1526,7 @@ impl LoadedSession {
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             flight_speed: 0.05,
+            walking_speed: 0.1,
             flight: crate::physics::FlightState::default(),
             fov_effect_scale: 1.0,
             food_use: crate::survival::FoodUse::default(),
@@ -3105,6 +3116,7 @@ impl LoadedSession {
         }
         self.player_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
         self.flight = crate::physics::FlightState::default();
+        self.walking_speed = 0.1;
         self.flight.flying = self.game_mode == GameMode::Spectator;
         self.experience_orbs.reset_player_pickup_delay();
         self.food_use = crate::survival::FoodUse::default();
@@ -5328,6 +5340,7 @@ impl LoadedSession {
                 self.motion.position,
                 self.player.pose.eye_height(),
                 camera_speed,
+                self.walking_speed,
                 camera_flying,
                 self.fov_effect_scale,
             );
@@ -6352,6 +6365,7 @@ impl LoadedSession {
             self.motion.position,
             camera_target_eye_height,
             camera_speed,
+            self.walking_speed,
             camera_flying,
             self.fov_effect_scale,
         );
@@ -7990,6 +8004,37 @@ mod tests {
             .unwrap();
             documents.push(doc);
         }
+        for (walk_speed, old_base) in [(0.25_f32, Some(0.7_f64)), (0.0, Some(0.3)), (0.375, None)] {
+            let mut fields = vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "abilities".into(),
+                    Tag::Compound(vec![("walkSpeed".into(), Tag::Float(walk_speed))]),
+                ),
+            ];
+            if let Some(base) = old_base {
+                fields.push((
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(base)),
+                        ])],
+                    },
+                ));
+            }
+            let doc = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(fields),
+            };
+            std::fs::write(
+                temp.path().join(format!("{}.nbt", documents.len())),
+                native_persistence::nbt::write(&doc).unwrap(),
+            )
+            .unwrap();
+            documents.push(doc);
+        }
         let source = temp.path().join("MovementEffectSaveOracle.java");
         std::fs::write(
             &source,
@@ -8023,6 +8068,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         for (index, original) in documents.iter().enumerate() {
             let mut session = session();
+            session
+                .restore_saved_walking_speed(
+                    crate::player_data::read_saved_walking_speed(original).unwrap(),
+                )
+                .unwrap();
             session.fall.configure(
                 crate::player_data::SavedAttribute::with_base(3.0),
                 crate::player_data::SavedAttribute::with_base(1.0),
@@ -8031,7 +8081,7 @@ mod tests {
             );
             session
                 .set_saved_movement_speed(
-                    crate::player_data::read_saved_movement_speed_attribute(original).unwrap(),
+                    crate::player_data::read_loaded_movement_speed_attribute(original).unwrap(),
                 )
                 .unwrap();
             for tick in 0..6 {
@@ -8096,6 +8146,69 @@ mod tests {
             .set_slot(crate::inventory::PlayerSlot::Armor(3), None);
         session.refresh_movement_speed();
         assert_eq!(session.movement_speed(false), 0.2_f32);
+    }
+
+    #[test]
+    fn loaded_walking_speed_overrides_saved_movement_base_and_is_drafted() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "abilities".into(),
+                    Tag::Compound(vec![("walkSpeed".into(), Tag::Float(0.25))]),
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(0.8)),
+                            ("custom".into(), Tag::Int(9)),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("id".into(), Tag::String("example:bonus".into())),
+                                        ("amount".into(), Tag::Double(0.2)),
+                                        (
+                                            "operation".into(),
+                                            Tag::String("add_multiplied_total".into()),
+                                        ),
+                                    ])],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let before = native_persistence::nbt::write(&original).unwrap();
+        let mut session = session();
+        session
+            .restore_saved_walking_speed(
+                crate::player_data::read_saved_walking_speed(&original).unwrap(),
+            )
+            .unwrap();
+        session
+            .set_saved_movement_speed(
+                crate::player_data::read_loaded_movement_speed_attribute(&original).unwrap(),
+            )
+            .unwrap();
+        session.refresh_movement_speed();
+        assert!((session.movement_speed(false) - 0.3).abs() < 1e-7);
+        session.update(TICK);
+        let draft = session.draft_player_state(&original).unwrap();
+        let Tag::List { values, .. } = draft.document().value.get("attributes").unwrap() else {
+            panic!()
+        };
+        assert_eq!(values[0].get("base"), Some(&Tag::Double(0.25)));
+        assert_eq!(values[0].get("custom"), Some(&Tag::Int(9)));
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), before);
+        assert!(session.restore_saved_walking_speed(0.3).is_err());
     }
 
     #[test]

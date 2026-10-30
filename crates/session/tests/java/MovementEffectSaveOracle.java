@@ -12,6 +12,7 @@ import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.ai.attributes.*;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.world.level.storage.TagValueInput;
 
 public class MovementEffectSaveOracle {
@@ -28,6 +29,9 @@ public class MovementEffectSaveOracle {
             var input = TagValueInput.create(ProblemReporter.DISCARDING, lookup, document);
             var attributes = new AttributeMap(Player.createAttributes().build());
             input.read("attributes", AttributeInstance.Packed.LIST_CODEC).ifPresent(attributes::apply);
+            var abilities = new Abilities();
+            input.read("abilities", Abilities.Packed.CODEC).ifPresent(abilities::apply);
+            attributes.getInstance(Attributes.MOVEMENT_SPEED).setBaseValue(abilities.getWalkingSpeed());
             var effects = new ArrayList<>(input.read("active_effects", MobEffectInstance.CODEC.listOf()).orElse(List.of()));
             var rows = new JsonArray();
             for (int tick = 0; tick < 6; tick++) {

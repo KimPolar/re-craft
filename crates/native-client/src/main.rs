@@ -932,6 +932,11 @@ fn prepare_existing_world(
                 .restore_saved_flight_speed(speed)
                 .map_err(anyhow::Error::msg)?;
             session
+                .restore_saved_walking_speed(native_session::player_data::read_saved_walking_speed(
+                    saved,
+                )?)
+                .map_err(anyhow::Error::msg)?;
+            session
                 .restore_saved_flying(native_session::player_data::read_saved_flying(saved))
                 .map_err(anyhow::Error::msg)?;
         }
@@ -1048,7 +1053,7 @@ fn prepare_existing_world(
                 .context("cannot configure fall damage")?;
             session
                 .set_saved_movement_speed(
-                    native_session::player_data::read_saved_movement_speed_attribute(player_data)
+                    native_session::player_data::read_loaded_movement_speed_attribute(player_data)
                         .context("cannot read saved movement speed")?,
                 )
                 .context("cannot restore saved movement speed")?;

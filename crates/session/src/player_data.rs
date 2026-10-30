@@ -109,6 +109,10 @@ impl SavedAttribute {
         self.modifiers.remove(id);
     }
 
+    pub(crate) fn set_base(&mut self, base: f64) {
+        self.base = base;
+    }
+
     pub(crate) fn modifier(&self, id: &ResourceId) -> Option<&AttributeModifier> {
         self.modifiers.get(id)
     }
@@ -267,6 +271,13 @@ pub fn read_saved_movement_speed_attribute(player: &NamedTag) -> Result<SavedAtt
     saved_attribute(player, "movement_speed", f64::from(0.1_f32))
 }
 
+/// Player.load overwrites this attribute's saved base with abilities.walkSpeed.
+pub fn read_loaded_movement_speed_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    let mut attribute = read_saved_movement_speed_attribute(player)?;
+    attribute.set_base(f64::from(read_saved_walking_speed(player)?));
+    Ok(attribute)
+}
+
 /// Preserve persistent armor and toughness modifiers for equipment changes.
 pub fn read_saved_armor_attributes(player: &NamedTag) -> Result<(SavedAttribute, SavedAttribute)> {
     Ok((
@@ -412,6 +423,17 @@ pub fn read_saved_flight_speed(player: &NamedTag) -> Result<f32> {
         .and_then(numeric_float)
         .unwrap_or(0.05);
     ensure!(speed.is_finite(), "saved flight speed is not finite");
+    Ok(speed)
+}
+
+pub fn read_saved_walking_speed(player: &NamedTag) -> Result<f32> {
+    let speed = player
+        .value
+        .get("abilities")
+        .and_then(|abilities| abilities.get("walkSpeed"))
+        .and_then(numeric_float)
+        .unwrap_or(0.1);
+    ensure!(speed.is_finite(), "saved walking speed is not finite");
     Ok(speed)
 }
 
@@ -772,10 +794,17 @@ impl PlayerStateDraft {
             unchanged_initial == unchanged_current,
             "untracked movement attribute change"
         );
-        let changed = ids
+        let modifier_changed = ids
             .iter()
             .any(|id| initial.modifier(id) != current.modifier(id));
-        if !changed {
+        let mut source_attribute = read_saved_movement_speed_attribute(original)?;
+        let base_changed = source_attribute.base != initial.base;
+        source_attribute.set_base(initial.base);
+        ensure!(
+            source_attribute == *initial,
+            "saved movement attribute does not match initial state"
+        );
+        if !modifier_changed && !base_changed {
             return Ok(());
         }
         let mut attributes = match unique_field(&original.value, "attributes")? {
@@ -806,12 +835,12 @@ impl PlayerStateDraft {
         }
         if movement_index.is_none() {
             ensure!(
-                initial == &SavedAttribute::with_base(f64::from(0.1_f32)),
+                initial.modifiers.is_empty(),
                 "missing original movement attribute"
             );
             attributes.push(Tag::Compound(vec![
                 ("id".into(), Tag::String("minecraft:movement_speed".into())),
-                ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                ("base".into(), Tag::Double(initial.base)),
             ]));
             movement_index = Some(attributes.len() - 1);
         }
@@ -820,6 +849,9 @@ impl PlayerStateDraft {
             .and_then(numeric_double)
             .context("movement attribute has no numeric base")?;
         ensure!(base.is_finite(), "movement attribute base is not finite");
+        if base_changed {
+            set_field(attribute, "base", Some(Tag::Double(initial.base)))?;
+        }
         let source_modifiers = unique_field(attribute, "modifiers")?;
         let mut modifiers = match source_modifiers {
             None => Vec::new(),
@@ -893,14 +925,16 @@ impl PlayerStateDraft {
                 ]));
             }
         }
-        set_field(
-            attribute,
-            "modifiers",
-            Some(Tag::List {
-                element_type: TagType::Compound,
-                values: modifiers,
-            }),
-        )?;
+        if modifier_changed {
+            set_field(
+                attribute,
+                "modifiers",
+                Some(Tag::List {
+                    element_type: TagType::Compound,
+                    values: modifiers,
+                }),
+            )?;
+        }
         set_field(
             &mut self.0.document.value,
             "attributes",
@@ -918,6 +952,12 @@ impl PlayerStateDraft {
         let source = unique_field(&original.value, "abilities")?;
         if let Some(value @ Tag::Compound(_)) = source {
             unique_field(value, "flying")?;
+            if let Some(walking) = unique_field(value, "walkSpeed")? {
+                ensure!(
+                    numeric_float(walking).is_some_and(f32::is_finite),
+                    "walking speed cannot be preserved safely"
+                );
+            }
         }
         if read_saved_flying(original) == flying {
             return Ok(());

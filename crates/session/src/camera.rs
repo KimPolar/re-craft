@@ -49,16 +49,18 @@ impl CameraMotion {
             position,
             target_eye_height,
             movement_speed,
+            0.1_f32,
             flying,
             effect_scale,
         );
     }
 
-    pub(crate) fn tick_with_speed(
+    pub fn tick_with_speed(
         &mut self,
         position: DVec3,
         target_eye_height: f32,
         movement_speed: f32,
+        walking_speed: f32,
         flying: bool,
         effect_scale: f32,
     ) {
@@ -67,9 +69,11 @@ impl CameraMotion {
         self.previous_eye_height = self.eye_height;
         self.eye_height += (target_eye_height - self.eye_height) * 0.5;
         self.previous_fov_modifier = self.fov_modifier;
-        let modifier = if flying { 1.1_f32 } else { 1.0_f32 };
-        let target =
-            1.0_f32 + effect_scale * (modifier * ((movement_speed / 0.1_f32 + 1.0) / 2.0) - 1.0);
+        let mut modifier = if flying { 1.1_f32 } else { 1.0_f32 };
+        if walking_speed != 0.0 {
+            modifier *= (movement_speed / walking_speed + 1.0) / 2.0;
+        }
+        let target = 1.0_f32 + effect_scale * (modifier - 1.0);
         self.fov_modifier += (target - self.fov_modifier) * 0.5;
         self.fov_modifier = self.fov_modifier.clamp(0.1, 1.5);
     }
@@ -263,6 +267,18 @@ mod tests {
             session.update(crate::TICK);
         }
         assert!((session.snapshot().camera.fov_modifier(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn walking_speed_scales_field_of_view_and_zero_avoids_division() {
+        let mut camera = CameraMotion::new(DVec3::ZERO, 1.62);
+        camera.tick_with_speed(DVec3::ZERO, 1.62, 0.25, 0.25, false, 1.0);
+        assert_eq!(camera.fov_modifier(1.0), 1.0);
+        camera.tick_with_speed(DVec3::ZERO, 1.62, 0.5, 0.25, false, 1.0);
+        assert_eq!(camera.fov_modifier(1.0), 1.25);
+        let mut zero = CameraMotion::new(DVec3::ZERO, 1.62);
+        zero.tick_with_speed(DVec3::ZERO, 1.62, 0.5, 0.0, true, 1.0);
+        assert!((zero.fov_modifier(1.0) - 1.05).abs() < 1e-6);
     }
 
     #[test]

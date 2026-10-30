@@ -349,6 +349,7 @@ pub struct LoadedSession {
     chest_sounds: VecDeque<ChestSoundEvent>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
+    uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
@@ -1189,7 +1190,7 @@ impl LoadedSession {
         Ok(PlayerWorldDraft { player, chunks })
     }
 
-    /// Snapshot player, terrain, tracked item and orb chunks and clocks at the
+    /// Snapshot player, terrain, tracked entity chunks and clocks at the
     /// same tick boundary. This remains incomplete for a playable world save.
     pub fn draft_player_terrain_entities_and_clocks(
         &self,
@@ -1203,7 +1204,7 @@ impl LoadedSession {
     ) -> anyhow::Result<PartialSessionSaveDraft> {
         let player_and_terrain =
             self.draft_player_and_dirty_chunks(player, terrain, tags, air_and_fluid)?;
-        let entity_chunks = self.draft_tracked_item_and_orb_chunks()?;
+        let entity_chunks = self.draft_tracked_entity_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
         Ok(PartialSessionSaveDraft {
             player_and_terrain,
@@ -2235,6 +2236,7 @@ impl LoadedSession {
             chest_sounds: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
+            uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
@@ -3218,9 +3220,9 @@ impl LoadedSession {
         self.draft_existing_entity_chunks(&positions)
     }
 
-    /// Include both item and saved-orb source and destination chunks. Orb
-    /// lifecycle effects that cannot yet be coordinated reject this draft.
-    pub fn draft_tracked_item_and_orb_chunks(
+    /// Include tracked items, saved orbs and saved falling blocks. Lifecycle
+    /// effects that cannot yet be coordinated reject this partial draft.
+    pub fn draft_tracked_entity_chunks(
         &self,
     ) -> anyhow::Result<BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>>
     {
@@ -3235,6 +3237,24 @@ impl LoadedSession {
             self.experience_orbs
                 .affected_orb_chunks(&self.saved_orb_uuids)?,
         );
+        anyhow::ensure!(
+            !self.uncoordinated_falling_lifecycle,
+            "falling-block lifecycle effects need coordinated saving"
+        );
+        positions.extend(self.saved_falling_uuids.values().copied());
+        for entity in &self.falling_sand {
+            let position = entity.motion.position;
+            anyhow::ensure!(
+                position.is_finite()
+                    && position.x.abs() <= 30_000_512.0
+                    && position.z.abs() <= 30_000_512.0,
+                "falling entity has an invalid position"
+            );
+            positions.insert(ChunkPos {
+                x: (position.x.floor() as i32).div_euclid(16),
+                z: (position.z.floor() as i32).div_euclid(16),
+            });
+        }
         self.draft_existing_entity_chunks(&positions)
     }
 
@@ -6600,6 +6620,7 @@ impl LoadedSession {
                         key.x, key.y, key.z,
                     ));
                     if self.set(relative, self.states[0]) {
+                        self.uncoordinated_falling_lifecycle = true;
                         self.falling_sand.push(FallingSand {
                             previous: motion.position,
                             motion,
@@ -6855,6 +6876,7 @@ impl LoadedSession {
     }
 
     fn advance_falling_sand(&mut self) {
+        let before = self.falling_sand.len();
         let mut remaining = Vec::new();
         for mut entity in std::mem::take(&mut self.falling_sand) {
             entity.previous = entity.motion.position;
@@ -7003,6 +7025,9 @@ impl LoadedSession {
                 continue;
             }
             remaining.push(entity);
+        }
+        if remaining.len() != before {
+            self.uncoordinated_falling_lifecycle = true;
         }
         self.falling_sand = remaining;
     }
@@ -14801,7 +14826,7 @@ mod tests {
                 .draft_existing_entity_chunks(&BTreeSet::from([home]))
                 .is_ok()
         );
-        assert!(session.draft_tracked_item_and_orb_chunks().is_ok());
+        assert!(session.draft_tracked_entity_chunks().is_ok());
         session.queue_chunk_window(remote, 0);
         session.update(TICK);
         assert!(session.snapshot().experience_orbs.is_empty());
@@ -14816,13 +14841,13 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.experience.total, 7);
         assert_eq!(session.snapshot().experience_orbs.len(), 1);
-        assert!(session.draft_tracked_item_and_orb_chunks().is_err());
+        assert!(session.draft_tracked_entity_chunks().is_err());
         for _ in 0..4 {
             session.update(TICK);
         }
         assert_eq!(session.experience.total, 21);
         assert!(session.snapshot().experience_orbs.is_empty());
-        assert!(session.draft_tracked_item_and_orb_chunks().is_err());
+        assert!(session.draft_tracked_entity_chunks().is_err());
         assert!(session.draft_existing_entity_chunk(home).is_err());
         assert_eq!(
             document.value.get("Entities").unwrap(),
@@ -16110,6 +16135,9 @@ mod tests {
         session.falling_sand[0].motion.position.x += 16.0;
         let both = std::collections::BTreeSet::from([home, remote]);
         let drafts = session.draft_existing_entity_chunks(&both).unwrap();
+        let tracked = session.draft_tracked_entity_chunks().unwrap();
+        assert_eq!(tracked.keys().copied().collect::<BTreeSet<_>>(), both);
+        assert_eq!(tracked[&remote].document(), drafts[&remote].document());
         assert!(drafts[&home].matches_source(&source_chunk).unwrap());
         assert!(drafts[&remote].matches_source(&remote_document).unwrap());
         let Some(Tag::List { values, .. }) = drafts[&remote].document().value.get("Entities")
@@ -16144,6 +16172,7 @@ mod tests {
             .entity_chunks
             .insert(remote, SavedEntityData::Unavailable);
         assert!(session.draft_existing_entity_chunks(&both).is_err());
+        assert!(session.draft_tracked_entity_chunks().is_err());
         session.falling_sand[0].motion.position.x -= 16.0;
         session.entity_chunks.remove(&remote);
 
@@ -16159,6 +16188,7 @@ mod tests {
         created.source = None;
         session.falling_sand.push(created);
         assert!(session.draft_existing_falling_entity_chunk(home).is_err());
+        assert!(session.draft_tracked_entity_chunks().is_err());
         session.falling_sand.pop();
         assert_eq!(
             session.snapshot().falling_blocks[0].kind,
@@ -16220,10 +16250,12 @@ mod tests {
                 .set_initial_entity_chunk(home, SavedEntityData::Present(chunk))
                 .unwrap();
             session.activate_saved_falling_sand();
+            assert!(!session.uncoordinated_falling_lifecycle);
             for _ in 0..20 {
                 session.advance_falling_sand();
             }
             assert!(session.falling_sand.is_empty());
+            assert!(session.uncoordinated_falling_lifecycle);
             assert_eq!(
                 session.dropped_items.snapshot().len(),
                 usize::from(drop_item && !cancel)
@@ -22809,11 +22841,13 @@ mod tests {
         }]);
         session.advance_sand_ticks();
         assert_eq!(session.falling_sand.len(), 1);
+        assert!(session.draft_tracked_entity_chunks().is_err());
         assert_eq!(session.falling_sand_snapshot()[0].kind, FallingKind::Gravel);
         for _ in 0..40 {
             session.advance_falling_sand();
         }
         assert!(session.falling_sand.is_empty());
+        assert!(session.draft_tracked_entity_chunks().is_err());
         assert!(
             matches!(cell(&session.world, session.origin, session.bounds, IVec3::new(10, 1, 8), session.states[0]), Cell::State(id) if id == gravel)
         );

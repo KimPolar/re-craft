@@ -7192,6 +7192,48 @@ fn created_item_path_region(bounds: BoundingBox, actual: DVec3) -> Option<(IVec3
     Some((low, high))
 }
 
+// The default entity-contact hooks and movement factors of these blocks are
+// checked against the installed Java 26.3 registry by ItemPathBlocksOracle.
+const CREATED_ITEM_PLAIN_BLOCKS: &[&str] = &[
+    "minecraft:air",
+    "minecraft:cave_air",
+    "minecraft:void_air",
+    "minecraft:stone",
+    "minecraft:dirt",
+    "minecraft:coarse_dirt",
+    "minecraft:cobblestone",
+    "minecraft:granite",
+    "minecraft:diorite",
+    "minecraft:andesite",
+    "minecraft:polished_granite",
+    "minecraft:polished_diorite",
+    "minecraft:polished_andesite",
+    "minecraft:stone_bricks",
+    "minecraft:mossy_stone_bricks",
+    "minecraft:cracked_stone_bricks",
+    "minecraft:sandstone",
+    "minecraft:red_sandstone",
+    "minecraft:oak_planks",
+    "minecraft:spruce_planks",
+    "minecraft:netherrack",
+    "minecraft:end_stone",
+    "minecraft:clay",
+    "minecraft:sand",
+    "minecraft:red_sand",
+    "minecraft:gravel",
+];
+
+fn created_item_plain_block(state: &BlockState) -> bool {
+    if state.name == "minecraft:grass_block" {
+        return state.properties.len() == 1
+            && state
+                .properties
+                .get("snowy")
+                .is_some_and(|value| value == "true" || value == "false");
+    }
+    state.properties.is_empty() && CREATED_ITEM_PLAIN_BLOCKS.contains(&state.name.as_str())
+}
+
 /// Cache only within one tick and one immutable world snapshot. The cap bounds
 /// memory when item paths are spread across many distinct regions.
 struct CreatedItemPathProof<'a> {
@@ -7215,20 +7257,55 @@ impl<'a> CreatedItemPathProof<'a> {
         let Some(region) = created_item_path_region(bounds, actual) else {
             return false;
         };
-        if let Some(result) = self.cache.get(&region) {
-            return *result;
-        }
-        let result =
-            created_item_region_safe(self.world, self.origin, self.build, region.0, region.1);
-        if self.cache.len() < 4096 {
-            self.cache.insert(region, result);
-        }
-        result
+        let region_safe = if let Some(result) = self.cache.get(&region) {
+            *result
+        } else {
+            let result =
+                created_item_region_safe(self.world, self.origin, self.build, region.0, region.1);
+            if self.cache.len() < 4096 {
+                self.cache.insert(region, result);
+            }
+            result
+        };
+        region_safe && created_item_start_clear(self.world, self.origin, bounds)
     }
 }
 
-/// Certify only a fully loaded, effect-free movement area for new-item base
-/// state. Unknown blocks, missing sections, fluids and oversized paths defer.
+// Java's server item tick uses the slightly deflated initial box to detect
+// entrapment and applies a separate escape algorithm. That algorithm is not
+// yet modeled, so reject any initial overlap with one of our full cubes.
+fn created_item_start_clear(world: &World, origin: IVec3, bounds: BoundingBox) -> bool {
+    let low = bounds.min + DVec3::splat(1.0e-7);
+    let high = bounds.max - DVec3::splat(1.0e-7);
+    if !low.cmple(high).all() {
+        return false;
+    }
+    let low = low.floor().as_ivec3();
+    let high = high.floor().as_ivec3();
+    for x in low.x..=high.x {
+        for y in low.y..=high.y {
+            for z in low.z..=high.z {
+                let Some(p) = add(origin, IVec3::new(x, y, z)) else {
+                    return false;
+                };
+                let Some(state) = world.block_id(p.x, p.y, p.z).and_then(|id| world.state(id))
+                else {
+                    return false;
+                };
+                if !matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Certify only a fully loaded movement area with supported ordinary blocks.
+/// Unknown blocks, missing sections, fluids and oversized paths defer.
 fn created_item_region_safe(
     world: &World,
     origin: IVec3,
@@ -7260,15 +7337,7 @@ fn created_item_region_safe(
                 else {
                     return false;
                 };
-                if !state.properties.is_empty()
-                    || !matches!(
-                        state.name.as_str(),
-                        "minecraft:air"
-                            | "minecraft:cave_air"
-                            | "minecraft:void_air"
-                            | "minecraft:stone"
-                    )
-                {
+                if !created_item_plain_block(state) {
                     return false;
                 }
             }
@@ -7287,6 +7356,7 @@ fn created_item_path_safe(
 ) -> bool {
     created_item_path_region(bounds, actual)
         .is_some_and(|(low, high)| created_item_region_safe(world, origin, build, low, high))
+        && created_item_start_clear(world, origin, bounds)
 }
 
 fn is_bed(name: &str) -> bool {
@@ -10563,6 +10633,144 @@ mod tests {
             unknown_section,
             DVec3::ZERO
         ));
+    }
+
+    #[test]
+    fn created_item_block_proof_accepts_known_states_and_rejects_special_blocks() {
+        for name in CREATED_ITEM_PLAIN_BLOCKS {
+            assert!(created_item_plain_block(&state(name, &[])), "{name}");
+            assert!(
+                !created_item_plain_block(&state(name, &[("unknown", "true")])),
+                "{name}"
+            );
+        }
+        for value in ["true", "false"] {
+            assert!(created_item_plain_block(&state(
+                "minecraft:grass_block",
+                &[("snowy", value)]
+            )));
+        }
+        assert!(!created_item_plain_block(&state(
+            "minecraft:grass_block",
+            &[]
+        )));
+        assert!(!created_item_plain_block(&state(
+            "minecraft:grass_block",
+            &[("snowy", "maybe")]
+        )));
+        for name in [
+            "minecraft:soul_sand",
+            "minecraft:redstone_ore",
+            "minecraft:nether_portal",
+            "minecraft:water",
+            "example:stone",
+        ] {
+            assert!(!created_item_plain_block(&state(name, &[])), "{name}");
+        }
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let dirt = session.intern_block(state("minecraft:dirt", &[]));
+        let grass = session.intern_block(state("minecraft:grass_block", &[("snowy", "false")]));
+        assert!(session.set(IVec3::new(4, 2, 3), dirt));
+        assert!(session.set(IVec3::new(3, 2, 3), grass));
+        let trapped = BoundingBox {
+            min: DVec3::new(3.25, 2.1, 3.25),
+            max: DVec3::new(3.5, 2.35, 3.5),
+        };
+        let mut proof = CreatedItemPathProof::new(&session.world, session.origin, session.bounds);
+        assert!(
+            !proof.safe(trapped, DVec3::ZERO),
+            "solid-overlapping item needs escape simulation"
+        );
+        let mut edge = BoundingBox {
+            min: DVec3::new(3.25, 3.0 - 5.0e-8, 3.25),
+            max: DVec3::new(3.5, 3.25, 3.5),
+        };
+        assert!(
+            proof.safe(edge, DVec3::ZERO),
+            "Java deflates the collision box"
+        );
+        edge.min.y = 3.0 - 2.0e-7;
+        assert!(
+            !proof.safe(edge, DVec3::ZERO),
+            "deeper penetration must be rejected"
+        );
+        let position = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        let stack = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            native_persistence::nbt::Tag::Compound(vec![]),
+        )
+        .unwrap();
+        session.dropped_items.spawn_from_entity(position, stack);
+        session.update(TICK);
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn created_item_plain_blocks_match_java_contact_behavior() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemPathBlocksOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ItemPathBlocksOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "Java compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ItemPathBlocksOracle")
+            .args(CREATED_ITEM_PLAIN_BLOCKS)
+            .arg("minecraft:grass_block")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Java block oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

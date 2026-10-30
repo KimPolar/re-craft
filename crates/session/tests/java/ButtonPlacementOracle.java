@@ -39,7 +39,8 @@ public class ButtonPlacementOracle {
       ctx.face=Direction.valueOf(input.get("face").getAsString());
       ctx.horizontal=Direction.fromYRot(input.get("yaw").getAsDouble());
       world.support=Blocks.STONE.defaultBlockState();
-      var placed=Blocks.STONE_BUTTON.getStateForPlacement(ctx);
+      var block = args.length > 2 && args[2].equals("lever") ? Blocks.LEVER : Blocks.STONE_BUTTON;
+      var placed=block.getStateForPlacement(ctx);
       if (placed == null) throw new AssertionError("stone support rejected " + ctx.face);
       world.support=Blocks.AIR.defaultBlockState();
       for (var powered: new boolean[]{false,true}) for (var changed : Direction.values()) {

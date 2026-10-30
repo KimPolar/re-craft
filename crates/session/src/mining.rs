@@ -88,6 +88,7 @@ pub enum Material {
     WoodButton,
     RedstoneLamp,
     RedstoneBlock,
+    Lever,
     Cobblestone,
     /// Vanilla ore hardness and the minimum harvest tier: wood, stone or iron.
     Ore {
@@ -118,6 +119,7 @@ impl Material {
             "minecraft:stone_button" => Some(Self::StoneButton),
             "minecraft:redstone_lamp" => Some(Self::RedstoneLamp),
             "minecraft:redstone_block" => Some(Self::RedstoneBlock),
+            "minecraft:lever" => Some(Self::Lever),
             "minecraft:cobblestone" => Some(Self::Cobblestone),
             "minecraft:coal_ore" | "minecraft:nether_gold_ore" | "minecraft:nether_quartz_ore" => {
                 Some(Self::Ore {
@@ -190,7 +192,7 @@ impl Material {
     pub fn hardness(self) -> f32 {
         match self {
             Self::Grass | Self::Gravel => 0.6,
-            Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton => 0.5,
+            Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton | Self::Lever => 0.5,
             Self::DirtPath => 0.65,
             Self::RedstoneLamp => 0.3,
             Self::RedstoneBlock => 5.0,

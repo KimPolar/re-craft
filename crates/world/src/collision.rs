@@ -177,6 +177,10 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "lever" {
+        lever_outline(state)?;
+        return Some(EMPTY.to_vec());
+    }
     if id.ends_with("_button") {
         button_outline(state)?;
         return Some(EMPTY.to_vec());
@@ -361,6 +365,9 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "lever" {
+        return lever_outline(state);
+    }
     if id.ends_with("_button") {
         return button_outline(state);
     }
@@ -429,6 +436,37 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     let shape = block_shape(state)?;
     if shape.is_empty() { None } else { Some(shape) }
+}
+
+fn lever_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if state.properties.len() != 3
+        || !matches!(
+            state.properties.get("powered").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    let facing = state.properties.get("facing")?.as_str();
+    let (a, b, c, d) = match facing {
+        "north" | "south" => (5.0, 11.0, 4.0, 12.0),
+        "west" | "east" => (4.0, 12.0, 5.0, 11.0),
+        _ => return None,
+    };
+    let s = 1.0 / 16.0;
+    let shape = match state.properties.get("face")?.as_str() {
+        "floor" => cuboid(a * s, 0.0, c * s, b * s, 6.0 * s, d * s),
+        "ceiling" => cuboid(a * s, 10.0 * s, c * s, b * s, 1.0, d * s),
+        "wall" => match facing {
+            "north" => cuboid(5.0 * s, 4.0 * s, 10.0 * s, 11.0 * s, 12.0 * s, 1.0),
+            "south" => cuboid(5.0 * s, 4.0 * s, 0.0, 11.0 * s, 12.0 * s, 6.0 * s),
+            "west" => cuboid(10.0 * s, 4.0 * s, 5.0 * s, 1.0, 12.0 * s, 11.0 * s),
+            "east" => cuboid(0.0, 4.0 * s, 5.0 * s, 6.0 * s, 12.0 * s, 11.0 * s),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(vec![shape])
 }
 
 fn button_outline(state: &BlockState) -> Option<Vec<Aabb>> {

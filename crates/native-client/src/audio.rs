@@ -136,6 +136,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn lever(&self, event: native_session::loaded::LeverSoundEvent) {
+        let _ = self.audio.commands.try_send(Command::Lever(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     pub fn item_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Item);
     }
@@ -170,6 +179,7 @@ enum Command {
     Prepare(Resources),
     Click(Resources),
     Button(Resources, native_session::loaded::ButtonSoundEvent),
+    Lever(Resources, native_session::loaded::LeverSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
 }
 
@@ -634,12 +644,13 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, button, pickup) = match command {
-            Command::Prepare(resources) => (resources, false, None, None),
-            Command::Click(resources) => (resources, true, None, None),
-            Command::Button(resources, event) => (resources, true, Some(event), None),
+        let (resources, play, button, lever, pickup) = match command {
+            Command::Prepare(resources) => (resources, false, None, None, None),
+            Command::Click(resources) => (resources, true, None, None, None),
+            Command::Button(resources, event) => (resources, true, Some(event), None, None),
+            Command::Lever(resources, event) => (resources, true, None, Some(event), None),
             Command::Pickup(resources, position, kind) => {
-                (resources, true, None, Some((position, kind)))
+                (resources, true, None, None, Some((position, kind)))
             }
         };
         if catalog
@@ -663,6 +674,15 @@ fn run(
             };
             let resolved = if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
+            } else if let Some(event) = lever {
+                catalog.resolve(
+                    "block.lever.click",
+                    0.3,
+                    if event.powered { 0.6 } else { 0.5 },
+                    Some(event.position.as_dvec3() + glam::DVec3::splat(0.5)),
+                    chosen_random,
+                    config.sample_rate.0,
+                )
             } else {
                 match button {
                     Some(event) => catalog.resolve(
@@ -1221,6 +1241,22 @@ mod tests {
                 assert!(voice.spatial.is_some());
                 assert!(!voice.player_sound);
             }
+        }
+        for pitch in [0.5, 0.6] {
+            let voice = catalog
+                .resolve(
+                    "block.lever.click",
+                    0.3,
+                    pitch,
+                    Some(glam::DVec3::ZERO),
+                    &mut random,
+                    48000,
+                )
+                .unwrap()
+                .expect("missing lever click");
+            assert!(voice.clip.samples.iter().any(|sample| *sample != 0));
+            assert!(voice.spatial.is_some());
+            assert!(!voice.player_sound);
         }
     }
 

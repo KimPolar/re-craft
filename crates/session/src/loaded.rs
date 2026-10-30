@@ -265,6 +265,7 @@ pub struct LoadedSession {
     lamp_pending: BTreeSet<(i32, i32, i32)>,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
+    lever_sounds: VecDeque<LeverSoundEvent>,
     falling_sand: Vec<FallingSand>,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
@@ -323,6 +324,13 @@ pub struct ButtonSoundEvent {
     pub powered: bool,
     pub tick: u64,
     pub kind: native_core::button::Button,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeverSoundEvent {
+    pub position: IVec3,
+    pub powered: bool,
+    pub tick: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1741,6 +1749,7 @@ impl LoadedSession {
             lamp_pending: BTreeSet::new(),
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
+            lever_sounds: VecDeque::new(),
             falling_sand: Vec::new(),
             falling_fire_tag: None,
             bounce_suppression_tag: None,
@@ -4086,7 +4095,11 @@ impl LoadedSession {
             PlayerSlot::Offhand
         };
         let held = self.inventory.slot(hand)?;
-        let kind = native_core::button::Button::from_id(held.id())?;
+        let kind = native_core::button::Button::from_id(held.id());
+        let lever = held.id() == "minecraft:lever";
+        if kind.is_none() && !lever {
+            return None;
+        }
         if held.max_count().is_none() {
             return None;
         }
@@ -4137,7 +4150,16 @@ impl LoadedSession {
             match button_support_face(support, -direction)? {
                 false => continue,
                 true => {
-                    let block = button_state(kind, -direction, self.player.yaw)?;
+                    let mut block = button_state(
+                        kind.unwrap_or_else(|| {
+                            native_core::button::Button::from_id("minecraft:stone_button").unwrap()
+                        }),
+                        -direction,
+                        self.player.yaw,
+                    )?;
+                    if lever {
+                        block.name = "minecraft:lever".into();
+                    }
                     let id = self.intern_block(block);
                     return self.set(target, id).then_some(hand);
                 }
@@ -5148,6 +5170,50 @@ impl LoadedSession {
         true
     }
 
+    fn use_lever(&mut self, relative: IVec3) -> bool {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(old) = self.world.state(id) else {
+            return false;
+        };
+        if old.name != "minecraft:lever" || block_outline(old).is_none() {
+            return false;
+        }
+        let powered = old
+            .properties
+            .get("powered")
+            .is_some_and(|value| value == "true");
+        let mut next = old.clone();
+        next.properties
+            .insert("powered".into(), (!powered).to_string());
+        let id = self.intern_block(next);
+        if self.set(relative, id) {
+            self.first_person.swing.start(crate::animation::Hand::Main);
+            if let Some(position) = add(self.origin, relative) {
+                if self.lever_sounds.len() == 4096 {
+                    self.lever_sounds.pop_front();
+                }
+                self.lever_sounds.push_back(LeverSoundEvent {
+                    position,
+                    powered: !powered,
+                    tick: self.tick,
+                });
+            }
+        }
+        true
+    }
+
+    pub fn take_lever_sounds(&mut self) -> Vec<LeverSoundEvent> {
+        self.lever_sounds.drain(..).collect()
+    }
+
     fn push_button_sound(
         &mut self,
         relative: IVec3,
@@ -5760,10 +5826,11 @@ impl LoadedSession {
                 self.update_lamp(neighbor);
             }
             let button_support = self.world.state(id).and_then(button_support_direction);
-            let button_kind = self
-                .world
-                .state(id)
-                .and_then(|state| native_core::button::Button::from_id(&state.name));
+            let attached_item = self.world.state(id).and_then(|state| {
+                (state.name == "minecraft:lever"
+                    || native_core::button::Button::from_id(&state.name).is_some())
+                .then(|| state.name.clone())
+            });
             if button_support == Some(-direction)
                 && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(current) if self.world.state(current).and_then(|state| button_support_face(state, direction)) == Some(false))
                 && self.set(neighbor, self.states[0])
@@ -5771,7 +5838,9 @@ impl LoadedSession {
                 if let Some(absolute) = add(self.origin, neighbor) {
                     self.dropped_items.drop_unattached_block(
                         absolute,
-                        button_kind.expect("supported button has a known kind").id(),
+                        attached_item
+                            .as_deref()
+                            .expect("supported attached block has a known kind"),
                         self.block_drops,
                         self.loot.as_deref(),
                     );
@@ -5791,7 +5860,7 @@ impl LoadedSession {
                 self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
             }
         }
-        // Button changes explicitly notify both the button and its support.
+        // Attached signal sources notify both their own position and their support.
         for (index, support) in [old_support, new_support].into_iter().enumerate() {
             if index == 1 && support == old_support {
                 continue;
@@ -6495,7 +6564,9 @@ impl LoadedSession {
                                 || native_core::button::Button::from_id(item.id()).is_some()
                                 || matches!(
                                     item.id(),
-                                    "minecraft:redstone_lamp" | "minecraft:redstone_block"
+                                    "minecraft:redstone_lamp"
+                                        | "minecraft:redstone_block"
+                                        | "minecraft:lever"
                                 )
                         });
                         let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
@@ -6511,7 +6582,7 @@ impl LoadedSession {
                         if !handled {
                             if self.game_mode != GameMode::Spectator
                                 && !bypass
-                                && self.use_button(hit.position)
+                                && (self.use_button(hit.position) || self.use_lever(hit.position))
                             {
                                 handled = true;
                             } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
@@ -8168,6 +8239,7 @@ fn button_can_replace(block: &BlockState) -> Option<bool> {
     if id.ends_with("_slab")
         || id.ends_with("_stairs")
         || id.ends_with("_button")
+        || id == "lever"
         || id.ends_with("_leaves")
         || id.ends_with("_fence")
         || id.ends_with("_bed")
@@ -8255,7 +8327,8 @@ fn button_placement_directions(
 }
 
 fn button_support_direction(button: &BlockState) -> Option<IVec3> {
-    if native_core::button::Button::from_id(&button.name).is_none()
+    if (button.name != "minecraft:lever"
+        && native_core::button::Button::from_id(&button.name).is_none())
         || block_outline(button).is_none()
     {
         return None;
@@ -8565,6 +8638,151 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    fn lever_places_toggles_and_drives_lamps_through_support() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:lever".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let target = session.origin + IVec3::new(8, 2, 7);
+                assert_eq!(
+                    session
+                        .world
+                        .block(target.x, target.y, target.z)
+                        .unwrap()
+                        .name,
+                    if mode == GameMode::Adventure {
+                        "minecraft:air"
+                    } else {
+                        "minecraft:lever"
+                    }
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+                if mode != GameMode::Adventure {
+                    session.update(TICK * 5);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    assert_eq!(
+                        session
+                            .world
+                            .block(target.x, target.y, target.z)
+                            .unwrap()
+                            .properties
+                            .get("powered")
+                            .map(String::as_str),
+                        Some("true")
+                    );
+                    assert!(matches!(
+                        session.take_lever_sounds().as_slice(),
+                        [LeverSoundEvent { powered: true, .. }]
+                    ));
+                }
+            }
+        }
+        for indirect in [false, true] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let lamp = IVec3::new(8, 5, 8);
+            let lever = lamp + IVec3::X * if indirect { 2 } else { 1 };
+            let support = if indirect {
+                lamp + IVec3::X
+            } else {
+                lever + IVec3::X
+            };
+            session.set(support, session.states[3]);
+            let lamp_id =
+                session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+            session.set(lamp, lamp_id);
+            let mut lever_state =
+                stone_button_state(if indirect { IVec3::X } else { IVec3::NEG_X }, 0.0).unwrap();
+            lever_state.name = "minecraft:lever".into();
+            let id = session.intern_block(lever_state);
+            session.set(lever, id);
+            let read = |session: &LoadedSession| {
+                let p = session.origin + lamp;
+                redstone_lamp_lit(session.world.block(p.x, p.y, p.z).unwrap()).unwrap()
+            };
+            assert!(session.use_lever(lever));
+            assert!(read(&session), "indirect={indirect}");
+            assert!(matches!(
+                session.take_lever_sounds().as_slice(),
+                [LeverSoundEvent { powered: true, .. }]
+            ));
+            for _ in 0..30 {
+                session.update(TICK);
+            }
+            assert!(read(&session));
+            assert!(session.use_lever(lever));
+            assert!(matches!(
+                session.take_lever_sounds().as_slice(),
+                [LeverSoundEvent { powered: false, .. }]
+            ));
+            for _ in 0..5 {
+                session.update(TICK);
+            }
+            assert!(!read(&session));
+        }
+    }
+
+    #[test]
+    fn lever_drops_data_pack_loot_when_support_is_removed() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/lever.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        for face in [
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ] {
+            let mut session = session();
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut LootSource).unwrap()));
+            let support = IVec3::new(8, 6, 8);
+            let target = support + face;
+            session.set(support, session.states[3]);
+            let mut lever = stone_button_state(face, 0.0).unwrap();
+            lever.name = "minecraft:lever".into();
+            let id = session.intern_block(lever);
+            session.set(target, id);
+            session.set(support, session.states[0]);
+            let absolute = session.origin + target;
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air",
+                "face={face:?}"
+            );
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(drops[0].stack.id(), "minecraft:diamond");
+        }
     }
 
     #[test]
@@ -21238,6 +21456,18 @@ mod tests {
         let actual: Vec<BTreeMap<String, String>> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(actual, expected);
+
+        let output = temp.path().join("lever-output.json");
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("ButtonPlacementOracle")
+            .arg(&input)
+            .arg(&output)
+            .arg("lever"));
+        let actual: Vec<BTreeMap<String, String>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(actual, expected, "lever placement states");
 
         let source = temp.path().join("ButtonFallbackOracle.java");
         std::fs::write(

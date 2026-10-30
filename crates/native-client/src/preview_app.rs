@@ -453,9 +453,24 @@ impl Viewer {
                 audio.set_listener(eye, self.camera.yaw);
                 self.audio_listener = Some((eye, self.camera.yaw));
             }
-            for sound in play.session.take_button_sounds() {
-                if let Some(audio) = &self.audio {
-                    audio.button(sound);
+            let mut buttons = play.session.take_button_sounds().into_iter().peekable();
+            let mut levers = play.session.take_lever_sounds().into_iter().peekable();
+            while buttons.peek().is_some() || levers.peek().is_some() {
+                let button_first = match (buttons.peek(), levers.peek()) {
+                    (Some(button), Some(lever)) => button.tick <= lever.tick,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if button_first {
+                    if let Some(audio) = &self.audio {
+                        audio.button(buttons.next().unwrap());
+                    } else {
+                        buttons.next();
+                    }
+                } else if let Some(audio) = &self.audio {
+                    audio.lever(levers.next().unwrap());
+                } else {
+                    levers.next();
                 }
             }
             for sound in play.session.take_pickup_sounds() {

@@ -200,7 +200,9 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
         "minecraft:redstone_block" if state.properties.is_empty() => (15, 0),
-        name if native_core::button::Button::from_id(name).is_some() => {
+        name if name == "minecraft:lever"
+            || native_core::button::Button::from_id(name).is_some() =>
+        {
             crate::collision::block_outline(state)?;
             (0, 0)
         }
@@ -1841,6 +1843,7 @@ mod tests {
             "redstone_wall_torch",
             "redstone_lamp",
             "redstone_block",
+            "lever",
             "stone_button",
             "polished_blackstone_button",
             "oak_button",

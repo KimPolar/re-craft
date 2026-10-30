@@ -1700,12 +1700,16 @@ fn button_neighbor_signal_matches_vanilla() {
         IVec3::X,
     ];
     let value = |position: IVec3, state: &BlockState| serde_json::json!({"pos": position.to_array(), "id": state.name, "properties": state.properties});
-    for button in native_core::button::Button::ALL {
+    for source in native_core::button::Button::ALL
+        .into_iter()
+        .map(|button| button.id())
+        .chain(std::iter::once("minecraft:lever"))
+    {
         for face in ["floor", "wall", "ceiling"] {
             for facing in ["north", "south", "west", "east"] {
                 for powered in ["true", "false"] {
                     let state = BlockState {
-                        name: button.id().into(),
+                        name: source.into(),
                         properties: [
                             ("face".into(), face.into()),
                             ("facing".into(), facing.into()),
@@ -1812,7 +1816,7 @@ fn button_neighbor_signal_matches_vanilla() {
         assert_eq!(actual, expected, "case {}: {}", i, cases[i]);
     }
     eprintln!(
-        "Compared {} direct and conducted button signal cases with Java 26.3",
+        "Compared {} direct and conducted button and lever signal cases with Java 26.3",
         cases.len()
     );
 }
@@ -2061,6 +2065,7 @@ fn ordinary_tool_mining_matches_vanilla() {
             "stone_button",
             "redstone_lamp",
             "redstone_block",
+            "lever",
         ])
         .args(
             native_core::button::Button::ALL
@@ -2071,7 +2076,7 @@ fn ordinary_tool_mining_matches_vanilla() {
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
     assert_eq!(
         rows.len(),
-        7 * 5 * (19 + native_core::wood::Wood::all().count() + 14) * 4
+        7 * 5 * (20 + native_core::wood::Wood::all().count() + 14) * 4
     );
     for row in &rows {
         let id = row[0].as_str().unwrap();
@@ -2121,7 +2126,7 @@ fn ordinary_tool_mining_matches_vanilla() {
             && native_core::button::Button::from_id(row[1].as_str().unwrap()).is_none()
             && !matches!(
                 row[1].as_str().unwrap(),
-                "minecraft:redstone_lamp" | "minecraft:redstone_block"
+                "minecraft:redstone_lamp" | "minecraft:redstone_block" | "minecraft:lever"
             )
         {
             let block = Block::from_item_id(row[1].as_str().unwrap()).unwrap();

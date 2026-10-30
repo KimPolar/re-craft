@@ -2043,6 +2043,7 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:stone"
         | "minecraft:stone_bricks"
         | "minecraft:stone_button"
+        | "minecraft:lever"
         | "minecraft:redstone_block"
         | "minecraft:redstone_lamp"
         | "minecraft:coal_ore"

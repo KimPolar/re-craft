@@ -23,9 +23,18 @@ fn add(a: IVec3, b: IVec3) -> Option<IVec3> {
     ))
 }
 
-fn button_connected_direction(state: &BlockState) -> Option<IVec3> {
-    native_core::button::Button::from_id(&state.name)?;
-    native_world::collision::block_outline(state)?;
+fn attached_source_direction(state: &BlockState) -> Option<IVec3> {
+    if native_core::button::Button::from_id(&state.name).is_some() {
+        native_world::collision::block_outline(state)?;
+    } else if state.name != "minecraft:lever" || state.properties.len() != 3 {
+        return None;
+    }
+    if !matches!(
+        state.properties.get("facing").map(String::as_str),
+        Some("north" | "south" | "west" | "east")
+    ) {
+        return None;
+    }
     match state.properties.get("face")?.as_str() {
         "floor" => Some(IVec3::Y),
         "ceiling" => Some(IVec3::NEG_Y),
@@ -46,8 +55,10 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
     if !DIRECTIONS.contains(&direction) {
         return None;
     }
-    if native_core::button::Button::from_id(&state.name).is_some() {
-        let connected = button_connected_direction(state)?;
+    if state.name == "minecraft:lever"
+        || native_core::button::Button::from_id(&state.name).is_some()
+    {
+        let connected = attached_source_direction(state)?;
         let powered = match state.properties.get("powered")?.as_str() {
             "true" => true,
             "false" => false,

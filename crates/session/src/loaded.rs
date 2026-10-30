@@ -5681,6 +5681,10 @@ impl LoadedSession {
                 .as_ref()
                 .map(|effect| effect.amplifier),
         );
+        let slow_falling = self.fall.effects().slow_falling.is_some();
+        if slow_falling {
+            self.fall_distance = 0.0;
+        }
         let start_flight_jump = self.flight.update(
             self.game_mode,
             input.jump,
@@ -5835,6 +5839,7 @@ impl LoadedSession {
                 input,
                 movement,
                 jump_power,
+                slow_falling,
                 resolve,
                 |position, offset| {
                     let target = position + offset;
@@ -5849,6 +5854,7 @@ impl LoadedSession {
                 input,
                 friction,
                 jump_power,
+                slow_falling,
                 resolve,
                 restitution,
             )
@@ -10603,6 +10609,40 @@ mod tests {
             (difference - f64::from(0.2_f32)).abs() < 1e-6,
             "{difference}"
         );
+    }
+
+    #[test]
+    fn slow_falling_resets_fall_distance_and_expires_before_movement() {
+        let make = |duration| {
+            let mut session = session();
+            session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+            session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.fall_distance = 20.0;
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    slow_falling: Some(crate::survival::EffectDuration {
+                        amplifier: 0,
+                        duration,
+                        hidden: None,
+                    }),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session.update(TICK);
+            session
+        };
+        let active = make(2);
+        let expired = make(1);
+        assert!((active.fall_distance - f64::from(0.2_f32)).abs() < 1e-7);
+        assert!(expired.fall_distance > 20.0);
+        assert!((active.motion.velocity.y - (-0.21 * f64::from(0.98_f32))).abs() < 1e-7);
+        assert!((expired.motion.velocity.y - (-0.28 * f64::from(0.98_f32))).abs() < 1e-7);
     }
 
     #[test]

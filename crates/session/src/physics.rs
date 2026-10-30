@@ -276,10 +276,22 @@ impl MotionState {
         jump_power: f32,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
     ) -> (bool, DVec3) {
+        self.tick_resolved_with_effects(input, block_friction, jump_power, false, collide)
+    }
+
+    pub fn tick_resolved_with_effects(
+        &mut self,
+        input: MovementInput,
+        block_friction: f32,
+        jump_power: f32,
+        slow_falling: bool,
+        collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
+    ) -> (bool, DVec3) {
         self.tick_resolved_with_restitution(
             input,
             block_friction,
             jump_power,
+            slow_falling,
             collide,
             |_, _, _| (0.0, 0.0),
         )
@@ -290,6 +302,7 @@ impl MotionState {
         input: MovementInput,
         block_friction: f32,
         jump_power: f32,
+        slow_falling: bool,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
     ) -> (bool, DVec3) {
@@ -370,7 +383,12 @@ impl MotionState {
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);
         self.velocity.x *= f64::from(horizontal_drag);
-        self.velocity.y = (self.velocity.y - 0.08) * f64::from(vertical_drag);
+        let gravity = if slow_falling && self.velocity.y <= 0.0 {
+            0.01
+        } else {
+            0.08
+        };
+        self.velocity.y = (self.velocity.y - gravity) * f64::from(vertical_drag);
         self.velocity.z *= f64::from(horizontal_drag);
         let horizontal_collision = blocked_x || blocked_z;
         (
@@ -391,6 +409,7 @@ impl MotionState {
             input,
             fluid,
             0.42_f32,
+            false,
             collide,
             can_jump_out,
             |_, _, _| (0.0, 0.0),
@@ -402,6 +421,7 @@ impl MotionState {
         input: MovementInput,
         fluid: FluidMovement,
         jump_power: f32,
+        slow_falling: bool,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
@@ -437,6 +457,7 @@ impl MotionState {
             }
         }
         let falling = self.velocity.y <= 0.0;
+        let gravity = if slow_falling && falling { 0.01 } else { 0.08 };
         let (left, forward) = keyboard_input(
             -input.right,
             input.forward,
@@ -474,16 +495,16 @@ impl MotionState {
             FluidKind::Water => {
                 let drag = if input.sprinting { 0.9_f32 } else { 0.8_f32 };
                 self.velocity *= DVec3::new(f64::from(drag), f64::from(0.8_f32), f64::from(drag));
-                self.velocity = fluid_gravity(self.velocity, falling, input.sprinting);
+                self.velocity = fluid_gravity(self.velocity, falling, input.sprinting, gravity);
             }
             FluidKind::Lava => {
                 if fluid.depth <= 0.4 {
                     self.velocity *= DVec3::new(0.5, f64::from(0.8_f32), 0.5);
-                    self.velocity = fluid_gravity(self.velocity, falling, input.sprinting);
+                    self.velocity = fluid_gravity(self.velocity, falling, input.sprinting, gravity);
                 } else {
                     self.velocity *= 0.5;
                 }
-                self.velocity.y -= 0.08 / 4.0;
+                self.velocity.y -= gravity / 4.0;
             }
         }
         let horizontal_collision = blocked_x || blocked_z;
@@ -504,15 +525,15 @@ impl MotionState {
     }
 }
 
-fn fluid_gravity(mut velocity: DVec3, falling: bool, sprinting: bool) -> DVec3 {
+fn fluid_gravity(mut velocity: DVec3, falling: bool, sprinting: bool, gravity: f64) -> DVec3 {
     if !sprinting {
         velocity.y = if falling
             && (velocity.y - 0.005).abs() >= 0.003
-            && (velocity.y - 0.08 / 16.0).abs() < 0.003
+            && (velocity.y - gravity / 16.0).abs() < 0.003
         {
             -0.003
         } else {
-            velocity.y - 0.08 / 16.0
+            velocity.y - gravity / 16.0
         };
     }
     velocity

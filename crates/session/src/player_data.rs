@@ -277,6 +277,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
         let slot = match (id.namespace.as_str(), id.path.as_str()) {
             ("minecraft", "jump_boost") => &mut effects.jump_boost,
             ("minecraft", "resistance") => &mut effects.resistance,
+            ("minecraft", "slow_falling") => &mut effects.slow_falling,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -870,6 +871,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                     resource.path.as_str(),
                     "jump_boost"
                         | "resistance"
+                        | "slow_falling"
                         | "water_breathing"
                         | "conduit_power"
                         | "breath_of_the_nautilus"
@@ -1525,6 +1527,38 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_slow_falling_survives_hidden_effect_promotion_in_draft() {
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:slow_falling".into())),
+                        ("duration".into(), Tag::Int(1)),
+                        (
+                            "hidden_effect".into(),
+                            Tag::Compound(vec![("duration".into(), Tag::Int(5))]),
+                        ),
+                    ])],
+                },
+            )]),
+        };
+        let mut effects = read_saved_fall_effects(&player).unwrap();
+        effects.tick();
+        let advanced = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                advance_saved_effects(&player, 1).unwrap().unwrap(),
+            )]),
+        };
+        assert_eq!(read_saved_fall_effects(&advanced).unwrap(), effects);
+        assert_eq!(effects.slow_falling.unwrap().duration, 4);
+    }
 
     #[test]
     fn effect_draft_ages_hidden_effects_and_preserves_promoted_display_settings() {

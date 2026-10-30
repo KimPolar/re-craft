@@ -77,6 +77,7 @@ public class SkyLightEngineOracle implements LightChunkGetter, BlockGetter {
             var chunk = world.chunks.get(new ChunkPos(Math.floorDiv(p.getX(), 16), Math.floorDiv(p.getZ(), 16)));
             chunk.sources.update(chunk, Math.floorMod(p.getX(), 16), p.getY(), Math.floorMod(p.getZ(), 16));
             engine.checkBlock(p);
+            if (item.has("defer") && item.get("defer").getAsBoolean()) continue;
             while (engine.hasLightWork()) engine.runLightUpdates();
             var grid = new JsonArray();
             var listener = engine.getLayerListener(LightLayer.SKY);

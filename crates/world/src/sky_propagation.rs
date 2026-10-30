@@ -109,12 +109,18 @@ pub fn relight_change(
             y.clamp(light_range.start, light_range.end - 1)
         }
     };
-    let low = normalize(previous_source)
-        .min(normalize(current_source))
-        .min(position.y);
-    let high = normalize(previous_source)
-        .max(normalize(current_source))
-        .max(position.y);
+    let (low, high) = if previous_source == current_source {
+        (position.y, position.y)
+    } else {
+        (
+            normalize(previous_source)
+                .min(normalize(current_source))
+                .min(position.y),
+            normalize(previous_source)
+                .max(normalize(current_source))
+                .max(position.y),
+        )
+    };
     let min_y = low.saturating_sub(RADIUS).max(light_range.start);
     let max_y = high.saturating_add(RADIUS).min(light_range.end - 1);
     let height = usize::try_from(max_y - min_y + 1).ok()?;
@@ -329,6 +335,371 @@ pub fn relight_change(
     Some(changed)
 }
 
+/// One edit and the direct-sky height immediately before and after that edit.
+#[derive(Clone, Copy, Debug)]
+pub struct SkyChange {
+    pub position: BlockPosition,
+    pub previous_source: i32,
+    pub current_source: i32,
+}
+
+#[derive(Clone, Copy)]
+struct Region {
+    x: i32,
+    z: i32,
+    low: i32,
+    high: i32,
+}
+
+/// Recompute the union of pending changes without using stale light from an
+/// overlapping change as a boundary. Changes in a column must be chronological;
+/// `source_y` must describe the world after every listed edit. Missing data,
+/// inconsistent source history or an oversized allocation leaves all light
+/// unchanged. A single edit uses the optimized single-change implementation.
+pub fn relight_changes(
+    world: &mut World,
+    bounds: LightBounds,
+    changes: &[SkyChange],
+    mut source_y: impl FnMut(i32, i32) -> Option<i32>,
+) -> Option<BTreeSet<ChunkPos>> {
+    relight_changes_inner(world, bounds, changes, &mut source_y)
+}
+
+fn relight_changes_inner(
+    world: &mut World,
+    bounds: LightBounds,
+    changes: &[SkyChange],
+    source_y: &mut dyn FnMut(i32, i32) -> Option<i32>,
+) -> Option<BTreeSet<ChunkPos>> {
+    if changes.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    if let [change] = changes {
+        return relight_change(
+            world,
+            bounds,
+            change.position,
+            change.previous_source,
+            change.current_source,
+            source_y,
+        );
+    }
+    let build = bounds.build_range();
+    let light = bounds.light_range();
+    let valid = |y| y == UNBOUNDED_SKY_SOURCE || (build.start..=build.end).contains(&y);
+    let normalize = |y: i32| {
+        if y == UNBOUNDED_SKY_SOURCE {
+            light.start
+        } else {
+            y.clamp(light.start, light.end - 1)
+        }
+    };
+    let mut regions = Vec::with_capacity(changes.len());
+    let mut expected_sources = BTreeMap::new();
+    let (mut min_x, mut max_x, mut min_z, mut max_z, mut min_y, mut max_y) =
+        (i32::MAX, i32::MIN, i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for change in changes {
+        let p = change.position;
+        if !build.contains(&p.y) || !valid(change.previous_source) || !valid(change.current_source)
+        {
+            return None;
+        }
+        if let Some(previous) = expected_sources.insert((p.x, p.z), change.current_source)
+            && previous != change.previous_source
+        {
+            return None;
+        }
+        let (low, high) = if change.previous_source == change.current_source {
+            (p.y, p.y)
+        } else {
+            (
+                normalize(change.previous_source)
+                    .min(normalize(change.current_source))
+                    .min(p.y),
+                normalize(change.previous_source)
+                    .max(normalize(change.current_source))
+                    .max(p.y),
+            )
+        };
+        regions.push(Region {
+            x: p.x,
+            z: p.z,
+            low,
+            high,
+        });
+        min_x = min_x.min(p.x.checked_sub(RADIUS)?);
+        max_x = max_x.max(p.x.checked_add(RADIUS)?);
+        min_z = min_z.min(p.z.checked_sub(RADIUS)?);
+        max_z = max_z.max(p.z.checked_add(RADIUS)?);
+        min_y = min_y.min(low.saturating_sub(RADIUS).max(light.start));
+        max_y = max_y.max(high.saturating_add(RADIUS).min(light.end - 1));
+    }
+    let x_len = usize::try_from(i64::from(max_x) - i64::from(min_x) + 1).ok()?;
+    let z_len = usize::try_from(i64::from(max_z) - i64::from(min_z) + 1).ok()?;
+    let height = usize::try_from(max_y - min_y + 1).ok()?;
+    let length = x_len.checked_mul(z_len).and_then(|n| n.checked_mul(height));
+    let Some(length) = length.filter(|&n| n <= 4_000_000) else {
+        // Disconnected groups cannot affect each other's boundary values.
+        // Stage them on a clone so failure in a later group remains atomic.
+        let mut seen = vec![false; changes.len()];
+        let mut groups = Vec::new();
+        for first in 0..changes.len() {
+            if seen[first] {
+                continue;
+            }
+            seen[first] = true;
+            let mut group = vec![first];
+            let mut cursor = 0;
+            while cursor < group.len() {
+                let a = regions[group[cursor]];
+                for (i, b) in regions.iter().copied().enumerate() {
+                    if seen[i] {
+                        continue;
+                    }
+                    let dy = if a.high < b.low {
+                        i64::from(b.low) - i64::from(a.high)
+                    } else if b.high < a.low {
+                        i64::from(a.low) - i64::from(b.high)
+                    } else {
+                        0
+                    };
+                    let distance = (i64::from(a.x) - i64::from(b.x)).abs()
+                        + (i64::from(a.z) - i64::from(b.z)).abs()
+                        + dy;
+                    if distance <= i64::from(2 * RADIUS + 1) {
+                        seen[i] = true;
+                        group.push(i);
+                    }
+                }
+                cursor += 1;
+            }
+            group.sort_unstable();
+            groups.push(group);
+        }
+        if groups.len() == 1 {
+            return None;
+        }
+        let mut staged = world.clone();
+        let mut changed = BTreeSet::new();
+        for group in groups {
+            let group: Vec<_> = group.into_iter().map(|i| changes[i]).collect();
+            changed.extend(relight_changes_inner(
+                &mut staged,
+                bounds,
+                &group,
+                source_y,
+            )?);
+        }
+        *world = staged;
+        return Some(changed);
+    };
+    let mut cells = vec![None; length];
+    let mut active = Vec::new();
+    let index = |x: i32, y: i32, z: i32| -> Option<usize> {
+        if x < min_x || x > max_x || z < min_z || z > max_z || y < min_y || y > max_y {
+            return None;
+        }
+        let dx = usize::try_from(i64::from(x) - i64::from(min_x)).ok()?;
+        let dz = usize::try_from(i64::from(z) - i64::from(min_z)).ok()?;
+        Some((dx * z_len + dz) * height + usize::try_from(y - min_y).ok()?)
+    };
+    let position = |i: usize| BlockPosition {
+        x: (i64::from(min_x) + (i / height / z_len) as i64) as i32,
+        y: min_y + (i % height) as i32,
+        z: (i64::from(min_z) + (i / height % z_len) as i64) as i32,
+    };
+    let mut ids = BTreeMap::new();
+    let mut behaviors = vec![transparent_light_properties()];
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            let mut intervals = Vec::new();
+            for region in &regions {
+                let distance = (i64::from(x) - i64::from(region.x)).abs()
+                    + (i64::from(z) - i64::from(region.z)).abs();
+                if distance > i64::from(RADIUS) {
+                    continue;
+                }
+                let remaining = RADIUS - distance as i32;
+                intervals.push((
+                    region.low.saturating_sub(remaining).max(light.start),
+                    region.high.saturating_add(remaining).min(light.end - 1),
+                ));
+            }
+            if intervals.is_empty() {
+                continue;
+            }
+            intervals.sort_unstable();
+            let mut merged: Vec<(i32, i32)> = Vec::new();
+            for (lo, hi) in intervals {
+                if let Some(last) = merged.last_mut()
+                    && lo <= last.1 + 1
+                {
+                    last.1 = last.1.max(hi);
+                } else {
+                    merged.push((lo, hi));
+                }
+            }
+            let source = source_y(x, z)?;
+            if !valid(source)
+                || expected_sources
+                    .get(&(x, z))
+                    .is_some_and(|&expected| expected != source)
+            {
+                return None;
+            }
+            let chunk = world.chunks.get(&ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            })?;
+            if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
+                return None;
+            }
+            let local_xz = x.rem_euclid(16) as usize + z.rem_euclid(16) as usize * 16;
+            let mut cached_y = i32::MIN;
+            let mut section = None;
+            for (lo, hi) in merged {
+                for y in lo..=hi {
+                    let section_y = y.div_euclid(16);
+                    if section_y != cached_y {
+                        section = Some(chunk.sections.get(&i8::try_from(section_y).ok()?)?);
+                        cached_y = section_y;
+                    }
+                    let section = section.as_ref()?;
+                    let local = local_xz + y.rem_euclid(16) as usize * 256;
+                    let byte = section.sky_light.as_ref()?[local / 2];
+                    let previous = if local.is_multiple_of(2) {
+                        byte & 15
+                    } else {
+                        byte >> 4
+                    };
+                    let behavior = if build.contains(&y) {
+                        behavior_for_id(
+                            world,
+                            *section.blocks.as_ref()?.get(local)?,
+                            &mut ids,
+                            &mut behaviors,
+                        )?
+                    } else {
+                        0
+                    };
+                    let i = index(x, y, z)?;
+                    cells[i] = Some(Cell {
+                        behavior,
+                        previous,
+                        value: if y >= source { 15 } else { 0 },
+                    });
+                    active.push(i);
+                }
+            }
+        }
+    }
+    for &i in &active {
+        let p = position(i);
+        let mut cell = cells[i]?;
+        for (d, direction) in DIRECTIONS.into_iter().enumerate() {
+            let next = offset(p, direction)?;
+            if index(next.x, next.y, next.z).is_some_and(|j| cells[j].is_some()) {
+                continue;
+            }
+            if next.y < light.start {
+                continue;
+            }
+            let (other, boundary) = if next.y >= light.end {
+                (0, 15)
+            } else {
+                (
+                    behavior_at(world, bounds, next, &mut ids, &mut behaviors)?,
+                    stored_light(world, next)?,
+                )
+            };
+            if !occluded(&behaviors, cell.behavior, other, d) {
+                cell.value = cell
+                    .value
+                    .max(boundary.saturating_sub(behaviors[cell.behavior].opacity.max(1)));
+            }
+        }
+        cells[i] = Some(cell);
+    }
+    let mut queue = BinaryHeap::new();
+    for &i in &active {
+        let cell = cells[i]?;
+        if cell.value <= 1 {
+            continue;
+        }
+        let p = position(i);
+        let mut useful = false;
+        for (d, direction) in DIRECTIONS.into_iter().enumerate() {
+            let next = offset(p, direction)?;
+            let Some(neighbor) = index(next.x, next.y, next.z).and_then(|j| cells[j]) else {
+                continue;
+            };
+            if cell
+                .value
+                .saturating_sub(behaviors[neighbor.behavior].opacity.max(1))
+                > neighbor.value
+                && !occluded(&behaviors, cell.behavior, neighbor.behavior, d)
+            {
+                useful = true;
+                break;
+            }
+        }
+        if useful {
+            queue.push((cell.value, i));
+        }
+    }
+    while let Some((level, i)) = queue.pop() {
+        let cell = cells[i]?;
+        if cell.value != level {
+            continue;
+        }
+        let p = position(i);
+        for (d, direction) in DIRECTIONS.into_iter().enumerate() {
+            let next = offset(p, direction)?;
+            let Some(j) = index(next.x, next.y, next.z) else {
+                continue;
+            };
+            let Some(mut other) = cells[j] else {
+                continue;
+            };
+            if occluded(&behaviors, cell.behavior, other.behavior, d) {
+                continue;
+            }
+            let value = level.saturating_sub(behaviors[other.behavior].opacity.max(1));
+            if value > other.value {
+                other.value = value;
+                cells[j] = Some(other);
+                queue.push((value, j));
+            }
+        }
+    }
+    let mut changed = BTreeSet::new();
+    for i in active {
+        let cell = cells[i]?;
+        if cell.value == cell.previous {
+            continue;
+        }
+        let p = position(i);
+        let chunk = Arc::make_mut(world.chunks.get_mut(&p.chunk())?);
+        let section = Arc::make_mut(
+            chunk
+                .sections
+                .get_mut(&i8::try_from(p.y.div_euclid(16)).ok()?)?,
+        );
+        let data = section.sky_light.as_mut()?;
+        let local = p.x.rem_euclid(16) as usize
+            + p.z.rem_euclid(16) as usize * 16
+            + p.y.rem_euclid(16) as usize * 256;
+        let byte = &mut data[local / 2];
+        if local.is_multiple_of(2) {
+            *byte = (*byte & 0xf0) | cell.value;
+        } else {
+            *byte = (*byte & 0x0f) | (cell.value << 4);
+        }
+        changed.insert(p.chunk());
+    }
+    Some(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +822,171 @@ mod tests {
         for (pos, chunk) in &world.chunks {
             assert!(Arc::ptr_eq(chunk, &before.chunks[pos]));
         }
+    }
+
+    #[test]
+    fn overlapping_changes_are_recomputed_together() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut sequential = fixture();
+        let mut batch = sequential.clone();
+        let sequential_stone = sequential.intern_state(state("stone", &[]));
+        let batch_stone = batch.intern_state(state("stone", &[]));
+        let mut sources = BTreeMap::new();
+        let mut changes = Vec::new();
+        for x in [14, 16] {
+            let mut col = SkyColumn::load(&sequential, bounds, x, 15).unwrap();
+            let old = col.lowest_source_y();
+            sequential
+                .set_block_id(x, 15, 15, sequential_stone)
+                .unwrap();
+            batch.set_block_id(x, 15, 15, batch_stone).unwrap();
+            col.update(&sequential, 15).unwrap();
+            let current = col.lowest_source_y();
+            sources.insert((x, 15), current);
+            let position = BlockPosition { x, y: 15, z: 15 };
+            relight_change(&mut sequential, bounds, position, old, current, |x, z| {
+                Some(*sources.get(&(x, z)).unwrap_or(&UNBOUNDED_SKY_SOURCE))
+            })
+            .unwrap();
+            changes.push(SkyChange {
+                position,
+                previous_source: old,
+                current_source: current,
+            });
+        }
+        let old_snapshot = batch.clone();
+        relight_changes(&mut batch, bounds, &changes, |x, z| {
+            Some(*sources.get(&(x, z)).unwrap_or(&UNBOUNDED_SKY_SOURCE))
+        })
+        .unwrap();
+        for y in -15..47 {
+            for z in 0..31 {
+                for x in 0..31 {
+                    assert_eq!(
+                        batch.light(x, y, z, true),
+                        sequential.light(x, y, z, true),
+                        "at {x},{y},{z}"
+                    );
+                }
+            }
+        }
+        assert_eq!(old_snapshot.light(14, 14, 15, true), Some(15));
+        assert_eq!(batch.light(14, 14, 15, true), Some(14));
+    }
+
+    #[test]
+    fn batch_rejects_missing_and_inconsistent_inputs_atomically() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let p = BlockPosition {
+            x: 15,
+            y: 15,
+            z: 15,
+        };
+        let changes = [
+            SkyChange {
+                position: p,
+                previous_source: UNBOUNDED_SKY_SOURCE,
+                current_source: 16,
+            },
+            SkyChange {
+                position: p,
+                previous_source: 17,
+                current_source: UNBOUNDED_SKY_SOURCE,
+            },
+        ];
+        let before = world.clone();
+        assert!(
+            relight_changes(&mut world, bounds, &changes, |_, _| Some(
+                UNBOUNDED_SKY_SOURCE
+            ))
+            .is_none()
+        );
+        for (pos, chunk) in &world.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[pos]));
+        }
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light = None;
+        let before = world.clone();
+        let changes = [
+            changes[0],
+            SkyChange {
+                position: BlockPosition { x: 16, ..p },
+                previous_source: UNBOUNDED_SKY_SOURCE,
+                current_source: 16,
+            },
+        ];
+        assert!(
+            relight_changes(&mut world, bounds, &changes, |x, z| Some(
+                if z == 15 && (x == 15 || x == 16) {
+                    16
+                } else {
+                    UNBOUNDED_SKY_SOURCE
+                }
+            ))
+            .is_none()
+        );
+        for (pos, chunk) in &world.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[pos]));
+        }
+    }
+
+    #[test]
+    fn distant_groups_are_staged_atomically_without_a_huge_bounding_box() {
+        let bounds = LightBounds::new(-64, 320).unwrap();
+        let mut world = fixture_range(-64, 320);
+        let duplicate: Vec<_> = world
+            .chunks
+            .iter()
+            .map(|(pos, chunk)| {
+                let target = ChunkPos {
+                    x: pos.x + 25,
+                    z: pos.z,
+                };
+                let mut chunk = (**chunk).clone();
+                chunk.position = target;
+                (target, Arc::new(chunk))
+            })
+            .collect();
+        world.chunks.extend(duplicate);
+        let stone = world.intern_state(state("stone", &[]));
+        let mut changes = Vec::new();
+        for x in [15, 415] {
+            let mut source = SkyColumn::load(&world, bounds, x, 15).unwrap();
+            let previous_source = source.lowest_source_y();
+            world.set_block_id(x, 319, 15, stone).unwrap();
+            source.update(&world, 319).unwrap();
+            changes.push(SkyChange {
+                position: BlockPosition { x, y: 319, z: 15 },
+                previous_source,
+                current_source: source.lowest_source_y(),
+            });
+        }
+        let sources = |x, z| {
+            Some(if z == 15 && (x == 15 || x == 415) {
+                320
+            } else {
+                UNBOUNDED_SKY_SOURCE
+            })
+        };
+        let mut incomplete = world.clone();
+        let chunk = Arc::make_mut(
+            incomplete
+                .chunks
+                .get_mut(&ChunkPos { x: 25, z: 0 })
+                .unwrap(),
+        );
+        Arc::make_mut(chunk.sections.get_mut(&19).unwrap()).sky_light = None;
+        let before = incomplete.clone();
+        assert!(relight_changes(&mut incomplete, bounds, &changes, sources).is_none());
+        for (pos, chunk) in &incomplete.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[pos]));
+        }
+        let changed = relight_changes(&mut world, bounds, &changes, sources).unwrap();
+        assert!(changed.contains(&ChunkPos { x: 0, z: 0 }));
+        assert!(changed.contains(&ChunkPos { x: 25, z: 0 }));
+        assert_eq!(world.light(15, 318, 15, true), Some(14));
+        assert_eq!(world.light(415, 318, 15, true), Some(14));
     }
 
     #[test]
@@ -646,5 +1182,91 @@ mod tests {
                 }
             }
         }
+        let mut actions = Vec::new();
+        for x in 13..=17 {
+            for z in 13..=17 {
+                actions.push((x, 24, z, "stone", true));
+            }
+        }
+        actions.last_mut().unwrap().4 = false;
+        actions.extend([
+            (14, 24, 15, "air", true),
+            (16, 24, 15, "air", false),
+            (14, 24, 15, "water", true),
+            (16, 24, 15, "slab_bottom", false),
+            (15, 24, 15, "air", true),
+            (15, 24, 15, "stone", true),
+            (15, 24, 15, "air", false),
+            (14, 24, 15, "air", true),
+            (16, 24, 15, "air", false),
+        ]);
+        let entries: Vec<_> = actions.iter().map(|(x,y,z,name,defer)| serde_json::json!({"x":x,"y":y,"z":z,"state":name,"defer":defer})).collect();
+        std::fs::write(&input, serde_json::to_vec(&entries).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SkyLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            expected.len(),
+            actions.iter().filter(|action| !action.4).count()
+        );
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let mut columns = BTreeMap::new();
+        let mut pending = Vec::new();
+        let mut expected = expected.into_iter();
+        for (x, y, z, name, defer) in actions {
+            let col = columns
+                .entry((x, z))
+                .or_insert_with(|| SkyColumn::load(&world, bounds, x, z).unwrap());
+            let previous_source = col.lowest_source_y();
+            let block = match name {
+                "water" => state("water", &[("level", "0")]),
+                "slab_bottom" => state(
+                    "stone_slab",
+                    &[("type", "bottom"), ("waterlogged", "false")],
+                ),
+                _ => state(name, &[]),
+            };
+            let id = world.intern_state(block);
+            world.set_block_id(x, y, z, id).unwrap();
+            col.update(&world, y).unwrap();
+            pending.push(SkyChange {
+                position: BlockPosition { x, y, z },
+                previous_source,
+                current_source: col.lowest_source_y(),
+            });
+            if defer {
+                continue;
+            }
+            relight_changes(&mut world, bounds, &pending, |x, z| {
+                Some(
+                    columns
+                        .get(&(x, z))
+                        .map_or(UNBOUNDED_SKY_SOURCE, |c| c.lowest_source_y()),
+                )
+            })
+            .unwrap();
+            pending.clear();
+            let expected = expected.next().unwrap();
+            for y in -15..47 {
+                for z in 0..31 {
+                    for x in 0..31 {
+                        let i = ((y + 15) * 31 * 31 + z * 31 + x) as usize;
+                        assert_eq!(
+                            world.light(x, y, z, true).unwrap(),
+                            expected[i],
+                            "after batched {name}, at {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(pending.is_empty());
+        assert!(expected.next().is_none());
     }
 }

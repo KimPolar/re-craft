@@ -2413,6 +2413,8 @@ fn ordinary_tool_mining_matches_vanilla() {
             "redstone_lamp",
             "redstone_block",
             "lever",
+            "chest",
+            "trapped_chest",
         ])
         .args(
             native_core::button::Button::ALL
@@ -2423,7 +2425,7 @@ fn ordinary_tool_mining_matches_vanilla() {
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
     assert_eq!(
         rows.len(),
-        7 * 5 * (20 + native_core::wood::Wood::all().count() + 14) * 4
+        7 * 5 * (22 + native_core::wood::Wood::all().count() + 14) * 4
     );
     for row in &rows {
         let id = row[0].as_str().unwrap();
@@ -2473,7 +2475,11 @@ fn ordinary_tool_mining_matches_vanilla() {
             && native_core::button::Button::from_id(row[1].as_str().unwrap()).is_none()
             && !matches!(
                 row[1].as_str().unwrap(),
-                "minecraft:redstone_lamp" | "minecraft:redstone_block" | "minecraft:lever"
+                "minecraft:redstone_lamp"
+                    | "minecraft:redstone_block"
+                    | "minecraft:lever"
+                    | "minecraft:chest"
+                    | "minecraft:trapped_chest"
             )
         {
             let block = Block::from_item_id(row[1].as_str().unwrap()).unwrap();

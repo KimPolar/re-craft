@@ -1265,6 +1265,61 @@ impl ItemEntities {
             .collect()
     }
 
+    /// `Containers.dropContents`: even an empty slot consumes its location
+    /// samples; all fragments from one slot use that same location.
+    pub(crate) fn drop_container_contents(&mut self, position: IVec3, slots: &[Option<ItemStack>]) {
+        for slot in slots {
+            let location = DVec3::new(
+                f64::from(position.x) + self.random.next_double() * 0.75 + 0.125,
+                f64::from(position.y) + self.random.next_double() * 0.75,
+                f64::from(position.z) + self.random.next_double() * 0.75 + 0.125,
+            );
+            let Some(stack) = slot else { continue };
+            let mut remaining = stack.count();
+            while remaining > 0 {
+                let count = remaining
+                    .min((self.random.next_int_bound(21).expect("positive bound") + 10) as u32);
+                remaining -= count;
+                let triangle = |random: &mut LegacyRandom, center: f64| {
+                    center + 0.11485000171139836 * (random.next_double() - random.next_double())
+                };
+                let velocity = DVec3::new(
+                    triangle(&mut self.random, 0.0),
+                    triangle(&mut self.random, 0.2),
+                    triangle(&mut self.random, 0.0),
+                );
+                let (bob_offset, yaw) = self.item_visuals();
+                self.entities.push(ItemEntity {
+                    item: DroppedItem {
+                        position: location,
+                        previous_position: location,
+                        stack: stack.with_count(count).expect("positive fragment"),
+                        age: 0,
+                        bob_offset,
+                    },
+                    velocity,
+                    on_ground: false,
+                    ground_without_support: false,
+                    pickup_delay: 0,
+                    lifetime: 0,
+                    no_gravity: false,
+                    owner: None,
+                    _saved_source: None,
+                    created: Some(CreatedItemIdentity::new(
+                        location,
+                        CreatedThrower::Known(None),
+                        yaw,
+                    )),
+                    id: self.next_id,
+                    section_sequence: self.next_section_sequence,
+                    _damage_state: ItemDamageState::default(),
+                });
+                self.next_id = self.next_id.wrapping_add(1);
+                self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+            }
+        }
+    }
+
     /// Java scatters death drops instead of throwing them along the view.
     pub fn drop_death(
         &mut self,
@@ -1390,6 +1445,80 @@ impl ItemEntities {
         enabled: bool,
         tables: Option<&BlockLootTables>,
     ) {
+        self.drop_block_with_name(position, name, hand, mode, enabled, tables, None);
+    }
+
+    /// Check the active table without advancing the session RNG or dropping an item.
+    pub(crate) fn can_drop_block(
+        &self,
+        name: &str,
+        hand: Option<&ItemStack>,
+        mode: GameMode,
+        enabled: bool,
+        tables: Option<&BlockLootTables>,
+    ) -> bool {
+        if !enabled || mode == GameMode::Creative {
+            return true;
+        }
+        let Some(material) = Material::from_block_name(name) else {
+            return false;
+        };
+        let Some(properties) = mining::mining_properties(material, hand) else {
+            return false;
+        };
+        if !properties.correct_for_drops {
+            return true;
+        }
+        let Some(tables) = tables else { return false };
+        if !tables.fully_supported_block(name) {
+            return false;
+        }
+        let Ok(enchantments) = hand.map(crate::inventory::item_enchantments).transpose() else {
+            return false;
+        };
+        let enchantments = enchantments.unwrap_or_default();
+        let tool = BasicTool {
+            item: hand.map(ItemStack::id),
+            count: hand.map_or(0, ItemStack::count),
+            enchantments: &enchantments,
+        };
+        let mut random = self.random.clone();
+        tables
+            .drops_with_random(name, tool, Some(&mut random))
+            .is_ok()
+    }
+
+    pub(crate) fn can_drop_container_block(
+        &self,
+        position: IVec3,
+        slots: &[Option<ItemStack>],
+        name: &str,
+        hand: Option<&ItemStack>,
+        mode: GameMode,
+        enabled: bool,
+        tables: Option<&BlockLootTables>,
+    ) -> bool {
+        if !enabled || mode == GameMode::Creative {
+            return true;
+        }
+        let mut preview = ItemEntities {
+            random: self.random.clone(),
+            ..Default::default()
+        };
+        preview.drop_container_contents(position, slots);
+        preview.can_drop_block(name, hand, mode, enabled, tables)
+    }
+
+    pub(crate) fn drop_block_with_name(
+        &mut self,
+        position: IVec3,
+        name: &str,
+        hand: Option<&ItemStack>,
+        mode: GameMode,
+        enabled: bool,
+        tables: Option<&BlockLootTables>,
+        custom_name: Option<&Tag>,
+    ) {
         let Some(material) = Material::from_block_name(name) else {
             return;
         };
@@ -1420,7 +1549,13 @@ impl ItemEntities {
                 return;
             }
         };
-        self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops);
+        self.spawn_drops(
+            position,
+            IVec3::ZERO,
+            DropStrategy::FromMiddle,
+            drops,
+            custom_name,
+        );
     }
 
     /// Block update destruction has no player tool or creative-mode exemption.
@@ -1441,7 +1576,9 @@ impl ItemEntities {
             enchantments: &[],
         };
         match tables.drops_with_random(name, tool, Some(&mut self.random)) {
-            Ok(drops) => self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops),
+            Ok(drops) => {
+                self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops, None)
+            }
             Err(error) => eprintln!("unsupported loot for {name}: {error:#}"),
         }
     }
@@ -1456,7 +1593,7 @@ impl ItemEntities {
         enabled: bool,
     ) {
         if enabled {
-            self.spawn_drops(position, face, strategy, drops);
+            self.spawn_drops(position, face, strategy, drops, None);
         }
     }
 
@@ -1466,6 +1603,7 @@ impl ItemEntities {
         face: IVec3,
         strategy: DropStrategy,
         drops: Vec<Drop>,
+        custom_name: Option<&Tag>,
     ) {
         for drop in drops {
             let id = format!("{}:{}", drop.item.namespace, drop.item.path);
@@ -1474,7 +1612,13 @@ impl ItemEntities {
             let mut remaining = drop.count;
             while remaining > 0 {
                 let count = remaining.min(maximum.unwrap_or(99));
-                let components = Tag::Compound(Vec::new());
+                let components = Tag::Compound(if drop.copy_block_entity_custom_name {
+                    custom_name
+                        .map(|value| vec![("minecraft:custom_name".into(), value.clone())])
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                });
                 let stack = match maximum {
                     Some(max) => ItemStack::new(id.clone(), count, max, components),
                     None => ItemStack::unresolved(id.clone(), count, components),
@@ -4475,6 +4619,129 @@ mod tests {
             assert_eq!(after.previous_position, before.position);
             assert_ne!(after.position, before.position);
             assert_eq!(after.bob_offset, before.bob_offset);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn chest_content_scattering_matches_java_random_order() {
+        use serde_json::Value;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let loot = BlockLootTables::load(&mut resources).unwrap();
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        for name in ["minecraft:chest", "minecraft:trapped_chest"] {
+            let drops = loot.drops(name, tool).unwrap();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(
+                format!("{}:{}", drops[0].item.namespace, drops[0].item.path),
+                name
+            );
+            assert!(drops[0].copy_block_entity_custom_name);
+        }
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("ChestDropOracle.java");
+        let output = temp.path().join("drops.json");
+        std::fs::write(&source, include_str!("../tests/java/ChestDropOracle.java")).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("ChestDropOracle")
+            .arg(&output));
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32);
+        for (seed, row) in rows.iter().enumerate() {
+            let mut items = ItemEntities {
+                random: LegacyRandom::new(seed as i64),
+                ..Default::default()
+            };
+            let counts = [1, 9, 10, 11, 29, 30, 31, 64];
+            let slots: Vec<_> = (0..27)
+                .map(|i| {
+                    ((i + seed) % 4 == 0).then(|| {
+                        ItemStack::new(
+                            "minecraft:dirt".into(),
+                            counts[(i / 4 + seed) % 8],
+                            64,
+                            Tag::Compound(vec![]),
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            let pos = IVec3::new(
+                if seed % 2 == 0 {
+                    -16_000_000
+                } else {
+                    16_000_000
+                },
+                seed as i32 - 64,
+                -(seed as i32) * 31,
+            );
+            items.drop_container_contents(pos, &slots);
+            let expected = row["drops"].as_array().unwrap();
+            assert_eq!(items.entities.len(), expected.len(), "seed {seed}");
+            for (item, row) in items.entities.iter().zip(expected) {
+                assert_eq!(
+                    u64::from(item.item.stack.count()),
+                    row["count"].as_u64().unwrap()
+                );
+                assert_eq!(item.pickup_delay, row["delay"].as_i64().unwrap() as i32);
+                for (actual, field) in [
+                    (item.item.position.x, "x"),
+                    (item.item.position.y, "y"),
+                    (item.item.position.z, "z"),
+                    (item.velocity.x, "vx"),
+                    (item.velocity.y, "vy"),
+                    (item.velocity.z, "vz"),
+                ] {
+                    assert_eq!(
+                        actual.to_bits(),
+                        row[field].as_f64().unwrap().to_bits(),
+                        "seed {seed} {field}"
+                    );
+                }
+            }
+            assert_eq!(
+                items.random.next_double().to_bits(),
+                row["next"].as_f64().unwrap().to_bits(),
+                "seed {seed} random"
+            );
         }
     }
 

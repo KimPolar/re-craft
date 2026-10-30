@@ -98,6 +98,7 @@ pub enum Material {
     Wood,
     Planks,
     CraftingTable,
+    Chest,
     Unbreakable,
 }
 
@@ -158,6 +159,7 @@ impl Material {
                 tier: 2,
             }),
             "minecraft:crafting_table" => Some(Self::CraftingTable),
+            "minecraft:chest" | "minecraft:trapped_chest" => Some(Self::Chest),
             "minecraft:bedrock"
             | "minecraft:moving_piston"
             | "minecraft:nether_portal"
@@ -198,7 +200,7 @@ impl Material {
             Self::RedstoneBlock => 5.0,
             Self::Stone | Self::StoneBricks => 1.5,
             Self::Planks | Self::Cobblestone | Self::Wood => 2.0,
-            Self::CraftingTable => 2.5,
+            Self::CraftingTable | Self::Chest => 2.5,
             Self::Ore { deepslate, .. } => {
                 if deepslate {
                     4.5
@@ -319,7 +321,11 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
         ),
         "axe" => matches!(
             material,
-            Material::Planks | Material::CraftingTable | Material::Wood | Material::WoodButton
+            Material::Planks
+                | Material::CraftingTable
+                | Material::Chest
+                | Material::Wood
+                | Material::WoodButton
         ),
         "sword" | "hoe" => false,
         _ => return None,

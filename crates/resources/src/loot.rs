@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 35] = [
+const BASIC_BLOCKS: [&str; 37] = [
     "grass_block",
     "dirt",
     "sand",
@@ -46,6 +46,8 @@ const BASIC_BLOCKS: [&str; 35] = [
     "deepslate_redstone_ore",
     "nether_gold_ore",
     "nether_quartz_ore",
+    "chest",
+    "trapped_chest",
 ];
 
 /// Loot functions consume both floating-point and bounded integer random values.
@@ -86,6 +88,8 @@ impl<F: FnMut() -> f32> LootRandom for F {
 pub struct Drop {
     pub item: ResourceId,
     pub count: u32,
+    /// The supported copy_components operation reads this from a block entity.
+    pub copy_block_entity_custom_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +129,15 @@ pub struct BasicTool<'a> {
 }
 
 impl Condition {
+    fn fully_supported(&self) -> bool {
+        match self {
+            Self::Unsupported(_) => false,
+            Self::Tool(predicate) => predicate.unsupported.is_none(),
+            Self::All(values) | Self::Any(values) => values.iter().all(Self::fully_supported),
+            Self::Not(value) => value.fully_supported(),
+            _ => true,
+        }
+    }
     fn test(&self, tool: BasicTool<'_>, random: &mut Option<&mut dyn LootRandom>) -> Result<bool> {
         match self {
             Self::Always => Ok(true),
@@ -210,10 +223,14 @@ enum ModifierKind {
     OreDrops(ResourceId),
     UniformBonus(ResourceId, i32),
     ExplosionDecay,
+    CopyBlockEntityCustomName,
     Unsupported(String),
 }
 
 impl Modifier {
+    fn fully_supported(&self) -> bool {
+        self.condition.fully_supported() && !matches!(self.kind, ModifierKind::Unsupported(_))
+    }
     fn apply(
         &self,
         drop: &mut Drop,
@@ -289,6 +306,7 @@ impl Modifier {
             }
             // Normal player mining does not have an explosion radius.
             ModifierKind::ExplosionDecay => {}
+            ModifierKind::CopyBlockEntityCustomName => drop.copy_block_entity_custom_name = true,
             ModifierKind::Unsupported(reason) => bail!("unsupported loot modifier: {reason}"),
         }
         Ok(())
@@ -312,6 +330,15 @@ struct Entry {
 }
 
 impl Entry {
+    fn fully_supported(&self) -> bool {
+        self.condition.fully_supported()
+            && self.modifiers.iter().all(Modifier::fully_supported)
+            && match &self.kind {
+                EntryKind::Unsupported(_) => false,
+                EntryKind::Alternatives(entries) => entries.iter().all(Self::fully_supported),
+                _ => true,
+            }
+    }
     /// An expanded empty entry still stops an alternatives chain.
     fn expand(
         &self,
@@ -327,6 +354,7 @@ impl Entry {
                 Some(Drop {
                     item: id.clone(),
                     count: 1,
+                    copy_block_entity_custom_name: false,
                 }),
             ),
             EntryKind::Empty => (self.weight, None),
@@ -379,6 +407,26 @@ pub struct BlockLootTables {
 }
 
 impl BlockLootTables {
+    /// Reject tables that could enter an unsupported branch under another RNG
+    /// state before a destructive container operation is performed.
+    pub fn fully_supported_block(&self, block: &str) -> bool {
+        let Ok(block) = ResourceId::parse(block) else {
+            return false;
+        };
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        self.tables.get(&id).is_some_and(|table| {
+            table.modifiers.iter().all(Modifier::fully_supported)
+                && table.pools.iter().all(|pool| {
+                    pool.condition.fully_supported()
+                        && pool.modifiers.iter().all(Modifier::fully_supported)
+                        && pool.entries.len() <= 1
+                        && pool.entries.iter().all(Entry::fully_supported)
+                })
+        })
+    }
     /// Read tables and referenced predicates from the configured world data packs.
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut result = Self::default();
@@ -703,6 +751,24 @@ fn parse_modifiers(
                     }
                 }
                 "minecraft:explosion_decay" => ModifierKind::ExplosionDecay,
+                "minecraft:copy_components" => {
+                    let source = modifier.get("source").and_then(Value::as_str);
+                    let include = modifier.get("include").and_then(Value::as_array);
+                    if source == Some("block_entity")
+                        && include.is_some_and(|values| {
+                            values.len() == 1 && values[0].as_str() == Some("minecraft:custom_name")
+                        })
+                        && modifier.as_object().is_some_and(|fields| {
+                            fields.keys().all(|key| {
+                                matches!(key.as_str(), "type" | "source" | "include" | "condition")
+                            })
+                        })
+                    {
+                        ModifierKind::CopyBlockEntityCustomName
+                    } else {
+                        ModifierKind::Unsupported("unsupported copy_components".into())
+                    }
+                }
                 other => ModifierKind::Unsupported(other.into()),
             };
             Ok(Modifier { condition, kind })
@@ -969,6 +1035,29 @@ mod tests {
     }
 
     #[test]
+    fn chest_loot_retains_custom_name_copy_and_rejects_unknown_component_rules() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/chest.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:custom_name"]}}]}]}"#);
+        source.put("data/minecraft/loot_table/blocks/trapped_chest.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:lore"]}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        let drops = tables.drops("minecraft:chest", tool).unwrap();
+        assert!(tables.fully_supported_block("minecraft:chest"));
+        assert!(!tables.fully_supported_block("minecraft:trapped_chest"));
+        assert_eq!(drops.len(), 1);
+        assert_eq!(
+            drops[0].item,
+            ResourceId::parse("minecraft:diamond").unwrap()
+        );
+        assert!(drops[0].copy_block_entity_custom_name);
+        assert!(tables.drops("minecraft:trapped_chest", tool).is_err());
+    }
+
+    #[test]
     fn conditions_alternatives_and_modifiers_follow_the_selected_resources() {
         let mut source = Memory::default();
         source.put(
@@ -986,7 +1075,8 @@ mod tests {
             tables.drops("minecraft:dirt", pick(None)).unwrap(),
             vec![Drop {
                 item: ResourceId::parse("minecraft:dirt").unwrap(),
-                count: 2
+                count: 2,
+                copy_block_entity_custom_name: false,
             }]
         );
         assert_eq!(
@@ -995,7 +1085,8 @@ mod tests {
                 .unwrap(),
             vec![Drop {
                 item: ResourceId::parse("minecraft:stone").unwrap(),
-                count: 2
+                count: 2,
+                copy_block_entity_custom_name: false,
             }]
         );
         assert!(tables.drops("minecraft:grass_block", pick(None)).is_err());
@@ -1168,7 +1259,8 @@ mod tests {
                 drops,
                 vec![Drop {
                     item: ResourceId::parse(expected).unwrap(),
-                    count: 1
+                    count: 1,
+                    copy_block_entity_custom_name: false,
                 }]
             );
             assert_eq!(calls, 1);
@@ -1188,7 +1280,8 @@ mod tests {
                 drops,
                 vec![Drop {
                     item: ResourceId::parse(&format!("minecraft:{expected}")).unwrap(),
-                    count: 1
+                    count: 1,
+                    copy_block_entity_custom_name: false,
                 }]
             );
         }
@@ -1201,7 +1294,8 @@ mod tests {
                 tables.drops(id, tool).unwrap(),
                 vec![Drop {
                     item: ResourceId::parse(id).unwrap(),
-                    count: 1
+                    count: 1,
+                    copy_block_entity_custom_name: false,
                 }],
                 "{id}"
             );

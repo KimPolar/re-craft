@@ -225,6 +225,7 @@ pub struct LoadedSession {
     dirty_chunks: BTreeSet<ChunkPos>,
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
+    removed_chests: BTreeSet<(i32, i32, i32)>,
     chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
     open_trapped_chests: BTreeSet<(i32, i32, i32)>,
@@ -1986,6 +1987,7 @@ impl LoadedSession {
             dirty_chunks: BTreeSet::new(),
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
+            removed_chests: BTreeSet::new(),
             chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
             open_trapped_chests: BTreeSet::new(),
@@ -4924,13 +4926,14 @@ impl LoadedSession {
             z: absolute.z.div_euclid(16),
         };
         if self.placed_chests.contains(&key)
-            || crate::saved_chest::read(
-                self.world.saved_block_entities.get(&chunk)?,
-                chunk,
-                absolute,
-            )
-            .ok()?
-            .is_some()
+            || (!self.removed_chests.contains(&key)
+                && crate::saved_chest::read(
+                    self.world.saved_block_entities.get(&chunk)?,
+                    chunk,
+                    absolute,
+                )
+                .ok()?
+                .is_some())
         {
             return None;
         }
@@ -5175,13 +5178,6 @@ impl LoadedSession {
             return None;
         };
         let block = self.world.state(id)?;
-        // Block-entity removal and item scattering are not coordinated yet.
-        if matches!(
-            block.name.as_str(),
-            "minecraft:chest" | "minecraft:trapped_chest"
-        ) {
-            return None;
-        }
         if mining::requires_game_master_permission(&block.name)
             && (self.game_mode != GameMode::Creative || !self.game_master_permission)
         {
@@ -5209,6 +5205,10 @@ impl LoadedSession {
         let Some(name) = self.world.state(id).map(|state| state.name.clone()) else {
             return;
         };
+        if matches!(name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") {
+            self.finish_breaking_chest(relative, id);
+            return;
+        }
         if self.set(relative, self.states[0]) {
             let hand = self
                 .inventory
@@ -5251,6 +5251,130 @@ impl LoadedSession {
                 }
             }
         }
+    }
+
+    fn finish_breaking_chest(&mut self, relative: IVec3, id: BlockStateId) {
+        let Some(absolute) = add(self.origin, relative) else {
+            return;
+        };
+        let Some(block) = self.world.state(id).cloned() else {
+            return;
+        };
+        let Ok(Some(chest)) = self.saved_chest(absolute) else {
+            return;
+        };
+        let partner = if block.properties.get("type").map(String::as_str) == Some("single") {
+            None
+        } else {
+            let Some(direction) = native_world::collision::chest_connection(&block) else {
+                return;
+            };
+            let Some(pos) = add(relative, direction) else {
+                return;
+            };
+            let Cell::State(partner_id) =
+                cell(&self.world, self.origin, self.bounds, pos, self.states[0])
+            else {
+                return;
+            };
+            let Some(mut partner) = self.world.state(partner_id).cloned() else {
+                return;
+            };
+            if partner.name != block.name
+                || partner.properties.get("facing") != block.properties.get("facing")
+                || native_world::collision::chest_connection(&partner) != Some(-direction)
+            {
+                return;
+            }
+            let Some(partner_absolute) = add(self.origin, pos) else {
+                return;
+            };
+            let partner_chunk = ChunkPos {
+                x: partner_absolute.x.div_euclid(16),
+                z: partner_absolute.z.div_euclid(16),
+            };
+            if self
+                .world
+                .chunks
+                .get(&partner_chunk)
+                .and_then(|chunk| chunk.status.as_deref())
+                != Some("minecraft:full")
+            {
+                return;
+            }
+            partner.properties.insert("type".into(), "single".into());
+            Some((pos, partner))
+        };
+        let hand = self
+            .inventory
+            .slot(crate::inventory::PlayerSlot::Storage(
+                self.inventory.selected(),
+            ))
+            .cloned();
+        if !self.dropped_items.can_drop_container_block(
+            absolute,
+            &chest.slots,
+            &block.name,
+            hand.as_ref(),
+            self.game_mode,
+            self.block_drops,
+            self.loot.as_deref(),
+        ) {
+            return;
+        }
+        let replacement = if block
+            .properties
+            .get("waterlogged")
+            .is_some_and(|value| value == "true")
+        {
+            self.intern_block(state("minecraft:water", &[("level", "0")]))
+        } else {
+            self.states[0]
+        };
+        // Vanilla removes the block entity and scatters it before notifying
+        // neighbors; those notifications may themselves produce drops.
+        if !self.set_with_notify(relative, replacement, false) {
+            return;
+        }
+        self.dropped_items
+            .drop_container_contents(absolute, &chest.slots);
+        self.block_notifications
+            .push_back((relative, id, replacement));
+        self.notify_fluid_neighbors();
+        if let Some((position, state)) = partner {
+            let id = self.intern_block(state);
+            self.set(position, id);
+        }
+        let key = (absolute.x, absolute.y, absolute.z);
+        if !self.placed_chests.remove(&key) {
+            self.removed_chests.insert(key);
+        }
+        self.chest_contents.remove(&key);
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        if !self.chest_contents.values().any(|other| {
+            other.position.x.div_euclid(16) == chunk.x
+                && other.position.z.div_euclid(16) == chunk.z
+                && other.inventory_changed()
+        }) {
+            self.chest_dirty_chunks.remove(&chunk);
+        }
+        let properties = mining::mining_properties(mining::Material::Chest, hand.as_ref());
+        let damage = properties.map_or(0, |properties| properties.damage_per_block);
+        if self.game_mode != GameMode::Creative && damage != 0 {
+            Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
+        }
+        self.dropped_items.drop_block_with_name(
+            absolute,
+            &block.name,
+            hand.as_ref(),
+            self.game_mode,
+            self.block_drops,
+            self.loot.as_deref(),
+            chest.custom_name(),
+        );
     }
 
     fn use_tool(&mut self, relative: IVec3, face: IVec3) -> bool {
@@ -11899,6 +12023,20 @@ mod tests {
                             Some((1, 1, false))
                         );
                     }
+                    if mode == GameMode::Creative {
+                        session.submit_command(PlayerCommand::ToggleInventory);
+                        session.update(TICK);
+                        session.submit_command(PlayerCommand::Break);
+                        session.update(TICK);
+                        assert_eq!(
+                            session
+                                .world
+                                .block(target.x, target.y, target.z)
+                                .unwrap()
+                                .name,
+                            "minecraft:air"
+                        );
+                    }
                 }
             }
         }
@@ -11943,6 +12081,51 @@ mod tests {
             Some(InventoryMenu::Chest { other: Some(_), .. })
         ));
         assert!(session.inventory.slot(PlayerSlot::Chest(53)).is_none());
+        let inventory = Arc::make_mut(&mut session.inventory);
+        assert!(inventory.set_slot(
+            PlayerSlot::Chest(0),
+            ItemStack::new("minecraft:diamond".into(), 5, 64, Tag::Compound(vec![]))
+        ));
+        assert!(inventory.set_slot(
+            PlayerSlot::Chest(27),
+            ItemStack::new("minecraft:dirt".into(), 3, 64, Tag::Compound(vec![]))
+        ));
+        assert!(inventory.toggle());
+        session.collect_closed_chest();
+        session.set_game_mode(GameMode::Creative);
+        let absolute = session.origin + first;
+        session.finish_breaking(absolute);
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        let other = session.origin + second;
+        assert_eq!(
+            session
+                .world
+                .block(other.x, other.y, other.z)
+                .unwrap()
+                .properties["type"],
+            "single"
+        );
+        assert!(session.try_open_saved_chest(second));
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Chest(0)).unwrap().id(),
+            "minecraft:dirt"
+        );
+        assert_eq!(
+            session
+                .dropped_items
+                .snapshot()
+                .iter()
+                .map(|item| (item.stack.id(), item.stack.count()))
+                .collect::<Vec<_>>(),
+            vec![("minecraft:diamond", 5)]
+        );
     }
 
     #[test]
@@ -11998,6 +12181,13 @@ mod tests {
         assert!(
             matches!(session.inventory.menu(), Some(InventoryMenu::Chest { position, .. }) if position == pos)
         );
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        session.set_game_mode(GameMode::Creative);
+        session.finish_breaking(pos);
+        let restored = session.world.block(pos.x, pos.y, pos.z).unwrap();
+        assert_eq!(restored.name, "minecraft:water");
+        assert_eq!(restored.properties["level"], "0");
     }
 
     #[test]
@@ -12032,6 +12222,108 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn breaking_chests_scatter_contents_and_use_active_block_loot() {
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::packs::ResourceProvider;
+        use native_world::loaded::SavedBlockEntities;
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/chest.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:chest","modifier":{"type":"minecraft:copy_components","include":["minecraft:custom_name"],"source":"block_entity"}}]}]}"#.to_vec()))
+            }
+        }
+        for (mode, drops_enabled) in [
+            (GameMode::Survival, true),
+            (GameMode::Survival, false),
+            (GameMode::Creative, true),
+        ] {
+            let (mut session, _, position, chunk) = saved_chest_fixture();
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!("expected entities")
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                unreachable!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                unreachable!()
+            };
+            fields.push(("CustomName".into(), Tag::String("treasure".into())));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut LootSource).unwrap()));
+            session.set_game_mode(mode);
+            session.set_block_drops(drops_enabled);
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            let items = session.dropped_items.snapshot();
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| item.stack.id() == "minecraft:diamond")
+                    .map(|item| item.stack.count())
+                    .sum::<u32>(),
+                5
+            );
+            let chest = items
+                .iter()
+                .find(|item| item.stack.id() == "minecraft:chest");
+            if mode == GameMode::Survival && drops_enabled {
+                assert_eq!(
+                    chest
+                        .unwrap()
+                        .stack
+                        .components()
+                        .get("minecraft:custom_name"),
+                    Some(&Tag::String("treasure".into()))
+                );
+            } else {
+                assert!(chest.is_none());
+            }
+        }
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        session.finish_breaking(position);
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Unavailable);
+        session.set_game_mode(GameMode::Creative);
+        session.finish_breaking(position);
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
     }
 
     #[test]

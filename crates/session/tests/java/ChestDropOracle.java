@@ -1,0 +1,52 @@
+import com.google.gson.*;
+import java.nio.file.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.Containers;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.*;
+import net.minecraft.world.level.levelgen.LegacyRandomSource;
+import net.minecraft.util.RandomSource;
+import net.minecraft.core.component.*;
+
+public class ChestDropOracle {
+    static class World extends ClientLevel {
+        RandomSource seeded; List<ItemEntity> items;
+        World() { super(null,null,null,null,0,0,null,false,0L,0); }
+        @Override public RandomSource getRandom() { return seeded; }
+        @Override public boolean addFreshEntity(Entity entity) { items.add((ItemEntity)entity); return true; }
+    }
+    public static void main(String[] args) throws Exception {
+        SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(net.minecraft.data.registries.VanillaRegistries.createWorldLookup());
+        for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+        var named=new net.minecraft.world.level.block.entity.ChestBlockEntity(BlockPos.ZERO,net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState());
+        var name=net.minecraft.world.level.block.entity.BaseContainerBlockEntity.class.getDeclaredField("name"); name.setAccessible(true); name.set(named,net.minecraft.network.chat.Component.literal("treasure"));
+        var params=new net.minecraft.world.level.storage.loot.LootParams(null,net.minecraft.util.context.ContextMap.builder().set(net.minecraft.world.level.storage.loot.parameters.LootContextParams.BLOCK_ENTITY,named).build(),Map.of(),0.0f);
+        var ctor=net.minecraft.world.level.storage.loot.LootContext.class.getDeclaredConstructor(net.minecraft.world.level.storage.loot.LootParams.class,RandomSource.class,net.minecraft.core.HolderGetter.Provider.class); ctor.setAccessible(true);
+        var context=ctor.newInstance(params,new LegacyRandomSource(1),registries);
+        var copy=net.minecraft.world.level.storage.loot.functions.CopyComponentsFunction.copyComponentsFromBlockEntity(net.minecraft.world.level.storage.loot.parameters.LootContextParams.BLOCK_ENTITY).include(DataComponents.CUSTOM_NAME).build();
+        var copied=copy.apply(new ItemStack(Items.CHEST),context);
+        if(!copied.get(DataComponents.CUSTOM_NAME).getString().equals("treasure")) throw new AssertionError("chest custom name copy");
+        Items.DIRT.builtInRegistryHolder().bindComponents(DataComponentMap.builder().set(DataComponents.MAX_STACK_SIZE,64).build());
+        var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var unsafe=(sun.misc.Unsafe)f.get(null);
+        var delay=ItemEntity.class.getDeclaredField("pickupDelay"); delay.setAccessible(true);
+        var rows=new JsonArray();
+        for(int seed=0;seed<32;seed++) {
+            var world=(World)unsafe.allocateInstance(World.class); world.seeded=new LegacyRandomSource(seed); world.items=new ArrayList<>();
+            var container=new SimpleContainer(27);
+            for(int i=0;i<27;i++) if ((i+seed)%4==0) container.setItem(i,new ItemStack(Items.DIRT,new int[]{1,9,10,11,29,30,31,64}[(i/4+seed)%8]));
+            var position=new BlockPos(seed%2==0 ? -16000000 : 16000000,seed-64,-seed*31);
+            Containers.dropContents(world,position,container);
+            var row=new JsonObject(); row.addProperty("seed",seed); var drops=new JsonArray();
+            for(var item:world.items) { var drop=new JsonObject(); drop.addProperty("count",item.getItem().getCount()); drop.addProperty("x",item.getX()); drop.addProperty("y",item.getY()); drop.addProperty("z",item.getZ()); drop.addProperty("vx",item.getDeltaMovement().x); drop.addProperty("vy",item.getDeltaMovement().y); drop.addProperty("vz",item.getDeltaMovement().z); drop.addProperty("delay",delay.getInt(item)); drops.add(drop); }
+            row.add("drops",drops); row.addProperty("next",world.seeded.nextDouble()); rows.add(row);
+        }
+        Files.writeString(Path.of(args[0]),rows.toString());
+    }
+}

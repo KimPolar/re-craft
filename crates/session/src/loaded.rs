@@ -4965,6 +4965,7 @@ impl LoadedSession {
                                 self.origin,
                                 self.motion.position,
                                 self.player,
+                                crate::items::PlayerDropOrigin::ContainerReturn,
                             );
                         }
                     }
@@ -4994,6 +4995,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Unknown,
                         );
                     }
                 }
@@ -5009,6 +5011,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Unknown,
                         );
                     }
                 }
@@ -5048,6 +5051,7 @@ impl LoadedSession {
                                 self.origin,
                                 self.motion.position,
                                 self.player,
+                                crate::items::PlayerDropOrigin::Unknown,
                             );
                         }
                     }
@@ -5061,6 +5065,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -5079,6 +5084,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -5089,6 +5095,7 @@ impl LoadedSession {
                             self.origin,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -5676,6 +5683,7 @@ impl LoadedSession {
                         self.origin,
                         self.motion.position,
                         self.player,
+                        crate::items::PlayerDropOrigin::ContainerReturn,
                     );
                 }
             }
@@ -5859,6 +5867,7 @@ impl LoadedSession {
                         self.origin,
                         self.motion.position,
                         self.player,
+                        crate::items::PlayerDropOrigin::ContainerReturn,
                     );
                 }
                 self.selected = selected_inventory_block(&self.inventory);

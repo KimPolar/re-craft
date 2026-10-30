@@ -205,6 +205,14 @@ enum CreatedThrower {
     Unknown,
 }
 
+/// Whether Java attributes this drop to the player when creating the entity.
+#[derive(Clone, Copy)]
+pub(crate) enum PlayerDropOrigin {
+    Direct,
+    ContainerReturn,
+    Unknown,
+}
+
 impl CreatedItemIdentity {
     fn new(origin: DVec3, thrower: CreatedThrower) -> Self {
         let mut bytes = [0_u8; 16];
@@ -738,6 +746,19 @@ impl ItemEntities {
             .map(|item| (item._damage_state.health, item._damage_state.fire_ticks))
             .collect()
     }
+
+    #[cfg(test)]
+    pub(crate) fn debug_created_throwers(&self) -> Vec<Option<Option<[i32; 4]>>> {
+        self.entities
+            .iter()
+            .map(
+                |entity| match entity.created.as_ref().map(|created| created.thrower) {
+                    Some(CreatedThrower::Known(thrower)) => Some(thrower),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
     pub fn set_damage_rules(
         &mut self,
         items: Arc<native_resources::item_registry::ItemRegistry>,
@@ -925,7 +946,10 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
-            created: Some(CreatedItemIdentity::new(position, CreatedThrower::Unknown)),
+            created: Some(CreatedItemIdentity::new(
+                position,
+                CreatedThrower::Known(None),
+            )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState::default(),
@@ -942,6 +966,7 @@ impl ItemEntities {
         origin: IVec3,
         feet: DVec3,
         player: PlayerState,
+        drop_origin: PlayerDropOrigin,
     ) {
         let angle = self.random.next_float() * 6.2831855_f32;
         let spread = 0.02_f32 * self.random.next_float();
@@ -980,7 +1005,18 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
-            created: Some(CreatedItemIdentity::new(position, CreatedThrower::Unknown)),
+            created: Some(CreatedItemIdentity::new(
+                position,
+                match drop_origin {
+                    PlayerDropOrigin::Direct => {
+                        self.player_uuid.map_or(CreatedThrower::Unknown, |uuid| {
+                            CreatedThrower::Known(Some(uuid))
+                        })
+                    }
+                    PlayerDropOrigin::ContainerReturn => CreatedThrower::Known(None),
+                    PlayerDropOrigin::Unknown => CreatedThrower::Unknown,
+                },
+            )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             _damage_state: ItemDamageState::default(),
@@ -1717,6 +1753,58 @@ mod tests {
         second.spawn_from_entity(DVec3::ZERO, stack);
         assert_eq!(first.entities[0].velocity, second.entities[0].velocity);
         assert_eq!(first.random.next_long(), second.random.next_long());
+    }
+
+    #[test]
+    fn player_drop_records_only_known_throwers() {
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let player = PlayerState {
+            position: glam::Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: true,
+            pose: PlayerPose::Standing,
+        };
+        let id = [1, 2, 3, 4];
+        items.drop_player(
+            stack.clone(),
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::Direct,
+        );
+        items.set_player_uuid(Some(id));
+        items.drop_player(
+            stack.clone(),
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::Direct,
+        );
+        items.drop_player(
+            stack.clone(),
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::ContainerReturn,
+        );
+        items.drop_death(stack, IVec3::ZERO, DVec3::ZERO, player);
+        let actual: Vec<_> = items
+            .entities
+            .iter()
+            .map(|entity| entity.created.as_ref().unwrap().thrower)
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                CreatedThrower::Unknown,
+                CreatedThrower::Known(Some(id)),
+                CreatedThrower::Known(None),
+                CreatedThrower::Known(None)
+            ]
+        );
     }
 
     #[test]
@@ -3149,7 +3237,13 @@ mod tests {
             pose: PlayerPose::Standing,
         };
         let stack = ItemStack::new("minecraft:dirt".into(), 3, 64, Tag::Compound(vec![])).unwrap();
-        items.drop_player(stack, IVec3::ZERO, player.position.as_dvec3(), player);
+        items.drop_player(
+            stack,
+            IVec3::ZERO,
+            player.position.as_dvec3(),
+            player,
+            PlayerDropOrigin::Unknown,
+        );
         items.entities[0].item.position = DVec3::new(0.5, 0.0, 0.5);
         items.entities[0].velocity = DVec3::ZERO;
         for tick in 0..40 {
@@ -3194,8 +3288,20 @@ mod tests {
             pose: PlayerPose::Standing,
         };
         let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
-        items.drop_player(stack.clone(), IVec3::ZERO, DVec3::ZERO, player);
-        items.drop_player(stack, IVec3::ZERO, DVec3::ZERO, player);
+        items.drop_player(
+            stack.clone(),
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::Unknown,
+        );
+        items.drop_player(
+            stack,
+            IVec3::ZERO,
+            DVec3::ZERO,
+            player,
+            PlayerDropOrigin::Unknown,
+        );
         let initial = items.snapshot();
         assert_eq!(initial[0].previous_position, initial[0].position);
         assert_ne!(initial[0].bob_offset, initial[1].bob_offset);
@@ -3264,6 +3370,7 @@ public class PlayerDropOracle {
     var position = Entity.class.getDeclaredField("position"); position.setAccessible(true);
     var random = Entity.class.getDeclaredField("random"); random.setAccessible(true);
     var delay = ItemEntity.class.getDeclaredField("pickupDelay"); delay.setAccessible(true);
+    var thrower = ItemEntity.class.getDeclaredField("thrower"); thrower.setAccessible(true);
     var inputs = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
     var output = new JsonArray();
     for (var value : inputs) {
@@ -3275,8 +3382,11 @@ public class PlayerDropOracle {
       position.set(player,new Vec3(p.get(0).getAsDouble(),p.get(1).getAsDouble(),p.get(2).getAsDouble()));
       player.eye = p.get(1).getAsDouble() + c.get("eyeHeight").getAsDouble();
       random.set(player,new LegacyRandomSource(c.get("seed").getAsLong()));
-      var item = player.createItemStackToDrop(new ItemStack(Items.DIRT),false,false);
+      player.setUUID(new java.util.UUID(0x0000000100000002L,0x0000000300000004L));
+      var item = player.createItemStackToDrop(new ItemStack(Items.DIRT),false,c.get("trace").getAsBoolean());
       var result = new JsonObject(); result.add("position",vec(new Vec3(item.getX(),item.getY(),item.getZ())));
+      var ref = (net.minecraft.world.entity.EntityReference<?>)thrower.get(item);
+      result.addProperty("thrower",ref == null ? "" : ref.getUUID().toString());
       result.add("velocity",vec(item.getDeltaMovement())); result.addProperty("delay",delay.getInt(item)); output.add(result);
     }
     Files.writeString(Path.of(args[1]),new Gson().toJson(output));
@@ -3340,7 +3450,7 @@ public class PlayerDropOracle {
                 on_ground: true,
                 pose,
             };
-            cases.push(json!({"seed":index as i64 + 31, "yaw":player.yaw.to_degrees()-180.0, "pitch":-player.pitch.to_degrees(), "eyeHeight":f64::from(pose.eye_height()), "position":player.position.to_array()}));
+            cases.push(json!({"seed":index as i64 + 31, "yaw":player.yaw.to_degrees()-180.0, "pitch":-player.pitch.to_degrees(), "eyeHeight":f64::from(pose.eye_height()), "position":player.position.to_array(), "trace":index % 2 == 0}));
             players.push(player);
         }
         std::fs::write(&source, JAVA).unwrap();
@@ -3366,8 +3476,30 @@ public class PlayerDropOracle {
             };
             let stack =
                 ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
-            items.drop_player(stack, IVec3::ZERO, player.position.as_dvec3(), player);
+            items.set_player_uuid(Some([1, 2, 3, 4]));
+            let traced = index % 2 == 0;
+            items.drop_player(
+                stack,
+                IVec3::ZERO,
+                player.position.as_dvec3(),
+                player,
+                if traced {
+                    PlayerDropOrigin::Direct
+                } else {
+                    PlayerDropOrigin::ContainerReturn
+                },
+            );
             let entity = &items.entities[0];
+            let expected_thrower = if traced {
+                "00000001-0000-0002-0000-000300000004"
+            } else {
+                ""
+            };
+            assert_eq!(expected["thrower"].as_str().unwrap(), expected_thrower);
+            assert_eq!(
+                entity.created.as_ref().unwrap().thrower,
+                CreatedThrower::Known(traced.then_some([1, 2, 3, 4]))
+            );
             let p_error = (entity.item.position - vec(&expected["position"]))
                 .abs()
                 .max_element();

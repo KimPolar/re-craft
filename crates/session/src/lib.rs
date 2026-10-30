@@ -845,6 +845,7 @@ impl LocalSession {
                                 IVec3::ZERO,
                                 self.motion.position,
                                 self.player,
+                                crate::items::PlayerDropOrigin::ContainerReturn,
                             );
                         }
                     }
@@ -874,6 +875,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Unknown,
                         );
                     }
                 }
@@ -889,6 +891,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Unknown,
                         );
                     }
                 }
@@ -928,6 +931,7 @@ impl LocalSession {
                                 IVec3::ZERO,
                                 self.motion.position,
                                 self.player,
+                                crate::items::PlayerDropOrigin::Unknown,
                             );
                         }
                     }
@@ -941,6 +945,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -959,6 +964,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -969,6 +975,7 @@ impl LocalSession {
                             IVec3::ZERO,
                             self.motion.position,
                             self.player,
+                            crate::items::PlayerDropOrigin::Direct,
                         );
                     }
                 }
@@ -1319,6 +1326,7 @@ impl LocalSession {
                     IVec3::ZERO,
                     self.motion.position,
                     self.player,
+                    crate::items::PlayerDropOrigin::ContainerReturn,
                 );
             }
         }
@@ -1411,6 +1419,7 @@ impl LocalSession {
                         IVec3::ZERO,
                         self.motion.position,
                         self.player,
+                        crate::items::PlayerDropOrigin::ContainerReturn,
                     );
                 }
                 if let Some(death) = &mut self.death {
@@ -3165,6 +3174,7 @@ mod tests {
         use inventory::ItemStack;
         use native_persistence::nbt::Tag;
         let mut session = LocalSession::demo();
+        session.dropped_items.set_player_uuid(Some([1, 2, 3, 4]));
         let original = session.snapshot();
         session.submit_command(PlayerCommand::DropSelected { all: false });
         session.update(Duration::from_millis(49));
@@ -3177,6 +3187,10 @@ mod tests {
         );
         assert_eq!(one.dropped_items.len(), 1);
         assert_eq!(one.dropped_items[0].stack.count(), 1);
+        assert_eq!(
+            session.dropped_items.debug_created_throwers()[0],
+            Some(Some([1, 2, 3, 4]))
+        );
         assert_eq!(
             original
                 .inventory
@@ -3220,6 +3234,10 @@ mod tests {
             "minecraft:dirt"
         );
         assert_eq!(closed.dropped_items.last().unwrap().stack.count(), 3);
+        assert_eq!(
+            session.dropped_items.debug_created_throwers().last(),
+            Some(&Some(None))
+        );
     }
 
     #[test]

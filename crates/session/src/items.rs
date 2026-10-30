@@ -260,7 +260,10 @@ struct CreatedItemIdentity {
     thrower: CreatedThrower,
     yaw: f32,
     fall_distance: f64,
-    ticked: bool,
+    /// Position and path for which every tick's base-entity state was checked.
+    verified_position: DVec3,
+    visited: BTreeSet<native_world::loaded::ChunkPos>,
+    base_valid: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,14 +283,55 @@ impl CreatedItemIdentity {
     fn new(origin: DVec3, thrower: CreatedThrower, yaw: f32) -> Self {
         let mut bytes = [0_u8; 16];
         let uuid = getrandom::fill(&mut bytes).ok().map(|_| uuid_v4(bytes));
+        let origin_chunk = created_chunk(origin);
         Self {
             uuid,
             origin,
             thrower,
             yaw,
             fall_distance: 0.0,
-            ticked: false,
+            verified_position: origin,
+            visited: origin_chunk.into_iter().collect(),
+            base_valid: origin_chunk.is_some(),
         }
+    }
+}
+
+fn created_chunk(position: DVec3) -> Option<native_world::loaded::ChunkPos> {
+    if !position.is_finite() || position.x.abs() > 30_000_512.0 || position.z.abs() > 30_000_512.0 {
+        return None;
+    }
+    Some(native_world::loaded::ChunkPos {
+        x: (position.x.floor() as i32).div_euclid(16),
+        z: (position.z.floor() as i32).div_euclid(16),
+    })
+}
+
+impl CreatedItemIdentity {
+    fn verify_movement(&mut self, start: DVec3, end: DVec3, safe: bool) {
+        self.base_valid &= safe && self.verified_position == start;
+        let Some(a) = created_chunk(start) else {
+            self.base_valid = false;
+            return;
+        };
+        let Some(b) = created_chunk(end) else {
+            self.base_valid = false;
+            return;
+        };
+        let x0 = a.x.min(b.x);
+        let x1 = a.x.max(b.x);
+        let z0 = a.z.min(b.z);
+        let z1 = a.z.max(b.z);
+        if (i64::from(x1) - i64::from(x0) + 1) * (i64::from(z1) - i64::from(z0) + 1) > 64 {
+            self.base_valid = false;
+            return;
+        }
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                self.visited.insert(native_world::loaded::ChunkPos { x, z });
+            }
+        }
+        self.verified_position = end;
     }
 }
 
@@ -598,6 +642,10 @@ impl ItemEntities {
             if !positions.contains(&destination)
                 && !source.is_some_and(|pos| positions.contains(&pos))
                 && !origin_chunk.is_some_and(|pos| positions.contains(&pos))
+                && entity
+                    .created
+                    .as_ref()
+                    .is_none_or(|created| created.visited.is_disjoint(positions))
             {
                 continue;
             }
@@ -627,6 +675,10 @@ impl ItemEntities {
                 ensure!(
                     positions.contains(&destination),
                     "new item destination chunk is unavailable"
+                );
+                ensure!(
+                    created.visited.is_subset(positions),
+                    "new item path chunk is unavailable"
                 );
                 continue;
             }
@@ -727,7 +779,7 @@ impl ItemEntities {
             );
             let in_origin = Self::active_in(positions, created.origin);
             let in_current = Self::active_in(positions, entity.item.position);
-            if !in_origin && !in_current {
+            if !in_origin && !in_current && created.visited.is_disjoint(positions) {
                 continue;
             }
             ensure!(
@@ -735,7 +787,11 @@ impl ItemEntities {
                 "created item crossed a chunk boundary"
             );
             ensure!(
-                !created.ticked && entity.item.position == created.origin,
+                created.visited.is_subset(positions),
+                "created item path chunk is unavailable"
+            );
+            ensure!(
+                created.base_valid && entity.item.position == created.verified_position,
                 "created item base fields require tick simulation"
             );
             let uuid = created.uuid.context("created item UUID is unavailable")?;
@@ -1414,11 +1470,14 @@ impl ItemEntities {
             |_| native_world::fluid::FluidContacts::default(),
             false,
             |_, _, _| None,
+            |_, _| false,
         );
     }
 
+    /// The proof callback must certify that the complete movement area has no
+    /// blocks or fluids with untracked base-entity effects.
     #[allow(clippy::too_many_arguments)]
-    pub fn tick_with_fluid<'a>(
+    pub(crate) fn tick_with_fluid_and_proof<'a>(
         &mut self,
         origin: IVec3,
         player: DVec3,
@@ -1432,6 +1491,7 @@ impl ItemEntities {
         fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
         path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+        safe: impl FnMut(BoundingBox, DVec3) -> bool,
     ) {
         self.tick_with_threshold(
             origin,
@@ -1447,6 +1507,7 @@ impl ItemEntities {
             fluid,
             fast_lava,
             path,
+            safe,
         );
     }
 
@@ -1466,6 +1527,7 @@ impl ItemEntities {
         mut fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+        mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
     ) {
         let player_box = movement::player_bounds(player, pose.height());
         let pickup = BoundingBox {
@@ -1488,9 +1550,6 @@ impl ItemEntities {
             let entity = &mut self.entities[index];
             if !Self::active(active_chunks, entity.item.position) {
                 continue;
-            }
-            if let Some(created) = &mut entity.created {
-                created.ticked = true;
             }
             if entity._damage_state.invulnerable_time > 0 {
                 entity._damage_state.invulnerable_time -= 1;
@@ -1620,6 +1679,18 @@ impl ItemEntities {
                 if entity.on_ground && entity.velocity.y < 0.0 {
                     entity.velocity.y *= -0.5;
                 }
+            }
+            if let Some(created) = &mut entity.created {
+                let supported = created.base_valid
+                    && contacts.water.depth <= 0.0
+                    && contacts.lava.depth <= 0.0
+                    && entity._damage_state.fire_ticks == 0
+                    && safe(bounds, actual);
+                created.verify_movement(
+                    entity.item.previous_position,
+                    entity.item.position,
+                    supported,
+                );
             }
             let moved_block = entity.item.previous_position.floor() != entity.item.position.floor();
             let after = if actual == DVec3::ZERO {
@@ -1762,6 +1833,8 @@ impl ItemEntities {
         );
         for (entity, removed) in self.entities.iter().zip(&removed) {
             if *removed && let Some(created) = &entity.created {
+                self.removed_created_chunks
+                    .extend(created.visited.iter().copied());
                 for position in [created.origin, entity.item.position] {
                     if !position.is_finite()
                         || position.x.abs() > 30_000_512.0
@@ -2112,6 +2185,93 @@ mod tests {
         assert!(
             items.draft_created_items_in_chunks(&group).is_err(),
             "movement needs verified base state"
+        );
+    }
+
+    #[test]
+    fn certified_ticks_allow_created_draft_and_require_every_visited_chunk() {
+        use native_world::loaded::ChunkPos;
+        let home = ChunkPos { x: 0, z: 0 };
+        let remote = ChunkPos { x: 1, z: 0 };
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(15.75, 5.0, 2.0), stack);
+        items.entities[0].velocity = DVec3::new(1.0, -0.1, 0.0);
+        items.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut Arc::new(PlayerInventory::default()),
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        assert!(
+            items
+                .draft_created_items_in_chunks(&BTreeSet::from([home]))
+                .is_err()
+        );
+        assert!(
+            items
+                .draft_created_items_in_chunks(&BTreeSet::from([remote]))
+                .is_err()
+        );
+        let group = BTreeSet::from([home, remote]);
+        let drafts = items.draft_created_items_in_chunks(&group).unwrap();
+        let saved = crate::saved_item::read(&drafts[0].document().value)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.position, items.entities[0].item.position);
+        assert_eq!(saved.velocity, items.entities[0].velocity);
+        assert_eq!(saved.age, 1);
+        assert_eq!(
+            drafts[0].document().value.get("fall_distance"),
+            Some(&Tag::Double(f64::from(0.14_f32)))
+        );
+        items.entities[0].velocity.x = -1.0;
+        items.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut Arc::new(PlayerInventory::default()),
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| None,
+            |_, _| true,
+        );
+        assert!(items.entities[0].item.position.x < 16.0);
+        assert!(
+            items
+                .draft_created_items_in_chunks(&BTreeSet::from([home]))
+                .is_err(),
+            "previously visited chunks remain required after returning"
+        );
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([home]), &Default::default())
+                .is_err()
+        );
+        assert!(
+            items
+                .validate_item_chunk_group(&BTreeSet::from([remote]), &Default::default())
+                .is_err()
+        );
+        assert!(items.draft_created_items_in_chunks(&group).is_ok());
+        items.entities[0].item.position.x += 0.25;
+        assert!(
+            items.draft_created_items_in_chunks(&group).is_err(),
+            "untracked movement must be rejected"
         );
     }
 
@@ -3030,6 +3190,7 @@ mod tests {
                                 |_| native_world::fluid::FluidContacts::default(),
                                 false,
                                 |_, _, _| None,
+                                |_, _| false,
                             );
                         }
                         timings[i].push(start.elapsed().as_secs_f64() * 1000.0);
@@ -4828,7 +4989,9 @@ public class ItemMotionOracle {
                     thrower: CreatedThrower::Known(None),
                     yaw: 0.0,
                     fall_distance: 0.0,
-                    ticked: false,
+                    verified_position: vec(&case["p"]),
+                    visited: created_chunk(vec(&case["p"])).into_iter().collect(),
+                    base_valid: true,
                 }),
                 id: index as u32,
                 section_sequence: 0,
@@ -4849,7 +5012,7 @@ public class ItemMotionOracle {
                 _ => 0.0,
             };
             for (tick, oracle) in expected[index].as_array().unwrap().iter().enumerate() {
-                items.tick_with_fluid(
+                items.tick_with_fluid_and_proof(
                     IVec3::ZERO,
                     DVec3::splat(1000.0),
                     PlayerPose::Standing,
@@ -4890,6 +5053,7 @@ public class ItemMotionOracle {
                     },
                     false,
                     |_, _, _| None,
+                    |_, _| true,
                 );
                 let actual = &items.entities[0];
                 let position_error = (actual.item.position - vec(&oracle["p"]))
@@ -4911,6 +5075,24 @@ public class ItemMotionOracle {
                     actual.velocity,
                     actual.on_ground
                 );
+                if case["fluid"].as_i64() == Some(0) {
+                    let group = actual.created.as_ref().unwrap().visited.clone();
+                    let drafts = items.draft_created_items_in_chunks(&group).unwrap();
+                    let saved = crate::saved_item::read(&drafts[0].document().value)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(saved.position, actual.item.position);
+                    assert_eq!(saved.velocity, actual.velocity);
+                    assert_eq!(i64::from(saved.age), oracle["age"].as_i64().unwrap());
+                    assert_eq!(
+                        i64::from(saved.pickup_delay),
+                        oracle["delay"].as_i64().unwrap()
+                    );
+                    assert_eq!(
+                        drafts[0].document().value.get("fall_distance"),
+                        Some(&Tag::Double(oracle["fall"].as_f64().unwrap()))
+                    );
+                }
             }
         }
     }

@@ -5795,7 +5795,7 @@ impl LoadedSession {
                 bounds,
                 air,
             };
-            self.dropped_items.tick_with_fluid(
+            self.dropped_items.tick_with_fluid_and_proof(
                 origin,
                 self.motion.position,
                 self.player.pose,
@@ -5844,6 +5844,9 @@ impl LoadedSession {
                 self.fast_lava,
                 |bounds, actual, requested| {
                     fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
+                },
+                |item_bounds, actual| {
+                    created_item_path_safe(world, origin, bounds, item_bounds, actual)
                 },
             );
             self.tick_experience_orbs(false);
@@ -6870,7 +6873,7 @@ impl LoadedSession {
             bounds,
             air,
         };
-        self.dropped_items.tick_with_fluid(
+        self.dropped_items.tick_with_fluid_and_proof(
             origin,
             self.motion.position,
             self.player.pose,
@@ -6923,6 +6926,9 @@ impl LoadedSession {
             self.fast_lava,
             |bounds, actual, requested| {
                 fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
+            },
+            |item_bounds, actual| {
+                created_item_path_safe(world, origin, bounds, item_bounds, actual)
             },
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
@@ -7158,6 +7164,73 @@ fn subtract(a: IVec3, b: IVec3) -> Option<IVec3> {
 enum Cell {
     Missing,
     State(BlockStateId),
+}
+
+/// Certify only a fully loaded, effect-free movement area for new-item base
+/// state. Unknown blocks, missing sections, fluids and oversized paths defer.
+fn created_item_path_safe(
+    world: &World,
+    origin: IVec3,
+    build: BuildBounds,
+    bounds: BoundingBox,
+    actual: DVec3,
+) -> bool {
+    let min = bounds.min.min(bounds.min + actual) - DVec3::ONE;
+    let max = bounds.max.max(bounds.max + actual) + DVec3::ONE;
+    if !min.is_finite()
+        || !max.is_finite()
+        || min.min_element() < f64::from(i32::MIN)
+        || max.max_element() > f64::from(i32::MAX)
+    {
+        return false;
+    }
+    let low = min.floor().as_ivec3();
+    let high = max.floor().as_ivec3();
+    let count = (i64::from(high.x) - i64::from(low.x) + 1)
+        .checked_mul(i64::from(high.y) - i64::from(low.y) + 1)
+        .and_then(|n| n.checked_mul(i64::from(high.z) - i64::from(low.z) + 1));
+    if count.is_none_or(|count| !(1..=4096).contains(&count)) {
+        return false;
+    }
+    for x in low.x..=high.x {
+        for y in low.y..=high.y {
+            for z in low.z..=high.z {
+                let Some(p) = add(origin, IVec3::new(x, y, z)) else {
+                    return false;
+                };
+                if p.y < build.min_y || p.y >= build.max_y {
+                    return false;
+                }
+                let pos = ChunkPos {
+                    x: p.x.div_euclid(16),
+                    z: p.z.div_euclid(16),
+                };
+                if !world
+                    .chunks
+                    .get(&pos)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+                {
+                    return false;
+                }
+                let Some(state) = world.block_id(p.x, p.y, p.z).and_then(|id| world.state(id))
+                else {
+                    return false;
+                };
+                if !state.properties.is_empty()
+                    || !matches!(
+                        state.name.as_str(),
+                        "minecraft:air"
+                            | "minecraft:cave_air"
+                            | "minecraft:void_air"
+                            | "minecraft:stone"
+                    )
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn is_bed(name: &str) -> bool {
@@ -10366,6 +10439,74 @@ mod tests {
             session.draft_existing_entity_chunks(&group).is_err(),
             "ticked base state must not be guessed"
         );
+    }
+
+    #[test]
+    fn ticked_created_item_drafts_only_after_known_effect_free_path() {
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let origin = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        session.dropped_items.spawn_from_entity(origin, stack);
+        for _ in 0..4 {
+            session.update(TICK);
+        }
+        let drafts = session
+            .draft_existing_entity_chunks(&BTreeSet::from([home]))
+            .unwrap();
+        let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities") else {
+            panic!("missing entities")
+        };
+        let saved = crate::saved_item::read(&values[0]).unwrap().unwrap();
+        assert_eq!(saved.age, 4);
+        assert_ne!(saved.position, origin);
+        let portal = session.intern_block(state("minecraft:nether_portal", &[("axis", "x")]));
+        assert!(session.set(IVec3::new(3, 3, 3), portal));
+        session.update(TICK);
+        assert!(
+            session
+                .draft_existing_entity_chunks(&BTreeSet::from([home]))
+                .is_err(),
+            "unknown path effects must reject the draft"
+        );
+    }
+
+    #[test]
+    fn item_path_proof_rejects_missing_blocks_and_oversized_movement() {
+        let session = session();
+        let bounds = BoundingBox {
+            min: DVec3::new(3.0, 3.0, 3.0),
+            max: DVec3::new(3.25, 3.25, 3.25),
+        };
+        assert!(created_item_path_safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            bounds,
+            DVec3::ZERO
+        ));
+        assert!(!created_item_path_safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            bounds,
+            DVec3::new(100.0, 0.0, 0.0)
+        ));
+        let unknown_section = BoundingBox {
+            min: DVec3::new(3.0, 20.0, 3.0),
+            max: DVec3::new(3.25, 20.25, 3.25),
+        };
+        assert!(!created_item_path_safe(
+            &session.world,
+            session.origin,
+            session.bounds,
+            unknown_section,
+            DVec3::ZERO
+        ));
     }
 
     #[test]

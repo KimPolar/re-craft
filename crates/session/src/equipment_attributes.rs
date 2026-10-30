@@ -45,6 +45,14 @@ pub(crate) fn gravity(
     equipped_attribute(saved, inventory, enchantments, "gravity")?.value(-1.0, 1.0)
 }
 
+pub(crate) fn water_movement_efficiency(
+    saved: &SavedAttribute,
+    inventory: &PlayerInventory,
+    enchantments: &OxygenEnchantments,
+) -> Result<f64> {
+    equipped_attribute(saved, inventory, enchantments, "water_movement_efficiency")?.value(0.0, 1.0)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArmorValues {
     pub armor: f64,
@@ -426,6 +434,72 @@ mod tests {
             bounciness(&SavedAttribute::with_base(0.5), &inventory, &registry).unwrap(),
             0.5
         );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 assets"]
+    fn depth_strider_uses_installed_vanilla_enchantment_data() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut resources).unwrap();
+        for level in 1..=3 {
+            let components = Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:depth_strider".into(), Tag::Int(level))]),
+            )]);
+            let boots =
+                ItemStack::unresolved("minecraft:iron_boots".into(), 1, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Armor(3), Some(boots));
+            let actual =
+                water_movement_efficiency(&SavedAttribute::with_base(0.0), &inventory, &registry)
+                    .unwrap();
+            let expected = (f64::from(0.33333334_f32 * level as f32)).min(1.0);
+            assert_eq!(actual, expected, "Depth Strider {level}");
+        }
+    }
+
+    #[test]
+    fn data_pack_movement_enchantments_apply_to_their_declared_attributes() {
+        struct MovementData;
+        impl ResourceProvider for MovementData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:movement")?])
+            }
+            fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(Some(br#"{"slots":["feet"],"effects":{"minecraft:attributes":[{"id":"example:speed","attribute":"minecraft:movement_speed","operation":"add_value","amount":0.1},{"id":"example:gravity","attribute":"minecraft:gravity","operation":"add_value","amount":0.2},{"id":"example:jump","attribute":"minecraft:jump_strength","operation":"add_value","amount":0.3},{"id":"example:water","attribute":"minecraft:water_movement_efficiency","operation":"add_value","amount":0.4}]}}"#.to_vec()))
+            }
+        }
+        let registry = OxygenEnchantments::load(&mut MovementData).unwrap();
+        let components = Tag::Compound(vec![(
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("example:movement".into(), Tag::Int(1))]),
+        )]);
+        let boots = ItemStack::unresolved("minecraft:iron_boots".into(), 1, components).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Armor(3), Some(boots));
+        for (name, expected) in [
+            ("movement_speed", 0.1_f32),
+            ("gravity", 0.2),
+            ("jump_strength", 0.3),
+            ("water_movement_efficiency", 0.4),
+        ] {
+            let attribute =
+                equipped_attribute(&SavedAttribute::with_base(0.0), &inventory, &registry, name)
+                    .unwrap();
+            assert_eq!(
+                attribute.value(-1.0, 1.0).unwrap(),
+                f64::from(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]

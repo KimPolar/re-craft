@@ -1033,6 +1033,14 @@ fn prepare_existing_world(
                     native_session::player_data::read_saved_no_gravity(player_data),
                 )
                 .context("cannot restore saved gravity")?;
+            session
+                .restore_saved_water_movement_efficiency(
+                    native_session::player_data::read_saved_water_movement_efficiency_attribute(
+                        player_data,
+                    )
+                    .context("cannot read saved water movement efficiency")?,
+                )
+                .context("cannot restore saved water movement efficiency")?;
             let fall_effects = native_session::player_data::read_saved_fall_effects(player_data)
                 .context("cannot read saved fall effects")?;
             session

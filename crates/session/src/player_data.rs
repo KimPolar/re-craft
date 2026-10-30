@@ -251,6 +251,10 @@ pub fn read_saved_gravity_attribute(player: &NamedTag) -> Result<SavedAttribute>
     saved_attribute(player, "gravity", 0.08)
 }
 
+pub fn read_saved_water_movement_efficiency_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "water_movement_efficiency", 0.0)
+}
+
 pub fn read_saved_no_gravity(player: &NamedTag) -> bool {
     player
         .value
@@ -335,6 +339,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "levitation") => &mut effects.levitation,
             ("minecraft", "speed") => &mut effects.speed,
             ("minecraft", "slowness") => &mut effects.slowness,
+            ("minecraft", "dolphins_grace") => &mut effects.dolphins_grace,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1096,6 +1101,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "levitation"
                         | "speed"
                         | "slowness"
+                        | "dolphins_grace"
                         | "water_breathing"
                         | "conduit_power"
                         | "breath_of_the_nautilus"
@@ -1781,6 +1787,10 @@ mod tests {
                             ("duration".into(), Tag::Int(3)),
                             ("amplifier".into(), Tag::Byte(1)),
                         ]),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:dolphins_grace".into())),
+                            ("duration".into(), Tag::Int(8)),
+                        ]),
                     ],
                 },
             )]),
@@ -1799,6 +1809,7 @@ mod tests {
         let levitation = effects.levitation.unwrap();
         assert_eq!(levitation.duration, 2);
         assert_eq!(levitation.amplifier, 1);
+        assert_eq!(effects.dolphins_grace.unwrap().duration, 7);
     }
 
     #[test]

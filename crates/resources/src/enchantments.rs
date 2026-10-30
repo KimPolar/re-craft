@@ -589,6 +589,10 @@ fn definition(value: &Value) -> Result<Definition> {
                     | "armor_toughness"
                     | "safe_fall_distance"
                     | "fall_damage_multiplier"
+                    | "movement_speed"
+                    | "gravity"
+                    | "jump_strength"
+                    | "water_movement_efficiency"
             )
         {
             continue;

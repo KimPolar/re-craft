@@ -41,7 +41,7 @@ public class FluidMotionOracle {
         @Override public void playSound(Entity source, BlockPos pos, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource category, float volume, float pitch) { }
     }
     static class TestPlayer extends Player {
-        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling,noGravity; float yaw; double look,depth,wall,ceiling,bounce,gravity; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
+        Vec3 p,v; boolean ground,sprint,water,swim,free,suppress,slowFalling,noGravity,dolphins; float yaw; double look,depth,wall,ceiling,bounce,gravity,waterEfficiency; int delay; AttributeInstance speed; MobEffectInstance jumpBoost,levitation;
         TestPlayer(){super(null,null);}
         void setup(TestLevel level,Vec3 pos,Vec3 velocity,boolean grounded,double wallX) throws Exception {setLevel(level);p=pos;v=velocity;ground=grounded;wall=wallX;delay=0;positionField.set(this,p);}
         @Override public GameType gameMode(){return GameType.SURVIVAL;}
@@ -55,7 +55,7 @@ public class FluidMotionOracle {
         @Override public boolean isAffectedByFluids(){return true;}
         @Override protected boolean shouldTravelInFluid(FluidState state){return true;}
         @Override public boolean onClimbable(){return false;}
-        @Override public boolean hasEffect(Holder<MobEffect> effect){return (effect==MobEffects.JUMP_BOOST && jumpBoost!=null)||(effect==MobEffects.SLOW_FALLING && slowFalling)||(effect==MobEffects.LEVITATION && levitation!=null);}
+        @Override public boolean hasEffect(Holder<MobEffect> effect){return (effect==MobEffects.JUMP_BOOST && jumpBoost!=null)||(effect==MobEffects.SLOW_FALLING && slowFalling)||(effect==MobEffects.LEVITATION && levitation!=null)||(effect==MobEffects.DOLPHINS_GRACE && dolphins);}
         @Override public double getFluidHeight(TagKey<Fluid> tag){return depth;}
         @Override public boolean isFree(double x,double y,double z){return free;}
         @Override public Vec3 getLookAngle(){return new Vec3(0,look,0);}
@@ -71,7 +71,7 @@ public class FluidMotionOracle {
         @Override public boolean isSuppressingBounce(){return suppress;}
         @Override public BlockPos getBlockPosBelowThatAffectsMyMovement(){return BlockPos.ZERO;}
         @Override public void gameEvent(Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
-        @Override public double getAttributeValue(Holder<Attribute> a){return a==Attributes.MOVEMENT_SPEED?speed.getValue():a==Attributes.WATER_MOVEMENT_EFFICIENCY?0.0:a==Attributes.JUMP_STRENGTH?0.42:1.0;}
+        @Override public double getAttributeValue(Holder<Attribute> a){return a==Attributes.MOVEMENT_SPEED?speed.getValue():a==Attributes.WATER_MOVEMENT_EFFICIENCY?waterEfficiency:a==Attributes.JUMP_STRENGTH?0.42:1.0;}
         @Override public MobEffectInstance getEffect(Holder<MobEffect> e){return e==MobEffects.JUMP_BOOST?jumpBoost:e==MobEffects.LEVITATION?levitation:null;}
         @Override public HumanoidArm getMainArm(){return HumanoidArm.RIGHT;}
         void down(){goDownInWater();}
@@ -104,9 +104,9 @@ public class FluidMotionOracle {
         Method square=LocalPlayer.class.getDeclaredMethod("modifyInputSpeedForSquareMovement",Vec2.class);square.setAccessible(true);
         Field jumping=LivingEntity.class.getDeclaredField("jumping");jumping.setAccessible(true);
         JsonArray scenarios=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray(), results=new JsonArray();
-        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());int boost=s.has("boost")?s.get("boost").getAsInt():-1;entity.jumpBoost=boost<0?null:new MobEffectInstance(MobEffects.JUMP_BOOST,1000,boost);int levitation=s.has("levitation")?s.get("levitation").getAsInt():-1;entity.levitation=levitation<0?null:new MobEffectInstance(MobEffects.LEVITATION,1000,levitation);entity.slowFalling=s.has("slow_falling")&&s.get("slow_falling").getAsBoolean();entity.gravity=s.has("gravity")?s.get("gravity").getAsDouble():0.08;entity.noGravity=s.has("no_gravity")&&s.get("no_gravity").getAsBoolean();entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
+        for(var entry:scenarios){var s=entry.getAsJsonObject();entity.setup(level,vec(s.getAsJsonArray("position")),vec(s.getAsJsonArray("velocity")),s.get("ground").getAsBoolean(),s.get("wall").getAsDouble());int boost=s.has("boost")?s.get("boost").getAsInt():-1;entity.jumpBoost=boost<0?null:new MobEffectInstance(MobEffects.JUMP_BOOST,1000,boost);int levitation=s.has("levitation")?s.get("levitation").getAsInt():-1;entity.levitation=levitation<0?null:new MobEffectInstance(MobEffects.LEVITATION,1000,levitation);entity.slowFalling=s.has("slow_falling")&&s.get("slow_falling").getAsBoolean();entity.gravity=s.has("gravity")?s.get("gravity").getAsDouble():0.08;entity.noGravity=s.has("no_gravity")&&s.get("no_gravity").getAsBoolean();entity.waterEfficiency=s.has("water_efficiency")?s.get("water_efficiency").getAsDouble():0.0;entity.dolphins=s.has("dolphins")&&s.get("dolphins").getAsBoolean();entity.speed.setBaseValue(s.has("movement_speed")?s.get("movement_speed").getAsDouble():(double)0.1f);entity.bounce=s.has("bounce")?s.get("bounce").getAsDouble():0;entity.suppress=s.has("suppress")&&s.get("suppress").getAsBoolean();entity.ceiling=s.has("ceiling")?s.get("ceiling").getAsDouble():10000;int block=s.has("block")?s.get("block").getAsInt():0;level.floor=(block==1?Blocks.SLIME_BLOCK:block==2?net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")):block==3?Blocks.SHELF_MUSHROOM:Blocks.STONE).defaultBlockState();JsonArray ticks=new JsonArray();
           for(var raw:s.getAsJsonArray("inputs")){var i=raw.getAsJsonObject();entity.water=i.get("water").getAsBoolean();entity.swim=i.get("swim").getAsBoolean();entity.sprint=i.get("sprint").getAsBoolean();entity.look=i.get("look").getAsDouble();entity.depth=i.get("depth").getAsDouble();entity.free=i.get("free").getAsBoolean();entity.yaw=i.get("yaw").getAsFloat();level.above=i.get("above").getAsBoolean();
-            entity.speed.removeModifier(modifier.id());if(entity.sprint)entity.speed.addTransientModifier(modifier);
+            entity.speed.removeModifier(modifier.id());if(entity.sprint)entity.speed.addTransientModifier(modifier);entity.setSpeed((float)entity.speed.getValue());
             if(entity.water&&i.get("descend").getAsBoolean())entity.down();
             if(entity.delay>0)entity.delay--; double x=entity.v.x,y=entity.v.y,z=entity.v.z;if(x*x+z*z<9.0e-6){x=0;z=0;}if(Math.abs(y)<0.003)y=0;entity.v=new Vec3(x,y,z);
             boolean jump=i.get("jump").getAsBoolean();jumping.setBoolean(entity,jump);
@@ -184,7 +184,7 @@ fn water_and_lava_motion_match_vanilla_player() {
             let swim = water && (s + t / 12) % 3 == 0;
             inputs.push(json!({"forward":forward,"right":right,"yaw":angles[(s+t/20)%angles.len()],"jump":(s+t/9)%3==0,"sprint":(s+t/11)%3==0,"slow":(s+t/13)%4==0,"water":water,"swim":swim,"descend":(s+t/7)%4==0,"look":([-0.8,-0.21,0.0,0.2,0.9][(s+t/8)%5]),"depth":([0.2,0.4,0.8,1.5][(s+t/10)%4]),"free":(s+t/6)%3==0,"above":(s+t/5)%2==0}));
         }
-        scenarios.push(json!({"position":[0.0,if s%2==0{0.0}else{2.0},0.0],"velocity":[if s%3==0{0.005}else{0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"boost":([-1,0,1,2,255][s%5]),"slow_falling":s%3==0,"levitation":([-1,0,1,127,255][(s/3)%5]),"gravity":([-1.0,-0.08,0.0,0.005,0.08,0.2,1.0][(s/2)%7]),"no_gravity":s%11==0,"inputs":inputs}));
+        scenarios.push(json!({"position":[0.0,if s%2==0{0.0}else{2.0},0.0],"velocity":[if s%3==0{0.005}else{0.0},0.0,0.0],"ground":s%2==0,"wall":2.75,"boost":([-1,0,1,2,255][s%5]),"slow_falling":s%3==0,"levitation":([-1,0,1,127,255][(s/3)%5]),"gravity":([-1.0,-0.08,0.0,0.005,0.08,0.2,1.0][(s/2)%7]),"no_gravity":s%11==0,"water_efficiency":([0.0,0.25,0.5,0.8,1.0][s%5]),"movement_speed":([0.04,0.1,0.3][(s/3)%3]),"dolphins":s%4==0,"inputs":inputs}));
     }
     for water in [false, true] {
         for bounce in [0.0, 0.25, 0.8] {
@@ -298,6 +298,18 @@ fn water_and_lava_motion_match_vanilla_player() {
             state.tick_fluid_with_restitution(
                 command,
                 fluid,
+                crate::physics::WaterMovement {
+                    efficiency: scenario["water_efficiency"].as_f64().unwrap_or(0.0) as f32,
+                    movement_speed: (scenario["movement_speed"]
+                        .as_f64()
+                        .unwrap_or(f64::from(0.1_f32))
+                        * if command.sprinting {
+                            1.0 + f64::from(0.3_f32)
+                        } else {
+                            1.0
+                        }) as f32,
+                    dolphins_grace: scenario["dolphins"].as_bool().unwrap_or(false),
+                },
                 crate::physics::jump_power(
                     0.42,
                     1.0,

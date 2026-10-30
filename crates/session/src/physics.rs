@@ -37,6 +37,23 @@ pub struct FluidMovement {
     pub fluid_above: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WaterMovement {
+    pub efficiency: f32,
+    pub movement_speed: f32,
+    pub dolphins_grace: bool,
+}
+
+impl Default for WaterMovement {
+    fn default() -> Self {
+        Self {
+            efficiency: 0.0,
+            movement_speed: 0.1,
+            dolphins_grace: false,
+        }
+    }
+}
+
 /// Java computes the jump impulse in float precision after reading attributes.
 pub fn jump_power(strength: f64, block_factor: f32, boost: Option<u8>) -> f32 {
     let boost = boost.map_or(0.0, |amplifier| 0.1_f32 * (f32::from(amplifier) + 1.0));
@@ -450,6 +467,7 @@ impl MotionState {
         self.tick_fluid_with_restitution(
             input,
             fluid,
+            WaterMovement::default(),
             0.42_f32,
             0.08,
             false,
@@ -463,6 +481,7 @@ impl MotionState {
         &mut self,
         input: MovementInput,
         fluid: FluidMovement,
+        water: WaterMovement,
         jump_power: f32,
         gravity: f64,
         slow_falling: bool,
@@ -506,14 +525,30 @@ impl MotionState {
         } else {
             gravity
         };
+        let mut horizontal_drag = if input.sprinting { 0.9_f32 } else { 0.8_f32 };
+        let mut acceleration = 0.02_f32;
+        if fluid.kind == FluidKind::Water {
+            let efficiency = if self.on_ground {
+                water.efficiency
+            } else {
+                water.efficiency * 0.5_f32
+            };
+            if efficiency > 0.0 {
+                horizontal_drag += (0.54600006_f32 - horizontal_drag) * efficiency;
+                acceleration += (water.movement_speed - acceleration) * efficiency;
+            }
+            if water.dolphins_grace {
+                horizontal_drag = 0.96_f32;
+            }
+        }
         let (left, forward) = keyboard_input(
             -input.right,
             input.forward,
             input.moving_slowly,
             input.using_item,
         );
-        let x = f64::from(left) * f64::from(0.02_f32);
-        let z = f64::from(forward) * f64::from(0.02_f32);
+        let x = f64::from(left) * f64::from(acceleration);
+        let z = f64::from(forward) * f64::from(acceleration);
         self.velocity.x += x * cosine - z * sine;
         self.velocity.z += z * cosine + x * sine;
         let previous_y = self.position.y;
@@ -541,8 +576,11 @@ impl MotionState {
         }
         match fluid.kind {
             FluidKind::Water => {
-                let drag = if input.sprinting { 0.9_f32 } else { 0.8_f32 };
-                self.velocity *= DVec3::new(f64::from(drag), f64::from(0.8_f32), f64::from(drag));
+                self.velocity *= DVec3::new(
+                    f64::from(horizontal_drag),
+                    f64::from(0.8_f32),
+                    f64::from(horizontal_drag),
+                );
                 self.velocity = fluid_gravity(self.velocity, falling, input.sprinting, gravity);
             }
             FluidKind::Lava => {

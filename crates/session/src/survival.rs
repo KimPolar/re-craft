@@ -272,6 +272,7 @@ pub struct FallEffects {
     pub levitation: Option<EffectDuration>,
     pub speed: Option<EffectDuration>,
     pub slowness: Option<EffectDuration>,
+    pub dolphins_grace: Option<EffectDuration>,
 }
 
 impl FallEffects {
@@ -282,6 +283,7 @@ impl FallEffects {
         EffectDuration::tick(&mut self.levitation);
         EffectDuration::tick(&mut self.speed);
         EffectDuration::tick(&mut self.slowness);
+        EffectDuration::tick(&mut self.dolphins_grace);
     }
 }
 

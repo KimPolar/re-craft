@@ -165,6 +165,9 @@ pub struct LoadedSession {
     gravity_inventory_revision: Option<u64>,
     gravity: Option<f64>,
     no_gravity: bool,
+    water_efficiency_attribute: crate::player_data::SavedAttribute,
+    water_efficiency_inventory_revision: Option<u64>,
+    water_efficiency: Option<f64>,
     movement_speed_attribute: crate::player_data::SavedAttribute,
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
@@ -251,6 +254,7 @@ struct EffectSaveTracking {
     fall: crate::survival::FallEffects,
     movement_speed: crate::player_data::SavedAttribute,
     gravity: crate::player_data::SavedAttribute,
+    water_efficiency: crate::player_data::SavedAttribute,
     ticks: u64,
 }
 
@@ -458,6 +462,7 @@ impl LoadedSession {
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
+        self.water_efficiency_inventory_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -489,6 +494,7 @@ impl LoadedSession {
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
+        self.water_efficiency_inventory_revision = None;
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -620,6 +626,46 @@ impl LoadedSession {
                 self.gravity = None;
                 self.stream_errors
                     .push(format!("player gravity equipment: {error:#}"));
+            }
+        }
+    }
+
+    pub fn restore_saved_water_movement_efficiency(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "water movement efficiency must be restored before the first tick"
+        );
+        self.water_efficiency = Some(attribute.value(0.0, 1.0)?);
+        self.water_efficiency_attribute = attribute;
+        self.water_efficiency_inventory_revision = None;
+        Ok(())
+    }
+
+    fn refresh_water_movement_efficiency(&mut self) {
+        let revision = self.inventory.revision();
+        if self.water_efficiency_inventory_revision == Some(revision) {
+            return;
+        }
+        self.water_efficiency_inventory_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::water_movement_efficiency(
+            &self.water_efficiency_attribute,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(value) => self.water_efficiency = Some(value),
+            Err(error) => {
+                self.water_efficiency = None;
+                self.stream_errors.push(format!(
+                    "player water movement efficiency equipment: {error:#}"
+                ));
             }
         }
     }
@@ -843,6 +889,17 @@ impl LoadedSession {
         anyhow::ensure!(
             crate::player_data::read_saved_gravity_attribute(original)? == *initial_gravity,
             "saved gravity attribute does not match the initial session state"
+        );
+        let initial_water_efficiency = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(&self.water_efficiency_attribute, |tracking| {
+                &tracking.water_efficiency
+            });
+        anyhow::ensure!(
+            crate::player_data::read_saved_water_movement_efficiency_attribute(original)?
+                == *initial_water_efficiency,
+            "saved water movement efficiency does not match the initial session state"
         );
         let effect_draft = if self.tick != 0 {
             anyhow::ensure!(
@@ -1274,6 +1331,7 @@ impl LoadedSession {
         self.bounciness_inventory_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
+        self.water_efficiency_inventory_revision = None;
         self.movement_speed_cache = None;
         self.armor.invalidate();
         if let Some((_, enchantments)) = &self.oxygen_equipment {
@@ -1448,6 +1506,9 @@ impl LoadedSession {
             gravity_inventory_revision: None,
             gravity: Some(0.08),
             no_gravity: false,
+            water_efficiency_attribute: crate::player_data::SavedAttribute::with_base(0.0),
+            water_efficiency_inventory_revision: None,
+            water_efficiency: Some(0.0),
             movement_speed_attribute: crate::player_data::SavedAttribute::with_base(f64::from(
                 0.1_f32,
             )),
@@ -3025,6 +3086,9 @@ impl LoadedSession {
         self.gravity_inventory_revision = None;
         self.gravity = self.gravity_attribute.value(-1.0, 1.0).ok();
         self.no_gravity = false;
+        self.water_efficiency_attribute.clear_modifiers();
+        self.water_efficiency_inventory_revision = None;
+        self.water_efficiency = self.water_efficiency_attribute.value(0.0, 1.0).ok();
         self.movement_speed_attribute.clear_modifiers();
         self.movement_speed_cache = None;
         self.fall.reset_after_death();
@@ -5745,6 +5809,7 @@ impl LoadedSession {
         self.refresh_bounciness();
         self.refresh_jump_strength();
         self.refresh_gravity();
+        self.refresh_water_movement_efficiency();
         let friction = self.friction_below();
         let fluid_view = FluidView {
             world: &self.world,
@@ -5811,6 +5876,7 @@ impl LoadedSession {
                 fall: self.fall.effects().clone(),
                 movement_speed: self.movement_speed_attribute.clone(),
                 gravity: self.gravity_attribute.clone(),
+                water_efficiency: self.water_efficiency_attribute.clone(),
                 ticks: 0,
             });
         tracking.ticks = tracking.ticks.saturating_add(1);
@@ -6094,6 +6160,11 @@ impl LoadedSession {
             self.motion.tick_fluid_with_restitution(
                 input,
                 movement,
+                crate::physics::WaterMovement {
+                    efficiency: self.water_efficiency.unwrap_or(0.0) as f32,
+                    movement_speed,
+                    dolphins_grace: self.fall.effects().dolphins_grace.is_some(),
+                },
                 jump_power,
                 gravity,
                 slow_falling,
@@ -8133,6 +8204,57 @@ mod tests {
             .set_slot(crate::inventory::PlayerSlot::Armor(3), None);
         session.refresh_gravity();
         assert_eq!(session.gravity, Some(0.08));
+    }
+
+    #[test]
+    fn saved_water_efficiency_and_dolphins_grace_affect_swimming() {
+        let make = |duration, efficiency| {
+            let mut session = session();
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            for x in 7..=9 {
+                for y in 1..=3 {
+                    for z in 7..=9 {
+                        assert!(session.set(IVec3::new(x, y, z), water));
+                    }
+                }
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            session.motion.velocity = DVec3::new(0.2, 0.0, 0.0);
+            session.motion.on_ground = false;
+            session.player.on_ground = false;
+            session
+                .restore_saved_water_movement_efficiency(
+                    crate::player_data::SavedAttribute::with_base(efficiency),
+                )
+                .unwrap();
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    dolphins_grace: Some(crate::survival::EffectDuration {
+                        amplifier: 0,
+                        duration,
+                        hidden: None,
+                    }),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session.submit_command(PlayerCommand::Move {
+                forward: 1.0,
+                strafe: 0.0,
+                jump: false,
+            });
+            session.update(TICK);
+            session
+        };
+        let active = make(2, 0.0);
+        let expired = make(1, 0.0);
+        let efficient = make(1, 1.0);
+        assert!((active.motion.velocity.x - 0.2 * f64::from(0.96_f32)).abs() < 1e-7);
+        assert!((expired.motion.velocity.x - 0.2 * f64::from(0.8_f32)).abs() < 1e-7);
+        assert!(efficient.motion.velocity.z.abs() > expired.motion.velocity.z.abs());
     }
 
     #[test]

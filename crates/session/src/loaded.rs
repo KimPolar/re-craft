@@ -385,18 +385,14 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
 }
 
 /// Vanilla chooses the first (right) half's custom name before the second.
-/// Styled and translated components need the full text-component renderer.
 fn chest_title(
     first: &crate::saved_chest::SavedChest,
     second: Option<&crate::saved_chest::SavedChest>,
-) -> Option<String> {
-    let name = first
+) -> Option<native_persistence::nbt::Tag> {
+    first
         .custom_name()
-        .or_else(|| second.and_then(|chest| chest.custom_name()))?;
-    match name {
-        native_persistence::nbt::Tag::String(value) => String::from_utf16(&value.0).ok(),
-        _ => None,
-    }
+        .or_else(|| second.and_then(|chest| chest.custom_name()))
+        .cloned()
 }
 
 fn fresh_breathing_seed() -> i64 {
@@ -12206,6 +12202,10 @@ mod tests {
                         matches!(session.inventory.menu(), Some(InventoryMenu::Chest { position, .. }) if position == pos)
                     );
                     assert_eq!(
+                        session.snapshot().inventory.chest_title_component(),
+                        Some(name)
+                    );
+                    assert_eq!(
                         session.inventory.slot(PlayerSlot::Chest(4)).unwrap().id(),
                         "minecraft:diamond"
                     );
@@ -12820,12 +12820,12 @@ mod tests {
             );
         let named = session.saved_chest(position).unwrap().unwrap();
         assert_eq!(
-            chest_title(&unnamed, Some(&named)).as_deref(),
-            Some("보관함 ♠")
+            chest_title(&unnamed, Some(&named)),
+            Some(Tag::String("보관함 ♠".into()))
         );
         assert_eq!(
-            chest_title(&named, Some(&unnamed)).as_deref(),
-            Some("보관함 ♠")
+            chest_title(&named, Some(&unnamed)),
+            Some(Tag::String("보관함 ♠".into()))
         );
         assert_eq!(chest_title(&unnamed, None), None);
         assert!(session.try_open_saved_chest(position - session.origin));

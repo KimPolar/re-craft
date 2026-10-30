@@ -284,6 +284,7 @@ struct ChestInventory {
     other: Option<IVec3>,
     slots: Vec<Option<ItemStack>>,
     title: Option<String>,
+    title_component: Option<Arc<Tag>>,
 }
 
 /// The player's saved recipe-book state; unknown recipe IDs remain preserved.
@@ -919,6 +920,7 @@ impl PlayerInventory {
             other,
             slots,
             title: None,
+            title_component: None,
         });
         self.menu = Some(InventoryMenu::Chest { position, other });
         self.revision = self.revision.wrapping_add(1);
@@ -932,9 +934,20 @@ impl PlayerInventory {
         self.chest.as_ref()?.title.as_deref()
     }
 
-    pub(crate) fn set_chest_title(&mut self, title: Option<String>) {
+    pub fn chest_title_component(&self) -> Option<&Tag> {
+        if !matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
+            return None;
+        }
+        self.chest.as_ref()?.title_component.as_deref()
+    }
+
+    pub(crate) fn set_chest_title(&mut self, title: Option<Tag>) {
         if let Some(chest) = &mut self.chest {
-            chest.title = title;
+            chest.title = match &title {
+                Some(Tag::String(value)) => String::from_utf16(&value.0).ok(),
+                _ => None,
+            };
+            chest.title_component = title.map(Arc::new);
             self.revision = self.revision.wrapping_add(1);
         }
     }

@@ -652,6 +652,71 @@ impl Canvas {
         self.text_pass(assets, x, y, text, color, 255);
     }
 
+    /// Draw resolved component spans using the existing resource-pack font.
+    pub fn component_without_shadow(
+        &mut self,
+        assets: Option<&MenuAssets>,
+        mut x: i32,
+        y: i32,
+        spans: &[crate::text_component::Span],
+        default_color: [u8; 3],
+    ) {
+        for span in spans {
+            let color = span.style.color.unwrap_or(default_color);
+            for ch in span.text.chars() {
+                let mut encoded = [0; 4];
+                let glyph = ch.encode_utf8(&mut encoded);
+                let width = glyph_width(assets, ch) + i32::from(span.style.bold);
+                if span.style.italic {
+                    let mut scratch = Canvas::new(12, 8);
+                    scratch.text_pass(assets, 0, 0, glyph, color, 255);
+                    if span.style.bold {
+                        scratch.text_pass(assets, 1, 0, glyph, color, 255);
+                    }
+                    for gy in 0..8 {
+                        for gx in 0..12 {
+                            let value = scratch.pixels[(gy * 12 + gx) as usize];
+                            let alpha = (value >> 24) as u8;
+                            self.pixel(
+                                x + gx + (7 - gy) / 4,
+                                y + gy,
+                                [color[0], color[1], color[2], alpha],
+                            );
+                        }
+                    }
+                } else {
+                    self.text_pass(assets, x, y, glyph, color, 255);
+                    if span.style.bold {
+                        self.text_pass(assets, x + 1, y, glyph, color, 255);
+                    }
+                }
+                if span.style.strikethrough {
+                    self.fill(
+                        Rect {
+                            x,
+                            y: y + 4,
+                            w: width,
+                            h: 1,
+                        },
+                        [color[0], color[1], color[2], 255],
+                    );
+                }
+                if span.style.underlined {
+                    self.fill(
+                        Rect {
+                            x,
+                            y: y + 8,
+                            w: width,
+                            h: 1,
+                        },
+                        [color[0], color[1], color[2], 255],
+                    );
+                }
+                x += width;
+            }
+        }
+    }
+
     fn text_pass(
         &mut self,
         assets: Option<&MenuAssets>,
@@ -930,6 +995,33 @@ mod tests {
         for x in [2, 3, 9, 10] {
             assert_eq!(row[x], 0xffff_ff55);
         }
+    }
+
+    #[test]
+    fn component_text_draws_inherited_color_bold_and_underlining() {
+        use crate::text_component::{Span, Style};
+        let mut canvas = Canvas::new(24, 12);
+        let spans = [
+            Span {
+                text: "I".into(),
+                style: Style {
+                    color: Some([255, 85, 85]),
+                    bold: true,
+                    underlined: true,
+                    ..Style::default()
+                },
+            },
+            Span {
+                text: "I".into(),
+                style: Style::default(),
+            },
+        ];
+        canvas.component_without_shadow(None, 0, 0, &spans, [64, 64, 64]);
+        assert_eq!(canvas.pixels[24 + 2], 0xffff_5555);
+        assert_eq!(canvas.pixels[24 + 3], 0xffff_5555);
+        assert_eq!(canvas.pixels[24 + 9], 0xff40_4040);
+        assert_eq!(canvas.pixels[8 * 24 + 6], 0xffff_5555);
+        assert_eq!(canvas.pixels[8 * 24 + 7], 0);
     }
 
     #[test]

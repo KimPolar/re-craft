@@ -1762,19 +1762,32 @@ impl GameUi {
                         [64, 64, 64],
                     );
                 } else if chest_menu {
-                    canvas.text_without_shadow(
-                        Some(assets),
-                        x + 8,
-                        y + 6,
-                        inventory.chest_title().unwrap_or_else(|| {
+                    let title = inventory.chest_title_component().and_then(|component| {
+                        crate::text_component::resolve(component, |key, fallback| {
+                            assets.translate(key, fallback).to_owned()
+                        })
+                    });
+                    if let Some(title) = title {
+                        canvas.component_without_shadow(
+                            Some(assets),
+                            x + 8,
+                            y + 6,
+                            &title,
+                            [64, 64, 64],
+                        );
+                    } else {
+                        canvas.text_without_shadow(
+                            Some(assets),
+                            x + 8,
+                            y + 6,
                             if double_chest {
                                 assets.translate("container.chestDouble", "Large Chest")
                             } else {
                                 assets.translate("container.chest", "Chest")
-                            }
-                        }),
-                        [64, 64, 64],
-                    );
+                            },
+                            [64, 64, 64],
+                        );
+                    }
                     canvas.text_without_shadow(
                         Some(assets),
                         x + 8,

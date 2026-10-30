@@ -46,6 +46,7 @@ mod screen_blur;
 mod sky_background;
 mod sound_ui;
 mod survival_hud;
+mod text_component;
 mod toggle_key;
 mod video_ui;
 mod visual_look;

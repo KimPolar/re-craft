@@ -199,6 +199,7 @@ pub struct LoadedSession {
     inventory: Arc<PlayerInventory>,
     saved_player_inventory_source: Option<Vec<u8>>,
     recipes: Option<Arc<CraftingRecipes>>,
+    item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     loot: Option<Arc<BlockLootTables>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
@@ -2093,6 +2094,7 @@ impl LoadedSession {
             inventory,
             saved_player_inventory_source: None,
             recipes: None,
+            item_registry: None,
             loot: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
@@ -2624,9 +2626,14 @@ impl LoadedSession {
         items: Arc<native_resources::item_registry::ItemRegistry>,
         damage_types: Arc<OxygenEnchantments>,
     ) {
+        self.item_registry = Some(Arc::clone(&items));
         self.experience_orbs
             .set_damage_tags(Arc::clone(&damage_types));
         self.dropped_items.set_damage_rules(items, damage_types);
+    }
+
+    pub fn set_item_registry(&mut self, items: Arc<native_resources::item_registry::ItemRegistry>) {
+        self.item_registry = Some(items);
     }
 
     pub fn set_orb_damage_tags(&mut self, damage_types: Arc<OxygenEnchantments>) {
@@ -2849,10 +2856,12 @@ impl LoadedSession {
             self.inventory.selected(),
         ));
         let spectator = self.game_mode == GameMode::Spectator;
-        let first = chest.can_unlock(hand, spectator);
+        let tags = self.recipes.as_ref().map(|recipes| &recipes.tags);
+        let registry = self.item_registry.as_deref();
+        let first = chest.can_unlock(hand, spectator, tags, registry);
         let second = pair
             .as_ref()
-            .map(|(_, other)| other.can_unlock(hand, spectator));
+            .map(|(_, other)| other.can_unlock(hand, spectator, tags, registry));
         if first.is_err() || second.as_ref().is_some_and(Result::is_err) {
             return false;
         }
@@ -13090,6 +13099,88 @@ mod tests {
             .set_slot(crate::inventory::PlayerSlot::Storage(0), None);
         session.set_game_mode(GameMode::Spectator);
         assert!(session.try_open_saved_chest(left - session.origin));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 item registry"]
+    fn chest_lock_uses_active_data_pack_item_tag() {
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::packs::{ResourceId, ResourceProvider, ResourceStack};
+        use native_world::loaded::SavedBlockEntities;
+
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if folder == "tags/item" {
+                    vec![ResourceId::parse("example:keys")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(if path == "data/example/tags/item/keys.json" {
+                    vec![
+                        br#"{"values":["minecraft:stone"]}"#.to_vec(),
+                        br#"{"replace":true,"values":["minecraft:diamond"]}"#.to_vec(),
+                    ]
+                } else {
+                    vec![]
+                })
+            }
+        }
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let recipes = Arc::new(CraftingRecipes::load(&mut Tags).unwrap());
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        session.set_player_inventory(PlayerInventory::default());
+        let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        let mut data = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut data.value else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!()
+        };
+        fields.push((
+            "lock".into(),
+            Tag::Compound(vec![("items".into(), Tag::String("#example:keys".into()))]),
+        ));
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into()),
+            );
+        let relative = position - session.origin;
+        let stack = |id: &str| ItemStack::new(id.into(), 1, 64, Tag::Compound(vec![]));
+        Arc::make_mut(&mut session.inventory).set_slot(
+            crate::inventory::PlayerSlot::Storage(0),
+            stack("minecraft:diamond"),
+        );
+        assert!(!session.try_open_saved_chest(relative));
+        session.set_item_registry(registry);
+        session.set_crafting_recipes(recipes);
+        Arc::make_mut(&mut session.inventory).set_slot(
+            crate::inventory::PlayerSlot::Storage(0),
+            stack("minecraft:stone"),
+        );
+        assert!(!session.try_open_saved_chest(relative));
+        assert!(session.locked_chest_message.is_some());
+        Arc::make_mut(&mut session.inventory).set_slot(
+            crate::inventory::PlayerSlot::Storage(0),
+            stack("minecraft:diamond"),
+        );
+        assert!(session.try_open_saved_chest(relative));
     }
 
     #[test]

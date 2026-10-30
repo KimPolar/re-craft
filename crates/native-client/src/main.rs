@@ -886,15 +886,18 @@ fn prepare_existing_world(
         if let Ok(damage_types) = &active_enchantments {
             session.set_orb_damage_tags(Arc::clone(damage_types));
         }
-        match (
-            resources.vanilla_item_registry(),
-            active_enchantments.as_ref(),
-        ) {
-            (Ok(items), Ok(damage_types)) => {
-                session.set_item_damage_rules(Arc::new(items), Arc::clone(damage_types))
+        match resources.vanilla_item_registry() {
+            Ok(items) => {
+                let items = Arc::new(items);
+                session.set_item_registry(Arc::clone(&items));
+                match &active_enchantments {
+                    Ok(damage_types) => {
+                        session.set_item_damage_rules(items, Arc::clone(damage_types))
+                    }
+                    Err(error) => eprintln!("Item damage rules are unavailable: {error:#}"),
+                }
             }
-            (Err(error), _) => eprintln!("Item damage rules are unavailable: {error:#}"),
-            (_, Err(error)) => eprintln!("Item damage rules are unavailable: {error:#}"),
+            Err(error) => eprintln!("Item registry is unavailable: {error:#}"),
         }
         match resources.vanilla_entity_collision_registry() {
             Ok(registry) => session.set_entity_collision_registry(Arc::new(registry))?,

@@ -154,7 +154,13 @@ impl SavedChest {
 
     /// Interpret the known item/count subset of 26.3's lock item predicate.
     /// Unknown predicates remain unavailable rather than being treated as open.
-    pub(crate) fn can_unlock(&self, item: Option<&ItemStack>, spectator: bool) -> Result<bool> {
+    pub(crate) fn can_unlock(
+        &self,
+        item: Option<&ItemStack>,
+        spectator: bool,
+        tags: Option<&native_resources::recipes::ItemTags>,
+        registry: Option<&native_resources::item_registry::ItemRegistry>,
+    ) -> Result<bool> {
         if spectator {
             return Ok(true);
         }
@@ -171,27 +177,48 @@ impl SavedChest {
             "unsupported lock predicate field"
         );
         if let Some(items) = unique(lock, "items")? {
-            let choices = match items {
-                Tag::String(_) => std::slice::from_ref(items),
-                Tag::List {
-                    element_type: TagType::String,
-                    values,
-                } => values.as_slice(),
-                _ => bail!("unsupported lock item set"),
-            };
-            let mut matched = false;
-            for choice in choices {
-                let Tag::String(id) = choice else {
-                    bail!("invalid lock item")
+            if let Tag::String(value) = items {
+                let name = String::from_utf16(&value.0).context("invalid lock item identifier")?;
+                if let Some(tag) = name.strip_prefix('#') {
+                    let tag = ResourceId::parse(tag)?;
+                    let tags = tags.context("active item tags are unavailable")?;
+                    let registry = registry.context("active item registry is unavailable")?;
+                    let held = item.map_or("minecraft:air", ItemStack::id);
+                    if !tags
+                        .checked_contains(&tag, held, |id| registry.id(id).is_some())
+                        .context("item tag is unavailable or invalid")?
+                    {
+                        return Ok(false);
+                    }
+                } else {
+                    let id = ResourceId::parse(&name)?;
+                    let id = format!("{}:{}", id.namespace, id.path);
+                    if !item.map_or(id == "minecraft:air", |item| item.id() == id) {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                let choices = match items {
+                    Tag::List {
+                        element_type: TagType::String,
+                        values,
+                    } => values.as_slice(),
+                    _ => bail!("unsupported lock item set"),
                 };
-                let id = String::from_utf16(&id.0).context("invalid lock item identifier")?;
-                ensure!(!id.starts_with('#'), "item tag locks are unsupported");
-                let id = ResourceId::parse(&id)?;
-                let id = format!("{}:{}", id.namespace, id.path);
-                matched |= item.map_or(id == "minecraft:air", |item| item.id() == id);
-            }
-            if !matched {
-                return Ok(false);
+                let mut matched = false;
+                for choice in choices {
+                    let Tag::String(id) = choice else {
+                        bail!("invalid lock item")
+                    };
+                    let id = String::from_utf16(&id.0).context("invalid lock item identifier")?;
+                    ensure!(!id.starts_with('#'), "item tag locks are unsupported");
+                    let id = ResourceId::parse(&id)?;
+                    let id = format!("{}:{}", id.namespace, id.path);
+                    matched |= item.map_or(id == "minecraft:air", |item| item.id() == id);
+                }
+                if !matched {
+                    return Ok(false);
+                }
             }
         }
         let count = item.map_or(0, |stack| stack.count() as i64);
@@ -651,7 +678,7 @@ mod tests {
         let locked = read(&payload(vec![locked]), chunk, position)
             .unwrap()
             .unwrap();
-        assert!(locked.can_unlock(None, false).unwrap());
+        assert!(locked.can_unlock(None, false, None, None).unwrap());
         let mut unsupported = chest();
         let Tag::Compound(fields) = &mut unsupported else {
             unreachable!()
@@ -663,8 +690,8 @@ mod tests {
         let unsupported = read(&payload(vec![unsupported]), chunk, position)
             .unwrap()
             .unwrap();
-        assert!(unsupported.can_unlock(None, false).is_err());
-        assert!(unsupported.can_unlock(None, true).unwrap());
+        assert!(unsupported.can_unlock(None, false, None, None).is_err());
+        assert!(unsupported.can_unlock(None, true, None, None).unwrap());
         assert!(read(&payload(vec![chest(), chest()]), chunk, position).is_err());
         let mut duplicate = chest();
         let Tag::Compound(fields) = &mut duplicate else {
@@ -690,7 +717,9 @@ mod tests {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
-        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_item_registry().unwrap();
+        let recipes = native_resources::recipes::CraftingRecipes::load(&mut resources).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let version = game.join("versions/26.3");
         let manifest: serde_json::Value =
@@ -739,6 +768,7 @@ mod tests {
             Some(stack("minecraft:diamond", 1)),
             Some(stack("minecraft:diamond", 3)),
             Some(stack("minecraft:stone", 2)),
+            Some(stack("minecraft:oak_planks", 1)),
         ];
         for (case, row) in values.iter().enumerate() {
             let mut original = chest();
@@ -758,11 +788,17 @@ mod tests {
             };
             for (hand, &answer) in hands.iter().zip(expected) {
                 assert_eq!(
-                    saved.can_unlock(hand.as_ref(), false).unwrap(),
+                    saved
+                        .can_unlock(hand.as_ref(), false, Some(&recipes.tags), Some(&registry))
+                        .unwrap(),
                     answer != 0,
                     "case {case} hand {hand:?}"
                 );
-                assert!(saved.can_unlock(hand.as_ref(), true).unwrap());
+                assert!(
+                    saved
+                        .can_unlock(hand.as_ref(), true, Some(&recipes.tags), Some(&registry))
+                        .unwrap()
+                );
             }
         }
     }

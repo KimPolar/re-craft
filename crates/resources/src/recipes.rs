@@ -20,6 +20,7 @@ pub(crate) enum TagEntry {
 #[derive(Clone, Debug, Default)]
 pub struct ItemTags {
     values: BTreeMap<ResourceId, BTreeSet<String>>,
+    unreliable: BTreeSet<ResourceId>,
 }
 
 impl ItemTags {
@@ -29,8 +30,27 @@ impl ItemTags {
             .is_some_and(|values| values.contains(item))
     }
 
+    /// Return unknown for unresolved definitions or entries absent from the
+    /// active item registry, instead of treating a broken tag as empty.
+    pub fn checked_contains(
+        &self,
+        tag: &ResourceId,
+        item: &str,
+        known: impl Fn(&str) -> bool,
+    ) -> Option<bool> {
+        if self.unreliable.contains(tag) {
+            return None;
+        }
+        let values = self.values.get(tag)?;
+        if values.iter().any(|id| !known(id)) {
+            return None;
+        }
+        Some(values.contains(item))
+    }
+
     fn load(provider: &mut impl ResourceProvider, warnings: &mut Vec<String>) -> Result<Self> {
         let mut raw = BTreeMap::<ResourceId, Vec<TagEntry>>::new();
+        let mut unreliable = BTreeSet::new();
         for id in provider.list_data("tags/item")? {
             let path = format!("data/{}/tags/item/{}.json", id.namespace, id.path);
             let mut entries = Vec::new();
@@ -42,7 +62,10 @@ impl ItemTags {
                         }
                         entries.extend(next);
                     }
-                    Err(error) => warnings.push(format!("invalid item tag {path}: {error:#}")),
+                    Err(error) => {
+                        unreliable.insert(id.clone());
+                        warnings.push(format!("invalid item tag {path}: {error:#}"));
+                    }
                 }
             }
             raw.insert(id, entries);
@@ -50,13 +73,22 @@ impl ItemTags {
         let mut values = BTreeMap::new();
         for id in raw.keys() {
             if let Err(error) = resolve_tag(id, &raw, &mut values, &mut BTreeSet::new()) {
+                unreliable.insert(id.clone());
                 warnings.push(format!(
                     "cannot resolve item tag {}:{}: {error:#}",
                     id.namespace, id.path
                 ));
             }
         }
-        Ok(Self { values })
+        // An invalid child also makes any parent containing it unreliable.
+        loop {
+            let affected: Vec<_> = raw.iter().filter(|(id, entries)| !unreliable.contains(*id) && entries.iter().any(|entry| matches!(entry, TagEntry::Tag { id, .. } if unreliable.contains(id)))).map(|(id, _)| id.clone()).collect();
+            if affected.is_empty() {
+                break;
+            }
+            unreliable.extend(affected);
+        }
+        Ok(Self { values, unreliable })
     }
 }
 
@@ -983,7 +1015,61 @@ mod tests {
         assert!(tags.contains(&group, "minecraft:stone"));
         assert!(tags.contains(&group, "minecraft:grass_block"));
         assert!(!tags.contains(&group, "minecraft:dirt"));
+        assert_eq!(
+            tags.checked_contains(&group, "minecraft:stone", |_| true),
+            Some(true)
+        );
+        assert_eq!(
+            tags.checked_contains(&group, "minecraft:dirt", |_| true),
+            Some(false)
+        );
+        assert_eq!(
+            tags.checked_contains(&group, "minecraft:stone", |id| id
+                != "minecraft:grass_block"),
+            None
+        );
+        assert_eq!(
+            tags.checked_contains(
+                &ResourceId::parse("example:missing").unwrap(),
+                "minecraft:stone",
+                |_| true
+            ),
+            None
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn invalid_item_tag_layer_makes_its_parent_unreliable() {
+        let mut provider = MemoryProvider::default();
+        provider.add(
+            "data/example/tags/item/broken.json",
+            r#"{"values":["minecraft:stone"]}"#,
+        );
+        provider.add("data/example/tags/item/broken.json", "not json");
+        provider.add(
+            "data/example/tags/item/parent.json",
+            r##"{"values":["#example:broken"]}"##,
+        );
+        provider.add(
+            "data/example/tags/item/good.json",
+            r#"{"values":["minecraft:stone"]}"#,
+        );
+        let tags = ItemTags::load(&mut provider, &mut Vec::new()).unwrap();
+        for id in ["example:broken", "example:parent"] {
+            assert_eq!(
+                tags.checked_contains(&ResourceId::parse(id).unwrap(), "minecraft:stone", |_| true),
+                None
+            );
+        }
+        assert_eq!(
+            tags.checked_contains(
+                &ResourceId::parse("example:good").unwrap(),
+                "minecraft:stone",
+                |_| true
+            ),
+            Some(true)
+        );
     }
 
     #[test]

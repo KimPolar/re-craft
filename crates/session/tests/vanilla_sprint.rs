@@ -6,7 +6,10 @@ use std::{
     process::Command,
 };
 
-use native_session::{PlayerPose, physics::SprintState};
+use native_session::{
+    GameMode, PlayerPose,
+    physics::{FlightState, SprintState},
+};
 use serde_json::{Value, json};
 
 const ORACLE: &str = r#"
@@ -16,6 +19,7 @@ import com.google.gson.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.Options;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.gui.Gui;
@@ -36,8 +40,11 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec2;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.level.material.Fluid;
 
 public class SprintOracle {
+    static class StopAfterFlight extends RuntimeException { }
     static class TestInput extends ClientInput {
         Input next = Input.EMPTY;
         @Override public void tick() {
@@ -48,6 +55,7 @@ public class SprintOracle {
     }
     static class TestLocal extends LocalPlayer {
         boolean running, water, under, swimming, grounded, enough, using;
+        int flightJumps;
         Abilities testAbilities;
         TestLocal() { super(null, null, null, null, null, null, false, null, null); }
         @Override public Abilities getAbilities() { return testAbilities; }
@@ -59,6 +67,10 @@ public class SprintOracle {
         @Override public boolean isInWater() { return water; }
         @Override public boolean onGround() { return grounded; }
         @Override public boolean isFallFlying() { return false; }
+        @Override public boolean onClimbable() { return true; }
+        @Override public boolean isEyeInFluid(TagKey<Fluid> fluid) { throw new StopAfterFlight(); }
+        @Override public void onUpdateAbilities() { }
+        @Override public void jumpFromGround() { flightJumps++; }
         @Override public boolean isUnderWater() { return under; }
         @Override public boolean isInShallowWater() { return water && !under; }
         @Override public boolean isMobilityRestricted() { return false; }
@@ -68,6 +80,9 @@ public class SprintOracle {
         @Override protected boolean canPlayerFitWithinBlocksAndEntitiesWhen(Pose pose) { return true; }
         @Override public float getEffectBlendFactor(Holder<MobEffect> effect, float delta) { return 0.0f; }
         void reset() { running = false; sprintTriggerTime = 0; input = new TestInput(); noPhysics = true; }
+        void resetFlight() { reset(); jumpTriggerTime = 0; flightJumps = 0; }
+        // aiStep is stopped before Player.aiStep, which decrements this timer.
+        void finishPlayerTick() { if (jumpTriggerTime > 0) jumpTriggerTime--; }
     }
     static class TestPose extends Player {
         Pose current;
@@ -139,6 +154,28 @@ public class SprintOracle {
             }
             output.add(ticks);
         }
+        MultiPlayerGameMode gameMode = (MultiPlayerGameMode) unsafe.allocateInstance(MultiPlayerGameMode.class);
+        set(Minecraft.class, minecraft, "gameMode", gameMode);
+        JsonArray flights = new JsonArray();
+        for (int mode = 0; mode < 3; mode++) for (int seed = 0; seed < 64; seed++) {
+            set(MultiPlayerGameMode.class, gameMode, "localPlayerMode", mode == 2 ? GameType.SPECTATOR : mode == 1 ? GameType.CREATIVE : GameType.SURVIVAL);
+            player.resetFlight(); player.testAbilities = new Abilities(); player.testAbilities.mayfly = mode != 0;
+            player.enough = true; player.water = false; player.under = false; player.using = false;
+            player.horizontalCollision = false; player.minorHorizontalCollision = false;
+            for (int tick = 0; tick < 40; tick++) {
+                boolean jump = ((tick + seed) % (2 + seed % 7)) == 0;
+                player.swimming = (tick + seed) % 11 == 0;
+                player.grounded = (tick + seed) % 3 == 0;
+                ((TestInput) player.input).next = new Input(false, false, false, false, jump, false, false);
+                int before = player.flightJumps;
+                try { player.aiStep(); throw new AssertionError("flight branch did not stop"); }
+                catch (StopAfterFlight expected) { }
+                player.finishPlayerTick();
+                JsonObject row = new JsonObject(); row.addProperty("mode", mode); row.addProperty("seed", seed); row.addProperty("tick", tick);
+                row.addProperty("jump", jump); row.addProperty("swimming", player.swimming); row.addProperty("ground", player.grounded);
+                row.addProperty("flying", player.testAbilities.flying); row.addProperty("impulse", player.flightJumps != before); flights.add(row);
+            }
+        }
         TestPose posePlayer = (TestPose) unsafe.allocateInstance(TestPose.class);
         set(Player.class, posePlayer, "abilities", new Abilities());
         Method updatePose = Player.class.getDeclaredMethod("updatePlayerPose"); updatePose.setAccessible(true);
@@ -153,7 +190,7 @@ public class SprintOracle {
                 updatePose.invoke(posePlayer); poses.add(posePlayer.current.name());
             }
         }
-        JsonObject result = new JsonObject(); result.add("sprints", output); result.add("poses", poses); result.add("dimensions", dimensions);
+        JsonObject result = new JsonObject(); result.add("sprints", output); result.add("poses", poses); result.add("dimensions", dimensions); result.add("flights", flights);
         Files.writeString(Path.of(args[1]), new Gson().toJson(result));
     }
 }
@@ -283,6 +320,28 @@ fn sprint_controls_match_vanilla_local_player() {
         "sprint mismatches:\n{}",
         differences.join("\n")
     );
+    let flights = expected["flights"].as_array().unwrap();
+    assert_eq!(flights.len(), 3 * 64 * 40);
+    let mut flight = FlightState::default();
+    for row in flights {
+        if row["tick"].as_u64() == Some(0) {
+            flight = FlightState::default();
+        }
+        let mode = match row["mode"].as_u64().unwrap() {
+            0 => GameMode::Survival,
+            1 => GameMode::Creative,
+            2 => GameMode::Spectator,
+            _ => unreachable!(),
+        };
+        let impulse = flight.update(
+            mode,
+            row["jump"].as_bool().unwrap(),
+            row["swimming"].as_bool().unwrap(),
+            row["ground"].as_bool().unwrap(),
+        );
+        assert_eq!(flight.flying, row["flying"].as_bool().unwrap(), "{row}");
+        assert_eq!(impulse, row["impulse"].as_bool().unwrap(), "{row}");
+    }
     let poses = [
         PlayerPose::Standing,
         PlayerPose::Crouching,
@@ -316,7 +375,8 @@ fn sprint_controls_match_vanilla_local_player() {
         }
     }
     println!(
-        "Compared {} sprint input ticks with 26.3 LocalPlayer.aiStep",
-        96 * 80
+        "Compared {} sprint and {} flight input ticks with 26.3 LocalPlayer.aiStep",
+        96 * 80,
+        3 * 64 * 40
     );
 }

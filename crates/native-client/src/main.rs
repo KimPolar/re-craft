@@ -404,6 +404,7 @@ fn run_cli() -> Result<()> {
     let mut resources = ResourceStack::open(&minecraft_dir)?;
     let tools = load_tool_transformers(&mut resources)?;
     let loot = load_block_loot(&mut resources, &tools)?;
+    let enchantments = native_resources::enchantments::OxygenEnchantments::load(&mut resources)?;
     run_demo(
         &mut event_loop,
         atlas,
@@ -412,6 +413,7 @@ fn run_cli() -> Result<()> {
         SessionContent {
             tools: tools.map(Some),
             loot: Some(Arc::new(loot)),
+            enchantments: Some(Arc::new(enchantments)),
             ..Default::default()
         },
         menu_settings::VideoSettings::default(),
@@ -424,6 +426,7 @@ fn run_cli() -> Result<()> {
 struct SessionContent {
     recipes: Option<Arc<CraftingRecipes>>,
     loot: Option<Arc<native_resources::loot::BlockLootTables>>,
+    enchantments: Option<Arc<native_resources::enchantments::OxygenEnchantments>>,
     tools: [Option<Arc<BlockTransformers>>; 3],
 }
 
@@ -1482,6 +1485,9 @@ impl App {
         }
         if let Some(loot) = content.loot {
             session.set_block_loot(loot);
+        }
+        if let Some(enchantments) = content.enchantments {
+            session.set_enchantments(enchantments);
         }
         for (kind, transforms) in [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe]
             .into_iter()

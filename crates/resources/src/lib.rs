@@ -57,7 +57,8 @@ pub const DEMO_SOIL_TEXTURES: [&str; 13] = [
     "red_sand.png",
     "gravel.png",
 ];
-pub const DEMO_ATLAS_TILES: u32 = DEMO_SOIL_TILE_START + DEMO_SOIL_TEXTURES.len() as u32;
+pub const DEMO_ORE_TILE_START: u32 = DEMO_SOIL_TILE_START + DEMO_SOIL_TEXTURES.len() as u32;
+pub const DEMO_ATLAS_TILES: u32 = DEMO_ORE_TILE_START + native_core::ore::Ore::ALL.len() as u32;
 pub const DEMO_ATLAS_COLUMNS: u32 = 8;
 pub const DEMO_ATLAS_ROWS: u32 = DEMO_ATLAS_TILES.div_ceil(DEMO_ATLAS_COLUMNS);
 const TEXTURE_ROOT: &str = "assets/minecraft/textures/block/";
@@ -193,7 +194,12 @@ pub fn load_atlas_with_packs(minecraft_dir: &Path, pack_paths: &[PathBuf]) -> Re
                 ),
         )
         .chain(native_core::wood::Wood::texture_names())
-        .chain(DEMO_SOIL_TEXTURES.into_iter().map(str::to_owned));
+        .chain(DEMO_SOIL_TEXTURES.into_iter().map(str::to_owned))
+        .chain(
+            native_core::ore::Ore::ALL
+                .into_iter()
+                .map(|ore| ore.texture_name()),
+        );
     for name in names {
         let path = format!("{TEXTURE_ROOT}{name}");
         let asset = sources
@@ -358,7 +364,12 @@ mod tests {
                 ),
         )
         .chain(native_core::wood::Wood::texture_names())
-        .chain(DEMO_SOIL_TEXTURES.into_iter().map(str::to_owned));
+        .chain(DEMO_SOIL_TEXTURES.into_iter().map(str::to_owned))
+        .chain(
+            native_core::ore::Ore::ALL
+                .into_iter()
+                .map(|ore| ore.texture_name()),
+        );
         for name in names {
             jar.start_file(format!("{TEXTURE_ROOT}{name}"), options)
                 .unwrap();

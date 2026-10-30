@@ -32,6 +32,7 @@ pub enum Block {
     Stone,
     StoneBricks,
     Cobblestone,
+    Ore(native_core::ore::Ore),
     Wood(Wood, Axis),
     Planks(Planks),
     CraftingTable,
@@ -86,9 +87,12 @@ impl Block {
             "minecraft:stone_bricks" => Self::StoneBricks,
             "minecraft:cobblestone" => Self::Cobblestone,
             "minecraft:crafting_table" => Self::CraftingTable,
-            _ => match Wood::from_id(id) {
-                Some(wood) => Self::Wood(wood, Axis::Y),
-                None => Self::Planks(Planks::from_id(id)?),
+            _ => match native_core::ore::Ore::from_id(id) {
+                Some(ore) => Self::Ore(ore),
+                None => match Wood::from_id(id) {
+                    Some(wood) => Self::Wood(wood, Axis::Y),
+                    None => Self::Planks(Planks::from_id(id)?),
+                },
             },
         })
     }
@@ -110,6 +114,7 @@ impl Block {
             Self::Stone => Some("minecraft:stone"),
             Self::StoneBricks => Some("minecraft:stone_bricks"),
             Self::Cobblestone => Some("minecraft:cobblestone"),
+            Self::Ore(ore) => Some(ore.id()),
             Self::Wood(wood, _) => Some(wood.id()),
             Self::Planks(kind) => Some(kind.id()),
             Self::CraftingTable => Some("minecraft:crafting_table"),

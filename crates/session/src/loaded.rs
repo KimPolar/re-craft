@@ -3857,7 +3857,11 @@ impl LoadedSession {
                 "minecraft:farmland",
                 &[("moisture", &moisture.to_string())],
             )),
+            Block::Ore(ore) if ore.has_lit_state() => {
+                self.intern_block(state(ore.id(), &[("lit", "false")]))
+            }
             Block::Cobblestone
+            | Block::Ore(_)
             | Block::Planks(_)
             | Block::CraftingTable
             | Block::CoarseDirt
@@ -8628,6 +8632,43 @@ mod tests {
                 .id(),
             "minecraft:stone"
         );
+    }
+
+    #[test]
+    fn pick_block_selects_ores_in_existing_worlds() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for ore in native_core::ore::Ore::ALL {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let properties = if ore.has_lit_state() {
+                    vec![("lit", "true")]
+                } else {
+                    vec![]
+                };
+                let block = session.intern_block(state(ore.id(), &properties));
+                assert!(session.set(IVec3::new(8, 2, 6), block));
+                let mut inventory = PlayerInventory::default();
+                if mode == GameMode::Survival {
+                    inventory.set_slot(
+                        PlayerSlot::Storage(5),
+                        ItemStack::new(ore.id().into(), 3, 64, Tag::Compound(vec![])),
+                    );
+                }
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::PickBlock);
+                session.update(TICK);
+                let snapshot = session.snapshot();
+                let selected = snapshot.inventory.selected();
+                let item = snapshot
+                    .inventory
+                    .slot(PlayerSlot::Storage(selected))
+                    .unwrap();
+                assert_eq!(item.id(), ore.id());
+                assert_eq!(item.count(), if mode == GameMode::Survival { 3 } else { 1 });
+            }
+        }
     }
 
     #[test]
@@ -17110,6 +17151,7 @@ mod tests {
             .chain(
                 native_core::wood::Wood::all().map(|wood| Block::Wood(wood, native_world::Axis::Y)),
             )
+            .chain(native_core::ore::Ore::ALL.into_iter().map(Block::Ore))
         {
             for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
                 for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
@@ -17158,6 +17200,11 @@ mod tests {
                     if placed {
                         if matches!(block, Block::Wood(_, _)) {
                             assert_eq!(state.properties.get("axis").map(String::as_str), Some("z"));
+                        } else if matches!(block, Block::Ore(ore) if ore.has_lit_state()) {
+                            assert_eq!(
+                                state.properties.get("lit").map(String::as_str),
+                                Some("false")
+                            );
                         } else {
                             assert!(state.properties.is_empty());
                         }

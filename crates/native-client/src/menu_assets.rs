@@ -438,6 +438,12 @@ impl MenuAssets {
         let soil_textures = native_resources::DEMO_SOIL_TEXTURES
             .into_iter()
             .chain(["hanging_roots.png"])
+            .map(str::to_owned)
+            .chain(
+                native_core::ore::Ore::ALL
+                    .into_iter()
+                    .map(|ore| ore.texture_name()),
+            )
             .map(|name| image(&format!("assets/minecraft/textures/block/{name}")))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut destroy_stages = Vec::with_capacity(10);
@@ -912,6 +918,9 @@ mod tests {
         RgbaImage::from_pixel(16, 16, image::Rgba([71, 92, 113, 255]))
             .save(textures.join("hanging_roots.png"))
             .unwrap();
+        RgbaImage::from_pixel(16, 16, image::Rgba([9, 33, 77, 255]))
+            .save(textures.join("diamond_ore.png"))
+            .unwrap();
         let orb_textures = temp
             .path()
             .join("assets/minecraft/textures/entity/experience");
@@ -938,6 +947,14 @@ mod tests {
             [71, 92, 113, 255]
         );
         assert_eq!(assets.experience_orb.get_pixel(0, 0).0, [9, 123, 45, 255]);
+        let diamond = native_core::ore::Ore::Diamond;
+        assert_eq!(
+            assets.soil_textures
+                [native_resources::DEMO_SOIL_TEXTURES.len() + 1 + diamond.index() as usize]
+                .get_pixel(0, 0)
+                .0,
+            [9, 33, 77, 255]
+        );
     }
 
     #[test]

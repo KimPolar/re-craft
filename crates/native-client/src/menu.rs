@@ -1006,11 +1006,14 @@ impl<'a> Menu<'a> {
                 let recipes = native_resources::recipes::CraftingRecipes::load(&mut resources)?;
                 let tools = crate::load_tool_transformers(&mut resources)?;
                 let loot = crate::load_block_loot(&mut resources, &tools)?;
+                let enchantments =
+                    native_resources::enchantments::OxygenEnchantments::load(&mut resources)?;
                 Ok(PreparedLaunch::Demo {
                     atlas,
                     content: crate::SessionContent {
                         recipes: Some(Arc::new(recipes)),
                         loot: Some(Arc::new(loot)),
+                        enchantments: Some(Arc::new(enchantments)),
                         tools: tools.map(Some),
                     },
                     assets,

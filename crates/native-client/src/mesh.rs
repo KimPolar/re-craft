@@ -5,8 +5,10 @@ use native_world::{Block, World};
 pub const DROPPED_BASE_TEXTURES: u32 = 6;
 pub const DROPPED_SOIL_TEXTURE_START: u32 =
     DROPPED_BASE_TEXTURES + native_core::wood::Wood::TEXTURE_COUNT;
-pub const DROPPED_TEXTURE_COUNT: u32 =
+pub const DROPPED_ORE_TEXTURE_START: u32 =
     DROPPED_SOIL_TEXTURE_START + native_resources::DEMO_SOIL_TEXTURES.len() as u32 + 1;
+pub const DROPPED_TEXTURE_COUNT: u32 =
+    DROPPED_ORE_TEXTURE_START + native_core::ore::Ore::ALL.len() as u32;
 pub const DROPPED_ATLAS_COLUMNS: u32 = 8;
 pub const DROPPED_ATLAS_ROWS: u32 = (DROPPED_TEXTURE_COUNT + 1).div_ceil(DROPPED_ATLAS_COLUMNS);
 
@@ -145,6 +147,7 @@ pub fn build(world: &World) -> Vec<Vertex> {
                 Block::Stone => 3,
                 Block::StoneBricks => 4,
                 Block::Cobblestone => native_resources::DEMO_COBBLESTONE,
+                Block::Ore(ore) => native_resources::DEMO_ORE_TILE_START + ore.index(),
                 Block::Wood(wood, axis) => {
                     let end_face = !wood.bark_all_sides()
                         && match axis {
@@ -261,6 +264,7 @@ pub fn dropped_items<'a>(
     let mut vertices = Vec::with_capacity(items.size_hint().0.saturating_mul(36));
     for item in items {
         let wood = native_core::wood::Wood::from_id(item.stack.id());
+        let ore = native_core::ore::Ore::from_id(item.stack.id());
         let base = (item.position - origin.as_dvec3()).as_vec3();
         let partial_tick = (seconds * 20.0).fract();
         let phase = (item.age as f32 + partial_tick) / 10.0;
@@ -295,6 +299,7 @@ pub fn dropped_items<'a>(
                 "minecraft:hanging_roots" => {
                     DROPPED_SOIL_TEXTURE_START + native_resources::DEMO_SOIL_TEXTURES.len() as u32
                 }
+                _ if ore.is_some() => DROPPED_ORE_TEXTURE_START + ore.unwrap().index(),
                 _ => wood.map_or(DROPPED_TEXTURE_COUNT, |wood| {
                     let end_face = !wood.bark_all_sides() && matches!(face_index, 0 | 1);
                     DROPPED_BASE_TEXTURES + wood.texture_index() + u32::from(end_face)
@@ -384,6 +389,47 @@ mod tests {
                 let col = (vertex.uv[0] * DROPPED_ATLAS_COLUMNS as f32) as u32;
                 let row = (vertex.uv[1] * DROPPED_ATLAS_ROWS as f32) as u32;
                 assert_eq!(row * DROPPED_ATLAS_COLUMNS + col, tile, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn ore_blocks_and_drops_use_their_own_textures() {
+        for ore in native_core::ore::Ore::ALL {
+            let item = native_session::items::DroppedItem {
+                position: glam::DVec3::ZERO,
+                previous_position: glam::DVec3::ZERO,
+                stack: native_session::inventory::ItemStack::new(
+                    ore.id().into(),
+                    1,
+                    64,
+                    native_persistence::nbt::Tag::Compound(vec![]),
+                )
+                .unwrap(),
+                age: 0,
+                bob_offset: 0.0,
+            };
+            for vertex in dropped_items(&[item], IVec3::ZERO, 0.0) {
+                let col = (vertex.uv[0] * DROPPED_ATLAS_COLUMNS as f32) as u32;
+                let row = (vertex.uv[1] * DROPPED_ATLAS_ROWS as f32) as u32;
+                assert_eq!(
+                    row * DROPPED_ATLAS_COLUMNS + col,
+                    DROPPED_ORE_TEXTURE_START + ore.index(),
+                    "{}",
+                    ore.id()
+                );
+            }
+            let mut world = World::default();
+            world.set_block(IVec3::ZERO, Block::Ore(ore));
+            for vertex in build(&world) {
+                let col = (vertex.uv[0] * native_resources::DEMO_ATLAS_COLUMNS as f32) as u32;
+                let row = (vertex.uv[1] * native_resources::DEMO_ATLAS_ROWS as f32) as u32;
+                assert_eq!(
+                    row * native_resources::DEMO_ATLAS_COLUMNS + col,
+                    native_resources::DEMO_ORE_TILE_START + ore.index(),
+                    "{}",
+                    ore.id()
+                );
             }
         }
     }
@@ -664,7 +710,13 @@ mod tests {
                 Block::Farmland(7),
                 BTreeMap::from([("moisture".into(), "7".into())]),
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            native_core::ore::Ore::ALL
+                .into_iter()
+                .map(|ore| (Block::Ore(ore), BTreeMap::new())),
+        ) {
             let id = block.item_id().unwrap();
             let baked = geometry::bake_blockstate(&mut source, id, &properties).unwrap();
             let positions: Vec<_> = if matches!(
@@ -728,6 +780,13 @@ mod tests {
                                 "crafting_table_front.png"
                             }
                             native_resources::DEMO_CRAFTING_TABLE_SIDE => "crafting_table_side.png",
+                            tile if tile >= native_resources::DEMO_ORE_TILE_START => {
+                                native_core::ore::Ore::ALL
+                                    [(tile - native_resources::DEMO_ORE_TILE_START) as usize]
+                                    .id()
+                                    .strip_prefix("minecraft:")
+                                    .unwrap()
+                            }
                             _ => {
                                 native_resources::DEMO_SOIL_TEXTURES
                                     [(tile - native_resources::DEMO_SOIL_TILE_START) as usize]
@@ -735,7 +794,7 @@ mod tests {
                         };
                         assert_eq!(
                             quad.texture.sprite.path,
-                            format!("block/{}", texture.strip_suffix(".png").unwrap()),
+                            format!("block/{}", texture.strip_suffix(".png").unwrap_or(texture)),
                             "{block:?} face {index}"
                         );
                         let uv = [

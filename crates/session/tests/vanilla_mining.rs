@@ -17,6 +17,44 @@ use serde_json::Value;
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn ore_placement_defaults_match_vanilla() {
+    use native_core::ore::Ore;
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("OrePlacementOracle.java");
+    let output = temp.path().join("placement.json");
+    std::fs::write(&source, include_str!("java/OrePlacementOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java_bin().join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("OrePlacementOracle")
+        .arg(&output)
+        .args(Ore::ALL.into_iter().map(Ore::id)));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), Ore::ALL.len());
+    for (ore, row) in Ore::ALL.into_iter().zip(rows) {
+        let expected = if ore.has_lit_state() {
+            serde_json::json!({"lit":"false"})
+        } else {
+            serde_json::json!({})
+        };
+        assert_eq!(row, expected, "{}", ore.id());
+        assert_eq!(Block::from_item_id(ore.id()), Some(Block::Ore(ore)));
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn ore_experience_and_silk_touch_match_vanilla() {
     use native_core::random::LegacyRandom;
     use native_resources::{enchantments::OxygenEnchantments, packs::ResourceStack};

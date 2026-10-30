@@ -366,6 +366,7 @@ pub struct LocalSession {
     inventory: Arc<PlayerInventory>,
     recipes: Option<Arc<CraftingRecipes>>,
     loot: Option<Arc<BlockLootTables>>,
+    enchantments: Option<Arc<native_resources::enchantments::OxygenEnchantments>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: VecDeque<(u64, IVec3, SoilKind)>,
     dropped_items: items::ItemEntities,
@@ -456,6 +457,7 @@ impl LocalSession {
             inventory,
             recipes: None,
             loot: None,
+            enchantments: None,
             tool_transforms: [None, None, None],
             soil_ticks: VecDeque::new(),
             dropped_items: items::ItemEntities::default(),
@@ -563,6 +565,10 @@ impl LocalSession {
         self.mining.release();
         self.first_person.invalidate_inventory();
         self.selected_block = selected_inventory_block(&inventory);
+        let mut inventory = inventory;
+        if let Some(registry) = &self.enchantments {
+            inventory.set_enchantments(Arc::clone(registry));
+        }
         self.inventory = Arc::new(inventory);
         self.armor.invalidate();
         if let Err(error) = self.armor.refresh(&self.inventory) {
@@ -593,6 +599,15 @@ impl LocalSession {
         });
     }
 
+    pub fn set_enchantments(
+        &mut self,
+        enchantments: Arc<native_resources::enchantments::OxygenEnchantments>,
+    ) {
+        Arc::make_mut(&mut self.inventory).set_enchantments(Arc::clone(&enchantments));
+        self.armor.set_enchantments(Arc::clone(&enchantments));
+        self.enchantments = Some(enchantments);
+    }
+
     fn mining_target(&self) -> Option<mining::Candidate> {
         let hit = self
             .world
@@ -614,9 +629,9 @@ impl LocalSession {
                 .inventory
                 .slot(PlayerSlot::Storage(self.inventory.selected()))
                 .cloned();
-            let damage = mining::Material::from_block_name(name)
-                .and_then(|material| mining::mining_properties(material, hand.as_ref()))
-                .map_or(0, |properties| properties.damage_per_block);
+            let properties = mining::Material::from_block_name(name)
+                .and_then(|material| mining::mining_properties(material, hand.as_ref()));
+            let damage = properties.map_or(0, |properties| properties.damage_per_block);
             if self.game_mode != GameMode::Creative && damage != 0 {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
@@ -629,6 +644,22 @@ impl LocalSession {
                 true,
                 self.loot.as_deref(),
             );
+            if self.game_mode != GameMode::Creative
+                && properties.is_some_and(|p| p.correct_for_drops)
+            {
+                match mining::ore_experience(
+                    name,
+                    hand.as_ref(),
+                    self.enchantments.as_deref(),
+                    &mut self.level_random,
+                ) {
+                    Ok(Some(amount)) if amount > 0 => self
+                        .experience_orbs
+                        .award(position.as_dvec3() + DVec3::splat(0.5), amount),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("ore experience for {name}: {error:#}"),
+                }
+            }
         }
     }
 
@@ -4203,6 +4234,43 @@ mod tests {
         assert_eq!(
             sessions[1].snapshot().world.demo().unwrap().block(target),
             Block::Dirt
+        );
+    }
+
+    #[test]
+    fn demo_ore_can_be_placed_then_mined_for_experience() {
+        use native_core::ore::Ore;
+        use native_persistence::nbt::Tag;
+        let mut world = World::demo();
+        world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+        let mut session = LocalSession::new(world);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            inventory::ItemStack::new(Ore::Diamond.id().into(), 1, 64, Tag::Compound(vec![])),
+        );
+        inventory.set_slot(
+            PlayerSlot::Storage(1),
+            inventory::ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let target = IVec3::new(0, 4, 4);
+        assert_eq!(session.world.block(target), Block::Ore(Ore::Diamond));
+        assert!(session.inventory.slot(PlayerSlot::Storage(0)).is_none());
+        session.submit_command(PlayerCommand::SelectSlot(1));
+        session.submit_command(PlayerCommand::Break);
+        for _ in 0..70 {
+            session.update(TICK);
+            if session.world.block(target) == Block::Air {
+                break;
+            }
+        }
+        assert_eq!(session.world.block(target), Block::Air);
+        assert!(
+            session.score > 0 || !session.experience_orbs.snapshot().is_empty(),
+            "ore XP was neither spawned nor picked up"
         );
     }
 

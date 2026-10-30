@@ -1601,6 +1601,73 @@ fn run(command: &mut Command) {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn button_types_and_installed_loot_match_vanilla() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let loot = native_resources::loot::BlockLootTables::load(&mut resources).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("ButtonTypesOracle.java");
+    let output = temp.path().join("result.json");
+    std::fs::write(&source, include_str!("java/ButtonTypesOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ButtonTypesOracle")
+        .arg(&output));
+    let rows: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(
+        rows.as_object().unwrap().len(),
+        native_core::button::Button::ALL.len()
+    );
+    for button in native_core::button::Button::ALL {
+        let row = &rows[button.id()];
+        assert_eq!(row["duration"].as_u64(), Some(u64::from(button.duration())));
+        assert_eq!(row["arrow"].as_bool(), Some(button.arrow_sensitive()));
+        assert_eq!(
+            row["hardness"].as_f64(),
+            Some(f64::from(
+                Material::from_block_name(button.id()).unwrap().hardness()
+            ))
+        );
+        for (key, powered) in [("on", true), ("off", false)] {
+            assert_eq!(
+                row[key].as_str(),
+                Some(format!("minecraft:{}", button.sound(powered)).as_str())
+            );
+        }
+        let drops = loot
+            .drops(
+                button.id(),
+                native_resources::loot::BasicTool {
+                    item: None,
+                    count: 0,
+                    enchantments: &[],
+                },
+            )
+            .unwrap();
+        assert_eq!(drops.len(), 1, "{}", button.id());
+        assert_eq!(
+            drops[0].item,
+            native_resources::packs::ResourceId::parse(button.id()).unwrap()
+        );
+        assert_eq!(drops[0].count, 1);
+        assert_eq!(
+            native_session::inventory::ordinary_item_default_max(button.id()),
+            Some(64)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn ore_mining_and_harvest_tiers_match_vanilla() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
@@ -1726,11 +1793,17 @@ fn ordinary_tool_mining_matches_vanilla() {
             "red_sand",
             "gravel",
             "stone_button",
-        ]));
+        ])
+        .args(
+            native_core::button::Button::ALL
+                .into_iter()
+                .filter(|button| button.id() != "minecraft:stone_button")
+                .map(|button| button.id().strip_prefix("minecraft:").unwrap()),
+        ));
     let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
     assert_eq!(
         rows.len(),
-        7 * 5 * (17 + native_core::wood::Wood::all().count()) * 4
+        7 * 5 * (17 + native_core::wood::Wood::all().count() + 14) * 4
     );
     for row in &rows {
         let id = row[0].as_str().unwrap();
@@ -1777,7 +1850,7 @@ fn ordinary_tool_mining_matches_vanilla() {
         if row[2].as_bool().unwrap()
             && !row[3].as_bool().unwrap()
             && row[1].as_str().unwrap() != "minecraft:gravel"
-            && row[1].as_str().unwrap() != "minecraft:stone_button"
+            && native_core::button::Button::from_id(row[1].as_str().unwrap()).is_none()
         {
             let block = Block::from_item_id(row[1].as_str().unwrap()).unwrap();
             let target = glam::IVec3::new(0, 4, 3);

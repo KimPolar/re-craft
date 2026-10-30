@@ -258,7 +258,7 @@ pub struct LoadedSession {
     button_ticks: ButtonTickQueue,
     button_deferred: ButtonTickQueue,
     button_deferred_revision: Option<u64>,
-    button_pending: BTreeSet<(i32, i32, i32)>,
+    button_pending: BTreeSet<ButtonTickKey>,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     falling_sand: Vec<FallingSand>,
@@ -302,7 +302,15 @@ struct SandTickKey {
     kind: FallingKind,
 }
 
-type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ButtonTickKey {
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: native_core::button::Button,
+}
+
+type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), ButtonTickKey>;
 
 /// Transient, ordered presentation events emitted by completed game ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +318,7 @@ pub struct ButtonSoundEvent {
     pub position: IVec3,
     pub powered: bool,
     pub tick: u64,
+    pub kind: native_core::button::Button,
 }
 
 #[derive(Clone, Debug)]
@@ -2494,10 +2503,7 @@ impl LoadedSession {
                 original.iter().all(|tick| {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
-                        || matches!(
-                            tick.block.as_str(),
-                            "minecraft:stone_button" | "stone_button"
-                        )
+                        || native_core::button::Button::from_id(&tick.block).is_some()
                 }),
                 "chunk contains block ticks that are not simulated"
             );
@@ -2523,21 +2529,21 @@ impl LoadedSession {
             ));
         }
         let mut queued_buttons = BTreeSet::new();
-        for (order, &(x, y, z)) in self
+        for (order, &key) in self
             .button_ticks
             .iter()
             .chain(&self.button_deferred)
-            .filter(|(_, (x, _, z))| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+            .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
         {
-            queued_buttons.insert((x, y, z));
+            queued_buttons.insert(key);
             let delay = i32::try_from(order.0 - i128::from(self.tick))
                 .context("button tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
                 order.3,
                 SavedBlockTick {
-                    block: "minecraft:stone_button".into(),
-                    position: [x, y, z],
+                    block: key.kind.id().into(),
+                    position: [key.x, key.y, key.z],
                     delay,
                     priority: order.1,
                 },
@@ -2546,9 +2552,9 @@ impl LoadedSession {
         ensure!(
             self.button_pending
                 .iter()
-                .filter(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
+                .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
                 .all(|key| queued_buttons.contains(key)),
-            "stone-button tick is missing its scheduled order"
+            "button tick is missing its scheduled order"
         );
         let mut queued_soil = BTreeSet::new();
         for (order, &(absolute, soil)) in
@@ -4028,7 +4034,7 @@ impl LoadedSession {
 
     /// Test candidate supports in Java's view-dependent order. An unknown
     /// earlier support cannot safely be skipped in favour of a later one.
-    fn place_stone_button(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+    fn place_button(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
         use crate::inventory::PlayerSlot;
         let main = PlayerSlot::Storage(self.inventory.selected());
         let hand = if self.inventory.slot(main).is_some() {
@@ -4037,7 +4043,8 @@ impl LoadedSession {
             PlayerSlot::Offhand
         };
         let held = self.inventory.slot(hand)?;
-        if held.id() != "minecraft:stone_button" || held.max_count().is_none() {
+        let kind = native_core::button::Button::from_id(held.id())?;
+        if held.max_count().is_none() {
             return None;
         }
         let Cell::State(clicked_id) = cell(
@@ -4049,7 +4056,7 @@ impl LoadedSession {
         ) else {
             return None;
         };
-        let replace_clicked = stone_button_can_replace(self.world.state(clicked_id)?)?;
+        let replace_clicked = button_can_replace(self.world.state(clicked_id)?)?;
         let target = if replace_clicked {
             hit.position
         } else {
@@ -4064,7 +4071,7 @@ impl LoadedSession {
         ) else {
             return None;
         };
-        if stone_button_can_replace(self.world.state(target_id)?) != Some(true) {
+        if button_can_replace(self.world.state(target_id)?) != Some(true) {
             return None;
         }
         for direction in button_placement_directions(
@@ -4087,7 +4094,7 @@ impl LoadedSession {
             match button_support_face(support, -direction)? {
                 false => continue,
                 true => {
-                    let block = stone_button_state(-direction, self.player.yaw)?;
+                    let block = button_state(kind, -direction, self.player.yaw)?;
                     let id = self.intern_block(block);
                     return self.set(target, id).then_some(hand);
                 }
@@ -4791,14 +4798,11 @@ impl LoadedSession {
 
     fn enqueue_saved_buttons(&mut self, ticks: &[SavedBlockTick]) {
         for (index, tick) in ticks.iter().enumerate() {
-            if !matches!(
-                tick.block.as_str(),
-                "minecraft:stone_button" | "stone_button"
-            ) {
+            let Some(kind) = native_core::button::Button::from_id(&tick.block) else {
                 continue;
-            }
+            };
             let [x, y, z] = tick.position;
-            let key = (x, y, z);
+            let key = ButtonTickKey { x, y, z, kind };
             self.tick_chunks_needing_dirty.insert(ChunkPos {
                 x: x.div_euclid(16),
                 z: z.div_euclid(16),
@@ -4845,20 +4849,25 @@ impl LoadedSession {
         }
     }
 
-    fn schedule_stone_button(&mut self, relative: IVec3) {
+    fn schedule_button(&mut self, relative: IVec3, kind: native_core::button::Button) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
         };
-        let key = (absolute.x, absolute.y, absolute.z);
+        let key = ButtonTickKey {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+            kind,
+        };
         if !self.button_pending.insert(key) {
             return;
         }
-        self.mark_tick_chunk_dirty(key.0, key.2);
+        self.mark_tick_chunk_dirty(key.x, key.z);
         let sequence = self.block_tick_sequence;
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.button_ticks.insert(
             (
-                i128::from(self.tick) + 20,
+                i128::from(self.tick) + i128::from(kind.duration()),
                 0,
                 i64::try_from(sequence).unwrap_or(i64::MAX),
                 sequence,
@@ -4867,7 +4876,12 @@ impl LoadedSession {
         );
     }
 
-    fn set_stone_button_power(&mut self, relative: IVec3, powered: bool) -> bool {
+    fn set_button_power(
+        &mut self,
+        relative: IVec3,
+        kind: native_core::button::Button,
+        powered: bool,
+    ) -> bool {
         let Cell::State(id) = cell(
             &self.world,
             self.origin,
@@ -4880,7 +4894,7 @@ impl LoadedSession {
         let Some(old) = self.world.state(id) else {
             return false;
         };
-        if old.name != "minecraft:stone_button" || block_outline(old).is_none() {
+        if old.name != kind.id() || block_outline(old).is_none() {
             return false;
         }
         if old.properties.get("powered").map(String::as_str)
@@ -4895,7 +4909,7 @@ impl LoadedSession {
         self.set(relative, id)
     }
 
-    fn use_stone_button(&mut self, relative: IVec3) -> bool {
+    fn use_button(&mut self, relative: IVec3) -> bool {
         let Cell::State(id) = cell(
             &self.world,
             self.origin,
@@ -4908,18 +4922,26 @@ impl LoadedSession {
         let Some(block) = self.world.state(id) else {
             return false;
         };
-        if block.name != "minecraft:stone_button" || block_outline(block).is_none() {
+        let Some(kind) = native_core::button::Button::from_id(&block.name) else {
+            return false;
+        };
+        if block_outline(block).is_none() {
             return false;
         }
-        if self.set_stone_button_power(relative, true) {
-            self.schedule_stone_button(relative);
+        if self.set_button_power(relative, kind, true) {
+            self.schedule_button(relative, kind);
             self.first_person.swing.start(crate::animation::Hand::Main);
-            self.push_button_sound(relative, true);
+            self.push_button_sound(relative, kind, true);
         }
         true
     }
 
-    fn push_button_sound(&mut self, relative: IVec3, powered: bool) {
+    fn push_button_sound(
+        &mut self,
+        relative: IVec3,
+        kind: native_core::button::Button,
+        powered: bool,
+    ) {
         if let Some(position) = add(self.origin, relative) {
             if self.button_sounds.len() == 4096 {
                 self.button_sounds.pop_front();
@@ -4928,6 +4950,7 @@ impl LoadedSession {
                 position,
                 powered,
                 tick: self.tick,
+                kind,
             });
         }
     }
@@ -5051,7 +5074,7 @@ impl LoadedSession {
                     .button_ticks
                     .pop_first()
                     .expect("selected button tick remains queued");
-                let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
                     deferred_buttons.push((order, key));
                     continue;
                 };
@@ -5068,11 +5091,11 @@ impl LoadedSession {
                     deferred_buttons.push((order, key));
                     continue;
                 }
-                self.mark_tick_chunk_dirty(key.0, key.2);
+                self.mark_tick_chunk_dirty(key.x, key.z);
                 self.button_pending.remove(&key);
                 executed += 1;
-                if self.set_stone_button_power(relative, false) {
-                    self.push_button_sound(relative, false);
+                if self.set_button_power(relative, key.kind, false) {
+                    self.push_button_sound(relative, key.kind, false);
                 }
             } else {
                 let (order, (absolute, soil)) = self
@@ -5465,10 +5488,11 @@ impl LoadedSession {
             ) else {
                 continue;
             };
-            let button_support = self
+            let button_support = self.world.state(id).and_then(button_support_direction);
+            let button_kind = self
                 .world
                 .state(id)
-                .and_then(stone_button_support_direction);
+                .and_then(|state| native_core::button::Button::from_id(&state.name));
             if button_support == Some(-direction)
                 && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(current) if self.world.state(current).and_then(|state| button_support_face(state, direction)) == Some(false))
                 && self.set(neighbor, self.states[0])
@@ -5476,7 +5500,7 @@ impl LoadedSession {
                 if let Some(absolute) = add(self.origin, neighbor) {
                     self.dropped_items.drop_unattached_block(
                         absolute,
-                        "minecraft:stone_button",
+                        button_kind.expect("supported button has a known kind").id(),
                         self.block_drops,
                         self.loot.as_deref(),
                     );
@@ -6176,10 +6200,10 @@ impl LoadedSession {
                         let ore = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).and_then(redstone_ore_lit).is_some());
                         let block_item = main.is_some_and(|item| {
                             Block::from_item_id(item.id()).is_some()
-                                || item.id() == "minecraft:stone_button"
+                                || native_core::button::Button::from_id(item.id()).is_some()
                         });
                         let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
-                            matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).and_then(stone_button_can_replace) == Some(true))
+                            matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).and_then(button_can_replace) == Some(true))
                         });
                         if ore && !bypass && self.game_mode != GameMode::Spectator {
                             self.set_redstone_ore_lit(hit.position, true);
@@ -6191,7 +6215,7 @@ impl LoadedSession {
                         if !handled {
                             if self.game_mode != GameMode::Spectator
                                 && !bypass
-                                && self.use_stone_button(hit.position)
+                                && self.use_button(hit.position)
                             {
                                 handled = true;
                             } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
@@ -6214,7 +6238,7 @@ impl LoadedSession {
                             {
                                 handled = true;
                             } else if self.game_mode.allows_basic_building()
-                                && let Some(hand) = self.place_stone_button(hit)
+                                && let Some(hand) = self.place_button(hit)
                             {
                                 handled = true;
                                 let swing = if hand == crate::inventory::PlayerSlot::Offhand {
@@ -7790,7 +7814,7 @@ fn is_vanilla_fence_gate(name: &str) -> bool {
     })
 }
 
-fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
+fn button_state(kind: native_core::button::Button, face: IVec3, yaw: f32) -> Option<BlockState> {
     if !yaw.is_finite() {
         return None;
     }
@@ -7807,7 +7831,7 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
         _ => return None,
     };
     Some(state(
-        "minecraft:stone_button",
+        kind.id(),
         &[
             ("face", attachment),
             ("facing", facing),
@@ -7816,9 +7840,18 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
     ))
 }
 
+#[cfg(test)]
+fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
+    button_state(
+        native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+        face,
+        yaw,
+    )
+}
+
 /// These default block behaviors were checked with a stone-button placement
 /// context. Other replaceable states can have item-specific rules.
-fn stone_button_can_replace(block: &BlockState) -> Option<bool> {
+fn button_can_replace(block: &BlockState) -> Option<bool> {
     let id = block.name.strip_prefix("minecraft:")?;
     if matches!(
         id,
@@ -7924,8 +7957,10 @@ fn button_placement_directions(
     Some(directions)
 }
 
-fn stone_button_support_direction(button: &BlockState) -> Option<IVec3> {
-    if button.name != "minecraft:stone_button" || block_outline(button).is_none() {
+fn button_support_direction(button: &BlockState) -> Option<IVec3> {
+    if native_core::button::Button::from_id(&button.name).is_none()
+        || block_outline(button).is_none()
+    {
         return None;
     }
     match button.properties.get("face")?.as_str() {
@@ -17671,11 +17706,12 @@ mod tests {
         session.advance_block_ticks();
         assert_eq!(session.sand_ticks.len(), 0);
         assert_eq!(session.button_ticks.len(), 1);
-        assert!(session.button_pending.contains(&(
-            button_absolute.x,
-            button_absolute.y,
-            button_absolute.z
-        )));
+        assert!(session.button_pending.contains(&ButtonTickKey {
+            x: button_absolute.x,
+            y: button_absolute.y,
+            z: button_absolute.z,
+            kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
+        }));
         assert_eq!(
             session
                 .world
@@ -19217,6 +19253,195 @@ mod tests {
     }
 
     #[test]
+    fn all_buttons_place_press_release_and_preserve_kind() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for kind in native_core::button::Button::ALL {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                let mut session = session();
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new(kind.id().into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let relative = IVec3::new(8, 2, 7);
+                let absolute = session.origin + relative;
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    kind.id()
+                );
+                assert_eq!(session.inventory.slot(hand).unwrap().count(), 1);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .properties["powered"],
+                    "true"
+                );
+                assert!(
+                    matches!(session.take_button_sounds().as_slice(), [ButtonSoundEvent { kind: played, powered: true, .. }] if *played == kind)
+                );
+                for _ in 1..kind.duration() {
+                    session.update(TICK);
+                }
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .properties["powered"],
+                    "true"
+                );
+                session.update(TICK);
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .properties["powered"],
+                    "false"
+                );
+                assert!(
+                    matches!(session.take_button_sounds().as_slice(), [ButtonSoundEvent { kind: played, powered: false, .. }] if *played == kind)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_button_is_not_released_by_old_kind_tick() {
+        let mut session = session();
+        let pos = IVec3::new(8, 2, 7);
+        let stone = native_core::button::Button::from_id("minecraft:stone_button").unwrap();
+        let oak = native_core::button::Button::from_id("minecraft:oak_button").unwrap();
+        let id = session.intern_block(button_state(stone, IVec3::Z, 0.0).unwrap());
+        assert!(session.set(pos, id));
+        assert!(session.use_button(pos));
+        session.take_button_sounds();
+        let mut replacement = button_state(oak, IVec3::Z, 0.0).unwrap();
+        replacement
+            .properties
+            .insert("powered".into(), "true".into());
+        let id = session.intern_block(replacement);
+        assert!(session.set(pos, id));
+        for _ in 0..=stone.duration() {
+            session.update(TICK);
+        }
+        let absolute = session.origin + pos;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .properties["powered"],
+            "true"
+        );
+        assert!(session.take_button_sounds().is_empty());
+    }
+
+    #[test]
+    fn saved_button_ticks_preserve_distinct_kinds_at_same_position() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let relative = IVec3::new(8, 2, 7);
+        let absolute = session.origin + relative;
+        let oak = native_core::button::Button::from_id("minecraft:oak_button").unwrap();
+        let mut button = button_state(oak, IVec3::Z, 0.0).unwrap();
+        button.properties.insert("powered".into(), "true".into());
+        let id = session.intern_block(button);
+        assert!(session.set(relative, id));
+        let ticks = vec![
+            SavedBlockTick {
+                block: "minecraft:stone_button".into(),
+                position: absolute.to_array(),
+                delay: 1,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:oak_button".into(),
+                position: absolute.to_array(),
+                delay: 3,
+                priority: 0,
+            },
+        ];
+        session.enqueue_saved_buttons(&ticks);
+        assert_eq!(session.draft_block_ticks(home).unwrap(), ticks);
+        for _ in 0..2 {
+            session.update(TICK);
+        }
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .properties["powered"],
+            "true"
+        );
+        assert!(session.take_button_sounds().is_empty());
+        for _ in 0..2 {
+            session.update(TICK);
+        }
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .properties["powered"],
+            "false"
+        );
+        assert!(
+            matches!(session.take_button_sounds().as_slice(), [ButtonSoundEvent { kind, powered: false, .. }] if *kind == oak)
+        );
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_button_drops_its_data_pack_loot_when_support_is_removed() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let Some(name) = path
+                    .strip_prefix("data/minecraft/loot_table/blocks/")
+                    .and_then(|p| p.strip_suffix(".json"))
+                else {
+                    return Ok(None);
+                };
+                if native_core::button::Button::from_id(name).is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut Source).unwrap());
+        for kind in native_core::button::Button::ALL {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            let support = IVec3::new(8, 2, 6);
+            let button = support + IVec3::Z;
+            let id = session.intern_block(button_state(kind, IVec3::Z, 0.0).unwrap());
+            assert!(session.set(button, id));
+            assert!(session.set(support, session.states[0]));
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), 1, "{}", kind.id());
+            assert_eq!(drops[0].stack.id(), "minecraft:diamond");
+        }
+    }
+
+    #[test]
     fn stone_button_places_on_each_face_and_requires_free_target() {
         use crate::inventory::PlayerSlot;
         use native_persistence::nbt::Tag;
@@ -19246,16 +19471,13 @@ mod tests {
                 location: DVec3::ZERO,
                 inside: false,
             };
-            assert_eq!(
-                session.place_stone_button(hit),
-                Some(PlayerSlot::Storage(0))
-            );
+            assert_eq!(session.place_button(hit), Some(PlayerSlot::Storage(0)));
             let target = session.origin + hit.position + face;
             assert_eq!(
                 session.world.block(target.x, target.y, target.z),
                 Some(&stone_button_state(face, session.player.yaw).unwrap())
             );
-            assert!(session.place_stone_button(hit).is_none());
+            assert!(session.place_button(hit).is_none());
         }
     }
 
@@ -19303,7 +19525,7 @@ mod tests {
                     inside: false,
                 };
                 assert_eq!(
-                    placement.place_stone_button(hit).is_some(),
+                    placement.place_button(hit).is_some(),
                     sturdy,
                     "{kind} {face:?}"
                 );
@@ -19380,7 +19602,7 @@ mod tests {
             state("minecraft:flower_pot", &[]),
         ];
         for support_state in cases {
-            assert_eq!(stone_button_can_replace(&support_state), Some(false));
+            assert_eq!(button_can_replace(&support_state), Some(false));
             for face in [
                 IVec3::X,
                 IVec3::NEG_X,
@@ -19450,16 +19672,13 @@ mod tests {
             button_placement_directions(session.player.yaw, session.player.pitch, hit.face, false)
                 .unwrap();
         assert!(session.set(target + directions[1], session.states[3]));
-        assert_eq!(
-            session.place_stone_button(hit),
-            Some(PlayerSlot::Storage(0))
-        );
+        assert_eq!(session.place_button(hit), Some(PlayerSlot::Storage(0)));
         let absolute = session.origin + target;
         let placed = session
             .world
             .block(absolute.x, absolute.y, absolute.z)
             .unwrap();
-        assert_eq!(stone_button_support_direction(placed), Some(directions[1]));
+        assert_eq!(button_support_direction(placed), Some(directions[1]));
     }
 
     #[test]
@@ -19498,7 +19717,7 @@ mod tests {
                 inside: false,
             };
             assert_eq!(
-                session.place_stone_button(hit),
+                session.place_button(hit),
                 Some(PlayerSlot::Storage(0)),
                 "{support_state:?}"
             );
@@ -19507,7 +19726,7 @@ mod tests {
                 .world
                 .block(absolute.x, absolute.y, absolute.z)
                 .unwrap();
-            assert_eq!(stone_button_support_direction(placed), Some(IVec3::Y));
+            assert_eq!(button_support_direction(placed), Some(IVec3::Y));
         }
     }
 
@@ -19556,7 +19775,7 @@ mod tests {
                 inside: false,
             };
             assert_eq!(
-                session.place_stone_button(hit).is_some(),
+                session.place_button(hit).is_some(),
                 matches!(face, IVec3::NEG_Y | IVec3::NEG_Z),
                 "{face:?}"
             );
@@ -19598,12 +19817,9 @@ mod tests {
         let unknown = session.intern_block(state("minecraft:unknown_support", &[]));
         assert!(session.set(target + directions[1], unknown));
         assert!(session.set(target + directions[2], session.states[3]));
-        assert!(session.place_stone_button(hit).is_none());
+        assert!(session.place_button(hit).is_none());
         assert!(session.set(target + directions[1], session.states[0]));
-        assert_eq!(
-            session.place_stone_button(hit),
-            Some(PlayerSlot::Storage(0))
-        );
+        assert_eq!(session.place_button(hit), Some(PlayerSlot::Storage(0)));
         let Cell::State(id) = cell(
             &session.world,
             session.origin,
@@ -19653,7 +19869,7 @@ mod tests {
                     inside: false,
                 };
                 assert_eq!(
-                    session.place_stone_button(hit),
+                    session.place_button(hit),
                     Some(PlayerSlot::Storage(0)),
                     "{plant}, clicked={clicked}"
                 );
@@ -19671,7 +19887,7 @@ mod tests {
                     "minecraft:stone_button"
                 );
                 assert_eq!(
-                    stone_button_support_direction(session.world.state(result).unwrap()),
+                    button_support_direction(session.world.state(result).unwrap()),
                     Some(IVec3::NEG_Z)
                 );
             }
@@ -19746,7 +19962,7 @@ mod tests {
                 inside: false,
             };
             assert_eq!(
-                session.place_stone_button(hit),
+                session.place_button(hit),
                 Some(PlayerSlot::Storage(0)),
                 "{fluid}"
             );
@@ -19862,7 +20078,8 @@ mod tests {
                 vec![ButtonSoundEvent {
                     position: absolute,
                     powered: true,
-                    tick: 0
+                    tick: 0,
+                    kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
                 }]
             );
             for _ in 0..18 {
@@ -19881,7 +20098,8 @@ mod tests {
                 vec![ButtonSoundEvent {
                     position: absolute,
                     powered: false,
-                    tick: 20
+                    tick: 20,
+                    kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
                 }]
             );
             assert!(session.take_button_sounds().is_empty());
@@ -20092,7 +20310,7 @@ mod tests {
                 let yaw = degrees.to_radians();
                 inputs.push(serde_json::json!({"face":face_name,"yaw":yaw.to_degrees()-180.0}));
                 let button = stone_button_state(face, yaw).unwrap();
-                assert_eq!(stone_button_support_direction(&button), Some(-face));
+                assert_eq!(button_support_direction(&button), Some(-face));
                 expected.push(button.properties);
             }
         }

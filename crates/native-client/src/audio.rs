@@ -666,11 +666,7 @@ fn run(
             } else {
                 match button {
                     Some(event) => catalog.resolve(
-                        if event.powered {
-                            "block.stone_button.click_on"
-                        } else {
-                            "block.stone_button.click_off"
-                        },
+                        event.kind.sound(event.powered),
                         1.0,
                         1.0,
                         Some(event.position.as_dvec3() + glam::DVec3::splat(0.5)),
@@ -1196,6 +1192,40 @@ mod tests {
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_all_button_sounds_resolve() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: Vec::new(),
+        })
+        .unwrap();
+        let mut random = LegacyRandom::new(123);
+        for kind in native_core::button::Button::ALL {
+            for powered in [false, true] {
+                let voice = catalog
+                    .resolve(
+                        kind.sound(powered),
+                        1.0,
+                        1.0,
+                        Some(glam::DVec3::ZERO),
+                        &mut random,
+                        48000,
+                    )
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("missing {} {}", kind.id(), powered));
+                assert!(
+                    voice.clip.samples.iter().any(|sample| *sample != 0),
+                    "{}",
+                    kind.id()
+                );
+                assert!(voice.spatial.is_some());
+                assert!(!voice.player_sound);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn installed_click_decodes_with_selected_pack_stack() {
         let root = native_resources::default_minecraft_dir().unwrap();
         let mut catalog = Catalog::load(Resources {
@@ -1277,6 +1307,7 @@ mod tests {
             position: pos,
             powered: true,
             tick: 1,
+            kind: native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !test_rendered() && std::time::Instant::now() < deadline {

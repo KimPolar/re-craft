@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 33] = [
+const BASIC_BLOCKS: [&str; 32] = [
     "grass_block",
     "dirt",
     "sand",
@@ -25,7 +25,6 @@ const BASIC_BLOCKS: [&str; 33] = [
     "mycelium",
     "dirt_path",
     "farmland",
-    "stone_button",
     "coal_ore",
     "deepslate_coal_ore",
     "iron_ore",
@@ -382,6 +381,11 @@ impl BlockLootTables {
         let mut result = Self::default();
         let names = BASIC_BLOCKS
             .into_iter()
+            .chain(
+                native_core::button::Button::ALL
+                    .into_iter()
+                    .map(|button| button.id().strip_prefix("minecraft:").unwrap()),
+            )
             .chain(
                 native_core::wood::Planks::ALL
                     .into_iter()

@@ -85,6 +85,7 @@ pub enum Material {
     Stone,
     StoneBricks,
     StoneButton,
+    WoodButton,
     Cobblestone,
     /// Vanilla ore hardness and the minimum harvest tier: wood, stone or iron.
     Ore {
@@ -166,16 +167,26 @@ impl Material {
             | "minecraft:jigsaw"
             | "minecraft:test_block"
             | "minecraft:test_instance_block" => Some(Self::Unbreakable),
-            _ => native_core::wood::Wood::from_id(name)
-                .map(|_| Self::Wood)
-                .or_else(|| native_core::wood::Planks::from_id(name).map(|_| Self::Planks)),
+            _ => native_core::button::Button::from_id(name)
+                .map(|button| {
+                    if button.arrow_sensitive() {
+                        Self::WoodButton
+                    } else {
+                        Self::StoneButton
+                    }
+                })
+                .or_else(|| {
+                    native_core::wood::Wood::from_id(name)
+                        .map(|_| Self::Wood)
+                        .or_else(|| native_core::wood::Planks::from_id(name).map(|_| Self::Planks))
+                }),
         }
     }
 
     pub fn hardness(self) -> f32 {
         match self {
             Self::Grass | Self::Gravel => 0.6,
-            Self::Dirt | Self::Sand | Self::StoneButton => 0.5,
+            Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton => 0.5,
             Self::DirtPath => 0.65,
             Self::Stone | Self::StoneBricks => 1.5,
             Self::Planks | Self::Cobblestone | Self::Wood => 2.0,
@@ -295,7 +306,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
         ),
         "axe" => matches!(
             material,
-            Material::Planks | Material::CraftingTable | Material::Wood
+            Material::Planks | Material::CraftingTable | Material::Wood | Material::WoodButton
         ),
         "sword" | "hoe" => false,
         _ => return None,

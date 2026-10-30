@@ -119,6 +119,18 @@ struct SavedOrbMerge {
     donor_position: DVec3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreatedOrbRemovalCause {
+    Pickup,
+    Expired,
+}
+
+struct RemovedCreatedOrb {
+    uuid: [i32; 4],
+    visited: BTreeSet<native_world::loaded::ChunkPos>,
+    cause: CreatedOrbRemovalCause,
+}
+
 impl Default for OrbDamageState {
     fn default() -> Self {
         Self {
@@ -146,6 +158,8 @@ pub(crate) struct Orbs {
     saved_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
     saved_merges: Vec<SavedOrbMerge>,
     removed_saved: Vec<Orb>,
+    created_pickups: BTreeMap<[i32; 4], BTreeSet<native_world::loaded::ChunkPos>>,
+    removed_created: Vec<RemovedCreatedOrb>,
     player_uuid: Option<[i32; 4]>,
 }
 
@@ -167,6 +181,8 @@ impl Default for Orbs {
             saved_pickups: BTreeMap::new(),
             saved_merges: Vec::new(),
             removed_saved: Vec::new(),
+            created_pickups: BTreeMap::new(),
+            removed_created: Vec::new(),
             player_uuid: None,
         }
     }
@@ -212,6 +228,16 @@ impl Orbs {
             chunks.insert(orb_chunk(merge.receiver_position)?);
             chunks.insert(orb_chunk(merge.donor_position)?);
         }
+        chunks.extend(
+            self.created_pickups
+                .values()
+                .flat_map(|positions| positions.iter().copied()),
+        );
+        chunks.extend(
+            self.removed_created
+                .iter()
+                .flat_map(|removed| removed.visited.iter().copied()),
+        );
         self.validate_chunk_group(&chunks, saved_uuids)?;
         Ok(chunks)
     }
@@ -350,11 +376,15 @@ impl Orbs {
     }
 
     pub(crate) fn has_created_in_chunk(&self, pos: native_world::loaded::ChunkPos) -> bool {
-        self.entities.iter().any(|orb| {
-            orb.created.as_ref().is_some_and(|created| {
-                created.visited.contains(&pos) || orb_chunk(orb.visual.position).ok() == Some(pos)
+        self.removed_created
+            .iter()
+            .any(|removed| removed.visited.contains(&pos))
+            || self.entities.iter().any(|orb| {
+                orb.created.as_ref().is_some_and(|created| {
+                    created.visited.contains(&pos)
+                        || orb_chunk(orb.visual.position).ok() == Some(pos)
+                })
             })
-        })
     }
 
     pub(crate) fn set_player_uuid(&mut self, uuid: Option<[i32; 4]>) {
@@ -468,6 +498,29 @@ impl Orbs {
                 "experience-orb destination chunk is unavailable"
             );
         }
+        for removed in &self.removed_created {
+            if removed.visited.is_disjoint(positions) {
+                continue;
+            }
+            ensure!(
+                removed.visited.is_subset(positions),
+                "removed created orb requires all visited chunks"
+            );
+            ensure!(seen.insert(removed.uuid), "duplicate created orb UUID");
+            ensure!(
+                !saved_uuids.contains_key(&removed.uuid) && self.player_uuid != Some(removed.uuid),
+                "removed created orb UUID conflicts with existing identity"
+            );
+        }
+        for (uuid, pickup_chunks) in &self.created_pickups {
+            if positions.is_disjoint(pickup_chunks) {
+                continue;
+            }
+            ensure!(
+                pickup_chunks.is_subset(positions) && seen.contains(uuid),
+                "created orb pickup requires all related chunks and final state"
+            );
+        }
         for (uuid, pickup_chunks) in &self.saved_pickups {
             let source = *saved_uuids
                 .get(uuid)
@@ -559,6 +612,17 @@ impl Orbs {
             )?);
         }
         Ok(result)
+    }
+
+    pub(crate) fn created_removal_effects(
+        &self,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> Vec<([i32; 4], CreatedOrbRemovalCause)> {
+        self.removed_created
+            .iter()
+            .filter(|removed| !removed.visited.is_disjoint(positions))
+            .map(|removed| (removed.uuid, removed.cause))
+            .collect()
     }
 
     pub fn drop_player_experience(
@@ -739,7 +803,7 @@ impl Orbs {
         let active_chunks = &self.active_chunks;
         let damage_tags = self.damage_tags.as_deref();
         let mut removed = vec![false; self.entities.len()];
-        let removals_before = self.removed_saved.len();
+        let removals_before = self.removed_saved.len() + self.removed_created.len();
         let mut spatial = None;
         for index in 0..self.entities.len() {
             if removed[index] || !Self::active(active_chunks, self.entities[index].visual.position)
@@ -950,6 +1014,12 @@ impl Orbs {
             entity.lifetime = entity.lifetime.wrapping_add(1);
             if entity.lifetime >= 6000 {
                 removed[index] = true;
+                record_removed_orb(
+                    entity,
+                    CreatedOrbRemovalCause::Expired,
+                    &mut self.removed_saved,
+                    &mut self.removed_created,
+                );
                 continue;
             }
             let bounds = orb_bounds(entity.visual.position - origin.as_dvec3());
@@ -982,6 +1052,22 @@ impl Orbs {
                             .zip(orb_chunk(entity.visual.position).ok())
                         {
                             self.saved_pickups.entry(uuid).or_default().insert(position);
+                        } else if let Some((uuid, position)) = entity
+                            .created
+                            .as_ref()
+                            .filter(|created| {
+                                created.checked
+                                    && created.valid
+                                    && created.verified_position == entity.visual.position
+                                    && !entity.save_unresolved
+                            })
+                            .and_then(|created| created.uuid)
+                            .zip(orb_chunk(entity.visual.position).ok())
+                        {
+                            self.created_pickups
+                                .entry(uuid)
+                                .or_default()
+                                .insert(position);
                         } else {
                             self.uncoordinated_lifecycle = true;
                         }
@@ -1001,11 +1087,12 @@ impl Orbs {
                         entity.count = entity.count.wrapping_sub(1);
                         if entity.count == 0 {
                             removed[index] = true;
-                            if entity.source.is_some() {
-                                let mut last = entity.clone();
-                                last.count = 1;
-                                self.removed_saved.push(last);
-                            }
+                            record_removed_orb(
+                                entity,
+                                CreatedOrbRemovalCause::Pickup,
+                                &mut self.removed_saved,
+                                &mut self.removed_created,
+                            );
                         }
                         continue;
                     }
@@ -1013,7 +1100,7 @@ impl Orbs {
             }
         }
         if removed.iter().filter(|&&removed| removed).count()
-            != self.removed_saved.len() - removals_before
+            != self.removed_saved.len() + self.removed_created.len() - removals_before
         {
             self.uncoordinated_lifecycle = true;
         }
@@ -1024,6 +1111,35 @@ impl Orbs {
             keep
         });
         self.update_snapshot();
+    }
+}
+
+fn record_removed_orb(
+    orb: &Orb,
+    cause: CreatedOrbRemovalCause,
+    saved: &mut Vec<Orb>,
+    created: &mut Vec<RemovedCreatedOrb>,
+) {
+    if orb.source.is_some() && orb.created.is_none() {
+        let mut last = orb.clone();
+        if cause == CreatedOrbRemovalCause::Pickup {
+            last.count = 1;
+        }
+        saved.push(last);
+    } else if let Some(identity) = &orb.created {
+        if let Some(uuid) = identity.uuid
+            && orb.source.is_none()
+            && identity.checked
+            && identity.valid
+            && identity.verified_position == orb.visual.position
+            && !orb.save_unresolved
+        {
+            created.push(RemovedCreatedOrb {
+                uuid,
+                visited: identity.visited.clone(),
+                cause,
+            });
+        }
     }
 }
 
@@ -1698,6 +1814,253 @@ mod tests {
         assert_eq!(xp.total, 1);
         assert!(orbs.entities.is_empty());
         assert!(orbs.affected_orb_chunks(&Default::default()).is_err());
+    }
+
+    #[test]
+    fn verified_created_orb_expiry_retains_chunks_and_identity() {
+        use native_world::loaded::ChunkPos;
+        let home = ChunkPos { x: 0, z: 0 };
+        let mut orbs = Orbs::default();
+        orbs.award(DVec3::new(2.0, 5.0, 2.0), 7);
+        let uuid = orbs.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        orbs.entities[0].lifetime = 5999;
+        orbs.entities[0].no_gravity = true;
+        orbs.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            true,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(0),
+            &mut Experience::default(),
+            &mut 0,
+            |_| &[],
+            |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+        );
+        assert!(orbs.entities.is_empty());
+        let group = BTreeSet::from([home]);
+        assert_eq!(orbs.affected_orb_chunks(&BTreeMap::new()).unwrap(), group);
+        assert_eq!(
+            orbs.created_removal_effects(&group),
+            [(uuid, CreatedOrbRemovalCause::Expired)]
+        );
+        orbs.set_player_uuid(Some(uuid));
+        assert!(orbs.affected_orb_chunks(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn created_orb_pickup_keeps_all_visited_chunks_after_removal() {
+        use native_world::loaded::ChunkPos;
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        let mut orbs = Orbs::default();
+        orbs.award(DVec3::new(15.9, 5.0, 0.5), 7);
+        let uuid = orbs.entities[0].created.as_ref().unwrap().uuid.unwrap();
+        orbs.entities[0].velocity = DVec3::new(0.5, 0.0, 0.0);
+        orbs.entities[0].no_gravity = true;
+        let mut inventory = Arc::new(PlayerInventory::default());
+        let mut rng = LegacyRandom::new(0);
+        let mut xp = Experience::default();
+        let mut score = 0;
+        for player in [DVec3::splat(100.0), DVec3::new(16.4, 5.0, 0.5)] {
+            orbs.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                player,
+                PlayerPose::Standing,
+                GameMode::Survival,
+                true,
+                &mut inventory,
+                &mut rng,
+                &mut xp,
+                &mut score,
+                |_| &[],
+                |_| 0.6,
+                |_| false,
+                |_, _| (Default::default(), false),
+                false,
+                |_, _, _| Some(Vec::new()),
+                |_, _| true,
+            );
+        }
+        assert_eq!(xp.total, 7);
+        assert!(orbs.entities.is_empty());
+        let group = BTreeSet::from([left, right]);
+        assert_eq!(orbs.affected_orb_chunks(&BTreeMap::new()).unwrap(), group);
+        assert_eq!(
+            orbs.created_removal_effects(&group),
+            [(uuid, CreatedOrbRemovalCause::Pickup)]
+        );
+        for single in [left, right] {
+            assert!(
+                orbs.validate_chunk_group(&BTreeSet::from([single]), &BTreeMap::new())
+                    .is_err()
+            );
+            assert!(orbs.has_created_in_chunk(single));
+        }
+        assert!(
+            orbs.validate_chunk_group(&group, &BTreeMap::from([(uuid, left)]))
+                .is_err()
+        );
+        orbs.set_player_uuid(Some(uuid));
+        assert!(orbs.validate_chunk_group(&group, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn saved_orb_expiry_is_a_coordinated_removal() {
+        use native_persistence::nbt::{Tag, TagType};
+        use native_world::loaded::ChunkPos;
+        let home = ChunkPos { x: 0, z: 0 };
+        let uuid = [1, 2, 3, 4];
+        let source = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:experience_orb".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: [2.0, 5.0, 2.0].into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("NoGravity".into(), Tag::Byte(1)),
+            ("Age".into(), Tag::Short(5999)),
+            ("Value".into(), Tag::Short(7)),
+            ("Count".into(), Tag::Int(1)),
+        ]);
+        let mut orbs = Orbs::default();
+        orbs.spawn_saved(crate::saved_orb::read(&source).unwrap().unwrap());
+        orbs.tick(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Survival,
+            true,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(0),
+            &mut Experience::default(),
+            &mut 0,
+            |_| &[],
+            |_| 0.6,
+        );
+        assert!(orbs.entities.is_empty());
+        assert_eq!(
+            orbs.affected_orb_chunks(&BTreeMap::from([(uuid, home)]))
+                .unwrap(),
+            BTreeSet::from([home])
+        );
+        let removed = orbs.draft_removed(uuid).unwrap().unwrap();
+        assert_eq!(
+            crate::saved_orb::read(&removed.document().value)
+                .unwrap()
+                .unwrap()
+                .age,
+            6000
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn created_orb_pickups_match_java_player_touch() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SavedOrbOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/SavedOrbOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("SavedOrbOracle")
+                .arg(temp.path())
+                .arg("--pickup"),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java pickup oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(temp.path().join("pickup.json")).unwrap())
+                .unwrap();
+        assert_eq!(rows.len(), 27);
+        for row in rows {
+            let value = row["value"].as_i64().unwrap() as i32;
+            let mut orbs = Orbs::default();
+            orbs.award(DVec3::new(2.0, 5.0, 2.0), value);
+            orbs.entities[0].count = row["count"].as_i64().unwrap() as i32;
+            orbs.entities[0].velocity = DVec3::ZERO;
+            orbs.entities[0].no_gravity = true;
+            let mut xp = Experience::default();
+            let mut score = 0;
+            let mut inventory = Arc::new(PlayerInventory::default());
+            let mut rng = LegacyRandom::new(0);
+            for _ in 0..(row["attempts"].as_u64().unwrap() * 2 - 1) {
+                if orbs.entities.is_empty() {
+                    break;
+                }
+                orbs.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    DVec3::new(2.0, 5.0, 2.0),
+                    PlayerPose::Standing,
+                    GameMode::Survival,
+                    true,
+                    &mut inventory,
+                    &mut rng,
+                    &mut xp,
+                    &mut score,
+                    |_| &[],
+                    |_| 0.6,
+                    |_| false,
+                    |_, _| (Default::default(), false),
+                    false,
+                    |_, _, _| Some(Vec::new()),
+                    |_, _| true,
+                );
+            }
+            assert_eq!(xp.total as i64, row["gained"].as_i64().unwrap(), "{row}");
+            assert_eq!(
+                orbs.entities.is_empty(),
+                row["removed"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                orbs.entities.first().map_or(0, |orb| orb.count) as i64,
+                row["remaining"].as_i64().unwrap(),
+                "{row}"
+            );
+            assert!(orbs.affected_orb_chunks(&BTreeMap::new()).is_ok(), "{row}");
+        }
     }
 
     #[test]

@@ -10,6 +10,10 @@ import net.minecraft.world.level.storage.TagValueInput;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.world.entity.ExperienceOrb;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.ItemStack;
 
 public class SavedOrbOracle {
   static class TestLevel extends ClientLevel {
@@ -21,9 +25,32 @@ public class SavedOrbOracle {
     TestOrb(TestLevel level) { super(level,0,0,0,7); }
     void loadExtra(ValueInput input) { super.readAdditionalSaveData(input); }
   }
+  static class TestPlayer extends ServerPlayer {
+    int gained;
+    TestPlayer() { super(null,null,null,null); }
+    @Override public ItemStack getItemBySlot(EquipmentSlot slot) { return ItemStack.EMPTY; }
+    @Override public void take(Entity entity, int count) {}
+    @Override public void giveExperiencePoints(int amount) { gained += amount; }
+  }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var registry = VanillaRegistries.createWorldLookup();
+    if (args.length > 1 && args[1].equals("--pickup")) {
+      var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
+      var unsafe=(sun.misc.Unsafe)unsafeField.get(null);
+      var level=(TestLevel)unsafe.allocateInstance(TestLevel.class);
+      var countField=ExperienceOrb.class.getDeclaredField("count"); countField.setAccessible(true);
+      var rows=new JsonArray();
+      for (int value : new int[]{1,7,17}) for (int count : new int[]{1,2,5}) for (int attempts : new int[]{1,2,3}) {
+        var orb=new TestOrb(level); var player=(TestPlayer)unsafe.allocateInstance(TestPlayer.class);
+        var tag=new CompoundTag(); tag.putShort("Value",(short)value); tag.putInt("Count",count);
+        orb.loadExtra(TagValueInput.create(ProblemReporter.DISCARDING,registry,tag));
+        for (int i=0;i<attempts && !orb.isRemoved();i++) { player.takeXpDelay=0; orb.playerTouch(player); }
+        var row=new JsonObject(); row.addProperty("value",value); row.addProperty("count",count); row.addProperty("attempts",attempts);
+        row.addProperty("remaining",countField.getInt(orb)); row.addProperty("gained",player.gained); row.addProperty("removed",orb.isRemoved()); rows.add(row);
+      }
+      Files.writeString(Path.of(args[0],"pickup.json"),new Gson().toJson(rows)); return;
+    }
     if (args.length > 2 && args[2].equals("--live")) {
       var tag = NbtIo.read(Path.of(args[1]));
       var input=TagValueInput.create(ProblemReporter.DISCARDING,registry,tag);

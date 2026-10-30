@@ -3450,7 +3450,12 @@ impl LoadedSession {
             .draft_created_items_in_chunks(positions)?;
         let created_orbs = self.experience_orbs.draft_created_in_chunks(positions)?;
         let created_removals = self.dropped_items.created_removal_effects(positions);
-        if !created_items.is_empty() || !created_orbs.is_empty() || !created_removals.is_empty() {
+        let removed_created_orbs = self.experience_orbs.created_removal_effects(positions);
+        if !created_items.is_empty()
+            || !created_orbs.is_empty()
+            || !created_removals.is_empty()
+            || !removed_created_orbs.is_empty()
+        {
             let mut created_uuids = BTreeSet::new();
             for document in created_items
                 .iter()
@@ -3463,6 +3468,9 @@ impl LoadedSession {
             }
             for (uuid, _) in created_removals {
                 ensure!(created_uuids.insert(uuid), "duplicate created item UUID");
+            }
+            for (uuid, _) in removed_created_orbs {
+                ensure!(created_uuids.insert(uuid), "duplicate created orb UUID");
             }
             // Check known source chunks outside this group as well. Unloaded
             // entities and world effects still prevent using this as a save.
@@ -16027,6 +16035,72 @@ mod tests {
         assert!(session.set(IVec3::new(3, 3, 3), portal));
         session.update(TICK);
         assert!(session.draft_tracked_entity_chunks().is_err());
+    }
+
+    #[test]
+    fn collected_created_orb_joins_player_and_entity_drafts() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let origin = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+        session.experience_orbs.award(origin, 7);
+        session.update(TICK);
+        let orb = session.snapshot().experience_orbs[0];
+        session.motion.position = orb.position - session.origin.as_dvec3();
+        session.update(TICK);
+        assert!(session.snapshot().experience_orbs.is_empty());
+        let draft = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_experience(draft.player_and_terrain.player()).total,
+            7
+        );
+        assert_eq!(
+            draft.player_and_terrain.player().value.get("Score"),
+            Some(&Tag::Int(7))
+        );
+        let Tag::List { values, .. } = draft.entity_chunks[&home]
+            .document()
+            .value
+            .get("Entities")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(values.is_empty());
+        assert!(draft.entity_chunks[&home].source_was_absent());
+        assert!(
+            session
+                .experience_orbs
+                .created_removal_effects(&BTreeSet::from([home]))
+                .iter()
+                .any(|(_, cause)| *cause == crate::orbs::CreatedOrbRemovalCause::Pickup)
+        );
     }
 
     #[test]

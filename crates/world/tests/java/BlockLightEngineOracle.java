@@ -82,6 +82,7 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
             var pos = position(item);
             world.blocks.put(pos, state(item.get("state").getAsString()));
             engine.checkBlock(pos);
+            if (item.has("defer") && item.get("defer").getAsBoolean()) continue;
             while (engine.hasLightWork()) engine.runLightUpdates();
             var grid = new JsonArray();
             var listener = engine.getLayerListener(LightLayer.BLOCK);

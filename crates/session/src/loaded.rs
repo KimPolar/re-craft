@@ -99,6 +99,19 @@ struct IncomingChunk {
     heightmaps: Option<SpawnHeightmaps>,
 }
 
+#[derive(Clone, Copy)]
+struct PendingLight {
+    change: native_world::block_light::LightChange,
+    last_attempt: Option<u64>,
+}
+
+fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> bool {
+    (i64::from(a.x) - i64::from(b.x)).abs()
+        + (i64::from(a.y) - i64::from(b.y)).abs()
+        + (i64::from(a.z) - i64::from(b.z)).abs()
+        <= i64::from(ar + br + 1)
+}
+
 pub struct LoadedSession {
     world: Arc<World>,
     shapes: Vec<Option<Vec<Aabb>>>,
@@ -204,6 +217,8 @@ pub struct LoadedSession {
     accumulated: Duration,
     tick: u64,
     revision: u64,
+    pending_light: BTreeMap<BlockPosition, PendingLight>,
+    light_generation: u64,
     snapshot: Arc<WorldSnapshot>,
     unsupported_states: usize,
     dirty_chunks: BTreeSet<ChunkPos>,
@@ -1650,6 +1665,8 @@ impl LoadedSession {
             accumulated: Duration::ZERO,
             tick: 0,
             revision: 0,
+            pending_light: BTreeMap::new(),
+            light_generation: 0,
             snapshot,
             unsupported_states,
             dirty_chunks: BTreeSet::new(),
@@ -3608,6 +3625,7 @@ impl LoadedSession {
         }
         if changed {
             self.revision += 1;
+            self.light_generation = self.light_generation.wrapping_add(1);
         }
         if changed || self.tick == 0 {
             self.dropped_items
@@ -4351,6 +4369,67 @@ impl LoadedSession {
         false
     }
 
+    fn try_pending_light(&mut self, first: BlockPosition) {
+        if !self.pending_light.contains_key(&first) {
+            return;
+        }
+        let mut group = BTreeSet::from([first]);
+        let mut frontier = vec![first];
+        while let Some(position) = frontier.pop() {
+            let other = self.pending_light[&position];
+            for (&candidate, entry) in &self.pending_light {
+                if group.contains(&candidate) {
+                    continue;
+                }
+                if light_regions_touch(
+                    candidate,
+                    entry.change.radius(),
+                    position,
+                    other.change.radius(),
+                ) {
+                    group.insert(candidate);
+                    frontier.push(candidate);
+                }
+            }
+        }
+        let changes: Vec<_> = group
+            .iter()
+            .map(|&position| (position, self.pending_light[&position].change))
+            .collect();
+        match native_world::block_light::relight_changes(Arc::make_mut(&mut self.world), &changes) {
+            Some(changed) => {
+                for position in group {
+                    self.pending_light.remove(&position);
+                }
+                if !changed.is_empty() {
+                    self.dirty_chunks.extend(changed);
+                    self.revision += 1;
+                }
+            }
+            None => {
+                for position in group {
+                    if let Some(pending) = self.pending_light.get_mut(&position) {
+                        pending.last_attempt = Some(self.light_generation);
+                    }
+                }
+            }
+        }
+    }
+
+    fn retry_pending_light(&mut self) {
+        // Unavailable data is retried only after the world changes. Limit
+        // independent groups per tick so streaming a large area cannot stall it.
+        for _ in 0..4 {
+            let next = self.pending_light.iter().find_map(|(&position, pending)| {
+                (pending.last_attempt != Some(self.light_generation)).then_some(position)
+            });
+            let Some(position) = next else {
+                break;
+            };
+            self.try_pending_light(position);
+        }
+    }
+
     fn set(&mut self, relative: IVec3, id: BlockStateId) -> bool {
         let Some(pos) = add(self.origin, relative) else {
             return false;
@@ -4387,9 +4466,10 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
-        let relight = original_state
-            .as_ref()
-            .and_then(|old| native_world::block_light::light_change(old, &replacement_state));
+        let relight = native_world::block_light::light_change_for_edit(
+            original_state.as_ref(),
+            &replacement_state,
+        );
         let world = Arc::make_mut(&mut self.world);
         let chunk = world.chunks.get_mut(&chunk_pos).expect("chunk was checked");
         let chunk = Arc::make_mut(chunk);
@@ -4457,16 +4537,32 @@ impl LoadedSession {
             });
         self.dirty_chunks.insert(chunk_pos);
         if let Some(light_change) = relight {
-            if let Some(changed) = native_world::block_light::relight_block(
-                Arc::make_mut(&mut self.world),
-                BlockPosition {
-                    x: pos.x,
-                    y: pos.y,
-                    z: pos.z,
-                },
-                light_change,
-            ) {
-                self.dirty_chunks.extend(changed);
+            self.light_generation = self.light_generation.wrapping_add(1);
+            let position = BlockPosition {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            };
+            let overlaps_pending = self.pending_light.iter().any(|(&other, pending)| {
+                light_regions_touch(
+                    position,
+                    light_change.radius(),
+                    other,
+                    pending.change.radius(),
+                )
+            });
+            self.pending_light
+                .entry(position)
+                .and_modify(|pending| {
+                    pending.change = pending.change.merge(light_change);
+                    pending.last_attempt = None;
+                })
+                .or_insert(PendingLight {
+                    change: light_change,
+                    last_attempt: None,
+                });
+            if !overlaps_pending {
+                self.try_pending_light(position);
             }
         }
         self.revision += 1;
@@ -5563,6 +5659,7 @@ impl LoadedSession {
         self.refresh_movement_speed();
         let camera_speed = self.movement_speed(camera_sprinting);
         self.apply_streaming();
+        self.retry_pending_light();
         // ServerLevel runs its scheduled block ticks before its fluid ticks.
         self.advance_block_ticks();
         self.advance_fluid_ticks();
@@ -7958,6 +8055,99 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn deferred_overlapping_light_changes_recover_when_neighbor_streams_in() {
+        let mut session = session();
+        let air = session.states[0];
+        let origin_chunk = BlockPosition {
+            x: session.origin.x,
+            y: 0,
+            z: session.origin.z,
+        }
+        .chunk();
+        for x in 0..=1 {
+            for z in 0..=1 {
+                let pos = ChunkPos {
+                    x: origin_chunk.x + x,
+                    z: origin_chunk.z + z,
+                };
+                let sections = (0..=1)
+                    .map(|y| {
+                        (
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )
+                    })
+                    .collect();
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: true,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let torch = session.intern_block(state("minecraft:torch", &[]));
+        let a = IVec3::new(14, 15, 15);
+        let b = IVec3::new(15, 15, 15);
+        assert!(session.set(a, torch));
+        assert!(session.set(b, torch));
+        assert!(session.pending_light.is_empty());
+        let before = session.world.clone();
+        let neighbor = ChunkPos {
+            x: origin_chunk.x + 1,
+            z: origin_chunk.z,
+        };
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .remove(&neighbor)
+            .unwrap();
+        assert!(session.set(a, air));
+        assert!(session.set(b, air));
+        assert_eq!(session.pending_light.len(), 2);
+        let absolute = session.origin + b;
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y, absolute.z, false),
+            Some(14)
+        );
+
+        session.queue_loaded_chunk(neighbor, (*before).clone());
+        session.update(TICK);
+        assert!(session.pending_light.is_empty());
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x, absolute.y, absolute.z, false),
+            Some(0)
+        );
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(0)
+        );
+        assert_eq!(
+            before.light(absolute.x, absolute.y, absolute.z, false),
+            Some(14)
+        );
+        let unknown = session.intern_block(state("minecraft:unknown_test_block", &[]));
+        assert!(session.set(b, unknown));
+        assert_eq!(session.pending_light.len(), 1);
+        assert!(session.set(b, air));
+        session.update(TICK);
+        assert!(session.pending_light.is_empty());
     }
 
     #[test]

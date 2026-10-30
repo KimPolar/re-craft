@@ -5,7 +5,7 @@
 
 use crate::loaded::{BlockPosition, BlockState, ChunkPos, World};
 use std::{
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     sync::Arc,
 };
 
@@ -565,11 +565,47 @@ pub struct LightChange {
     allow_dark_skip: bool,
 }
 
+impl LightChange {
+    /// The largest possible effect of an unrecognized block-state change.
+    pub fn unknown() -> Self {
+        Self {
+            radius: 14,
+            allow_dark_skip: false,
+        }
+    }
+
+    pub fn radius(self) -> i32 {
+        i32::from(self.radius)
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            radius: self.radius.max(other.radius),
+            allow_dark_skip: self.allow_dark_skip && other.allow_dark_skip,
+        }
+    }
+}
+
+/// Unknown original or replacement states still need an eventual relight.
+pub fn light_change_for_edit(old: Option<&BlockState>, new: &BlockState) -> Option<LightChange> {
+    match (old.and_then(light_properties), light_properties(new)) {
+        (Some(old), Some(new)) => light_change_from_properties(&old, &new),
+        _ => Some(LightChange::unknown()),
+    }
+}
+
 /// Determine whether a supported change can affect block light. Both states
 /// must have known light behavior; identical behavior needs no recomputation.
 pub fn light_change(old: &BlockState, new: &BlockState) -> Option<LightChange> {
     let old = light_properties(old)?;
     let new = light_properties(new)?;
+    light_change_from_properties(&old, &new)
+}
+
+fn light_change_from_properties(
+    old: &LightProperties,
+    new: &LightProperties,
+) -> Option<LightChange> {
     let old_opacity = old.opacity.max(1);
     let new_opacity = new.opacity.max(1);
     if old_opacity == new_opacity && old.emission == new.emission && old.faces == new.faces {
@@ -731,6 +767,151 @@ pub fn relight_block(
             continue;
         }
         let p = offset(center, dense_offset(index, radius, side))?;
+        let chunk_pos = p.chunk();
+        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
+        let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
+        let section = Arc::make_mut(chunk.sections.get_mut(&section_y)?);
+        let data = section
+            .block_light
+            .get_or_insert_with(|| Box::new([0; crate::loaded::LIGHT_BYTES]));
+        let index = p.x.rem_euclid(16) as usize
+            + p.z.rem_euclid(16) as usize * 16
+            + p.y.rem_euclid(16) as usize * 256;
+        let byte = &mut data[index / 2];
+        if index.is_multiple_of(2) {
+            *byte = (*byte & 0xf0) | cell.value;
+        } else {
+            *byte = (*byte & 0x0f) | (cell.value << 4);
+        }
+        changed.insert(chunk_pos);
+    }
+    Some(changed)
+}
+
+/// Recompute the union of several overlapping changed regions atomically.
+/// Boundary light outside the union cannot be affected by any of the changes.
+pub fn relight_changes(
+    world: &mut World,
+    changes: &[(BlockPosition, LightChange)],
+) -> Option<BTreeSet<ChunkPos>> {
+    if changes.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    if let [(position, change)] = changes {
+        return relight_block(world, *position, *change);
+    }
+
+    let mut indices = HashMap::new();
+    let mut cells: Vec<(BlockPosition, LightCell)> = Vec::new();
+    let mut cache = BTreeMap::new();
+    let mut behaviors: Vec<LightProperties> = Vec::new();
+    let behavior =
+        |p: BlockPosition, cache: &mut BTreeMap<_, u32>, behaviors: &mut Vec<LightProperties>| {
+            let id = world.block_id(p.x, p.y, p.z)?;
+            if let Some(&index) = cache.get(&id) {
+                return Some(index);
+            }
+            let value = light_properties(world.state(id)?)?;
+            let index = u32::try_from(behaviors.len())
+                .ok()
+                .filter(|&i| i != u32::MAX)?;
+            behaviors.push(value);
+            cache.insert(id, index);
+            Some(index)
+        };
+    for &(center, change) in changes {
+        let radius = change.radius();
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    if dx.abs() + dy.abs() + dz.abs() > radius {
+                        continue;
+                    }
+                    let p = offset(center, (dx, dy, dz))?;
+                    if indices.contains_key(&p) {
+                        continue;
+                    }
+                    let chunk = world.chunks.get(&p.chunk())?;
+                    if chunk.status.as_deref() != Some("minecraft:full")
+                        || !chunk.block_light_correct
+                    {
+                        return None;
+                    }
+                    let value = behavior(p, &mut cache, &mut behaviors)?;
+                    let previous = world.light(p.x, p.y, p.z, false)?;
+                    indices.insert(p, cells.len());
+                    cells.push((
+                        p,
+                        LightCell {
+                            behavior: value,
+                            previous,
+                            value: behaviors[value as usize].emission,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let mut queue = BinaryHeap::new();
+    for (index, (p, cell)) in cells.iter_mut().enumerate() {
+        for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
+            let next = offset(*p, direction)?;
+            if indices.contains_key(&next) {
+                continue;
+            }
+            let chunk = world.chunks.get(&next.chunk())?;
+            if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
+                return None;
+            }
+            let other = behavior(next, &mut cache, &mut behaviors)?;
+            if (behaviors[cell.behavior as usize].has_faces || behaviors[other as usize].has_faces)
+                && faces_occlude(
+                    &behaviors[cell.behavior as usize].faces[direction_index],
+                    &behaviors[other as usize].faces[direction_index ^ 1],
+                )
+            {
+                continue;
+            }
+            let boundary = world.light(next.x, next.y, next.z, false)?;
+            cell.value = cell
+                .value
+                .max(boundary.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1)));
+        }
+        if cell.value > 0 {
+            queue.push((cell.value, index));
+        }
+    }
+    while let Some((level, index)) = queue.pop() {
+        if cells[index].1.value != level {
+            continue;
+        }
+        let (p, from) = (cells[index].0, cells[index].1.behavior);
+        for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
+            let next = offset(p, direction)?;
+            let Some(&next) = indices.get(&next) else {
+                continue;
+            };
+            let cell = &mut cells[next].1;
+            if (behaviors[from as usize].has_faces || behaviors[cell.behavior as usize].has_faces)
+                && faces_occlude(
+                    &behaviors[from as usize].faces[direction_index],
+                    &behaviors[cell.behavior as usize].faces[direction_index ^ 1],
+                )
+            {
+                continue;
+            }
+            let value = level.saturating_sub(behaviors[cell.behavior as usize].opacity.max(1));
+            if value > cell.value {
+                cell.value = value;
+                queue.push((value, next));
+            }
+        }
+    }
+    let mut changed = BTreeSet::new();
+    for (p, cell) in cells {
+        if cell.previous == cell.value {
+            continue;
+        }
         let chunk_pos = p.chunk();
         let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos)?);
         let section_y = i8::try_from(p.y.div_euclid(16)).ok()?;
@@ -1063,6 +1244,201 @@ mod tests {
         set(&mut world, center, air_id);
         relight_block(&mut world, center, light_change(&mushroom, &air).unwrap()).unwrap();
         assert_eq!(light(&world, center), 0);
+    }
+
+    #[test]
+    fn overlapping_deferred_source_removals_clear_each_others_old_light() {
+        let (mut world, _, _, _) = fixture();
+        let air = state("air", None);
+        let torch = state("torch", None);
+        let air_id = world.intern_state(air.clone());
+        let torch_id = world.intern_state(torch.clone());
+        let locations = [position(14, 15, 15), position(16, 15, 15)];
+        let add = light_change(&air, &torch).unwrap();
+        let remove = light_change(&torch, &air).unwrap();
+        for &pos in &locations {
+            set(&mut world, pos, torch_id);
+            relight_block(&mut world, pos, add).unwrap();
+        }
+        let mut sequential = world.clone();
+        let mut deferred = world;
+        for &pos in &locations {
+            set(&mut sequential, pos, air_id);
+            relight_block(&mut sequential, pos, remove).unwrap();
+            set(&mut deferred, pos, air_id);
+        }
+        let before = deferred.clone();
+        relight_changes(&mut deferred, &locations.map(|pos| (pos, remove))).unwrap();
+        for y in 0..32 {
+            for z in 0..32 {
+                for x in 0..32 {
+                    assert_eq!(
+                        light(&deferred, position(x, y, z)),
+                        light(&sequential, position(x, y, z)),
+                        "{x},{y},{z}"
+                    );
+                }
+            }
+        }
+        assert_eq!(light(&deferred, locations[0]), 0);
+        assert!(light(&before, locations[0]) > 0);
+    }
+
+    #[test]
+    fn overlapping_relight_leaves_every_chunk_untouched_when_data_is_unknown() {
+        let (mut world, _, _, _) = fixture();
+        let unknown = world.intern_state(state("unknown_block", None));
+        set(&mut world, position(15, 15, 16), unknown);
+        let before = world.clone();
+        let changes = [
+            (position(14, 15, 15), LightChange::unknown()),
+            (position(16, 15, 15), LightChange::unknown()),
+        ];
+        assert!(relight_changes(&mut world, &changes).is_none());
+        for (key, chunk) in &world.chunks {
+            assert!(Arc::ptr_eq(chunk, &before.chunks[key]));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn overlapping_batches_match_vanilla_light_engine() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BlockLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BlockLightEngineOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actions = [
+            (15, "air", true),
+            (16, "air", false),
+            (15, "torch", true),
+            (16, "torch", false),
+            (15, "slab_bottom", true),
+            (16, "slab_top", false),
+            (15, "torch", true),
+            (16, "snow_7", false),
+        ];
+        let initial = [15, 16].map(|x| serde_json::json!({"x":x,"y":15,"z":15,"state":"torch"}));
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        let entries: Vec<_> = actions.iter().map(|(x,state,defer)| serde_json::json!({"x":x,"y":15,"z":15,"state":state,"defer":defer})).collect();
+        std::fs::write(
+            &input,
+            serde_json::to_vec(&serde_json::json!({"initial":initial,"actions":entries})).unwrap(),
+        )
+        .unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BlockLightEngineOracle")
+            .arg(&input)
+            .arg(&output));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 4);
+        let (mut world, _, _, _) = fixture();
+        let air = world.intern_state(state("air", None));
+        let torch = world.intern_state(state("torch", None));
+        let slab = |kind: &str| BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), kind.into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        };
+        let bottom = world.intern_state(slab("bottom"));
+        let top = world.intern_state(slab("top"));
+        let snow = world.intern_state(BlockState {
+            name: "minecraft:snow".into(),
+            properties: [("layers".into(), "7".into())].into(),
+        });
+        let id = |name: &str| match name {
+            "air" => air,
+            "torch" => torch,
+            "slab_bottom" => bottom,
+            "slab_top" => top,
+            "snow_7" => snow,
+            _ => unreachable!(),
+        };
+        for x in [15, 16] {
+            let p = position(x, 15, 15);
+            let change =
+                light_change(world.state(air).unwrap(), world.state(torch).unwrap()).unwrap();
+            set(&mut world, p, torch);
+            relight_block(&mut world, p, change).unwrap();
+        }
+        let mut pending = Vec::new();
+        let mut expected = expected.into_iter();
+        for (x, name, defer) in actions {
+            let p = position(x, 15, 15);
+            let change = light_change(
+                world.block(p.x, p.y, p.z).unwrap(),
+                world.state(id(name)).unwrap(),
+            )
+            .unwrap();
+            set(&mut world, p, id(name));
+            pending.push((p, change));
+            if defer {
+                continue;
+            }
+            relight_changes(&mut world, &pending).unwrap();
+            pending.clear();
+            let expected = expected.next().unwrap();
+            for y in 0..31 {
+                for z in 0..31 {
+                    for x in 0..31 {
+                        let index = (y * 31 * 31 + z * 31 + x) as usize;
+                        assert_eq!(
+                            light(&world, position(x, y, z)),
+                            expected[index],
+                            "after {name} at {p:?}, checking {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(expected.next().is_none());
     }
 
     #[test]

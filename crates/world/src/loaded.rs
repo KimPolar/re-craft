@@ -109,7 +109,7 @@ pub struct ChunkPos {
     pub z: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlockPosition {
     pub x: i32,
     pub y: i32,

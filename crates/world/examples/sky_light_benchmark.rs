@@ -4,7 +4,7 @@ use native_world::{
     loaded::{
         BLOCK_COUNT, BlockPosition, BlockState, Chunk, ChunkPos, LIGHT_BYTES, Section, World,
     },
-    sky_light::{SkyColumn, UNBOUNDED_SKY_SOURCE},
+    sky_light::{SkyColumn, SkySourceScanner, UNBOUNDED_SKY_SOURCE},
     sky_propagation::{SkyChange, relight_change, relight_changes},
 };
 use std::{collections::BTreeMap, hint::black_box, sync::Arc, time::Instant};
@@ -144,4 +144,35 @@ fn main() {
         "two changes under cover: p50={:.3} ms, p95={:.3} ms (50 samples)",
         samples[25], samples[47]
     );
+    for cached in [false, true] {
+        let mut samples = Vec::new();
+        for i in 0..12 {
+            let started = Instant::now();
+            let mut scanner = SkySourceScanner::new(&world, bounds);
+            for x in 0..16 {
+                for z in 0..16 {
+                    let value = if cached {
+                        scanner.load(x, z)
+                    } else {
+                        SkyColumn::load(&world, bounds, x, z)
+                    };
+                    black_box(value.unwrap());
+                }
+            }
+            if i >= 2 {
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "256 source columns ({}): p50={:.3} ms, p95={:.3} ms (10 samples)",
+            if cached {
+                "shared scan"
+            } else {
+                "independent scans"
+            },
+            samples[5],
+            samples[9]
+        );
+    }
 }

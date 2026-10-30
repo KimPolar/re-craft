@@ -8,7 +8,7 @@ use crate::{
     block_light::{
         LightBounds, LightProperties, faces_occlude, light_properties, transparent_light_properties,
     },
-    loaded::{BlockPosition, BlockStateId, World},
+    loaded::{BlockPosition, BlockStateId, ChunkPos, World},
 };
 
 /// Whether an edit can affect sky-light attenuation or occlusion. Unlike
@@ -40,13 +40,7 @@ impl SkyColumn {
     /// Computes the source from loaded block data. Unknown blocks or sections
     /// return `None` rather than assuming they transmit sky light.
     pub fn load(world: &World, bounds: LightBounds, x: i32, z: i32) -> Option<Self> {
-        let lowest = scan(world, bounds, x, z)?;
-        Some(Self {
-            x,
-            z,
-            bounds,
-            lowest,
-        })
+        SkySourceScanner::new(world, bounds).load(x, z)
     }
 
     pub fn lowest_source_y(self) -> i32 {
@@ -82,6 +76,34 @@ impl SkyColumn {
             return Some(true);
         }
         Some(false)
+    }
+}
+
+/// Reuses section air checks while scanning many columns of one immutable
+/// world snapshot. Construct a new scanner after changing block data.
+pub struct SkySourceScanner<'a> {
+    world: &'a World,
+    bounds: LightBounds,
+    empty_sections: BTreeMap<(ChunkPos, i8), Option<bool>>,
+}
+
+impl<'a> SkySourceScanner<'a> {
+    pub fn new(world: &'a World, bounds: LightBounds) -> Self {
+        Self {
+            world,
+            bounds,
+            empty_sections: BTreeMap::new(),
+        }
+    }
+
+    pub fn load(&mut self, x: i32, z: i32) -> Option<SkyColumn> {
+        let lowest = scan(self.world, self.bounds, x, z, &mut self.empty_sections)?;
+        Some(SkyColumn {
+            x,
+            z,
+            bounds: self.bounds,
+            lowest,
+        })
     }
 }
 
@@ -169,41 +191,51 @@ impl<'a> ColumnReader<'a> {
     }
 }
 
-fn scan(world: &World, bounds: LightBounds, x: i32, z: i32) -> Option<i32> {
+fn scan(
+    world: &World,
+    bounds: LightBounds,
+    x: i32,
+    z: i32,
+    empty_sections: &mut BTreeMap<(ChunkPos, i8), Option<bool>>,
+) -> Option<i32> {
     let mut reader = ColumnReader::new(world, bounds, x, z)?;
-    let chunk = world.chunks.get(
-        &BlockPosition {
-            x,
-            y: reader.range.start,
-            z,
-        }
-        .chunk(),
-    )?;
+    let pos = BlockPosition {
+        x,
+        y: reader.range.start,
+        z,
+    }
+    .chunk();
+    let chunk = world.chunks.get(&pos)?;
     let mut above = 0;
     for section_y in (reader.range.start.div_euclid(16)..reader.range.end.div_euclid(16)).rev() {
-        let section = chunk.sections.get(&i8::try_from(section_y).ok()?)?;
-        let blocks = section.blocks.as_ref()?;
+        let sy = i8::try_from(section_y).ok()?;
         // Java's fillFrom skips a section only when the entire section is
         // air, and resets the previous shape without checking its top edge.
-        let first = *blocks.first()?;
-        let is_air = |id| -> Option<bool> {
-            Some(matches!(
-                world.state(id)?.name.as_str(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            ))
-        };
-        let empty = if is_air(first)? {
-            let mut empty = true;
+        let empty = *empty_sections.entry((pos, sy)).or_insert_with(|| {
+            let blocks = chunk.sections.get(&sy)?.blocks.as_ref()?;
+            let first = *blocks.first()?;
+            let is_air = |id| -> Option<bool> {
+                let state = world.state(id)?;
+                let air = matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                );
+                if air && !state.properties.is_empty() {
+                    return None;
+                }
+                Some(air)
+            };
+            if !is_air(first)? {
+                return Some(false);
+            }
             for &id in blocks.iter().skip(1) {
                 if id != first && !is_air(id)? {
-                    empty = false;
-                    break;
+                    return Some(false);
                 }
             }
-            empty
-        } else {
-            false
-        };
+            Some(true)
+        });
+        let empty = empty?;
         if empty {
             above = 0;
             continue;
@@ -309,6 +341,30 @@ mod tests {
             26,
             "failed scans retain the last known source"
         );
+    }
+
+    #[test]
+    fn scanner_reuses_section_checks_without_changing_column_results() {
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let mut world = fixture();
+        let stone = world.intern_state(state("stone", &[]));
+        let water = world.intern_state(state("water", &[("level", "0")]));
+        world.set_block_id(2, 5, 7, stone).unwrap();
+        world.set_block_id(14, 21, 12, water).unwrap();
+        let mut scanner = SkySourceScanner::new(&world, bounds);
+        for x in 0..16 {
+            for z in 0..16 {
+                assert_eq!(scanner.load(x, z), SkyColumn::load(&world, bounds, x, z));
+            }
+        }
+        assert_eq!(scanner.empty_sections.len(), 2);
+    }
+    #[test]
+    fn scanner_rejects_invalid_air_properties() {
+        let mut world = fixture();
+        let invalid = world.intern_state(state("air", &[("unknown", "true")]));
+        world.set_block_id(15, 31, 15, invalid).unwrap();
+        assert!(SkyColumn::load(&world, LightBounds::new(0, 32).unwrap(), 15, 15).is_none());
     }
 
     #[test]

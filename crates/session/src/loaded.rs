@@ -11545,6 +11545,43 @@ mod tests {
     }
 
     #[test]
+    fn common_solid_blocks_conduct_chest_power_and_block_opening() {
+        for name in [
+            "minecraft:crafting_table",
+            "minecraft:diamond_block",
+            "minecraft:iron_ore",
+        ] {
+            let (mut session, chest, _) = trapped_chest_fixture();
+            let relative = chest - session.origin;
+            let below = relative + IVec3::NEG_Y;
+            let lamp_position = below + IVec3::X;
+            let block = session.intern_block(state(name, &[]));
+            let lamp = session.intern_block(state("minecraft:redstone_lamp", &[("lit", "false")]));
+            assert!(session.set(below, block));
+            assert!(session.set(lamp_position, lamp));
+            assert!(session.try_open_saved_chest(relative), "{name}");
+            let pos = session.origin + lamp_position;
+            assert_eq!(
+                redstone_lamp_lit(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+                Some(true),
+                "{name}"
+            );
+            assert!(Arc::make_mut(&mut session.inventory).toggle());
+            session.collect_closed_chest();
+            for _ in 0..5 {
+                session.update(TICK);
+            }
+            assert_eq!(
+                redstone_lamp_lit(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+                Some(false),
+                "{name}"
+            );
+            assert!(session.set(relative + IVec3::Y, block));
+            assert!(!session.try_open_saved_chest(relative), "{name}");
+        }
+    }
+
+    #[test]
     fn trapped_chest_signal_requires_known_block_entity_data() {
         use native_world::loaded::SavedBlockEntities;
         let (mut session, chest, chunk) = trapped_chest_fixture();

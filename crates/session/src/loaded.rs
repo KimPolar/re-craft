@@ -7893,6 +7893,31 @@ mod tests {
                 .light(absolute.x + 1, absolute.y, absolute.z, false),
             Some(0)
         );
+        assert!(session.set(relative, air));
+        assert!(session.set(relative - IVec3::X, torch));
+        let bottom = session.intern_block(state(
+            "minecraft:stone_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        ));
+        let top = session.intern_block(state(
+            "minecraft:stone_slab",
+            &[("type", "top"), ("waterlogged", "false")],
+        ));
+        assert!(session.set(relative, bottom));
+        assert!(session.set(relative + IVec3::X, bottom));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(12)
+        );
+        assert!(session.set(relative + IVec3::X, top));
+        assert_eq!(
+            session
+                .world
+                .light(absolute.x + 1, absolute.y, absolute.z, false),
+            Some(10)
+        );
     }
 
     #[test]

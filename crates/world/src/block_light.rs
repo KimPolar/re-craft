@@ -18,6 +18,117 @@ const DIRECTIONS: [(i32, i32, i32); 6] = [
     (0, 0, -1),
 ];
 
+fn shape_family(name: &str) -> bool {
+    let Some(name) = name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    let (base, slab) = if let Some(base) = name.strip_suffix("_slab") {
+        (base, true)
+    } else if let Some(base) = name.strip_suffix("_stairs") {
+        (base, false)
+    } else {
+        return false;
+    };
+    if matches!(
+        base,
+        "cut_red_sandstone" | "cut_sandstone" | "petrified_oak" | "smooth_stone"
+    ) {
+        return slab;
+    }
+    if let Some(color) = base
+        .strip_suffix("_concrete")
+        .or_else(|| base.strip_suffix("_wool"))
+    {
+        return matches!(
+            color,
+            "white"
+                | "orange"
+                | "magenta"
+                | "light_blue"
+                | "yellow"
+                | "lime"
+                | "pink"
+                | "gray"
+                | "light_gray"
+                | "cyan"
+                | "purple"
+                | "blue"
+                | "brown"
+                | "green"
+                | "red"
+                | "black"
+        );
+    }
+    matches!(
+        base,
+        "acacia"
+            | "andesite"
+            | "bamboo"
+            | "bamboo_mosaic"
+            | "birch"
+            | "blackstone"
+            | "brick"
+            | "cherry"
+            | "cinnabar"
+            | "cinnabar_brick"
+            | "cobbled_deepslate"
+            | "cobblestone"
+            | "crimson"
+            | "cut_copper"
+            | "dark_oak"
+            | "dark_prismarine"
+            | "deepslate_brick"
+            | "deepslate_tile"
+            | "diorite"
+            | "end_stone_brick"
+            | "exposed_cut_copper"
+            | "granite"
+            | "jungle"
+            | "mangrove"
+            | "mossy_cobblestone"
+            | "mossy_stone_brick"
+            | "mud_brick"
+            | "nether_brick"
+            | "oak"
+            | "oxidized_cut_copper"
+            | "pale_oak"
+            | "polished_andesite"
+            | "polished_blackstone"
+            | "polished_blackstone_brick"
+            | "polished_cinnabar"
+            | "polished_deepslate"
+            | "polished_diorite"
+            | "polished_granite"
+            | "polished_sulfur"
+            | "polished_tuff"
+            | "poplar"
+            | "prismarine"
+            | "prismarine_brick"
+            | "purpur"
+            | "quartz"
+            | "red_nether_brick"
+            | "red_sandstone"
+            | "resin_brick"
+            | "sandstone"
+            | "smooth_quartz"
+            | "smooth_red_sandstone"
+            | "smooth_sandstone"
+            | "spruce"
+            | "stone"
+            | "stone_brick"
+            | "sulfur"
+            | "sulfur_brick"
+            | "tuff"
+            | "tuff_brick"
+            | "warped"
+            | "waxed_cut_copper"
+            | "waxed_exposed_cut_copper"
+            | "waxed_oxidized_cut_copper"
+            | "waxed_weathered_cut_copper"
+            | "weathered_cut_copper"
+    )
+}
+
 fn properties(state: &BlockState) -> Option<(u8, u8)> {
     let boolean = |name: &str| match state.properties.get(name)?.as_str() {
         "true" => Some(true),
@@ -41,6 +152,14 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             if state.properties.is_empty() =>
         {
             (0, 0)
+        }
+        name if shape_family(name) => {
+            crate::collision::slab_stair_solid(state)?;
+            if state.properties.get("type").is_some_and(|v| v == "double") {
+                (15, 0)
+            } else {
+                (u8::from(boolean("waterlogged")?), 0)
+            }
         }
         "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
             if state.properties.len() == 1 =>
@@ -192,6 +311,67 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
     Some(pair)
 }
 
+/// Masks use a 2×2 grid on each boundary face. The verified slab and stair
+/// occlusion shapes have edges on the half-block grid.
+fn face_masks(state: &BlockState) -> Option<[u8; 6]> {
+    if !shape_family(&state.name) {
+        return Some([0; 6]);
+    }
+    crate::collision::slab_stair_solid(state)?;
+    if state.properties.get("type").is_some_and(|v| v == "double") {
+        return Some([0; 6]);
+    }
+    let boxes = crate::collision::block_shape(state)?;
+    let mut masks = [0; 6];
+    for (index, (dx, dy, dz)) in DIRECTIONS.into_iter().enumerate() {
+        let axis = if dx != 0 {
+            0
+        } else if dy != 0 {
+            1
+        } else {
+            2
+        };
+        let high = dx + dy + dz > 0;
+        let a = if axis == 0 { 1 } else { 0 };
+        let b = if axis == 2 { 1 } else { 2 };
+        for i in 0..2 {
+            for j in 0..2 {
+                let x = 0.25 + i as f32 * 0.5;
+                let y = 0.25 + j as f32 * 0.5;
+                if boxes.iter().any(|bb| {
+                    (if high {
+                        bb.max[axis] >= 1.0
+                    } else {
+                        bb.min[axis] <= 0.0
+                    }) && bb.min[a] <= x
+                        && bb.max[a] >= x
+                        && bb.min[b] <= y
+                        && bb.max[b] >= y
+                }) {
+                    masks[index] |= 1 << (i * 2 + j);
+                }
+            }
+        }
+    }
+    Some(masks)
+}
+
+#[derive(Clone, Copy)]
+struct LightProperties {
+    opacity: u8,
+    emission: u8,
+    faces: [u8; 6],
+}
+
+fn light_properties(state: &BlockState) -> Option<LightProperties> {
+    let (opacity, emission) = properties(state)?;
+    Some(LightProperties {
+        opacity,
+        emission,
+        faces: face_masks(state)?,
+    })
+}
+
 fn offset(p: BlockPosition, d: (i32, i32, i32)) -> Option<BlockPosition> {
     Some(BlockPosition {
         x: p.x.checked_add(d.0)?,
@@ -210,21 +390,21 @@ pub struct LightChange {
 /// Determine whether a supported change can affect block light. Both states
 /// must have known light behavior; identical behavior needs no recomputation.
 pub fn light_change(old: &BlockState, new: &BlockState) -> Option<LightChange> {
-    let (old_opacity, old_emission) = properties(old)?;
-    let (new_opacity, new_emission) = properties(new)?;
-    let old_opacity = old_opacity.max(1);
-    let new_opacity = new_opacity.max(1);
-    if old_opacity == new_opacity && old_emission == new_emission {
+    let old = light_properties(old)?;
+    let new = light_properties(new)?;
+    let old_opacity = old.opacity.max(1);
+    let new_opacity = new.opacity.max(1);
+    if old_opacity == new_opacity && old.emission == new.emission && old.faces == new.faces {
         return None;
     }
-    let radius = if old_opacity != new_opacity {
+    let radius = if old_opacity != new_opacity || old.faces != new.faces {
         14
     } else {
-        old_emission.max(new_emission).saturating_sub(1)
+        old.emission.max(new.emission).saturating_sub(1)
     };
     Some(LightChange {
         radius,
-        allow_dark_skip: old_emission == 0 && new_emission == 0,
+        allow_dark_skip: old.emission == 0 && new.emission == 0,
     })
 }
 
@@ -256,6 +436,16 @@ pub fn relight_block(
     }
     let radius = i32::from(change.radius);
     let mut cells = BTreeMap::new();
+    let mut cache = BTreeMap::new();
+    let behavior = |p: BlockPosition, cache: &mut BTreeMap<_, LightProperties>| {
+        let id = world.block_id(p.x, p.y, p.z)?;
+        if let Some(value) = cache.get(&id) {
+            return Some(*value);
+        }
+        let value = light_properties(world.state(id)?)?;
+        cache.insert(id, value);
+        Some(value)
+    };
     for dx in -radius..=radius {
         for dy in -radius..=radius {
             for dz in -radius..=radius {
@@ -267,15 +457,15 @@ pub fn relight_block(
                 if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                     return None;
                 }
-                let (opacity, emission) = properties(world.block(p.x, p.y, p.z)?)?;
+                let value = behavior(p, &mut cache)?;
                 let previous = world.light(p.x, p.y, p.z, false)?;
-                cells.insert(p, (opacity, emission, previous, emission));
+                cells.insert(p, (value, previous, value.emission));
             }
         }
     }
     let mut queue = BinaryHeap::new();
     for (&p, cell) in &mut cells {
-        for direction in DIRECTIONS {
+        for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
             let next = offset(p, direction)?;
             if (next.x - center.x).abs() + (next.y - center.y).abs() + (next.z - center.z).abs()
                 <= radius
@@ -286,33 +476,40 @@ pub fn relight_block(
             if chunk.status.as_deref() != Some("minecraft:full") || !chunk.block_light_correct {
                 return None;
             }
-            properties(world.block(next.x, next.y, next.z)?)?;
+            let other = behavior(next, &mut cache)?;
+            if (cell.0.faces[direction_index] | other.faces[direction_index ^ 1]) == 15 {
+                continue;
+            }
             let boundary = world.light(next.x, next.y, next.z, false)?;
-            cell.3 = cell.3.max(boundary.saturating_sub(cell.0.max(1)));
+            cell.2 = cell.2.max(boundary.saturating_sub(cell.0.opacity.max(1)));
         }
-        if cell.3 > 0 {
-            queue.push((cell.3, p));
+        if cell.2 > 0 {
+            queue.push((cell.2, p));
         }
     }
     while let Some((level, p)) = queue.pop() {
-        if cells.get(&p)?.3 != level {
+        if cells.get(&p)?.2 != level {
             continue;
         }
-        for direction in DIRECTIONS {
+        let from = cells.get(&p)?.0;
+        for (direction_index, direction) in DIRECTIONS.into_iter().enumerate() {
             let next = offset(p, direction)?;
             let Some(cell) = cells.get_mut(&next) else {
                 continue;
             };
-            let value = level.saturating_sub(cell.0.max(1));
-            if value > cell.3 {
-                cell.3 = value;
+            if (from.faces[direction_index] | cell.0.faces[direction_index ^ 1]) == 15 {
+                continue;
+            }
+            let value = level.saturating_sub(cell.0.opacity.max(1));
+            if value > cell.2 {
+                cell.2 = value;
                 queue.push((value, next));
             }
         }
     }
     // All reads and validation have completed before the first mutation.
     let mut changed = BTreeSet::new();
-    for (p, (_, _, previous, value)) in cells {
+    for (p, (_, previous, value)) in cells {
         if previous == value {
             continue;
         }
@@ -556,6 +753,26 @@ mod tests {
     }
 
     #[test]
+    fn opposite_slab_faces_block_light_only_when_their_halves_cover_the_face() {
+        let slab = |kind: &str| BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), kind.into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        };
+        let bottom = slab("bottom");
+        let top = slab("top");
+        let bottom_faces = face_masks(&bottom).unwrap();
+        let top_faces = face_masks(&top).unwrap();
+        assert_eq!(bottom_faces[0] | top_faces[1], 15);
+        assert_ne!(bottom_faces[0] | bottom_faces[1], 15);
+        assert!(light_change(&bottom, &top).is_some());
+        assert!(light_change(&bottom, &bottom).is_none());
+    }
+
+    #[test]
     fn removing_a_lit_source_clears_its_light() {
         let (mut world, _, lit, _) = fixture();
         let center = position(15, 15, 15);
@@ -678,17 +895,12 @@ mod tests {
         ];
         let input = temp.path().join("input.json");
         let output = temp.path().join("output.json");
-        std::fs::write(
-            &input,
-            serde_json::to_vec(
-                &names
-                    .iter()
-                    .map(|n| format!("minecraft:{n}"))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let mut requested = names
+            .iter()
+            .map(|n| format!("minecraft:{n}"))
+            .collect::<Vec<_>>();
+        requested.push("@vanilla_slabs_stairs".into());
+        std::fs::write(&input, serde_json::to_vec(&requested).unwrap()).unwrap();
         run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&cp)
@@ -697,7 +909,15 @@ mod tests {
             .arg(&output));
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert!(rows.len() > names.len());
+        assert!(rows.len() > 8_000);
+        let shaped_names: BTreeSet<_> = rows
+            .iter()
+            .filter_map(|row| {
+                let name = row["name"].as_str()?;
+                (name.ends_with("_slab") || name.ends_with("_stairs")).then_some(name)
+            })
+            .collect();
+        assert_eq!(shaped_names.len(), 198);
         for row in rows {
             let s = BlockState {
                 name: row["name"].as_str().unwrap().into(),
@@ -712,7 +932,14 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
-            assert_eq!(row["shaped"], false, "{s:?}");
+            let shaped =
+                shape_family(&s.name) && s.properties.get("type").is_none_or(|v| v != "double");
+            assert_eq!(row["shaped"], shaped, "{s:?}");
+            assert_eq!(
+                row["faces"],
+                serde_json::json!(face_masks(&s).unwrap()),
+                "{s:?}"
+            );
         }
     }
 
@@ -773,12 +1000,20 @@ mod tests {
             (16, 15, 15, "torch"),
             (15, 15, 16, "water"),
             (14, 15, 15, "wet_pane"),
+            (13, 15, 15, "slab_bottom"),
+            (13, 15, 16, "slab_top"),
+            (13, 15, 14, "stair_bottom"),
         ];
         let actions = [
             (20, 15, 15, "lit"),
             (15, 15, 15, "lit"),
             (15, 15, 15, "unlit"),
             (15, 15, 15, "lit"),
+            (15, 15, 15, "air"),
+            (15, 15, 15, "slab_bottom"),
+            (15, 15, 15, "slab_top"),
+            (15, 15, 15, "stair_bottom"),
+            (15, 15, 15, "stair_top"),
             (15, 15, 15, "air"),
             (15, 15, 15, "torch"),
             (15, 15, 15, "air"),
@@ -820,6 +1055,34 @@ mod tests {
         }
         let air = world.intern_state(state("air", None));
         let torch = world.intern_state(state("torch", None));
+        let slab_bottom = world.intern_state(BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), "bottom".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        });
+        let slab_top = world.intern_state(BlockState {
+            name: "minecraft:stone_slab".into(),
+            properties: [
+                ("type".into(), "top".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        });
+        let stairs = |facing: &str, half: &str, shape: &str| BlockState {
+            name: "minecraft:oak_stairs".into(),
+            properties: [
+                ("facing".into(), facing.into()),
+                ("half".into(), half.into()),
+                ("shape".into(), shape.into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        };
+        let stair_bottom = world.intern_state(stairs("north", "bottom", "straight"));
+        let stair_top = world.intern_state(stairs("east", "top", "inner_left"));
         let water = world.intern_state(BlockState {
             name: "minecraft:water".into(),
             properties: [("level".into(), "0".into())].into(),
@@ -843,6 +1106,10 @@ mod tests {
             "torch" => torch,
             "water" => water,
             "wet_pane" => wet_pane,
+            "slab_bottom" => slab_bottom,
+            "slab_top" => slab_top,
+            "stair_bottom" => stair_bottom,
+            "stair_top" => stair_top,
             _ => unreachable!(),
         };
         for (x, y, z, name) in initial {

@@ -46,6 +46,49 @@ pub fn stacks_mergeable(first: &ItemStack, second: &ItemStack) -> bool {
         })
 }
 
+/// Restitution of 26.3 vanilla blocks that make nonliving entities bounce.
+pub(crate) fn block_bounce_restitution(name: &str) -> f32 {
+    match name {
+        "minecraft:slime_block" => 1.0,
+        "minecraft:shelf_mushroom" => 0.75,
+        name if matches!(
+            name.strip_prefix("minecraft:"),
+            Some(
+                "white_bed"
+                    | "orange_bed"
+                    | "magenta_bed"
+                    | "light_blue_bed"
+                    | "yellow_bed"
+                    | "lime_bed"
+                    | "pink_bed"
+                    | "gray_bed"
+                    | "light_gray_bed"
+                    | "cyan_bed"
+                    | "purple_bed"
+                    | "blue_bed"
+                    | "brown_bed"
+                    | "green_bed"
+                    | "red_bed"
+                    | "black_bed"
+            )
+        ) =>
+        {
+            0.75
+        }
+        _ => 0.0,
+    }
+}
+
+fn vertical_restitution(velocity: f64, actual_y: f64, restitution: f32) -> f64 {
+    if velocity >= -0.04 || restitution <= 0.0 {
+        return 0.0;
+    }
+    let ratio = actual_y / velocity;
+    let air_drag = f64::from(0.98_f32);
+    let drag = 1.0 + ratio * (air_drag - 1.0);
+    (ratio * 0.04 - velocity) * drag * f64::from(restitution * 0.8_f32)
+}
+
 /// The prototype must be resolved from the installed item registry before a
 /// missing component patch can be interpreted as non-resistant.
 pub enum DamageResistancePrototype<'a> {
@@ -1304,6 +1347,7 @@ impl ItemEntities {
             inventory,
             shape,
             friction,
+            |_| 0.0,
             512,
             |_| native_world::fluid::FluidContacts::default(),
             false,
@@ -1321,12 +1365,14 @@ impl ItemEntities {
         inventory: &mut Arc<PlayerInventory>,
         shape: impl FnMut(IVec3) -> &'a [Aabb],
         friction: impl FnMut(IVec3) -> f32,
+        bounce: impl FnMut(IVec3) -> f32,
         fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
         path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
     ) {
         self.tick_with_threshold(
-            origin, player, pose, mode, inventory, shape, friction, 512, fluid, fast_lava, path,
+            origin, player, pose, mode, inventory, shape, friction, bounce, 512, fluid, fast_lava,
+            path,
         );
     }
 
@@ -1340,6 +1386,7 @@ impl ItemEntities {
         inventory: &mut Arc<PlayerInventory>,
         mut shape: impl FnMut(IVec3) -> &'a [Aabb],
         mut friction: impl FnMut(IVec3) -> f32,
+        mut bounce: impl FnMut(IVec3) -> f32,
         index_threshold: usize,
         mut fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
         fast_lava: bool,
@@ -1453,13 +1500,22 @@ impl ItemEntities {
                     entity.velocity.z = 0.0;
                 }
                 if hit_y {
-                    entity.velocity.y = 0.0;
+                    let below = (entity.item.position
+                        - origin.as_dvec3()
+                        - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
+                    .floor()
+                    .as_ivec3();
+                    entity.velocity.y = if entity.on_ground {
+                        vertical_restitution(entity.velocity.y, actual.y, bounce(below))
+                    } else {
+                        0.0
+                    };
                 }
                 let drag = 0.98_f32;
                 let ground_drag = if entity.on_ground {
                     let below = (entity.item.position
                         - origin.as_dvec3()
-                        - DVec3::new(0.0, f64::from(0.999999_f32), 0.0))
+                        - DVec3::new(0.0, f64::from(0.500001_f32), 0.0))
                     .floor()
                     .as_ivec3();
                     drag * friction(below)
@@ -2823,6 +2879,7 @@ mod tests {
                                 &mut inventory,
                                 |_| &[],
                                 |_| 0.6,
+                                |_| 0.0,
                                 threshold,
                                 |_| native_world::fluid::FluidContacts::default(),
                                 false,
@@ -4098,7 +4155,9 @@ import net.minecraft.world.level.material.Fluid;
 
 public class ItemMotionOracle {
     static final Field POSITION;
-    static { try { POSITION = Entity.class.getDeclaredField("position"); POSITION.setAccessible(true); }
+    static final Method RESTITUTE;
+    static { try { POSITION = Entity.class.getDeclaredField("position"); POSITION.setAccessible(true);
+                   RESTITUTE=Entity.class.getDeclaredMethod("restituteMovementAfterCollisions", BlockState.class, boolean.class, boolean.class, Vec3.class); RESTITUTE.setAccessible(true); }
              catch (Exception e) { throw new RuntimeException(e); } }
     static class TestLevel extends ClientLevel {
         BlockState ground;
@@ -4125,6 +4184,8 @@ public class ItemMotionOracle {
         @Override public boolean isInLava() { return fluidKind == 2; }
         @Override public double getFluidHeight(TagKey<Fluid> tag) { return 1.0; }
         @Override public boolean isNoGravity() { return noGravity; }
+        @Override public boolean isSuppressingBounce() { return false; }
+        @Override public void gameEvent(net.minecraft.core.Holder<net.minecraft.world.level.gameevent.GameEvent> event) { }
         @Override public boolean onGround() { return grounded; }
         @Override public int getId() { return identity; }
         @Override public Vec3 getDeltaMovement() { return velocity; }
@@ -4143,7 +4204,11 @@ public class ItemMotionOracle {
             // Landing also triggers block effects, which this mock omits.
             if (grounded) resetFallDistance();
             else checkFallDamage(y, false, world.getBlockState(BlockPos.ZERO), BlockPos.ZERO);
-            if (blocked) velocity = new Vec3(velocity.x, 0, velocity.z);
+            if (blocked) {
+                verticalCollision=true; verticalCollisionBelow=grounded;
+                try { RESTITUTE.invoke(this,world.getBlockState(BlockPos.ZERO),false,false,new Vec3(requested.x,y,requested.z)); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            }
         }
     }
     static JsonArray vector(Vec3 v) { JsonArray a = new JsonArray(); a.add(v.x); a.add(v.y); a.add(v.z); return a; }
@@ -4159,7 +4224,9 @@ public class ItemMotionOracle {
         for (var value : cases) {
             var input = value.getAsJsonObject();
             var world = (TestLevel) unsafe.allocateInstance(TestLevel.class);
-            world.ground = (input.get("ice").getAsBoolean() ? Blocks.ICE : Blocks.STONE).defaultBlockState();
+            int block = input.get("block").getAsInt();
+            world.ground = (block==1 ? Blocks.SLIME_BLOCK : block==2 ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:red_bed")) :
+                block==3 ? Blocks.SHELF_MUSHROOM : input.get("ice").getAsBoolean() ? Blocks.ICE : Blocks.STONE).defaultBlockState();
             var item = (TestItem) unsafe.allocateInstance(TestItem.class);
             item.world = world; item.identity = input.get("id").getAsInt();
             item.noGravity = input.get("no_gravity").getAsBoolean();
@@ -4290,7 +4357,7 @@ public class ItemMotionOracle {
         let source = temp.path().join("ItemMotionOracle.java");
         let input = temp.path().join("input.json");
         let output = temp.path().join("output.json");
-        let cases: Vec<_> = (0..32).map(|i| json!({"id":i, "p":[0.5, if i % 3 == 0 {0.0} else {2.0}, 0.5], "v":[(i as f64 % 5.0) * 0.012, if i % 4 == 0 {0.2} else {0.0}, -0.02], "ground":i%3==0, "ice":i%2==0, "no_gravity":i%2==0, "age":([-32768,-2,0,42][i%4]), "delay":([32767,-1,0,3][(i/4)%4]), "fluid":i%3})).collect();
+        let cases: Vec<_> = (0..64).map(|i| json!({"id":i, "p":[0.5, if i % 3 == 0 {0.0} else {2.0}, 0.5], "v":[(i as f64 % 5.0) * 0.012, if i % 4 == 0 {0.2} else {0.0}, -0.02], "ground":i%3==0, "ice":i%2==0, "block":(i/4)%4, "no_gravity":i%2==0, "age":([-32768,-2,0,42][i%4]), "delay":([32767,-1,0,3][(i/4)%4]), "fluid":i%3})).collect();
         std::fs::write(&source, JAVA).unwrap();
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         let cp = classpath(&game, temp.path());
@@ -4505,10 +4572,18 @@ public class ItemMotionOracle {
                 _damage_state: ItemDamageState::default(),
             });
             let mut inventory = Arc::new(PlayerInventory::default());
-            let friction = if case["ice"].as_bool().unwrap() {
+            let block = case["block"].as_u64().unwrap();
+            let friction = if block == 1 {
+                0.8
+            } else if block == 0 && case["ice"].as_bool().unwrap() {
                 0.98
             } else {
                 0.6
+            };
+            let bounce = match block {
+                1 => 1.0,
+                2 | 3 => 0.75,
+                _ => 0.0,
             };
             for (tick, oracle) in expected[index].as_array().unwrap().iter().enumerate() {
                 items.tick_with_fluid(
@@ -4525,6 +4600,7 @@ public class ItemMotionOracle {
                         }
                     },
                     |_| friction,
+                    |_| bounce,
                     |bounds| {
                         use native_world::fluid::{Cell, FluidKind, FluidState};
                         let kind = match case["fluid"].as_i64().unwrap() {

@@ -942,6 +942,13 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_bounce_suppression_tag(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_bounce_suppression_tag(Arc::new(tag)),
+                    Err(error) => eprintln!("Bounce suppression tag is unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::load_farmland_maintainers(
                     &mut resources,
                     &registry,

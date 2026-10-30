@@ -216,6 +216,7 @@ pub struct LoadedSession {
     button_sounds: VecDeque<ButtonSoundEvent>,
     falling_sand: Vec<FallingSand>,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
+    bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
     advance_time: bool,
@@ -900,6 +901,10 @@ impl LoadedSession {
         self.sand_deferred_revision = None;
     }
 
+    pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.bounce_suppression_tag = Some(tag);
+    }
+
     pub fn set_farmland_maintainers(&mut self, tag: Arc<BTreeSet<String>>) {
         self.farmland_maintainers = Some(tag);
         self.soil_deferred_revision = None;
@@ -1159,6 +1164,7 @@ impl LoadedSession {
             button_sounds: VecDeque::new(),
             falling_sand: Vec::new(),
             falling_fire_tag: None,
+            bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             advance_time: true,
             fast_lava,
@@ -4871,6 +4877,7 @@ impl LoadedSession {
             let origin = self.origin;
             let bounds = self.bounds;
             let air = self.states[0];
+            let bounce_suppression = &self.bounce_suppression_tag;
             let fluid_view = FluidView {
                 world,
                 shapes,
@@ -4897,6 +4904,15 @@ impl LoadedSession {
                         .state(id)
                         .map_or(0.6, |state| crate::physics::ground_friction(&state.name)),
                     Cell::Missing => 0.6,
+                },
+                |pos| match cell(world, origin, bounds, pos, air) {
+                    Cell::State(id) => world.state(id).map_or(0.0, |state| {
+                        bounce_suppression
+                            .as_ref()
+                            .filter(|tag| !tag.contains(&state.name))
+                            .map_or(0.0, |_| crate::items::block_bounce_restitution(&state.name))
+                    }),
+                    Cell::Missing => 0.0,
                 },
                 |item_bounds| {
                     if fluid_view.chunks_loaded(item_bounds) {
@@ -5705,6 +5721,7 @@ impl LoadedSession {
         let origin = self.origin;
         let bounds = self.bounds;
         let air = self.states[0];
+        let bounce_suppression = &self.bounce_suppression_tag;
         let before_pickup = Arc::clone(&self.inventory);
         let fluid_view = FluidView {
             world,
@@ -5736,6 +5753,15 @@ impl LoadedSession {
                     .state(id)
                     .map_or(0.6, |state| crate::physics::ground_friction(&state.name)),
                 Cell::Missing => 0.6,
+            },
+            |pos| match cell(world, origin, bounds, pos, air) {
+                Cell::State(id) => world.state(id).map_or(0.0, |state| {
+                    bounce_suppression
+                        .as_ref()
+                        .filter(|tag| !tag.contains(&state.name))
+                        .map_or(0.0, |_| crate::items::block_bounce_restitution(&state.name))
+                }),
+                Cell::Missing => 0.0,
             },
             |item_bounds| {
                 if fluid_view.chunks_loaded(item_bounds) {
@@ -6782,6 +6808,7 @@ mod tests {
         )
         .unwrap();
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
     }
@@ -11958,6 +11985,59 @@ mod tests {
             assert!(
                 (item.position.y - position.y - f64::from(0.0005_f32)).abs() < 1.0e-10,
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_item_bounces_on_slime_but_not_stone() {
+        for (name, suppressed, expected_bounce) in [
+            ("minecraft:slime_block", false, true),
+            ("minecraft:slime_block", true, false),
+            ("minecraft:stone", false, false),
+        ] {
+            let mut session = session();
+            if suppressed {
+                session.set_bounce_suppression_tag(Arc::new(BTreeSet::from([name.into()])));
+            }
+            let block = session.intern_block(state(name, &[]));
+            assert!(session.set(IVec3::new(4, 1, 4), block));
+            let position = session.origin.as_dvec3() + DVec3::new(4.5, 2.2, 4.5);
+            session
+                .dropped_items
+                .spawn_saved(crate::saved_item::SavedItemState {
+                    source: Arc::new(native_persistence::nbt::Tag::Compound(vec![])),
+                    uuid: None,
+                    position,
+                    velocity: DVec3::new(0.0, -0.5, 0.0),
+                    on_ground: false,
+                    no_gravity: false,
+                    age: 0,
+                    pickup_delay: 10,
+                    health: 5,
+                    fire_ticks: 0,
+                    invulnerable: false,
+                    invulnerable_time: 0,
+                    owner: None,
+                    thrower: None,
+                    stack: ItemStack::new(
+                        "minecraft:stone".into(),
+                        1,
+                        64,
+                        native_persistence::nbt::Tag::Compound(vec![]),
+                    )
+                    .unwrap(),
+                });
+            session.update(TICK);
+            let landed = session.snapshot().dropped_items[0].position.y;
+            for _ in 0..4 {
+                session.update(TICK);
+            }
+            let next = session.snapshot().dropped_items[0].position.y;
+            assert_eq!(
+                next > landed + 0.001,
+                expected_bounce,
+                "{name}: {landed} -> {next}"
             );
         }
     }

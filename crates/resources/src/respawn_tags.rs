@@ -45,6 +45,25 @@ pub fn load_fire_tag(
     .context("cannot resolve falling-block fire tag")
 }
 
+/// Resolve the active block tag that disables restitution on contact.
+pub fn load_bounce_suppression_tag(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:suppresses_bounce")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve bounce suppression tag")
+}
+
 /// Resolve the active tag that lets a block above farmland preserve it.
 pub fn load_farmland_maintainers(
     provider: &mut impl ResourceProvider,
@@ -276,6 +295,25 @@ mod tests {
     }
 
     #[test]
+    fn bounce_suppression_resolves_pack_overrides() {
+        let mut provider = Provider(BTreeMap::from([(
+            "data/minecraft/tags/block/suppresses_bounce.json".into(),
+            vec![
+                br#"{"values":["minecraft:honey_block"]}"#.to_vec(),
+                br#"{"replace":true,"values":["minecraft:slime_block"]}"#.to_vec(),
+            ],
+        )]));
+        let registry = BTreeSet::from([
+            "minecraft:honey_block".into(),
+            "minecraft:slime_block".into(),
+        ]);
+        assert_eq!(
+            load_bounce_suppression_tag(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:slime_block".into()])
+        );
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn installed_falling_fire_tag_loads() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -286,6 +324,9 @@ mod tests {
         let fire = load_fire_tag(&mut source, &registry).unwrap();
         assert!(fire.contains("minecraft:fire"));
         assert!(!fire.contains("minecraft:stone"));
+        let suppressed = load_bounce_suppression_tag(&mut source, &registry).unwrap();
+        assert!(suppressed.contains("minecraft:honey_block"));
+        assert!(!suppressed.contains("minecraft:slime_block"));
     }
 
     #[test]

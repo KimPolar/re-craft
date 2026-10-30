@@ -157,39 +157,64 @@ impl LineLayout {
 
 // Split at words where possible, with character boundaries as a fallback. The
 // canvas uses the same local font data for measuring and drawing the text.
-fn wrap(canvas: &Canvas, assets: &MenuAssets, text: &str, max_width: i32) -> Vec<String> {
+fn wrap(
+    canvas: &Canvas,
+    assets: &MenuAssets,
+    text: &str,
+    max_width: i32,
+    bold_prefix: usize,
+) -> Vec<(String, usize)> {
     let mut lines = Vec::new();
     let mut line = String::new();
+    let mut line_bold: usize = 0;
     let mut width = 0;
     let mut last_space = None;
-    for ch in text.chars().take(16_384) {
+    for (index, ch) in text.char_indices().take(16_384) {
         if ch == '\n' {
-            lines.push(std::mem::take(&mut line));
+            lines.push((std::mem::take(&mut line), line_bold));
+            line_bold = 0;
             width = 0;
             last_space = None;
             continue;
         }
-        let char_width = canvas.text_width(Some(assets), ch.encode_utf8(&mut [0; 4]));
+        let bold = index < bold_prefix;
+        let char_width =
+            canvas.text_width(Some(assets), ch.encode_utf8(&mut [0; 4])) + i32::from(bold);
+        let mut wrapped = false;
         if width + char_width > max_width && !line.is_empty() {
+            wrapped = true;
             if let Some(space) = last_space {
                 let remainder = line.split_off(space);
                 line.pop();
-                lines.push(std::mem::replace(&mut line, remainder));
-                width = canvas.text_width(Some(assets), &line);
+                let remainder_bold = line_bold.saturating_sub(space);
+                lines.push((
+                    std::mem::replace(&mut line, remainder),
+                    line_bold.min(space - 1),
+                ));
+                line_bold = remainder_bold;
+                width = canvas.bold_text_width(Some(assets), &line[..line_bold])
+                    + canvas.text_width(Some(assets), &line[line_bold..]);
                 last_space = None;
             } else {
-                lines.push(std::mem::take(&mut line));
+                lines.push((std::mem::take(&mut line), line_bold));
+                line_bold = 0;
                 width = 0;
             }
+        }
+        if wrapped && line.is_empty() && ch == ' ' {
+            continue;
         }
         if ch == ' ' {
             last_space = Some(line.len() + 1);
         }
         line.push(ch);
+        if bold {
+            line_bold += ch.len_utf8();
+        }
         width += char_width;
     }
     if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
+        lines.push((line, line_bold));
     }
     lines
 }
@@ -235,16 +260,14 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
                 )
             }
         };
-        for text in wrap(canvas, assets, &message, layout.width.max(1))
+        let prefix_bytes = debug_prefix.map_or(0, str::len);
+        for (text, prefix_len) in wrap(canvas, assets, &message, layout.width.max(1), prefix_bytes)
             .into_iter()
             .rev()
         {
             if lines.len() >= base.max_lines {
                 break;
             }
-            let prefix_len = debug_prefix
-                .filter(|prefix| text.starts_with(prefix))
-                .map_or(0, str::len);
             lines.push((text, layout, prefix_len));
         }
         if lines.len() >= base.max_lines {
@@ -269,14 +292,18 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
         let y = ((bottom - layout.text_offset) as f32 * layout.scale).floor() as i32;
         let draw_text = |canvas: &mut Canvas, x, y| {
             let (prefix, rest) = text.split_at(*prefix_len);
-            canvas.text_alpha(Some(assets), x, y, prefix, [255, 255, 85], opacity);
-            let offset = canvas.text_width(Some(assets), prefix);
+            canvas.bold_text_alpha(Some(assets), x, y, prefix, [255, 255, 85], opacity);
+            let offset = canvas.bold_text_width(Some(assets), prefix);
             canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
         };
         if layout.scale == 1.0 {
             draw_text(canvas, x, y);
         } else {
-            let width = canvas.text_width(Some(assets), text).clamp(1, 32768) as u32 + 2;
+            let (prefix, rest) = text.split_at(*prefix_len);
+            let width = (canvas.bold_text_width(Some(assets), prefix)
+                + canvas.text_width(Some(assets), rest))
+            .clamp(1, 32768) as u32
+                + 2;
             let mut source = Canvas::new(width, 10);
             draw_text(&mut source, 0, 0);
             let w = (source.width as f32 * layout.scale).ceil() as i32;
@@ -302,6 +329,35 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn wrapped_debug_prefix_keeps_bold_width_and_unicode_boundaries() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&directory, &[]).unwrap();
+        let canvas = Canvas::new(400, 100);
+        let prefix = "[AB CD한]";
+        let text = format!("{prefix} rest");
+        let max_width = canvas.bold_text_width(Some(&assets), "[AB");
+        let lines = wrap(&canvas, &assets, &text, max_width, prefix.len());
+        assert!(lines.len() > 2);
+        let mut bold = String::new();
+        let mut regular = String::new();
+        for (text, bold_bytes) in lines {
+            let (head, tail) = text.split_at(bold_bytes);
+            assert!(
+                canvas.bold_text_width(Some(&assets), head)
+                    + canvas.text_width(Some(&assets), tail)
+                    <= max_width
+            );
+            bold.push_str(head);
+            regular.push_str(tail);
+        }
+        assert_eq!(bold, prefix.replace(' ', ""));
+        assert_eq!(regular, "rest");
+    }
 
     #[test]
     fn settings_follow_minecraft_options_and_ignore_invalid_values() {

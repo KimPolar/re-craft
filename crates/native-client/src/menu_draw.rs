@@ -529,6 +529,11 @@ impl Canvas {
         text.chars().map(|c| glyph_width(assets, c)).sum()
     }
 
+    /// The default Minecraft bitmap glyph adds one pixel of advance when bold.
+    pub fn bold_text_width(&self, assets: Option<&MenuAssets>, text: &str) -> i32 {
+        text.chars().map(|c| glyph_width(assets, c) + 1).sum()
+    }
+
     pub fn text_centered(
         &mut self,
         assets: Option<&MenuAssets>,
@@ -605,6 +610,35 @@ impl Canvas {
         let dark = [color[0] / 4, color[1] / 4, color[2] / 4];
         self.text_pass(assets, x + 1, y + 1, text, dark, opacity);
         self.text_pass(assets, x, y, text, color, opacity);
+    }
+
+    pub fn bold_text_alpha(
+        &mut self,
+        assets: Option<&MenuAssets>,
+        x: i32,
+        y: i32,
+        text: &str,
+        color: [u8; 3],
+        opacity: u8,
+    ) {
+        let dark = [color[0] / 4, color[1] / 4, color[2] / 4];
+        for (offset, color) in [(1, dark), (0, color)] {
+            let mut cursor = x;
+            for ch in text.chars() {
+                let mut encoded = [0; 4];
+                let glyph = ch.encode_utf8(&mut encoded);
+                self.text_pass(assets, cursor + offset, y + offset, glyph, color, opacity);
+                self.text_pass(
+                    assets,
+                    cursor + offset + 1,
+                    y + offset,
+                    glyph,
+                    color,
+                    opacity,
+                );
+                cursor += glyph_width(assets, ch) + 1;
+            }
+        }
     }
 
     pub fn text_without_shadow(
@@ -885,6 +919,18 @@ fn fallback_glyph(c: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bold_text_advances_each_glyph_and_fills_its_right_neighbor() {
+        let mut canvas = Canvas::new(24, 12);
+        assert_eq!(canvas.text_width(None, "II"), 12);
+        assert_eq!(canvas.bold_text_width(None, "II"), 14);
+        canvas.bold_text_alpha(None, 0, 0, "II", [255, 255, 85], 255);
+        let row = &canvas.pixels[24..48];
+        for x in [2, 3, 9, 10] {
+            assert_eq!(row[x], 0xffff_ff55);
+        }
+    }
 
     #[test]
     fn item_glint_mask_follows_occlusion_and_child_compositing() {

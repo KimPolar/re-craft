@@ -147,6 +147,11 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             Some("x" | "y" | "z")
         )
     };
+    let bounded = |name: &str, maximum: u8| -> Option<()> {
+        let raw = state.properties.get(name)?;
+        let value = raw.parse::<u8>().ok()?;
+        (value <= maximum && value.to_string() == *raw).then_some(())
+    };
     let pair = match state.name.as_str() {
         "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
             if state.properties.is_empty() =>
@@ -232,6 +237,58 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         {
             (0, 0)
         }
+        "minecraft:dandelion"
+        | "minecraft:poppy"
+        | "minecraft:blue_orchid"
+        | "minecraft:allium"
+        | "minecraft:azure_bluet"
+        | "minecraft:red_tulip"
+        | "minecraft:orange_tulip"
+        | "minecraft:white_tulip"
+        | "minecraft:pink_tulip"
+        | "minecraft:oxeye_daisy"
+        | "minecraft:cornflower"
+        | "minecraft:lily_of_the_valley"
+        | "minecraft:wither_rose"
+        | "minecraft:torchflower"
+        | "minecraft:closed_eyeblossom"
+        | "minecraft:open_eyeblossom"
+        | "minecraft:dead_bush"
+        | "minecraft:red_mushroom"
+        | "minecraft:azalea"
+        | "minecraft:flowering_azalea"
+            if state.properties.is_empty() =>
+        {
+            (0, 0)
+        }
+        "minecraft:brown_mushroom" if state.properties.is_empty() => (0, 1),
+        "minecraft:oak_sapling"
+        | "minecraft:spruce_sapling"
+        | "minecraft:birch_sapling"
+        | "minecraft:jungle_sapling"
+        | "minecraft:acacia_sapling"
+        | "minecraft:dark_oak_sapling"
+        | "minecraft:cherry_sapling"
+        | "minecraft:pale_oak_sapling"
+            if state.properties.len() == 1 =>
+        {
+            bounded("stage", 1)?;
+            (0, 0)
+        }
+        "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes"
+            if state.properties.len() == 1 =>
+        {
+            bounded("age", 7)?;
+            (0, 0)
+        }
+        "minecraft:beetroots" if state.properties.len() == 1 => {
+            bounded("age", 3)?;
+            (0, 0)
+        }
+        "minecraft:sugar_cane" | "minecraft:cactus" if state.properties.len() == 1 => {
+            bounded("age", 15)?;
+            (0, 0)
+        }
         "minecraft:glass_pane" if state.properties.len() == 5 => {
             for direction in ["north", "south", "east", "west"] {
                 boolean(direction)?;
@@ -260,7 +317,19 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (u8::from(boolean("waterlogged")?), 0)
         }
         "minecraft:cobweb" if state.properties.is_empty() => (1, 0),
-        "minecraft:oak_leaves" if state.properties.len() == 3 => {
+        "minecraft:oak_leaves"
+        | "minecraft:spruce_leaves"
+        | "minecraft:birch_leaves"
+        | "minecraft:jungle_leaves"
+        | "minecraft:acacia_leaves"
+        | "minecraft:dark_oak_leaves"
+        | "minecraft:mangrove_leaves"
+        | "minecraft:cherry_leaves"
+        | "minecraft:pale_oak_leaves"
+        | "minecraft:azalea_leaves"
+        | "minecraft:flowering_azalea_leaves"
+            if state.properties.len() == 3 =>
+        {
             boolean("persistent")?;
             boolean("waterlogged")?;
             if !matches!(
@@ -271,13 +340,22 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (1, 0)
         }
-        "minecraft:oak_log" | "minecraft:basalt" if state.properties.len() == 1 && axis() => {
+        "minecraft:basalt" | "minecraft:muddy_mangrove_roots"
+            if state.properties.len() == 1 && axis() =>
+        {
             (15, 0)
         }
-        "minecraft:grass_block" if state.properties.len() == 1 => {
+        "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+            if state.properties.len() == 1 =>
+        {
             boolean("snowy")?;
             (15, 0)
         }
+        "minecraft:mangrove_roots" if state.properties.len() == 1 => {
+            boolean("waterlogged")?;
+            (1, 0)
+        }
+        "minecraft:ice" if state.properties.is_empty() => (1, 0),
         "minecraft:glowstone" | "minecraft:sea_lantern" | "minecraft:shroomlight"
             if state.properties.is_empty() =>
         {
@@ -321,8 +399,41 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:mud"
         | "minecraft:calcite"
         | "minecraft:dripstone_block"
-        | "minecraft:oak_planks"
+        | "minecraft:cobbled_deepslate"
+        | "minecraft:stone_bricks"
+        | "minecraft:cobblestone"
+        | "minecraft:coarse_dirt"
+        | "minecraft:rooted_dirt"
+        | "minecraft:mossy_cobblestone"
+        | "minecraft:tuff_bricks"
+        | "minecraft:polished_tuff"
+        | "minecraft:polished_andesite"
+        | "minecraft:polished_granite"
+        | "minecraft:polished_diorite"
+        | "minecraft:end_stone"
+        | "minecraft:crafting_table"
+        | "minecraft:sandstone"
+        | "minecraft:red_sandstone"
+        | "minecraft:nether_bricks"
+        | "minecraft:quartz_block"
+        | "minecraft:packed_ice"
+        | "minecraft:blue_ice"
+        | "minecraft:bamboo_mosaic"
+        | "minecraft:soul_sand"
+        | "minecraft:soul_soil"
+        | "minecraft:smooth_stone"
             if state.properties.is_empty() =>
+        {
+            (15, 0)
+        }
+        name if state.properties.len() == 1
+            && axis()
+            && native_core::wood::Wood::from_id(name).is_some() =>
+        {
+            (15, 0)
+        }
+        name if state.properties.is_empty()
+            && native_core::wood::Planks::from_id(name).is_some() =>
         {
             (15, 0)
         }
@@ -938,6 +1049,23 @@ mod tests {
     }
 
     #[test]
+    fn level_one_mushroom_light_stays_within_its_cell() {
+        let (mut world, _, _, _) = fixture();
+        let center = position(15, 15, 15);
+        let air = world.block(center.x, center.y, center.z).unwrap().clone();
+        let mushroom = state("brown_mushroom", None);
+        let id = world.intern_state(mushroom.clone());
+        set(&mut world, center, id);
+        relight_block(&mut world, center, light_change(&air, &mushroom).unwrap()).unwrap();
+        assert_eq!(light(&world, center), 1);
+        assert_eq!(light(&world, position(16, 15, 15)), 0);
+        let air_id = world.intern_state(air.clone());
+        set(&mut world, center, air_id);
+        relight_block(&mut world, center, light_change(&mushroom, &air).unwrap()).unwrap();
+        assert_eq!(light(&world, center), 0);
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn all_extended_light_states_match_vanilla() {
@@ -989,6 +1117,79 @@ mod tests {
             "dirt_path",
             "farmland",
             "snow",
+            "dandelion",
+            "poppy",
+            "blue_orchid",
+            "allium",
+            "azure_bluet",
+            "red_tulip",
+            "orange_tulip",
+            "white_tulip",
+            "pink_tulip",
+            "oxeye_daisy",
+            "cornflower",
+            "lily_of_the_valley",
+            "wither_rose",
+            "torchflower",
+            "closed_eyeblossom",
+            "open_eyeblossom",
+            "dead_bush",
+            "brown_mushroom",
+            "red_mushroom",
+            "oak_sapling",
+            "spruce_sapling",
+            "birch_sapling",
+            "jungle_sapling",
+            "acacia_sapling",
+            "dark_oak_sapling",
+            "cherry_sapling",
+            "pale_oak_sapling",
+            "azalea",
+            "flowering_azalea",
+            "wheat",
+            "carrots",
+            "potatoes",
+            "beetroots",
+            "sugar_cane",
+            "cactus",
+            "spruce_leaves",
+            "birch_leaves",
+            "jungle_leaves",
+            "acacia_leaves",
+            "dark_oak_leaves",
+            "mangrove_leaves",
+            "cherry_leaves",
+            "pale_oak_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
+            "cobbled_deepslate",
+            "stone_bricks",
+            "cobblestone",
+            "coarse_dirt",
+            "rooted_dirt",
+            "podzol",
+            "mycelium",
+            "mossy_cobblestone",
+            "tuff_bricks",
+            "polished_tuff",
+            "polished_andesite",
+            "polished_granite",
+            "polished_diorite",
+            "end_stone",
+            "crafting_table",
+            "sandstone",
+            "red_sandstone",
+            "nether_bricks",
+            "quartz_block",
+            "ice",
+            "packed_ice",
+            "blue_ice",
+            "bamboo_mosaic",
+            "mangrove_roots",
+            "muddy_mangrove_roots",
+            "soul_sand",
+            "soul_soil",
+            "smooth_stone",
             "torch",
             "wall_torch",
             "soul_torch",
@@ -1038,6 +1239,12 @@ mod tests {
             .iter()
             .map(|n| format!("minecraft:{n}"))
             .collect::<Vec<_>>();
+        requested.extend(native_core::wood::Wood::all().map(|wood| wood.id().to_owned()));
+        requested.extend(
+            native_core::wood::Planks::ALL
+                .into_iter()
+                .map(|planks| planks.id().to_owned()),
+        );
         requested.push("@vanilla_slabs_stairs".into());
         std::fs::write(&input, serde_json::to_vec(&requested).unwrap()).unwrap();
         run(Command::new(java.join("java.exe"))
@@ -1148,6 +1355,10 @@ mod tests {
             (13, 15, 14, "stair_bottom"),
             (12, 15, 15, "snow_1"),
             (12, 15, 14, "dirt_path"),
+            (12, 15, 16, "spruce_log"),
+            (12, 15, 17, "birch_leaves"),
+            (13, 15, 17, "ice"),
+            (14, 15, 17, "podzol"),
         ];
         let actions = [
             (20, 15, 15, "lit"),
@@ -1172,6 +1383,13 @@ mod tests {
             (15, 15, 15, "water"),
             (15, 15, 15, "wet_pane"),
             (15, 15, 15, "air"),
+            (15, 15, 15, "spruce_log"),
+            (15, 15, 15, "birch_leaves"),
+            (15, 15, 15, "ice"),
+            (15, 15, 15, "podzol"),
+            (15, 15, 15, "air"),
+            (15, 30, 15, "brown_mushroom"),
+            (15, 30, 15, "air"),
         ];
         let json = |items: &[(i32, i32, i32, &str)]| {
             items
@@ -1245,6 +1463,25 @@ mod tests {
             properties: [("moisture".into(), "0".into())].into(),
         });
         let dirt_path = world.intern_state(state("dirt_path", None));
+        let brown_mushroom = world.intern_state(state("brown_mushroom", None));
+        let spruce_log = world.intern_state(BlockState {
+            name: "minecraft:spruce_log".into(),
+            properties: [("axis".into(), "x".into())].into(),
+        });
+        let birch_leaves = world.intern_state(BlockState {
+            name: "minecraft:birch_leaves".into(),
+            properties: [
+                ("distance".into(), "3".into()),
+                ("persistent".into(), "true".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        });
+        let ice = world.intern_state(state("ice", None));
+        let podzol = world.intern_state(BlockState {
+            name: "minecraft:podzol".into(),
+            properties: [("snowy".into(), "true".into())].into(),
+        });
         let water = world.intern_state(BlockState {
             name: "minecraft:water".into(),
             properties: [("level".into(), "0".into())].into(),
@@ -1277,6 +1514,11 @@ mod tests {
             "snow_8" => snow_8,
             "farmland" => farmland,
             "dirt_path" => dirt_path,
+            "spruce_log" => spruce_log,
+            "birch_leaves" => birch_leaves,
+            "ice" => ice,
+            "podzol" => podzol,
+            "brown_mushroom" => brown_mushroom,
             _ => unreachable!(),
         };
         for (x, y, z, name) in initial {

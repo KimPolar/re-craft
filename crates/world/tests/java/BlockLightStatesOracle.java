@@ -22,7 +22,9 @@ public class BlockLightStatesOracle {
         }
         var result = new JsonArray();
         for (var name : names) {
-            var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse(name));
+            var id = Identifier.parse(name);
+            if (!BuiltInRegistries.BLOCK.containsKey(id)) throw new IllegalArgumentException("unknown block: " + name);
+            var block = BuiltInRegistries.BLOCK.getValue(id);
             for (var state : block.getStateDefinition().getPossibleStates()) {
                 var entry = new JsonObject();
                 var properties = new JsonObject();

@@ -7935,6 +7935,29 @@ mod tests {
                 .light(absolute.x + 1, absolute.y, absolute.z, false),
             Some(10)
         );
+        let mushroom_pos = IVec3::new(15, 30, 15);
+        let mushroom_absolute = session.origin + mushroom_pos;
+        let mushroom = session.intern_block(state("minecraft:brown_mushroom", &[]));
+        assert!(session.set(mushroom_pos, mushroom));
+        assert_eq!(
+            session.world.light(
+                mushroom_absolute.x,
+                mushroom_absolute.y,
+                mushroom_absolute.z,
+                false
+            ),
+            Some(1)
+        );
+        assert!(session.set(mushroom_pos, air));
+        assert_eq!(
+            session.world.light(
+                mushroom_absolute.x,
+                mushroom_absolute.y,
+                mushroom_absolute.z,
+                false
+            ),
+            Some(0)
+        );
     }
 
     #[test]

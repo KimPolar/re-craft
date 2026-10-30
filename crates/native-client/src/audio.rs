@@ -137,21 +137,34 @@ impl UiAudio {
         ));
     }
     pub fn item_pickup(&self, position: glam::DVec3) {
-        let _ = self.audio.commands.try_send(Command::ItemPickup(
+        self.pickup(position, PickupSound::Item);
+    }
+    pub fn experience_pickup(&self, position: glam::DVec3) {
+        self.pickup(position, PickupSound::Experience);
+    }
+    fn pickup(&self, position: glam::DVec3, kind: PickupSound) {
+        let _ = self.audio.commands.try_send(Command::Pickup(
             Resources {
                 root: self.root.clone(),
                 packs: self.packs.clone(),
             },
             position,
+            kind,
         ));
     }
+}
+
+#[derive(Clone, Copy)]
+enum PickupSound {
+    Item,
+    Experience,
 }
 
 enum Command {
     Prepare(Resources),
     Click(Resources),
     Button(Resources, native_session::loaded::ButtonSoundEvent),
-    ItemPickup(Resources, glam::DVec3),
+    Pickup(Resources, glam::DVec3, PickupSound),
 }
 
 impl Audio {
@@ -466,27 +479,37 @@ impl Catalog {
         self.resolve("ui.button.click", 0.25, 1.0, None, random, output_rate)
     }
 
+    #[cfg(test)]
     fn item_pickup(
         &mut self,
         position: glam::DVec3,
         random: &mut LegacyRandom,
         output_rate: u32,
     ) -> Result<Option<Voice>> {
-        let pitch = (random.next_float() - random.next_float()) * 1.4 + 2.0;
-        self.resolve(
-            "entity.item.pickup",
-            0.2,
-            pitch,
-            Some(position),
-            random,
-            output_rate,
-        )
-        .map(|voice| {
-            voice.map(|mut voice| {
-                voice.player_sound = true;
-                voice
+        self.pickup(position, PickupSound::Item, random, output_rate)
+    }
+
+    fn pickup(
+        &mut self,
+        position: glam::DVec3,
+        kind: PickupSound,
+        random: &mut LegacyRandom,
+        output_rate: u32,
+    ) -> Result<Option<Voice>> {
+        let difference = random.next_float() - random.next_float();
+        let (event, volume, pitch) = match kind {
+            PickupSound::Item => ("entity.item.pickup", 0.2, difference * 1.4 + 2.0),
+            PickupSound::Experience => {
+                ("entity.experience_orb.pickup", 0.1, difference * 0.35 + 0.9)
+            }
+        };
+        self.resolve(event, volume, pitch, Some(position), random, output_rate)
+            .map(|voice| {
+                voice.map(|mut voice| {
+                    voice.player_sound = true;
+                    voice
+                })
             })
-        })
     }
 
     fn resolve(
@@ -609,7 +632,9 @@ fn run(
             Command::Prepare(resources) => (resources, false, None, None),
             Command::Click(resources) => (resources, true, None, None),
             Command::Button(resources, event) => (resources, true, Some(event), None),
-            Command::ItemPickup(resources, position) => (resources, true, None, Some(position)),
+            Command::Pickup(resources, position, kind) => {
+                (resources, true, None, Some((position, kind)))
+            }
         };
         if catalog
             .as_ref()
@@ -630,8 +655,8 @@ fn run(
             } else {
                 &mut preload_random
             };
-            let resolved = if let Some(position) = pickup {
-                catalog.item_pickup(position, chosen_random, config.sample_rate.0)
+            let resolved = if let Some((position, kind)) = pickup {
+                catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
             } else {
                 match button {
                     Some(event) => catalog.resolve(
@@ -884,6 +909,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn experience_pickup_uses_resource_pack_pitch_and_player_category() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let position = glam::DVec3::new(17.25, 64.7, -3.125);
+        let mut vanilla = Catalog::load(Resources {
+            root: root.clone(),
+            packs: Vec::new(),
+        })
+        .unwrap();
+        let voice = vanilla
+            .pickup(
+                position,
+                PickupSound::Experience,
+                &mut LegacyRandom::new(1),
+                48000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"entity.experience_orb.pickup":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let mut expected = LegacyRandom::new(42);
+        let pitch = ((expected.next_float() - expected.next_float()) * 0.35 + 0.9) * 1.5;
+        let voice = catalog
+            .pickup(
+                position,
+                PickupSound::Experience,
+                &mut LegacyRandom::new(42),
+                48000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(voice.player_sound);
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert_eq!(voice.volume, 0.1_f32 * 0.4);
+        assert_eq!(
+            voice.step,
+            f64::from(voice.clip.rate) / 48000.0 * f64::from(pitch.clamp(0.5, 2.0))
+        );
+        assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+    }
+
+    #[test]
     #[ignore = "requires an available Windows audio output and installed 26.3 assets"]
     fn item_pickup_reaches_output_with_only_player_gain_enabled() {
         let root = native_resources::default_minecraft_dir().unwrap();
@@ -904,6 +979,30 @@ mod tests {
         assert!(
             test_rendered(),
             "item sound did not reach the output callback"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an available Windows audio output and installed 26.3 assets"]
+    fn experience_pickup_reaches_output_with_only_player_gain_enabled() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let audio = Audio::new().unwrap();
+        audio.prepare(&root, &[]);
+        let ui = UiAudio::new(audio, root, Vec::new());
+        ui.set_gain(0.0);
+        ui.set_block_gain(0.0);
+        ui.set_player_gain(1.0);
+        reset_test_rendered();
+        let position = glam::DVec3::new(1234.25, 64.0, -900.5);
+        ui.set_listener(position, 0.0);
+        ui.experience_pickup(position);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !test_rendered() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            test_rendered(),
+            "experience sound did not reach the output callback"
         );
     }
 

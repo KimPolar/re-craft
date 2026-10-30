@@ -409,6 +409,11 @@ impl LocalSession {
     pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
         self.dropped_items.take_pickup_sounds()
     }
+
+    /// Drain one-shot experience-orb pickup sounds after advancing the session.
+    pub fn take_experience_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.experience_orbs.take_pickup_sounds()
+    }
     pub fn demo() -> Self {
         Self::new(World::demo())
     }
@@ -2111,6 +2116,10 @@ mod tests {
         assert_eq!(first.experience, second.experience);
         assert_eq!(a.score, b.score);
         assert_eq!(dead.experience_orbs.len(), 4);
+        let sound_a = a.take_experience_pickup_sounds();
+        let sound_b = b.take_experience_pickup_sounds();
+        assert_eq!(sound_a.len(), 4);
+        assert_eq!(sound_a, sound_b);
     }
 
     #[test]

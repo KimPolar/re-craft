@@ -463,6 +463,11 @@ impl Viewer {
                     audio.item_pickup(position);
                 }
             }
+            for position in play.session.take_experience_pickup_sounds() {
+                if let Some(audio) = &self.audio {
+                    audio.experience_pickup(position);
+                }
+            }
         } else {
             self.camera.advance(&self.input, elapsed);
         }

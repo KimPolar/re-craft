@@ -365,6 +365,11 @@ impl LoadedSession {
     pub fn take_item_pickup_sounds(&mut self) -> Vec<DVec3> {
         self.dropped_items.take_pickup_sounds()
     }
+
+    /// Drain one-shot experience-orb pickup sounds after advancing the session.
+    pub fn take_experience_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.experience_orbs.take_pickup_sounds()
+    }
     /// Restore health and food before play begins. World files remain untouched.
     pub fn set_player_vitals(&mut self, vitals: crate::survival::PlayerVitals) {
         self.vitals = vitals;

@@ -2272,8 +2272,12 @@ impl ApplicationHandler for App {
                 for position in self.session.take_item_pickup_sounds() {
                     audio.item_pickup(position);
                 }
+                for position in self.session.take_experience_pickup_sounds() {
+                    audio.experience_pickup(position);
+                }
             } else {
                 self.session.take_item_pickup_sounds();
+                self.session.take_experience_pickup_sounds();
             }
             self.last_update = now;
             let size = window.inner_size();

@@ -3,7 +3,7 @@
 //! Pickup is withheld when equipment repair effects cannot be resolved.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -77,6 +77,7 @@ pub(crate) struct Orbs {
     entity_seeder: LegacyRandom,
     award_random: LegacyRandom,
     pickup_delay: u8,
+    pickup_sounds: VecDeque<DVec3>,
     next_entity_id: i32,
     next_section_sequence: u64,
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
@@ -92,6 +93,7 @@ impl Default for Orbs {
             entity_seeder: LegacyRandom::new(1),
             award_random: LegacyRandom::new(2),
             pickup_delay: 0,
+            pickup_sounds: VecDeque::new(),
             next_entity_id: 1,
             next_section_sequence: 0,
             active_chunks: None,
@@ -134,6 +136,10 @@ impl Orbs {
 
     pub fn reset_player_pickup_delay(&mut self) {
         self.pickup_delay = 0;
+    }
+
+    pub(crate) fn take_pickup_sounds(&mut self) -> Vec<DVec3> {
+        self.pickup_sounds.drain(..).collect()
     }
 
     pub fn set_damage_tags(&mut self, tags: Arc<OxygenEnchantments>) {
@@ -636,6 +642,18 @@ impl Orbs {
                         *score = next_score;
                         *player_random = random;
                         self.pickup_delay = 2;
+                        let silent = entity
+                            .source
+                            .as_ref()
+                            .and_then(|source| source.get("Silent"))
+                            .and_then(crate::player_data::numeric_byte)
+                            .is_some_and(|value| value != 0);
+                        if !silent {
+                            if self.pickup_sounds.len() == 4096 {
+                                self.pickup_sounds.pop_front();
+                            }
+                            self.pickup_sounds.push_back(entity.visual.position);
+                        }
                         entity.count = entity.count.wrapping_sub(1);
                         if entity.count == 0 {
                             removed[index] = true;
@@ -1748,6 +1766,50 @@ public class OrbAttractionOracle {
         assert!(orbs.snapshot().is_empty());
         assert_eq!(score, 100);
         assert_eq!(xp.total, 100);
+        assert_eq!(orbs.take_pickup_sounds().len(), 4);
+        assert!(orbs.take_pickup_sounds().is_empty());
+    }
+
+    #[test]
+    fn pickup_sounds_follow_group_count_delay_and_silent_flag() {
+        use native_persistence::nbt::Tag;
+        for silent in [false, true] {
+            let mut orbs = Orbs::default();
+            orbs.award(DVec3::new(0.0, 1.0, 0.0), 1);
+            orbs.entities[0].velocity = DVec3::ZERO;
+            orbs.entities[0].no_gravity = true;
+            orbs.entities[0].count = 2;
+            if silent {
+                orbs.entities[0].source = Some(Arc::new(Tag::Compound(vec![(
+                    "Silent".into(),
+                    Tag::Byte(1),
+                )])));
+            }
+            let mut inventory = Arc::new(PlayerInventory::default());
+            let mut random = LegacyRandom::new(0);
+            let mut xp = Experience::default();
+            let mut score = 0;
+            for tick in 0..3 {
+                orbs.tick(
+                    IVec3::ZERO,
+                    DVec3::new(0.0, 1.0, 0.0),
+                    PlayerPose::Standing,
+                    GameMode::Survival,
+                    true,
+                    &mut inventory,
+                    &mut random,
+                    &mut xp,
+                    &mut score,
+                    |_| &[],
+                    |_| 0.6,
+                );
+                let sounds = orbs.take_pickup_sounds();
+                assert_eq!(sounds.len(), usize::from(!silent && tick != 1));
+                assert!(orbs.take_pickup_sounds().is_empty());
+                assert_eq!(score, if tick < 2 { 1 } else { 2 });
+            }
+            assert!(orbs.snapshot().is_empty());
+        }
     }
 
     #[test]
@@ -1809,6 +1871,7 @@ public class OrbAttractionOracle {
         );
         assert_eq!(orbs.snapshot().len(), 1);
         assert_eq!(score, 0);
+        assert!(orbs.take_pickup_sounds().is_empty());
         Arc::make_mut(&mut inventory).set_slot(PlayerSlot::Storage(0), None);
         orbs.tick(
             IVec3::ZERO,
@@ -1825,6 +1888,7 @@ public class OrbAttractionOracle {
         );
         assert!(orbs.snapshot().is_empty());
         assert_eq!(score, 7);
+        assert_eq!(orbs.take_pickup_sounds().len(), 1);
     }
 
     #[test]

@@ -392,6 +392,7 @@ pub struct LoadedSession {
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     pickup_sounds: VecDeque<crate::PickupSound>,
+    extinguish_sounds: VecDeque<crate::ExtinguishSound>,
     consume_sounds: VecDeque<crate::ConsumeSound>,
     consume_particles: VecDeque<crate::consume_particles::ConsumeParticleSpawn>,
     block_drops: bool,
@@ -984,6 +985,10 @@ impl LoadedSession {
     /// Drain one-shot pickup sounds in simulated order after updating.
     pub fn take_pickup_sounds(&mut self) -> Vec<crate::PickupSound> {
         self.pickup_sounds.drain(..).collect()
+    }
+
+    pub fn take_extinguish_sounds(&mut self) -> Vec<crate::ExtinguishSound> {
+        self.extinguish_sounds.drain(..).collect()
     }
 
     pub fn take_consume_sounds(&mut self) -> Vec<crate::ConsumeSound> {
@@ -3306,6 +3311,7 @@ impl LoadedSession {
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
+            extinguish_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
             consume_particles: VecDeque::new(),
             block_drops: true,
@@ -12472,6 +12478,11 @@ impl GameSession for LoadedSession {
             self.chest_lids.tick(self.inventory.menu());
             crate::collect_pickup_sounds(
                 &mut self.pickup_sounds,
+                &mut self.dropped_items,
+                &mut self.experience_orbs,
+            );
+            crate::collect_extinguish_sounds(
+                &mut self.extinguish_sounds,
                 &mut self.dropped_items,
                 &mut self.experience_orbs,
             );

@@ -1377,6 +1377,7 @@ mod tests {
                     match sound.category {
                         crate::ConsumeSoundCategory::Player => "player",
                         crate::ConsumeSoundCategory::Neutral => "neutral",
+                        crate::ConsumeSoundCategory::Ambient => "ambient",
                     },
                     expected["category"].as_str().unwrap(),
                     "{row}"

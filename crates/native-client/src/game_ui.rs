@@ -428,6 +428,7 @@ impl GameUi {
             audio.set_block_gain(self.sound.block_gain());
             audio.set_player_gain(self.sound.player_gain());
             audio.set_neutral_gain(self.sound.neutral_gain());
+            audio.set_ambient_gain(self.sound.ambient_gain());
         }
     }
 

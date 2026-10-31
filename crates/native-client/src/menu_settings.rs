@@ -211,6 +211,9 @@ impl SoundSettings {
     pub fn neutral_gain(self) -> f32 {
         (self.get(SoundCategory::Master) as f32) * (self.get(SoundCategory::Neutral) as f32)
     }
+    pub fn ambient_gain(self) -> f32 {
+        (self.get(SoundCategory::Master) as f32) * (self.get(SoundCategory::Ambient) as f32)
+    }
     fn valid(mut self) -> Self {
         for value in &mut self.volumes {
             *value = value.valid_or(1.0);
@@ -635,9 +638,10 @@ mod tests {
         assert_eq!(saved["video"]["future_video"], true);
         let parsed: Settings = serde_json::from_value(saved).unwrap();
         assert_eq!(parsed.video, video);
-        let invalid: VideoSettings =
-            serde_json::from_str(r#"{"mouse_sensitivity":1.5,"mouse_wheel_sensitivity":12.0,"weather_radius":11}"#)
-                .unwrap();
+        let invalid: VideoSettings = serde_json::from_str(
+            r#"{"mouse_sensitivity":1.5,"mouse_wheel_sensitivity":12.0,"weather_radius":11}"#,
+        )
+        .unwrap();
         assert_eq!(invalid.valid().mouse_sensitivity.value(), 0.5);
         assert_eq!(invalid.valid().mouse_wheel_sensitivity.value(), 1.0);
         assert_eq!(invalid.valid().weather_radius, 10);

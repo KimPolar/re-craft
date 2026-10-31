@@ -86,10 +86,38 @@ pub enum PickupSound {
     Experience(DVec3),
 }
 
+/// A server-side entity extinguish event, including the pitch chosen during its tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtinguishSound {
+    pub position: DVec3,
+    pub pitch: f32,
+}
+
+fn extinguish_pitch(random: &mut native_core::random::LegacyRandom) -> f32 {
+    1.6_f32 + (random.next_float() - random.next_float()) * 0.4_f32
+}
+
+fn collect_extinguish_sounds(
+    queue: &mut VecDeque<ExtinguishSound>,
+    items: &mut items::ItemEntities,
+    orbs: &mut orbs::Orbs,
+) {
+    for event in items
+        .drain_extinguish_sounds()
+        .chain(orbs.drain_extinguish_sounds())
+    {
+        if queue.len() == 4096 {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsumeSoundCategory {
     Player,
     Neutral,
+    Ambient,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -497,6 +525,7 @@ pub struct LocalSession {
     dropped_items: items::ItemEntities,
     experience_orbs: orbs::Orbs,
     pickup_sounds: VecDeque<PickupSound>,
+    extinguish_sounds: VecDeque<ExtinguishSound>,
     consume_sounds: VecDeque<ConsumeSound>,
     consume_particles: VecDeque<consume_particles::ConsumeParticleSpawn>,
     player_random: native_core::random::LegacyRandom,
@@ -591,6 +620,10 @@ impl LocalSession {
         self.pickup_sounds.drain(..).collect()
     }
 
+    pub fn take_extinguish_sounds(&mut self) -> Vec<ExtinguishSound> {
+        self.extinguish_sounds.drain(..).collect()
+    }
+
     pub fn take_consume_sounds(&mut self) -> Vec<ConsumeSound> {
         self.consume_sounds.drain(..).collect()
     }
@@ -667,6 +700,7 @@ impl LocalSession {
             dropped_items: items::ItemEntities::default(),
             experience_orbs: orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
+            extinguish_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
             consume_particles: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
@@ -1839,6 +1873,11 @@ impl GameSession for LocalSession {
             self.advance_tick();
             collect_pickup_sounds(
                 &mut self.pickup_sounds,
+                &mut self.dropped_items,
+                &mut self.experience_orbs,
+            );
+            collect_extinguish_sounds(
+                &mut self.extinguish_sounds,
                 &mut self.dropped_items,
                 &mut self.experience_orbs,
             );

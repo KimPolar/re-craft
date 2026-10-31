@@ -157,6 +157,7 @@ pub(crate) struct Orbs {
     award_random: LegacyRandom,
     pickup_delay: u8,
     pickup_sounds: VecDeque<DVec3>,
+    extinguish_sounds: VecDeque<crate::ExtinguishSound>,
     next_entity_id: i32,
     next_section_sequence: u64,
     active_chunks: Option<BTreeSet<native_world::loaded::ChunkPos>>,
@@ -181,6 +182,7 @@ impl Default for Orbs {
             award_random: LegacyRandom::new(2),
             pickup_delay: 0,
             pickup_sounds: VecDeque::new(),
+            extinguish_sounds: VecDeque::new(),
             next_entity_id: 1,
             next_section_sequence: 0,
             active_chunks: None,
@@ -292,6 +294,12 @@ impl Orbs {
 
     pub(crate) fn drain_pickup_sounds(&mut self) -> impl Iterator<Item = DVec3> + '_ {
         self.pickup_sounds.drain(..)
+    }
+
+    pub(crate) fn drain_extinguish_sounds(
+        &mut self,
+    ) -> impl Iterator<Item = crate::ExtinguishSound> + '_ {
+        self.extinguish_sounds.drain(..)
     }
 
     #[cfg(test)]
@@ -976,6 +984,7 @@ impl Orbs {
             let actual =
                 movement::resolve_box(bounds, requested, entity.on_ground, 0.0, &mut shape);
             entity.visual.position += actual;
+            let was_burning = entity.damage.fire_ticks > 0;
             match path(bounds, actual, requested) {
                 Some(effects) => {
                     for effect in effects {
@@ -1016,6 +1025,16 @@ impl Orbs {
                     Some(false) => {}
                     None => entity.save_unresolved = true,
                 }
+            }
+            if was_burning && entity.damage.fire_ticks <= 0 {
+                let event = crate::ExtinguishSound {
+                    position: entity.visual.position,
+                    pitch: crate::extinguish_pitch(&mut entity.random),
+                };
+                if self.extinguish_sounds.len() == 4096 {
+                    self.extinguish_sounds.pop_front();
+                }
+                self.extinguish_sounds.push_back(event);
             }
             if crate::items::item_section_order(entity.visual.previous_position)
                 != crate::items::item_section_order(entity.visual.position)
@@ -1504,6 +1523,8 @@ mod tests {
             orb.no_gravity = true;
             orb.damage.health = 10;
             orb.damage.fire_ticks = 20;
+            let mut expected_random = orb.random.clone();
+            let expected_pitch = crate::extinguish_pitch(&mut expected_random);
             let mut orbs = Orbs::default();
             orbs.set_damage_tags(Arc::clone(&tags));
             orbs.entities.push(orb);
@@ -1546,6 +1567,16 @@ mod tests {
                     .err()
                     .expect("uncertain orb must not be drafted");
                 assert!(error.to_string().contains("damage effects"));
+            }
+            let sounds: Vec<_> = orbs.drain_extinguish_sounds().collect();
+            assert_eq!(sounds.len(), usize::from(rain == Some(true)));
+            if let Some(sound) = sounds.first() {
+                assert_eq!(sound.position, position);
+                assert_eq!(sound.pitch, expected_pitch);
+                assert_eq!(
+                    orbs.entities[0].random.next_int(),
+                    expected_random.next_int()
+                );
             }
         }
     }
@@ -1634,6 +1665,7 @@ mod tests {
                 ),
                 (1, expected_fire)
             );
+            assert!(orbs.drain_extinguish_sounds().next().is_none());
         }
     }
 
@@ -1683,13 +1715,15 @@ mod tests {
         let lava = temp.path().join("lava.json");
         let fire = temp.path().join("fire.json");
         let rain = temp.path().join("rain.json");
+        let sound = temp.path().join("sound.json");
         run(Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg("OrbLavaOracle")
             .arg(&lava)
             .arg(&fire)
-            .arg(&rain));
+            .arg(&rain)
+            .arg(&sound));
         for (path, is_lava) in [(lava, true), (fire, false)] {
             let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             for mode in 0..if is_lava { 2 } else { 4 } {
@@ -1740,6 +1774,19 @@ mod tests {
                 );
                 index += 1;
             }
+        }
+        let sound_oracle: Value = serde_json::from_slice(&std::fs::read(sound).unwrap()).unwrap();
+        for seed in 0..32 {
+            let mut random = LegacyRandom::new(seed);
+            let pitch = crate::extinguish_pitch(&mut random);
+            assert_eq!(
+                i64::from(pitch.to_bits() as i32),
+                sound_oracle[seed as usize]["pitch"].as_i64().unwrap()
+            );
+            assert_eq!(
+                i64::from(random.next_int()),
+                sound_oracle[seed as usize]["next"].as_i64().unwrap()
+            );
         }
     }
 

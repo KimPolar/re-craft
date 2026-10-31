@@ -627,6 +627,11 @@ impl Viewer {
                     audio.consume(sound);
                 }
             }
+            for sound in play.session.take_extinguish_sounds() {
+                if let Some(audio) = &self.audio {
+                    audio.extinguish(sound);
+                }
+            }
         } else {
             self.camera.advance(&self.input, elapsed);
         }

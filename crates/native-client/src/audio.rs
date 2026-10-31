@@ -99,6 +99,7 @@ pub struct Audio {
     block_gain: Arc<AtomicU32>,
     player_gain: Arc<AtomicU32>,
     neutral_gain: Arc<AtomicU32>,
+    ambient_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 }
 
@@ -127,6 +128,9 @@ impl UiAudio {
     }
     pub fn set_neutral_gain(&self, gain: f32) {
         self.audio.set_neutral_gain(gain);
+    }
+    pub fn set_ambient_gain(&self, gain: f32) {
+        self.audio.set_ambient_gain(gain);
     }
     pub fn set_listener(&self, eye: glam::DVec3, yaw: f32) {
         self.audio.listener.publish(Listener { eye, yaw });
@@ -197,6 +201,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn extinguish(&self, event: native_session::ExtinguishSound) {
+        let _ = self.audio.commands.try_send(Command::Extinguish(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     fn pickup(&self, position: glam::DVec3, kind: PickupSound) {
         let _ = self.audio.commands.try_send(Command::Pickup(
             Resources {
@@ -225,6 +238,19 @@ enum Command {
     Bucket(Resources, native_session::loaded::BucketSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
     Consume(Resources, native_session::ConsumeSound),
+    Extinguish(Resources, native_session::ExtinguishSound),
+}
+
+fn extinguish_audio(event: native_session::ExtinguishSound) -> native_session::ConsumeSound {
+    native_session::ConsumeSound {
+        position: event.position,
+        info: native_session::ConsumeSoundInfo {
+            event: "entity.generic.extinguish_fire",
+            volume: 0.7,
+            pitch: event.pitch,
+            category: native_session::ConsumeSoundCategory::Ambient,
+        },
+    }
 }
 
 impl Audio {
@@ -235,6 +261,7 @@ impl Audio {
         let block_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let player_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let neutral_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let ambient_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let listener = Arc::new(SharedListener::default());
         (
             Self {
@@ -243,6 +270,7 @@ impl Audio {
                 block_gain,
                 player_gain,
                 neutral_gain,
+                ambient_gain,
                 listener,
             },
             AudioProbe { receiver, gain },
@@ -258,6 +286,8 @@ impl Audio {
         let output_player_gain = player_gain.clone();
         let neutral_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_neutral_gain = neutral_gain.clone();
+        let ambient_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let output_ambient_gain = ambient_gain.clone();
         let listener = Arc::new(SharedListener::default());
         let output_listener = listener.clone();
         std::thread::Builder::new()
@@ -269,6 +299,7 @@ impl Audio {
                     output_block_gain,
                     output_player_gain,
                     output_neutral_gain,
+                    output_ambient_gain,
                     output_listener,
                 ) {
                     eprintln!("Audio unavailable: {error:#}");
@@ -280,6 +311,7 @@ impl Audio {
             block_gain,
             player_gain,
             neutral_gain,
+            ambient_gain,
             listener,
         })
     }
@@ -298,6 +330,10 @@ impl Audio {
     }
     pub fn set_neutral_gain(&self, gain: f32) {
         self.neutral_gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn set_ambient_gain(&self, gain: f32) {
+        self.ambient_gain
             .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
@@ -349,7 +385,7 @@ struct Voice {
     volume: f32,
     spatial: Option<SpatialSource>,
     player_sound: bool,
-    neutral_gain: Option<Arc<AtomicU32>>,
+    category_gain: Option<Arc<AtomicU32>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -425,7 +461,7 @@ fn mix(
             .map_or((1.0, 0.0), |source| source.factors(listener));
         let volume = voice.volume
             * attenuation
-            * if let Some(neutral_gain) = &voice.neutral_gain {
+            * if let Some(neutral_gain) = &voice.category_gain {
                 f32::from_bits(neutral_gain.load(Ordering::Relaxed))
             } else if voice.player_sound {
                 player_gain
@@ -611,6 +647,7 @@ impl Catalog {
         random: &mut LegacyRandom,
         output_rate: u32,
         neutral_gain: &Arc<AtomicU32>,
+        ambient_gain: &Arc<AtomicU32>,
     ) -> Result<Option<Voice>> {
         self.resolve(
             event.info.event,
@@ -625,7 +662,10 @@ impl Catalog {
                 match event.info.category {
                     native_session::ConsumeSoundCategory::Player => voice.player_sound = true,
                     native_session::ConsumeSoundCategory::Neutral => {
-                        voice.neutral_gain = Some(neutral_gain.clone())
+                        voice.category_gain = Some(neutral_gain.clone())
+                    }
+                    native_session::ConsumeSoundCategory::Ambient => {
+                        voice.category_gain = Some(ambient_gain.clone())
                     }
                 }
                 voice
@@ -717,7 +757,7 @@ impl Catalog {
             volume,
             spatial,
             player_sound: false,
-            neutral_gain: None,
+            category_gain: None,
         }))
     }
 }
@@ -728,6 +768,7 @@ fn run(
     block_gain: Arc<AtomicU32>,
     player_gain: Arc<AtomicU32>,
     neutral_gain: Arc<AtomicU32>,
+    ambient_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 ) -> Result<()> {
     let device = cpal::default_host()
@@ -858,6 +899,17 @@ fn run(
                 Some(event),
                 None,
             ),
+            Command::Extinguish(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(extinguish_audio(event)),
+                None,
+            ),
         };
         if catalog
             .as_ref()
@@ -881,7 +933,13 @@ fn run(
             let resolved = if let Some(event) = bucket {
                 catalog.bucket(event, chosen_random, config.sample_rate.0)
             } else if let Some(event) = consume {
-                catalog.consume(event, chosen_random, config.sample_rate.0, &neutral_gain)
+                catalog.consume(
+                    event,
+                    chosen_random,
+                    config.sample_rate.0,
+                    &neutral_gain,
+                    &ambient_gain,
+                )
             } else if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
             } else if let Some(event) = locked {
@@ -1048,6 +1106,32 @@ mod tests {
     }
 
     #[test]
+    fn extinguish_command_uses_ambient_volume_and_preserves_pitch() {
+        let (audio, probe) = Audio::test_channel();
+        let ambient = Arc::clone(&audio.ambient_gain);
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        ui.set_ambient_gain(0.25);
+        let event = native_session::ExtinguishSound {
+            position: glam::DVec3::new(1.0, 2.0, 3.0),
+            pitch: 1.75,
+        };
+        ui.extinguish(event);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Extinguish(_, actual)) if actual == event)
+        );
+        assert_eq!(f32::from_bits(ambient.load(Ordering::Relaxed)), 0.25);
+        let sound = extinguish_audio(event);
+        assert_eq!(sound.position, event.position);
+        assert_eq!(sound.info.event, "entity.generic.extinguish_fire");
+        assert_eq!(sound.info.volume, 0.7);
+        assert_eq!(sound.info.pitch, event.pitch);
+        assert_eq!(
+            sound.info.category,
+            native_session::ConsumeSoundCategory::Ambient
+        );
+    }
+
+    #[test]
     fn neutral_gain_updates_existing_consume_voice() {
         let neutral_gain = Arc::new(AtomicU32::new(0.5_f32.to_bits()));
         let mut voices = vec![Voice {
@@ -1064,7 +1148,7 @@ mod tests {
                 radius: 16.0,
             }),
             player_sound: false,
-            neutral_gain: Some(neutral_gain.clone()),
+            category_gain: Some(neutral_gain.clone()),
         }];
         let mut output = [0.0; 2];
         mix(
@@ -1114,18 +1198,62 @@ mod tests {
             },
         };
         let voice = catalog
-            .consume(event, &mut LegacyRandom::new(1), 48000, &gain)
+            .consume(event, &mut LegacyRandom::new(1), 48000, &gain, &gain)
             .unwrap()
             .unwrap();
         assert!(
             voice
-                .neutral_gain
+                .category_gain
                 .as_ref()
                 .is_some_and(|value| Arc::ptr_eq(value, &gain))
         );
         assert_eq!(voice.spatial.unwrap().position, event.position);
         assert_eq!(voice.volume, 0.2);
         assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
+        assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn extinguish_uses_resource_pack_and_ambient_gain() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"entity.generic.extinguish_fire":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let ambient = Arc::new(AtomicU32::new(0.25_f32.to_bits()));
+        let neutral = Arc::new(AtomicU32::new(0.75_f32.to_bits()));
+        let event = native_session::ExtinguishSound {
+            position: glam::DVec3::new(2.0, 3.0, 4.0),
+            pitch: 1.25,
+        };
+        let voice = catalog
+            .consume(
+                extinguish_audio(event),
+                &mut LegacyRandom::new(1),
+                48000,
+                &neutral,
+                &ambient,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            voice
+                .category_gain
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &ambient))
+        );
+        assert_eq!(voice.spatial.unwrap().position, event.position);
+        assert_eq!(voice.volume, 0.7_f32 * 0.4_f32);
+        assert_eq!(
+            voice.step,
+            f64::from(voice.clip.rate) / 48000.0 * f64::from(1.25_f32 * 1.5)
+        );
         assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
     }
 
@@ -1265,7 +1393,7 @@ mod tests {
             volume: 0.5,
             spatial: None,
             player_sound: false,
-            neutral_gain: None,
+            category_gain: None,
         }];
         let mut output = [0.0; 12];
         mix(
@@ -1300,7 +1428,7 @@ mod tests {
             volume: 1.0,
             spatial: None,
             player_sound: false,
-            neutral_gain: None,
+            category_gain: None,
         };
         let mut voices = vec![voice(), voice()];
         let mut output = [0.0; 1];
@@ -1352,7 +1480,7 @@ mod tests {
                 volume: 1.0,
                 spatial: None,
                 player_sound: false,
-                neutral_gain: None,
+                category_gain: None,
             },
             Voice {
                 clip,
@@ -1364,7 +1492,7 @@ mod tests {
                     radius: f64::INFINITY,
                 }),
                 player_sound: false,
-                neutral_gain: None,
+                category_gain: None,
             },
         ];
         let mut frame = [0.0; 2];
@@ -1408,7 +1536,7 @@ mod tests {
                 radius: 16.0,
             }),
             player_sound: true,
-            neutral_gain: None,
+            category_gain: None,
         }];
         let mut output = [0.0; 2];
         mix(
@@ -1589,7 +1717,7 @@ mod tests {
                 radius: 16.0,
             }),
             player_sound: false,
-            neutral_gain: None,
+            category_gain: None,
         }];
         let mut output = [0.0; 2];
         let front = Listener {

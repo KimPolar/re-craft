@@ -512,6 +512,8 @@ pub(crate) struct ItemEntities {
     removed_created: Vec<RemovedCreatedItem>,
     created_pickups: Vec<CreatedPickupRecord>,
     pickup_sounds: VecDeque<DVec3>,
+    extinguish_sounds: VecDeque<crate::ExtinguishSound>,
+    sound_random: LegacyRandom,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -535,6 +537,8 @@ impl Default for ItemEntities {
             removed_created: Vec::new(),
             created_pickups: Vec::new(),
             pickup_sounds: VecDeque::new(),
+            extinguish_sounds: VecDeque::new(),
+            sound_random: LegacyRandom::new(0),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1152,6 +1156,12 @@ impl ItemEntities {
 
     pub(crate) fn drain_pickup_sounds(&mut self) -> impl Iterator<Item = DVec3> + '_ {
         self.pickup_sounds.drain(..)
+    }
+
+    pub(crate) fn drain_extinguish_sounds(
+        &mut self,
+    ) -> impl Iterator<Item = crate::ExtinguishSound> + '_ {
+        self.extinguish_sounds.drain(..)
     }
 
     #[cfg(test)]
@@ -2138,6 +2148,13 @@ impl ItemEntities {
                 }
                 effects
             });
+            let was_burning = entity._damage_state.fire_ticks > 0
+                && damage_rules.as_ref().is_some_and(|(items, tags)| {
+                    damage_resistant_in_world(&entity.item.stack, items, tags, "minecraft:in_fire")
+                        .ok()
+                        .flatten()
+                        == Some(false)
+                });
             for effect in effects {
                 match effect {
                     native_world::fluid::FluidKind::Lava => {
@@ -2162,6 +2179,16 @@ impl ItemEntities {
             }
             if removed[index] {
                 continue;
+            }
+            if was_burning && entity._damage_state.fire_ticks <= 0 {
+                let event = crate::ExtinguishSound {
+                    position: entity.item.position,
+                    pitch: crate::extinguish_pitch(&mut self.sound_random),
+                };
+                if self.extinguish_sounds.len() == 4096 {
+                    self.extinguish_sounds.pop_front();
+                }
+                self.extinguish_sounds.push_back(event);
             }
             if item_section_order(entity.item.previous_position)
                 != item_section_order(entity.item.position)
@@ -2612,6 +2639,15 @@ mod tests {
             assert_eq!(items.entities[0]._damage_state.health, expected_health);
             assert_eq!(items.entities[0]._damage_state.fire_ticks, expected_fire);
             assert_eq!(items.unresolved_rain_effect, rain.is_none());
+            let sounds: Vec<_> = items.drain_extinguish_sounds().collect();
+            assert_eq!(sounds.len(), usize::from(rain == Some(true)));
+            if let Some(sound) = sounds.first() {
+                assert_eq!(sound.position, position);
+                assert_eq!(
+                    sound.pitch,
+                    crate::extinguish_pitch(&mut LegacyRandom::new(0))
+                );
+            }
             if rain.is_none() {
                 assert!(items.affected_item_chunks(&Default::default()).is_err());
                 assert!(items.draft_saved_item([0; 4]).is_err());

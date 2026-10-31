@@ -21,14 +21,24 @@ import net.minecraft.world.level.gameevent.GameEvent;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.RandomSource;
 
 public class OrbLavaOracle {
   static class World extends ServerLevel {
     GameRules rules;
     Set<BlockPos> raining = Set.of();
+    float soundPitch; boolean soundCalled;
     World() { super(null,null,null,null,null,null,false,0L,null,false); }
     @Override public GameRules getGameRules() { return rules; }
     @Override public boolean isRainingAt(BlockPos pos) { return raining.contains(pos); }
+    @Override public void playSound(Entity source, double x, double y, double z, SoundEvent event, SoundSource category, float volume, float pitch) {
+      if(source != null || x != 3.5 || y != 5.8 || z != 4.5 || event != SoundEvents.GENERIC_EXTINGUISH_FIRE || category != SoundSource.AMBIENT || volume != 0.7f) throw new AssertionError("extinguish sound parameters differ");
+      soundCalled=true; soundPitch=pitch;
+    }
   }
   static class Orb extends ExperienceOrb {
     World world; DamageSources sources; boolean removed; boolean inLava;
@@ -51,6 +61,7 @@ public class OrbLavaOracle {
     @Override public void checkBelowWorld() { }
     @Override public void setSharedFlagOnFire(boolean value) { }
     @Override public BlockPos blockPosition() { return blockPos; }
+    void extinguishSound() { playEntityOnFireExtinguishedSound(); }
   }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
@@ -111,5 +122,18 @@ public class OrbLavaOracle {
       }
     }
     Files.writeString(Path.of(args[2]),new Gson().toJson(rainOut));
+    var randomField=Entity.class.getDeclaredField("random"); randomField.setAccessible(true);
+    var positionField=Entity.class.getDeclaredField("position"); positionField.setAccessible(true);
+    var levelField=Entity.class.getDeclaredField("level"); levelField.setAccessible(true);
+    var soundOut=new JsonArray();
+    for(long seed=0;seed<32;seed++) {
+      var orb=(Orb)unsafe.allocateInstance(Orb.class); orb.world=world;
+      levelField.set(orb,world);
+      var random=RandomSource.create(seed); randomField.set(orb,random);
+      positionField.set(orb,new Vec3(3.5,5.8,4.5)); world.soundCalled=false;
+      orb.extinguishSound(); if(!world.soundCalled) throw new AssertionError("no extinguish sound");
+      var row=new JsonObject(); row.addProperty("pitch",Float.floatToIntBits(world.soundPitch)); row.addProperty("next",random.nextInt()); soundOut.add(row);
+    }
+    Files.writeString(Path.of(args[3]),new Gson().toJson(soundOut));
   }
 }

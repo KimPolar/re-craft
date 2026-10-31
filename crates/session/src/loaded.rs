@@ -464,6 +464,7 @@ pub struct LoadedSession {
     chest_sounds: VecDeque<ChestSoundEvent>,
     locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
     bucket_sounds: VecDeque<BucketSoundEvent>,
+    evaporation_smoke: VecDeque<EvaporationSmoke>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -591,6 +592,12 @@ pub struct BucketSoundEvent {
     pub volume: f32,
     pub pitch: f32,
     pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvaporationSmoke {
+    pub position: IVec3,
+    pub tick: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -3145,6 +3152,7 @@ impl LoadedSession {
             chest_sounds: VecDeque::new(),
             locked_chest_sounds: VecDeque::new(),
             bucket_sounds: VecDeque::new(),
+            evaporation_smoke: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -3988,6 +3996,10 @@ impl LoadedSession {
 
     pub fn take_bucket_sounds(&mut self) -> Vec<BucketSoundEvent> {
         self.bucket_sounds.drain(..).collect()
+    }
+
+    pub fn take_evaporation_smoke(&mut self) -> Vec<EvaporationSmoke> {
+        self.evaporation_smoke.drain(..).collect()
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -7398,6 +7410,13 @@ impl LoadedSession {
             let pitch = 2.6_f32
                 + (self.level_random.next_float() - self.level_random.next_float()) * 0.8_f32;
             self.push_bucket_sound(BucketSoundKind::Evaporate, sound_position, 0.5, pitch);
+            if self.evaporation_smoke.len() == 4096 {
+                self.evaporation_smoke.pop_front();
+            }
+            self.evaporation_smoke.push_back(EvaporationSmoke {
+                position: add(self.origin, target).expect("sound position was checked"),
+                tick: self.tick.saturating_add(1),
+            });
         } else {
             let id = self.intern_block(replacement);
             if id != existing && !self.set(target, id) {
@@ -13816,6 +13835,18 @@ mod tests {
                         session.submit_command(PlayerCommand::Place);
                         session.update(TICK);
                         let pos = session.origin + IVec3::new(8, 2, 7);
+                        let bursts = session.take_evaporation_smoke();
+                        if fluid == "minecraft:water" && evaporates {
+                            assert_eq!(
+                                bursts,
+                                vec![EvaporationSmoke {
+                                    position: pos,
+                                    tick: session.tick
+                                }]
+                            );
+                        } else {
+                            assert!(bursts.is_empty());
+                        }
                         let expected = if fluid == "minecraft:water" && evaporates {
                             "minecraft:air"
                         } else {

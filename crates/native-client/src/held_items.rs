@@ -361,6 +361,32 @@ fn compass_range_branch<'a>(definition: &'a Value, key: &ModelKey) -> Option<&'a
 }
 
 impl Loader {
+    pub(crate) fn load_large_smoke_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
+        let bytes = self
+            .stack
+            .read_asset("assets/minecraft/particles/large_smoke.json")?
+            .context("missing large smoke particle definition")?;
+        let definition: Value =
+            serde_json::from_slice(&bytes).context("invalid large smoke particle definition")?;
+        let textures = definition
+            .get("textures")
+            .and_then(Value::as_array)
+            .context("missing large smoke textures")?;
+        ensure!(
+            !textures.is_empty() && textures.len() <= 256,
+            "invalid large smoke texture count"
+        );
+        textures
+            .iter()
+            .map(|value| {
+                let id = ResourceId::parse(value.as_str().context("invalid particle texture ID")?)?;
+                self.texture(&ResourceId {
+                    namespace: id.namespace,
+                    path: format!("particle/{}", id.path),
+                })
+            })
+            .collect()
+    }
     pub(crate) fn load_armor(
         &mut self,
         key: &crate::equipment_visual::ArmorKey,
@@ -1189,6 +1215,34 @@ impl ItemModelCache {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn large_smoke_sprites_follow_particle_definition_and_pack() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let sprites = open_loader(&game, &[]).load_large_smoke_sprites().unwrap();
+        assert_eq!(sprites.len(), 8);
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("particles")).unwrap();
+        std::fs::create_dir_all(base.join("textures/particle")).unwrap();
+        std::fs::write(
+            base.join("particles/large_smoke.json"),
+            br#"{"textures":["minecraft:test_smoke","minecraft:test_smoke"]}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(4, 4, image::Rgba([7, 11, 13, 255]))
+            .save(base.join("textures/particle/test_smoke.png"))
+            .unwrap();
+        let sprites = open_loader(&game, &[pack.path().to_path_buf()])
+            .load_large_smoke_sprites()
+            .unwrap();
+        assert_eq!(sprites.len(), 2);
+        assert!(Arc::ptr_eq(&sprites[0], &sprites[1]));
+        assert_eq!(sprites[0].get_pixel(0, 0).0, [7, 11, 13, 255]);
+    }
 
     #[test]
     fn compass_conditions_and_ranges_choose_component_and_threshold() {

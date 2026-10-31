@@ -6,10 +6,15 @@ use anyhow::{Result, ensure};
 use glam::{IVec3, Vec3};
 use image::RgbaImage;
 
-use crate::{consume_particles::Particle, mesh::Vertex};
+use crate::mesh::Vertex;
 
 pub(crate) struct RenderParticle {
-    pub particle: Particle,
+    pub previous: glam::DVec3,
+    pub position: glam::DVec3,
+    pub size: f32,
+    pub uv: [f32; 4],
+    pub color: [f32; 3],
+    pub opaque: bool,
     pub texture: Arc<RgbaImage>,
     pub light: u32,
 }
@@ -23,6 +28,7 @@ struct Material {
 struct Draw {
     binding: wgpu::BindGroup,
     vertices: Range<u32>,
+    opaque: bool,
 }
 
 pub(crate) struct ParticleRenderer {
@@ -71,9 +77,12 @@ impl ParticleRenderer {
             return Ok(binding);
         }
         let width = image.width();
-        let height = image.height().min(width);
+        let height = image.height();
         ensure!(
-            width > 0 && height > 0 && width <= device.limits().max_texture_dimension_2d,
+            width > 0
+                && height > 0
+                && width <= device.limits().max_texture_dimension_2d
+                && height <= device.limits().max_texture_dimension_2d,
             "invalid particle texture"
         );
         let size = wgpu::Extent3d {
@@ -159,41 +168,39 @@ impl ParticleRenderer {
         let right = direction.cross(camera_up).normalize_or_zero();
         let up = right.cross(direction).normalize_or_zero();
         let mut vertices = Vec::with_capacity(particles.len().saturating_mul(6));
-        let mut previous: Option<Arc<RgbaImage>> = None;
+        let mut previous: Option<(Arc<RgbaImage>, bool)> = None;
         for entry in particles {
-            if previous
-                .as_ref()
-                .is_none_or(|image| !Arc::ptr_eq(image, &entry.texture))
-            {
+            if previous.as_ref().is_none_or(|(image, opaque)| {
+                *opaque != entry.opaque || !Arc::ptr_eq(image, &entry.texture)
+            }) {
                 let binding = self.material(device, queue, &entry.texture)?;
                 let start = u32::try_from(vertices.len())?;
                 self.draws.push(Draw {
                     binding,
                     vertices: start..start,
+                    opaque: entry.opaque,
                 });
-                previous = Some(Arc::clone(&entry.texture));
+                previous = Some((Arc::clone(&entry.texture), entry.opaque));
             }
-            let p = &entry.particle;
-            let center = (p
+            let center = (entry
                 .previous
-                .lerp(p.position, f64::from(partial.clamp(0.0, 1.0)))
+                .lerp(entry.position, f64::from(partial.clamp(0.0, 1.0)))
                 - origin.as_dvec3())
             .as_vec3();
-            let u0 = p.uv[0] / 4.0;
-            let v0 = p.uv[1] / 4.0;
+            let [u0, v0, u1, v1] = entry.uv;
             let corners = [
-                (-1.0, -1.0, u0, v0 + 0.25),
-                (1.0, -1.0, u0 + 0.25, v0 + 0.25),
-                (1.0, 1.0, u0 + 0.25, v0),
+                (-1.0, -1.0, u0, v1),
+                (1.0, -1.0, u1, v1),
+                (1.0, 1.0, u1, v0),
                 (-1.0, 1.0, u0, v0),
             ];
             for i in [0, 1, 2, 0, 2, 3] {
                 let (x, y, u, v) = corners[i];
                 vertices.push(Vertex {
-                    position: (center + (right * x + up * y) * p.size).to_array(),
+                    position: (center + (right * x + up * y) * entry.size).to_array(),
                     uv: [u, v],
                     shade: 1.0,
-                    tint: [1.0; 3],
+                    tint: entry.color,
                     light: entry.light,
                 });
             }
@@ -223,14 +230,15 @@ impl ParticleRenderer {
         Ok(())
     }
 
-    pub fn draw<'a>(
+    pub fn draw_layer<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         pipeline: &'a wgpu::RenderPipeline,
         lightmap: &'a wgpu::BindGroup,
         fog: &'a wgpu::BindGroup,
+        opaque: bool,
     ) {
-        if self.draws.is_empty() {
+        if !self.draws.iter().any(|draw| draw.opaque == opaque) {
             return;
         }
         let Some(buffer) = &self.buffer else { return };
@@ -238,7 +246,7 @@ impl ParticleRenderer {
         pass.set_bind_group(1, lightmap, &[]);
         pass.set_bind_group(2, fog, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
-        for draw in &self.draws {
+        for draw in self.draws.iter().filter(|draw| draw.opaque == opaque) {
             pass.set_bind_group(0, &draw.binding, &[]);
             pass.draw(draw.vertices.clone(), 0..1);
         }
@@ -326,42 +334,52 @@ mod tests {
                 @group(0) @binding(0) var<uniform> camera: mat4x4<f32>;
                 @group(0) @binding(1) var tex: texture_2d<f32>;
                 @group(0) @binding(2) var samp: sampler;
-                struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-                @vertex fn vs(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>) -> Out { var o: Out; o.pos = camera * vec4<f32>(pos, 1.0); o.uv = uv; return o; }
-                @fragment fn fs(o: Out) -> @location(0) vec4<f32> { return textureSample(tex, samp, o.uv); }
+                struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec3<f32> };
+                @vertex fn vs(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>, @location(3) tint: vec3<f32>) -> Out { var o: Out; o.pos = camera * vec4<f32>(pos, 1.0); o.uv = uv; o.tint = tint; return o; }
+                @fragment fn fs(o: Out) -> @location(0) vec4<f32> { let c=textureSample(tex, samp, o.uv); return vec4<f32>(c.rgb * o.tint,c.a); }
             "#.into()) });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: None,
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &VERTEX_ATTRIBUTES,
-                    })],
-                },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+            let make_pipeline = |opaque| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None,
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Vertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &VERTEX_ATTRIBUTES,
+                        })],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(opaque),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: (!opaque).then_some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let opaque_pipeline = make_pipeline(true);
+            let translucent_pipeline = make_pipeline(false);
             let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&glam::Mat4::IDENTITY.to_cols_array()),
@@ -385,11 +403,50 @@ mod tests {
                 }],
             );
             let image = Arc::new(RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])));
-            let entries = vec![RenderParticle {
-                particle: particles.particles().next().unwrap().clone(),
-                texture: image,
-                light: u32::MAX,
-            }];
+            let particle = particles.particles().next().unwrap();
+            let entries = vec![
+                RenderParticle {
+                    previous: particle.previous,
+                    position: particle.position,
+                    size: particle.size,
+                    uv: [
+                        particle.uv[0] / 4.0,
+                        particle.uv[1] / 4.0,
+                        particle.uv[0] / 4.0 + 0.25,
+                        particle.uv[1] / 4.0 + 0.25,
+                    ],
+                    color: [1.0; 3],
+                    opaque: false,
+                    texture: Arc::clone(&image),
+                    light: u32::MAX,
+                },
+                RenderParticle {
+                    previous: DVec3::new(0.5, 0.0, 0.5),
+                    position: DVec3::new(0.5, 0.0, 0.5),
+                    size: 0.25,
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    color: [0.5; 3],
+                    opaque: true,
+                    texture: Arc::new(RgbaImage::from_fn(8, 16, |_, y| {
+                        if y < 8 {
+                            image::Rgba([0, 255, 0, 255])
+                        } else {
+                            image::Rgba([0, 0, 255, 255])
+                        }
+                    })),
+                    light: u32::MAX,
+                },
+                RenderParticle {
+                    previous: DVec3::new(0.5, 0.0, 0.6),
+                    position: DVec3::new(0.5, 0.0, 0.6),
+                    size: 0.25,
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    color: [1.0; 3],
+                    opaque: false,
+                    texture: image,
+                    light: u32::MAX,
+                },
+            ];
             renderer
                 .update(
                     &device,
@@ -416,6 +473,16 @@ mod tests {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 64 * 64 * 4,
@@ -426,6 +493,7 @@ mod tests {
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             {
                 let view = output.create_view(&wgpu::TextureViewDescriptor::default());
+                let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: None,
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -437,12 +505,32 @@ mod tests {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                renderer.draw(&mut pass, &pipeline, &empty_binding, &empty_binding);
+                renderer.draw_layer(
+                    &mut pass,
+                    &opaque_pipeline,
+                    &empty_binding,
+                    &empty_binding,
+                    true,
+                );
+                renderer.draw_layer(
+                    &mut pass,
+                    &translucent_pipeline,
+                    &empty_binding,
+                    &empty_binding,
+                    false,
+                );
             }
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -480,6 +568,21 @@ mod tests {
                 data.chunks_exact(4)
                     .any(|pixel| pixel[0] > 200 && pixel[1] == 0 && pixel[2] == 0),
                 "fragment was not rendered"
+            );
+            for y in [28, 36] {
+                let pixel = &data[(y * 64 + 48) * 4..(y * 64 + 48) * 4 + 4];
+                assert_eq!(
+                    pixel[0], 0,
+                    "opaque smoke failed to occlude the fragment: {pixel:?}"
+                );
+            }
+            assert!(
+                data.chunks_exact(4).any(|p| p[1] >= 120 && p[2] == 0),
+                "sprite upper half was not rendered"
+            );
+            assert!(
+                data.chunks_exact(4).any(|p| p[2] >= 120 && p[1] == 0),
+                "sprite lower half was not rendered"
             );
             drop(data);
             buffer.unmap();

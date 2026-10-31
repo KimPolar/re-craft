@@ -444,8 +444,10 @@ impl Viewer {
             play.streamer.service(&mut play.session)?;
             let snapshot = play.session.snapshot();
             let particles = play.session.take_consume_particles();
+            let smoke = play.session.take_evaporation_smoke();
             if let Some(ui) = &mut self.ui {
                 ui.update_consume_particles(&snapshot, particles);
+                ui.update_evaporation_smoke(&snapshot, smoke);
             }
             self.camera.eye =
                 eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());

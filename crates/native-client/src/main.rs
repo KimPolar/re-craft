@@ -48,6 +48,7 @@ mod recipe_book_ui;
 mod renderer;
 mod screen_blur;
 mod sky_background;
+mod smoke_particles;
 mod sound_ui;
 mod survival_hud;
 mod text_component;

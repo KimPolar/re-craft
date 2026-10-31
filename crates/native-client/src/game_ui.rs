@@ -139,6 +139,9 @@ pub struct GameUi {
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
     consume_particles: crate::consume_particles::ParticleSystem,
+    smoke_particles: crate::smoke_particles::SmokeSystem,
+    smoke_sprites: Option<Vec<Arc<image::RgbaImage>>>,
+    smoke_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
     pause_page: PausePage,
@@ -178,6 +181,21 @@ pub struct GameUi {
 impl GameUi {
     pub fn new(assets: Arc<MenuAssets>) -> Self {
         let skin = Arc::clone(&assets.player_skin);
+        let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let smoke_loader = Arc::clone(&assets.item_models);
+        let _ = std::thread::Builder::new()
+            .name("particle-sprite-loader".into())
+            .spawn(move || {
+                let result = smoke_loader
+                    .lock()
+                    .map_err(|_| "particle resource loader is unavailable".to_owned())
+                    .and_then(|mut loader| {
+                        loader
+                            .load_large_smoke_sprites()
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                let _ = smoke_sender.send(result);
+            });
         let mut held_models = ItemModelCache::new(Arc::clone(&assets.item_models));
         // Falling blocks can appear immediately after a world starts. Request
         // their models on the existing worker before the first entity spawns.
@@ -193,6 +211,9 @@ impl GameUi {
             skin,
             held_models,
             consume_particles: crate::consume_particles::ParticleSystem::default(),
+            smoke_particles: crate::smoke_particles::SmokeSystem::default(),
+            smoke_sprites: None,
+            smoke_sprite_result,
             armor_models,
             paused: false,
             pause_page: PausePage::Game,
@@ -245,6 +266,15 @@ impl GameUi {
     ) {
         self.consume_particles
             .update(snapshot.tick, &snapshot.world, spawns);
+    }
+
+    pub fn update_evaporation_smoke(
+        &mut self,
+        snapshot: &native_session::WorldSnapshot,
+        bursts: Vec<native_session::loaded::EvaporationSmoke>,
+    ) {
+        self.smoke_particles
+            .update(snapshot.tick, &snapshot.world, bursts);
     }
 
     pub fn set_trim_registry(&mut self, trims: Arc<crate::equipment_visual::TrimRegistry>) {
@@ -1545,6 +1575,13 @@ impl GameUi {
         if self.held_models.poll() {
             self.last_draw = None;
         }
+        if self.smoke_sprites.is_none() {
+            match self.smoke_sprite_result.try_recv() {
+                Ok(Ok(sprites)) => self.smoke_sprites = Some(sprites),
+                Ok(Err(error)) => eprintln!("Cannot load large smoke sprites: {error}"),
+                Err(_) => {}
+            }
+        }
         let mut particle_draws = Vec::new();
         for particle in self.consume_particles.particles() {
             let Some(model) = self.held_models.get_item(&particle.item) else {
@@ -1562,10 +1599,47 @@ impl GameUi {
                 }
             };
             particle_draws.push(crate::consume_particle_render::RenderParticle {
-                particle: particle.clone(),
+                previous: particle.previous,
+                position: particle.position,
+                size: particle.size,
+                uv: [
+                    particle.uv[0] / 4.0,
+                    particle.uv[1] / 4.0,
+                    particle.uv[0] / 4.0 + 0.25,
+                    particle.uv[1] / 4.0 + 0.25,
+                ],
+                color: [1.0; 3],
+                opaque: false,
                 texture: Arc::clone(texture),
                 light,
             });
+        }
+        if let Some(sprites) = &self.smoke_sprites {
+            for particle in self.smoke_particles.particles() {
+                let Some(texture) = sprites.get(particle.frame(sprites.len())) else {
+                    continue;
+                };
+                let light = match &snapshot.world {
+                    native_session::SessionWorld::Demo(_) => u32::MAX,
+                    native_session::SessionWorld::Loaded(world) => {
+                        let cell = particle.position.floor().as_ivec3();
+                        u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                            + 16 * u32::from(
+                                world.light(cell.x, cell.y, cell.z, true).unwrap_or(15),
+                            )
+                    }
+                };
+                particle_draws.push(crate::consume_particle_render::RenderParticle {
+                    previous: particle.previous,
+                    position: particle.position,
+                    size: particle.display_size(partial),
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    color: [particle.color; 3],
+                    opaque: true,
+                    texture: Arc::clone(texture),
+                    light,
+                });
+            }
         }
         renderer.set_consume_particles(particle_draws, render_origin, partial);
         let dropped_models = snapshot

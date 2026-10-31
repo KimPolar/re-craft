@@ -2108,6 +2108,13 @@ impl Renderer {
             if let Some(breaking) = &self.breaking_renderer {
                 breaking.draw(&mut pass);
             }
+            self.consume_renderer.draw_layer(
+                &mut pass,
+                &self.terrain_pipeline,
+                &self.lightmap_bind_group,
+                &self.fog_bind_group,
+                true,
+            );
             if self.translucent_count > 0
                 && let Some(buffer) = &self.translucent_buffer
             {
@@ -2121,11 +2128,12 @@ impl Renderer {
             if let Some(orbs) = &self.orb_renderer {
                 orbs.draw(&mut pass);
             }
-            self.consume_renderer.draw(
+            self.consume_renderer.draw_layer(
                 &mut pass,
                 &self.translucent_pipeline,
                 &self.lightmap_bind_group,
                 &self.fog_bind_group,
+                false,
             );
         }
         self.first_person.draw(

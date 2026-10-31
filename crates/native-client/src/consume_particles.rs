@@ -109,7 +109,7 @@ impl Particle {
     }
 }
 
-fn collide(
+pub(crate) fn collide(
     world: &SessionWorld,
     cache: &mut HashMap<u32, Option<Vec<Aabb>>>,
     bounds: BoundingBox,

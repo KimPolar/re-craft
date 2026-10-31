@@ -1703,6 +1703,7 @@ impl LoadedSession {
         if self.chest_dirty_chunks.contains(&position) {
             self.stage_chest_inventories(position, original, &mut draft)?;
         }
+        self.stage_chest_lifecycle(position, original, &mut draft)?;
         Ok(draft)
     }
 
@@ -1850,6 +1851,27 @@ impl LoadedSession {
         position: ChunkPos,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
+        anyhow::ensure!(
+            !self
+                .placed_chests
+                .iter()
+                .chain(&self.removed_chests)
+                .any(|&(x, _, z)| x.div_euclid(16) == position.x && z.div_euclid(16) == position.z),
+            "chest creation or removal requires a coordinated terrain draft"
+        );
+        anyhow::ensure!(
+            !self.chest_contents.values().any(|chest| {
+                let p = chest.position;
+                p.x.div_euclid(16) == position.x
+                    && p.z.div_euclid(16) == position.z
+                    && chest.inventory_changed()
+                    && self
+                        .block_edits
+                        .get(&position)
+                        .is_some_and(|edits| edits.contains_key(&(p.x, p.y, p.z)))
+            }),
+            "changed chest block requires a coordinated terrain draft"
+        );
         let mut draft = self.draft_unchanged_chunk(position, original)?;
         self.stage_chest_inventories(position, original, &mut draft)?;
         Ok(draft)
@@ -1862,7 +1884,7 @@ impl LoadedSession {
         draft: &mut native_persistence::edit::ChunkDraft,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
-        use native_persistence::edit::BlockEntityChange;
+        use native_persistence::edit::BlockEntityMutation;
         ensure!(
             self.chest_dirty_chunks.contains(&position),
             "chunk has no changed chest inventories"
@@ -1886,31 +1908,57 @@ impl LoadedSession {
         for chest in self.chest_contents.values().filter(|chest| {
             chest.position.x.div_euclid(16) == position.x
                 && chest.position.z.div_euclid(16) == position.z
+                && !self.placed_chests.contains(&(
+                    chest.position.x,
+                    chest.position.y,
+                    chest.position.z,
+                ))
         }) {
             let edited = chest.draft_inventory(&chest.slots)?;
             if &edited == chest.source() {
                 continue;
             }
             let p = chest.position;
-            ensure!(
-                !self
-                    .block_edits
-                    .get(&position)
-                    .is_some_and(|edits| edits.contains_key(&(p.x, p.y, p.z))),
-                "chest block was changed"
-            );
             let section_y =
                 i8::try_from(p.y.div_euclid(16)).context("chest section out of range")?;
             let index = p.x.rem_euclid(16) as usize
                 + p.z.rem_euclid(16) as usize * 16
                 + p.y.rem_euclid(16) as usize * 256;
-            let current = chunk
+            let current_id = *chunk
                 .sections
                 .get(&section_y)
                 .and_then(|s| s.blocks.as_ref())
                 .and_then(|b| b.get(index))
-                .and_then(|id| self.world.state(*id))
                 .context("chest block is unavailable")?;
+            let current = self
+                .world
+                .state(current_id)
+                .context("chest block state is unavailable")?;
+            let original_state = if let Some(edit) = self
+                .block_edits
+                .get(&position)
+                .and_then(|edits| edits.get(&(p.x, p.y, p.z)))
+            {
+                ensure!(
+                    edit.current == current_id,
+                    "chest block changed outside session history"
+                );
+                let previous = edit
+                    .original
+                    .and_then(|id| self.world.state(id))
+                    .context("original chest block is unavailable")?;
+                ensure!(
+                    previous.name == current.name
+                        && matches!(
+                            current.name.as_str(),
+                            "minecraft:chest" | "minecraft:trapped_chest"
+                        ),
+                    "chest block type changed"
+                );
+                previous
+            } else {
+                current
+            };
             let source = sections
                 .iter()
                 .find(|s| s.y == section_y)
@@ -1924,21 +1972,21 @@ impl LoadedSession {
                 })
                 .context("source chest block is unavailable")?;
             ensure!(
-                source.name.matches(&current.name),
+                source.name.matches(&original_state.name),
                 "source chest block differs"
             );
             if source.properties.is_empty() {
                 ensure!(
-                    current.properties.len() == 3
-                        && current
+                    original_state.properties.len() == 3
+                        && original_state
                             .properties
                             .get("facing")
                             .is_some_and(|v| v == "north")
-                        && current
+                        && original_state
                             .properties
                             .get("type")
                             .is_some_and(|v| v == "single")
-                        && current
+                        && original_state
                             .properties
                             .get("waterlogged")
                             .is_some_and(|v| v == "false"),
@@ -1946,21 +1994,113 @@ impl LoadedSession {
                 );
             } else {
                 ensure!(
-                    source.properties.len() == current.properties.len()
-                        && source.properties.iter().all(|(key, value)| current
+                    source.properties.len() == original_state.properties.len()
+                        && source.properties.iter().all(|(key, value)| original_state
                             .properties
                             .iter()
                             .any(|(k, v)| key.matches(k) && value.matches(v))),
                     "source chest state differs"
                 );
             }
-            changes.push(BlockEntityChange {
-                expected: chest.source().clone(),
-                replacement: edited,
+            changes.push(BlockEntityMutation {
+                expected: Some(chest.source().clone()),
+                replacement: Some(edited),
             });
         }
-        draft.replace_block_entities(&changes)?;
+        draft.stage_block_entity_mutations(&changes)?;
         Ok(())
+    }
+
+    /// Include created and destroyed chests in the same partial draft as their
+    /// block changes. This still cannot authorize a playable-world write.
+    fn stage_chest_lifecycle(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        draft: &mut native_persistence::edit::ChunkDraft,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use native_persistence::edit::BlockEntityMutation;
+        let keys: BTreeSet<_> = self
+            .placed_chests
+            .iter()
+            .chain(&self.removed_chests)
+            .copied()
+            .filter(|(x, _, z)| x.div_euclid(16) == position.x && z.div_euclid(16) == position.z)
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            !matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z)),
+            "chest inventory is still open"
+        );
+        ensure!(
+            draft.matches_source(original)?,
+            "chunk draft source differs"
+        );
+        let payload = self
+            .world
+            .saved_block_entities
+            .get(&position)
+            .context("chest source block entities are unavailable")?;
+        let edits = self
+            .block_edits
+            .get(&position)
+            .context("chest lifecycle block edits are unavailable")?;
+        let mut changes = Vec::new();
+        for key @ (x, y, z) in keys {
+            let edit = edits
+                .get(&key)
+                .context("chest lifecycle block edit is unavailable")?;
+            let current = self
+                .world
+                .state(edit.current)
+                .context("chest block state is unavailable")?;
+            let source = crate::saved_chest::read(payload, position, IVec3::new(x, y, z))?;
+            let expected = if self.removed_chests.contains(&key) {
+                Some(
+                    source
+                        .context("removed chest source is missing")?
+                        .source()
+                        .clone(),
+                )
+            } else {
+                ensure!(
+                    source.is_none(),
+                    "new chest position already has a block entity"
+                );
+                None
+            };
+            let replacement = if self.placed_chests.contains(&key) {
+                let chest = self
+                    .chest_contents
+                    .get(&key)
+                    .context("placed chest data is unavailable")?;
+                ensure!(
+                    matches!(
+                        current.name.as_str(),
+                        "minecraft:chest" | "minecraft:trapped_chest"
+                    ) && matches!(chest.source().get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(&current.name)),
+                    "placed chest block and entity differ"
+                );
+                Some(chest.draft_inventory(&chest.slots)?)
+            } else {
+                ensure!(
+                    !matches!(
+                        current.name.as_str(),
+                        "minecraft:chest" | "minecraft:trapped_chest"
+                    ),
+                    "removed chest block is still present"
+                );
+                None
+            };
+            changes.push(BlockEntityMutation {
+                expected,
+                replacement,
+            });
+        }
+        draft.stage_block_entity_mutations(&changes)
     }
 
     /// Chunks whose blocks, chest inventories, or modeled scheduled ticks changed.
@@ -17516,6 +17656,398 @@ mod tests {
         assert!(session.draft_player_and_chests(&original, &chunks).is_err());
         session.update(TICK);
         assert!(session.restore_saved_player_inventory(&original).is_err());
+    }
+
+    fn chest_lifecycle_draft_fixture() -> (
+        native_persistence::nbt::NamedTag,
+        native_persistence::nbt::NamedTag,
+    ) {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{self, Tag},
+            palette::BlockState,
+        };
+        use native_world::loaded::SavedBlockEntities;
+
+        let mut created = session();
+        let home = created.player_chunk().unwrap();
+        let source = fixture_chunk_document(home);
+        let original_bytes = nbt::write(&source).unwrap();
+        Arc::make_mut(&mut created.world)
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        let mut inventory = PlayerInventory::default();
+        let components = Tag::Compound(vec![(
+            "minecraft:custom_name".into(),
+            Tag::String("Test chest".into()),
+        )]);
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:chest".into(), 1, 64, components),
+        );
+        created.set_player_inventory(inventory);
+        let hit = ShapeRayHit {
+            position: IVec3::new(4, 0, 4),
+            face: IVec3::Y,
+            location: DVec3::new(4.5, 1.0, 4.5),
+            inside: false,
+        };
+        assert_eq!(created.place_chest(hit), Some(PlayerSlot::Storage(0)));
+        let absolute = created.origin + IVec3::new(4, 1, 4);
+        let key = (absolute.x, absolute.y, absolute.z);
+        created.chest_contents.get_mut(&key).unwrap().slots[2] =
+            ItemStack::new("minecraft:diamond".into(), 3, 64, Tag::Compound(vec![]));
+        let mut draft = created.draft_changed_chunk(home, &source).unwrap();
+        created
+            .stage_chest_lifecycle(home, &source, &mut draft)
+            .unwrap();
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!("missing created chest")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("id"),
+            Some(&Tag::String("minecraft:chest".into()))
+        );
+        assert_eq!(
+            values[0].get("CustomName"),
+            Some(&Tag::String("Test chest".into()))
+        );
+        let Some(Tag::List { values: items, .. }) = values[0].get("Items") else {
+            panic!("missing chest contents")
+        };
+        assert_eq!(items[0].get("Slot"), Some(&Tag::Byte(2)));
+        assert_eq!(items[0].get("count"), Some(&Tag::Int(3)));
+        assert_eq!(nbt::write(&source).unwrap(), original_bytes);
+        struct HeightTags;
+        impl native_resources::packs::ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:chest".into(),
+        ]);
+        let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
+        let combined = created
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(home, &source, &tags, |state| {
+                Ok((state.name.matches("minecraft:air"), false))
+            })
+            .unwrap();
+        assert_eq!(
+            combined.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
+        let created_document = combined.document().clone();
+
+        let (mut removed, world, chest_pos, chunk) = saved_chest_fixture();
+        let state = |name: &str, properties: &[(&str, &str)]| BlockState {
+            name: name.into(),
+            properties: properties
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let mut source = draft_chunk_blocks(
+            &fixture_chunk_document(chunk),
+            native_persistence::world::ChunkPos {
+                x: chunk.x,
+                z: chunk.z,
+            },
+            &[BlockChange {
+                x: chest_pos.x,
+                y: chest_pos.y,
+                z: chest_pos.z,
+                expected: state("minecraft:stone", &[]),
+                replacement: state(
+                    "minecraft:chest",
+                    &[
+                        ("facing", "north"),
+                        ("type", "single"),
+                        ("waterlogged", "false"),
+                    ],
+                ),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let SavedBlockEntities::Encoded(bytes) = &world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut source.value else {
+            panic!()
+        };
+        fields.push(("block_entities".into(), nbt::read(bytes).unwrap().value));
+        removed.set_game_mode(GameMode::Creative);
+        removed.finish_breaking(chest_pos);
+        let mut draft = removed.draft_changed_chunk(chunk, &source).unwrap();
+        removed
+            .stage_chest_lifecycle(chunk, &source, &mut draft)
+            .unwrap();
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!()
+        };
+        assert!(values.is_empty());
+        let removed_document = draft.document().clone();
+        let relative = chest_pos - removed.origin;
+        let support = relative + IVec3::X;
+        assert!(removed.set(support, removed.states[3]));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:chest".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        removed.set_player_inventory(inventory);
+        let hit = ShapeRayHit {
+            position: support,
+            face: IVec3::NEG_X,
+            location: DVec3::new(
+                f64::from(support.x),
+                f64::from(support.y) + 0.5,
+                f64::from(support.z) + 0.5,
+            ),
+            inside: false,
+        };
+        assert_eq!(removed.place_chest(hit), Some(PlayerSlot::Storage(0)));
+        let mut replaced = removed.draft_changed_chunk(chunk, &source).unwrap();
+        removed
+            .stage_chest_lifecycle(chunk, &source, &mut replaced)
+            .unwrap();
+        let Some(Tag::List { values, .. }) = replaced.document().value.get("block_entities") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert!(
+            values[0].get("Items").is_none(),
+            "new chest must not retain the removed inventory"
+        );
+        let mut stale = source.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            panic!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!()
+        };
+        fields.push(("changed".into(), Tag::Byte(1)));
+        let mut stale_draft = removed.draft_changed_chunk(chunk, &stale).unwrap();
+        let before = stale_draft.document().clone();
+        assert!(
+            removed
+                .stage_chest_lifecycle(chunk, &stale, &mut stale_draft)
+                .is_err()
+        );
+        assert_eq!(stale_draft.document(), &before);
+        (created_document, removed_document)
+    }
+
+    #[test]
+    fn chest_lifecycle_draft_stages_creation_and_removal_without_writing() {
+        let _ = chest_lifecycle_draft_fixture();
+    }
+
+    #[test]
+    fn chest_inventory_draft_tracks_joined_chest_state_and_new_partner() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{self, Tag},
+            palette::BlockState,
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, world, position, home) = saved_chest_fixture();
+        let state = |name: &str, properties: &[(&str, &str)]| BlockState {
+            name: name.into(),
+            properties: properties
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let mut source = draft_chunk_blocks(
+            &fixture_chunk_document(home),
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[BlockChange {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                expected: state("minecraft:stone", &[]),
+                replacement: state(
+                    "minecraft:chest",
+                    &[
+                        ("facing", "north"),
+                        ("type", "single"),
+                        ("waterlogged", "false"),
+                    ],
+                ),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let SavedBlockEntities::Encoded(bytes) = &world.saved_block_entities[&home] else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut source.value else {
+            panic!()
+        };
+        fields.push(("block_entities".into(), nbt::read(bytes).unwrap().value));
+        assert!(session.try_open_saved_chest(position - session.origin));
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: PlayerSlot::Chest(3),
+        });
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        assert!(session.chest_dirty_chunks.contains(&home));
+        let support = position - session.origin + IVec3::X + IVec3::NEG_Y;
+        assert!(session.set(support, session.states[3]));
+        session.player.yaw = std::f32::consts::PI;
+        Arc::make_mut(&mut session.inventory).set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:chest".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        let hit = ShapeRayHit {
+            position: support,
+            face: IVec3::Y,
+            location: DVec3::new(
+                f64::from(support.x) + 0.5,
+                f64::from(support.y) + 1.0,
+                f64::from(support.z) + 0.5,
+            ),
+            inside: false,
+        };
+        assert_eq!(session.place_chest(hit), Some(PlayerSlot::Storage(0)));
+        let state = session
+            .world
+            .block(position.x, position.y, position.z)
+            .unwrap();
+        assert_ne!(state.properties["type"], "single");
+        let mut draft = session.draft_changed_chunk(home, &source).unwrap();
+        session
+            .stage_chest_inventories(home, &source, &mut draft)
+            .unwrap();
+        session
+            .stage_chest_lifecycle(home, &source, &mut draft)
+            .unwrap();
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 2);
+        assert!(
+            matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        assert!(values[1].get("Items").is_none());
+        assert!(session.draft_chest_inventory_chunk(home, &source).is_err());
+        struct HeightTags;
+        impl native_resources::packs::ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:chest".into(),
+        ]);
+        let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
+        let combined = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(home, &source, &tags, |state| {
+                Ok((state.name.matches("minecraft:air"), false))
+            })
+            .unwrap();
+        assert_eq!(
+            combined.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn java_reads_chest_lifecycle_drafts() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChestLifecycleDraftOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ChestLifecycleDraftOracle.java"),
+        )
+        .unwrap();
+        let (created, removed) = chest_lifecycle_draft_fixture();
+        let created_file = temp.path().join("created.nbt");
+        let removed_file = temp.path().join("removed.nbt");
+        std::fs::write(
+            &created_file,
+            native_persistence::nbt::write(&created).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &removed_file,
+            native_persistence::nbt::write(&removed).unwrap(),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ChestLifecycleDraftOracle")
+                .arg(&created_file)
+                .arg(&removed_file),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java chest draft oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

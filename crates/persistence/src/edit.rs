@@ -32,6 +32,14 @@ pub struct BlockEntityChange {
     pub replacement: Tag,
 }
 
+/// A block entity added, removed, or replaced in an incomplete chunk draft.
+/// `None` asserts that the position was empty before or after the change.
+#[derive(Clone, Debug)]
+pub struct BlockEntityMutation {
+    pub expected: Option<Tag>,
+    pub replacement: Option<Tag>,
+}
+
 /// One saved light layer, with an exact pre-edit source for stale-data checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightLayerChange {
@@ -228,6 +236,111 @@ impl ChunkDraft {
             }
         }
         ensure!(replacements.is_empty(), "edited block entity is missing");
+        self.document = document;
+        self.uncoordinated_block_entities = true;
+        Ok(())
+    }
+
+    /// Stage additions and removals without authorizing a world write. The
+    /// caller must separately account for the block, inventory and drops.
+    pub fn stage_block_entity_mutations(&mut self, changes: &[BlockEntityMutation]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let position = |entity: &Tag| -> Result<(i32, i32, i32)> {
+            let coordinate = |name| match unique_field(entity, name)? {
+                Some(Tag::Int(value)) => Ok(*value),
+                _ => bail!("block entity has an invalid {name} coordinate"),
+            };
+            ensure!(
+                matches!(unique_field(entity, "id")?, Some(Tag::String(id)) if !id.0.is_empty()),
+                "block entity has an invalid id"
+            );
+            Ok((coordinate("x")?, coordinate("y")?, coordinate("z")?))
+        };
+        let mut pending = BTreeMap::new();
+        for change in changes {
+            let pos = position(
+                change
+                    .expected
+                    .as_ref()
+                    .or(change.replacement.as_ref())
+                    .context("empty block entity mutation")?,
+            )?;
+            for entity in [change.expected.as_ref(), change.replacement.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                ensure!(position(entity)? == pos, "block entity coordinates changed");
+            }
+            ensure!(
+                pos.0.div_euclid(16) == self.position.x && pos.2.div_euclid(16) == self.position.z,
+                "block entity is outside its chunk"
+            );
+            ensure!(
+                pending.insert(pos, change).is_none(),
+                "duplicate block entity mutation"
+            );
+        }
+        let mut document = self.document.clone();
+        if unique_field(&document.value, "block_entities")?.is_none() {
+            let Tag::Compound(fields) = &mut document.value else {
+                bail!("chunk is not a compound")
+            };
+            fields.push((
+                "block_entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: Vec::new(),
+                },
+            ));
+        }
+        let Some(Tag::List {
+            element_type,
+            values,
+        }) = unique_field_mut(&mut document.value, "block_entities")?
+        else {
+            bail!("chunk block entities are not a list")
+        };
+        ensure!(
+            *element_type == TagType::Compound || values.is_empty(),
+            "block entities must be a compound list"
+        );
+        let mut positions = BTreeSet::new();
+        let mut result = Vec::with_capacity(values.len() + pending.len());
+        for entity in values.iter() {
+            let pos = position(entity)?;
+            ensure!(
+                pos.0.div_euclid(16) == self.position.x && pos.2.div_euclid(16) == self.position.z,
+                "block entity is outside its chunk"
+            );
+            ensure!(positions.insert(pos), "duplicate block entity position");
+            if let Some(change) = pending.remove(&pos) {
+                ensure!(
+                    change.expected.as_ref() == Some(entity),
+                    "block entity changed before edit"
+                );
+                if let Some(replacement) = &change.replacement {
+                    result.push(replacement.clone());
+                }
+            } else {
+                result.push(entity.clone());
+            }
+        }
+        for (_, change) in pending {
+            ensure!(change.expected.is_none(), "edited block entity is missing");
+            result.push(
+                change
+                    .replacement
+                    .as_ref()
+                    .context("empty block entity mutation")?
+                    .clone(),
+            );
+        }
+        if !result.is_empty() {
+            *element_type = TagType::Compound;
+        }
+        *values = result;
         self.document = document;
         self.uncoordinated_block_entities = true;
         Ok(())
@@ -1491,6 +1604,109 @@ mod tests {
         };
         assert_eq!(values, &[replacement, other]);
         assert!(draft.validate_for_write(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn block_entity_creation_removal_and_replacement_are_atomic() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let entity = |x, name: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(name.into())),
+                ("x".into(), Tag::Int(x)),
+                ("y".into(), Tag::Int(-64)),
+                ("z".into(), Tag::Int(32)),
+                ("future".into(), Tag::Int(42)),
+            ])
+        };
+        let a = entity(-16, "minecraft:chest");
+        let b = entity(-15, "minecraft:trapped_chest");
+        let c = entity(-14, "minecraft:chest");
+        let replacement = entity(-15, "minecraft:chest");
+        let mut source = fixture(1, false);
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push((
+            "block_entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![a.clone(), b.clone()],
+            },
+        ));
+        let mut draft = draft_chunk_blocks(&source, pos, &[edit(-16, "minecraft:dirt")]).unwrap();
+        let before = draft.document().clone();
+        let changes = vec![
+            BlockEntityMutation {
+                expected: Some(a.clone()),
+                replacement: None,
+            },
+            BlockEntityMutation {
+                expected: Some(b.clone()),
+                replacement: Some(replacement.clone()),
+            },
+            BlockEntityMutation {
+                expected: None,
+                replacement: Some(c.clone()),
+            },
+        ];
+        let mut stale = changes.clone();
+        stale[1].expected = Some(entity(-15, "example:wrong"));
+        assert!(draft.stage_block_entity_mutations(&stale).is_err());
+        assert_eq!(draft.document(), &before);
+        let mut duplicate = changes.clone();
+        duplicate.push(changes[0].clone());
+        assert!(draft.stage_block_entity_mutations(&duplicate).is_err());
+        assert_eq!(draft.document(), &before);
+        for invalid in [
+            BlockEntityMutation {
+                expected: None,
+                replacement: Some(a.clone()),
+            },
+            BlockEntityMutation {
+                expected: Some(entity(-13, "minecraft:chest")),
+                replacement: None,
+            },
+            BlockEntityMutation {
+                expected: Some(a.clone()),
+                replacement: Some(b.clone()),
+            },
+            BlockEntityMutation {
+                expected: None,
+                replacement: Some(entity(0, "minecraft:chest")),
+            },
+            BlockEntityMutation {
+                expected: None,
+                replacement: None,
+            },
+        ] {
+            assert!(draft.stage_block_entity_mutations(&[invalid]).is_err());
+            assert_eq!(draft.document(), &before);
+        }
+        draft.stage_block_entity_mutations(&changes).unwrap();
+        let Some(Tag::List { values, .. }) = draft.document().value.get("block_entities") else {
+            panic!()
+        };
+        assert_eq!(values, &[replacement, c]);
+        assert!(draft.matches_source(&source).unwrap());
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+
+        let source = fixture(1, false);
+        let mut empty = draft_chunk_blocks(&source, pos, &[]).unwrap();
+        empty
+            .stage_block_entity_mutations(&[BlockEntityMutation {
+                expected: None,
+                replacement: Some(a.clone()),
+            }])
+            .unwrap();
+        let Some(Tag::List {
+            element_type,
+            values,
+        }) = empty.document().value.get("block_entities")
+        else {
+            panic!()
+        };
+        assert_eq!(*element_type, TagType::Compound);
+        assert_eq!(values, &[a]);
     }
 
     #[test]

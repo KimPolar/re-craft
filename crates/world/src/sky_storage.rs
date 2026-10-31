@@ -576,6 +576,8 @@ mod tests {
         assert_eq!(cases.len(), 2);
         let bounds = LightBounds::new(0, 64).unwrap();
         for (roof, case) in [false, true].into_iter().zip(cases) {
+            assert_eq!(case["above"], serde_json::json!([15, 15, 15, 15]));
+            assert_eq!(case["noSky"], serde_json::json!([0, 0, 0, 0]));
             let mut world = fixture(roof);
             for row in case["layers"].as_array().unwrap() {
                 let pos = ChunkPos {

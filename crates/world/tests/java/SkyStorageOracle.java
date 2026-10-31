@@ -51,6 +51,13 @@ public class SkyStorageOracle implements LightChunkGetter, BlockGetter {
         for (int x=-2;x<=2;x++) for (int z=-2;z<=2;z++) engine.propagateLightSources(new ChunkPos(x,z));
         while (engine.hasLightWork()) engine.runLightUpdates();
         var listener = engine.getLayerListener(LightLayer.SKY);
+        var noSky = new LevelLightEngine(world,false,false).getLayerListener(LightLayer.SKY);
+        var above = new JsonArray();
+        var noSkyValues = new JsonArray();
+        for (int y : new int[]{80, 81, 320, 1000}) {
+            above.add(listener.getLightValue(new BlockPos(8,y,8)));
+            noSkyValues.add(noSky.getLightValue(new BlockPos(8,y,8)));
+        }
         var layers = new JsonArray();
         for (int x=-2;x<=2;x++) for (int z=-2;z<=2;z++) for (int sy=-1;sy<=4;sy++) {
             var data = listener.getDataLayerData(SectionPos.of(x,sy,z));
@@ -70,7 +77,7 @@ public class SkyStorageOracle implements LightChunkGetter, BlockGetter {
         while (engine.hasLightWork()) engine.runLightUpdates();
         var after = new JsonArray();
         for (int y=-16;y<80;y++) for (int z=0;z<16;z++) for (int x=0;x<16;x++) after.add(listener.getLightValue(new BlockPos(x,y,z)));
-        var result = new JsonObject(); result.add("layers",layers); result.add("grid",grid); result.add("after",after); return result;
+        var result = new JsonObject(); result.add("layers",layers); result.add("grid",grid); result.add("after",after); result.add("above",above); result.add("noSky",noSkyValues); return result;
     }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();

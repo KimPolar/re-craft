@@ -409,6 +409,7 @@ mod tests {
                 },
             )])),
             sea_level: Some(63),
+            has_skylight: Some(true),
             min_y: 0,
             max_y: 32,
         });

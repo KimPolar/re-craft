@@ -13,6 +13,7 @@ pub struct WeatherTerrain {
     pub heightmaps: Arc<BTreeMap<ChunkPos, Arc<SpawnHeightmaps>>>,
     pub climates: Arc<BTreeMap<String, BiomeClimate>>,
     pub sea_level: Option<i32>,
+    pub has_skylight: Option<bool>,
     pub min_y: i32,
     pub max_y: i32,
 }

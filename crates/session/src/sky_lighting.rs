@@ -42,6 +42,7 @@ struct Reply {
 #[derive(Default)]
 pub(crate) struct SkyLighting {
     enabled: bool,
+    configured: bool,
     generation: u64,
     failed_generation: Option<u64>,
     retry_delay: u8,
@@ -55,12 +56,16 @@ pub(crate) struct SkyLighting {
 }
 
 impl SkyLighting {
+    pub(crate) fn capability(&self) -> Option<bool> {
+        self.configured.then_some(self.enabled)
+    }
     pub(crate) fn is_current(&self) -> bool {
         self.enabled && self.pending.is_empty()
     }
 
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        self.configured = true;
         self.invalidate();
     }
 

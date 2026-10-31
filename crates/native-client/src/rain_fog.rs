@@ -3,8 +3,17 @@
 use glam::DVec3;
 use native_session::WorldSnapshot;
 
-/// Return no sample when the loaded snapshot lacks the camera's biome or sky light.
+/// Return no sample when the loaded snapshot lacks inputs needed for the target.
 pub fn inputs(snapshot: &WorldSnapshot, camera: DVec3, partial: f32) -> Option<(f32, u8, bool)> {
+    let rain = snapshot.weather?.rain_at(partial);
+    // The other inputs cannot affect a zero target.
+    if rain == 0.0 {
+        return Some((rain, 0, false));
+    }
+    let terrain = snapshot.weather_terrain.as_ref()?;
+    if terrain.has_skylight == Some(false) {
+        return Some((rain, 0, false));
+    }
     if !camera.is_finite() {
         return None;
     }
@@ -15,8 +24,20 @@ pub fn inputs(snapshot: &WorldSnapshot, camera: DVec3, partial: f32) -> Option<(
         return None;
     }
     let position = floor.as_ivec3();
-    let terrain = snapshot.weather_terrain.as_ref()?;
     let world = snapshot.world.loaded()?;
+    let light = if terrain.has_skylight == Some(true)
+        && terrain
+            .max_y
+            .checked_add(16)
+            .is_some_and(|end| position.y >= end)
+    {
+        15
+    } else {
+        world.light(position.x, position.y, position.z, true)?
+    };
+    if light <= 8 {
+        return Some((rain, light, false));
+    }
     let biome = world.biome_at_block_in_bounds(
         position.x,
         position.y,
@@ -25,8 +46,7 @@ pub fn inputs(snapshot: &WorldSnapshot, camera: DVec3, partial: f32) -> Option<(
         terrain.max_y,
     )?;
     let precipitation = terrain.climates.get(biome)?.has_precipitation;
-    let light = world.light(position.x, position.y, position.z, true)?;
-    Some((snapshot.weather?.rain_at(partial), light, precipitation))
+    Some((rain, light, precipitation))
 }
 
 #[derive(Default)]
@@ -101,6 +121,7 @@ mod tests {
                 },
             )])),
             sea_level: Some(63),
+            has_skylight: Some(true),
             min_y: 0,
             max_y: 16,
         });
@@ -110,7 +131,23 @@ mod tests {
         );
         assert_eq!(inputs(&snapshot, DVec3::new(100.0, 8.5, 8.5), 0.5), None);
         assert_eq!(inputs(&snapshot, DVec3::new(f64::NAN, 8.5, 8.5), 0.5), None);
+        assert_eq!(
+            inputs(&snapshot, DVec3::new(8.5, 40.0, 8.5), 0.5),
+            Some((0.6, 15, false))
+        );
+        snapshot.weather_terrain.as_mut().unwrap().has_skylight = None;
         assert_eq!(inputs(&snapshot, DVec3::new(8.5, 40.0, 8.5), 0.5), None);
+        snapshot.weather_terrain.as_mut().unwrap().has_skylight = Some(false);
+        assert_eq!(
+            inputs(&snapshot, DVec3::new(8.5, 40.0, 8.5), 0.5),
+            Some((0.6, 0, false))
+        );
+        snapshot.weather = Some(WeatherVisual::default());
+        snapshot.weather_terrain = None;
+        assert_eq!(
+            inputs(&snapshot, DVec3::new(100.0, 8.0, 8.0), 0.5),
+            Some((0.0, 0, false))
+        );
     }
 
     #[test]

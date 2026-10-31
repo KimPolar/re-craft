@@ -2850,6 +2850,7 @@ impl LoadedSession {
             heightmaps: Arc::clone(&self.spawn_heightmaps),
             climates: Arc::clone(self.biome_climates.as_ref()?),
             sea_level: self.generator_sea_level,
+            has_skylight: self.sky_lighting.capability(),
             min_y: self.bounds.min_y,
             max_y: self.bounds.max_y,
         })
@@ -13960,6 +13961,24 @@ mod tests {
             fast.snapshot().weather,
             Some(crate::weather::WeatherVisual::default())
         );
+    }
+
+    #[test]
+    fn weather_snapshot_reports_configured_skylight_capability() {
+        let mut session = session();
+        session.set_precipitation_environment(Arc::new(BTreeMap::new()), None);
+        session.publish_initial_weather_terrain().unwrap();
+        let unknown = session.snapshot();
+        assert_eq!(unknown.weather_terrain.as_ref().unwrap().has_skylight, None);
+        session.set_has_skylight(false).unwrap();
+        session.publish_initial_weather_terrain().unwrap();
+        let no_sky = session.snapshot();
+        assert_eq!(no_sky.weather_terrain.as_ref().unwrap().has_skylight, Some(false));
+        session.set_has_skylight(true).unwrap();
+        session.publish_initial_weather_terrain().unwrap();
+        assert_eq!(session.snapshot().weather_terrain.as_ref().unwrap().has_skylight, Some(true));
+        assert_eq!(unknown.weather_terrain.as_ref().unwrap().has_skylight, None);
+        assert_eq!(no_sky.weather_terrain.as_ref().unwrap().has_skylight, Some(false));
     }
 
     #[test]

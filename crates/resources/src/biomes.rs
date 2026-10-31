@@ -3,7 +3,7 @@
 //! World data packs can replace these definitions. Callers must not mistake these
 //! built-in colors for the world's fully resolved dynamic biome registry.
 
-use std::io::Cursor;
+use std::{io::Cursor, sync::OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use image::{ImageFormat, RgbaImage};
@@ -88,7 +88,6 @@ impl ColorMaps {
 pub enum GrassModifier {
     None,
     DarkForest,
-    /// The vanilla spatial noise has not been implemented yet.
     Swamp,
 }
 
@@ -174,11 +173,19 @@ impl BiomeColors {
         })
     }
 
-    pub fn grass(&self) -> u32 {
+    pub fn grass_at(&self, x: i32, z: i32) -> u32 {
         match self.grass_modifier {
             GrassModifier::None => self.grass,
             GrassModifier::DarkForest => ((self.grass & 0xfefefe) + 0x28340a) >> 1,
-            GrassModifier::Swamp => 0x6a7039,
+            GrassModifier::Swamp => {
+                static NOISE: OnceLock<native_core::simplex::Simplex2D> = OnceLock::new();
+                let noise = NOISE.get_or_init(|| native_core::simplex::Simplex2D::new(2345, true));
+                if f64::from(noise.sample(f64::from(x) * 0.0225, f64::from(z) * 0.0225)) < -0.1 {
+                    0x4c763c
+                } else {
+                    0x6a7039
+                }
+            }
         }
     }
 }
@@ -225,7 +232,10 @@ mod tests {
         let biome = BiomeColors::from_json(data, &ColorMaps::default()).unwrap();
         assert_eq!(biome.water, 0x3f76e4);
         assert_eq!(biome.foliage, 0xffffff);
-        assert_eq!(biome.grass(), ((0xc0e080 & 0xfefefe) + 0x28340a) >> 1);
+        assert_eq!(
+            biome.grass_at(0, 0),
+            ((0xc0e080 & 0xfefefe) + 0x28340a) >> 1
+        );
         assert!(
             BiomeColors::from_json(
                 br##"{"temperature":0.8,"downfall":0.4,"effects":{"water_color":"#oops"}}"##,

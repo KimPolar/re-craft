@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use glam::{IVec3, Vec3};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use native_resources::{
-    biomes::{BiomeColors, ColorMaps, GrassModifier},
+    biomes::{BiomeColors, ColorMaps},
     blockstates::{self, BlockstateDefinition, ModelChoice},
     geometry::{self, BakedBlockstate, CuboidModel, Direction, Quad, WeightedModel},
     models::ResolvedModel,
@@ -274,15 +274,10 @@ impl PreviewMaterials {
         let mut biome_colors = BTreeMap::new();
         if !biome_ids.is_empty() {
             let maps = ColorMaps::load(provider.inner, &mut warnings);
-            let mut swamp_warned = false;
             for id in biome_ids {
                 let name = world.biome_by_id(id).context("invalid biome ID")?;
                 match BiomeColors::load_world(provider.inner, name, &maps) {
                     Ok(Some(biome)) => {
-                        if biome.grass_modifier == GrassModifier::Swamp && !swamp_warned {
-                            warnings.push("swamp grass color uses an approximation; spatial noise is not implemented".into());
-                            swamp_warned = true;
-                        }
                         biome_colors.insert(name.to_owned(), biome);
                     }
                     Ok(None) => warnings.push(format!(
@@ -1239,7 +1234,7 @@ struct TintCache<'a> {
     world: &'a World,
     biomes: &'a BTreeMap<String, BiomeColors>,
     radius: i32,
-    samples: HashMap<IVec3, [u32; 4]>,
+    samples: HashMap<IVec3, (Option<&'a BiomeColors>, Option<u32>)>,
     rows: HashMap<(IVec3, BiomeTint), [u32; 3]>,
 }
 
@@ -1255,19 +1250,21 @@ impl<'a> TintCache<'a> {
     }
 
     fn sample(&mut self, position: IVec3, kind: BiomeTint) -> u32 {
-        let colors = self.samples.entry(position).or_insert_with(|| {
+        let (biome, grass) = self.samples.entry(position).or_insert_with(|| {
             let biome = self
                 .world
                 .biome_at_block(position.x, position.y, position.z)
                 .and_then(|name| self.biomes.get(name));
-            [
-                biome.map_or(0x91bd5a, BiomeColors::grass),
-                biome.map_or(0x7ab847, |b| b.foliage),
-                biome.map_or(0xae9d77, |b| b.dry_foliage),
-                biome.map_or(0x3f76e4, |b| b.water),
-            ]
+            (biome, None)
         });
-        colors[kind as usize]
+        match kind {
+            BiomeTint::Grass => *grass.get_or_insert_with(|| {
+                biome.map_or(0x91bd5a, |b| b.grass_at(position.x, position.z))
+            }),
+            BiomeTint::Foliage => biome.map_or(0x7ab847, |b| b.foliage),
+            BiomeTint::DryFoliage => biome.map_or(0xae9d77, |b| b.dry_foliage),
+            BiomeTint::Water => biome.map_or(0x3f76e4, |b| b.water),
+        }
     }
 
     fn get(&mut self, position: IVec3, kind: BiomeTint) -> [f32; 3] {
@@ -1482,6 +1479,59 @@ fn missing_model() -> Result<BakedBlockstate> {
 mod tests {
     use super::*;
     use native_world::loaded::{BLOCK_COUNT, Chunk, ChunkPos, Section};
+
+    #[test]
+    fn swamp_grass_and_particles_use_position_before_blending() {
+        let biome = BiomeColors::from_json(
+            br##"{"temperature":0.8,"downfall":0.9,"effects":{"water_color":"#3f76e4","grass_color_modifier":"swamp"}}"##,
+            &ColorMaps::default(),
+        ).unwrap();
+        let biomes = BTreeMap::from([("minecraft:swamp".into(), biome)]);
+        let mut world = World::new("minecraft:overworld");
+        let id = world.intern_biome("minecraft:swamp".into());
+        for x in -3..=3 {
+            for z in -3..=3 {
+                let pos = ChunkPos { x, z };
+                world.chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        block_light_correct: false,
+                        position: pos,
+                        status: None,
+                        sections: BTreeMap::from([(
+                            0,
+                            Arc::new(Section {
+                                blocks: None,
+                                biomes: Some(Box::new([id; native_world::loaded::BIOME_COUNT])),
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )]),
+                    }),
+                );
+            }
+        }
+        let biome = &biomes["minecraft:swamp"];
+        let mut observed = [false; 2];
+        for x in -30..=30 {
+            for z in -30..=30 {
+                let position = IVec3::new(x, 0, z);
+                let color = biome.grass_at(x, z);
+                observed[usize::from(color == 0x4c763c)] = true;
+                let mut cache = TintCache::new(&world, &biomes, 2);
+                let expected =
+                    native_world::biome_blend::blend(position, 2, |p| biome.grass_at(p.x, p.z));
+                assert_eq!(cache.get(position, BiomeTint::Grass), rgb(expected));
+                if x % 15 == 0 && z % 15 == 0 {
+                    assert_eq!(
+                        grass_particle_tint(&world, &biomes, position, 2),
+                        rgb(expected).map(|component| component * 0.6)
+                    );
+                }
+            }
+        }
+        assert_eq!(observed, [true, true]);
+    }
     use std::sync::Arc;
 
     fn fixture_dimension(path: &str) -> Option<Vec<u8>> {

@@ -140,6 +140,12 @@ pub struct PartialSessionSaveDraft {
     player_and_terrain: PlayerWorldDraft,
     entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
     clocks: WorldClockDraft,
+    weather: Option<WeatherSaveDraft>,
+}
+
+struct WeatherSaveDraft {
+    source: Option<native_persistence::nbt::NamedTag>,
+    weather: native_persistence::world::SavedWeather,
 }
 
 /// A partial same-tick snapshot including all recorded POI block transitions.
@@ -215,6 +221,9 @@ impl PartialSessionSaveDraft {
         let (player, chunks) = self.player_and_terrain.into_parts();
         player.add_to_save_plan(&mut plan, uuid, player_source)?;
         self.clocks.add_to_save_plan(&mut plan, clock_source)?;
+        if let Some(weather) = &self.weather {
+            plan.add_weather(weather.source.as_ref(), weather.weather)?;
+        }
         for (position, draft) in &self.entity_chunks {
             draft.add_to_save_plan(
                 &mut plan,
@@ -314,6 +323,7 @@ pub struct LoadedSession {
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
     weather: Option<crate::weather::Weather>,
+    weather_source: Option<Option<native_persistence::nbt::NamedTag>>,
     can_have_weather: Option<bool>,
     advance_weather: bool,
     game_time: i64,
@@ -1679,11 +1689,31 @@ impl LoadedSession {
             self.draft_player_and_dirty_chunks(player, terrain, tags, air_and_fluid)?;
         let entity_chunks = self.draft_tracked_entity_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
+        anyhow::ensure!(
+            self.can_have_weather != Some(true) || self.weather.is_some(),
+            "saved weather is unavailable for this dimension"
+        );
         Ok(PartialSessionSaveDraft {
             dimension: native_persistence::world::DimensionId::parse(&self.world.dimension)?,
             player_and_terrain,
             entity_chunks,
             clocks,
+            weather: if let Some(weather) = &self.weather {
+                Some(WeatherSaveDraft {
+                    source: self
+                        .weather_source
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "saved weather source was not captured at session start"
+                            )
+                        })?
+                        .clone(),
+                    weather: weather.data,
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -2833,9 +2863,37 @@ impl LoadedSession {
     ) {
         self.can_have_weather = can_have_weather;
         self.weather = data.map(crate::weather::Weather::new);
+        self.weather_source = None;
         self.advance_weather = advance_weather;
         let visual = self.weather_visual();
         Arc::make_mut(&mut self.snapshot).weather = visual;
+    }
+
+    /// Capture the exact document (or its absence) before any weather ticks.
+    pub fn capture_weather_source(
+        &mut self,
+        source: Option<&native_persistence::nbt::NamedTag>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "weather source must be captured before simulation begins"
+        );
+        anyhow::ensure!(
+            self.weather_source.is_none(),
+            "weather source was already captured"
+        );
+        let expected = source
+            .map(native_persistence::world::parse_weather_data)
+            .transpose()?
+            .unwrap_or_default();
+        anyhow::ensure!(
+            self.weather
+                .as_ref()
+                .is_some_and(|weather| weather.data == expected),
+            "weather source differs from the initialized state"
+        );
+        self.weather_source = Some(source.cloned());
+        Ok(())
     }
 
     fn weather_visual(&self) -> Option<crate::weather::WeatherVisual> {
@@ -3169,6 +3227,7 @@ impl LoadedSession {
             farmland_maintainers: None,
             farmland_water_tag: None,
             weather: None,
+            weather_source: None,
             can_have_weather: None,
             advance_weather: true,
             game_time: 0,
@@ -13973,12 +14032,26 @@ mod tests {
         session.set_has_skylight(false).unwrap();
         session.publish_initial_weather_terrain().unwrap();
         let no_sky = session.snapshot();
-        assert_eq!(no_sky.weather_terrain.as_ref().unwrap().has_skylight, Some(false));
+        assert_eq!(
+            no_sky.weather_terrain.as_ref().unwrap().has_skylight,
+            Some(false)
+        );
         session.set_has_skylight(true).unwrap();
         session.publish_initial_weather_terrain().unwrap();
-        assert_eq!(session.snapshot().weather_terrain.as_ref().unwrap().has_skylight, Some(true));
+        assert_eq!(
+            session
+                .snapshot()
+                .weather_terrain
+                .as_ref()
+                .unwrap()
+                .has_skylight,
+            Some(true)
+        );
         assert_eq!(unknown.weather_terrain.as_ref().unwrap().has_skylight, None);
-        assert_eq!(no_sky.weather_terrain.as_ref().unwrap().has_skylight, Some(false));
+        assert_eq!(
+            no_sky.weather_terrain.as_ref().unwrap().has_skylight,
+            Some(false)
+        );
     }
 
     #[test]
@@ -24775,6 +24848,100 @@ mod tests {
             .unwrap();
         assert_eq!(plan.chunk_count(), 1);
         assert_eq!(plan.poi_chunk_count(), 1);
+    }
+
+    #[test]
+    fn combined_draft_keeps_exact_weather_source_and_tick_state() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            world::{SavedWeather, WorldReader},
+        };
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+            ]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        session.set_weather(Some(true), None, true);
+        assert!(
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &test_heightmap_tags(),
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+        session.set_weather(Some(true), Some(SavedWeather::default()), true);
+        let wrong = WorldReader::update_weather_document(
+            None,
+            SavedWeather {
+                raining: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(session.capture_weather_source(Some(&wrong)).is_err());
+        assert!(
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &test_heightmap_tags(),
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+        session.capture_weather_source(None).unwrap();
+        assert!(session.capture_weather_source(None).is_err());
+        session.update(TICK);
+        let state = session.weather.as_ref().unwrap().data;
+        let draft = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        let weather = draft.weather.as_ref().unwrap();
+        assert_eq!(weather.weather, state);
+        assert!(weather.source.is_none());
+        let plan = draft
+            .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
+            .unwrap();
+        assert!(plan.has_weather());
+        assert!(session.capture_weather_source(None).is_err());
+        let mut existing = self::session();
+        existing.set_weather(Some(true), Some(SavedWeather::default()), false);
+        let mut source =
+            WorldReader::update_weather_document(None, SavedWeather::default()).unwrap();
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("unknown".into(), Tag::Int(7)));
+        existing.capture_weather_source(Some(&source)).unwrap();
+        assert_eq!(
+            existing.weather_source.as_ref().unwrap().as_ref(),
+            Some(&source)
+        );
     }
 
     #[test]

@@ -897,8 +897,15 @@ fn prepare_existing_world(
             };
         }
         let weather = if can_weather == Some(true) {
-            match reader.weather_data() {
-                Ok(weather) => Some(weather),
+            match reader.weather_document() {
+                Ok(source) => {
+                    let data = source
+                        .as_ref()
+                        .map(native_persistence::world::parse_weather_data)
+                        .transpose()?
+                        .unwrap_or_default();
+                    Some((data, source))
+                }
                 Err(error) => {
                     eprintln!("Saved weather is unavailable: {error:#}");
                     None
@@ -907,7 +914,14 @@ fn prepare_existing_world(
         } else {
             None
         };
-        session.set_weather(can_weather, weather, rules.advance_weather);
+        session.set_weather(
+            can_weather,
+            weather.as_ref().map(|(data, _)| *data),
+            rules.advance_weather,
+        );
+        if let Some((_, source)) = &weather {
+            session.capture_weather_source(source.as_ref())?;
+        }
         if can_weather == Some(true) {
             let climates = native_resources::biome_climate::load_world_climates(&mut resources);
             let sea_level = reader.saved_dimension_generators().and_then(|saved| {

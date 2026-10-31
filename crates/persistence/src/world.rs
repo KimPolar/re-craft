@@ -1538,7 +1538,7 @@ fn read_region_document(
     reader.read_chunk(x, z)
 }
 
-fn decode_poi_chunk(document: NamedTag, expected: ChunkPos) -> Result<SavedPoiChunk> {
+pub(crate) fn decode_poi_chunk(document: NamedTag, expected: ChunkPos) -> Result<SavedPoiChunk> {
     use crate::nbt::TagType;
     fn field<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
         let Tag::Compound(fields) = tag else {

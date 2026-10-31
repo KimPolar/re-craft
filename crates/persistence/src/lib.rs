@@ -3,6 +3,7 @@ pub mod edit;
 pub mod heightmap;
 pub mod nbt;
 pub mod palette;
+pub mod poi;
 pub mod save;
 mod save_transaction;
 pub mod snbt;

@@ -413,6 +413,16 @@ public class PoiOracle {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var home = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.HOME);
     var ops = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
+    if (args.length > 1) {
+      var root = NbtIo.read(Path.of(args[1]));
+      var sections = (CompoundTag)root.get("Sections");
+      var section = PoiSection.Packed.CODEC.parse(ops, sections.get("-1")).getOrThrow();
+      if (!section.isValid() || section.records().size() != 1) throw new AssertionError("wrong section");
+      var record = section.records().getFirst();
+      if (!record.pos().equals(new BlockPos(-2,-2,1)) || !record.poiType().getRegisteredName().equals("minecraft:meeting") || record.freeTickets() != 32)
+        throw new AssertionError("wrong drafted POI " + record);
+      return;
+    }
     var first = new PoiSection.Packed(true, List.of(new PoiRecord.Packed(new BlockPos(-1,-1,0), home, 1)));
     var second = new PoiSection.Packed(false, List.of(new PoiRecord.Packed(new BlockPos(-16,3,15), home, 0)));
     var sections = new CompoundTag();
@@ -462,6 +472,42 @@ public class PoiOracle {
         assert_eq!(section.records[0].type_id, "minecraft:home".into());
         assert_eq!(section.records[0].free_tickets, free);
     }
+    use native_persistence::poi::{PoiBlockChange, draft_block_changes};
+    use native_world::loaded::BlockState;
+    let state = |name: &str, properties: &[(&str, &str)]| BlockState {
+        name: format!("minecraft:{name}"),
+        properties: properties
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect(),
+    };
+    let draft = draft_block_changes(
+        &chunk,
+        &[
+            PoiBlockChange {
+                position: [-1, -1, 0],
+                expected: state("red_bed", &[("part", "head")]),
+                replacement: state("air", &[]),
+            },
+            PoiBlockChange {
+                position: [-2, -2, 1],
+                expected: state("air", &[]),
+                replacement: state("bell", &[]),
+            },
+        ],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let edited = temp.path().join("edited-poi.nbt");
+    std::fs::write(&edited, nbt::write(draft.document()).unwrap()).unwrap();
+    run_checked(
+        Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("PoiOracle")
+            .arg(temp.path())
+            .arg(&edited),
+    );
 }
 
 #[test]

@@ -1289,10 +1289,34 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
 
 /// Replay known food-applied hunger effects at the point they occurred between
 /// base ticks. Unknown effect data still prevents a draft from being written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HungerUpdate {
+    pub tick: u64,
+    pub duration: i32,
+    pub amplifier: u8,
+    pub ambient: bool,
+    pub visible: bool,
+    pub show_icon: bool,
+}
+
+impl HungerUpdate {
+    #[cfg(test)]
+    fn rotten_flesh(tick: u64) -> Self {
+        Self {
+            tick,
+            duration: 600,
+            amplifier: 0,
+            ambient: false,
+            visible: true,
+            show_icon: true,
+        }
+    }
+}
+
 pub fn replay_saved_hunger_effects(
     player: &NamedTag,
     ticks: u64,
-    hunger_updates: &[u64],
+    hunger_updates: &[HungerUpdate],
 ) -> Result<Option<Tag>> {
     fn as_player(effects: Option<Tag>) -> NamedTag {
         NamedTag {
@@ -1306,15 +1330,21 @@ pub fn replay_saved_hunger_effects(
         }
     }
 
-    fn new_hunger(root: bool) -> Tag {
-        let mut fields = vec![("duration".into(), Tag::Int(600))];
+    fn new_hunger(root: bool, update: HungerUpdate) -> Tag {
+        let mut fields = vec![
+            ("duration".into(), Tag::Int(update.duration)),
+            ("amplifier".into(), Tag::Byte(update.amplifier as i8)),
+            ("ambient".into(), Tag::Byte(i8::from(update.ambient))),
+            ("show_particles".into(), Tag::Byte(i8::from(update.visible))),
+            ("show_icon".into(), Tag::Byte(i8::from(update.show_icon))),
+        ];
         if root {
             fields.insert(0, ("id".into(), Tag::String("minecraft:hunger".into())));
         }
         Tag::Compound(fields)
     }
 
-    fn merge(effect: &mut Tag, depth: usize) -> Result<()> {
+    fn merge(effect: &mut Tag, depth: usize, update: HungerUpdate) -> Result<()> {
         ensure!(depth <= 256, "status effect nesting is too deep");
         let duration = match effect.get("duration") {
             Some(Tag::Int(value)) => *value,
@@ -1326,31 +1356,56 @@ pub fn replay_saved_hunger_effects(
             None => 0,
             _ => bail!("invalid hunger amplifier"),
         };
-        if duration != -1 && duration < 600 {
-            if amplifier == 0 {
-                set_field(effect, "duration", Some(Tag::Int(600)))?;
+        let shorter = |left: i32, right: i32| left != -1 && (right == -1 || left < right);
+        let mut changed = false;
+        if update.amplifier > amplifier {
+            if shorter(update.duration, duration) {
+                ensure!(depth < 256, "status effect nesting is too deep");
+                let mut previous = effect.clone();
+                set_field(&mut previous, "id", None)?;
+                set_field(effect, "hidden_effect", Some(previous))?;
+            }
+            set_field(effect, "duration", Some(Tag::Int(update.duration)))?;
+            set_field(effect, "amplifier", Some(Tag::Byte(update.amplifier as i8)))?;
+            changed = true;
+        } else if shorter(duration, update.duration) {
+            if amplifier == update.amplifier {
+                set_field(effect, "duration", Some(Tag::Int(update.duration)))?;
+                changed = true;
             } else if let Some(mut hidden) = effect.get("hidden_effect").cloned() {
-                merge(&mut hidden, depth + 1)?;
+                merge(&mut hidden, depth + 1, update)?;
                 set_field(effect, "hidden_effect", Some(hidden))?;
             } else {
                 ensure!(depth < 256, "status effect nesting is too deep");
-                set_field(effect, "hidden_effect", Some(new_hunger(false)))?;
+                set_field(effect, "hidden_effect", Some(new_hunger(false, update)))?;
             }
         }
-        // Food-created effects are non-ambient, visible and show their icon.
-        set_field(effect, "ambient", Some(Tag::Byte(0)))?;
-        set_field(effect, "show_particles", Some(Tag::Byte(1)))?;
-        set_field(effect, "show_icon", Some(Tag::Byte(1)))?;
+        let was_ambient = matches!(effect.get("ambient"), Some(Tag::Byte(1)));
+        if (!update.ambient && was_ambient) || changed {
+            set_field(effect, "ambient", Some(Tag::Byte(i8::from(update.ambient))))?;
+        }
+        set_field(
+            effect,
+            "show_particles",
+            Some(Tag::Byte(i8::from(update.visible))),
+        )?;
+        set_field(
+            effect,
+            "show_icon",
+            Some(Tag::Byte(i8::from(update.show_icon))),
+        )?;
         Ok(())
     }
 
     let mut effects = advance_saved_effects(player, 0)?;
     let mut elapsed = 0;
-    for &event_tick in hunger_updates {
+    for &update in hunger_updates {
+        let event_tick = update.tick;
         ensure!(
             event_tick >= elapsed && event_tick <= ticks,
             "invalid hunger update order"
         );
+        ensure!(update.duration >= -1, "unsupported hunger duration");
         effects = advance_saved_effects(&as_player(effects), event_tick - elapsed)?;
         let mut list = effects.unwrap_or(Tag::List {
             element_type: TagType::Compound,
@@ -1371,9 +1426,9 @@ pub fn replay_saved_hunger_effects(
                 .and_then(|id| ResourceId::parse(&id).ok())
                 .is_some_and(|id| id.namespace == "minecraft" && id.path == "hunger")
         }) {
-            merge(effect, 0)?;
+            merge(effect, 0, update)?;
         } else {
-            values.push(new_hunger(true));
+            values.push(new_hunger(true, update));
         }
         effects = Some(list);
         elapsed = event_tick;
@@ -1999,8 +2054,17 @@ mod tests {
             name: "".into(),
             value: Tag::Compound(vec![]),
         };
-        assert!(replay_saved_hunger_effects(&original, 3, &[2, 1]).is_err());
-        assert!(replay_saved_hunger_effects(&original, 3, &[4]).is_err());
+        assert!(
+            replay_saved_hunger_effects(
+                &original,
+                3,
+                &[HungerUpdate::rotten_flesh(2), HungerUpdate::rotten_flesh(1)]
+            )
+            .is_err()
+        );
+        assert!(
+            replay_saved_hunger_effects(&original, 3, &[HungerUpdate::rotten_flesh(4)]).is_err()
+        );
         let invalid = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![(
@@ -2014,7 +2078,9 @@ mod tests {
                 },
             )]),
         };
-        assert!(replay_saved_hunger_effects(&invalid, 3, &[1]).is_err());
+        assert!(
+            replay_saved_hunger_effects(&invalid, 3, &[HungerUpdate::rotten_flesh(1)]).is_err()
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -2100,7 +2166,12 @@ mod tests {
                             .collect(),
                     ),
                 };
-                let output = replay_saved_hunger_effects(&original, ticks, &events).unwrap();
+                let updates = events
+                    .iter()
+                    .copied()
+                    .map(HungerUpdate::rotten_flesh)
+                    .collect::<Vec<_>>();
+                let output = replay_saved_hunger_effects(&original, ticks, &updates).unwrap();
                 let draft = NamedTag {
                     name: "".into(),
                     value: Tag::Compound(
@@ -2122,6 +2193,77 @@ mod tests {
                 )
                 .unwrap();
                 input.push(serde_json::json!({"ticks":ticks,"events":events}));
+            }
+        }
+        for duration in [-1, 8, 40, 800] {
+            for amplifier in [0, 1, 3] {
+                for visible in [false, true] {
+                    let original = NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![(
+                            "active_effects".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("id".into(), Tag::String("minecraft:hunger".into())),
+                                    ("duration".into(), Tag::Int(duration)),
+                                    ("amplifier".into(), Tag::Byte(amplifier)),
+                                    ("ambient".into(), Tag::Byte(1)),
+                                    ("show_particles".into(), Tag::Byte(i8::from(visible))),
+                                ])],
+                            },
+                        )]),
+                    };
+                    let updates = [
+                        HungerUpdate {
+                            tick: 0,
+                            duration: 10,
+                            amplifier: 2,
+                            ambient: true,
+                            visible: false,
+                            show_icon: false,
+                        },
+                        HungerUpdate {
+                            tick: 3,
+                            duration: 200,
+                            amplifier: 0,
+                            ambient: false,
+                            visible: true,
+                            show_icon: false,
+                        },
+                        HungerUpdate {
+                            tick: 15,
+                            duration: -1,
+                            amplifier: 1,
+                            ambient: true,
+                            visible: true,
+                            show_icon: true,
+                        },
+                    ];
+                    let effects = replay_saved_hunger_effects(&original, 50, &updates).unwrap();
+                    let draft = NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(
+                            effects
+                                .map(|value| ("active_effects".into(), value))
+                                .into_iter()
+                                .collect(),
+                        ),
+                    };
+                    let index = input.len();
+                    std::fs::write(
+                        temp.path().join(format!("source{index}.nbt")),
+                        native_persistence::nbt::write(&original).unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        temp.path().join(format!("draft{index}.nbt")),
+                        native_persistence::nbt::write(&draft).unwrap(),
+                    )
+                    .unwrap();
+                    let events: Vec<_> = updates.iter().map(|event| serde_json::json!({"tick":event.tick,"duration":event.duration,"amplifier":event.amplifier,"ambient":event.ambient,"visible":event.visible,"show_icon":event.show_icon})).collect();
+                    input.push(serde_json::json!({"ticks":50,"events":events}));
+                }
             }
         }
         let cases = temp.path().join("cases.json");

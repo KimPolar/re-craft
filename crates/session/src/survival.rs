@@ -14,6 +14,7 @@ pub struct FoodProperties {
     pub saturation: f32,
     pub use_ticks: i32,
     pub can_always_eat: bool,
+    pub consume_particles: bool,
 }
 
 pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
@@ -42,6 +43,7 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         saturation: nutrition as f32 * modifier * 2.0,
         use_ticks: if id == "minecraft:dried_kelp" { 16 } else { 32 },
         can_always_eat: false,
+        consume_particles: true,
     })
 }
 
@@ -74,13 +76,137 @@ pub(crate) fn custom_food(value: &Tag) -> Option<(i32, f32, bool)> {
     Some((nutrition?, saturation?, always.unwrap_or(false)))
 }
 
-/// Effect-free consumables with ordinary eating animation. Unsupported
-/// effects/remainders must not be discarded.
-pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<i32> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HungerApplication {
+    pub duration: i32,
+    pub amplifier: u8,
+    pub ambient: bool,
+    pub visible: bool,
+    pub show_icon: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HungerGroup {
+    probability: f32,
+    effects: Vec<HungerApplication>,
+}
+
+#[derive(Clone, Debug)]
+struct CustomConsumable {
+    ticks: i32,
+    particles: bool,
+    hunger: Vec<HungerGroup>,
+}
+
+fn parse_hunger_effect(value: &Tag) -> Option<HungerApplication> {
     let Tag::Compound(fields) = value else {
         return None;
     };
-    let (mut seconds, mut animation, mut effects) = (None, false, false);
+    let (mut id, mut duration, mut amplifier, mut ambient, mut visible, mut icon) =
+        (None, None, None, None, None, None);
+    for (name, value) in fields {
+        if name.matches("id") && id.is_none() {
+            let Tag::String(value) = value else {
+                return None;
+            };
+            if !value.matches("minecraft:hunger") && !value.matches("hunger") {
+                return None;
+            }
+            id = Some(());
+        } else if name.matches("duration") && duration.is_none() {
+            duration = value.as_java_int().filter(|value| *value >= -1);
+            duration?;
+        } else if name.matches("amplifier") && amplifier.is_none() {
+            let Tag::Byte(value) = value else { return None };
+            amplifier = Some(*value as u8);
+        } else if name.matches("ambient") && ambient.is_none() {
+            ambient = match value {
+                Tag::Byte(0) => Some(false),
+                Tag::Byte(1) => Some(true),
+                _ => return None,
+            };
+        } else if name.matches("show_particles") && visible.is_none() {
+            visible = match value {
+                Tag::Byte(0) => Some(false),
+                Tag::Byte(1) => Some(true),
+                _ => return None,
+            };
+        } else if name.matches("show_icon") && icon.is_none() {
+            icon = match value {
+                Tag::Byte(0) => Some(false),
+                Tag::Byte(1) => Some(true),
+                _ => return None,
+            };
+        } else {
+            return None;
+        }
+    }
+    id?;
+    let visible = visible.unwrap_or(true);
+    Some(HungerApplication {
+        duration: duration.unwrap_or(0),
+        amplifier: amplifier.unwrap_or(0),
+        ambient: ambient.unwrap_or(false),
+        visible,
+        show_icon: icon.unwrap_or(visible),
+    })
+}
+
+fn parse_hunger_group(value: &Tag, collect: bool) -> Option<HungerGroup> {
+    let Tag::Compound(fields) = value else {
+        return None;
+    };
+    let (mut kind, mut effects, mut probability) = (None, None, None);
+    for (name, value) in fields {
+        if name.matches("type") && kind.is_none() {
+            let Tag::String(value) = value else {
+                return None;
+            };
+            if !value.matches("minecraft:apply_effects") && !value.matches("apply_effects") {
+                return None;
+            }
+            kind = Some(());
+        } else if name.matches("effects") && effects.is_none() {
+            let Tag::List {
+                element_type,
+                values,
+            } = value
+            else {
+                return None;
+            };
+            if *element_type != native_persistence::nbt::TagType::Compound && !values.is_empty() {
+                return None;
+            }
+            let mut result = Vec::new();
+            for value in values {
+                let effect = parse_hunger_effect(value)?;
+                if collect {
+                    result.push(effect);
+                }
+            }
+            effects = Some(result);
+        } else if name.matches("probability") && probability.is_none() {
+            let value = crate::player_data::numeric_double(value)? as f32;
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return None;
+            }
+            probability = Some(value);
+        } else {
+            return None;
+        }
+    }
+    kind?;
+    Some(HungerGroup {
+        probability: probability.unwrap_or(1.0),
+        effects: effects?,
+    })
+}
+
+fn parse_consumable(value: &Tag, collect: bool) -> Option<CustomConsumable> {
+    let Tag::Compound(fields) = value else {
+        return None;
+    };
+    let (mut seconds, mut animation, mut effects, mut particles) = (None, false, None, None);
     for (name, value) in fields {
         if name.matches("consume_seconds") && seconds.is_none() {
             let number = crate::player_data::numeric_double(value)? as f32;
@@ -93,16 +219,44 @@ pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<i32> {
                 return None;
             }
             animation = true;
-        } else if name.matches("on_consume_effects") && !effects {
-            if !matches!(value, Tag::List { values, .. } if values.is_empty()) {
+        } else if name.matches("on_consume_effects") && effects.is_none() {
+            let Tag::List {
+                element_type,
+                values,
+            } = value
+            else {
+                return None;
+            };
+            if *element_type != native_persistence::nbt::TagType::Compound && !values.is_empty() {
                 return None;
             }
-            effects = true;
+            let mut result = Vec::new();
+            for value in values {
+                let group = parse_hunger_group(value, collect)?;
+                if collect {
+                    result.push(group);
+                }
+            }
+            effects = Some(result);
+        } else if name.matches("has_consume_particles") && particles.is_none() {
+            particles = match value {
+                Tag::Byte(0) => Some(false),
+                Tag::Byte(1) => Some(true),
+                _ => return None,
+            };
         } else {
             return None;
         }
     }
-    Some((seconds.unwrap_or(1.6_f32) * 20.0) as i32)
+    Some(CustomConsumable {
+        ticks: (seconds.unwrap_or(1.6_f32) * 20.0) as i32,
+        particles: particles.unwrap_or(true),
+        hunger: effects.unwrap_or_default(),
+    })
+}
+
+pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<i32> {
+    Some(parse_consumable(value, false)?.ticks)
 }
 
 /// Decode a use-remainder item template when its stack behavior is known.
@@ -185,15 +339,22 @@ pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
             (food.nutrition, food.saturation, food.can_always_eat)
         }
     };
-    let use_ticks = match components.get("minecraft:consumable") {
-        Some(consumable) => custom_consumable_ticks(consumable)?,
-        None => default?.use_ticks,
+    let (use_ticks, consume_particles) = match components.get("minecraft:consumable") {
+        Some(consumable) => {
+            let parsed = parse_consumable(consumable, false)?;
+            (parsed.ticks, parsed.particles)
+        }
+        None => {
+            let default = default?;
+            (default.use_ticks, default.consume_particles)
+        }
     };
     Some(FoodProperties {
         nutrition,
         saturation,
         use_ticks,
         can_always_eat,
+        consume_particles,
     })
 }
 
@@ -214,29 +375,43 @@ pub struct FoodUse {
     events: Vec<FoodRandomEvent>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum FoodRandomEvent {
     ParticlePulse(u8),
-    Finish { causes_hunger: bool },
+    Finish {
+        causes_hunger: bool,
+        particles: bool,
+    },
+    HungerGroup {
+        probability: f32,
+        effects: Vec<HungerApplication>,
+    },
 }
 
 impl FoodRandomEvent {
     /// Advance the player's stream for the sound and particle calculations
     /// Java performs even when their visual output is not yet rendered.
-    pub(crate) fn apply(self, random: &mut native_core::random::LegacyRandom) -> bool {
+    pub(crate) fn apply(&self, random: &mut native_core::random::LegacyRandom) -> bool {
         let particles = match self {
-            Self::ParticlePulse(count) => count,
-            Self::Finish { .. } => 16,
+            Self::ParticlePulse(count) => *count,
+            Self::Finish { particles, .. } => {
+                if *particles {
+                    16
+                } else {
+                    0
+                }
+            }
+            Self::HungerGroup { probability, .. } => return random.next_float() < *probability,
         };
         random.next_bool();
         for _ in 0..3 + u32::from(particles) * 4 {
             random.next_float();
         }
-        if let Self::Finish { causes_hunger } = self {
+        if let Self::Finish { causes_hunger, .. } = self {
             for _ in 0..3 {
                 random.next_float();
             }
-            return causes_hunger && random.next_float() < 0.8;
+            return *causes_hunger && random.next_float() < 0.8;
         }
         false
     }
@@ -362,7 +537,9 @@ impl FoodUse {
         let elapsed = active.food.use_ticks - active.remaining;
         let threshold = (active.food.use_ticks as f32 * 0.21875_f32) as i32;
         if elapsed > threshold && active.remaining % 4 == 0 {
-            self.events.push(FoodRandomEvent::ParticlePulse(5));
+            self.events.push(FoodRandomEvent::ParticlePulse(
+                if active.food.consume_particles { 5 } else { 0 },
+            ));
         }
         active.remaining = active.remaining.saturating_sub(1);
         if active.remaining != 0 {
@@ -386,8 +563,23 @@ impl FoodUse {
             item.id() == "minecraft:rotten_flesh"
                 && item.components().get("minecraft:consumable").is_none()
         });
+        let custom_groups = inventory
+            .slot(hand)
+            .and_then(|item| item.components().get("minecraft:consumable"))
+            .and_then(|component| parse_consumable(component, true))
+            .map(|value| value.hunger)
+            .unwrap_or_default();
         if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
-            self.events.push(FoodRandomEvent::Finish { causes_hunger });
+            self.events.push(FoodRandomEvent::Finish {
+                causes_hunger,
+                particles: food.consume_particles,
+            });
+            self.events.extend(custom_groups.into_iter().map(|group| {
+                FoodRandomEvent::HungerGroup {
+                    probability: group.probability,
+                    effects: group.effects,
+                }
+            }));
             vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
             vitals.saturation =
                 (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
@@ -957,6 +1149,7 @@ mod tests {
                 }
                 let expected = FoodRandomEvent::Finish {
                     causes_hunger: !overridden,
+                    particles: true,
                 }
                 .apply(&mut random);
                 assert_eq!(
@@ -1021,6 +1214,303 @@ mod tests {
         );
         assert_eq!(slow_effect, fast_effect);
         assert_eq!(slow_random, fast_random);
+    }
+
+    #[test]
+    fn custom_food_applies_grouped_hunger_effects_and_particle_flag() {
+        let effect = |duration, amplifier| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:hunger".into())),
+                ("duration".into(), Tag::Int(duration)),
+                ("amplifier".into(), Tag::Byte(amplifier)),
+            ])
+        };
+        let group = |probability, effects| {
+            Tag::Compound(vec![
+                ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                ("probability".into(), Tag::Float(probability)),
+                (
+                    "effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: effects,
+                    },
+                ),
+            ])
+        };
+        let component = Tag::Compound(vec![
+            ("consume_seconds".into(), Tag::Float(0.0)),
+            ("has_consume_particles".into(), Tag::Byte(0)),
+            (
+                "on_consume_effects".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: vec![
+                        group(1.0, vec![effect(20, 0), effect(10, 2)]),
+                        group(0.0, vec![effect(900, 3)]),
+                    ],
+                },
+            ),
+        ]);
+        let components = Tag::Compound(vec![("minecraft:consumable".into(), component)]);
+        assert_eq!(saved_item_max("minecraft:apple", &components), Some(64));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, components),
+        );
+        let mut session = LocalSession::demo();
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.update(Duration::from_millis(50));
+        let hunger = session.fall.effects().hunger.as_ref().unwrap();
+        assert_eq!((hunger.duration, hunger.amplifier), (9, 2));
+        assert_eq!(
+            (
+                hunger.hidden.as_ref().unwrap().duration,
+                hunger.hidden.as_ref().unwrap().amplifier
+            ),
+            (19, 0)
+        );
+        assert_eq!(session.snapshot().vitals.food, 14);
+    }
+
+    #[test]
+    fn unsupported_effect_prevents_partial_food_consumption() {
+        let component = Tag::Compound(vec![(
+            "on_consume_effects".into(),
+            Tag::List {
+                element_type: native_persistence::nbt::TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                    (
+                        "effects".into(),
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Compound,
+                            values: vec![
+                                Tag::Compound(vec![(
+                                    "id".into(),
+                                    Tag::String("minecraft:hunger".into()),
+                                )]),
+                                Tag::Compound(vec![(
+                                    "id".into(),
+                                    Tag::String("minecraft:poison".into()),
+                                )]),
+                            ],
+                        },
+                    ),
+                ])],
+            },
+        )]);
+        let components = Tag::Compound(vec![("minecraft:consumable".into(), component)]);
+        assert_eq!(saved_item_max("minecraft:apple", &components), None);
+        let item = ItemStack::new("minecraft:apple".into(), 1, 64, components).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+        let mut inventory = Arc::new(inventory);
+        let mut vitals = PlayerVitals {
+            food: 10,
+            ..Default::default()
+        };
+        let mut usage = FoodUse::default();
+        assert!(!usage.start_hand(
+            &mut inventory,
+            PlayerSlot::Storage(0),
+            &mut vitals,
+            GameMode::Survival
+        ));
+        assert_eq!(vitals.food, 10);
+        assert!(inventory.slot(PlayerSlot::Storage(0)).is_some());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn custom_consumable_hunger_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CustomHungerOracle.java");
+        let output = temp.path().join("custom.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CustomHungerOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("CustomHungerOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let effect = |duration, amplifier| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:hunger".into())),
+                ("duration".into(), Tag::Int(duration)),
+                ("amplifier".into(), Tag::Byte(amplifier)),
+            ])
+        };
+        let group = |probability, effects| {
+            Tag::Compound(vec![
+                ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                ("probability".into(), Tag::Float(probability)),
+                (
+                    "effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: effects,
+                    },
+                ),
+            ])
+        };
+        let mut ambient_effect = effect(-1, 1);
+        if let Tag::Compound(fields) = &mut ambient_effect {
+            fields.push(("ambient".into(), Tag::Byte(1)));
+            fields.push(("show_particles".into(), Tag::Byte(0)));
+        }
+        let cases = [
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                ("has_consume_particles".into(), Tag::Byte(0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            group(1.0, vec![effect(20, 0), effect(10, 2)]),
+                            group(0.0, vec![effect(900, 3)]),
+                        ],
+                    },
+                ),
+            ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            group(0.35, vec![effect(70, 1)]),
+                            group(0.8, vec![effect(300, 0)]),
+                        ],
+                    },
+                ),
+            ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.25)),
+                ("has_consume_particles".into(), Tag::Byte(0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![group(1.0, vec![ambient_effect])],
+                    },
+                ),
+            ]),
+        ];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 120);
+        for row in rows {
+            let case = row["case"].as_u64().unwrap() as usize;
+            let components =
+                Tag::Compound(vec![("minecraft:consumable".into(), cases[case].clone())]);
+            let item = ItemStack::new("minecraft:apple".into(), 1, 64, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            assert!(usage.start_hand(
+                &mut inventory,
+                PlayerSlot::Storage(0),
+                &mut vitals,
+                GameMode::Survival
+            ));
+            for _ in 0..=5 {
+                if usage.is_active() {
+                    usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                }
+            }
+            let mut active: Option<EffectDuration> = None;
+            for event in usage.take_events() {
+                if event.apply(&mut random)
+                    && let FoodRandomEvent::HungerGroup { effects, .. } = event
+                {
+                    for effect in effects {
+                        let incoming = EffectDuration {
+                            duration: effect.duration,
+                            amplifier: effect.amplifier,
+                            hidden: None,
+                        };
+                        if let Some(existing) = &mut active {
+                            existing.merge(incoming);
+                        } else {
+                            active = Some(incoming);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                active.as_ref().map(|v| (v.duration, v.amplifier)),
+                row["duration"]
+                    .as_i64()
+                    .map(|v| (v as i32, row["amplifier"].as_u64().unwrap() as u8)),
+                "{row}"
+            );
+            assert_eq!(
+                active
+                    .as_ref()
+                    .and_then(|v| v.hidden.as_ref())
+                    .map(|v| (v.duration, v.amplifier)),
+                row["hidden_duration"]
+                    .as_i64()
+                    .map(|v| (v as i32, row["hidden_amplifier"].as_u64().unwrap() as u8)),
+                "{row}"
+            );
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]

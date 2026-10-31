@@ -488,7 +488,7 @@ struct EffectSaveTracking {
     water_efficiency: crate::player_data::SavedAttribute,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     ticks: u64,
-    hunger_updates: Vec<u64>,
+    hunger_updates: Vec<crate::player_data::HungerUpdate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -723,9 +723,34 @@ impl LoadedSession {
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
             if event.apply(&mut self.player_random) {
-                let tracking = self.ensure_effect_save_tracking();
-                tracking.hunger_updates.push(tracking.ticks);
-                self.fall.add_hunger(600, 0);
+                let effects = match event {
+                    crate::survival::FoodRandomEvent::Finish {
+                        causes_hunger: true,
+                        ..
+                    } => vec![crate::survival::HungerApplication {
+                        duration: 600,
+                        amplifier: 0,
+                        ambient: false,
+                        visible: true,
+                        show_icon: true,
+                    }],
+                    crate::survival::FoodRandomEvent::HungerGroup { effects, .. } => effects,
+                    _ => Vec::new(),
+                };
+                for effect in effects {
+                    let tracking = self.ensure_effect_save_tracking();
+                    tracking
+                        .hunger_updates
+                        .push(crate::player_data::HungerUpdate {
+                            tick: tracking.ticks,
+                            duration: effect.duration,
+                            amplifier: effect.amplifier,
+                            ambient: effect.ambient,
+                            visible: effect.visible,
+                            show_icon: effect.show_icon,
+                        });
+                    self.fall.add_hunger(effect.duration, effect.amplifier);
+                }
             }
         }
         for stack in self.food_use.take_drops() {
@@ -27331,6 +27356,7 @@ mod tests {
                 }
                 crate::survival::FoodRandomEvent::Finish {
                     causes_hunger: true,
+                    particles: true,
                 }
                 .apply(&mut random)
             })
@@ -27380,7 +27406,14 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hunger_updates,
-            vec![32]
+            vec![crate::player_data::HungerUpdate {
+                tick: 32,
+                duration: 600,
+                amplifier: 0,
+                ambient: false,
+                visible: true,
+                show_icon: true
+            }]
         );
         assert_eq!(session.snapshot().vitals.food, 14);
         let draft = session.draft_player_state(&original).unwrap();
@@ -27392,6 +27425,88 @@ mod tests {
             native_persistence::nbt::write(&original).unwrap(),
             original_bytes
         );
+    }
+
+    #[test]
+    fn custom_food_effects_are_replayed_in_player_draft() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let effects = vec![
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:hunger".into())),
+                ("duration".into(), Tag::Int(20)),
+                ("ambient".into(), Tag::Byte(1)),
+                ("show_particles".into(), Tag::Byte(0)),
+            ]),
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:hunger".into())),
+                ("duration".into(), Tag::Int(10)),
+                ("amplifier".into(), Tag::Byte(2)),
+                ("show_icon".into(), Tag::Byte(0)),
+            ]),
+        ];
+        let group = Tag::Compound(vec![
+            ("type".into(), Tag::String("minecraft:apply_effects".into())),
+            (
+                "effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: effects,
+                },
+            ),
+        ]);
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![group],
+                    },
+                ),
+            ]),
+        )]);
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, components),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let hunger = session.fall.effects().hunger.as_ref().unwrap();
+        assert_eq!((hunger.duration, hunger.amplifier), (9, 2));
+        assert_eq!(
+            (
+                hunger.hidden.as_ref().unwrap().duration,
+                hunger.hidden.as_ref().unwrap().amplifier
+            ),
+            (19, 0)
+        );
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        let Tag::List { values, .. } = draft.document().value.get("active_effects").unwrap() else {
+            panic!()
+        };
+        assert_eq!(values[0].get("show_icon"), Some(&Tag::Byte(0)));
+        let hidden = values[0].get("hidden_effect").unwrap();
+        assert_eq!(hidden.get("ambient"), Some(&Tag::Byte(1)));
+        assert_eq!(hidden.get("show_particles"), Some(&Tag::Byte(0)));
+        assert_eq!(hidden.get("show_icon"), Some(&Tag::Byte(0)));
     }
 
     #[test]

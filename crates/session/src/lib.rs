@@ -469,7 +469,18 @@ impl LocalSession {
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
             if event.apply(&mut self.player_random) {
-                self.fall.add_hunger(600, 0);
+                match event {
+                    survival::FoodRandomEvent::Finish {
+                        causes_hunger: true,
+                        ..
+                    } => self.fall.add_hunger(600, 0),
+                    survival::FoodRandomEvent::HungerGroup { effects, .. } => {
+                        for effect in effects {
+                            self.fall.add_hunger(effect.duration, effect.amplifier);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         for stack in self.food_use.take_drops() {

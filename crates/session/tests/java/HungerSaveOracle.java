@@ -32,10 +32,13 @@ public class HungerSaveOracle {
       var effects=new ArrayList<>(before.read("active_effects",MobEffectInstance.CODEC.listOf()).orElse(List.of()));
       var updates=c.getAsJsonArray("events"); int event=0; int ticks=c.get("ticks").getAsInt();
       for(int tick=0;tick<=ticks;tick++) {
-        while(event<updates.size() && updates.get(event).getAsInt()==tick) {
+        while(event<updates.size() && (updates.get(event).isJsonPrimitive()?updates.get(event).getAsInt():updates.get(event).getAsJsonObject().get("tick").getAsInt())==tick) {
+          var entry=updates.get(event);
+          var object=entry.isJsonObject()?entry.getAsJsonObject():null;
+          var incoming=object==null?new MobEffectInstance(MobEffects.HUNGER,600,0):new MobEffectInstance(MobEffects.HUNGER,object.get("duration").getAsInt(),object.get("amplifier").getAsInt(),object.get("ambient").getAsBoolean(),object.get("visible").getAsBoolean(),object.get("show_icon").getAsBoolean());
           var existing=effects.stream().filter(e->e.getEffect()==MobEffects.HUNGER).findFirst();
-          if(existing.isPresent()) existing.get().update(new MobEffectInstance(MobEffects.HUNGER,600,0));
-          else effects.add(new MobEffectInstance(MobEffects.HUNGER,600,0));
+          if(existing.isPresent()) existing.get().update(incoming);
+          else effects.add(incoming);
           event++;
         }
         if(tick<ticks) {

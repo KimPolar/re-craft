@@ -180,6 +180,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn compass(&self, event: native_session::loaded::CompassSoundEvent) {
+        let _ = self.audio.commands.try_send(Command::Compass(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     pub fn item_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Item);
     }
@@ -236,6 +245,7 @@ enum Command {
     Chest(Resources, native_session::loaded::ChestSoundEvent),
     LockedChest(Resources, native_session::loaded::LockedChestSoundEvent),
     Bucket(Resources, native_session::loaded::BucketSoundEvent),
+    Compass(Resources, native_session::loaded::CompassSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
     Consume(Resources, native_session::ConsumeSound),
     Extinguish(Resources, native_session::ExtinguishSound),
@@ -249,6 +259,18 @@ fn extinguish_audio(event: native_session::ExtinguishSound) -> native_session::C
             volume: 0.7,
             pitch: event.pitch,
             category: native_session::ConsumeSoundCategory::Ambient,
+        },
+    }
+}
+
+fn compass_audio(event: native_session::loaded::CompassSoundEvent) -> native_session::ConsumeSound {
+    native_session::ConsumeSound {
+        position: event.position,
+        info: native_session::ConsumeSoundInfo {
+            event: "item.lodestone_compass.lock",
+            volume: 1.0,
+            pitch: 1.0,
+            category: native_session::ConsumeSoundCategory::Player,
         },
     }
 }
@@ -910,6 +932,17 @@ fn run(
                 Some(extinguish_audio(event)),
                 None,
             ),
+            Command::Compass(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(compass_audio(event)),
+                None,
+            ),
         };
         if catalog
             .as_ref()
@@ -1129,6 +1162,63 @@ mod tests {
             sound.info.category,
             native_session::ConsumeSoundCategory::Ambient
         );
+    }
+
+    #[test]
+    fn compass_sound_command_uses_player_category() {
+        let (audio, probe) = Audio::test_channel();
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        let event = native_session::loaded::CompassSoundEvent {
+            position: glam::DVec3::new(-19.5, 64.5, 47.5),
+            sequence: 8,
+        };
+        ui.compass(event);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Compass(_, actual)) if actual == event)
+        );
+        let sound = compass_audio(event);
+        assert_eq!(sound.position, event.position);
+        assert_eq!(sound.info.event, "item.lodestone_compass.lock");
+        assert_eq!((sound.info.volume, sound.info.pitch), (1.0, 1.0));
+        assert_eq!(
+            sound.info.category,
+            native_session::ConsumeSoundCategory::Player
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn compass_sound_uses_selected_pack_and_player_gain() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"item.lodestone_compass.lock":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let neutral = Arc::new(AtomicU32::new(0.25_f32.to_bits()));
+        let event = native_session::loaded::CompassSoundEvent {
+            position: glam::DVec3::new(-19.5, 64.5, 47.5),
+            sequence: 8,
+        };
+        let voice = catalog
+            .consume(
+                compass_audio(event),
+                &mut LegacyRandom::new(1),
+                48000,
+                &neutral,
+                &neutral,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(voice.player_sound);
+        assert!(voice.category_gain.is_none());
+        assert_eq!(voice.spatial.unwrap().position, event.position);
+        assert_eq!(voice.volume, 0.4);
+        assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
     }
 
     #[test]

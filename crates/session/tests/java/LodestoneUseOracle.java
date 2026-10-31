@@ -24,7 +24,10 @@ public class LodestoneUseOracle {
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
     @Override public BlockState getBlockState(BlockPos pos) { return Blocks.LODESTONE.defaultBlockState(); }
     @Override public net.minecraft.resources.ResourceKey<Level> dimension() { return Level.OVERWORLD; }
-    @Override public void playSound(Entity entity, BlockPos pos, net.minecraft.sounds.SoundEvent event, net.minecraft.sounds.SoundSource source, float volume, float pitch) { sounds++; }
+    @Override public void playSound(Entity entity, BlockPos pos, net.minecraft.sounds.SoundEvent event, net.minecraft.sounds.SoundSource source, float volume, float pitch) {
+      if(entity!=null || !POS.equals(pos) || event!=net.minecraft.sounds.SoundEvents.LODESTONE_COMPASS_LOCK || source!=net.minecraft.sounds.SoundSource.PLAYERS || volume!=1.0f || pitch!=1.0f) throw new AssertionError("compass sound differs");
+      sounds++;
+    }
   }
   static class Player extends ServerPlayer {
     Inventory inventory; boolean creative; ItemStack dropped;

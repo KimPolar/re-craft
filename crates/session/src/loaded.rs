@@ -541,6 +541,7 @@ pub struct LoadedSession {
     chest_sounds: VecDeque<ChestSoundEvent>,
     locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
     bucket_sounds: VecDeque<BucketSoundEvent>,
+    compass_sounds: VecDeque<CompassSoundEvent>,
     evaporation_smoke: VecDeque<EvaporationSmoke>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
     sound_sequence: u64,
@@ -671,6 +672,12 @@ pub struct BucketSoundEvent {
     pub position: DVec3,
     pub volume: f32,
     pub pitch: f32,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompassSoundEvent {
+    pub position: DVec3,
     pub sequence: u64,
 }
 
@@ -3463,6 +3470,7 @@ impl LoadedSession {
             chest_sounds: VecDeque::new(),
             locked_chest_sounds: VecDeque::new(),
             bucket_sounds: VecDeque::new(),
+            compass_sounds: VecDeque::new(),
             evaporation_smoke: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
             sound_sequence: 0,
@@ -4308,6 +4316,10 @@ impl LoadedSession {
 
     pub fn take_bucket_sounds(&mut self) -> Vec<BucketSoundEvent> {
         self.bucket_sounds.drain(..).collect()
+    }
+
+    pub fn take_compass_sounds(&mut self) -> Vec<CompassSoundEvent> {
+        self.compass_sounds.drain(..).collect()
     }
 
     pub fn take_evaporation_smoke(&mut self) -> Vec<EvaporationSmoke> {
@@ -7212,15 +7224,24 @@ impl LoadedSession {
         } else {
             crate::placement_input_hand(&self.inventory)
         };
+        let absolute = add(self.origin, position)?;
         let target = crate::lodestone::Tracker::linked(
             native_resources::packs::ResourceId::parse(&self.world.dimension).ok()?,
-            add(self.origin, position)?,
+            absolute,
         );
         let overflow = Arc::make_mut(&mut self.inventory).bind_lodestone_compass(
             hand,
             &target,
             self.game_mode == GameMode::Creative,
         )?;
+        let sequence = self.next_sound_sequence();
+        if self.compass_sounds.len() == 4096 {
+            self.compass_sounds.pop_front();
+        }
+        self.compass_sounds.push_back(CompassSoundEvent {
+            position: absolute.as_dvec3() + DVec3::splat(0.5),
+            sequence,
+        });
         if let Some(stack) = overflow {
             self.dropped_items.drop_player(
                 stack,
@@ -17303,6 +17324,13 @@ mod tests {
                     PlayerSlot::Storage(if hand == PlayerSlot::Storage(0) { 1 } else { 0 })
                 };
                 if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                    let sounds = session.take_compass_sounds();
+                    assert_eq!(sounds.len(), 1, "{mode:?} {hand:?}");
+                    assert_eq!(
+                        sounds[0].position,
+                        (session.origin + position).as_dvec3() + DVec3::splat(0.5)
+                    );
+                    assert_eq!(sounds[0].sequence, 0);
                     assert_eq!(
                         session
                             .inventory
@@ -17313,6 +17341,7 @@ mod tests {
                         "{mode:?} {hand:?}"
                     );
                 } else {
+                    assert!(session.take_compass_sounds().is_empty());
                     assert!(
                         session
                             .inventory
@@ -17377,6 +17406,7 @@ mod tests {
             session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
             "minecraft:stick"
         );
+        assert_eq!(session.take_compass_sounds().len(), 1);
     }
 
     #[test]
@@ -17407,6 +17437,7 @@ mod tests {
             "minecraft:snow_block"
         );
         assert!(session.inventory.slot(PlayerSlot::Offhand).is_none());
+        assert!(session.take_compass_sounds().is_empty());
         assert!(
             session
                 .inventory
@@ -23093,10 +23124,26 @@ mod tests {
             native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
             true,
         );
+        let compass_pos = IVec3::new(8, 2, 9);
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(compass_pos, lodestone));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            crate::inventory::PlayerSlot::Storage(0),
+            crate::inventory::ItemStack::new(
+                "minecraft:compass".into(),
+                1,
+                64,
+                native_persistence::nbt::Tag::Compound(vec![]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        assert!(session.use_lodestone_compass(compass_pos).is_some());
         assert_eq!(session.take_chest_sounds()[0].sequence, 0);
         assert_eq!(session.take_lever_sounds()[0].sequence, 1);
         assert_eq!(session.take_bucket_sounds()[0].sequence, 2);
         assert_eq!(session.take_button_sounds()[0].sequence, 3);
+        assert_eq!(session.take_compass_sounds()[0].sequence, 4);
     }
 
     #[test]

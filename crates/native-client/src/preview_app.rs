@@ -573,12 +573,14 @@ impl Viewer {
                 .into_iter()
                 .peekable();
             let mut buckets = play.session.take_bucket_sounds().into_iter().peekable();
+            let mut compasses = play.session.take_compass_sounds().into_iter().peekable();
             while let Some((_, kind)) = [
                 buttons.peek().map(|event| (event.sequence, 0)),
                 levers.peek().map(|event| (event.sequence, 1)),
                 chests.peek().map(|event| (event.sequence, 2)),
                 locked_chests.peek().map(|event| (event.sequence, 3)),
                 buckets.peek().map(|event| (event.sequence, 4)),
+                compasses.peek().map(|event| (event.sequence, 5)),
             ]
             .into_iter()
             .flatten()
@@ -609,10 +611,16 @@ impl Viewer {
                             audio.locked_chest(event);
                         }
                     }
-                    _ => {
+                    4 => {
                         let event = buckets.next().unwrap();
                         if let Some(audio) = &self.audio {
                             audio.bucket(event);
+                        }
+                    }
+                    _ => {
+                        let event = compasses.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.compass(event);
                         }
                     }
                 }

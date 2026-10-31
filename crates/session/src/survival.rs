@@ -26,7 +26,7 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         "carrot" => (3, 0.6),
         "cod" | "salmon" | "cookie" | "sweet_berries" | "glow_berries" => (2, 0.1),
         "rotten_flesh" => (4, 0.1),
-        "poisonous_potato" => (2, 0.3),
+        "chicken" | "poisonous_potato" => (2, 0.3),
         "spider_eye" => (2, 0.8),
         "cooked_beef" | "cooked_porkchop" => (8, 0.8),
         "cooked_chicken" | "mushroom_stew" | "beetroot_soup" => (6, 0.6),
@@ -586,17 +586,18 @@ impl FoodUse {
             .unwrap_or_default();
         if let Some(item) = inventory.slot(hand)
             && item.components().get("minecraft:consumable").is_none()
-            && let Some(probability) = match item.id() {
-                "minecraft:poisonous_potato" => Some(0.6),
-                "minecraft:spider_eye" => Some(1.0),
+            && let Some((kind, duration, probability)) = match item.id() {
+                "minecraft:chicken" => Some((FoodStatusKind::Hunger, 600, 0.3)),
+                "minecraft:poisonous_potato" => Some((FoodStatusKind::Poison, 100, 0.6)),
+                "minecraft:spider_eye" => Some((FoodStatusKind::Poison, 100, 1.0)),
                 _ => None,
             }
         {
             custom_groups.push(StatusGroup {
                 probability,
                 effects: vec![StatusApplication {
-                    kind: FoodStatusKind::Poison,
-                    duration: 100,
+                    kind,
+                    duration,
                     amplifier: 0,
                     ambient: false,
                     visible: true,
@@ -1069,7 +1070,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-    fn poison_food_matches_java() {
+    fn food_effects_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -1089,9 +1090,13 @@ mod tests {
         }
         let cp = std::env::join_paths(paths).unwrap();
         let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
-        let source = temp.path().join("PoisonFoodOracle.java");
+        let source = temp.path().join("FoodEffectsOracle.java");
         let output = temp.path().join("food.json");
-        std::fs::write(&source, include_str!("../tests/java/PoisonFoodOracle.java")).unwrap();
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FoodEffectsOracle.java"),
+        )
+        .unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
                 .arg("-classpath")
@@ -1100,7 +1105,7 @@ mod tests {
             Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
-                .arg("PoisonFoodOracle")
+                .arg("FoodEffectsOracle")
                 .arg(&output),
         ] {
             let result = command.output().unwrap();
@@ -1113,7 +1118,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 200);
+        assert_eq!(rows.len(), 300);
         for row in rows {
             let id = format!("minecraft:{}", row["item"].as_str().unwrap());
             let item = ItemStack::new(id, 1, 64, Tag::Compound(vec![])).unwrap();
@@ -1157,7 +1162,14 @@ mod tests {
                 "{row}"
             );
             if let Some(effect) = applied {
-                assert_eq!(effect.kind, FoodStatusKind::Poison);
+                assert_eq!(
+                    effect.kind,
+                    match row["effect"].as_str().unwrap() {
+                        "hunger" => FoodStatusKind::Hunger,
+                        "poison" => FoodStatusKind::Poison,
+                        other => panic!("unexpected Java effect {other}"),
+                    }
+                );
                 assert_eq!(effect.duration, row["duration"].as_i64().unwrap() as i32);
                 assert_eq!(effect.amplifier, row["amplifier"].as_u64().unwrap() as u8);
             }
@@ -1353,19 +1365,14 @@ mod tests {
     }
 
     #[test]
-    fn rotten_flesh_outcome_is_independent_of_frame_cadence() {
-        let run = |frame_ms: u64| {
+    fn hunger_food_outcome_is_independent_of_frame_cadence() {
+        let run = |frame_ms: u64, id: &str| {
             let mut session = LocalSession::demo();
             session.player_random = native_core::random::LegacyRandom::new(99);
             let mut inventory = PlayerInventory::default();
             inventory.set_slot(
                 PlayerSlot::Storage(0),
-                ItemStack::new(
-                    "minecraft:rotten_flesh".into(),
-                    2,
-                    64,
-                    Tag::Compound(vec![]),
-                ),
+                ItemStack::new(id.into(), 2, 64, Tag::Compound(vec![])),
             );
             session.set_player_inventory(inventory);
             session.set_player_vitals(PlayerVitals {
@@ -1384,16 +1391,18 @@ mod tests {
                 session.player_random.next_float().to_bits(),
             )
         };
-        let (slow, slow_effect, slow_random) = run(100);
-        let (fast, fast_effect, fast_random) = run(5);
-        assert_eq!(slow.tick, fast.tick);
-        assert_eq!(slow.vitals, fast.vitals);
-        assert_eq!(
-            slow.inventory.slot(PlayerSlot::Storage(0)),
-            fast.inventory.slot(PlayerSlot::Storage(0))
-        );
-        assert_eq!(slow_effect, fast_effect);
-        assert_eq!(slow_random, fast_random);
+        for id in ["minecraft:rotten_flesh", "minecraft:chicken"] {
+            let (slow, slow_effect, slow_random) = run(100, id);
+            let (fast, fast_effect, fast_random) = run(5, id);
+            assert_eq!(slow.tick, fast.tick);
+            assert_eq!(slow.vitals, fast.vitals);
+            assert_eq!(
+                slow.inventory.slot(PlayerSlot::Storage(0)),
+                fast.inventory.slot(PlayerSlot::Storage(0))
+            );
+            assert_eq!(slow_effect, fast_effect);
+            assert_eq!(slow_random, fast_random);
+        }
     }
 
     #[test]

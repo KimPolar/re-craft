@@ -14,7 +14,7 @@ import net.minecraft.world.item.*;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
-public class PoisonFoodOracle {
+public class FoodEffectsOracle {
   static class World extends ClientLevel {
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
     @Override public void playSound(Entity source,double x,double y,double z,SoundEvent sound,SoundSource category,float volume,float pitch) { }
@@ -38,18 +38,19 @@ public class PoisonFoodOracle {
     var world=(World)unsafe.allocateInstance(World.class); var player=(TestPlayer)unsafe.allocateInstance(TestPlayer.class);
     player.world=world; var position=Entity.class.getDeclaredField("position"); position.setAccessible(true); position.set(player,Vec3.ZERO);
     var out=new JsonArray();
-    for(var item:new Item[]{Items.POISONOUS_POTATO,Items.SPIDER_EYE}) for(int seed=0;seed<100;seed++) {
+    for(var item:new Item[]{Items.POISONOUS_POTATO,Items.SPIDER_EYE,Items.CHICKEN}) for(int seed=0;seed<100;seed++) {
       var stack=new ItemStack(item); var food=stack.get(DataComponents.FOOD); var consumable=stack.get(DataComponents.CONSUMABLE);
       player.rng=RandomSource.create(seed); player.food=new FoodData(); player.food.setFoodLevel(10); player.food.setSaturation(0); player.applied=null;
       for(int remaining=consumable.consumeTicks();remaining>0;remaining--)
         if(consumable.shouldEmitParticlesAndSounds(remaining)) consumable.emitParticlesAndSounds(player.rng,player,stack,5);
       consumable.emitParticlesAndSounds(player.rng,player,stack,16); food.onConsume(world,player,stack,consumable);
       for(var effect:consumable.onConsumeEffects()) effect.apply(world,stack,player);
-      var row=new JsonObject(); row.addProperty("item",item==Items.POISONOUS_POTATO?"poisonous_potato":"spider_eye");
+      var row=new JsonObject(); row.addProperty("item",item==Items.POISONOUS_POTATO?"poisonous_potato":item==Items.SPIDER_EYE?"spider_eye":"chicken");
       row.addProperty("seed",seed); row.addProperty("food",player.food.getFoodLevel());
       row.addProperty("saturation_bits",Float.floatToRawIntBits(player.food.getSaturationLevel()));
       row.addProperty("applied",player.applied!=null);
-      if(player.applied!=null) { row.addProperty("duration",player.applied.getDuration()); row.addProperty("amplifier",player.applied.getAmplifier()); }
+      if(player.applied!=null) { row.addProperty("duration",player.applied.getDuration()); row.addProperty("amplifier",player.applied.getAmplifier());
+        row.addProperty("effect",player.applied.getEffect()==net.minecraft.world.effect.MobEffects.HUNGER?"hunger":"poison"); }
       row.addProperty("next_bits",Float.floatToRawIntBits(player.rng.nextFloat())); out.add(row);
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));

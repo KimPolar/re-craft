@@ -27547,6 +27547,80 @@ mod tests {
     }
 
     #[test]
+    fn chicken_hunger_applies_in_world_and_survives_the_player_draft() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag};
+        let seed_for = |expected: bool| {
+            (0..1000)
+                .find(|&seed| {
+                    let mut random = native_core::random::LegacyRandom::new(seed);
+                    for _ in 0..6 {
+                        crate::survival::FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                    }
+                    crate::survival::FoodRandomEvent::Finish {
+                        causes_hunger: false,
+                        particles: true,
+                    }
+                    .apply(&mut random);
+                    crate::survival::FoodRandomEvent::StatusGroup {
+                        probability: 0.3,
+                        effects: Vec::new(),
+                    }
+                    .apply(&mut random)
+                        == expected
+                })
+                .unwrap()
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        for (seed, overridden, applied) in [
+            (seed_for(true), false, true),
+            (seed_for(false), false, false),
+            (seed_for(true), true, false),
+        ] {
+            let mut session = session();
+            session.player_random = native_core::random::LegacyRandom::new(seed);
+            let mut inventory = PlayerInventory::default();
+            let components = if overridden {
+                Tag::Compound(vec![("minecraft:consumable".into(), Tag::Compound(vec![]))])
+            } else {
+                Tag::Compound(vec![])
+            };
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:chicken".into(), 1, 64, components),
+            );
+            session.set_player_inventory(inventory);
+            session.set_player_vitals(crate::survival::PlayerVitals {
+                food: 10,
+                saturation: 0.0,
+                ..Default::default()
+            });
+            session.submit_command(PlayerCommand::Place);
+            for _ in 0..32 {
+                session.update(TICK);
+            }
+            assert_eq!(session.snapshot().vitals.food, 12);
+            assert_eq!(session.snapshot().hunger_effect, applied);
+            if applied {
+                assert_eq!(
+                    session.fall.effects().hunger.as_ref().unwrap().duration,
+                    600
+                );
+                session.update(TICK);
+                assert_eq!(session.vitals.exhaustion, 0.005);
+            }
+            let draft = session.draft_player_state(&original).unwrap();
+            assert_eq!(
+                crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+                *session.fall.effects()
+            );
+        }
+    }
+
+    #[test]
     fn eaten_rotten_flesh_preserves_stronger_hunger_and_tracks_save() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::{NamedTag, Tag, TagType};

@@ -18,8 +18,13 @@ import net.minecraft.world.phys.Vec3;
 
 public class FoodEffectsOracle {
   static class World extends ClientLevel {
+    JsonArray sounds;
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
-    @Override public void playSound(Entity source,double x,double y,double z,SoundEvent sound,SoundSource category,float volume,float pitch) { }
+    void capture(SoundEvent sound,SoundSource category,float volume,float pitch) {
+      var row=new JsonObject(); row.addProperty("event",sound.location().toString()); row.addProperty("category",category.getName());
+      row.addProperty("volume_bits",Float.floatToRawIntBits(volume)); row.addProperty("pitch_bits",Float.floatToRawIntBits(pitch)); sounds.add(row);
+    }
+    @Override public void playSound(Entity source,double x,double y,double z,SoundEvent sound,SoundSource category,float volume,float pitch) { capture(sound,category,volume,pitch); }
   }
   static class TestPlayer extends Player {
     World world; RandomSource rng; FoodData food; MobEffectInstance applied; boolean poison;
@@ -28,7 +33,7 @@ public class FoodEffectsOracle {
     @Override public Level level() { return world; }
     @Override public RandomSource getRandom() { return rng; }
     @Override public FoodData getFoodData() { return food; }
-    @Override public void playSound(SoundEvent sound,float volume,float pitch) { }
+    @Override public void playSound(SoundEvent sound,float volume,float pitch) { world.capture(sound,SoundSource.PLAYERS,volume,pitch); }
     @Override public void spawnItemParticles(ItemStack stack,int count) { for(int i=0;i<count*4;i++) rng.nextFloat(); }
     @Override public boolean addEffect(MobEffectInstance effect,Entity source) { applied=effect; return true; }
     @Override public boolean removeEffect(Holder<MobEffect> effect) {
@@ -46,7 +51,7 @@ public class FoodEffectsOracle {
     var out=new JsonArray();
     for(var item:new Item[]{Items.POISONOUS_POTATO,Items.SPIDER_EYE,Items.CHICKEN,Items.HONEY_BOTTLE}) for(int seed=0;seed<100;seed++) {
       var stack=new ItemStack(item); var food=stack.get(DataComponents.FOOD); var consumable=stack.get(DataComponents.CONSUMABLE);
-      player.rng=RandomSource.create(seed); player.food=new FoodData(); player.food.setFoodLevel(10); player.food.setSaturation(0); player.applied=null; player.poison=true;
+      player.rng=RandomSource.create(seed); player.food=new FoodData(); player.food.setFoodLevel(10); player.food.setSaturation(0); player.applied=null; player.poison=true; world.sounds=new JsonArray();
       for(int remaining=consumable.consumeTicks();remaining>0;remaining--)
         if(consumable.shouldEmitParticlesAndSounds(remaining)) consumable.emitParticlesAndSounds(player.rng,player,stack,5);
       consumable.emitParticlesAndSounds(player.rng,player,stack,16); food.onConsume(world,player,stack,consumable);
@@ -66,6 +71,7 @@ public class FoodEffectsOracle {
       if(player.applied!=null) { row.addProperty("duration",player.applied.getDuration()); row.addProperty("amplifier",player.applied.getAmplifier());
         row.addProperty("effect",player.applied.getEffect()==net.minecraft.world.effect.MobEffects.HUNGER?"hunger":"poison"); }
       row.addProperty("next_bits",Float.floatToRawIntBits(player.rng.nextFloat())); out.add(row);
+      row.add("sounds",world.sounds);
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));
   }

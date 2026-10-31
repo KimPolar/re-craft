@@ -2315,8 +2315,12 @@ impl ApplicationHandler for App {
                 for sound in self.session.take_pickup_sounds() {
                     audio.play_pickup(sound);
                 }
+                for sound in self.session.take_consume_sounds() {
+                    audio.consume(sound);
+                }
             } else {
                 self.session.take_pickup_sounds();
+                self.session.take_consume_sounds();
             }
             self.last_update = now;
             let size = window.inner_size();

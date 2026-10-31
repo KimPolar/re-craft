@@ -98,6 +98,7 @@ pub struct Audio {
     gain: Arc<AtomicU32>,
     block_gain: Arc<AtomicU32>,
     player_gain: Arc<AtomicU32>,
+    neutral_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 }
 
@@ -123,6 +124,9 @@ impl UiAudio {
     }
     pub fn set_player_gain(&self, gain: f32) {
         self.audio.set_player_gain(gain);
+    }
+    pub fn set_neutral_gain(&self, gain: f32) {
+        self.audio.set_neutral_gain(gain);
     }
     pub fn set_listener(&self, eye: glam::DVec3, yaw: f32) {
         self.audio.listener.publish(Listener { eye, yaw });
@@ -175,6 +179,15 @@ impl UiAudio {
             native_session::PickupSound::Experience(position) => self.experience_pickup(position),
         }
     }
+    pub fn consume(&self, event: native_session::ConsumeSound) {
+        let _ = self.audio.commands.try_send(Command::Consume(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     fn pickup(&self, position: glam::DVec3, kind: PickupSound) {
         let _ = self.audio.commands.try_send(Command::Pickup(
             Resources {
@@ -201,6 +214,7 @@ enum Command {
     Chest(Resources, native_session::loaded::ChestSoundEvent),
     LockedChest(Resources, native_session::loaded::LockedChestSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
+    Consume(Resources, native_session::ConsumeSound),
 }
 
 impl Audio {
@@ -210,6 +224,7 @@ impl Audio {
         let gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let block_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let player_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let neutral_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let listener = Arc::new(SharedListener::default());
         (
             Self {
@@ -217,6 +232,7 @@ impl Audio {
                 gain: gain.clone(),
                 block_gain,
                 player_gain,
+                neutral_gain,
                 listener,
             },
             AudioProbe { receiver, gain },
@@ -230,6 +246,8 @@ impl Audio {
         let output_block_gain = block_gain.clone();
         let player_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
         let output_player_gain = player_gain.clone();
+        let neutral_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+        let output_neutral_gain = neutral_gain.clone();
         let listener = Arc::new(SharedListener::default());
         let output_listener = listener.clone();
         std::thread::Builder::new()
@@ -240,6 +258,7 @@ impl Audio {
                     output_gain,
                     output_block_gain,
                     output_player_gain,
+                    output_neutral_gain,
                     output_listener,
                 ) {
                     eprintln!("Audio unavailable: {error:#}");
@@ -250,6 +269,7 @@ impl Audio {
             gain,
             block_gain,
             player_gain,
+            neutral_gain,
             listener,
         })
     }
@@ -264,6 +284,10 @@ impl Audio {
     }
     pub fn set_player_gain(&self, gain: f32) {
         self.player_gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn set_neutral_gain(&self, gain: f32) {
+        self.neutral_gain
             .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
@@ -315,6 +339,7 @@ struct Voice {
     volume: f32,
     spatial: Option<SpatialSource>,
     player_sound: bool,
+    neutral_gain: Option<Arc<AtomicU32>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -390,7 +415,9 @@ fn mix(
             .map_or((1.0, 0.0), |source| source.factors(listener));
         let volume = voice.volume
             * attenuation
-            * if voice.player_sound {
+            * if let Some(neutral_gain) = &voice.neutral_gain {
+                f32::from_bits(neutral_gain.load(Ordering::Relaxed))
+            } else if voice.player_sound {
                 player_gain
             } else if voice.spatial.is_some() {
                 block_gain
@@ -568,6 +595,34 @@ impl Catalog {
             })
     }
 
+    fn consume(
+        &mut self,
+        event: native_session::ConsumeSound,
+        random: &mut LegacyRandom,
+        output_rate: u32,
+        neutral_gain: &Arc<AtomicU32>,
+    ) -> Result<Option<Voice>> {
+        self.resolve(
+            event.info.event,
+            event.info.volume,
+            event.info.pitch,
+            Some(event.position),
+            random,
+            output_rate,
+        )
+        .map(|voice| {
+            voice.map(|mut voice| {
+                match event.info.category {
+                    native_session::ConsumeSoundCategory::Player => voice.player_sound = true,
+                    native_session::ConsumeSoundCategory::Neutral => {
+                        voice.neutral_gain = Some(neutral_gain.clone())
+                    }
+                }
+                voice
+            })
+        })
+    }
+
     fn resolve(
         &mut self,
         event: &str,
@@ -630,6 +685,7 @@ impl Catalog {
             volume,
             spatial,
             player_sound: false,
+            neutral_gain: None,
         }))
     }
 }
@@ -639,6 +695,7 @@ fn run(
     gain: Arc<AtomicU32>,
     block_gain: Arc<AtomicU32>,
     player_gain: Arc<AtomicU32>,
+    neutral_gain: Arc<AtomicU32>,
     listener: Arc<SharedListener>,
 ) -> Result<()> {
     let device = cpal::default_host()
@@ -684,20 +741,20 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, button, lever, chest, locked, pickup) = match command {
-            Command::Prepare(resources) => (resources, false, None, None, None, None, None),
-            Command::Click(resources) => (resources, true, None, None, None, None, None),
+        let (resources, play, button, lever, chest, locked, pickup, consume) = match command {
+            Command::Prepare(resources) => (resources, false, None, None, None, None, None, None),
+            Command::Click(resources) => (resources, true, None, None, None, None, None, None),
             Command::Button(resources, event) => {
-                (resources, true, Some(event), None, None, None, None)
+                (resources, true, Some(event), None, None, None, None, None)
             }
             Command::Lever(resources, event) => {
-                (resources, true, None, Some(event), None, None, None)
+                (resources, true, None, Some(event), None, None, None, None)
             }
             Command::Chest(resources, event) => {
-                (resources, true, None, None, Some(event), None, None)
+                (resources, true, None, None, Some(event), None, None, None)
             }
             Command::LockedChest(resources, event) => {
-                (resources, true, None, None, None, Some(event), None)
+                (resources, true, None, None, None, Some(event), None, None)
             }
             Command::Pickup(resources, position, kind) => (
                 resources,
@@ -707,7 +764,11 @@ fn run(
                 None,
                 None,
                 Some((position, kind)),
+                None,
             ),
+            Command::Consume(resources, event) => {
+                (resources, true, None, None, None, None, None, Some(event))
+            }
         };
         if catalog
             .as_ref()
@@ -728,7 +789,9 @@ fn run(
             } else {
                 &mut preload_random
             };
-            let resolved = if let Some((position, kind)) = pickup {
+            let resolved = if let Some(event) = consume {
+                catalog.consume(event, chosen_random, config.sample_rate.0, &neutral_gain)
+            } else if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
             } else if let Some(event) = locked {
                 catalog.resolve(
@@ -780,6 +843,107 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consume_sound_command_preserves_event_and_category() {
+        let (audio, probe) = Audio::test_channel();
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        let event = native_session::ConsumeSound {
+            position: glam::DVec3::new(1.0, 2.0, 3.0),
+            info: native_session::ConsumeSoundInfo {
+                event: "entity.generic.eat",
+                volume: 0.5,
+                pitch: 1.1,
+                category: native_session::ConsumeSoundCategory::Neutral,
+            },
+        };
+        ui.consume(event);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Consume(_, actual)) if actual == event)
+        );
+    }
+
+    #[test]
+    fn neutral_gain_updates_existing_consume_voice() {
+        let neutral_gain = Arc::new(AtomicU32::new(0.5_f32.to_bits()));
+        let mut voices = vec![Voice {
+            clip: Arc::new(Clip {
+                samples: vec![16384; 16],
+                channels: 1,
+                rate: 48000,
+            }),
+            frame: 0.0,
+            step: 1.0,
+            volume: 1.0,
+            spatial: Some(SpatialSource {
+                position: glam::DVec3::ZERO,
+                radius: 16.0,
+            }),
+            player_sound: false,
+            neutral_gain: Some(neutral_gain.clone()),
+        }];
+        let mut output = [0.0; 2];
+        mix(
+            &mut voices,
+            &mut output,
+            2,
+            0.0,
+            0.0,
+            0.0,
+            Listener::default(),
+        );
+        assert_eq!(output, [0.25, 0.25]);
+        neutral_gain.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        mix(
+            &mut voices,
+            &mut output,
+            2,
+            1.0,
+            1.0,
+            1.0,
+            Listener::default(),
+        );
+        assert_eq!(output, [0.0, 0.0]);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn consume_sound_uses_selected_pack_and_neutral_gain() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"entity.generic.eat":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let gain = Arc::new(AtomicU32::new(0.25_f32.to_bits()));
+        let event = native_session::ConsumeSound {
+            position: glam::DVec3::new(2.0, 3.0, 4.0),
+            info: native_session::ConsumeSoundInfo {
+                event: "entity.generic.eat",
+                volume: 0.5,
+                pitch: 1.0,
+                category: native_session::ConsumeSoundCategory::Neutral,
+            },
+        };
+        let voice = catalog
+            .consume(event, &mut LegacyRandom::new(1), 48000, &gain)
+            .unwrap()
+            .unwrap();
+        assert!(
+            voice
+                .neutral_gain
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &gain))
+        );
+        assert_eq!(voice.spatial.unwrap().position, event.position);
+        assert_eq!(voice.volume, 0.2);
+        assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
+        assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+    }
+
     #[test]
     fn mixed_pickup_commands_keep_session_order() {
         let (audio, probe) = Audio::test_channel();
@@ -916,6 +1080,7 @@ mod tests {
             volume: 0.5,
             spatial: None,
             player_sound: false,
+            neutral_gain: None,
         }];
         let mut output = [0.0; 12];
         mix(
@@ -950,6 +1115,7 @@ mod tests {
             volume: 1.0,
             spatial: None,
             player_sound: false,
+            neutral_gain: None,
         };
         let mut voices = vec![voice(), voice()];
         let mut output = [0.0; 1];
@@ -1001,6 +1167,7 @@ mod tests {
                 volume: 1.0,
                 spatial: None,
                 player_sound: false,
+                neutral_gain: None,
             },
             Voice {
                 clip,
@@ -1012,6 +1179,7 @@ mod tests {
                     radius: f64::INFINITY,
                 }),
                 player_sound: false,
+                neutral_gain: None,
             },
         ];
         let mut frame = [0.0; 2];
@@ -1055,6 +1223,7 @@ mod tests {
                 radius: 16.0,
             }),
             player_sound: true,
+            neutral_gain: None,
         }];
         let mut output = [0.0; 2];
         mix(
@@ -1235,6 +1404,7 @@ mod tests {
                 radius: 16.0,
             }),
             player_sound: false,
+            neutral_gain: None,
         }];
         let mut output = [0.0; 2];
         let front = Listener {

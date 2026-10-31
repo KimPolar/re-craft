@@ -83,6 +83,39 @@ pub enum PickupSound {
     Experience(DVec3),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumeSoundCategory {
+    Player,
+    Neutral,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConsumeSoundInfo {
+    pub event: &'static str,
+    pub volume: f32,
+    pub pitch: f32,
+    pub category: ConsumeSoundCategory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConsumeSound {
+    pub position: DVec3,
+    pub info: ConsumeSoundInfo,
+}
+
+fn collect_consume_sounds(
+    queue: &mut VecDeque<ConsumeSound>,
+    position: DVec3,
+    sounds: [Option<ConsumeSoundInfo>; 3],
+) {
+    for info in sounds.into_iter().flatten() {
+        if queue.len() == 4096 {
+            queue.pop_front();
+        }
+        queue.push_back(ConsumeSound { position, info });
+    }
+}
+
 fn collect_pickup_sounds(
     queue: &mut VecDeque<PickupSound>,
     items: &mut items::ItemEntities,
@@ -435,6 +468,7 @@ pub struct LocalSession {
     dropped_items: items::ItemEntities,
     experience_orbs: orbs::Orbs,
     pickup_sounds: VecDeque<PickupSound>,
+    consume_sounds: VecDeque<ConsumeSound>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -471,7 +505,9 @@ pub struct LocalSession {
 impl LocalSession {
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
-            if event.apply(&mut self.player_random) {
+            let (applied, sounds) = event.apply_with_sounds(&mut self.player_random);
+            collect_consume_sounds(&mut self.consume_sounds, self.motion.position, sounds);
+            if applied {
                 match event {
                     survival::FoodRandomEvent::Finish {
                         causes_hunger: true,
@@ -506,6 +542,10 @@ impl LocalSession {
     /// Drain one-shot pickup sounds in simulated order after updating.
     pub fn take_pickup_sounds(&mut self) -> Vec<PickupSound> {
         self.pickup_sounds.drain(..).collect()
+    }
+
+    pub fn take_consume_sounds(&mut self) -> Vec<ConsumeSound> {
+        self.consume_sounds.drain(..).collect()
     }
     pub fn demo() -> Self {
         Self::new(World::demo())
@@ -573,6 +613,7 @@ impl LocalSession {
             dropped_items: items::ItemEntities::default(),
             experience_orbs: orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
+            consume_sounds: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,

@@ -503,6 +503,11 @@ impl Viewer {
                     audio.play_pickup(sound);
                 }
             }
+            for sound in play.session.take_consume_sounds() {
+                if let Some(audio) = &self.audio {
+                    audio.consume(sound);
+                }
+            }
         } else {
             self.camera.advance(&self.input, elapsed);
         }

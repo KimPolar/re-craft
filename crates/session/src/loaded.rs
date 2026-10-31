@@ -316,6 +316,7 @@ pub struct LoadedSession {
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     pickup_sounds: VecDeque<crate::PickupSound>,
+    consume_sounds: VecDeque<crate::ConsumeSound>,
     block_drops: bool,
     entity_drops: bool,
     game_mode: GameMode,
@@ -725,7 +726,13 @@ impl LoadedSession {
 
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
-            if event.apply(&mut self.player_random) {
+            let (applied, sounds) = event.apply_with_sounds(&mut self.player_random);
+            crate::collect_consume_sounds(
+                &mut self.consume_sounds,
+                self.origin.as_dvec3() + self.motion.position,
+                sounds,
+            );
+            if applied {
                 let effects = match event {
                     crate::survival::FoodRandomEvent::Finish {
                         causes_hunger: true,
@@ -808,6 +815,10 @@ impl LoadedSession {
     /// Drain one-shot pickup sounds in simulated order after updating.
     pub fn take_pickup_sounds(&mut self) -> Vec<crate::PickupSound> {
         self.pickup_sounds.drain(..).collect()
+    }
+
+    pub fn take_consume_sounds(&mut self) -> Vec<crate::ConsumeSound> {
+        self.consume_sounds.drain(..).collect()
     }
     /// Restore health and food before play begins. World files remain untouched.
     pub fn set_player_vitals(&mut self, vitals: crate::survival::PlayerVitals) {
@@ -2920,6 +2931,7 @@ impl LoadedSession {
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
+            consume_sounds: VecDeque::new(),
             block_drops: true,
             entity_drops: true,
             game_mode: GameMode::default(),
@@ -27669,11 +27681,16 @@ mod tests {
                 .find(|&seed| {
                     let mut random = native_core::random::LegacyRandom::new(seed);
                     for _ in 0..6 {
-                        crate::survival::FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                        crate::survival::FoodRandomEvent::ParticlePulse {
+                            count: 5,
+                            sound: crate::survival::FoodSound::Eat,
+                        }
+                        .apply(&mut random);
                     }
                     crate::survival::FoodRandomEvent::Finish {
                         causes_hunger: false,
                         particles: true,
+                        sound: crate::survival::FoodSound::Eat,
                     }
                     .apply(&mut random);
                     crate::survival::FoodRandomEvent::StatusGroup {
@@ -27762,11 +27779,16 @@ mod tests {
             .find(|&seed| {
                 let mut random = native_core::random::LegacyRandom::new(seed);
                 for _ in 0..6 {
-                    crate::survival::FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                    crate::survival::FoodRandomEvent::ParticlePulse {
+                        count: 5,
+                        sound: crate::survival::FoodSound::Eat,
+                    }
+                    .apply(&mut random);
                 }
                 crate::survival::FoodRandomEvent::Finish {
                     causes_hunger: true,
                     particles: true,
+                    sound: crate::survival::FoodSound::Eat,
                 }
                 .apply(&mut random)
             })
@@ -28037,6 +28059,21 @@ mod tests {
                 "minecraft:glass_bottle"
             );
             assert_eq!(session.snapshot().vitals.food, 20);
+            let sounds = session.take_consume_sounds();
+            assert!(sounds.len() >= 3);
+            assert_eq!(
+                sounds[sounds.len() - 2].info.category,
+                crate::ConsumeSoundCategory::Neutral
+            );
+            assert_eq!(sounds.last().unwrap().info.event, "entity.player.burp");
+            assert_eq!(
+                sounds[0].info.event,
+                if overridden {
+                    "entity.generic.eat"
+                } else {
+                    "item.honey_bottle.drink"
+                }
+            );
             let draft = session.draft_player_state(&original).unwrap();
             assert_eq!(
                 crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),

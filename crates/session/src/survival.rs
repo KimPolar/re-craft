@@ -15,6 +15,13 @@ pub struct FoodProperties {
     pub use_ticks: i32,
     pub can_always_eat: bool,
     pub consume_particles: bool,
+    pub sound: FoodSound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FoodSound {
+    Eat,
+    HoneyDrink,
 }
 
 pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
@@ -51,6 +58,11 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         },
         can_always_eat: id == "minecraft:honey_bottle",
         consume_particles: id != "minecraft:honey_bottle",
+        sound: if id == "minecraft:honey_bottle" {
+            FoodSound::HoneyDrink
+        } else {
+            FoodSound::Eat
+        },
     })
 }
 
@@ -443,6 +455,11 @@ pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
         use_ticks,
         can_always_eat,
         consume_particles,
+        sound: if components.get("minecraft:consumable").is_some() {
+            FoodSound::Eat
+        } else {
+            default?.sound
+        },
     })
 }
 
@@ -465,10 +482,14 @@ pub struct FoodUse {
 
 #[derive(Clone, Debug)]
 pub(crate) enum FoodRandomEvent {
-    ParticlePulse(u8),
+    ParticlePulse {
+        count: u8,
+        sound: FoodSound,
+    },
     Finish {
         causes_hunger: bool,
         particles: bool,
+        sound: FoodSound,
     },
     StatusGroup {
         probability: f32,
@@ -480,30 +501,69 @@ pub(crate) enum FoodRandomEvent {
 impl FoodRandomEvent {
     /// Advance the player's stream for the sound and particle calculations
     /// Java performs even when their visual output is not yet rendered.
-    pub(crate) fn apply(&self, random: &mut native_core::random::LegacyRandom) -> bool {
-        let particles = match self {
-            Self::ParticlePulse(count) => *count,
-            Self::Finish { particles, .. } => {
+    pub(crate) fn apply_with_sounds(
+        &self,
+        random: &mut native_core::random::LegacyRandom,
+    ) -> (bool, [Option<crate::ConsumeSoundInfo>; 3]) {
+        let (particles, sound) = match self {
+            Self::ParticlePulse { count, sound } => (*count, *sound),
+            Self::Finish {
+                particles, sound, ..
+            } => {
                 if *particles {
-                    16
+                    (16, *sound)
                 } else {
-                    0
+                    (0, *sound)
                 }
             }
-            Self::StatusGroup { probability, .. } => return random.next_float() < *probability,
-            Self::RemoveStatuses(_) => return true,
+            Self::StatusGroup { probability, .. } => {
+                return (random.next_float() < *probability, [None; 3]);
+            }
+            Self::RemoveStatuses(_) => return (true, [None; 3]),
         };
-        random.next_bool();
-        for _ in 0..3 + u32::from(particles) * 4 {
+        let volume = if random.next_bool() { 0.5 } else { 1.0 };
+        let eat_pitch = 1.0_f32 + 0.2_f32 * (random.next_float() - random.next_float());
+        let drink_pitch = 0.9_f32 + random.next_float() * (1.0_f32 - 0.9_f32);
+        for _ in 0..u32::from(particles) * 4 {
             random.next_float();
         }
+        let (event, volume, pitch) = match sound {
+            FoodSound::Eat => ("entity.generic.eat", volume, eat_pitch),
+            FoodSound::HoneyDrink => ("item.honey_bottle.drink", 0.5, drink_pitch),
+        };
+        let mut sounds = [
+            Some(crate::ConsumeSoundInfo {
+                event,
+                volume,
+                pitch,
+                category: crate::ConsumeSoundCategory::Player,
+            }),
+            None,
+            None,
+        ];
         if let Self::Finish { causes_hunger, .. } = self {
-            for _ in 0..3 {
-                random.next_float();
-            }
-            return *causes_hunger && random.next_float() < 0.8;
+            let pitch = 1.0_f32 + 0.4_f32 * (random.next_float() - random.next_float());
+            let burp_pitch = 0.9_f32 + random.next_float() * (1.0_f32 - 0.9_f32);
+            sounds[1] = Some(crate::ConsumeSoundInfo {
+                event,
+                volume: 1.0,
+                pitch,
+                category: crate::ConsumeSoundCategory::Neutral,
+            });
+            sounds[2] = Some(crate::ConsumeSoundInfo {
+                event: "entity.player.burp",
+                volume: 0.5,
+                pitch: burp_pitch,
+                category: crate::ConsumeSoundCategory::Player,
+            });
+            return (*causes_hunger && random.next_float() < 0.8, sounds);
         }
-        false
+        (false, sounds)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply(&self, random: &mut native_core::random::LegacyRandom) -> bool {
+        self.apply_with_sounds(random).0
     }
 }
 
@@ -627,9 +687,10 @@ impl FoodUse {
         let elapsed = active.food.use_ticks - active.remaining;
         let threshold = (active.food.use_ticks as f32 * 0.21875_f32) as i32;
         if elapsed > threshold && active.remaining % 4 == 0 {
-            self.events.push(FoodRandomEvent::ParticlePulse(
-                if active.food.consume_particles { 5 } else { 0 },
-            ));
+            self.events.push(FoodRandomEvent::ParticlePulse {
+                count: if active.food.consume_particles { 5 } else { 0 },
+                sound: active.food.sound,
+            });
         }
         active.remaining = active.remaining.saturating_sub(1);
         if active.remaining != 0 {
@@ -688,6 +749,7 @@ impl FoodUse {
             self.events.push(FoodRandomEvent::Finish {
                 causes_hunger,
                 particles: food.consume_particles,
+                sound: food.sound,
             });
             self.events
                 .extend(custom_groups.into_iter().map(|action| match action {
@@ -1245,10 +1307,13 @@ mod tests {
             ));
             let mut applied = None;
             let mut removed = false;
+            let mut sounds = Vec::new();
             for _ in 0..food.use_ticks {
                 usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
                 for event in usage.take_events() {
-                    if event.apply(&mut random) {
+                    let (applies, emitted) = event.apply_with_sounds(&mut random);
+                    sounds.extend(emitted.into_iter().flatten());
+                    if applies {
                         match event {
                             FoodRandomEvent::StatusGroup { effects, .. } => {
                                 assert_eq!(effects.len(), 1);
@@ -1261,6 +1326,33 @@ mod tests {
                         }
                     }
                 }
+            }
+            let expected_sounds = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), expected_sounds.len(), "{row}");
+            for (sound, expected) in sounds.iter().zip(expected_sounds) {
+                assert_eq!(
+                    format!("minecraft:{}", sound.event),
+                    expected["event"].as_str().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    match sound.category {
+                        crate::ConsumeSoundCategory::Player => "player",
+                        crate::ConsumeSoundCategory::Neutral => "neutral",
+                    },
+                    expected["category"].as_str().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    sound.volume.to_bits(),
+                    expected["volume_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    sound.pitch.to_bits(),
+                    expected["pitch_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
             }
             assert_eq!(removed, row["poison_removed"].as_bool().unwrap(), "{row}");
             assert_eq!(
@@ -1455,11 +1547,16 @@ mod tests {
                 assert!(snapshot.inventory.slot(PlayerSlot::Storage(0)).is_none());
                 let mut random = native_core::random::LegacyRandom::new(seed);
                 for _ in 0..6 {
-                    FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                    FoodRandomEvent::ParticlePulse {
+                        count: 5,
+                        sound: FoodSound::Eat,
+                    }
+                    .apply(&mut random);
                 }
                 let expected = FoodRandomEvent::Finish {
                     causes_hunger: !overridden,
                     particles: true,
+                    sound: FoodSound::Eat,
                 }
                 .apply(&mut random);
                 assert_eq!(
@@ -1531,6 +1628,47 @@ mod tests {
                     assert_eq!((bottle.id(), bottle.count()), ("minecraft:glass_bottle", 1));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn consume_sounds_keep_tick_order_across_frame_rates() {
+        let run = |id: &str, max: u32, frame_ms: u64| {
+            let mut session = LocalSession::demo();
+            session.player_random = native_core::random::LegacyRandom::new(99);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(id.into(), 1, max, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            session.set_player_vitals(PlayerVitals {
+                food: 10,
+                ..Default::default()
+            });
+            session.submit_command(PlayerCommand::Place);
+            let mut sounds = Vec::new();
+            for _ in 0..(4_000 / frame_ms) {
+                session.update(Duration::from_millis(frame_ms));
+                sounds.extend(session.take_consume_sounds());
+            }
+            assert!(session.take_consume_sounds().is_empty());
+            sounds
+        };
+        for (id, max, sound) in [
+            ("minecraft:apple", 64, "entity.generic.eat"),
+            ("minecraft:honey_bottle", 16, "item.honey_bottle.drink"),
+        ] {
+            let slow = run(id, max, 100);
+            let fast = run(id, max, 5);
+            assert_eq!(slow, fast);
+            assert!(slow.len() >= 3);
+            assert_eq!(slow[slow.len() - 3].info.event, sound);
+            assert_eq!(
+                slow[slow.len() - 2].info.category,
+                crate::ConsumeSoundCategory::Neutral
+            );
+            assert_eq!(slow.last().unwrap().info.event, "entity.player.burp");
         }
     }
 

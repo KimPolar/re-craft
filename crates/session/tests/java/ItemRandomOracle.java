@@ -38,6 +38,9 @@ public class ItemRandomOracle {
       long seed=state^0x5deece66dL;
       var row=new JsonObject();
       row.addProperty("mode",mode); row.addProperty("seed",seed);
+      var uuid=item.getUUID(); var ids=new JsonArray();
+      ids.add((int)(uuid.getMostSignificantBits()>>>32)); ids.add((int)uuid.getMostSignificantBits());
+      ids.add((int)(uuid.getLeastSignificantBits()>>>32)); ids.add((int)uuid.getLeastSignificantBits()); row.add("uuid",ids);
       row.addProperty("bob",Float.floatToRawIntBits(item.bobOffs));
       row.addProperty("yaw",Float.floatToRawIntBits(item.getYRot()));
       row.addProperty("x",Double.doubleToRawLongBits(item.getDeltaMovement().x));

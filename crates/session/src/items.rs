@@ -294,9 +294,7 @@ pub(crate) enum PlayerDropOrigin {
 }
 
 impl CreatedItemIdentity {
-    fn new(origin: DVec3, thrower: CreatedThrower, yaw: f32) -> Self {
-        let mut bytes = [0_u8; 16];
-        let uuid = getrandom::fill(&mut bytes).ok().map(|_| uuid_v4(bytes));
+    fn new(origin: DVec3, thrower: CreatedThrower, yaw: f32, uuid: Option<[i32; 4]>) -> Self {
         let origin_chunk = created_chunk(origin);
         Self {
             uuid,
@@ -522,6 +520,8 @@ pub(crate) struct ItemEntities {
     // until the session is restarted instead of accepting partial save drafts.
     unresolved_rain_effect: bool,
     random: LegacyRandom,
+    entity_seeder: Option<native_core::random::XoroshiroRandom>,
+    entity_seed_checked: bool,
     next_id: u32,
     next_section_sequence: u64,
     player_uuid: Option<[i32; 4]>,
@@ -544,6 +544,8 @@ impl Default for ItemEntities {
             uncoordinated_saved_merge: false,
             unresolved_rain_effect: false,
             random: LegacyRandom::new(0),
+            entity_seeder: None,
+            entity_seed_checked: false,
             next_id: 0,
             next_section_sequence: 0,
             player_uuid: None,
@@ -1226,7 +1228,7 @@ impl ItemEntities {
             for (_, index) in restored {
                 // A reloaded Java entity runs the base ItemEntity constructor,
                 // then restores its saved fields without rerolling velocity.
-                let (bob_offset, _, random) = self.item_visuals();
+                let (_, bob_offset, _, random) = self.item_visuals();
                 let new_id = self.next_id;
                 self.next_id = self.next_id.wrapping_add(1);
                 let entity = &mut self.entities[index];
@@ -1269,7 +1271,7 @@ impl ItemEntities {
 
     pub fn spawn_saved(&mut self, saved: crate::saved_item::SavedItemState) {
         let position = saved.position;
-        let (bob_offset, _, entity_random) = self.item_visuals();
+        let (_, bob_offset, _, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1306,7 +1308,7 @@ impl ItemEntities {
     /// ItemEntity created by Entity.spawnAtLocation. The random stream is
     /// still session-local; the saved Java entity RNG is not yet reproduced.
     pub(crate) fn spawn_from_entity(&mut self, position: DVec3, stack: ItemStack) {
-        let (bob_offset, yaw, mut entity_random) = self.item_visuals();
+        let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
         let velocity = DVec3::new(
             entity_random.next_double() * 0.2 - 0.1,
             0.2,
@@ -1334,6 +1336,7 @@ impl ItemEntities {
                 position,
                 CreatedThrower::Known(None),
                 yaw,
+                uuid,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -1344,10 +1347,21 @@ impl ItemEntities {
         self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
     }
 
-    fn item_visuals(&self) -> (f32, f32, LegacyRandom) {
-        // Keep visual randomness independent of the incomplete loot/physics RNG.
-        let mut seed = native_core::random::XoroshiroRandom::new(i64::from(self.next_id));
-        item_random_from_seed(seed.next_long())
+    fn item_visuals(&mut self) -> (Option<[i32; 4]>, f32, f32, LegacyRandom) {
+        if !self.entity_seed_checked {
+            self.entity_seed_checked = true;
+            let mut seed = [0_u8; 8];
+            if getrandom::fill(&mut seed).is_ok() {
+                self.entity_seeder = Some(native_core::random::XoroshiroRandom::new(
+                    i64::from_ne_bytes(seed),
+                ));
+            }
+        }
+        let seed = self.entity_seeder.as_mut().map(|random| random.next_long());
+        let fallback =
+            || native_core::random::XoroshiroRandom::new(i64::from(self.next_id)).next_long();
+        let (uuid, bob, yaw, random) = item_random_from_seed(seed.unwrap_or_else(fallback));
+        (seed.map(|_| uuid), bob, yaw, random)
     }
 
     pub fn snapshot(&self) -> Arc<[DroppedItem]> {
@@ -1386,7 +1400,7 @@ impl ItemEntities {
                     triangle(&mut self.random, 0.2),
                     triangle(&mut self.random, 0.0),
                 );
-                let (bob_offset, yaw, entity_random) = self.item_visuals();
+                let (uuid, bob_offset, yaw, entity_random) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -1409,6 +1423,7 @@ impl ItemEntities {
                         location,
                         CreatedThrower::Known(None),
                         yaw,
+                        uuid,
                     )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
@@ -1439,7 +1454,7 @@ impl ItemEntities {
         let position = origin.as_dvec3()
             + feet
             + DVec3::Y * (f64::from(player.pose.eye_height()) - f64::from(0.3_f32));
-        let (bob_offset, yaw, entity_random) = self.item_visuals();
+        let (uuid, bob_offset, yaw, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1462,6 +1477,7 @@ impl ItemEntities {
                 position,
                 CreatedThrower::Known(None),
                 yaw,
+                uuid,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -1503,7 +1519,7 @@ impl ItemEntities {
                 f64::from(player.pose.eye_height()) - f64::from(0.3_f32),
                 0.0,
             );
-        let (bob_offset, yaw, entity_random) = self.item_visuals();
+        let (uuid, bob_offset, yaw, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1533,6 +1549,7 @@ impl ItemEntities {
                     PlayerDropOrigin::ContainerReturn => CreatedThrower::Known(None),
                 },
                 yaw,
+                uuid,
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -1853,7 +1870,7 @@ impl ItemEntities {
                         (location, DVec3::new(vx, vy, vz))
                     }
                 };
-                let (bob_offset, yaw, entity_random) = self.item_visuals();
+                let (uuid, bob_offset, yaw, entity_random) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -1876,6 +1893,7 @@ impl ItemEntities {
                         location,
                         CreatedThrower::Known(None),
                         yaw,
+                        uuid,
                     )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
@@ -2570,13 +2588,15 @@ fn item_bounds(position: DVec3) -> BoundingBox {
 
 // Entity constructs an insecure UUID before ItemEntity initializes its visuals.
 // The actual seed and stored UUID are not available in a loaded world.
-fn item_random_from_seed(seed: i64) -> (f32, f32, LegacyRandom) {
+fn item_random_from_seed(seed: i64) -> ([i32; 4], f32, f32, LegacyRandom) {
     let mut random = LegacyRandom::new(seed);
-    random.next_long();
-    random.next_long();
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&random.next_long().to_be_bytes());
+    bytes[8..].copy_from_slice(&random.next_long().to_be_bytes());
+    let uuid = uuid_v4(bytes);
     let bob = random.next_float() * std::f32::consts::PI * 2.0;
     let yaw = random.next_float() * 360.0;
-    (bob, yaw, random)
+    (uuid, bob, yaw, random)
 }
 
 /// Entity.isInRain checks the block containing the feet and the upper edge.
@@ -2637,7 +2657,14 @@ mod tests {
         let rows: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         for row in rows.as_array().unwrap() {
-            let (bob, yaw, mut random) = item_random_from_seed(row["seed"].as_i64().unwrap());
+            let (uuid, bob, yaw, mut random) = item_random_from_seed(row["seed"].as_i64().unwrap());
+            let expected_uuid: Vec<i32> = row["uuid"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect();
+            assert_eq!(uuid.as_slice(), expected_uuid);
             assert_eq!(bob.to_bits(), row["bob"].as_i64().unwrap() as i32 as u32);
             assert_eq!(yaw.to_bits(), row["yaw"].as_i64().unwrap() as i32 as u32);
             if row["mode"] == 0 {
@@ -2790,6 +2817,10 @@ mod tests {
         assert_eq!(uuid, [-1, -45057, -1073741825, -1]);
         let mut first = ItemEntities::default();
         let mut second = ItemEntities::default();
+        first.entity_seed_checked = true;
+        second.entity_seed_checked = true;
+        first.entity_seeder = Some(native_core::random::XoroshiroRandom::new(7));
+        second.entity_seeder = Some(native_core::random::XoroshiroRandom::new(7));
         let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
         first.spawn_from_entity(DVec3::ZERO, stack.clone());
         second.spawn_from_entity(DVec3::ZERO, stack);
@@ -2800,6 +2831,8 @@ mod tests {
     #[test]
     fn item_random_streams_are_independent() {
         let mut items = ItemEntities::default();
+        items.entity_seed_checked = true;
+        items.entity_seeder = Some(native_core::random::XoroshiroRandom::new(7));
         let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
         items.spawn_from_entity(DVec3::ZERO, stack.clone());
         items.spawn_from_entity(DVec3::ZERO, stack);
@@ -2815,9 +2848,37 @@ mod tests {
     }
 
     #[test]
+    fn item_uuid_comes_from_entity_random_and_missing_entropy_blocks_saving() {
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let mut seeded = ItemEntities::default();
+        seeded.entity_seed_checked = true;
+        seeded.entity_seeder = Some(native_core::random::XoroshiroRandom::new(71));
+        let mut seeder = seeded.entity_seeder.clone().unwrap();
+        let (expected_uuid, _, _, _) = item_random_from_seed(seeder.next_long());
+        seeded.spawn_from_entity(DVec3::ZERO, stack.clone());
+        assert_eq!(
+            seeded.entities[0].created.as_ref().unwrap().uuid,
+            Some(expected_uuid)
+        );
+
+        let mut unavailable = ItemEntities::default();
+        unavailable.entity_seed_checked = true;
+        unavailable.spawn_from_entity(DVec3::ZERO, stack);
+        assert_eq!(unavailable.entities[0].created.as_ref().unwrap().uuid, None);
+        let pos = native_world::loaded::ChunkPos { x: 0, z: 0 };
+        assert!(
+            unavailable
+                .validate_item_chunk_group(&BTreeSet::from([pos]), &Default::default())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn reloaded_items_get_a_fresh_constructor_stream_and_keep_saved_state() {
         use native_world::loaded::ChunkPos;
         let mut items = ItemEntities::default();
+        items.entity_seed_checked = true;
+        items.entity_seeder = Some(native_core::random::XoroshiroRandom::new(7));
         let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
         items.spawn_from_entity(DVec3::new(1.5, 5.0, 1.5), stack);
         let original = items.entities[0].clone();
@@ -2826,8 +2887,8 @@ mod tests {
         let home = ChunkPos { x: 0, z: 0 };
         items.set_active_chunks(BTreeSet::from([home]));
         items.set_active_chunks(BTreeSet::new());
-        let mut seed = native_core::random::XoroshiroRandom::new(1);
-        let (bob, _, mut expected_random) = item_random_from_seed(seed.next_long());
+        let mut seeder = items.entity_seeder.clone().unwrap();
+        let (_, bob, _, mut expected_random) = item_random_from_seed(seeder.next_long());
         items.set_active_chunks(BTreeSet::from([home]));
         let restored = &mut items.entities[0];
         assert_eq!(restored.id, 1);

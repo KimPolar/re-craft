@@ -143,6 +143,14 @@ impl Spline {
                 .fold(coordinate.5, |axes, point| axes | point.value.domain_axes()),
         }
     }
+    pub fn bulk_safe(&self) -> bool {
+        match self {
+            Self::Constant(_) => true,
+            Self::Multipoint {
+                coordinate, points, ..
+            } => coordinate.6 && points.iter().all(|point| point.value.bulk_safe()),
+        }
+    }
     pub fn range(&self) -> Interval {
         match self {
             Self::Constant(value) => Interval::exact(*value),

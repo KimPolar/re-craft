@@ -1,6 +1,6 @@
 //! Compile the density router from the active 26.3 noise-settings data pack.
 //!
-//! This exposes point sampling only. It does not generate chunks, fluids,
+//! This exposes point and unit-step block-volume sampling. It does not generate chunks, fluids,
 //! surfaces or structures, and assumes no older-chunk or structure adjustment.
 use std::sync::Arc;
 
@@ -160,6 +160,17 @@ impl NoiseRouter {
     pub fn sample_all(&self, evaluator: &mut DensityEvaluator, x: i32, y: i32, z: i32) -> [f32; 8] {
         evaluator.sample_array(&self.functions, x, y, z)
     }
+
+    /// Sample a unit-step block volume in Z, X, Y order.
+    pub fn sample_block_volume(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        field: RouterField,
+        min: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Vec<f32>> {
+        evaluator.sample_block_volume(self.function(field), min, size)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +216,17 @@ mod tests {
         assert_eq!(
             router.sample_all(&mut evaluator, 4, 5, 6),
             [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(
+            router
+                .sample_block_volume(
+                    &mut evaluator,
+                    RouterField::FinalDensity,
+                    [-1, -1, -1],
+                    [2, 2, 2]
+                )
+                .unwrap(),
+            vec![1.0; 8]
         );
         for (i, field) in RouterField::ALL.into_iter().enumerate() {
             assert_eq!(

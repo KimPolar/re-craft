@@ -349,6 +349,22 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             json!({"id":"minecraft:terrain","rust_expression":value,"java_expression":value}),
         );
     }
+    let gx = json!({"type":"gradient","axis":"x","from_coordinate":-32,"to_coordinate":32,"from_value":-1.0,"to_value":1.0});
+    let gy = json!({"type":"gradient","axis":"y","from_coordinate":-64,"to_coordinate":64,"from_value":1.0,"to_value":-1.0});
+    let gz = json!({"type":"gradient","axis":"z","from_coordinate":-32,"to_coordinate":32,"from_value":0.5,"to_value":-0.5});
+    let shape = json!({"type":"add","left":{"type":"mul","left":gx,"right":gy},"right":gz});
+    for (min, size, xz, y) in [
+        ([-8, -8, 0], [9, 9, 5], 4, 8),
+        ([-17, -5, 31], [5, 9, 5], 3, 5),
+        ([0, 0, 0], [1, 1, 1], 4, 8),
+        ([2, 3, 5], [1, 1, 1], 4, 8),
+        ([0, 0, 0], [4, 8, 4], 1, 1),
+        ([i32::MIN, -5, i32::MAX - 8], [5, 9, 5], 3, 5),
+        ([0, i32::MIN, 0], [3, 6, 3], 3, 5),
+    ] {
+        let expr = json!({"type":"interpolated","input":shape,"cell_size_xz":xz,"cell_size_y":y});
+        fixtures.push(json!({"id":"minecraft:terrain","rust_expression":expr,"java_expression":expr,"volume_min":min,"volume_size":size}));
+    }
     for name in ["overworld", "nether", "end"] {
         let path = format!("data/minecraft/worldgen/noise_settings/{name}.json");
         let bytes = sources.read_builtin_data(&path).unwrap().unwrap();
@@ -375,7 +391,12 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
                 );
             }
-            fixtures.push(json!({"id":"minecraft:terrain","noises":noises,"router_settings":format!("minecraft:{name}"),"router_field":field.name(),"router_mode":mode,"rust_expression":expression,"java_expression":java}));
+            let mut fixture = json!({"id":"minecraft:terrain","noises":noises,"router_settings":format!("minecraft:{name}"),"router_field":field.name(),"router_mode":mode,"rust_expression":expression,"java_expression":java});
+            if field.name() == "final_density" {
+                fixture["volume_min"] = json!([-17, -5, 31]);
+                fixture["volume_size"] = json!([5, 9, 5]);
+            }
+            fixtures.push(fixture);
         }
     }
     let input = temp.path().join("fixtures.json");
@@ -390,6 +411,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     let mut groups = 0;
     let mut samples = 0;
     let mut end_samples = 0;
+    let mut volume_samples = 0;
+    let mut volume_values = None;
     for line in output.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         match fields.first().copied() {
@@ -442,6 +465,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     "range fixture {index}"
                 );
                 compiled = Some((index, mode, seed, function));
+                volume_values = None;
                 groups += 1;
             }
             Some("P") | Some("Q") => {
@@ -467,6 +491,26 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     end_samples += 1;
                 }
             }
+            Some("V") => {
+                let (index, mode, seed, function) = compiled.as_ref().unwrap();
+                let min =
+                    [0, 1, 2].map(|i| fixtures[*index]["volume_min"][i].as_i64().unwrap() as i32);
+                let size =
+                    [0, 1, 2].map(|i| fixtures[*index]["volume_size"][i].as_u64().unwrap() as u32);
+                let values = volume_values.get_or_insert_with(|| {
+                    evaluator.sample_block_volume(function, min, size).unwrap()
+                });
+                let x: usize = fields[1].parse().unwrap();
+                let y: usize = fields[2].parse().unwrap();
+                let z: usize = fields[3].parse().unwrap();
+                let expected = fields[4].parse::<i32>().unwrap() as u32;
+                assert_eq!(
+                    values[(z * size[0] as usize + x) * size[1] as usize + y].to_bits(),
+                    expected,
+                    "volume fixture {index} mode {mode} seed {seed} at {x},{y},{z}"
+                );
+                volume_samples += 1;
+            }
             _ => {}
         }
     }
@@ -483,4 +527,23 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     );
     assert_eq!(samples, groups * 24);
     assert_eq!(end_samples, 3 * 10 * 80);
+    let expected_volume_samples: usize = fixtures
+        .iter()
+        .filter_map(|fixture| {
+            let size = fixture.get("volume_size")?.as_array()?;
+            let groups = if fixture.get("router_mode").is_some() {
+                5
+            } else {
+                10
+            };
+            Some(
+                groups
+                    * size
+                        .iter()
+                        .map(|n| n.as_u64().unwrap() as usize)
+                        .product::<usize>(),
+            )
+        })
+        .sum();
+    assert_eq!(volume_samples, expected_volume_samples);
 }

@@ -17,6 +17,8 @@ import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunctions;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunctionCompiler;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
+import net.minecraft.world.level.levelgen.densityfunction.DensityBuffer;
+import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.synth.Noise;
 import net.minecraft.world.level.levelgen.synth.NormalNoise;
 
@@ -92,6 +94,15 @@ public class WorldDensityNoiseOracle {
                 System.out.printf("S %d %d %d %d %d%n",i,mode,seed,Float.floatToRawIntBits(range.min()),Float.floatToRawIntBits(range.max()));
                 for (var p:points) {
                     System.out.printf("P %d %d %d %d%n",p[0],p[1],p[2],Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,p[0],p[1],p[2])));
+                }
+                if (fixture.has("volume_min")) {
+                    var min=fixture.getAsJsonArray("volume_min");
+                    var size=fixture.getAsJsonArray("volume_size");
+                    var volume=new DensityVolume(size.get(0).getAsInt(),size.get(1).getAsInt(),size.get(2).getAsInt(),min.get(0).getAsInt(),min.get(1).getAsInt(),min.get(2).getAsInt());
+                    var buffer=DensityBuffer.createUnpooled(volume.size());
+                    sampler.sampleVolume(SamplerContext.EMPTY_UNCACHED,buffer,volume);
+                    for(int z=0;z<volume.sizeZ();z++) for(int x=0;x<volume.sizeX();x++) for(int y=0;y<volume.sizeY();y++)
+                        System.out.printf("V %d %d %d %d%n",x,y,z,Float.floatToRawIntBits(buffer.get(volume.indexUnchecked(x,y,z))));
                 }
                 if (fixture.has("end_fixture")) for (int j=0;j<80;j++) {
                     int x=(j*7919)%90000-45000, z=(j*3571)%90000-45000, y=j-40;

@@ -4,6 +4,7 @@
 //! produce a different world.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 
@@ -30,9 +31,30 @@ const MAX_SURFACE_STEPS: f64 = 1_000_000.0;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
-pub struct DensityFunction(Node, usize, usize, bool, Interval, u8);
+pub struct DensityFunction(Node, usize, usize, bool, Interval, u8, bool);
 
-type SampleMemo = HashMap<(usize, i32, i32, i32, bool), f32>;
+#[derive(Clone, Copy)]
+struct BlockVolume {
+    min: [i32; 3],
+    max: [i32; 3],
+}
+
+#[derive(Default)]
+struct SampleMemo {
+    values: HashMap<(usize, i32, i32, i32, bool), f32>,
+    volume: Option<BlockVolume>,
+}
+impl Deref for SampleMemo {
+    type Target = HashMap<(usize, i32, i32, i32, bool), f32>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl DerefMut for SampleMemo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
 
 /// Reuse cache storage across samples; each sample starts with an empty cache.
 #[derive(Default)]
@@ -43,6 +65,7 @@ pub struct DensityEvaluator {
 impl DensityEvaluator {
     pub fn sample(&mut self, function: &DensityFunction, x: i32, y: i32, z: i32) -> f32 {
         self.memo.clear();
+        self.memo.volume = None;
         function.evaluate_cached(x, y, z, false, &mut self.memo)
     }
 
@@ -55,9 +78,52 @@ impl DensityEvaluator {
         z: i32,
     ) -> [f32; N] {
         self.memo.clear();
+        self.memo.volume = None;
         std::array::from_fn(|index| {
             functions[index].evaluate_cached(x, y, z, false, &mut self.memo)
         })
+    }
+
+    /// Evaluate a unit-step block volume in Java's Z, X, Y buffer order.
+    /// Slices enclosing interpolated functions are not yet supported in bulk.
+    pub fn sample_block_volume(
+        &mut self,
+        function: &DensityFunction,
+        min: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            function.6,
+            "bulk sampling of a slice enclosing interpolation is not supported"
+        );
+        ensure!(
+            size.iter().all(|n| *n > 0),
+            "volume dimensions must be positive"
+        );
+        let count = size
+            .iter()
+            .try_fold(1usize, |total, n| total.checked_mul(*n as usize))
+            .context("volume size overflow")?;
+        ensure!(count <= 1_000_000, "volume exceeds maximum sample count");
+        let mut max = [0; 3];
+        for axis in 0..3 {
+            max[axis] = i64::from(min[axis])
+                .checked_add(i64::from(size[axis]) - 1)
+                .and_then(|v| i32::try_from(v).ok())
+                .context("volume coordinates overflow")?;
+        }
+        self.memo.volume = Some(BlockVolume { min, max });
+        let mut output = Vec::with_capacity(count);
+        for z in min[2]..=max[2] {
+            for x in min[0]..=max[0] {
+                self.memo.clear();
+                for y in min[1]..=max[1] {
+                    output.push(function.evaluate_cached(x, y, z, true, &mut self.memo));
+                }
+            }
+        }
+        self.memo.volume = None;
+        Ok(output)
     }
 }
 
@@ -203,7 +269,7 @@ impl DensityFunction {
     // Java's volume and single-point samplers differ in their multiplication
     // fast path. InterpolatedFunction samples its eight corners in a volume.
     fn evaluate(&self, x: i32, y: i32, z: i32, volume: bool) -> f32 {
-        let mut memo = HashMap::new();
+        let mut memo = SampleMemo::default();
         self.evaluate_cached(x, y, z, volume, &mut memo)
     }
 
@@ -397,12 +463,21 @@ impl DensityFunction {
                 cell_xz,
                 cell_y,
             } => {
-                debug_assert!(!volume, "nested interpolation is not supported");
                 // The Java compiler slices axes outside this function's domain
                 // to zero before sampling, even when the result is non-finite.
                 let x = if self.5 & 1 == 0 { 0 } else { x };
                 let y = if self.5 & 2 == 0 { 0 } else { y };
                 let z = if self.5 & 4 == 0 { 0 } else { z };
+                if volume {
+                    return interpolate_block_volume(
+                        input,
+                        *cell_xz,
+                        *cell_y,
+                        self.5,
+                        [x, y, z],
+                        memo,
+                    );
+                }
                 let rx = x.rem_euclid(*cell_xz);
                 let ry = y.rem_euclid(*cell_y);
                 let rz = z.rem_euclid(*cell_xz);
@@ -504,6 +579,71 @@ fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
     first + alpha * (second - first)
 }
 
+fn interpolate_block_volume(
+    input: &Arc<DensityFunction>,
+    cell_xz: i32,
+    cell_y: i32,
+    axes: u8,
+    position: [i32; 3],
+    memo: &mut SampleMemo,
+) -> f32 {
+    let mut bounds = memo.volume.expect("block volume context is required");
+    for axis in 0..3 {
+        if axes & (1 << axis) == 0 {
+            bounds.min[axis] = 0;
+            bounds.max[axis] = 0;
+        }
+    }
+    let cell = [cell_xz, cell_y, cell_xz];
+    let aligned = (0..3).all(|axis| {
+        bounds.min[axis].rem_euclid(cell[axis]) == 0
+            && (bounds.min[axis] == bounds.max[axis] || cell[axis] == 1)
+    });
+    if aligned {
+        return input.evaluate_cached(position[0], position[1], position[2], true, memo);
+    }
+    let mut base = [0; 3];
+    let mut next = [0; 3];
+    let mut offset = [0; 3];
+    for axis in 0..3 {
+        offset[axis] = position[axis].rem_euclid(cell[axis]);
+        base[axis] = position[axis].wrapping_sub(offset[axis]);
+        next[axis] = if base[axis] == bounds.max[axis] {
+            base[axis]
+        } else {
+            base[axis].wrapping_add(cell[axis])
+        };
+    }
+    let mut corner = |x, y, z| {
+        let key = (Arc::as_ptr(input) as usize, x, y, z, true);
+        if let Some(value) = memo.get(&key) {
+            return *value;
+        }
+        let value = input.evaluate_cached(x, y, z, true, memo);
+        memo.insert(key, value);
+        value
+    };
+    let c000 = corner(base[0], base[1], base[2]);
+    let c100 = corner(next[0], base[1], base[2]);
+    let c010 = corner(base[0], next[1], base[2]);
+    let c110 = corner(next[0], next[1], base[2]);
+    let c001 = corner(base[0], base[1], next[2]);
+    let c101 = corner(next[0], base[1], next[2]);
+    let c011 = corner(base[0], next[1], next[2]);
+    let c111 = corner(next[0], next[1], next[2]);
+    let tz = offset[2] as f32 * (1.0 / cell_xz as f32);
+    let tx = offset[0] as f32 * (1.0 / cell_xz as f32);
+    let bottom = lerp(tx, lerp(tz, c000, c001), lerp(tz, c100, c101));
+    let top = lerp(tx, lerp(tz, c010, c011), lerp(tz, c110, c111));
+    let increment = (top - bottom) * (1.0 / cell_y as f32);
+    let start_y = bounds.min[1].wrapping_sub(base[1]).max(0);
+    let mut value = bottom + increment * start_y as f32;
+    for _ in start_y..offset[1] {
+        value += increment;
+    }
+    value
+}
+
 fn end_outer_island_density(noise: &Simplex2D, x: i32, z: i32) -> f32 {
     let x = x / 8;
     let z = z / 8;
@@ -593,16 +733,21 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     }
     let mut has_interpolation =
         matches!(node, Node::Interpolated { .. }) || children.iter().any(|child| child.3);
+    let mut bulk_safe = children.iter().all(|child| child.6);
     let mut axes = children.iter().fold(0, |axes, child| axes | child.5);
     match &node {
         Node::Gradient { axis, .. } => axes = 1 << axis,
         Node::DistanceToPoint { .. } => axes = 7,
         Node::EndOuterIslands(_) => axes = 5,
         Node::OldBlendedNoise(_) => axes = 7,
-        Node::Slice { axis, .. } => axes &= !(1 << axis),
+        Node::Slice { axis, input, .. } => {
+            axes &= !(1 << axis);
+            bulk_safe &= !input.3;
+        }
         Node::FindTopSurface { upper, .. } => {
             axes &= !2;
             has_interpolation = upper.3;
+            bulk_safe = upper.6 && !upper.3;
         }
         Node::Noise {
             xz_scale, y_scale, ..
@@ -629,6 +774,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         work = 1usize.saturating_add(spline.work());
         has_interpolation = spline.has_interpolation();
         axes = spline.domain_axes();
+        bulk_safe = spline.bulk_safe();
     }
     ensure!(depth <= MAX_DEPTH, "density function exceeds maximum depth");
     ensure!(
@@ -713,6 +859,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         has_interpolation,
         range,
         axes,
+        bulk_safe,
     )))
 }
 
@@ -1470,7 +1617,7 @@ mod tests {
             panic!("expected binary");
         };
         assert!(Arc::ptr_eq(left, right));
-        let mut memo = HashMap::new();
+        let mut memo = SampleMemo::default();
         let value = function.evaluate_cached(1, 5, 3, false, &mut memo);
         assert_eq!(value, 1.0);
         assert_eq!(memo.len(), 1);
@@ -1675,5 +1822,35 @@ mod tests {
         invalid["cell_height"] = json!(1);
         invalid["upper_bound"] = json!({"type":"mul","left":1000000,"right":1000000});
         assert!(compiler.compile(&invalid).is_err());
+    }
+
+    #[test]
+    fn block_volume_rejects_unsupported_or_invalid_shapes() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        let value = compiler.compile(&json!({"type":"slice","axis":"y","coordinate":3,"input":{"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":1}})).unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        assert!(
+            evaluator
+                .sample_block_volume(&value, [0, 0, 0], [2, 2, 2])
+                .is_err()
+        );
+        let constant = compiler.compile(&json!(1)).unwrap();
+        assert!(
+            evaluator
+                .sample_block_volume(&constant, [0, 0, 0], [0, 1, 1])
+                .is_err()
+        );
+        assert!(
+            evaluator
+                .sample_block_volume(&constant, [i32::MAX, 0, 0], [2, 1, 1])
+                .is_err()
+        );
+        assert_eq!(
+            evaluator
+                .sample_block_volume(&constant, [0, 0, 0], [2, 2, 2])
+                .unwrap(),
+            vec![1.0; 8]
+        );
     }
 }

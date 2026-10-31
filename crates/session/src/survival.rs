@@ -454,8 +454,8 @@ impl EffectDuration {
     }
 }
 
-/// Active effects needed for fall damage. The hidden chain ages with the
-/// visible effect, as it does for the other living-entity effects.
+/// Active effects used by movement, survival and fall damage. The hidden chain
+/// ages with the visible effect, as it does for other living-entity effects.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FallEffects {
     pub jump_boost: Option<EffectDuration>,
@@ -467,9 +467,20 @@ pub struct FallEffects {
     pub dolphins_grace: Option<EffectDuration>,
     pub haste: Option<EffectDuration>,
     pub mining_fatigue: Option<EffectDuration>,
+    pub hunger: Option<EffectDuration>,
 }
 
 impl FallEffects {
+    pub fn apply_hunger(&self, vitals: &mut PlayerVitals, mode: crate::GameMode) {
+        if let Some(effect) = &self.hunger
+            && effect.has_time()
+            && vitals.health > 0.0
+            && !matches!(mode, crate::GameMode::Creative | crate::GameMode::Spectator)
+        {
+            vitals.add_exhaustion(0.005_f32 * (f32::from(effect.amplifier) + 1.0));
+        }
+    }
+
     pub fn tick(&mut self) {
         EffectDuration::tick(&mut self.jump_boost);
         EffectDuration::tick(&mut self.resistance);
@@ -480,6 +491,7 @@ impl FallEffects {
         EffectDuration::tick(&mut self.dolphins_grace);
         EffectDuration::tick(&mut self.haste);
         EffectDuration::tick(&mut self.mining_fatigue);
+        EffectDuration::tick(&mut self.hunger);
     }
 }
 
@@ -716,6 +728,100 @@ impl PlayerVitals {
 mod tests {
     use super::*;
     use crate::{GameMode, GameSession, LocalSession, PlayerCommand};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn hunger_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("HungerEffectOracle.java");
+        let output = temp.path().join("hunger.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/HungerEffectOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("HungerEffectOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java hunger oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 120);
+        for row in rows {
+            let mode = if row["invulnerable"].as_bool().unwrap() {
+                GameMode::Creative
+            } else {
+                GameMode::Survival
+            };
+            let mut vitals = PlayerVitals {
+                exhaustion: row["initial"].as_f64().unwrap() as f32,
+                ..Default::default()
+            };
+            let mut effects = FallEffects {
+                hunger: Some(EffectDuration {
+                    amplifier: row["amplifier"].as_u64().unwrap() as u8,
+                    duration: row["duration"].as_i64().unwrap() as i32,
+                    hidden: None,
+                }),
+                ..Default::default()
+            };
+            for expected in row["ticks"].as_array().unwrap() {
+                effects.apply_hunger(&mut vitals, mode);
+                effects.tick();
+                assert_eq!(
+                    vitals.exhaustion.to_bits(),
+                    expected["exhaustion_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    effects.hunger.is_some(),
+                    expected["active"].as_bool().unwrap(),
+                    "{row}"
+                );
+                if let Some(effect) = &effects.hunger {
+                    assert_eq!(
+                        effect.duration,
+                        expected["duration"].as_i64().unwrap() as i32,
+                        "{row}"
+                    );
+                }
+            }
+        }
+    }
     use native_persistence::nbt::Tag;
     use std::time::Duration;
 

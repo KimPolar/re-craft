@@ -402,6 +402,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "dolphins_grace") => &mut effects.dolphins_grace,
             ("minecraft", "haste") => &mut effects.haste,
             ("minecraft", "mining_fatigue") => &mut effects.mining_fatigue,
+            ("minecraft", "hunger") => &mut effects.hunger,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1237,6 +1238,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "water_breathing"
                         | "conduit_power"
                         | "breath_of_the_nautilus"
+                        | "hunger"
                 ),
             "unsupported status effect {id}"
         );
@@ -1923,6 +1925,18 @@ mod tests {
                             ("id".into(), Tag::String("minecraft:dolphins_grace".into())),
                             ("duration".into(), Tag::Int(8)),
                         ]),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:hunger".into())),
+                            ("duration".into(), Tag::Int(1)),
+                            ("amplifier".into(), Tag::Byte(2)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![
+                                    ("duration".into(), Tag::Int(4)),
+                                    ("amplifier".into(), Tag::Byte(1)),
+                                ]),
+                            ),
+                        ]),
                     ],
                 },
             )]),
@@ -1942,6 +1956,8 @@ mod tests {
         assert_eq!(levitation.duration, 2);
         assert_eq!(levitation.amplifier, 1);
         assert_eq!(effects.dolphins_grace.unwrap().duration, 7);
+        let hunger = effects.hunger.unwrap();
+        assert_eq!((hunger.duration, hunger.amplifier), (3, 1));
     }
 
     #[test]

@@ -1588,7 +1588,8 @@ impl GameUi {
     fn sync_hud(&mut self, snapshot: &native_session::WorldSnapshot) {
         self.hud =
             HudDisplay::with_air(snapshot.vitals, snapshot.game_mode, snapshot.eyes_in_water)
-                .with_armor(snapshot.armor);
+                .with_armor(snapshot.armor)
+                .with_hunger_effect(snapshot.hunger_effect);
         self.experience =
             crate::experience_hud::Display::new(snapshot.experience, snapshot.game_mode);
     }

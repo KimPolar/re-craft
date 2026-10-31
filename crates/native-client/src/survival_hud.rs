@@ -16,6 +16,7 @@ pub struct HudDisplay {
     max_health_bits: u32,
     absorption: i32,
     food: i32,
+    hunger_effect: bool,
     empty_saturation: bool,
     hardcore: bool,
     air: Option<AirBubbles>,
@@ -73,6 +74,7 @@ impl HudDisplay {
             max_health_bits: max_health.max(health as f32).to_bits(),
             absorption,
             food: vitals.food,
+            hunger_effect: false,
             empty_saturation: vitals.saturation <= 0.0,
             hardcore: vitals.hardcore,
             air,
@@ -81,6 +83,11 @@ impl HudDisplay {
 
     pub fn with_armor(mut self, armor: Option<native_session::ArmorValues>) -> Self {
         self.armor = armor.map_or(0, native_session::ArmorValues::display_value);
+        self
+    }
+
+    pub fn with_hunger_effect(mut self, hunger_effect: bool) -> Self {
+        self.hunger_effect = hunger_effect;
         self
     }
 
@@ -120,6 +127,9 @@ enum Sprite {
     FoodEmpty,
     FoodFull,
     FoodHalf,
+    FoodEmptyHunger,
+    FoodFullHunger,
+    FoodHalfHunger,
     Air,
     AirBursting,
     AirEmpty,
@@ -144,6 +154,9 @@ impl Sprite {
             Self::FoodEmpty => &sprites.food_empty,
             Self::FoodFull => &sprites.food_full,
             Self::FoodHalf => &sprites.food_half,
+            Self::FoodEmptyHunger => &sprites.food_empty_hunger,
+            Self::FoodFullHunger => &sprites.food_full_hunger,
+            Self::FoodHalfHunger => &sprites.food_half_hunger,
             Self::Air => &sprites.air,
             Self::AirBursting => &sprites.air_bursting,
             Self::AirEmpty => &sprites.air_empty,
@@ -241,19 +254,31 @@ fn placements(hud: HudDisplay, width: i32, height: i32, tick: u64) -> Vec<Placem
                 0
             };
         result.push(Placement {
-            sprite: Sprite::FoodEmpty,
+            sprite: if hud.hunger_effect {
+                Sprite::FoodEmptyHunger
+            } else {
+                Sprite::FoodEmpty
+            },
             x,
             y,
         });
         if index * 2 + 1 < hud.food {
             result.push(Placement {
-                sprite: Sprite::FoodFull,
+                sprite: if hud.hunger_effect {
+                    Sprite::FoodFullHunger
+                } else {
+                    Sprite::FoodFull
+                },
                 x,
                 y,
             });
         } else if index * 2 + 1 == hud.food {
             result.push(Placement {
-                sprite: Sprite::FoodHalf,
+                sprite: if hud.hunger_effect {
+                    Sprite::FoodHalfHunger
+                } else {
+                    Sprite::FoodHalf
+                },
                 x,
                 y,
             });
@@ -327,6 +352,9 @@ mod tests {
             Sprite::FoodEmpty => "hud/food_empty",
             Sprite::FoodFull => "hud/food_full",
             Sprite::FoodHalf => "hud/food_half",
+            Sprite::FoodEmptyHunger => "hud/food_empty_hunger",
+            Sprite::FoodFullHunger => "hud/food_full_hunger",
+            Sprite::FoodHalfHunger => "hud/food_half_hunger",
             Sprite::Air => "hud/air",
             Sprite::AirBursting => "hud/air_bursting",
             Sprite::AirEmpty => "hud/air_empty",
@@ -402,11 +430,11 @@ public class SurvivalHudOracle {
     static final class TestPlayer extends Player {
         TestLevel testLevel;
         FoodData food;
-        int air; boolean eyes; int armor;
+        int air; boolean eyes; boolean hunger; int armor;
         TestPlayer() { super(null, null); }
         @Override public Level level() { return testLevel; }
         @Override public FoodData getFoodData() { return food; }
-        @Override public boolean hasEffect(Holder<MobEffect> effect) { return false; }
+        @Override public boolean hasEffect(Holder<MobEffect> effect) { return hunger && effect == net.minecraft.world.effect.MobEffects.HUNGER; }
         @Override public boolean isFullyFrozen() { return false; }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
         @Override public int getAirSupply() { return air; }
@@ -445,6 +473,7 @@ public class SurvivalHudOracle {
             player.air = c.has("air") ? c.get("air").getAsInt() : 300;
             player.armor = c.has("armor") ? c.get("armor").getAsInt() : 0;
             player.eyes = c.has("eyes") && c.get("eyes").getAsBoolean();
+            player.hunger = c.has("hunger") && c.get("hunger").getAsBoolean();
             int tick = c.get("tick").getAsInt(); ticks.setInt(hud, tick); ((RandomSource) rng.get(hud)).setSeed((long)(tick * 312871));
             int health = (int)Math.ceil(c.get("health").getAsFloat());
             int absorb = (int)Math.ceil(c.get("absorption").getAsFloat());
@@ -543,6 +572,11 @@ public class SurvivalHudOracle {
                 cases.push(json!({"armor":armor,"health":health,"max_health":maximum,"absorption":absorption,"food":20,"saturation":5.0,"hardcore":false,"tick":1}));
             }
         }
+        for food in 0..=20 {
+            for tick in [0, 1, 21, 62] {
+                cases.push(json!({"health":3,"max_health":20.0,"absorption":0,"food":food,"saturation":0.0,"hardcore":false,"tick":tick,"hunger":true}));
+            }
+        }
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SurvivalHudOracle.java");
         let input = temp.path().join("input.json");
@@ -584,7 +618,8 @@ public class SurvivalHudOracle {
                 .with_armor(Some(native_session::ArmorValues {
                     armor: case["armor"].as_f64().unwrap_or(0.0),
                     toughness: 0.0,
-                })),
+                }))
+                .with_hunger_effect(case["hunger"].as_bool().unwrap_or(false)),
                 320,
                 240,
                 case["tick"].as_u64().unwrap(),

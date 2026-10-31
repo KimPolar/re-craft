@@ -1292,6 +1292,7 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("active enchantment registry is unavailable"))?;
         self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
+        Arc::make_mut(&mut self.snapshot).hunger_effect = self.fall.effects().hunger.is_some();
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -2653,6 +2654,7 @@ impl LoadedSession {
             camera: self.camera,
             game_mode: self.game_mode,
             vitals: self.vitals,
+            hunger_effect: self.fall.effects().hunger.is_some(),
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
@@ -2760,6 +2762,7 @@ impl LoadedSession {
             camera,
             game_mode: GameMode::default(),
             vitals: crate::survival::PlayerVitals::default(),
+            hunger_effect: false,
             experience: crate::experience::Experience::default(),
             death: None,
             armor: Some(crate::ArmorValues::default()),
@@ -10458,6 +10461,9 @@ impl LoadedSession {
                     .as_ref()
                     .is_some_and(|effect| effect.duration != -1 && effect.duration <= 1)
             });
+        self.fall
+            .effects()
+            .apply_hunger(&mut self.vitals, self.game_mode);
         self.fall.tick_effects();
         self.update_movement_effect_modifiers(transitions);
         self.refresh_movement_speed();
@@ -11248,6 +11254,7 @@ impl GameSession for LoadedSession {
                 camera: self.camera,
                 game_mode: self.game_mode,
                 vitals: self.vitals,
+                hunger_effect: self.fall.effects().hunger.is_some(),
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),
@@ -27242,6 +27249,35 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn saved_hunger_applies_exhaustion_and_expires_in_snapshot() {
+        let mut session = session();
+        let effect = crate::survival::EffectDuration {
+            amplifier: 1,
+            duration: 2,
+            hidden: None,
+        };
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                hunger: Some(effect),
+                ..Default::default()
+            },
+            Arc::new(native_resources::enchantments::OxygenEnchantments::default()),
+        );
+        session.set_player_vitals(crate::survival::PlayerVitals::default());
+        session.update(TICK);
+        let first = session.snapshot();
+        assert!(first.hunger_effect);
+        assert_eq!(first.vitals.exhaustion, 0.01);
+        session.update(TICK);
+        let second = session.snapshot();
+        assert!(!second.hunger_effect);
+        assert_eq!(second.vitals.exhaustion, 0.02);
+        assert!(first.hunger_effect);
     }
 
     #[test]

@@ -1360,13 +1360,14 @@ impl WorldReader {
             .unwrap_or_else(|| Ok(BTreeMap::new()))
     }
 
-    /// The server uses a zero-initialized weather state when this file is absent.
-    pub fn weather_data(&self) -> Result<SavedWeather> {
+    /// Read the shared weather document, preserving the distinction between an
+    /// absent file and an existing default-valued document.
+    pub fn weather_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/weather.dat");
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(SavedWeather::default());
+                return Ok(None);
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("cannot open {}", path.display()));
@@ -1380,7 +1381,59 @@ impl WorldReader {
             nbt::read(&bytes)
         }
         .with_context(|| format!("invalid {}", path.display()))?;
-        parse_weather_data(&root)
+        parse_weather_data(&root)?;
+        Ok(Some(root))
+    }
+
+    /// The server uses a zero-initialized weather state when this file is absent.
+    pub fn weather_data(&self) -> Result<SavedWeather> {
+        self.weather_document()?
+            .map(|document| parse_weather_data(&document))
+            .unwrap_or_else(|| Ok(SavedWeather::default()))
+    }
+
+    /// Prepare a 26.3 weather document while retaining all unrelated tags.
+    pub fn update_weather_document(
+        source: Option<&NamedTag>,
+        weather: SavedWeather,
+    ) -> Result<NamedTag> {
+        let mut document = if let Some(source) = source {
+            parse_weather_data(source)?;
+            source.clone()
+        } else {
+            NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    ("data".into(), Tag::Compound(Vec::new())),
+                ]),
+            }
+        };
+        let Tag::Compound(root) = &mut document.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root
+            .iter_mut()
+            .find(|(key, _)| key.matches("data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        for (name, value) in [
+            ("clear_weather_time", Tag::Int(weather.clear_weather_time)),
+            ("rain_time", Tag::Int(weather.rain_time)),
+            ("thunder_time", Tag::Int(weather.thunder_time)),
+            ("raining", Tag::Byte(i8::from(weather.raining))),
+            ("thundering", Tag::Byte(i8::from(weather.thundering))),
+        ] {
+            replace_clock_field(data, name, value);
+        }
+        ensure!(
+            parse_weather_data(&document)? == weather,
+            "weather document did not round-trip"
+        );
+        Ok(document)
     }
 
     /// Serialize updated clock states while retaining unrecognized NBT fields.

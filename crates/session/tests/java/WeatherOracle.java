@@ -8,6 +8,7 @@ import net.minecraft.core.Holder;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Bootstrap;
@@ -47,6 +48,9 @@ public class WeatherOracle {
     static Field field(Class<?> c,String name) throws Exception { var f=c.getDeclaredField(name); f.setAccessible(true); return f; }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        var rustDocument = NbtIo.readCompressed(Path.of(args[2]), NbtAccounter.unlimitedHeap());
+        var rustWeather = WeatherData.CODEC.parse(NbtOps.INSTANCE, rustDocument.get("data")).getOrThrow();
+        if (rustWeather.getClearWeatherTime() != 37 || rustWeather.getRainTime() != 239 || rustWeather.getThunderTime() != 919 || !rustWeather.isRaining() || rustWeather.isThundering()) throw new AssertionError("Rust weather document differs");
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var u=(sun.misc.Unsafe)f.get(null);
         var world=(World)u.allocateInstance(World.class); var rules=(Rules)u.allocateInstance(Rules.class);
         var server=(Server)u.allocateInstance(Server.class); server.list=(Players)u.allocateInstance(Players.class);

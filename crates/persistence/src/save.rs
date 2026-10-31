@@ -70,6 +70,7 @@ pub struct WorldSavePlan {
     poi_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedWorldClocks>,
+    weather: Option<PlannedWeather>,
 }
 
 struct PlannedChunk {
@@ -111,6 +112,11 @@ struct PlannedWorldClocks {
     document: crate::nbt::NamedTag,
 }
 
+struct PlannedWeather {
+    source_nbt: Option<Vec<u8>>,
+    document: crate::nbt::NamedTag,
+}
+
 impl WorldSavePlan {
     pub fn new() -> Self {
         Self::default()
@@ -143,6 +149,10 @@ impl WorldSavePlan {
 
     pub fn poi_chunk_count(&self) -> usize {
         self.poi_chunks.len()
+    }
+
+    pub fn has_weather(&self) -> bool {
+        self.weather.is_some()
     }
 
     /// Add a POI chunk to a coordinated partial transaction. The caller must
@@ -303,6 +313,25 @@ impl WorldSavePlan {
         });
         Ok(())
     }
+
+    /// Stage shared 26.3 weather with all unknown source fields preserved.
+    /// An absent source requires the file still to be absent at commit time.
+    pub fn add_weather(
+        &mut self,
+        source: Option<&nbt::NamedTag>,
+        weather: crate::world::SavedWeather,
+    ) -> Result<()> {
+        ensure!(
+            self.weather.is_none(),
+            "world save plan contains duplicate weather data"
+        );
+        let document = crate::world::WorldReader::update_weather_document(source, weather)?;
+        self.weather = Some(PlannedWeather {
+            source_nbt: source.map(nbt::write).transpose()?,
+            document,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -312,6 +341,7 @@ pub struct WorldSaveResult {
     pub poi_region_paths: Vec<PathBuf>,
     pub player_paths: Vec<PathBuf>,
     pub world_clocks_path: Option<PathBuf>,
+    pub weather_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
 }
 
@@ -623,7 +653,8 @@ impl WorldWriteGuard {
                 || !plan.entity_chunks.is_empty()
                 || !plan.poi_chunks.is_empty()
                 || !plan.players.is_empty()
-                || plan.world_clocks.is_some(),
+                || plan.world_clocks.is_some()
+                || plan.weather.is_some(),
             "world save plan is empty"
         );
         let mut groups = BTreeMap::<(RegionKind, DimensionId, i32, i32), Vec<RegionChange>>::new();
@@ -703,7 +734,10 @@ impl WorldWriteGuard {
             .prefix("transaction-")
             .tempdir_in(&backup_root)?;
         let mut replacements = Vec::with_capacity(
-            groups.len() + plan.players.len() + plan.world_clocks.is_some() as usize,
+            groups.len()
+                + plan.players.len()
+                + plan.world_clocks.is_some() as usize
+                + plan.weather.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut absent_dependencies = Vec::new();
@@ -749,6 +783,7 @@ impl WorldWriteGuard {
         let mut poi_region_paths = Vec::new();
         let mut player_paths = Vec::with_capacity(plan.players.len());
         let mut world_clocks_path = None;
+        let mut weather_path = None;
 
         for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
@@ -1076,10 +1111,117 @@ impl WorldWriteGuard {
             world_clocks_path = Some(canonical);
         }
 
+        if let Some(planned) = &plan.weather {
+            let mut directory = self.root.clone();
+            for component in ["data", "minecraft"] {
+                directory.push(component);
+                let (_, exists) =
+                    crate::save_transaction::checked_directory(&self.root, &directory)?;
+                if !exists {
+                    ensure!(
+                        planned.source_nbt.is_none(),
+                        "weather data directory changed after its draft was created"
+                    );
+                    fs::create_dir(&directory)?;
+                    ensure!(
+                        crate::save_transaction::checked_directory(&self.root, &directory)?.1,
+                        "weather data directory disappeared"
+                    );
+                }
+            }
+            let directory = directory.canonicalize()?;
+            ensure!(
+                directory.starts_with(&self.root),
+                "weather data directory is outside the world"
+            );
+            let path = directory.join("weather.dat");
+            let current = match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_file() && ordinary(&metadata),
+                        "weather data must be an ordinary file"
+                    );
+                    let canonical = path.canonicalize()?;
+                    ensure!(
+                        canonical.parent() == Some(directory.as_path()),
+                        "weather data resolves outside its directory"
+                    );
+                    let bytes = nbt::decompress_limited(File::open(&canonical)?)?;
+                    let compressed = bytes.starts_with(&[0x1f, 0x8b]);
+                    let document = if compressed {
+                        nbt::read_gzip(bytes.as_slice())?
+                    } else {
+                        nbt::read(&bytes)?
+                    };
+                    crate::world::parse_weather_data(&document)?;
+                    ensure!(
+                        planned
+                            .source_nbt
+                            .as_ref()
+                            .is_some_and(|expected| nbt::write(&document)
+                                .is_ok_and(|actual| &actual == expected)),
+                        "weather data changed after its draft was created"
+                    );
+                    let original_hash = hash_file(&canonical)?;
+                    let backup_dir = backup.path().join("world-data");
+                    fs::create_dir_all(&backup_dir)?;
+                    let weather_backup = backup_dir.join("weather.dat");
+                    copy_sync(&canonical, &weather_backup)?;
+                    Some((canonical, weather_backup, original_hash, compressed))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(
+                        planned.source_nbt.is_none(),
+                        "weather data disappeared after its draft was created"
+                    );
+                    None
+                }
+                Err(error) => return Err(error).context("cannot inspect weather data"),
+            };
+            let replacement = nbt::write(&planned.document)?;
+            let compressed = current
+                .as_ref()
+                .is_none_or(|(_, _, _, compressed)| *compressed);
+            let bytes = if compressed {
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&replacement)?;
+                gzip.finish()?
+            } else {
+                replacement.clone()
+            };
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&directory)?;
+            stage.write_all(&bytes)?;
+            stage.flush()?;
+            stage.as_file().sync_all()?;
+            let staged = if compressed {
+                nbt::read_gzip(File::open(stage.path())?)?
+            } else {
+                nbt::read(&bytes)?
+            };
+            ensure!(
+                nbt::write(&staged)? == replacement,
+                "staged weather data failed the NBT round-trip check"
+            );
+            crate::world::parse_weather_data(&staged)?;
+            let (target, backup, original_hash) = match current {
+                Some((target, backup, hash, _)) => (target, Some(backup), Some(hash)),
+                None => (path, None, None),
+            };
+            replacements.push(crate::save_transaction::Replacement {
+                target: target.clone(),
+                backup,
+                stage,
+                original_hash,
+            });
+            weather_path = Some(target);
+        }
+
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}",
             region_paths.len(),
             plan.chunks.len(),
             entity_region_paths.len(),
@@ -1088,7 +1230,8 @@ impl WorldWriteGuard {
             plan.poi_chunks.len(),
             absent_dependencies.len(),
             plan.players.len(),
-            plan.world_clocks.is_some() as usize
+            plan.world_clocks.is_some() as usize,
+            plan.weather.is_some() as usize
         )?;
         note.sync_all()?;
         let backup_directory = backup.keep();
@@ -1111,6 +1254,7 @@ impl WorldWriteGuard {
             poi_region_paths,
             player_paths,
             world_clocks_path,
+            weather_path,
             backup_directory,
         })
     }
@@ -1670,6 +1814,129 @@ mod tests {
             .prefix("world-")
             .tempdir_in(root)
             .unwrap()
+    }
+
+    #[test]
+    fn weather_plan_preserves_unknown_data_and_detects_stale_or_missing_sources() {
+        use crate::world::SavedWeather;
+        let weather = SavedWeather {
+            clear_weather_time: 37,
+            rain_time: 239,
+            thunder_time: 919,
+            raining: true,
+            thundering: false,
+        };
+        for compressed in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let path = world.path().join("data/minecraft/weather.dat");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut source =
+                crate::world::WorldReader::update_weather_document(None, SavedWeather::default())
+                    .unwrap();
+            let Tag::Compound(root) = &mut source.value else {
+                unreachable!()
+            };
+            root.push(("future_root".into(), Tag::Long(42)));
+            let Tag::Compound(data) = &mut root
+                .iter_mut()
+                .find(|(key, _)| key.matches("data"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            data.push(("future_data".into(), Tag::String("keep".into())));
+            let raw = nbt::write(&source).unwrap();
+            let original = if compressed {
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&raw).unwrap();
+                gzip.finish().unwrap()
+            } else {
+                raw
+            };
+            fs::write(&path, &original).unwrap();
+            let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+            let mut stale = WorldSavePlan::new();
+            stale.add_weather(None, weather).unwrap();
+            assert!(guard.write_plan(stale, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let mut plan = WorldSavePlan::new();
+            plan.add_weather(Some(&source), weather).unwrap();
+            assert!(plan.add_weather(Some(&source), weather).is_err());
+            let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+            assert_eq!(
+                result.weather_path.as_deref(),
+                Some(path.canonicalize().unwrap().as_path())
+            );
+            let saved_bytes = fs::read(&path).unwrap();
+            assert_eq!(saved_bytes.starts_with(&[0x1f, 0x8b]), compressed);
+            let saved = if compressed {
+                nbt::read_gzip(saved_bytes.as_slice()).unwrap()
+            } else {
+                nbt::read(&saved_bytes).unwrap()
+            };
+            assert_eq!(crate::world::parse_weather_data(&saved).unwrap(), weather);
+            assert_eq!(saved.value.get("future_root"), Some(&Tag::Long(42)));
+            assert_eq!(
+                saved.value.get("data").unwrap().get("future_data"),
+                Some(&Tag::String("keep".into()))
+            );
+            assert_eq!(
+                fs::read(result.backup_directory.join("world-data/weather.dat")).unwrap(),
+                original
+            );
+            let mut old = WorldSavePlan::new();
+            old.add_weather(Some(&source), weather).unwrap();
+            assert!(guard.write_plan(old, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), saved_bytes);
+            let clock_path = path.parent().unwrap().join("world_clocks.dat");
+            let clock = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    ("data".into(), Tag::Compound(Vec::new())),
+                ]),
+            };
+            let clock_bytes = nbt::write(&clock).unwrap();
+            fs::write(&clock_path, &clock_bytes).unwrap();
+            let mut stale_multi = WorldSavePlan::new();
+            stale_multi
+                .add_world_clocks(
+                    &clock,
+                    &BTreeMap::from([(
+                        DimensionId::parse("minecraft:overworld").unwrap(),
+                        crate::world::SavedClock::default(),
+                    )]),
+                )
+                .unwrap();
+            stale_multi.add_weather(Some(&source), weather).unwrap();
+            assert!(guard.write_plan(stale_multi, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&clock_path).unwrap(), clock_bytes);
+            assert_eq!(fs::read(&path).unwrap(), saved_bytes);
+        }
+        let world = test_world();
+        fixture(world.path());
+        let path = world.path().join("data/minecraft/weather.dat");
+        assert!(!path.exists());
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_weather(None, weather).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            result.weather_path.as_deref(),
+            Some(path.canonicalize().unwrap().as_path())
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]));
+        assert_eq!(
+            crate::world::parse_weather_data(&nbt::read_gzip(bytes.as_slice()).unwrap()).unwrap(),
+            weather
+        );
+        let mut duplicate = WorldSavePlan::new();
+        duplicate.add_weather(None, weather).unwrap();
+        assert!(guard.write_plan(duplicate, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     fn chunk(x: i32, marker: &str) -> NamedTag {
@@ -2969,6 +3236,25 @@ mod tests {
             .unwrap();
         let original_clock_bytes = clock_gzip.finish().unwrap();
         fs::write(&clock_path, &original_clock_bytes).unwrap();
+        let weather_path = world.path().join("data/minecraft/weather.dat");
+        let weather_source = crate::world::WorldReader::update_weather_document(
+            None,
+            crate::world::SavedWeather::default(),
+        )
+        .unwrap();
+        let mut weather_gzip = GzEncoder::new(Vec::new(), Compression::default());
+        weather_gzip
+            .write_all(&nbt::write(&weather_source).unwrap())
+            .unwrap();
+        let original_weather_bytes = weather_gzip.finish().unwrap();
+        fs::write(&weather_path, &original_weather_bytes).unwrap();
+        let weather = crate::world::SavedWeather {
+            clear_weather_time: 9,
+            rain_time: 31,
+            thunder_time: 47,
+            raining: true,
+            thundering: false,
+        };
         let clock_states = BTreeMap::from([(
             DimensionId::parse("overworld").unwrap(),
             crate::world::SavedClock {
@@ -3040,6 +3326,7 @@ mod tests {
         )
         .unwrap();
         plan.add_world_clocks(&clock_source, &clock_states).unwrap();
+        plan.add_weather(Some(&weather_source), weather).unwrap();
         assert_eq!(plan.chunk_count(), 3);
 
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
@@ -3067,6 +3354,21 @@ mod tests {
         assert_eq!(
             result.world_clocks_path,
             Some(clock_path.canonicalize().unwrap())
+        );
+        assert_eq!(
+            result.weather_path,
+            Some(weather_path.canonicalize().unwrap())
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("world-data/weather.dat")).unwrap(),
+            original_weather_bytes
+        );
+        assert_eq!(
+            crate::world::parse_weather_data(
+                &nbt::read_gzip(File::open(weather_path).unwrap()).unwrap()
+            )
+            .unwrap(),
+            weather
         );
         assert_eq!(
             fs::read(result.backup_directory.join("world-data/world_clocks.dat")).unwrap(),

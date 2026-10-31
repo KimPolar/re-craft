@@ -313,7 +313,19 @@ fn valid_poi_directory(value: &str) -> bool {
 }
 
 fn valid_created_target(value: &str, version: u32) -> bool {
-    valid_created_entity_region(value) || (version >= 4 && valid_created_poi_region(value))
+    valid_created_entity_region(value)
+        || (version >= 4 && valid_created_poi_region(value))
+        || (version >= 5 && valid_created_weather(value))
+}
+
+fn valid_created_weather(value: &str) -> bool {
+    let components: Vec<_> = Path::new(value).components().collect();
+    components
+        == [
+            Component::Normal("data".as_ref()),
+            Component::Normal("minecraft".as_ref()),
+            Component::Normal("weather.dat".as_ref()),
+        ]
 }
 
 fn valid_absent_directory(value: &str, version: u32) -> bool {
@@ -322,7 +334,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5),
         "unsupported transaction version"
     );
     ensure!(
@@ -357,7 +369,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             }
             (None, None) if manifest.version >= 2 => ensure!(
                 valid_created_target(&record.target, manifest.version),
-                "invalid created region path"
+                "invalid created file path"
             ),
             _ => bail!("invalid transaction original"),
         }
@@ -567,6 +579,11 @@ fn prepare(
     }
     let manifest = Manifest {
         version: if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_weather(&record.target))
+        {
+            5
+        } else if records
             .iter()
             .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
             || absent_dependencies
@@ -1051,6 +1068,48 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(recover(&root).unwrap());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn created_weather_recovery_is_versioned_and_refuses_unrelated_paths() {
+        let weather = "data/minecraft/weather.dat";
+        assert!(!valid_created_target(weather, 4));
+        assert!(valid_created_target(weather, 5));
+        for invalid in [
+            "data/minecraft/game_rules.dat",
+            "data/minecraft/world_clocks.dat",
+            "data/example/weather.dat",
+            "players/data/weather.dat",
+            "data/minecraft/../weather.dat",
+        ] {
+            assert!(!valid_created_target(invalid, 5), "{invalid}");
+        }
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join(weather);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new weather").unwrap();
+        let file = Replacement {
+            target: target.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        };
+        let mut prepared = prepare(&root, &backup, vec![file], vec![]).unwrap();
+        assert_eq!(prepared.manifest.version, 5);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        fs::write(&target, b"new weather").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
     }
 
     #[test]

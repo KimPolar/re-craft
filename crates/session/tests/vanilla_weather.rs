@@ -11,6 +11,7 @@ fn weather_timer_and_intensities_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    native_resources::packs::ResourceStack::open(&game).unwrap();
     let version = game.join("versions/26.3");
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
@@ -29,6 +30,26 @@ fn weather_timer_and_intensities_match_java() {
     let source = temp.path().join("WeatherOracle.java");
     let output = temp.path().join("weather.json");
     let saved_data = temp.path().join("weather.dat");
+    let rust_data = temp.path().join("rust-weather.dat");
+    let state = SavedWeather {
+        clear_weather_time: 37,
+        rain_time: 239,
+        thunder_time: 919,
+        raining: true,
+        thundering: false,
+    };
+    let document =
+        native_persistence::world::WorldReader::update_weather_document(None, state).unwrap();
+    {
+        use std::io::Write;
+        let mut file = flate2::write::GzEncoder::new(
+            std::fs::File::create(&rust_data).unwrap(),
+            flate2::Compression::default(),
+        );
+        file.write_all(&native_persistence::nbt::write(&document).unwrap())
+            .unwrap();
+        file.finish().unwrap();
+    }
     std::fs::write(&source, include_str!("java/WeatherOracle.java")).unwrap();
     for command in [
         Command::new(java.join("javac.exe"))
@@ -40,7 +61,8 @@ fn weather_timer_and_intensities_match_java() {
             .arg(&cp)
             .arg("WeatherOracle")
             .arg(&output)
-            .arg(&saved_data),
+            .arg(&saved_data)
+            .arg(&rust_data),
     ] {
         let result = command.output().unwrap();
         assert!(
@@ -52,8 +74,18 @@ fn weather_timer_and_intensities_match_java() {
     }
     let cases: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    let saved = native_persistence::nbt::read_gzip(std::fs::File::open(saved_data).unwrap()).unwrap();
-    assert_eq!(native_persistence::world::parse_weather_data(&saved).unwrap(), SavedWeather { clear_weather_time: 37, rain_time: 239, thunder_time: 919, raining: true, thundering: false });
+    let saved =
+        native_persistence::nbt::read_gzip(std::fs::File::open(saved_data).unwrap()).unwrap();
+    assert_eq!(
+        native_persistence::world::parse_weather_data(&saved).unwrap(),
+        SavedWeather {
+            clear_weather_time: 37,
+            rain_time: 239,
+            thunder_time: 919,
+            raining: true,
+            thundering: false
+        }
+    );
     assert_eq!(cases.len(), 240);
     for (case, row) in cases.iter().enumerate() {
         let data = SavedWeather {

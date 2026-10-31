@@ -278,6 +278,9 @@ enum SourceKind {
     Multi(ClimateTree),
 }
 impl BiomeSource {
+    pub fn is_fixed(&self) -> bool {
+        matches!(self.kind, SourceKind::Fixed(_))
+    }
     /// Parse the generator's active biome_source definition. Unknown presets fail.
     pub fn load(provider: &mut impl ResourceProvider, value: &Value) -> Result<Self> {
         let registry: BTreeSet<_> = provider.list_data("worldgen/biome")?.into_iter().collect();

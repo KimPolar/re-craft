@@ -12,6 +12,7 @@ native-core = { path = "../core" }
 native-persistence = { path = "../persistence" }
 native-resources = { path = "../resources" }
 native-world = { path = "../world" }
+serde_json.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true

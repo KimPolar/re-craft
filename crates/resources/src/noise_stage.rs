@@ -201,6 +201,9 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 }
 
 impl NoiseStageGenerator {
+    pub fn router(&self) -> &NoiseRouter {
+        &self.router
+    }
     pub fn sea_level(&self) -> i32 {
         self.sea_level
     }

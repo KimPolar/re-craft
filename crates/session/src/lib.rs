@@ -57,6 +57,7 @@ pub mod stair_placement;
 pub mod survival;
 pub mod weather;
 pub mod world_spawn;
+pub mod worldgen;
 
 #[cfg(test)]
 mod vanilla_fluid_motion;

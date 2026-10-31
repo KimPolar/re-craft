@@ -18,6 +18,7 @@ pub enum VideoControl {
     MenuBlur,
     RenderDistance,
     BiomeBlend,
+    WeatherRadius,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +168,18 @@ fn slider_from_blend(value: u8) -> f64 {
     }
 }
 
+fn weather_from_slider(value: f64) -> u8 {
+    3 + (value.clamp(0.0, f64::from(0.99999_f32)) * 8.0).floor() as u8
+}
+
+fn slider_from_weather(value: u8) -> f64 {
+    match value.clamp(3, 10) {
+        3 => 0.0,
+        10 => 1.0,
+        value => (f64::from(value - 3) + 0.5) / 8.0,
+    }
+}
+
 pub struct VideoUi {
     scroll: f64,
     slider: f64,
@@ -176,6 +189,7 @@ pub struct VideoUi {
     distance_pending: Option<Instant>,
     blend_slider: f64,
     blend_pending: Option<Instant>,
+    weather_slider: f64,
     dragging_scrollbar: Option<i32>,
     pub keyboard_adjust: bool,
 }
@@ -191,6 +205,7 @@ impl VideoUi {
             distance_pending: None,
             blend_slider: slider_from_blend(video.biome_blend),
             blend_pending: None,
+            weather_slider: slider_from_weather(video.weather_radius),
             dragging_scrollbar: None,
             keyboard_adjust: false,
         }
@@ -213,6 +228,7 @@ impl VideoUi {
             y: match control {
                 VideoControl::Inactivity => 105,
                 VideoControl::MenuBlur => 366,
+                VideoControl::WeatherRadius => 441,
                 VideoControl::RenderDistance | VideoControl::BiomeBlend => 241,
                 _ => 80,
             } - self.scroll as i32,
@@ -234,6 +250,7 @@ impl VideoUi {
             VideoControl::MenuBlur,
             VideoControl::RenderDistance,
             VideoControl::BiomeBlend,
+            VideoControl::WeatherRadius,
         ]
         .into_iter()
         .find(|control| {
@@ -272,6 +289,13 @@ impl VideoUi {
     ) -> bool {
         let rect = self.control_rect(width, control);
         let value = (f64::from(x - rect.x - 4) / f64::from(rect.w - 8)).clamp(0.0, 1.0);
+        if control == VideoControl::WeatherRadius {
+            self.weather_slider = value;
+            let next = weather_from_slider(value);
+            let changed = video.weather_radius != next;
+            video.weather_radius = next;
+            return changed;
+        }
         if control == VideoControl::BiomeBlend {
             self.blend_slider = value;
             self.blend_pending = Some(Instant::now() + Duration::from_millis(600));
@@ -327,6 +351,18 @@ impl VideoUi {
         };
         self.blend_slider = slider_from_blend(next);
         self.blend_pending = Some(Instant::now() + Duration::from_millis(600));
+    }
+
+    pub fn weather_arrow(&mut self, right: bool, video: &mut VideoSettings) -> bool {
+        let next = if right {
+            video.weather_radius.saturating_add(1).min(10)
+        } else {
+            video.weather_radius.saturating_sub(1).max(3)
+        };
+        let changed = next != video.weather_radius;
+        video.weather_radius = next;
+        self.weather_slider = slider_from_weather(next);
+        changed
     }
 
     pub fn apply_pending_distance(
@@ -429,6 +465,9 @@ impl VideoUi {
         if self.dragging_slider == Some(VideoControl::MenuBlur) {
             self.blur_slider = crate::blur_ui::to_slider(video.menu_blur);
         }
+        if self.dragging_slider == Some(VideoControl::WeatherRadius) {
+            self.weather_slider = slider_from_weather(video.weather_radius);
+        }
         self.dragging_slider = None;
         self.dragging_scrollbar = None;
     }
@@ -508,14 +547,20 @@ impl VideoUi {
                             );
                         } else if label.key == "options.renderDistance"
                             || label.key == "options.biomeBlendRadius"
+                            || label.key == "options.weatherRadius"
                         {
                             let blend = label.key == "options.biomeBlendRadius";
-                            let slider = if blend {
+                            let weather = label.key == "options.weatherRadius";
+                            let slider = if weather {
+                                self.weather_slider
+                            } else if blend {
                                 self.blend_slider
                             } else {
                                 self.distance_slider
                             };
-                            let control = if blend {
+                            let control = if weather {
+                                VideoControl::WeatherRadius
+                            } else if blend {
                                 VideoControl::BiomeBlend
                             } else {
                                 VideoControl::RenderDistance
@@ -542,7 +587,13 @@ impl VideoUi {
                                 },
                                 handle.scaling,
                             );
-                            let value = if blend {
+                            let value = if weather {
+                                assets.translate("options.blocks", "%s Blocks").replacen(
+                                    "%s",
+                                    &weather_from_slider(slider).to_string(),
+                                    1,
+                                )
+                            } else if blend {
                                 let side = blend_from_slider(slider) * 2 + 1;
                                 let key = format!("options.biomeBlendRadius.{side}");
                                 let fallback = if side == 1 {
@@ -694,6 +745,37 @@ impl VideoUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn weather_radius_slider_applies_immediately_and_supports_keyboard() {
+        let mut video = VideoSettings::default();
+        let mut ui = VideoUi::new(video);
+        assert_eq!(
+            ui.control_rect(426, VideoControl::WeatherRadius),
+            Rect {
+                x: 58,
+                y: 441,
+                w: 150,
+                h: 20
+            }
+        );
+        for radius in 3..=10 {
+            assert_eq!(weather_from_slider(slider_from_weather(radius)), radius);
+        }
+        assert!(ui.start_control_slider(426, 62, VideoControl::WeatherRadius, &mut video));
+        assert_eq!(video.weather_radius, 3);
+        ui.release(video);
+        assert!(ui.weather_arrow(true, &mut video));
+        assert_eq!(video.weather_radius, 4);
+        assert!(ui.weather_arrow(false, &mut video));
+        assert!(!ui.weather_arrow(false, &mut video));
+        ui.ensure_control_visible(240, VideoControl::WeatherRadius);
+        let rect = ui.control_rect(426, VideoControl::WeatherRadius);
+        assert!(ui.visible(240, rect));
+        assert_eq!(
+            ui.hit(426, 240, (rect.x + 5, rect.y + 5)),
+            Some(VideoControl::WeatherRadius)
+        );
+    }
     #[test]
     fn biome_blend_slider_delays_changes_and_supports_keyboard() {
         let mut video = VideoSettings::default();

@@ -82,6 +82,7 @@ enum PauseButton {
     VideoBlur,
     VideoDistance,
     VideoBlend,
+    VideoWeather,
 }
 
 impl PauseButton {
@@ -747,6 +748,7 @@ impl GameUi {
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
                             VideoControl::RenderDistance => PauseButton::VideoDistance,
                             VideoControl::BiomeBlend => PauseButton::VideoBlend,
+                            VideoControl::WeatherRadius => PauseButton::VideoWeather,
                         })
                 }
             }
@@ -971,6 +973,20 @@ impl GameUi {
                 }
                 PauseAction::None
             }
+            PauseButton::VideoWeather => {
+                if mouse {
+                    let (width, _) = self.logical_size();
+                    self.video_dirty |= self.video_ui.start_control_slider(
+                        width,
+                        self.cursor.0,
+                        VideoControl::WeatherRadius,
+                        &mut self.video,
+                    );
+                } else {
+                    self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
+                }
+                PauseAction::None
+            }
             PauseButton::VideoDistance => {
                 if mouse {
                     let (width, _) = self.logical_size();
@@ -1029,6 +1045,7 @@ impl GameUi {
                 | PauseButton::VideoBlur
                 | PauseButton::VideoDistance
                 | PauseButton::VideoBlend
+                | PauseButton::VideoWeather
                 | PauseButton::GlintSpeed
                 | PauseButton::FovEffectScale
                 | PauseButton::GlintStrength
@@ -1102,6 +1119,7 @@ impl GameUi {
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
+                    Some(PauseButton::VideoWeather) => Some(VideoControl::WeatherRadius),
                     _ => None,
                 };
                 if focused_control.is_some_and(|control| {
@@ -1242,6 +1260,7 @@ impl GameUi {
                     buttons.push(PauseButton::VideoBlend);
                     buttons.push(PauseButton::VideoDistance);
                     buttons.push(PauseButton::VideoBlur);
+                    buttons.push(PauseButton::VideoWeather);
                     buttons.push(PauseButton::Done);
                     buttons
                 }
@@ -1272,6 +1291,7 @@ impl GameUi {
                         PauseButton::VideoBlur
                             | PauseButton::VideoDistance
                             | PauseButton::VideoBlend
+                            | PauseButton::VideoWeather
                     )
                 )
             {
@@ -1282,6 +1302,8 @@ impl GameUi {
                         VideoControl::MenuBlur
                     } else if self.pause_focus == Some(PauseButton::VideoBlend) {
                         VideoControl::BiomeBlend
+                    } else if self.pause_focus == Some(PauseButton::VideoWeather) {
+                        VideoControl::WeatherRadius
                     } else {
                         VideoControl::RenderDistance
                     },
@@ -1372,6 +1394,15 @@ impl GameUi {
             self.video_dirty |= self
                 .fov_ui
                 .arrow(key == KeyCode::ArrowRight, &mut self.video);
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Video
+            && self.pause_focus == Some(PauseButton::VideoWeather)
+            && self.video_ui.keyboard_adjust
+            && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
+        {
+            self.video_dirty |= self
+                .video_ui
+                .weather_arrow(key == KeyCode::ArrowRight, &mut self.video);
             self.last_draw = None;
         } else if self.pause_page == PausePage::Video
             && self.pause_focus == Some(PauseButton::VideoBlend)
@@ -2667,6 +2698,7 @@ impl GameUi {
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
                     Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
+                    Some(PauseButton::VideoWeather) => Some(VideoControl::WeatherRadius),
                     _ => None,
                 };
                 self.video_ui
@@ -4105,6 +4137,11 @@ mod inventory_tests {
         ui.pause_key(KeyCode::Enter, false);
         ui.pause_key(KeyCode::ArrowRight, false);
         assert_eq!(ui.video_settings().menu_blur, 5);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::VideoWeather));
+        ui.pause_key(KeyCode::Enter, false);
+        ui.pause_key(KeyCode::ArrowLeft, false);
+        assert_eq!(ui.video_settings().weather_radius, 9);
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::Done));
     }

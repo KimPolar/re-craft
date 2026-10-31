@@ -57,6 +57,8 @@ mod video_ui;
 mod visual_look;
 #[cfg(test)]
 mod weather_column_tests;
+mod weather_gpu;
+mod weather_render;
 #[cfg(all(test, target_os = "windows"))]
 mod window_test;
 
@@ -1005,6 +1007,9 @@ fn prepare_existing_world(
                 );
             }
         }
+        session
+            .publish_initial_weather_terrain()
+            .map_err(anyhow::Error::msg)?;
         if chunk.is_none() {
             let saved = player_data
                 .as_ref()

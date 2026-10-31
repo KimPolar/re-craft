@@ -450,6 +450,7 @@ pub struct WorldSnapshot {
     pub locked_chest_message: Option<Arc<LockedChestMessage>>,
     /// Unknown when saved weather or dimension capability was not resolved.
     pub weather: Option<weather::WeatherVisual>,
+    pub weather_terrain: Option<weather::WeatherTerrain>,
     /// Shared world game time, including ticks before this session was opened.
     pub game_time: i64,
     pub tick: u64,
@@ -639,6 +640,7 @@ impl LocalSession {
             system_messages: Arc::from([]),
             locked_chest_message: None,
             weather: Some(weather::WeatherVisual::default()),
+            weather_terrain: None,
             game_time: 0,
             tick: 0,
             origin: IVec3::ZERO,
@@ -807,6 +809,7 @@ impl LocalSession {
             system_messages: Arc::clone(&self.snapshot.system_messages),
             locked_chest_message: self.snapshot.locked_chest_message.clone(),
             weather: self.snapshot.weather,
+            weather_terrain: None,
             game_time: self.tick as i64,
             tick: self.tick,
             origin: IVec3::ZERO,
@@ -1868,6 +1871,7 @@ impl GameSession for LocalSession {
                 system_messages: Arc::clone(&self.snapshot.system_messages),
                 locked_chest_message: self.snapshot.locked_chest_message.clone(),
                 weather: self.snapshot.weather,
+                weather_terrain: None,
                 game_time: self.tick as i64,
                 tick: self.tick,
                 origin: IVec3::ZERO,

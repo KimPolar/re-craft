@@ -226,6 +226,8 @@ pub struct VideoSettings {
     pub render_distance: u8,
     /// Radius of the square biome-color average, in blocks.
     pub biome_blend: u8,
+    /// Java 26.3 precipitation effect radius, in blocks.
+    pub weather_radius: u8,
     pub vsync: bool,
     /// 260 is the vanilla unlimited setting; lower values are frames per second.
     pub max_fps: u16,
@@ -277,6 +279,7 @@ impl Default for VideoSettings {
         Self {
             render_distance: 12,
             biome_blend: 2,
+            weather_radius: 10,
             vsync: true,
             max_fps: 120,
             fov: 70,
@@ -309,6 +312,11 @@ impl VideoSettings {
                 self.biome_blend
             } else {
                 2
+            },
+            weather_radius: if (3..=10).contains(&self.weather_radius) {
+                self.weather_radius
+            } else {
+                10
             },
             render_distance: if (2..=32).contains(&self.render_distance) {
                 self.render_distance
@@ -613,6 +621,7 @@ mod tests {
         .unwrap();
         let video = VideoSettings {
             mouse_sensitivity: UnitInterval::new(0.77),
+            weather_radius: 6,
             mouse_wheel_sensitivity: MouseWheelSensitivity::new(3.4),
             discrete_mouse_scroll: true,
             invert_mouse_x: true,
@@ -627,10 +636,11 @@ mod tests {
         let parsed: Settings = serde_json::from_value(saved).unwrap();
         assert_eq!(parsed.video, video);
         let invalid: VideoSettings =
-            serde_json::from_str(r#"{"mouse_sensitivity":1.5,"mouse_wheel_sensitivity":12.0}"#)
+            serde_json::from_str(r#"{"mouse_sensitivity":1.5,"mouse_wheel_sensitivity":12.0,"weather_radius":11}"#)
                 .unwrap();
         assert_eq!(invalid.valid().mouse_sensitivity.value(), 0.5);
         assert_eq!(invalid.valid().mouse_wheel_sensitivity.value(), 1.0);
+        assert_eq!(invalid.valid().weather_radius, 10);
     }
 
     #[test]

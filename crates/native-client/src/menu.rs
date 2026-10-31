@@ -84,6 +84,7 @@ enum ButtonId {
     VideoBlur,
     VideoDistance,
     VideoBlend,
+    VideoWeather,
     Accessibility,
     ViewBobbing,
     FovEffectScale,
@@ -1251,6 +1252,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
             ButtonId::VideoBlend => Some(VideoControl::BiomeBlend),
+            ButtonId::VideoWeather => Some(VideoControl::WeatherRadius),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -1608,6 +1610,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
+                    (ButtonId::VideoWeather, VideoControl::WeatherRadius),
                 ] {
                     let rect = self.video_ui.control_rect(w, control);
                     add(
@@ -1618,7 +1621,10 @@ impl<'a> Menu<'a> {
                         String::new(),
                         matches!(
                             id,
-                            ButtonId::VideoBlur | ButtonId::VideoDistance | ButtonId::VideoBlend
+                            ButtonId::VideoBlur
+                                | ButtonId::VideoDistance
+                                | ButtonId::VideoBlend
+                                | ButtonId::VideoWeather
                         ) || self.video_ui.visible(h, rect),
                     );
                 }
@@ -1887,6 +1893,15 @@ impl<'a> Menu<'a> {
                     &mut self.state.video,
                 );
             }
+            ButtonId::VideoWeather => {
+                let (width, _) = self.logical_size();
+                self.state.video_dirty |= self.video_ui.start_control_slider(
+                    width,
+                    self.cursor.0,
+                    VideoControl::WeatherRadius,
+                    &mut self.state.video,
+                );
+            }
             ButtonId::VideoDistance => {
                 let (width, _) = self.logical_size();
                 self.video_ui.start_control_slider(
@@ -2030,6 +2045,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoBlur
                     | ButtonId::VideoDistance
                     | ButtonId::VideoBlend
+                    | ButtonId::VideoWeather
                     | ButtonId::VideoVsync
                     | ButtonId::VideoInactivity
                     | ButtonId::OptionsFov
@@ -2482,6 +2498,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
                         Some(ButtonId::VideoBlend) => Some(VideoControl::BiomeBlend),
+                        Some(ButtonId::VideoWeather) => Some(VideoControl::WeatherRadius),
                         _ => None,
                     };
                     self.video_ui
@@ -2638,6 +2655,7 @@ impl<'a> Menu<'a> {
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
                         | ButtonId::VideoBlend
+                        | ButtonId::VideoWeather
                         | ButtonId::ViewBobbing
                 )
             {
@@ -2914,6 +2932,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoBlend
+                                | ButtonId::VideoWeather
                                 | ButtonId::OptionsFov
                                 | ButtonId::FovEffectScale
                                 | ButtonId::GlintSpeed
@@ -2936,6 +2955,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoBlend
+                                | ButtonId::VideoWeather
                                 | ButtonId::VideoVsync
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
@@ -3179,6 +3199,14 @@ impl ApplicationHandler for Menu<'_> {
                         .fov_ui
                         .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Video
+                    && self.focused == Some(ButtonId::VideoWeather)
+                    && self.video_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.state.video_dirty |= self
+                        .video_ui
+                        .weather_arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
+                } else if self.state.screen == Screen::Video
                     && self.focused == Some(ButtonId::VideoBlend)
                     && self.video_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -3240,6 +3268,7 @@ impl ApplicationHandler for Menu<'_> {
                                     ButtonId::VideoBlur
                                         | ButtonId::VideoDistance
                                         | ButtonId::VideoBlend
+                                        | ButtonId::VideoWeather
                                 )
                             )
                         {
@@ -3250,6 +3279,8 @@ impl ApplicationHandler for Menu<'_> {
                                     VideoControl::MenuBlur
                                 } else if self.focused == Some(ButtonId::VideoBlend) {
                                     VideoControl::BiomeBlend
+                                } else if self.focused == Some(ButtonId::VideoWeather) {
+                                    VideoControl::WeatherRadius
                                 } else {
                                     VideoControl::RenderDistance
                                 },
@@ -3275,6 +3306,7 @@ impl ApplicationHandler for Menu<'_> {
                                     | ButtonId::VideoBlur
                                     | ButtonId::VideoDistance
                                     | ButtonId::VideoBlend
+                                    | ButtonId::VideoWeather
                             )
                         );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
@@ -3328,6 +3360,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
                                 | ButtonId::VideoBlend
+                                | ButtonId::VideoWeather
                         ) {
                             self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
                         } else if matches!(

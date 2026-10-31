@@ -442,7 +442,7 @@ pub struct LoadedSession {
     heightmap_tags: Option<Arc<HeightmapTags>>,
     heightmap_flags: Vec<Option<BlockHeightFlags>>,
     heightmap_air: Option<BlockHeightFlags>,
-    spawn_heightmaps: BTreeMap<ChunkPos, SpawnHeightmaps>,
+    spawn_heightmaps: Arc<BTreeMap<ChunkPos, Arc<SpawnHeightmaps>>>,
     stream_window: Option<(ChunkPos, u32)>,
     pending_window: Option<(ChunkPos, u32)>,
     respawn_window: Option<(ChunkPos, u32)>,
@@ -2845,6 +2845,27 @@ impl LoadedSession {
         }
     }
 
+    fn weather_terrain(&self) -> Option<crate::weather::WeatherTerrain> {
+        Some(crate::weather::WeatherTerrain {
+            heightmaps: Arc::clone(&self.spawn_heightmaps),
+            climates: Arc::clone(self.biome_climates.as_ref()?),
+            sea_level: self.generator_sea_level,
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+        })
+    }
+
+    /// Publish the initial heightmap set after the world-loading worker has
+    /// finished preparing its chunks, avoiding a map clone per loaded chunk.
+    pub fn publish_initial_weather_terrain(&mut self) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("initial weather terrain must be published before simulation begins");
+        }
+        let terrain = self.weather_terrain();
+        Arc::make_mut(&mut self.snapshot).weather_terrain = terrain;
+        Ok(())
+    }
+
     pub fn set_initial_game_time(&mut self, value: i64) -> Result<(), &'static str> {
         if self.tick != 0 || self.accumulated != Duration::ZERO {
             return Err("game time must be restored before simulation begins");
@@ -2995,6 +3016,7 @@ impl LoadedSession {
             system_messages: Arc::clone(&self.system_messages),
             locked_chest_message: self.locked_chest_message.clone(),
             weather: self.weather_visual(),
+            weather_terrain: self.weather_terrain(),
             game_time: self.game_time,
             tick: self.tick,
             origin: self.origin,
@@ -3106,6 +3128,7 @@ impl LoadedSession {
             system_messages: Arc::from([]),
             locked_chest_message: None,
             weather: None,
+            weather_terrain: None,
             game_time: 0,
             tick: 0,
             origin,
@@ -3276,7 +3299,7 @@ impl LoadedSession {
             heightmap_tags: None,
             heightmap_flags: Vec::new(),
             heightmap_air: None,
-            spawn_heightmaps: BTreeMap::new(),
+            spawn_heightmaps: Arc::new(BTreeMap::new()),
             stream_window: None,
             pending_window: None,
             respawn_window: None,
@@ -3485,7 +3508,7 @@ impl LoadedSession {
             "heightmap chunk is not loaded"
         );
         self.validate_spawn_heightmaps(&maps)?;
-        self.spawn_heightmaps.insert(pos, maps);
+        Arc::make_mut(&mut self.spawn_heightmaps).insert(pos, Arc::new(maps));
         Ok(())
     }
 
@@ -5873,7 +5896,11 @@ impl LoadedSession {
                             respawn_changed = true;
                         }
                         self.entity_collision_cache.remove(&pos);
-                        if self.spawn_heightmaps.remove(&pos).is_some() {
+                        if self.spawn_heightmaps.contains_key(&pos)
+                            && Arc::make_mut(&mut self.spawn_heightmaps)
+                                .remove(&pos)
+                                .is_some()
+                        {
                             respawn_changed = true;
                         }
                     }
@@ -5940,7 +5967,9 @@ impl LoadedSession {
                 self.entity_chunks.remove(&pos);
             }
             self.entity_collision_cache.remove(&pos);
-            self.spawn_heightmaps.remove(&pos);
+            if self.spawn_heightmaps.contains_key(&pos) {
+                Arc::make_mut(&mut self.spawn_heightmaps).remove(&pos);
+            }
             if !self.fluid_chunks_seen.contains(&pos) {
                 let world = Arc::make_mut(&mut self.world);
                 world.saved_fluid_ticks.remove(&pos);
@@ -6088,7 +6117,8 @@ impl LoadedSession {
                             }
                             self.entity_collision_cache.insert(pos, OnceLock::new());
                             if let Some(maps) = heightmaps {
-                                self.spawn_heightmaps.insert(pos, maps);
+                                Arc::make_mut(&mut self.spawn_heightmaps)
+                                    .insert(pos, Arc::new(maps));
                             }
                             respawn_changed = true;
                             for (_, state) in self.world.states().skip(old_count) {
@@ -8945,7 +8975,10 @@ impl LoadedSession {
                 z: pos.z,
             },
         );
-        if let Some(mut maps) = self.spawn_heightmaps.remove(&chunk_pos) {
+        if self.spawn_heightmaps.contains_key(&chunk_pos)
+            && let Some(maps) = Arc::make_mut(&mut self.spawn_heightmaps).remove(&chunk_pos)
+        {
+            let mut maps = Arc::unwrap_or_clone(maps);
             let update = (|| -> anyhow::Result<()> {
                 use anyhow::Context;
                 let flags = self
@@ -8968,7 +9001,7 @@ impl LoadedSession {
             })();
             match update {
                 Ok(()) => {
-                    self.spawn_heightmaps.insert(chunk_pos, maps);
+                    Arc::make_mut(&mut self.spawn_heightmaps).insert(chunk_pos, Arc::new(maps));
                 }
                 Err(error) => self.stream_errors.push(format!(
                     "heightmap chunk {}, {}: {error:#}",
@@ -12312,6 +12345,7 @@ impl GameSession for LoadedSession {
                 system_messages: Arc::clone(&self.system_messages),
                 locked_chest_message: self.locked_chest_message.clone(),
                 weather: self.weather_visual(),
+                weather_terrain: self.weather_terrain(),
                 game_time: self.game_time,
                 tick: self.tick,
                 origin: self.origin,
@@ -13925,6 +13959,59 @@ mod tests {
         assert_eq!(
             fast.snapshot().weather,
             Some(crate::weather::WeatherVisual::default())
+        );
+    }
+
+    #[test]
+    fn weather_terrain_shares_unchanged_heightmaps_and_preserves_old_snapshots() {
+        use native_resources::biome_climate::{BiomeClimate, TemperatureModifier};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(home, None))
+            .unwrap();
+        session.set_precipitation_environment(
+            Arc::new(BTreeMap::from([(
+                "minecraft:plains".into(),
+                BiomeClimate {
+                    has_precipitation: true,
+                    temperature: 0.8,
+                    modifier: TemperatureModifier::None,
+                },
+            )])),
+            Some(63),
+        );
+        session.publish_initial_weather_terrain().unwrap();
+        let before = session.snapshot();
+        let prior = before.weather_terrain.as_ref().unwrap();
+        session.set_random_tick_speed(0);
+        session.update(TICK);
+        let unchanged = session.snapshot();
+        assert!(Arc::ptr_eq(
+            &prior.heightmaps,
+            &unchanged.weather_terrain.as_ref().unwrap().heightmaps
+        ));
+        let x = session.origin.x + 8;
+        let z = session.origin.z + 8;
+        let old_height = prior.heightmaps[&home]
+            .highest(SpawnHeightmapKind::MotionBlocking, x, z)
+            .unwrap();
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(IVec3::new(8, 5, 8), stone));
+        session.update(TICK);
+        let after = session.snapshot();
+        let current = after.weather_terrain.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(&prior.heightmaps, &current.heightmaps));
+        assert_eq!(
+            prior.heightmaps[&home].highest(SpawnHeightmapKind::MotionBlocking, x, z),
+            Some(old_height)
+        );
+        assert_eq!(
+            current.heightmaps[&home].highest(SpawnHeightmapKind::MotionBlocking, x, z),
+            Some(5)
         );
     }
 

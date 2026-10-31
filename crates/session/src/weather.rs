@@ -1,7 +1,21 @@
 //! Shared Java 26.3 weather timers and per-level rain and thunder intensity.
 
 use native_core::random::LegacyRandom;
+use native_persistence::heightmap::SpawnHeightmaps;
 use native_persistence::world::SavedWeather;
+use native_resources::biome_climate::BiomeClimate;
+use native_world::loaded::ChunkPos;
+use std::{collections::BTreeMap, sync::Arc};
+
+/// Immutable weather inputs; each heightmap is shared independently across ticks.
+#[derive(Clone)]
+pub struct WeatherTerrain {
+    pub heightmaps: Arc<BTreeMap<ChunkPos, Arc<SpawnHeightmaps>>>,
+    pub climates: Arc<BTreeMap<String, BiomeClimate>>,
+    pub sea_level: Option<i32>,
+    pub min_y: i32,
+    pub max_y: i32,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Weather {

@@ -508,6 +508,31 @@ impl World {
         )
     }
 
+    /// Java clamps the selected quart-Y to the chunk's build range after
+    /// biome zoom, including for cameras above or below the dimension.
+    pub fn biome_at_block_in_bounds(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_y: i32,
+        max_y: i32,
+    ) -> Option<&str> {
+        if min_y >= max_y {
+            return None;
+        }
+        let seed = self.biome_zoom_seed?;
+        let quart = crate::biome_zoom::quart_position(seed, glam::IVec3::new(x, y, z));
+        let quart_y = quart
+            .y
+            .clamp(min_y.div_euclid(4), (max_y - 1).div_euclid(4));
+        self.biome(
+            quart.x.checked_mul(4)?,
+            quart_y.checked_mul(4)?,
+            quart.z.checked_mul(4)?,
+        )
+    }
+
     pub fn light(&self, x: i32, y: i32, z: i32, sky: bool) -> Option<u8> {
         let (section, local) = self.section_and_local(x, y, z)?;
         let data = if sky {
@@ -608,6 +633,14 @@ mod tests {
             }
         }
         assert!(changed > 0);
+        for y in [-100, -1, 0, 15, 16, 100] {
+            let quart = crate::biome_zoom::quart_position(
+                crate::biome_zoom::obfuscate_seed(seed),
+                glam::IVec3::new(8, y, 8),
+            );
+            let expected = world.biome(quart.x * 4, quart.y.clamp(0, 3) * 4, quart.z * 4);
+            assert_eq!(world.biome_at_block_in_bounds(8, y, 8, 0, 16), expected);
+        }
     }
 
     #[test]

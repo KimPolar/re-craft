@@ -222,6 +222,8 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     terrain_pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
+    weather_pipeline: wgpu::RenderPipeline,
+    weather_gpu: Option<crate::weather_gpu::WeatherGpu>,
     breaking_renderer: Option<BreakingRenderer>,
     item_renderer: Option<ItemRenderer>,
     ground_items: Option<GroundItemRenderer>,
@@ -284,6 +286,27 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn set_weather_textures(
+        &mut self,
+        textures: &crate::weather_render::WeatherTextures,
+    ) -> Result<()> {
+        self.weather_gpu = Some(crate::weather_gpu::WeatherGpu::new(
+            &self.device,
+            &self.queue,
+            &self.atlas_bind_layout,
+            &self.camera_buffer,
+            textures,
+        )?);
+        Ok(())
+    }
+
+    pub fn update_weather(&mut self, mesh: &crate::weather_render::WeatherMesh) -> Result<()> {
+        if let Some(weather) = &mut self.weather_gpu {
+            weather.update(&self.device, &self.queue, mesh)?;
+        }
+        Ok(())
+    }
+
     pub fn set_fog_range(&mut self, range: Option<[f32; 2]>) {
         self.fog_range = range;
     }
@@ -894,6 +917,8 @@ impl Renderer {
         };
         let terrain_pipeline = make_terrain_pipeline(false);
         let translucent_pipeline = make_terrain_pipeline(true);
+        let weather_pipeline =
+            crate::weather_gpu::pipeline(&device, &terrain_layout, config.format, DEPTH_FORMAT);
         let breaking_renderer = breaking_textures
             .map(|textures| {
                 BreakingRenderer::new(
@@ -1200,6 +1225,8 @@ impl Renderer {
             bind_group,
             terrain_pipeline,
             translucent_pipeline,
+            weather_pipeline,
+            weather_gpu: None,
             breaking_renderer,
             item_renderer,
             ground_items,
@@ -2135,6 +2162,14 @@ impl Renderer {
                 &self.fog_bind_group,
                 false,
             );
+            if let Some(weather) = &self.weather_gpu {
+                weather.draw(
+                    &mut pass,
+                    &self.weather_pipeline,
+                    &self.lightmap_bind_group,
+                    &self.fog_bind_group,
+                );
+            }
         }
         self.first_person.draw(
             &self.queue,

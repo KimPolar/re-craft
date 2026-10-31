@@ -130,7 +130,7 @@ pub fn run_play(
     event_loop: &mut EventLoop<()>,
     scene: PreviewScene,
     session: LoadedSession,
-    resources: ResourceStack,
+    mut resources: ResourceStack,
     streamer: ChunkStreamer,
     smoke_test: bool,
     assets: Option<Arc<MenuAssets>>,
@@ -156,6 +156,15 @@ pub fn run_play(
         session.submit_command(PlayerCommand::Place);
         session.update(Duration::from_millis(50));
     }
+    let weather_textures = snapshot.weather_terrain.as_ref().and_then(|_| {
+        match crate::weather_render::WeatherTextures::load(&mut resources) {
+            Ok(textures) => Some(textures),
+            Err(error) => {
+                eprintln!("Weather textures are unavailable: {error:#}");
+                None
+            }
+        }
+    });
     let mesher = MeshWorker::start(resources)?;
     run_inner(
         event_loop,
@@ -171,6 +180,9 @@ pub fn run_play(
             trims,
             sky_timeline,
             sky_background,
+            weather_textures,
+            weather_mesh: crate::weather_render::WeatherMesh::default(),
+            weather_frame: None,
             sky_background_tick: None,
             sky_background_revision: None,
             sky_background_previous: None,
@@ -277,6 +289,9 @@ struct PlayState {
     trims: Arc<crate::equipment_visual::TrimRegistry>,
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
+    weather_textures: Option<crate::weather_render::WeatherTextures>,
+    weather_mesh: crate::weather_render::WeatherMesh,
+    weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
     sky_background_tick: Option<u64>,
     sky_background_revision: Option<u64>,
     sky_background_previous: Option<[f32; 3]>,
@@ -824,8 +839,33 @@ impl Viewer {
             renderer.set_view_yaw(self.camera.yaw);
         }
         if let (Some(renderer), Some(play), Some(snapshot)) =
-            (&mut self.renderer, &self.play, &render_snapshot)
+            (&mut self.renderer, &mut self.play, &render_snapshot)
         {
+            let camera = self.scene.origin.as_dvec3() + self.camera.eye.as_dvec3();
+            let partial = play.session.partial_tick();
+            let key = (
+                snapshot.tick,
+                snapshot.world_revision,
+                partial.to_bits(),
+                [camera.x.to_bits(), camera.y.to_bits(), camera.z.to_bits()],
+                self.scene.origin,
+                self.video.weather_radius,
+            );
+            if play.weather_frame.as_ref() != Some(&key) {
+                crate::weather_render::build_into(
+                    &mut play.weather_mesh,
+                    snapshot,
+                    self.scene.origin,
+                    camera,
+                    partial,
+                    i32::from(self.video.weather_radius),
+                );
+                if let Err(error) = renderer.update_weather(&play.weather_mesh) {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                play.weather_frame = Some(key);
+            }
             renderer.set_chest_lids(
                 Arc::clone(&snapshot.chest_lids),
                 play.session.partial_tick(),
@@ -964,6 +1004,14 @@ impl ApplicationHandler for Viewer {
         };
         renderer.set_fov(self.video.fov);
         renderer.set_view_bobbing(self.video.view_bobbing);
+        if let Some(textures) = self
+            .play
+            .as_ref()
+            .and_then(|play| play.weather_textures.as_ref())
+            && let Err(error) = renderer.set_weather_textures(textures)
+        {
+            eprintln!("Weather rendering is unavailable: {error:#}");
+        }
         #[cfg(debug_assertions)]
         println!("World viewer graphics backend: {}", renderer.backend_name);
         self.window = Some(window);
@@ -2295,6 +2343,7 @@ mod tests {
             system_messages: Arc::clone(&previous.system_messages),
             locked_chest_message: previous.locked_chest_message.clone(),
             weather: previous.weather,
+            weather_terrain: previous.weather_terrain.clone(),
             game_time: previous.game_time,
             tick: previous.tick,
             origin: glam::IVec3::new(16_000_016, 0, -16_000_000),

@@ -372,6 +372,8 @@ mod tests {
             ),
         ] {
             let item = native_session::items::DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::ZERO,
                 previous_position: glam::DVec3::ZERO,
                 stack: native_session::inventory::ItemStack::new(
@@ -397,6 +399,8 @@ mod tests {
     fn ore_blocks_and_drops_use_their_own_textures() {
         for ore in native_core::ore::Ore::ALL {
             let item = native_session::items::DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::ZERO,
                 previous_position: glam::DVec3::ZERO,
                 stack: native_session::inventory::ItemStack::new(
@@ -551,6 +555,8 @@ mod tests {
                 }
             }
             let item = native_session::items::DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::ZERO,
                 previous_position: glam::DVec3::ZERO,
                 stack: native_session::inventory::ItemStack::new(

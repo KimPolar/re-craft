@@ -380,6 +380,8 @@ mod tests {
             )
             .unwrap();
             let item = DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(-0.4, -0.2, 0.5),
                 previous_position: glam::DVec3::new(-0.4, -0.2, 0.5),
                 age: 0,
@@ -393,6 +395,8 @@ mod tests {
                 .unwrap(),
             };
             let wood = DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(0.4, -0.2, 0.5),
                 previous_position: glam::DVec3::new(0.4, -0.2, 0.5),
                 age: 0,
@@ -523,6 +527,8 @@ mod tests {
                 })
             };
             let ground_item = DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(0.0, 0.25, 0.25),
                 previous_position: glam::DVec3::new(0.0, 0.25, 0.25),
                 age: 0,
@@ -536,6 +542,8 @@ mod tests {
                 .unwrap(),
             };
             let glowing_item = DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(0.6, 0.25, 0.25),
                 previous_position: glam::DVec3::new(0.6, 0.25, 0.25),
                 ..ground_item.clone()

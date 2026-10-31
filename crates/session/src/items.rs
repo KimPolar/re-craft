@@ -24,6 +24,10 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct DroppedItem {
+    /// Session-local entity identifier used by item model properties.
+    pub entity_id: i32,
+    /// Java item lifetime (distinct from Entity.tickCount, used below as age).
+    pub item_age: i32,
     /// Absolute position, independent of streaming's relative coordinate origin.
     pub position: DVec3,
     /// Position at the preceding tick, for render interpolation.
@@ -1224,6 +1228,8 @@ impl ItemEntities {
         let (bob_offset, _) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position,
                 previous_position: position,
                 stack: saved.stack,
@@ -1263,6 +1269,8 @@ impl ItemEntities {
         let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position,
                 previous_position: position,
                 stack,
@@ -1304,7 +1312,12 @@ impl ItemEntities {
         self.entities
             .iter()
             .filter(|entity| Self::active(&self.active_chunks, entity.item.position))
-            .map(|entity| entity.item.clone())
+            .map(|entity| {
+                let mut item = entity.item.clone();
+                item.entity_id = entity.id as i32;
+                item.item_age = entity.lifetime;
+                item
+            })
             .collect()
     }
 
@@ -1334,6 +1347,8 @@ impl ItemEntities {
                 let (bob_offset, yaw) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
+                        entity_id: 0,
+                        item_age: 0,
                         position: location,
                         previous_position: location,
                         stack: stack.with_count(count).expect("positive fragment"),
@@ -1384,6 +1399,8 @@ impl ItemEntities {
         let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position,
                 previous_position: position,
                 stack,
@@ -1445,6 +1462,8 @@ impl ItemEntities {
         let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position,
                 previous_position: position,
                 stack,
@@ -1792,6 +1811,8 @@ impl ItemEntities {
                 let (bob_offset, yaw) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
+                        entity_id: 0,
+                        item_age: 0,
                         position: location,
                         previous_position: location,
                         stack,
@@ -3253,6 +3274,8 @@ mod tests {
         );
         let make = |id: &str| ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: DVec3::ZERO,
                 previous_position: DVec3::ZERO,
                 stack: ItemStack::new(id.into(), 1, 64, Tag::Compound(vec![])).unwrap(),
@@ -3989,6 +4012,8 @@ mod tests {
                         };
                         items.entities.push(ItemEntity {
                             item: DroppedItem {
+                                entity_id: 0,
+                                item_age: 0,
                                 position,
                                 previous_position: position,
                                 stack: ItemStack::new(
@@ -4071,6 +4096,8 @@ mod tests {
             let position = DVec3::new((index % 20) as f64 - 10.5, 0.0, (index / 20) as f64 - 5.5);
             original.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position,
                     previous_position: position,
                     stack: ItemStack::new(
@@ -4137,6 +4164,8 @@ mod tests {
             };
             items.entities.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position,
                     previous_position: position,
                     stack: ItemStack::new(
@@ -4224,6 +4253,8 @@ mod tests {
         for (count, lifetime, delay) in [(5, 100, 4), (10, 200, 7)] {
             items.entities.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position: DVec3::ZERO,
                     previous_position: DVec3::ZERO,
                     stack: ItemStack::new(
@@ -4284,6 +4315,8 @@ mod tests {
         for _ in 0..2 {
             items.entities.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position: DVec3::ZERO,
                     previous_position: DVec3::ZERO,
                     stack: ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![]))
@@ -4333,6 +4366,8 @@ mod tests {
             let position = DVec3::new(x, 2.0, 0.5);
             items.entities.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position,
                     previous_position: position,
                     stack: ItemStack::new(
@@ -4388,6 +4423,8 @@ mod tests {
         let position = DVec3::new(1.0, 2.0, 1.0);
         items.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position,
                 previous_position: position - DVec3::X,
                 stack: ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![]))
@@ -4426,6 +4463,8 @@ mod tests {
         let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
         items.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: DVec3::ZERO,
                 previous_position: DVec3::ZERO,
                 stack,
@@ -4484,6 +4523,8 @@ mod tests {
         let stack = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
         items.entities.push(ItemEntity {
             item: DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: DVec3::ZERO,
                 previous_position: DVec3::ZERO,
                 stack,
@@ -4655,6 +4696,41 @@ mod tests {
         );
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].age, 0);
+    }
+
+    #[test]
+    fn dropped_visual_metadata_tracks_item_lifetime_and_session_identity() {
+        let mut items = ItemEntities::default();
+        let mut first = test_saved_item([1, 2, 3, 4], 1);
+        first.position = DVec3::new(1.5, 5.0, 1.5);
+        first.age = 37;
+        let mut second = test_saved_item([5, 6, 7, 8], 1);
+        second.position = DVec3::new(10.5, 5.0, 10.5);
+        second.age = i16::MIN;
+        items.spawn_saved(first);
+        items.spawn_saved(second);
+        let before = items.snapshot();
+        assert_ne!(before[0].entity_id, before[1].entity_id);
+        assert_eq!((before[0].age, before[0].item_age), (0, 37));
+        assert_eq!(
+            (before[1].age, before[1].item_age),
+            (0, i32::from(i16::MIN))
+        );
+        let mut inventory = Arc::new(PlayerInventory::default());
+        items.tick(
+            IVec3::ZERO,
+            DVec3::new(100.0, 0.0, 100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+        );
+        let after = items.snapshot();
+        assert_eq!((after[0].age, after[0].item_age), (1, 38));
+        assert_eq!((after[1].age, after[1].item_age), (1, i32::from(i16::MIN)));
+        assert_eq!(before[0].item_age, 37);
+        assert_eq!(before[0].entity_id, after[0].entity_id);
     }
 
     #[test]
@@ -5796,6 +5872,8 @@ public class ItemMotionOracle {
                 for (count, lifetime, pickup_delay) in [(a, 123, 7), (b, 456, 13)] {
                     items.entities.push(ItemEntity {
                         item: DroppedItem {
+                            entity_id: 0,
+                            item_age: 0,
                             position: DVec3::ZERO,
                             previous_position: DVec3::ZERO,
                             stack: ItemStack::new(
@@ -5860,6 +5938,8 @@ public class ItemMotionOracle {
                     for (i, count) in [a, b, c].into_iter().enumerate() {
                         items.entities.push(ItemEntity {
                             item: DroppedItem {
+                                entity_id: 0,
+                                item_age: 0,
                                 position: DVec3::ZERO,
                                 previous_position: DVec3::ZERO,
                                 stack: ItemStack::new(
@@ -6003,6 +6083,8 @@ public class ItemMotionOracle {
                 ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
             items.entities.push(ItemEntity {
                 item: DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position: vec(&case["p"]),
                     previous_position: vec(&case["p"]),
                     stack,

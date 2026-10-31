@@ -702,6 +702,8 @@ mod tests {
         assert!((bounds.1.y - 0.375).abs() < 1e-6);
         assert!((bounds.1.z - bounds.0.z - 0.03125).abs() < 1e-6);
         let item = DroppedItem {
+            entity_id: 0,
+            item_age: 0,
             position: glam::DVec3::new(3.0, 2.0, 0.0),
             previous_position: glam::DVec3::new(1.0, 2.0, 0.0),
             stack: ItemStack::new("minecraft:diamond".into(), 33, 64, Tag::Compound(vec![]))
@@ -831,6 +833,8 @@ mod tests {
             ItemStack::new("minecraft:diamond".into(), 17, 64, Tag::Compound(vec![])).unwrap();
         let items = (0..1000)
             .map(|index| DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(f64::from(index % 32), 10.0, f64::from(index / 32)),
                 previous_position: glam::DVec3::new(
                     f64::from(index % 32),
@@ -1034,6 +1038,8 @@ mod tests {
                     for count in [1, 17, 64] {
                         for seed in [0, 1337] {
                             let item = DroppedItem {
+                                entity_id: 0,
+                                item_age: 0,
                                 position: glam::DVec3::ZERO,
                                 previous_position: glam::DVec3::ZERO,
                                 stack: ItemStack::new(

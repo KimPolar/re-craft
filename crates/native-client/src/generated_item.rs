@@ -393,6 +393,8 @@ mod tests {
                 (&glint_view, &sampler, &glint_uniform),
             );
             let item = native_session::items::DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(0.0, -0.5, 0.5),
                 previous_position: glam::DVec3::new(0.0, -0.5, 0.5),
                 stack: native_session::inventory::ItemStack::new(

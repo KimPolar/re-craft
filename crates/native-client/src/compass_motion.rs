@@ -89,6 +89,29 @@ pub(crate) fn local_target_angle(
     Some(positive_modulo(direction + rotation))
 }
 
+/// Item entities use their lifetime and bob phase as visual yaw; unlike the
+/// local player, Java does not apply a target wobbler to their direction.
+pub(crate) fn dropped_target_angle(
+    owner: DVec3,
+    target: IVec3,
+    item_age: i32,
+    bob_offset: f32,
+) -> Option<f32> {
+    let center = target.as_dvec3() + DVec3::splat(0.5);
+    let delta = center - owner;
+    if !owner.is_finite()
+        || !bob_offset.is_finite()
+        || delta.length_squared() < f64::from(1.0e-5_f32)
+    {
+        return None;
+    }
+    let spin = (item_age as f32 + 0.5) / 20.0 + bob_offset;
+    let yaw = 180.0 - (spin / std::f32::consts::TAU) * 360.0;
+    let wrapped_yaw = positive_modulo(yaw / 360.0);
+    let direction = (delta.z.atan2(delta.x) / f64::from(std::f32::consts::TAU)) as f32;
+    Some(positive_modulo(0.5 - (wrapped_yaw - 0.25 - direction)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +152,7 @@ mod tests {
         let source = temp.path().join("CompassMotionOracle.java");
         let output = temp.path().join("motion.json");
         let random_output = temp.path().join("random.json");
+        let dropped_output = temp.path().join("dropped.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/CompassMotionOracle.java"),
@@ -144,7 +168,8 @@ mod tests {
                 .arg(&cp)
                 .arg("CompassMotionOracle")
                 .arg(&output)
-                .arg(&random_output),
+                .arg(&random_output)
+                .arg(&dropped_output),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -170,6 +195,25 @@ mod tests {
             )
             .unwrap();
             let expected = f32::from_bits(row["bits"].as_i64().unwrap() as i32 as u32);
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "{row}: {actual} != {expected}"
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(dropped_output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 240);
+        for row in rows {
+            let f = |name: &str| row[name].as_f64().unwrap();
+            let i = |name: &str| row[name].as_i64().unwrap() as i32;
+            let actual = dropped_target_angle(
+                DVec3::new(f("x"), f("y"), f("z")),
+                IVec3::new(i("tx"), i("ty"), i("tz")),
+                i("age"),
+                f("bob") as f32,
+            )
+            .unwrap();
+            let expected = f32::from_bits(i("bits") as u32);
             assert!(
                 (actual - expected).abs() <= 1e-6,
                 "{row}: {actual} != {expected}"

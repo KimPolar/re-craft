@@ -2329,6 +2329,8 @@ mod tests {
                 )
                 .unwrap();
                 snapshot.dropped_items = Arc::from([native_session::items::DroppedItem {
+                    entity_id: 0,
+                    item_age: 0,
                     position: glam::DVec3::new(0.0, 2.0, 0.0),
                     previous_position: glam::DVec3::new(0.0, 2.0, 0.0),
                     stack,

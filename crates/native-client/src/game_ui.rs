@@ -1533,10 +1533,7 @@ impl GameUi {
         let dropped_models = snapshot
             .dropped_items
             .iter()
-            .map(|item| {
-                self.held_models
-                    .get_item_without_compass_context(&item.stack)
-            })
+            .map(|item| self.held_models.get_dropped_item(item))
             .collect::<Vec<_>>();
         let falling_models = snapshot
             .falling_blocks
@@ -5085,6 +5082,74 @@ mod inventory_tests {
         };
         let one = load_seed(1);
         let two = load_seed(2);
+        assert_ne!(
+            one.gui_icon.as_ref().unwrap().as_raw(),
+            two.gui_icon.as_ref().unwrap().as_raw()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn dropped_compass_uses_item_position_and_recovery_has_no_player_target() {
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceId;
+        use native_session::items::DroppedItem;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&directory, &[]).unwrap()));
+        let target = native_session::lodestone::Target {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            position: glam::IVec3::new(100, 64, 0),
+        };
+        let mut spawn = native_persistence::world::RespawnData::default();
+        spawn.position = target.position.to_array();
+        ui.held_models
+            .set_compass_context(crate::held_items::CompassContext {
+                dimension: "minecraft:overworld".into(),
+                world_spawn: Some(Arc::new(spawn)),
+                last_death: native_session::LastDeathLocation::At(target),
+                owner: glam::DVec3::new(0.5, 64.0, 0.5),
+                yaw_degrees: 0.0,
+                tick: 11,
+            });
+        let item = |id: &str, x, entity_id| DroppedItem {
+            entity_id,
+            item_age: 42,
+            position: glam::DVec3::new(x, 64.0, 0.5),
+            previous_position: glam::DVec3::new(x, 64.0, 0.5),
+            stack: ItemStack::new(id.into(), 1, 64, Tag::Compound(vec![])).unwrap(),
+            age: 2,
+            bob_offset: 1.25,
+        };
+        let load = |ui: &mut GameUi, item: &DroppedItem| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_dropped_item(item) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dropped compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let east = item("minecraft:compass", 0.5, 1);
+        let west = item("minecraft:compass", 200.5, 2);
+        load(&mut ui, &east);
+        let east_model = load(&mut ui, &east);
+        let west_model = load(&mut ui, &west);
+        assert_ne!(
+            east_model.gui_icon.as_ref().unwrap().as_raw(),
+            west_model.gui_icon.as_ref().unwrap().as_raw()
+        );
+        let first = item("minecraft:recovery_compass", 0.5, 1);
+        let second = item("minecraft:recovery_compass", 0.5, 2);
+        load(&mut ui, &first);
+        let one = load(&mut ui, &first);
+        let two = load(&mut ui, &second);
         assert_ne!(
             one.gui_icon.as_ref().unwrap().as_raw(),
             two.gui_icon.as_ref().unwrap().as_raw()

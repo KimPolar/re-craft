@@ -2169,6 +2169,8 @@ mod tests {
             stone,
             dirt,
             item: native_session::items::DroppedItem {
+                entity_id: 0,
+                item_age: 0,
                 position: glam::DVec3::new(8.0, 4.8, 11.0),
                 previous_position: glam::DVec3::new(8.0, 4.8, 11.0),
                 stack: native_session::inventory::ItemStack::new(

@@ -14304,6 +14304,49 @@ mod tests {
     }
 
     #[test]
+    fn dropped_lodestone_compass_keeps_tracker_when_target_is_removed() {
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let pos = IVec3::new(8, 2, 6);
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(pos, lodestone));
+        let tracker = crate::lodestone::Tracker::linked(
+            native_resources::packs::ResourceId::parse("minecraft:overworld").unwrap(),
+            session.origin + pos,
+        );
+        let stack = crate::inventory::ItemStack::new(
+            "minecraft:compass".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:lodestone_tracker".into(),
+                tracker.to_nbt(),
+            )]),
+        )
+        .unwrap();
+        session.dropped_items.drop_player(
+            stack,
+            session.origin,
+            session.motion.position,
+            session.player,
+            crate::items::PlayerDropOrigin::ContainerReturn,
+        );
+        assert!(session.set(pos, session.states[0]));
+        session.update(TICK);
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.dropped_items.len(), 1);
+        assert_eq!(
+            snapshot.dropped_items[0]
+                .stack
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(crate::lodestone::Tracker::parse),
+            Some(tracker)
+        );
+    }
+
+    #[test]
     fn compass_tick_uses_valid_saved_poi_instead_of_current_block() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::{NamedTag, Tag, TagType};

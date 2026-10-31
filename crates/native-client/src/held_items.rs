@@ -330,6 +330,37 @@ fn selected_model<'a>(mut entry: &'a Value, key: &ModelKey) -> Result<&'a Value>
     bail!("item model nesting is too deep")
 }
 
+fn compass_range_branch<'a>(definition: &'a Value, key: &ModelKey) -> Option<&'a Value> {
+    let branch = if key.id == "minecraft:recovery_compass" {
+        definition.get("model")?
+    } else if key.id == "minecraft:compass"
+        && definition
+            .pointer("/model/property")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "minecraft:has_component" | "has_component"))
+    {
+        definition.pointer(if key.lodestone_tracker {
+            "/model/on_true"
+        } else {
+            "/model/on_false"
+        })?
+    } else {
+        return None;
+    };
+    (branch
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "minecraft:range_dispatch" | "range_dispatch"))
+        && branch
+            .get("property")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
+        && branch
+            .get("wobble")
+            .is_none_or(|value| value.as_bool() == Some(true)))
+    .then_some(branch)
+}
+
 impl Loader {
     pub(crate) fn load_armor(
         &mut self,
@@ -951,36 +982,8 @@ impl ItemModelCache {
         seed: i32,
     ) -> Option<Arc<HeldModel>> {
         let mut key = ModelKey::from_item(item);
-        if matches!(
-            key.id.as_str(),
-            "minecraft:compass" | "minecraft:recovery_compass"
-        ) && let Some(definition) = self.compass.definitions.get(&key.id)
-            && let Some(branch) = if key.id == "minecraft:recovery_compass" {
-                definition.get("model")
-            } else if definition
-                .pointer("/model/property")
-                .and_then(Value::as_str)
-                .is_some_and(|value| matches!(value, "minecraft:has_component" | "has_component"))
-            {
-                definition.pointer(if key.lodestone_tracker {
-                    "/model/on_true"
-                } else {
-                    "/model/on_false"
-                })
-            } else {
-                None
-            }
-            && branch
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|value| matches!(value, "minecraft:range_dispatch" | "range_dispatch"))
-            && branch
-                .get("property")
-                .and_then(Value::as_str)
-                .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
-            && branch
-                .get("wobble")
-                .is_none_or(|value| value.as_bool() == Some(true))
+        if let Some(definition) = self.compass.definitions.get(&key.id)
+            && let Some(branch) = compass_range_branch(definition, &key)
             && let Some(context) = self.compass.context.as_ref()
         {
             let target = match branch.get("target").and_then(Value::as_str) {
@@ -1053,11 +1056,56 @@ impl ItemModelCache {
         self.get_key(key)
     }
 
-    pub(crate) fn get_item_without_compass_context(
+    pub(crate) fn get_dropped_item(
         &mut self,
-        item: &ItemStack,
+        item: &native_session::items::DroppedItem,
     ) -> Option<Arc<HeldModel>> {
-        self.get_key(ModelKey::from_item(item))
+        let mut key = ModelKey::from_item(&item.stack);
+        if let Some(definition) = self.compass.definitions.get(&key.id)
+            && let Some(branch) = compass_range_branch(definition, &key)
+            && let Some(context) = self.compass.context.as_ref()
+        {
+            let target = match branch.get("target").and_then(Value::as_str) {
+                Some("lodestone") => item
+                    .stack
+                    .components()
+                    .get("minecraft:lodestone_tracker")
+                    .and_then(native_session::lodestone::Tracker::parse)
+                    .map(|tracker| {
+                        let pos = tracker
+                            .target
+                            .filter(|target| {
+                                format!("{}:{}", target.dimension.namespace, target.dimension.path)
+                                    == context.dimension
+                            })
+                            .map(|target| target.position);
+                        (pos, &mut self.compass.random_lodestone)
+                    }),
+                Some("spawn") => context.world_spawn.as_ref().map(|spawn| {
+                    let pos = (format!("{}:{}", spawn.dimension.namespace, spawn.dimension.path)
+                        == context.dimension)
+                        .then(|| glam::IVec3::from_array(spawn.position));
+                    (pos, &mut self.compass.random_spawn)
+                }),
+                // A dropped item is not a player, so Java's recovery target is absent.
+                Some("recovery") => Some((None, &mut self.compass.random_recovery)),
+                _ => None,
+            };
+            if let Some((target, random)) = target {
+                let angle = target
+                    .and_then(|target| {
+                        crate::compass_motion::dropped_target_angle(
+                            item.position,
+                            target,
+                            item.item_age,
+                            item.bob_offset,
+                        )
+                    })
+                    .unwrap_or_else(|| random.angle(context.tick, item.entity_id));
+                key.compass_angle = angle.to_bits();
+            }
+        }
+        self.get_key(key)
     }
 
     fn get_key(&mut self, mut key: ModelKey) -> Option<Arc<HeldModel>> {

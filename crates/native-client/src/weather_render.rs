@@ -1,6 +1,6 @@
 //! Precipitation columns from an immutable world snapshot.
 
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
@@ -10,7 +10,8 @@ use native_core::weather_columns;
 use native_persistence::heightmap::SpawnHeightmapKind;
 use native_resources::{biome_climate::Precipitation, packs::ResourceProvider};
 use native_session::WorldSnapshot;
-use native_world::loaded::ChunkPos;
+use native_session::weather::WeatherTerrain;
+use native_world::loaded::{ChunkPos, World};
 
 pub struct WeatherTextures {
     pub rain: RgbaImage,
@@ -62,9 +63,37 @@ pub struct WeatherMesh {
     pub snow: Vec<WeatherVertex>,
 }
 
+#[derive(Clone, Copy)]
+enum AnimationSeed {
+    Rain(weather_columns::RainSeed),
+    Snow(weather_columns::SnowSeed),
+}
+
+struct Column {
+    x: i32,
+    z: i32,
+    bottom: i32,
+    top: i32,
+    light: [u8; 2],
+    seed: AnimationSeed,
+}
+
+/// The expensive world queries and coordinate-seeded random values change only
+/// when the camera enters another block or the relevant snapshot changes.
+#[derive(Default)]
+pub struct WeatherColumnCache {
+    key: Option<(IVec3, i32, u64, Option<i32>, i32, i32)>,
+    world: Option<Arc<World>>,
+    terrain: Option<WeatherTerrain>,
+    columns: Vec<Column>,
+    #[cfg(test)]
+    rebuilds: usize,
+}
+
 /// Missing heightmaps or biome definitions leave the affected columns empty.
 pub fn build_into(
     mesh: &mut WeatherMesh,
+    cache: &mut WeatherColumnCache,
     snapshot: &WorldSnapshot,
     scene_origin: IVec3,
     camera: DVec3,
@@ -98,81 +127,129 @@ pub fn build_into(
     let eye = floor.as_ivec3();
     let count = ((radius * 2 + 1) * (radius * 2 + 1) * 6) as usize;
     mesh.rain.reserve(count);
-    for z in eye.z - radius..=eye.z + radius {
-        for x in eye.x - radius..=eye.x + radius {
-            let chunk_pos = ChunkPos {
-                x: x.div_euclid(16),
-                z: z.div_euclid(16),
-            };
-            let Some(chunk) = world.chunks.get(&chunk_pos) else {
-                continue;
-            };
-            if chunk.status.as_deref() != Some("minecraft:full") {
-                continue;
-            }
-            let Some(height) = terrain
-                .heightmaps
-                .get(&chunk_pos)
-                .and_then(|map| map.highest(SpawnHeightmapKind::MotionBlocking, x, z))
-                .and_then(|height| height.checked_add(1))
-            else {
-                continue;
-            };
-            let Some((bottom, top)) = weather_columns::vertical_range(eye.y, height, radius) else {
-                continue;
-            };
-            let Some(biome) = world
-                .biome_at_block_in_bounds(x, eye.y, z, terrain.min_y, terrain.max_y)
-                .and_then(|id| terrain.climates.get(id))
-            else {
-                continue;
-            };
-            let kind = if !biome.has_precipitation {
-                Precipitation::None
-            } else if let Some(sea) = terrain.sea_level {
-                biome.precipitation_at(x, eye.y, z, sea)
-            } else {
-                continue;
-            };
-            if kind == Precipitation::None {
-                continue;
-            }
-            // The viewer already uses these visual fallbacks when a saved light
-            // layer is omitted; simulation never consumes them.
-            let light_y = eye.y.max(height);
-            let light = [
-                world.light(x, light_y, z, false).unwrap_or(0),
-                world.light(x, light_y, z, true).unwrap_or(15),
-            ];
-            let animation = match kind {
-                Precipitation::Rain => {
-                    weather_columns::rain(x, z, snapshot.game_time, partial, light)
-                }
-                Precipitation::Snow => {
-                    weather_columns::snow(x, z, snapshot.game_time, partial, light)
-                }
-                Precipitation::None => unreachable!(),
-            };
-            let target = if kind == Precipitation::Rain {
-                &mut mesh.rain
-            } else {
-                &mut mesh.snow
-            };
-            append_column(
-                target,
-                x,
-                z,
-                bottom,
-                top,
-                eye,
-                scene_origin,
-                camera,
-                radius,
-                intensity,
-                kind,
-                animation,
-            );
+    let key = (
+        eye,
+        radius,
+        snapshot.world_revision,
+        terrain.sea_level,
+        terrain.min_y,
+        terrain.max_y,
+    );
+    let same_world = cache
+        .world
+        .as_ref()
+        .is_some_and(|previous| Arc::ptr_eq(previous, world));
+    let same_terrain = cache.terrain.as_ref().is_some_and(|previous| {
+        Arc::ptr_eq(&previous.heightmaps, &terrain.heightmaps)
+            && Arc::ptr_eq(&previous.climates, &terrain.climates)
+    });
+    if cache.key != Some(key) || !same_world || !same_terrain {
+        cache.columns.clear();
+        cache.columns.reserve(count / 6);
+        #[cfg(test)]
+        {
+            cache.rebuilds += 1;
         }
+        for z in eye.z - radius..=eye.z + radius {
+            for x in eye.x - radius..=eye.x + radius {
+                let chunk_pos = ChunkPos {
+                    x: x.div_euclid(16),
+                    z: z.div_euclid(16),
+                };
+                let Some(chunk) = world.chunks.get(&chunk_pos) else {
+                    continue;
+                };
+                if chunk.status.as_deref() != Some("minecraft:full") {
+                    continue;
+                }
+                let Some(height) = terrain
+                    .heightmaps
+                    .get(&chunk_pos)
+                    .and_then(|map| map.highest(SpawnHeightmapKind::MotionBlocking, x, z))
+                    .and_then(|height| height.checked_add(1))
+                else {
+                    continue;
+                };
+                let Some((bottom, top)) = weather_columns::vertical_range(eye.y, height, radius)
+                else {
+                    continue;
+                };
+                let Some(biome) = world
+                    .biome_at_block_in_bounds(x, eye.y, z, terrain.min_y, terrain.max_y)
+                    .and_then(|id| terrain.climates.get(id))
+                else {
+                    continue;
+                };
+                let kind = if !biome.has_precipitation {
+                    Precipitation::None
+                } else if let Some(sea) = terrain.sea_level {
+                    biome.precipitation_at(x, eye.y, z, sea)
+                } else {
+                    continue;
+                };
+                if kind == Precipitation::None {
+                    continue;
+                }
+                // The viewer already uses these visual fallbacks when a saved light
+                // layer is omitted; simulation never consumes them.
+                let light_y = eye.y.max(height);
+                let light = [
+                    world.light(x, light_y, z, false).unwrap_or(0),
+                    world.light(x, light_y, z, true).unwrap_or(15),
+                ];
+                let seed = match kind {
+                    Precipitation::Rain => {
+                        AnimationSeed::Rain(weather_columns::RainSeed::new(x, z))
+                    }
+                    Precipitation::Snow => {
+                        AnimationSeed::Snow(weather_columns::SnowSeed::new(x, z))
+                    }
+                    Precipitation::None => unreachable!(),
+                };
+                cache.columns.push(Column {
+                    x,
+                    z,
+                    bottom,
+                    top,
+                    light,
+                    seed,
+                });
+            }
+        }
+        cache.key = Some(key);
+        cache.world = Some(Arc::clone(world));
+        cache.terrain = Some(terrain.clone());
+    }
+    for column in &cache.columns {
+        let (kind, animation) = match column.seed {
+            AnimationSeed::Rain(seed) => (
+                Precipitation::Rain,
+                seed.sample(snapshot.game_time, partial, column.light),
+            ),
+            AnimationSeed::Snow(seed) => (
+                Precipitation::Snow,
+                seed.sample(snapshot.game_time, partial, column.light),
+            ),
+        };
+        let target = if kind == Precipitation::Rain {
+            &mut mesh.rain
+        } else {
+            &mut mesh.snow
+        };
+        append_column(
+            target,
+            column.x,
+            column.z,
+            column.bottom,
+            column.top,
+            eye,
+            scene_origin,
+            camera,
+            radius,
+            intensity,
+            kind,
+            animation,
+        );
     }
 }
 
@@ -185,7 +262,15 @@ fn build(
     radius: i32,
 ) -> WeatherMesh {
     let mut mesh = WeatherMesh::default();
-    build_into(&mut mesh, snapshot, scene_origin, camera, partial, radius);
+    build_into(
+        &mut mesh,
+        &mut WeatherColumnCache::default(),
+        snapshot,
+        scene_origin,
+        camera,
+        partial,
+        radius,
+    );
     mesh
 }
 
@@ -364,6 +449,53 @@ mod tests {
     }
 
     #[test]
+    fn cached_columns_match_fresh_geometry_and_invalidate_on_world_changes() {
+        let mut world = snapshot(0.8, 0);
+        let mut cache = WeatherColumnCache::default();
+        let mut cached = WeatherMesh::default();
+        let mut camera = DVec3::new(8.2, 10.1, 8.3);
+        let mut check = |world: &WorldSnapshot, camera, partial| {
+            build_into(
+                &mut cached,
+                &mut cache,
+                world,
+                IVec3::ZERO,
+                camera,
+                partial,
+                3,
+            );
+            let fresh = build(world, IVec3::ZERO, camera, partial, 3);
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&cached.rain),
+                bytemuck::cast_slice::<_, u8>(&fresh.rain)
+            );
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&cached.snow),
+                bytemuck::cast_slice::<_, u8>(&fresh.snow)
+            );
+            cache.rebuilds
+        };
+        assert_eq!(check(&world, camera, 0.1), 1);
+        camera += DVec3::new(0.3, 0.2, 0.4);
+        world.game_time += 1;
+        assert_eq!(check(&world, camera, 0.7), 1);
+        camera.x += 1.0;
+        assert_eq!(check(&world, camera, 0.7), 2);
+        world.world_revision += 1;
+        assert_eq!(check(&world, camera, 0.7), 3);
+        world.weather_terrain.as_mut().unwrap().climates =
+            snapshot(0.0, 0).weather_terrain.unwrap().climates;
+        assert_eq!(check(&world, camera, 0.7), 4);
+        world.weather_terrain.as_mut().unwrap().heightmaps =
+            snapshot(0.0, 13).weather_terrain.unwrap().heightmaps;
+        assert_eq!(check(&world, camera, 0.7), 5);
+        world.weather_terrain.as_mut().unwrap().sea_level = Some(64);
+        assert_eq!(check(&world, camera, 0.7), 6);
+        world.world = snapshot(0.8, 0).world;
+        assert_eq!(check(&world, camera, 0.7), 7);
+    }
+
+    #[test]
     fn column_vertices_keep_relative_precision_at_world_edges() {
         let mut vertices = Vec::new();
         let origin = IVec3::new(29_999_984, 0, -30_000_000);
@@ -410,5 +542,134 @@ mod tests {
         let overridden = WeatherTextures::load(&mut source).unwrap();
         assert_eq!(overridden.rain, replacement);
         assert_eq!(overridden.snow, original.snow);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn precipitation_vertices_match_java_renderer() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let source = temp.path().join("WeatherGeometryOracle.java");
+        let output = temp.path().join("vertices.txt");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WeatherGeometryOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("WeatherGeometryOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "oracle failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let text = std::fs::read_to_string(output).unwrap();
+        let mut count = 0;
+        for line in text.lines() {
+            let n: Vec<i64> = line
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            assert_eq!(n.len(), 42);
+            let float = |i: usize| f32::from_bits(n[i] as i32 as u32);
+            let camera = DVec3::new(
+                f64::from_bits(n[4] as u64),
+                f64::from_bits(n[5] as u64),
+                f64::from_bits(n[6] as u64),
+            );
+            let eye = camera.floor().as_ivec3();
+            let origin = IVec3::new(eye.x, 0, eye.z);
+            let kind = if n[9] == 0 {
+                Precipitation::Rain
+            } else {
+                Precipitation::Snow
+            };
+            let mut vertices = Vec::new();
+            append_column(
+                &mut vertices,
+                n[0] as i32,
+                n[1] as i32,
+                n[2] as i32,
+                n[3] as i32,
+                eye,
+                origin,
+                camera,
+                n[7] as i32,
+                float(8),
+                kind,
+                weather_columns::ColumnAnimation {
+                    u: float(10),
+                    v: float(11),
+                    block_light: n[12] as u8,
+                    sky_light: n[13] as u8,
+                },
+            );
+            assert_eq!(vertices.len(), 6);
+            for (java_index, vertex_index) in [0, 1, 2, 5].into_iter().enumerate() {
+                let vertex = &vertices[vertex_index];
+                let base = 14 + java_index * 7;
+                let relative = glam::Vec3::from_array(vertex.position)
+                    - (camera - origin.as_dvec3()).as_vec3();
+                let expected = glam::Vec3::new(float(base), float(base + 1), float(base + 2));
+                assert!(
+                    (relative - expected).abs().max_element() <= 0.000_04,
+                    "position: {line}; {relative:?} != {expected:?}"
+                );
+                assert_eq!(
+                    vertex.uv[0].to_bits(),
+                    float(base + 3).to_bits(),
+                    "u: {line}"
+                );
+                assert_eq!(
+                    vertex.uv[1].to_bits(),
+                    float(base + 4).to_bits(),
+                    "v: {line}"
+                );
+                assert_eq!(
+                    (vertex.opacity * 255.0).round() as u8,
+                    ((n[base + 5] as i32 as u32) >> 24) as u8,
+                    "alpha: {line}"
+                );
+                assert_eq!(
+                    vertex.light,
+                    (((n[base + 6] as u32) >> 20) & 15) * 16 + (((n[base + 6] as u32) >> 4) & 15),
+                    "light: {line}"
+                );
+            }
+            count += 1;
+        }
+        assert_eq!(count, 4000);
     }
 }

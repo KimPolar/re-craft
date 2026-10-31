@@ -182,6 +182,7 @@ pub fn run_play(
             sky_background,
             weather_textures,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
+            weather_columns: crate::weather_render::WeatherColumnCache::default(),
             weather_frame: None,
             sky_background_tick: None,
             sky_background_revision: None,
@@ -291,6 +292,7 @@ struct PlayState {
     sky_background: Option<crate::sky_background::SkyBackground>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
     weather_mesh: crate::weather_render::WeatherMesh,
+    weather_columns: crate::weather_render::WeatherColumnCache,
     weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
     sky_background_tick: Option<u64>,
     sky_background_revision: Option<u64>,
@@ -854,6 +856,7 @@ impl Viewer {
             if play.weather_frame.as_ref() != Some(&key) {
                 crate::weather_render::build_into(
                     &mut play.weather_mesh,
+                    &mut play.weather_columns,
                     snapshot,
                     self.scene.origin,
                     camera,

@@ -13,6 +13,21 @@ pub struct ColumnAnimation {
     pub sky_light: u8,
 }
 
+/// The coordinate-dependent part is stable across frames and can be reused.
+#[derive(Clone, Copy, Debug)]
+pub struct RainSeed {
+    speed: f32,
+    hash: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SnowSeed {
+    first: f64,
+    gaussian_x: f32,
+    second: f64,
+    gaussian_y: f32,
+}
+
 fn coordinate_seed(x: i32, z: i32) -> i32 {
     let x = x
         .wrapping_mul(x)
@@ -39,40 +54,65 @@ fn gaussian_pair(random: &mut LegacyRandom) -> (f64, f64) {
 
 /// Create the animated texture offsets for a rain column.
 pub fn rain(x: i32, z: i32, game_time: i64, partial: f32, light: [u8; 2]) -> ColumnAnimation {
-    let mut random = LegacyRandom::new(i64::from(coordinate_seed(x, z)));
-    let hash = x
-        .wrapping_mul(x)
-        .wrapping_mul(3121)
-        .wrapping_add(x.wrapping_mul(45_238_971))
-        .wrapping_add(z.wrapping_mul(z).wrapping_mul(418_711))
-        .wrapping_add(z.wrapping_mul(13_761))
-        & 255;
-    let time = (game_time & 131_071) as i32;
-    let speed = 3.0_f32 + random.next_float();
-    let v = (-((time + hash) as f32 + partial) / 32.0 * speed) % 32.0;
-    ColumnAnimation {
-        u: 0.0,
-        v,
-        block_light: light[0],
-        sky_light: light[1],
+    RainSeed::new(x, z).sample(game_time, partial, light)
+}
+
+impl RainSeed {
+    pub fn new(x: i32, z: i32) -> Self {
+        let mut random = LegacyRandom::new(i64::from(coordinate_seed(x, z)));
+        let hash = x
+            .wrapping_mul(x)
+            .wrapping_mul(3121)
+            .wrapping_add(x.wrapping_mul(45_238_971))
+            .wrapping_add(z.wrapping_mul(z).wrapping_mul(418_711))
+            .wrapping_add(z.wrapping_mul(13_761))
+            & 255;
+        let speed = 3.0_f32 + random.next_float();
+        Self { speed, hash }
+    }
+
+    pub fn sample(self, game_time: i64, partial: f32, light: [u8; 2]) -> ColumnAnimation {
+        let time = (game_time & 131_071) as i32;
+        let v = (-((time + self.hash) as f32 + partial) / 32.0 * self.speed) % 32.0;
+        ColumnAnimation {
+            u: 0.0,
+            v,
+            block_light: light[0],
+            sky_light: light[1],
+        }
     }
 }
 
 /// Create the animated texture offsets and brightened light for snow.
 pub fn snow(x: i32, z: i32, game_time: i64, partial: f32, light: [u8; 2]) -> ColumnAnimation {
-    let mut random = LegacyRandom::new(i64::from(coordinate_seed(x, z)));
-    let time = (game_time & 131_071) as f32 + partial;
-    let first = random.next_double();
-    let (a, b) = gaussian_pair(&mut random);
-    let u = (first + f64::from(time * 0.01 * a as f32)) as f32;
-    let second = random.next_double();
-    let drift = (second + f64::from(time * b as f32 * 0.001)) as f32;
-    let v = -((game_time & 511) as f32 + partial) / 512.0 + drift;
-    ColumnAnimation {
-        u,
-        v,
-        block_light: (light[0].min(15) * 3 + 15) / 4,
-        sky_light: (light[1].min(15) * 3 + 15) / 4,
+    SnowSeed::new(x, z).sample(game_time, partial, light)
+}
+
+impl SnowSeed {
+    pub fn new(x: i32, z: i32) -> Self {
+        let mut random = LegacyRandom::new(i64::from(coordinate_seed(x, z)));
+        let first = random.next_double();
+        let (a, b) = gaussian_pair(&mut random);
+        let second = random.next_double();
+        Self {
+            first,
+            gaussian_x: a as f32,
+            second,
+            gaussian_y: b as f32,
+        }
+    }
+
+    pub fn sample(self, game_time: i64, partial: f32, light: [u8; 2]) -> ColumnAnimation {
+        let time = (game_time & 131_071) as f32 + partial;
+        let u = (self.first + f64::from(time * 0.01 * self.gaussian_x)) as f32;
+        let drift = (self.second + f64::from(time * self.gaussian_y * 0.001)) as f32;
+        let v = -((game_time & 511) as f32 + partial) / 512.0 + drift;
+        ColumnAnimation {
+            u,
+            v,
+            block_light: (light[0].min(15) * 3 + 15) / 4,
+            sky_light: (light[1].min(15) * 3 + 15) / 4,
+        }
     }
 }
 

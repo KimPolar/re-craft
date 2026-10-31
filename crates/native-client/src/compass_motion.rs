@@ -15,6 +15,9 @@ pub(crate) struct Wobbler {
 }
 
 impl Wobbler {
+    fn should_update(&self, tick: i64) -> bool {
+        self.last_tick != tick
+    }
     pub(crate) fn update(&mut self, tick: i64, target: f32) -> f32 {
         if self.last_tick != tick {
             self.last_tick = tick;
@@ -23,6 +26,42 @@ impl Wobbler {
             self.rotation = positive_modulo(self.rotation + self.velocity);
         }
         self.rotation
+    }
+}
+
+pub(crate) struct RandomNeedle {
+    wobbler: Wobbler,
+    random: native_core::random::LegacyRandom,
+}
+
+impl RandomNeedle {
+    fn with_seed(seed: i64) -> Self {
+        Self {
+            wobbler: Wobbler::default(),
+            random: native_core::random::LegacyRandom::new(seed),
+        }
+    }
+
+    pub(crate) fn angle(&mut self, tick: i64, item_seed: i32) -> f32 {
+        let rotation = if self.wobbler.should_update(tick) {
+            self.wobbler.update(tick, self.random.next_float())
+        } else {
+            self.wobbler.rotation
+        };
+        let hash = item_seed.wrapping_mul(1_327_217_883);
+        positive_modulo(rotation + (hash as f32) / 2_147_483_648.0_f32)
+    }
+}
+
+impl Default for RandomNeedle {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self::with_seed((time ^ SEQUENCE.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)) as i64)
     }
 }
 
@@ -89,6 +128,7 @@ mod tests {
         let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
         let source = temp.path().join("CompassMotionOracle.java");
         let output = temp.path().join("motion.json");
+        let random_output = temp.path().join("random.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/CompassMotionOracle.java"),
@@ -103,7 +143,8 @@ mod tests {
                 .arg("-cp")
                 .arg(&cp)
                 .arg("CompassMotionOracle")
-                .arg(&output),
+                .arg(&output)
+                .arg(&random_output),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -132,6 +173,21 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 1e-6,
                 "{row}: {actual} != {expected}"
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(random_output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 245);
+        let mut random = RandomNeedle::with_seed(1_234_567);
+        for row in rows {
+            let actual = random.angle(
+                row["tick"].as_i64().unwrap(),
+                row["seed"].as_i64().unwrap() as i32,
+            );
+            assert_eq!(
+                actual.to_bits(),
+                row["bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
             );
         }
     }

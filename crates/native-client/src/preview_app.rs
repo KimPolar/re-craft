@@ -2204,6 +2204,7 @@ mod tests {
         player.position = Vec3::new(0.5, 2.0, 8.5);
         let snapshot = WorldSnapshot {
             world: previous.world.clone(),
+            world_spawn: previous.world_spawn.clone(),
             player,
             camera: native_session::camera::CameraMotion::new(
                 player.position.as_dvec3(),

@@ -882,6 +882,10 @@ fn prepare_existing_world(
             eprintln!("Fast lava environment is unavailable; using dimension fallback: {error}");
         }
         session.set_player_uuid(reader.singleplayer_uuid_words()?);
+        match reader.world_spawn() {
+            Ok(spawn) => session.set_world_spawn(spawn)?,
+            Err(error) => eprintln!("World spawn is unavailable for compass rendering: {error:#}"),
+        }
         let active_enchantments =
             native_resources::enchantments::OxygenEnchantments::load(&mut resources).map(Arc::new);
         if let Ok(damage_types) = &active_enchantments {

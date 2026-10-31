@@ -813,6 +813,19 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Expose the saved shared spawn to clients even when respawn search is unavailable.
+    pub fn set_world_spawn(
+        &mut self,
+        spawn: native_persistence::world::RespawnData,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0,
+            "world spawn must be set before the first tick"
+        );
+        Arc::make_mut(&mut self.snapshot).world_spawn = Some(Arc::new(spawn));
+        Ok(())
+    }
+
     pub fn set_survival_rules(&mut self, rules: crate::survival::SurvivalRules) {
         self.survival_rules = rules;
     }
@@ -2590,6 +2603,7 @@ impl LoadedSession {
         }
         self.snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Loaded(Arc::clone(&self.world)),
+            world_spawn: self.snapshot.world_spawn.clone(),
             player: self.player,
             camera: self.camera,
             game_mode: self.game_mode,
@@ -2685,6 +2699,7 @@ impl LoadedSession {
             crate::camera::CameraMotion::new(player.position.as_dvec3(), player.pose.eye_height());
         let snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Loaded(Arc::clone(&world)),
+            world_spawn: None,
             player,
             camera,
             game_mode: GameMode::default(),
@@ -11164,6 +11179,7 @@ impl GameSession for LoadedSession {
         if processed > 0 {
             self.snapshot = Arc::new(WorldSnapshot {
                 world: SessionWorld::Loaded(Arc::clone(&self.world)),
+                world_spawn: self.snapshot.world_spawn.clone(),
                 player: self.player,
                 camera: self.camera,
                 game_mode: self.game_mode,
@@ -14361,6 +14377,23 @@ mod tests {
         );
         assert!(session.set(IVec3::new(8, 2, 6), session.states[0]));
         assert_eq!(session.known_lodestone_poi(target), Some(false));
+    }
+
+    #[test]
+    fn world_spawn_survives_inventory_changes_and_new_snapshots() {
+        let mut session = session();
+        let mut spawn = native_persistence::world::RespawnData::default();
+        spawn.dimension = native_persistence::world::DimensionId::parse("example:remote").unwrap();
+        spawn.position = [-30_000_000, 123, 42];
+        let before = session.snapshot();
+        session.set_world_spawn(spawn.clone()).unwrap();
+        assert!(before.world_spawn.is_none());
+        assert_eq!(session.snapshot().world_spawn.as_deref(), Some(&spawn));
+        session.set_player_inventory(PlayerInventory::default());
+        assert_eq!(session.snapshot().world_spawn.as_deref(), Some(&spawn));
+        session.update(TICK);
+        assert_eq!(session.snapshot().world_spawn.as_deref(), Some(&spawn));
+        assert!(session.set_world_spawn(spawn).is_err());
     }
 
     #[test]

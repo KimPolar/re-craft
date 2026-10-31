@@ -43,5 +43,18 @@ public class CompassMotionOracle {
       row.addProperty("bits",Float.floatToRawIntBits(result)); out.add(row);
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));
+    if (args.length > 1) {
+      var randomState=new CompassAngleState(true,CompassAngleState.CompassTarget.LODESTONE);
+      var randomField=CompassAngleState.class.getDeclaredField("random"); randomField.setAccessible(true);
+      unsafe.putObject(randomState,unsafe.objectFieldOffset(randomField),net.minecraft.util.RandomSource.create(1234567L));
+      var spin=CompassAngleState.class.getDeclaredMethod("getRandomlySpinningRotation",int.class,long.class); spin.setAccessible(true);
+      var rotations=new JsonArray(); int[] seeds={0,1,10,12345,-1,Integer.MIN_VALUE,Integer.MAX_VALUE};
+      for(int n=0;n<245;n++) {
+        int seed=seeds[n%seeds.length]; long tick=n/3;
+        float value=(float)spin.invoke(randomState,seed,tick);
+        var row=new JsonObject(); row.addProperty("tick",tick); row.addProperty("seed",seed); row.addProperty("bits",Float.floatToRawIntBits(value)); rotations.add(row);
+      }
+      Files.writeString(Path.of(args[1]),new Gson().toJson(rotations));
+    }
   }
 }

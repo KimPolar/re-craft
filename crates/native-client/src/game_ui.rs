@@ -1469,19 +1469,14 @@ impl GameUi {
         };
         let context = crate::held_items::CompassContext {
             dimension: dimension.to_owned(),
+            world_spawn: snapshot.world_spawn.clone(),
             owner: snapshot.origin.as_dvec3() + snapshot.player.position.as_dvec3(),
             yaw_degrees: snapshot.player.yaw.to_degrees() - 180.0,
             tick: snapshot.tick.min(i64::MAX as u64) as i64,
         };
         let context_changed = self.held_models.set_compass_context(context);
         if self.compass_inventory_revision != Some(snapshot.inventory.revision()) {
-            let has_linked = |item: &ItemStack| {
-                item.id() == "minecraft:compass"
-                    && item
-                        .components()
-                        .get("minecraft:lodestone_tracker")
-                        .is_some()
-            };
+            let has_linked = |item: &ItemStack| item.id() == "minecraft:compass";
             let slots = (0..36)
                 .map(PlayerSlot::Storage)
                 .chain((0..4).map(PlayerSlot::Armor))
@@ -1720,24 +1715,26 @@ impl GameUi {
                 },
                 sprite,
             );
-            stack_icon(
+            stack_icon_seeded(
                 &mut canvas,
                 assets,
                 &mut self.held_models,
                 icon.0,
                 icon.1,
                 item,
+                10,
             );
         }
         for slot in 0..9_u8 {
             if let Some(item) = inventory.slot(PlayerSlot::Storage(slot)) {
-                stack_icon(
+                stack_icon_seeded(
                     &mut canvas,
                     assets,
                     &mut self.held_models,
                     hotbar_x + 3 + i32::from(slot) * 20,
                     h - 19,
                     item,
+                    i32::from(slot) + 1,
                 );
             }
         }
@@ -2662,6 +2659,10 @@ fn inventory_slot_icon(
     slot: PlayerSlot,
     preview: Option<&QuickCraftPreview>,
 ) {
+    let seed = inventory
+        .menu()
+        .and_then(|menu| menu_slot_position(slot, menu))
+        .map_or(0, |(x, y)| x + y * 176);
     let selected =
         preview.and_then(|preview| preview.slots.iter().find(|entry| entry.slot == slot));
     if let Some(selected) = selected {
@@ -2683,10 +2684,11 @@ fn inventory_slot_icon(
                 position.1,
                 item,
                 selected.capped,
+                seed,
             );
         }
     } else if let Some(item) = inventory.slot(slot) {
-        stack_icon(canvas, assets, models, position.0, position.1, item);
+        stack_icon_seeded(canvas, assets, models, position.0, position.1, item, seed);
     }
 }
 
@@ -2698,7 +2700,19 @@ pub(crate) fn stack_icon(
     y: i32,
     item: &ItemStack,
 ) {
-    stack_icon_with_cap(canvas, assets, models, x, y, item, false);
+    stack_icon_with_cap(canvas, assets, models, x, y, item, false, 0);
+}
+
+fn stack_icon_seeded(
+    canvas: &mut Canvas,
+    assets: &MenuAssets,
+    models: &mut ItemModelCache,
+    x: i32,
+    y: i32,
+    item: &ItemStack,
+    seed: i32,
+) {
+    stack_icon_with_cap(canvas, assets, models, x, y, item, false, seed);
 }
 
 fn stack_icon_with_cap(
@@ -2709,8 +2723,9 @@ fn stack_icon_with_cap(
     y: i32,
     item: &ItemStack,
     capped: bool,
+    seed: i32,
 ) {
-    let cached_model = models.get_item(item);
+    let cached_model = models.get_item_seeded(item, seed);
     if let Some((icon, uv, pixels)) = cached_model.as_ref().and_then(|model| {
         model
             .gui_icon
@@ -4873,6 +4888,7 @@ mod inventory_tests {
         inventory.set_slot(PlayerSlot::Storage(0), Some(compass.clone()));
         let context = |x| crate::held_items::CompassContext {
             dimension: "minecraft:overworld".into(),
+            world_spawn: None,
             owner: glam::DVec3::new(x, 64.0, 0.5),
             yaw_degrees: -180.0,
             tick: 10,
@@ -4921,6 +4937,73 @@ mod inventory_tests {
         assert!(
             visible > 32,
             "hotbar should show the model for the updated position"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn ordinary_compass_models_follow_shared_world_spawn() {
+        use native_persistence::{nbt::Tag, world::RespawnData};
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&directory, &[]).unwrap()));
+        let compass =
+            ItemStack::new("minecraft:compass".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        let mut spawn = RespawnData::default();
+        spawn.position = [100, 64, 0];
+        let context = |x| crate::held_items::CompassContext {
+            dimension: "minecraft:overworld".into(),
+            world_spawn: Some(Arc::new(spawn.clone())),
+            owner: glam::DVec3::new(x, 64.0, 0.5),
+            yaw_degrees: -180.0,
+            tick: 10,
+        };
+        let load = |ui: &mut GameUi, x| {
+            ui.held_models.set_compass_context(context(x));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_item(&compass) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "spawn compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        load(&mut ui, 0.5);
+        let east = load(&mut ui, 0.5);
+        let west = load(&mut ui, 200.5);
+        assert_ne!(
+            east.gui_icon.as_ref().unwrap().as_raw(),
+            west.gui_icon.as_ref().unwrap().as_raw()
+        );
+        let mut remote = context(0.5);
+        remote.dimension = "minecraft:the_nether".into();
+        remote.tick = 11;
+        ui.held_models.set_compass_context(remote);
+        let mut load_seed = |seed| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_item_seeded(&compass, seed) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "random compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let slot_one = load_seed(1);
+        let slot_two = load_seed(2);
+        assert_ne!(
+            slot_one.gui_icon.as_ref().unwrap().as_raw(),
+            slot_two.gui_icon.as_ref().unwrap().as_raw()
         );
     }
 

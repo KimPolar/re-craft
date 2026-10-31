@@ -784,6 +784,7 @@ pub struct ItemModelCache {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompassContext {
     pub dimension: String,
+    pub world_spawn: Option<Arc<native_persistence::world::RespawnData>>,
     pub owner: glam::DVec3,
     pub yaw_degrees: f32,
     pub tick: i64,
@@ -796,6 +797,9 @@ struct CompassCache {
     variants: HashMap<(ModelKey, String), ModelKey>,
     context: Option<CompassContext>,
     wobbler: crate::compass_motion::Wobbler,
+    spawn_wobbler: crate::compass_motion::Wobbler,
+    random_lodestone: crate::compass_motion::RandomNeedle,
+    random_spawn: crate::compass_motion::RandomNeedle,
 }
 
 impl ItemModelCache {
@@ -935,46 +939,85 @@ impl ItemModelCache {
     }
 
     pub fn get_item(&mut self, item: &ItemStack) -> Option<Arc<HeldModel>> {
+        self.get_item_seeded(item, 0)
+    }
+
+    pub(crate) fn get_item_seeded(
+        &mut self,
+        item: &ItemStack,
+        seed: i32,
+    ) -> Option<Arc<HeldModel>> {
         let mut key = ModelKey::from_item(item);
         if key.id == "minecraft:compass"
-            && key.lodestone_tracker
             && let Some(definition) = self.compass.definitions.get(&key.id)
             && definition
                 .pointer("/model/property")
                 .and_then(Value::as_str)
                 .is_some_and(|value| matches!(value, "minecraft:has_component" | "has_component"))
-            && definition
-                .pointer("/model/on_true/type")
+            && let Some(branch) = definition.pointer(if key.lodestone_tracker {
+                "/model/on_true"
+            } else {
+                "/model/on_false"
+            })
+            && branch
+                .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|value| matches!(value, "minecraft:range_dispatch" | "range_dispatch"))
-            && definition
-                .pointer("/model/on_true/property")
+            && branch
+                .get("property")
                 .and_then(Value::as_str)
                 .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
-            && definition
-                .pointer("/model/on_true/target")
-                .and_then(Value::as_str)
-                == Some("lodestone")
-            && definition
-                .pointer("/model/on_true/wobble")
+            && branch
+                .get("wobble")
                 .is_none_or(|value| value.as_bool() == Some(true))
             && let Some(context) = self.compass.context.as_ref()
-            && let Some(tracker) = item
-                .components()
-                .get("minecraft:lodestone_tracker")
-                .and_then(native_session::lodestone::Tracker::parse)
-            && let Some(target) = tracker.target
-            && format!("{}:{}", target.dimension.namespace, target.dimension.path)
-                == context.dimension
-            && let Some(angle) = crate::compass_motion::local_target_angle(
-                &mut self.compass.wobbler,
-                context.tick,
-                context.yaw_degrees,
-                context.owner,
-                target.position,
-            )
         {
-            key.compass_angle = angle.to_bits();
+            let target = match branch.get("target").and_then(Value::as_str) {
+                Some("lodestone") => item
+                    .components()
+                    .get("minecraft:lodestone_tracker")
+                    .and_then(native_session::lodestone::Tracker::parse)
+                    .map(|tracker| {
+                        let target = tracker
+                            .target
+                            .filter(|target| {
+                                format!("{}:{}", target.dimension.namespace, target.dimension.path)
+                                    == context.dimension
+                            })
+                            .map(|target| target.position);
+                        (
+                            target,
+                            &mut self.compass.wobbler,
+                            &mut self.compass.random_lodestone,
+                        )
+                    }),
+                Some("spawn") => context.world_spawn.as_ref().map(|spawn| {
+                    let target =
+                        (format!("{}:{}", spawn.dimension.namespace, spawn.dimension.path)
+                            == context.dimension)
+                            .then(|| glam::IVec3::from_array(spawn.position));
+                    (
+                        target,
+                        &mut self.compass.spawn_wobbler,
+                        &mut self.compass.random_spawn,
+                    )
+                }),
+                _ => None,
+            };
+            if let Some((target, wobbler, random)) = target {
+                let angle = target
+                    .and_then(|target| {
+                        crate::compass_motion::local_target_angle(
+                            wobbler,
+                            context.tick,
+                            context.yaw_degrees,
+                            context.owner,
+                            target,
+                        )
+                    })
+                    .unwrap_or_else(|| random.angle(context.tick, seed));
+                key.compass_angle = angle.to_bits();
+            }
         }
         self.get_key(key)
     }

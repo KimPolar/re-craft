@@ -353,6 +353,8 @@ impl PlayerState {
 #[derive(Clone)]
 pub struct WorldSnapshot {
     pub world: SessionWorld,
+    /// Saved world-wide spawn, independent of the player's respawn point.
+    pub world_spawn: Option<Arc<native_persistence::world::RespawnData>>,
     pub player: PlayerState,
     /// Camera endpoints are visual-only and never used for simulation.
     pub camera: camera::CameraMotion,
@@ -475,6 +477,7 @@ impl LocalSession {
             camera::CameraMotion::new(player.position.as_dvec3(), player.pose.eye_height());
         let snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Demo(world.clone()),
+            world_spawn: None,
             player,
             camera,
             game_mode: GameMode::default(),
@@ -633,6 +636,7 @@ impl LocalSession {
         }
         self.snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Demo(self.world.clone()),
+            world_spawn: self.snapshot.world_spawn.clone(),
             player: self.player,
             camera: self.camera,
             game_mode: self.game_mode,
@@ -1643,6 +1647,7 @@ impl GameSession for LocalSession {
         if processed > 0 {
             self.snapshot = Arc::new(WorldSnapshot {
                 world: SessionWorld::Demo(self.world.clone()),
+                world_spawn: self.snapshot.world_spawn.clone(),
                 player: self.player,
                 camera: self.camera,
                 game_mode: self.game_mode,

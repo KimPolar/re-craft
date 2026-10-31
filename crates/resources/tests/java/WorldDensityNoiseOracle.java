@@ -49,7 +49,10 @@ public class WorldDensityNoiseOracle {
         long[] seeds = {0, -1, 2345, Long.MIN_VALUE, Long.MAX_VALUE};
         int[][] points = {{0,0,0},{1,1,1},{-1,-1,-1},{31,63,-80},{-17,-64,49},
             {12345,-20,-9832},{30000000,100,-30000000},{Integer.MIN_VALUE,12,7},
-            {Integer.MAX_VALUE,-31,-17},{0,319,0},{0,320,0},{7,13,19}};
+            {Integer.MAX_VALUE,-31,-17},{0,319,0},{0,320,0},{7,13,19},
+            {1023,0,0},{1024,0,0},{1025,0,0},{-1023,0,0},{-1024,0,0},{-1025,0,0},
+            {1500,17,1500},{-1500,-17,-1500},{4096,20,-4096},{-4096,20,4096},
+            {8191,7,-7},{-8191,7,7}};
         for (int i=0;i<fixtures.size();i++) {
             var fixture=fixtures.get(i).getAsJsonObject();
             String id=fixture.get("id").getAsString();
@@ -84,6 +87,10 @@ public class WorldDensityNoiseOracle {
                 System.out.printf("S %d %d %d %d %d%n",i,mode,seed,Float.floatToRawIntBits(range.min()),Float.floatToRawIntBits(range.max()));
                 for (var p:points) {
                     System.out.printf("P %d %d %d %d%n",p[0],p[1],p[2],Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,p[0],p[1],p[2])));
+                }
+                if (fixture.has("end_fixture")) for (int j=0;j<80;j++) {
+                    int x=(j*7919)%90000-45000, z=(j*3571)%90000-45000, y=j-40;
+                    System.out.printf("Q %d %d %d %d%n",x,y,z,Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,x,y,z)));
                 }
             }
         }

@@ -301,6 +301,18 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         }
         fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"unblended":true,"rust_expression":id,"java_expression":java_expression}));
     }
+    let mut noise_ids = std::collections::BTreeSet::new();
+    let java_islands = inline_installed(
+        json!("minecraft:end/islands"),
+        &mut sources,
+        &mut data,
+        &mut noise_ids,
+    );
+    assert!(noise_ids.is_empty());
+    let outer = json!({"type":"end_outer_islands"});
+    fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":outer,"java_expression":outer}));
+    fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":"minecraft:end/islands","java_expression":java_islands}));
+    fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":{"type":"interpolated","input":outer,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":outer,"cell_size_xz":4,"cell_size_y":8}}));
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -312,6 +324,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     let mut evaluator = DensityEvaluator::default();
     let mut groups = 0;
     let mut samples = 0;
+    let mut end_samples = 0;
     for line in output.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         match fields.first().copied() {
@@ -342,7 +355,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 compiled = Some((index, mode, seed, function));
                 groups += 1;
             }
-            Some("P") => {
+            Some("P") | Some("Q") => {
                 let x = fields[1].parse::<i32>().unwrap();
                 let y = fields[2].parse::<i32>().unwrap();
                 let z = fields[3].parse::<i32>().unwrap();
@@ -359,11 +372,16 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     expected,
                     "reused evaluator fixture {index}"
                 );
-                samples += 1;
+                if fields[0] == "P" {
+                    samples += 1;
+                } else {
+                    end_samples += 1;
+                }
             }
             _ => {}
         }
     }
     assert_eq!(groups, fixtures.len() * 10);
-    assert_eq!(samples, groups * 12);
+    assert_eq!(samples, groups * 24);
+    assert_eq!(end_samples, 3 * 10 * 80);
 }

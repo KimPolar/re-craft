@@ -28,6 +28,7 @@ fn catalog_compiles_installed_density_functions() {
         "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
         "minecraft:overworld/caves/spaghetti_2d",
         "minecraft:overworld/caves/entrances",
+        "minecraft:end/islands",
         "minecraft:shift_x",
         "minecraft:shift_z",
         "minecraft:overworld/temperature",

@@ -4,6 +4,7 @@ use crate::random::LegacyRandom;
 
 /// Java's simplex permutation and coordinate offsets, initialized from its
 /// legacy random source. Even zero offsets consume three random doubles.
+#[derive(Debug)]
 pub struct Simplex2D {
     permutation: [u8; 256],
     offset_x: f64,

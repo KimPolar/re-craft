@@ -13,6 +13,7 @@ use native_core::{
         LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
     },
     random::{LegacyRandom, XoroshiroRandom},
+    simplex::Simplex2D,
 };
 use serde_json::Value;
 
@@ -119,6 +120,7 @@ enum Node {
         noise: Arc<NormalNoise>,
         kind: ShiftKind,
     },
+    EndOuterIslands(Arc<Simplex2D>),
     Spline(Spline),
     UnblendedAlpha,
     UnblendedOffset,
@@ -427,6 +429,7 @@ impl DensityFunction {
                     noise.sample_scaled_volume(x, y, z, 0.25, 0.25) * 4.0
                 }
             },
+            Node::EndOuterIslands(noise) => end_outer_island_density(noise, x, z),
             Node::IntervalSelect {
                 input,
                 thresholds,
@@ -449,6 +452,35 @@ impl DensityFunction {
 fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
     first + alpha * (second - first)
 }
+
+fn end_outer_island_density(noise: &Simplex2D, x: i32, z: i32) -> f32 {
+    let x = x / 8;
+    let z = z / 8;
+    let (cell_x, cell_z) = (x / 2, z / 2);
+    let (local_x, local_z) = (x % 2, z % 2);
+    let mut height = -100.0_f32;
+    for dx in -12_i32..=12 {
+        for dz in -12_i32..=12 {
+            let px = i64::from(cell_x.wrapping_add(dx));
+            let pz = i64::from(cell_z.wrapping_add(dz));
+            if px * px + pz * pz <= 4096 {
+                continue;
+            }
+            let ox = (local_x - dx * 2) as f32;
+            let oz = (local_z - dz * 2) as f32;
+            let distance = (ox * ox + oz * oz).sqrt();
+            // The island scale is always at least nine. Skip simplex sampling
+            // when even the largest possible candidate cannot improve height.
+            if 100.0 - distance * 9.0 <= height || noise.sample(px as f64, pz as f64) >= -0.9 {
+                continue;
+            }
+            let scale = ((px as f32).abs() * 3439.0 + (pz as f32).abs() * 147.0) % 13.0 + 9.0;
+            let candidate = (100.0 - distance * scale).clamp(-100.0, 80.0);
+            height = height.max(candidate);
+        }
+    }
+    (height - 8.0) / 128.0
+}
 fn squeeze(a: f32) -> f32 {
     let v = if a < -1.0 {
         -1.0
@@ -465,6 +497,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Constant(_)
         | Node::Gradient { .. }
         | Node::DistanceToPoint { .. }
+        | Node::EndOuterIslands(_)
         | Node::Shift { .. }
         | Node::Spline(_)
         | Node::UnblendedAlpha
@@ -509,6 +542,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     match &node {
         Node::Gradient { axis, .. } => axes = 1 << axis,
         Node::DistanceToPoint { .. } => axes = 7,
+        Node::EndOuterIslands(_) => axes = 5,
         Node::Slice { axis, .. } => axes &= !(1 << axis),
         Node::Noise {
             xz_scale, y_scale, ..
@@ -549,6 +583,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             value, to_value, ..
         } => Interval::enclosing_values(*value, *to_value),
         Node::DistanceToPoint { .. } => Interval::bounds(0.0, f32::INFINITY),
+        Node::EndOuterIslands(_) => Interval::bounds(-0.84375, 0.5625),
         Node::Binary { op, left, right } => match op {
             Binary::Add => left.4.add(right.4),
             Binary::Sub => left.4.sub(right.4),
@@ -621,6 +656,7 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     world_seed: Option<i64>,
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
     unblended: bool,
+    end_island_noise: Option<Arc<Simplex2D>>,
 }
 
 enum WorldNoiseFactory {
@@ -648,6 +684,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             world_seed: None,
             noises: BTreeMap::new(),
             unblended: false,
+            end_island_noise: None,
         }
     }
 
@@ -806,6 +843,17 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 }
             }
             "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
+            "end_outer_islands" => {
+                let seed = self
+                    .world_seed
+                    .context("end island noise requires a world seed")?;
+                let noise = self.end_island_noise.get_or_insert_with(|| {
+                    let mut random = LegacyRandom::new(seed);
+                    random.skip_ints(17_292);
+                    Arc::new(Simplex2D::from_random(&mut random, true))
+                });
+                Node::EndOuterIslands(Arc::clone(noise))
+            }
             "distance_to_point" => {
                 let point = field("point")?
                     .as_array()
@@ -1384,5 +1432,25 @@ mod tests {
         ] {
             assert!(compiler.compile(&value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn end_islands_require_a_seed_and_share_the_initialized_noise() {
+        let mut data = Data::default();
+        let expression = json!({"type":"end_outer_islands"});
+        assert!(
+            DensityCompiler::new(&mut data)
+                .compile(&expression)
+                .is_err()
+        );
+        let mut compiler =
+            DensityCompiler::with_world_seed(&mut data, 123, WorldgenRandom::Xoroshiro);
+        let first = compiler.compile(&expression).unwrap();
+        let second = compiler.compile(&expression).unwrap();
+        let (Node::EndOuterIslands(first), Node::EndOuterIslands(second)) = (&first.0, &second.0)
+        else {
+            panic!("expected end island samplers");
+        };
+        assert!(Arc::ptr_eq(first, second));
     }
 }

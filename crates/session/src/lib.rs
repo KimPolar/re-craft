@@ -460,6 +460,7 @@ pub struct LocalSession {
     fall_distance: f64,
     ground_without_support: bool,
     fall: fall::FallTracker,
+    damage_cooldown: fall::DamageCooldown,
     accumulated: Duration,
     tick: u64,
     snapshot: Arc<WorldSnapshot>,
@@ -589,6 +590,7 @@ impl LocalSession {
             fall_distance: 0.0,
             ground_without_support: false,
             fall: fall::FallTracker::default(),
+            damage_cooldown: fall::DamageCooldown::default(),
             accumulated: Duration::ZERO,
             tick: 0,
             snapshot,
@@ -949,6 +951,7 @@ impl LocalSession {
             self.tick += 1;
             return;
         }
+        self.damage_cooldown.tick();
         self.use_repeat.advance_tick();
         let mut repeated_use = false;
         loop {
@@ -1452,7 +1455,7 @@ impl LocalSession {
                 self.push_entities_from_soil(landed_on);
                 self.set_block(landed_on, Block::Dirt);
             }
-            if let Err(error) = self.fall.land(
+            if let Err(error) = self.fall.land_with_cooldown(
                 self.fall_distance,
                 None,
                 &self.inventory,
@@ -1460,6 +1463,7 @@ impl LocalSession {
                 &mut self.vitals,
                 self.game_mode,
                 self.survival_rules,
+                &mut self.damage_cooldown,
             ) {
                 eprintln!("player fall damage: {error:#}");
             }
@@ -1554,7 +1558,21 @@ impl LocalSession {
         self.first_person.tick(&self.inventory);
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
-            self.vitals.apply_food_effect(effect, self.game_mode);
+            if effect == survival::FoodEffect::Starve {
+                if let Err(error) = self.fall.damage(
+                    1.0,
+                    "minecraft:starve",
+                    &self.inventory,
+                    self.armor.value(),
+                    &mut self.vitals,
+                    self.game_mode,
+                    Some(&mut self.damage_cooldown),
+                ) {
+                    eprintln!("player starvation damage: {error:#}");
+                }
+            } else {
+                self.vitals.apply_food_effect(effect, self.game_mode);
+            }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
                     cause: DeathCause::Starve,
@@ -1668,6 +1686,7 @@ impl LocalSession {
         self.sneak = false;
         self.previous_sneak = false;
         self.fall_distance = 0.0;
+        self.damage_cooldown = fall::DamageCooldown::default();
         self.ground_without_support = false;
         self.fall = fall::FallTracker::default();
         self.food_use = survival::FoodUse::default();

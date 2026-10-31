@@ -395,6 +395,7 @@ pub struct LoadedSession {
     // Absolute coordinates survive streaming origin changes.
     ground_support: Option<IVec3>,
     fall: crate::fall::FallTracker,
+    damage_cooldown: crate::fall::DamageCooldown,
     accumulated: Duration,
     tick: u64,
     revision: u64,
@@ -2954,6 +2955,7 @@ impl LoadedSession {
             ground_without_support: false,
             ground_support: None,
             fall: crate::fall::FallTracker::default(),
+            damage_cooldown: crate::fall::DamageCooldown::default(),
             accumulated: Duration::ZERO,
             tick: 0,
             revision: 0,
@@ -5305,6 +5307,7 @@ impl LoadedSession {
         self.movement_speed_attribute.clear_modifiers();
         self.movement_speed_cache = None;
         self.fall.reset_after_death();
+        self.damage_cooldown = crate::fall::DamageCooldown::default();
         self.breathing_effects = crate::survival::BreathingEffects::default();
         self.effect_save_invalid = true;
         if let Some((attribute, _)) = &mut self.oxygen_equipment {
@@ -9942,6 +9945,7 @@ impl LoadedSession {
             self.mark_advanced_saved_tick_chunks_dirty();
             return;
         }
+        self.damage_cooldown.tick();
         self.use_repeat.advance_tick();
         let mut repeated_use = false;
         loop {
@@ -10473,7 +10477,7 @@ impl LoadedSession {
                         Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:bubble_column")
                     )
                 };
-            self.vitals.tick_air_with(
+            let drowning = self.vitals.advance_air(
                 contacts.water.eyes_inside,
                 bubble_column,
                 self.game_mode,
@@ -10481,6 +10485,20 @@ impl LoadedSession {
                 breathing_oxygen,
                 &mut || self.player_random.next_double(),
             );
+            if drowning
+                && let Err(error) = self.fall.damage(
+                    2.0,
+                    "minecraft:drown",
+                    &self.inventory,
+                    self.armor.value(),
+                    &mut self.vitals,
+                    self.game_mode,
+                    Some(&mut self.damage_cooldown),
+                )
+            {
+                self.stream_errors
+                    .push(format!("player drowning damage: {error:#}"));
+            }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
                     cause: DeathCause::Drown,
@@ -10898,7 +10916,7 @@ impl LoadedSession {
             }
             let state = landing_state.and_then(|id| self.world.state(id));
             if let Some(state) = state
-                && let Err(error) = self.fall.land(
+                && let Err(error) = self.fall.land_with_cooldown(
                     self.fall_distance,
                     Some(state),
                     &self.inventory,
@@ -10906,6 +10924,7 @@ impl LoadedSession {
                     &mut self.vitals,
                     self.game_mode,
                     self.survival_rules,
+                    &mut self.damage_cooldown,
                 )
             {
                 self.stream_errors
@@ -11097,7 +11116,22 @@ impl LoadedSession {
         self.first_person.tick(&self.inventory);
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
-            self.vitals.apply_food_effect(effect, self.game_mode);
+            if effect == crate::survival::FoodEffect::Starve {
+                if let Err(error) = self.fall.damage(
+                    1.0,
+                    "minecraft:starve",
+                    &self.inventory,
+                    self.armor.value(),
+                    &mut self.vitals,
+                    self.game_mode,
+                    Some(&mut self.damage_cooldown),
+                ) {
+                    self.stream_errors
+                        .push(format!("player starvation damage: {error:#}"));
+                }
+            } else {
+                self.vitals.apply_food_effect(effect, self.game_mode);
+            }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
                     cause: DeathCause::Starve,
@@ -25200,6 +25234,52 @@ mod tests {
         assert_eq!(after.death.unwrap().score, 42);
         assert!(!after.death.unwrap().can_respawn);
         assert_eq!(after.inventory.as_ref(), before.inventory.as_ref());
+    }
+
+    #[test]
+    fn drowning_and_starvation_share_the_fall_damage_cooldown() {
+        let mut session = session();
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        for x in 7..=9 {
+            for y in 1..=3 {
+                for z in 7..=9 {
+                    assert!(session.set(IVec3::new(x, y, z), water));
+                }
+            }
+        }
+        session.set_survival_rules(crate::survival::SurvivalRules {
+            difficulty: native_persistence::world::Difficulty::Hard,
+            ..Default::default()
+        });
+        session
+            .fall
+            .damage(
+                4.0,
+                "minecraft:fall",
+                &session.inventory,
+                session.armor.value(),
+                &mut session.vitals,
+                session.game_mode,
+                Some(&mut session.damage_cooldown),
+            )
+            .unwrap();
+        session.vitals.air = -19;
+        session.vitals.food = 0;
+        session.vitals.saturation = 0.0;
+        session.vitals.food_tick_timer = 79;
+        session.update(TICK);
+        assert_eq!(session.vitals.health, 16.0);
+        assert_eq!(session.vitals.air, 0);
+
+        for _ in 0..9 {
+            session.update(TICK);
+        }
+        session.vitals.air = -19;
+        session.vitals.food_tick_timer = 79;
+        session.update(TICK);
+        // Drowning is processed first and suppresses the weaker starvation hit.
+        assert_eq!(session.vitals.health, 14.0);
+        assert_eq!(session.vitals.air, 0);
     }
 
     #[test]

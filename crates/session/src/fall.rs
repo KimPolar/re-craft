@@ -55,6 +55,48 @@ impl Default for FallSurface {
     }
 }
 
+/// The server player's transient damage cooldown and the unmitigated amount of
+/// the last accepted hit. These values are not the saved HurtTime animation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DamageCooldown {
+    ticks: i32,
+    last_damage: f32,
+}
+
+impl DamageCooldown {
+    pub(crate) fn tick(&mut self) {
+        if self.ticks > 0 {
+            self.ticks -= 1;
+        }
+    }
+
+    fn accept(&mut self, amount: f32, bypass: bool) -> Option<f32> {
+        // Player.hurtServer rejects zero before LivingEntity normalizes damage.
+        if amount == 0.0 {
+            return None;
+        }
+        let amount = if amount < 0.0 {
+            0.0
+        } else if amount.is_finite() {
+            amount
+        } else {
+            f32::MAX
+        };
+        if self.ticks > 10 && !bypass {
+            if amount <= self.last_damage {
+                return None;
+            }
+            let difference = amount - self.last_damage;
+            self.last_damage = amount;
+            Some(difference)
+        } else {
+            self.last_damage = amount;
+            self.ticks = 20;
+            Some(amount)
+        }
+    }
+}
+
 impl FallSurface {
     fn for_state(state: Option<&BlockState>) -> Self {
         let Some(state) = state else {
@@ -154,11 +196,20 @@ impl FallTracker {
         if let Some(registry) = &self.enchantments {
             registry.damage_type_has_tag(tag, damage)
         } else {
-            // The demo contains no data packs and uses the built-in ordinary fall.
-            Ok(matches!(
-                tag,
-                "minecraft:is_fall" | "minecraft:bypasses_armor"
-            ))
+            // The demo has no data packs and uses the built-in damage tags.
+            Ok(match tag {
+                "minecraft:is_fall" => matches!(damage, "minecraft:fall" | "minecraft:stalagmite"),
+                "minecraft:bypasses_armor" => matches!(
+                    damage,
+                    "minecraft:fall"
+                        | "minecraft:stalagmite"
+                        | "minecraft:drown"
+                        | "minecraft:starve"
+                        | "minecraft:magic"
+                ),
+                "minecraft:bypasses_effects" => damage == "minecraft:starve",
+                _ => false,
+            })
         }
     }
 
@@ -213,6 +264,45 @@ impl FallTracker {
         mode: GameMode,
         rules: SurvivalRules,
     ) -> Result<()> {
+        self.land_impl(distance, state, inventory, armor, vitals, mode, rules, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn land_with_cooldown(
+        &self,
+        distance: f64,
+        state: Option<&BlockState>,
+        inventory: &PlayerInventory,
+        armor: Option<ArmorValues>,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        rules: SurvivalRules,
+        cooldown: &mut DamageCooldown,
+    ) -> Result<()> {
+        self.land_impl(
+            distance,
+            state,
+            inventory,
+            armor,
+            vitals,
+            mode,
+            rules,
+            Some(cooldown),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn land_impl(
+        &self,
+        distance: f64,
+        state: Option<&BlockState>,
+        inventory: &PlayerInventory,
+        armor: Option<ArmorValues>,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        rules: SurvivalRules,
+        cooldown: Option<&mut DamageCooldown>,
+    ) -> Result<()> {
         if distance <= 0.0
             || vitals.health <= 0.0
             || matches!(mode, GameMode::Creative | GameMode::Spectator)
@@ -252,7 +342,7 @@ impl FallTracker {
             )
         };
         let distance = distance * surface.distance_multiplier + surface.added_distance;
-        let mut amount =
+        let amount =
             calculate_fall_damage(distance, safe, surface.damage_multiplier, multiplier) as f32;
         if amount <= 0.0 {
             return Ok(());
@@ -261,6 +351,35 @@ impl FallTracker {
         if !rules.fall_damage && self.damage_tag("minecraft:is_fall", damage)? {
             return Ok(());
         }
+        self.damage(amount, damage, inventory, armor, vitals, mode, cooldown)
+    }
+
+    /// Apply one supported damage source; unsupported tag or enchantment data
+    /// leaves both health and the cooldown unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn damage(
+        &self,
+        amount: f32,
+        damage: &str,
+        inventory: &PlayerInventory,
+        armor: Option<ArmorValues>,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        cooldown: Option<&mut DamageCooldown>,
+    ) -> Result<()> {
+        if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
+            return Ok(());
+        }
+        let mut next_cooldown = cooldown.as_deref().copied();
+        let mut amount = if let Some(next) = &mut next_cooldown {
+            let bypass = self.damage_tag("minecraft:bypasses_cooldown", damage)?;
+            let Some(accepted) = next.accept(amount, bypass) else {
+                return Ok(());
+            };
+            accepted
+        } else {
+            amount
+        };
         if !self.damage_tag("minecraft:bypasses_armor", damage)? {
             let armor = armor.context("armor attributes are unavailable")?;
             let value = armor.armor as f32;
@@ -282,7 +401,10 @@ impl FallTracker {
                 }
             }
         }
-        ensure!(amount.is_finite(), "fall damage is not finite");
+        ensure!(amount.is_finite(), "player damage is not finite");
+        if let (Some(cooldown), Some(next)) = (cooldown, next_cooldown) {
+            *cooldown = next;
+        }
         let absorbed = vitals.absorption.clamp(0.0, amount);
         vitals.absorption -= absorbed;
         vitals.health = (vitals.health - (amount - absorbed)).max(0.0);
@@ -295,6 +417,160 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn damage_sources_share_cooldown_and_leave_failed_damage_untouched() {
+        let mut tracker = FallTracker::default();
+        let inventory = PlayerInventory::default();
+        let mut vitals = PlayerVitals::default();
+        let mut cooldown = DamageCooldown::default();
+        tracker
+            .damage(
+                4.0,
+                "minecraft:fall",
+                &inventory,
+                None,
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            )
+            .unwrap();
+        assert_eq!(vitals.health, 16.0);
+        tracker
+            .damage(
+                2.0,
+                "minecraft:drown",
+                &inventory,
+                None,
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            )
+            .unwrap();
+        assert_eq!(vitals.health, 16.0);
+        tracker
+            .damage(
+                6.0,
+                "minecraft:drown",
+                &inventory,
+                None,
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            )
+            .unwrap();
+        assert_eq!(vitals.health, 14.0);
+        for _ in 0..10 {
+            cooldown.tick();
+        }
+        tracker
+            .damage(
+                1.0,
+                "minecraft:starve",
+                &inventory,
+                None,
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            )
+            .unwrap();
+        assert_eq!(vitals.health, 13.0);
+        tracker.enchantments = Some(Arc::new(OxygenEnchantments::default()));
+        let before = cooldown;
+        assert!(
+            tracker
+                .damage(
+                    8.0,
+                    "minecraft:fall",
+                    &inventory,
+                    None,
+                    &mut vitals,
+                    GameMode::Survival,
+                    Some(&mut cooldown)
+                )
+                .is_err()
+        );
+        assert_eq!(cooldown, before);
+        assert_eq!(vitals.health, 13.0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn damage_cooldown_matches_java_hurt_server() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("DamageCooldownOracle.java");
+        let output = temp.path().join("damage.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/DamageCooldownOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("DamageCooldownOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java damage oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 480);
+        for row in rows {
+            let bits = |name: &str| row[name].as_i64().unwrap() as i32 as u32;
+            let mut cooldown = DamageCooldown {
+                ticks: row["timer"].as_i64().unwrap() as i32,
+                last_damage: f32::from_bits(bits("last_bits")),
+            };
+            let actual = cooldown.accept(
+                f32::from_bits(bits("amount_bits")),
+                row["bypass"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                actual.is_some(),
+                row["accepted"].as_bool().unwrap(),
+                "{row}"
+            );
+            if let Some(actual) = actual {
+                assert_eq!(actual.to_bits(), bits("damage_bits"), "{row}");
+                assert_eq!(
+                    cooldown.ticks,
+                    row["timer_after"].as_i64().unwrap() as i32,
+                    "{row}"
+                );
+            }
+        }
+    }
 
     fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
         BlockState {

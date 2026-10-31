@@ -824,8 +824,32 @@ impl PlayerVitals {
         oxygen_bonus: f64,
         random: &mut impl FnMut() -> f64,
     ) {
+        if self.advance_air(
+            eyes_in_water,
+            in_bubble_column,
+            mode,
+            effects,
+            oxygen_bonus,
+            random,
+        ) {
+            let absorbed = self.absorption.clamp(0.0, 2.0);
+            self.absorption -= absorbed;
+            self.health = (self.health - (2.0 - absorbed)).max(0.0);
+        }
+    }
+
+    /// Advance air and report a drowning hit for the shared damage pipeline.
+    pub(crate) fn advance_air(
+        &mut self,
+        eyes_in_water: bool,
+        in_bubble_column: bool,
+        mode: crate::GameMode,
+        effects: &BreathingEffects,
+        oxygen_bonus: f64,
+        random: &mut impl FnMut() -> f64,
+    ) -> bool {
         if self.health <= 0.0 {
-            return;
+            return false;
         }
         if eyes_in_water && !in_bubble_column {
             let protected = effects.protects()
@@ -840,14 +864,13 @@ impl PlayerVitals {
                 }
                 if self.air <= -20 {
                     self.air = 0;
-                    let absorbed = self.absorption.clamp(0.0, 2.0);
-                    self.absorption -= absorbed;
-                    self.health = (self.health - (2.0 - absorbed)).max(0.0);
+                    return true;
                 }
             }
         } else if self.air < 300 {
             self.air = self.air.wrapping_add(4).min(300);
         }
+        false
     }
 
     pub fn can_sprint(self, mode: crate::GameMode) -> bool {

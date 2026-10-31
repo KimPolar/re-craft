@@ -7416,6 +7416,12 @@ impl LoadedSession {
             if id != existing && !self.set(target, id) {
                 return false;
             }
+            if id != existing
+                && waterloggable
+                && let Some(water) = self.simulated_fluid(id)
+            {
+                self.schedule_fluid(target, water, self.fluid_settings().delay(water.kind));
+            }
             self.push_bucket_sound(
                 if fluid == "minecraft:water" {
                     BucketSoundKind::EmptyWater
@@ -8633,7 +8639,13 @@ impl LoadedSession {
         }
         let fluid = self.fluids.get(id.0 as usize).copied().flatten()?;
         let state = self.world.state(id)?;
-        if self.slab_top(state).is_none() && self.stair_voxels(id).is_none() {
+        if self.slab_top(state).is_none()
+            && self.stair_voxels(id).is_none()
+            && !(matches!(
+                state.name.as_str(),
+                "minecraft:chest" | "minecraft:trapped_chest"
+            ) && self.shapes.get(id.0 as usize).is_some_and(Option::is_some))
+        {
             return None;
         }
         Some(fluid)
@@ -10020,6 +10032,15 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::GrateWater(fluid);
         }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest"
+        ) && self.shapes.get(id.0 as usize).is_some_and(Option::is_some)
+        {
+            return fluid_sim::Cell::Chest {
+                waterlogged: state.properties["waterlogged"] == "true",
+            };
+        }
         if let Some(top) = self.slab_top(state) {
             return fluid_sim::Cell::Slab {
                 top,
@@ -10184,7 +10205,8 @@ impl LoadedSession {
                     fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
                     fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
                     fluid_sim::ChangedBlock::WaterloggedSlab { .. }
-                    | fluid_sim::ChangedBlock::WaterloggedStairs { .. } => {
+                    | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
+                    | fluid_sim::ChangedBlock::WaterloggedChest => {
                         let expected = match change.block {
                             fluid_sim::ChangedBlock::WaterloggedSlab { top } => {
                                 fluid_sim::Cell::Slab {
@@ -10197,6 +10219,9 @@ impl LoadedSession {
                                     voxels,
                                     waterlogged: false,
                                 }
+                            }
+                            fluid_sim::ChangedBlock::WaterloggedChest => {
+                                fluid_sim::Cell::Chest { waterlogged: false }
                             }
                             _ => unreachable!(),
                         };
@@ -10229,6 +10254,7 @@ impl LoadedSession {
                         change.block,
                         fluid_sim::ChangedBlock::WaterloggedSlab { .. }
                             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
+                            | fluid_sim::ChangedBlock::WaterloggedChest
                     ) && let Some(water) = self.simulated_fluid(id)
                     {
                         self.schedule_fluid(change.position, water, settings.delay(water.kind));
@@ -13897,6 +13923,7 @@ mod tests {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
         let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:stone_slab".into()])));
         let mut inventory = PlayerInventory::default();
         inventory.set_slot(
             PlayerSlot::Storage(0),
@@ -13924,6 +13951,12 @@ mod tests {
         assert_eq!(
             session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
             "minecraft:bucket"
+        );
+        for _ in 0..6 {
+            session.update(TICK);
+        }
+        assert!(
+            matches!(session.simulation_cell(pos + IVec3::NEG_Y), fluid_sim::Cell::Fluid(water) if water.kind == FluidKind::Water && water.falling)
         );
     }
 
@@ -13975,6 +14008,19 @@ mod tests {
                 assert_eq!(
                     session.inventory.slot(hand).unwrap().id(),
                     "minecraft:bucket"
+                );
+                for _ in 0..6 {
+                    session.update(TICK);
+                }
+                assert!(
+                    matches!(session.simulation_cell(chest + IVec3::NEG_Y), fluid_sim::Cell::Fluid(water) if water.kind == FluidKind::Water && water.falling)
+                );
+                assert_eq!(
+                    session.saved_chest(position).unwrap().unwrap().slots[3]
+                        .as_ref()
+                        .unwrap()
+                        .count(),
+                    5
                 );
             }
         }
@@ -33199,6 +33245,66 @@ mod tests {
                     assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
                         && key.y == absolute.y
                         && key.z == absolute.z
+                        && key.kind == FluidKind::Water
+                        && key.source));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_conversion_waterlogs_saved_chests_and_schedules_water() {
+        for trapped in [false, true] {
+            for conversion in [false, true] {
+                let (mut session, position) = if trapped {
+                    let (session, position, _) = trapped_chest_fixture();
+                    (session, position)
+                } else {
+                    let (session, _, position, _) = saved_chest_fixture();
+                    (session, position)
+                };
+                session.set_source_conversion(conversion, false);
+                let chest = position - session.origin;
+                let source = chest - IVec3::X;
+                let water = FluidState {
+                    kind: FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                };
+                let water_id = session.intern_liquid(water);
+                session.set_with_notify(source, water_id, false);
+                session.set_with_notify(chest + IVec3::X, water_id, false);
+                for offset in [
+                    IVec3::NEG_Y,
+                    IVec3::X + IVec3::NEG_Y,
+                    IVec3::NEG_X,
+                    IVec3::NEG_Z,
+                    IVec3::Z,
+                ] {
+                    session.set_with_notify(source + offset, session.states[3], false);
+                }
+                session.fluid_ticks.clear();
+                session.fluid_pending.clear();
+                session.schedule_fluid(source, water, 0);
+                session.advance_fluid_ticks();
+                assert_eq!(
+                    session.simulation_cell(chest),
+                    fluid_sim::Cell::Chest {
+                        waterlogged: conversion
+                    }
+                );
+                assert_eq!(
+                    session.saved_chest(position).unwrap().unwrap().slots[3]
+                        .as_ref()
+                        .unwrap()
+                        .count(),
+                    5
+                );
+                if conversion {
+                    assert!(session.fluid_pending.iter().any(|key| key.x == position.x
+                        && key.y == position.y
+                        && key.z == position.z
                         && key.kind == FluidKind::Water
                         && key.source));
                 }

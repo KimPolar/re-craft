@@ -1,4 +1,4 @@
-//! Scheduled fluid spread for air, full blocks, liquids, slabs and stairs.
+//! Scheduled fluid spread for air, full blocks, liquids, slabs, stairs and chests.
 //!
 //! Other blocks are barriers until their fluid occupancy and side shapes are
 //! available. Wet copper grates block flow but count in source checks. The
@@ -23,6 +23,10 @@ pub enum Cell {
     /// A staircase's occupied 2×2×2 cells and water occupancy.
     Stairs {
         voxels: u8,
+        waterlogged: bool,
+    },
+    /// A chest has no fully occluding face and can contain source water.
+    Chest {
         waterlogged: bool,
     },
     /// Unloaded or unsupported data: never replace or traverse it.
@@ -115,6 +119,7 @@ pub enum ChangedBlock {
     Solid(Solidified),
     WaterloggedSlab { top: bool },
     WaterloggedStairs { voxels: u8 },
+    WaterloggedChest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +195,7 @@ fn source(cell: Cell, kind: FluidKind) -> bool {
     matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) if state.kind == kind && state.source)
         || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
+        || matches!(cell, Cell::Chest { waterlogged: true } if kind == FluidKind::Water)
 }
 
 fn fluid(cell: Cell) -> Option<FluidState> {
@@ -200,7 +206,8 @@ fn fluid(cell: Cell) -> Option<FluidState> {
         }
         | Cell::Stairs {
             waterlogged: true, ..
-        } => Some(flowing(FluidKind::Water, 8, false)),
+        }
+        | Cell::Chest { waterlogged: true } => Some(flowing(FluidKind::Water, 8, false)),
         _ => None,
     }
 }
@@ -209,7 +216,7 @@ fn fluid(cell: Cell) -> Option<FluidState> {
 // only if it covers the whole face. Solid and unknown cells block all faces.
 fn face(cell: Cell, direction: IVec3) -> u8 {
     match cell {
-        Cell::Air | Cell::Fluid(_) => 0,
+        Cell::Air | Cell::Fluid(_) | Cell::Chest { .. } => 0,
         Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 15,
         Cell::Slab { top, .. } if direction == IVec3::Y => {
             if top {
@@ -321,8 +328,10 @@ pub fn new_liquid(
     }
     if sources >= 2 && settings.converts_source(kind) {
         let below = at(world, offset(position, IVec3::NEG_Y));
-        if matches!(below, Cell::Solid | Cell::Slab { .. } | Cell::Stairs { .. })
-            || source(below, kind)
+        if matches!(
+            below,
+            Cell::Solid | Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+        ) || source(below, kind)
         {
             return Some(flowing(kind, 8, false));
         }
@@ -339,7 +348,7 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
-        Cell::Slab { .. } | Cell::Stairs { .. } => !source(cell, kind),
+        Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } => !source(cell, kind),
         Cell::Solid | Cell::GrateWater(_) | Cell::Unknown => false,
     }
 }
@@ -356,7 +365,8 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
         }
         | Cell::Stairs {
             waterlogged: true, ..
-        } => kind == FluidKind::Water,
+        }
+        | Cell::Chest { waterlogged: true } => kind == FluidKind::Water,
         _ => false,
     }
 }
@@ -374,7 +384,10 @@ fn can_replace(
         }
         | Cell::Stairs {
             waterlogged: false, ..
-        } => incoming.kind == FluidKind::Water && incoming.source,
+        }
+        | Cell::Chest { waterlogged: false } => {
+            incoming.kind == FluidKind::Water && incoming.source
+        }
         Cell::Fluid(state)
             if state.kind == FluidKind::Water && incoming.kind == FluidKind::Lava =>
         {
@@ -410,8 +423,10 @@ fn slope_distance(
         // Slope search asks whether the *flowing* fluid can enter the block;
         // slabs accept only source water, even when their shape is open.
         let candidate = world(next);
-        if matches!(candidate, Cell::Slab { .. } | Cell::Stairs { .. })
-            || !can_search(candidate, kind)
+        if matches!(
+            candidate,
+            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+        ) || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
         {
             continue;
@@ -461,8 +476,10 @@ fn side_changes(
         let Some(new) = new_liquid(world, next, state.kind, settings) else {
             continue;
         };
-        if matches!(cell, Cell::Slab { .. } | Cell::Stairs { .. })
-            && !(new.kind == FluidKind::Water && new.source)
+        if matches!(
+            cell,
+            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+        ) && !(new.kind == FluidKind::Water && new.source)
         {
             continue;
         }
@@ -488,6 +505,7 @@ fn side_changes(
                     block: match cell {
                         Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
                         Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
+                        Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
                         _ => ChangedBlock::Fluid(new),
                     },
                 });
@@ -529,7 +547,10 @@ pub fn tick(
     }
     let with_self = |pos| {
         if pos == position {
-            if matches!(original, Cell::Slab { .. } | Cell::Stairs { .. }) {
+            if matches!(
+                original,
+                Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+            ) {
                 original
             } else {
                 Cell::Fluid(current)
@@ -556,6 +577,8 @@ pub fn tick(
                 ChangedBlock::WaterloggedSlab { top }
             } else if let Cell::Stairs { voxels, .. } = below {
                 ChangedBlock::WaterloggedStairs { voxels }
+            } else if let Cell::Chest { .. } = below {
+                ChangedBlock::WaterloggedChest
             } else {
                 ChangedBlock::Fluid(next)
             };
@@ -580,6 +603,7 @@ pub fn tick(
                                 voxels,
                                 waterlogged: true,
                             },
+                            ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
                             _ => Cell::Solid,
                         }
                     } else {
@@ -600,6 +624,22 @@ mod tests {
     use super::*;
     use crate::collision::{block_shape, merged_face_occludes};
     use crate::loaded::BlockState;
+
+    #[test]
+    fn chest_support_allows_water_source_conversion() {
+        let water = flowing(FluidKind::Water, 8, false);
+        for waterlogged in [false, true] {
+            let world = |pos| match pos {
+                IVec3::NEG_Y => Cell::Chest { waterlogged },
+                IVec3::NEG_X | IVec3::X => Cell::Fluid(water),
+                _ => Cell::Air,
+            };
+            assert_eq!(
+                new_liquid(&world, IVec3::ZERO, FluidKind::Water, Settings::default()),
+                Some(water)
+            );
+        }
+    }
 
     #[test]
     fn compact_faces_match_full_collision_shapes_for_stairs_and_slabs() {
@@ -654,6 +694,23 @@ mod tests {
                 },
                 block_shape(&state).unwrap(),
             ));
+        }
+        for name in ["minecraft:chest", "minecraft:trapped_chest"] {
+            for facing in ["north", "south", "west", "east"] {
+                for kind in ["single", "left", "right"] {
+                    let state = BlockState {
+                        name: name.into(),
+                        properties: [("facing", facing), ("type", kind), ("waterlogged", "false")]
+                            .into_iter()
+                            .map(|(k, v)| (k.into(), v.into()))
+                            .collect(),
+                    };
+                    shapes.push((
+                        Cell::Chest { waterlogged: false },
+                        block_shape(&state).unwrap(),
+                    ));
+                }
+            }
         }
         for (from, from_boxes) in &shapes {
             for (to, to_boxes) in &shapes {

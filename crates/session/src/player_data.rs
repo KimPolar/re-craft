@@ -1320,6 +1320,28 @@ pub fn replay_saved_hunger_effects(
     ticks: u64,
     hunger_updates: &[HungerUpdate],
 ) -> Result<Option<Tag>> {
+    let updates: Vec<_> = hunger_updates
+        .iter()
+        .copied()
+        .map(|update| StatusUpdate {
+            kind: crate::survival::FoodStatusKind::Hunger,
+            update,
+        })
+        .collect();
+    replay_saved_status_effects(player, ticks, &updates)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StatusUpdate {
+    pub kind: crate::survival::FoodStatusKind,
+    pub update: HungerUpdate,
+}
+
+pub(crate) fn replay_saved_status_effects(
+    player: &NamedTag,
+    ticks: u64,
+    updates: &[StatusUpdate],
+) -> Result<Option<Tag>> {
     fn as_player(effects: Option<Tag>) -> NamedTag {
         NamedTag {
             name: "".into(),
@@ -1332,7 +1354,7 @@ pub fn replay_saved_hunger_effects(
         }
     }
 
-    fn new_hunger(root: bool, update: HungerUpdate) -> Tag {
+    fn new_effect(root: bool, kind: crate::survival::FoodStatusKind, update: HungerUpdate) -> Tag {
         let mut fields = vec![
             ("duration".into(), Tag::Int(update.duration)),
             ("amplifier".into(), Tag::Byte(update.amplifier as i8)),
@@ -1341,12 +1363,29 @@ pub fn replay_saved_hunger_effects(
             ("show_icon".into(), Tag::Byte(i8::from(update.show_icon))),
         ];
         if root {
-            fields.insert(0, ("id".into(), Tag::String("minecraft:hunger".into())));
+            fields.insert(
+                0,
+                (
+                    "id".into(),
+                    Tag::String(
+                        match kind {
+                            crate::survival::FoodStatusKind::Hunger => "minecraft:hunger",
+                            crate::survival::FoodStatusKind::Poison => "minecraft:poison",
+                        }
+                        .into(),
+                    ),
+                ),
+            );
         }
         Tag::Compound(fields)
     }
 
-    fn merge(effect: &mut Tag, depth: usize, update: HungerUpdate) -> Result<()> {
+    fn merge(
+        effect: &mut Tag,
+        depth: usize,
+        kind: crate::survival::FoodStatusKind,
+        update: HungerUpdate,
+    ) -> Result<()> {
         ensure!(depth <= 256, "status effect nesting is too deep");
         let duration = match effect.get("duration") {
             Some(Tag::Int(value)) => *value,
@@ -1375,11 +1414,15 @@ pub fn replay_saved_hunger_effects(
                 set_field(effect, "duration", Some(Tag::Int(update.duration)))?;
                 changed = true;
             } else if let Some(mut hidden) = effect.get("hidden_effect").cloned() {
-                merge(&mut hidden, depth + 1, update)?;
+                merge(&mut hidden, depth + 1, kind, update)?;
                 set_field(effect, "hidden_effect", Some(hidden))?;
             } else {
                 ensure!(depth < 256, "status effect nesting is too deep");
-                set_field(effect, "hidden_effect", Some(new_hunger(false, update)))?;
+                set_field(
+                    effect,
+                    "hidden_effect",
+                    Some(new_effect(false, kind, update)),
+                )?;
             }
         }
         let was_ambient = matches!(effect.get("ambient"), Some(Tag::Byte(1)));
@@ -1401,7 +1444,7 @@ pub fn replay_saved_hunger_effects(
 
     let mut effects = advance_saved_effects(player, 0)?;
     let mut elapsed = 0;
-    for &update in hunger_updates {
+    for &StatusUpdate { kind, update } in updates {
         let event_tick = update.tick;
         ensure!(
             event_tick >= elapsed && event_tick <= ticks,
@@ -1426,11 +1469,18 @@ pub fn replay_saved_hunger_effects(
                 .get("id")
                 .and_then(text)
                 .and_then(|id| ResourceId::parse(&id).ok())
-                .is_some_and(|id| id.namespace == "minecraft" && id.path == "hunger")
+                .is_some_and(|id| {
+                    id.namespace == "minecraft"
+                        && id.path
+                            == match kind {
+                                crate::survival::FoodStatusKind::Hunger => "hunger",
+                                crate::survival::FoodStatusKind::Poison => "poison",
+                            }
+                })
         }) {
-            merge(effect, 0, update)?;
+            merge(effect, 0, kind, update)?;
         } else {
-            values.push(new_hunger(true, update));
+            values.push(new_effect(true, kind, update));
         }
         effects = Some(list);
         elapsed = event_tick;
@@ -2264,6 +2314,115 @@ mod tests {
                     )
                     .unwrap();
                     let events: Vec<_> = updates.iter().map(|event| serde_json::json!({"tick":event.tick,"duration":event.duration,"amplifier":event.amplifier,"ambient":event.ambient,"visible":event.visible,"show_icon":event.show_icon})).collect();
+                    input.push(serde_json::json!({"ticks":50,"events":events}));
+                }
+            }
+        }
+        for duration in [-1, 8, 40, 800] {
+            for amplifier in [0, 1, 3] {
+                for hidden in [false, true] {
+                    let mut poison = vec![
+                        ("id".into(), Tag::String("minecraft:poison".into())),
+                        ("duration".into(), Tag::Int(duration)),
+                        ("amplifier".into(), Tag::Byte(amplifier)),
+                        ("ambient".into(), Tag::Byte(1)),
+                    ];
+                    if hidden {
+                        poison.push((
+                            "hidden_effect".into(),
+                            Tag::Compound(vec![
+                                ("duration".into(), Tag::Int(900)),
+                                ("amplifier".into(), Tag::Byte(0)),
+                            ]),
+                        ));
+                    }
+                    let original = NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![(
+                            "active_effects".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![
+                                    Tag::Compound(poison),
+                                    Tag::Compound(vec![
+                                        ("id".into(), Tag::String("minecraft:hunger".into())),
+                                        ("duration".into(), Tag::Int(40)),
+                                    ]),
+                                ],
+                            },
+                        )]),
+                    };
+                    let updates = [
+                        StatusUpdate {
+                            kind: crate::survival::FoodStatusKind::Poison,
+                            update: HungerUpdate {
+                                tick: 0,
+                                duration: 10,
+                                amplifier: 2,
+                                ambient: true,
+                                visible: false,
+                                show_icon: false,
+                            },
+                        },
+                        StatusUpdate {
+                            kind: crate::survival::FoodStatusKind::Hunger,
+                            update: HungerUpdate {
+                                tick: 0,
+                                duration: 100,
+                                amplifier: 1,
+                                ambient: false,
+                                visible: true,
+                                show_icon: true,
+                            },
+                        },
+                        StatusUpdate {
+                            kind: crate::survival::FoodStatusKind::Poison,
+                            update: HungerUpdate {
+                                tick: 3,
+                                duration: 200,
+                                amplifier: 0,
+                                ambient: false,
+                                visible: true,
+                                show_icon: false,
+                            },
+                        },
+                        StatusUpdate {
+                            kind: crate::survival::FoodStatusKind::Poison,
+                            update: HungerUpdate {
+                                tick: 15,
+                                duration: -1,
+                                amplifier: 1,
+                                ambient: true,
+                                visible: true,
+                                show_icon: true,
+                            },
+                        },
+                    ];
+                    let effects = replay_saved_status_effects(&original, 50, &updates).unwrap();
+                    let draft = NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(
+                            effects
+                                .map(|value| ("active_effects".into(), value))
+                                .into_iter()
+                                .collect(),
+                        ),
+                    };
+                    let index = input.len();
+                    std::fs::write(
+                        temp.path().join(format!("source{index}.nbt")),
+                        native_persistence::nbt::write(&original).unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        temp.path().join(format!("draft{index}.nbt")),
+                        native_persistence::nbt::write(&draft).unwrap(),
+                    )
+                    .unwrap();
+                    let events: Vec<_> = updates.iter().map(|event| {
+                        let value = event.update;
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger" }, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                    }).collect();
                     input.push(serde_json::json!({"ticks":50,"events":events}));
                 }
             }

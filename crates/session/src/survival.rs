@@ -26,6 +26,8 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         "carrot" => (3, 0.6),
         "cod" | "salmon" | "cookie" | "sweet_berries" | "glow_berries" => (2, 0.1),
         "rotten_flesh" => (4, 0.1),
+        "poisonous_potato" => (2, 0.3),
+        "spider_eye" => (2, 0.8),
         "cooked_beef" | "cooked_porkchop" => (8, 0.8),
         "cooked_chicken" | "mushroom_stew" | "beetroot_soup" => (6, 0.6),
         "rabbit_stew" => (10, 0.6),
@@ -77,7 +79,14 @@ pub(crate) fn custom_food(value: &Tag) -> Option<(i32, f32, bool)> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HungerApplication {
+pub(crate) enum FoodStatusKind {
+    Hunger,
+    Poison,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StatusApplication {
+    pub kind: FoodStatusKind,
     pub duration: i32,
     pub amplifier: u8,
     pub ambient: bool,
@@ -86,19 +95,19 @@ pub(crate) struct HungerApplication {
 }
 
 #[derive(Clone, Debug)]
-struct HungerGroup {
+struct StatusGroup {
     probability: f32,
-    effects: Vec<HungerApplication>,
+    effects: Vec<StatusApplication>,
 }
 
 #[derive(Clone, Debug)]
 struct CustomConsumable {
     ticks: i32,
     particles: bool,
-    hunger: Vec<HungerGroup>,
+    effects: Vec<StatusGroup>,
 }
 
-fn parse_hunger_effect(value: &Tag) -> Option<HungerApplication> {
+fn parse_status_effect(value: &Tag) -> Option<StatusApplication> {
     let Tag::Compound(fields) = value else {
         return None;
     };
@@ -109,10 +118,15 @@ fn parse_hunger_effect(value: &Tag) -> Option<HungerApplication> {
             let Tag::String(value) = value else {
                 return None;
             };
-            if !value.matches("minecraft:hunger") && !value.matches("hunger") {
-                return None;
-            }
-            id = Some(());
+            id = Some(
+                if value.matches("minecraft:hunger") || value.matches("hunger") {
+                    FoodStatusKind::Hunger
+                } else if value.matches("minecraft:poison") || value.matches("poison") {
+                    FoodStatusKind::Poison
+                } else {
+                    return None;
+                },
+            );
         } else if name.matches("duration") && duration.is_none() {
             duration = value.as_java_int().filter(|value| *value >= -1);
             duration?;
@@ -141,9 +155,10 @@ fn parse_hunger_effect(value: &Tag) -> Option<HungerApplication> {
             return None;
         }
     }
-    id?;
+    let kind = id?;
     let visible = visible.unwrap_or(true);
-    Some(HungerApplication {
+    Some(StatusApplication {
+        kind,
         duration: duration.unwrap_or(0),
         amplifier: amplifier.unwrap_or(0),
         ambient: ambient.unwrap_or(false),
@@ -152,7 +167,7 @@ fn parse_hunger_effect(value: &Tag) -> Option<HungerApplication> {
     })
 }
 
-fn parse_hunger_group(value: &Tag, collect: bool) -> Option<HungerGroup> {
+fn parse_status_group(value: &Tag, collect: bool) -> Option<StatusGroup> {
     let Tag::Compound(fields) = value else {
         return None;
     };
@@ -179,7 +194,7 @@ fn parse_hunger_group(value: &Tag, collect: bool) -> Option<HungerGroup> {
             }
             let mut result = Vec::new();
             for value in values {
-                let effect = parse_hunger_effect(value)?;
+                let effect = parse_status_effect(value)?;
                 if collect {
                     result.push(effect);
                 }
@@ -196,7 +211,7 @@ fn parse_hunger_group(value: &Tag, collect: bool) -> Option<HungerGroup> {
         }
     }
     kind?;
-    Some(HungerGroup {
+    Some(StatusGroup {
         probability: probability.unwrap_or(1.0),
         effects: effects?,
     })
@@ -232,7 +247,7 @@ fn parse_consumable(value: &Tag, collect: bool) -> Option<CustomConsumable> {
             }
             let mut result = Vec::new();
             for value in values {
-                let group = parse_hunger_group(value, collect)?;
+                let group = parse_status_group(value, collect)?;
                 if collect {
                     result.push(group);
                 }
@@ -251,7 +266,7 @@ fn parse_consumable(value: &Tag, collect: bool) -> Option<CustomConsumable> {
     Some(CustomConsumable {
         ticks: (seconds.unwrap_or(1.6_f32) * 20.0) as i32,
         particles: particles.unwrap_or(true),
-        hunger: effects.unwrap_or_default(),
+        effects: effects.unwrap_or_default(),
     })
 }
 
@@ -382,9 +397,9 @@ pub(crate) enum FoodRandomEvent {
         causes_hunger: bool,
         particles: bool,
     },
-    HungerGroup {
+    StatusGroup {
         probability: f32,
-        effects: Vec<HungerApplication>,
+        effects: Vec<StatusApplication>,
     },
 }
 
@@ -401,7 +416,7 @@ impl FoodRandomEvent {
                     0
                 }
             }
-            Self::HungerGroup { probability, .. } => return random.next_float() < *probability,
+            Self::StatusGroup { probability, .. } => return random.next_float() < *probability,
         };
         random.next_bool();
         for _ in 0..3 + u32::from(particles) * 4 {
@@ -563,19 +578,39 @@ impl FoodUse {
             item.id() == "minecraft:rotten_flesh"
                 && item.components().get("minecraft:consumable").is_none()
         });
-        let custom_groups = inventory
+        let mut custom_groups = inventory
             .slot(hand)
             .and_then(|item| item.components().get("minecraft:consumable"))
             .and_then(|component| parse_consumable(component, true))
-            .map(|value| value.hunger)
+            .map(|value| value.effects)
             .unwrap_or_default();
+        if let Some(item) = inventory.slot(hand)
+            && item.components().get("minecraft:consumable").is_none()
+            && let Some(probability) = match item.id() {
+                "minecraft:poisonous_potato" => Some(0.6),
+                "minecraft:spider_eye" => Some(1.0),
+                _ => None,
+            }
+        {
+            custom_groups.push(StatusGroup {
+                probability,
+                effects: vec![StatusApplication {
+                    kind: FoodStatusKind::Poison,
+                    duration: 100,
+                    amplifier: 0,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                }],
+            });
+        }
         if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
             self.events.push(FoodRandomEvent::Finish {
                 causes_hunger,
                 particles: food.consume_particles,
             });
             self.events.extend(custom_groups.into_iter().map(|group| {
-                FoodRandomEvent::HungerGroup {
+                FoodRandomEvent::StatusGroup {
                     probability: group.probability,
                     effects: group.effects,
                 }
@@ -1034,6 +1069,109 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn poison_food_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PoisonFoodOracle.java");
+        let output = temp.path().join("food.json");
+        std::fs::write(&source, include_str!("../tests/java/PoisonFoodOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("PoisonFoodOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java poison food oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 200);
+        for row in rows {
+            let id = format!("minecraft:{}", row["item"].as_str().unwrap());
+            let item = ItemStack::new(id, 1, 64, Tag::Compound(vec![])).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                saturation: 0.0,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            assert!(usage.start_hand(
+                &mut inventory,
+                PlayerSlot::Storage(0),
+                &mut vitals,
+                GameMode::Survival
+            ));
+            let mut applied = None;
+            for _ in 0..32 {
+                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                for event in usage.take_events() {
+                    if event.apply(&mut random)
+                        && let FoodRandomEvent::StatusGroup { effects, .. } = event
+                    {
+                        assert_eq!(effects.len(), 1);
+                        applied = Some(effects[0]);
+                    }
+                }
+            }
+            assert_eq!(vitals.food, row["food"].as_i64().unwrap() as i32, "{row}");
+            assert_eq!(
+                vitals.saturation.to_bits(),
+                row["saturation_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+            assert_eq!(
+                applied.is_some(),
+                row["applied"].as_bool().unwrap(),
+                "{row}"
+            );
+            if let Some(effect) = applied {
+                assert_eq!(effect.kind, FoodStatusKind::Poison);
+                assert_eq!(effect.duration, row["duration"].as_i64().unwrap() as i32);
+                assert_eq!(effect.amplifier, row["amplifier"].as_u64().unwrap() as u8);
+            }
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn rotten_flesh_random_and_hunger_merge_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1340,7 +1478,7 @@ mod tests {
                                 )]),
                                 Tag::Compound(vec![(
                                     "id".into(),
-                                    Tag::String("minecraft:poison".into()),
+                                    Tag::String("minecraft:weakness".into()),
                                 )]),
                             ],
                         },
@@ -1443,6 +1581,13 @@ mod tests {
             fields.push(("ambient".into(), Tag::Byte(1)));
             fields.push(("show_particles".into(), Tag::Byte(0)));
         }
+        let poison = |duration, amplifier| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:poison".into())),
+                ("duration".into(), Tag::Int(duration)),
+                ("amplifier".into(), Tag::Byte(amplifier)),
+            ])
+        };
         let cases = [
             Tag::Compound(vec![
                 ("consume_seconds".into(), Tag::Float(0.0)),
@@ -1482,10 +1627,23 @@ mod tests {
                     },
                 ),
             ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            group(0.35, vec![effect(70, 1), poison(100, 0)]),
+                            group(0.8, vec![poison(20, 2)]),
+                        ],
+                    },
+                ),
+            ]),
         ];
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 120);
+        assert_eq!(rows.len(), 160);
         for row in rows {
             let case = row["case"].as_u64().unwrap() as usize;
             let components =
@@ -1512,9 +1670,10 @@ mod tests {
                 }
             }
             let mut active: Option<EffectDuration> = None;
+            let mut active_poison: Option<EffectDuration> = None;
             for event in usage.take_events() {
                 if event.apply(&mut random)
-                    && let FoodRandomEvent::HungerGroup { effects, .. } = event
+                    && let FoodRandomEvent::StatusGroup { effects, .. } = event
                 {
                     for effect in effects {
                         let incoming = EffectDuration {
@@ -1522,14 +1681,36 @@ mod tests {
                             amplifier: effect.amplifier,
                             hidden: None,
                         };
-                        if let Some(existing) = &mut active {
+                        let target = match effect.kind {
+                            FoodStatusKind::Hunger => &mut active,
+                            FoodStatusKind::Poison => &mut active_poison,
+                        };
+                        if let Some(existing) = target {
                             existing.merge(incoming);
                         } else {
-                            active = Some(incoming);
+                            *target = Some(incoming);
                         }
                     }
                 }
             }
+            assert_eq!(
+                active_poison.as_ref().map(|v| (v.duration, v.amplifier)),
+                row["poison_duration"]
+                    .as_i64()
+                    .map(|v| (v as i32, row["poison_amplifier"].as_u64().unwrap() as u8)),
+                "{row}"
+            );
+            assert_eq!(
+                active_poison
+                    .as_ref()
+                    .and_then(|v| v.hidden.as_ref())
+                    .map(|v| (v.duration, v.amplifier)),
+                row["poison_hidden_duration"].as_i64().map(|v| (
+                    v as i32,
+                    row["poison_hidden_amplifier"].as_u64().unwrap() as u8
+                )),
+                "{row}"
+            );
             assert_eq!(
                 active.as_ref().map(|v| (v.duration, v.amplifier)),
                 row["duration"]

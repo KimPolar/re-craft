@@ -477,9 +477,10 @@ impl LocalSession {
                         causes_hunger: true,
                         ..
                     } => self.fall.add_hunger(600, 0),
-                    survival::FoodRandomEvent::HungerGroup { effects, .. } => {
+                    survival::FoodRandomEvent::StatusGroup { effects, .. } => {
                         for effect in effects {
-                            self.fall.add_hunger(effect.duration, effect.amplifier);
+                            self.fall
+                                .add_status(effect.kind, effect.duration, effect.amplifier);
                         }
                     }
                     _ => {}

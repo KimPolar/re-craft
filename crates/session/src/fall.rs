@@ -157,15 +157,28 @@ impl FallTracker {
     }
 
     pub(crate) fn add_hunger(&mut self, duration: i32, amplifier: u8) {
+        self.add_status(crate::survival::FoodStatusKind::Hunger, duration, amplifier);
+    }
+
+    pub(crate) fn add_status(
+        &mut self,
+        kind: crate::survival::FoodStatusKind,
+        duration: i32,
+        amplifier: u8,
+    ) {
         let incoming = crate::survival::EffectDuration {
             duration,
             amplifier,
             hidden: None,
         };
-        if let Some(effect) = &mut self.effects.hunger {
+        let slot = match kind {
+            crate::survival::FoodStatusKind::Hunger => &mut self.effects.hunger,
+            crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
+        };
+        if let Some(effect) = slot {
             effect.merge(incoming);
         } else {
-            self.effects.hunger = Some(incoming);
+            *slot = Some(incoming);
         }
     }
 

@@ -490,7 +490,7 @@ struct EffectSaveTracking {
     water_efficiency: crate::player_data::SavedAttribute,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     ticks: u64,
-    hunger_updates: Vec<crate::player_data::HungerUpdate>,
+    status_updates: Vec<crate::player_data::StatusUpdate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -718,7 +718,7 @@ impl LoadedSession {
                 water_efficiency: self.water_efficiency_attribute.clone(),
                 mining_attributes: self.mining_attributes.clone(),
                 ticks: 0,
-                hunger_updates: Vec::new(),
+                status_updates: Vec::new(),
             })
     }
 
@@ -729,29 +729,34 @@ impl LoadedSession {
                     crate::survival::FoodRandomEvent::Finish {
                         causes_hunger: true,
                         ..
-                    } => vec![crate::survival::HungerApplication {
+                    } => vec![crate::survival::StatusApplication {
+                        kind: crate::survival::FoodStatusKind::Hunger,
                         duration: 600,
                         amplifier: 0,
                         ambient: false,
                         visible: true,
                         show_icon: true,
                     }],
-                    crate::survival::FoodRandomEvent::HungerGroup { effects, .. } => effects,
+                    crate::survival::FoodRandomEvent::StatusGroup { effects, .. } => effects,
                     _ => Vec::new(),
                 };
                 for effect in effects {
                     let tracking = self.ensure_effect_save_tracking();
                     tracking
-                        .hunger_updates
-                        .push(crate::player_data::HungerUpdate {
-                            tick: tracking.ticks,
-                            duration: effect.duration,
-                            amplifier: effect.amplifier,
-                            ambient: effect.ambient,
-                            visible: effect.visible,
-                            show_icon: effect.show_icon,
+                        .status_updates
+                        .push(crate::player_data::StatusUpdate {
+                            kind: effect.kind,
+                            update: crate::player_data::HungerUpdate {
+                                tick: tracking.ticks,
+                                duration: effect.duration,
+                                amplifier: effect.amplifier,
+                                ambient: effect.ambient,
+                                visible: effect.visible,
+                                show_icon: effect.show_icon,
+                            },
                         });
-                    self.fall.add_hunger(effect.duration, effect.amplifier);
+                    self.fall
+                        .add_status(effect.kind, effect.duration, effect.amplifier);
                 }
             }
         }
@@ -1655,7 +1660,7 @@ impl LoadedSession {
                         &tracking.breathing,
                         &tracking.fall,
                         tracking.ticks,
-                        tracking.hunger_updates.as_slice(),
+                        tracking.status_updates.as_slice(),
                     ),
                     None => (&self.breathing_effects, self.fall.effects(), 0, &[][..]),
                 };
@@ -1665,7 +1670,7 @@ impl LoadedSession {
                 "saved player effects do not match the initial session state"
             );
             let effects =
-                crate::player_data::replay_saved_hunger_effects(original, effect_ticks, updates)?;
+                crate::player_data::replay_saved_status_effects(original, effect_ticks, updates)?;
             let advanced = native_persistence::nbt::NamedTag {
                 name: "".into(),
                 value: native_persistence::nbt::Tag::Compound(
@@ -27622,14 +27627,17 @@ mod tests {
                 .effect_save_tracking
                 .as_ref()
                 .unwrap()
-                .hunger_updates,
-            vec![crate::player_data::HungerUpdate {
-                tick: 32,
-                duration: 600,
-                amplifier: 0,
-                ambient: false,
-                visible: true,
-                show_icon: true
+                .status_updates,
+            vec![crate::player_data::StatusUpdate {
+                kind: crate::survival::FoodStatusKind::Hunger,
+                update: crate::player_data::HungerUpdate {
+                    tick: 32,
+                    duration: 600,
+                    amplifier: 0,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true
+                }
             }]
         );
         assert_eq!(session.snapshot().vitals.food, 14);
@@ -27641,6 +27649,46 @@ mod tests {
         assert_eq!(
             native_persistence::nbt::write(&original).unwrap(),
             original_bytes
+        );
+    }
+
+    #[test]
+    fn spider_eye_applies_poison_and_replays_the_player_draft() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:spider_eye".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            saturation: 0.0,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..32 {
+            session.update(TICK);
+        }
+        assert!(session.snapshot().poison_effect);
+        assert_eq!(session.snapshot().vitals.food, 12);
+        assert_eq!(
+            session.fall.effects().poison.as_ref().unwrap().duration,
+            100
+        );
+        session.update(TICK);
+        assert_eq!(session.snapshot().vitals.health, 19.0);
+        assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 99);
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
         );
     }
 
@@ -27660,6 +27708,12 @@ mod tests {
                 ("duration".into(), Tag::Int(10)),
                 ("amplifier".into(), Tag::Byte(2)),
                 ("show_icon".into(), Tag::Byte(0)),
+            ]),
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:poison".into())),
+                ("duration".into(), Tag::Int(14)),
+                ("amplifier".into(), Tag::Byte(1)),
+                ("show_particles".into(), Tag::Byte(0)),
             ]),
         ];
         let group = Tag::Compound(vec![
@@ -27711,6 +27765,8 @@ mod tests {
             ),
             (19, 0)
         );
+        let poison = session.fall.effects().poison.as_ref().unwrap();
+        assert_eq!((poison.duration, poison.amplifier), (13, 1));
         let draft = session.draft_player_state(&original).unwrap();
         assert_eq!(
             crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
@@ -27724,6 +27780,7 @@ mod tests {
         assert_eq!(hidden.get("ambient"), Some(&Tag::Byte(1)));
         assert_eq!(hidden.get("show_particles"), Some(&Tag::Byte(0)));
         assert_eq!(hidden.get("show_icon"), Some(&Tag::Byte(0)));
+        assert_eq!(values[1].get("show_particles"), Some(&Tag::Byte(0)));
     }
 
     #[test]

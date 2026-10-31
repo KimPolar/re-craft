@@ -22,7 +22,7 @@ public class CustomHungerOracle {
     @Override public void playSound(Entity source,double x,double y,double z,SoundEvent sound,SoundSource category,float volume,float pitch) { }
   }
   static class TestPlayer extends Player {
-    World world; RandomSource rng; FoodData food; MobEffectInstance active;
+    World world; RandomSource rng; FoodData food; MobEffectInstance active; MobEffectInstance poison;
     TestPlayer() { super(null,null); }
     @Override public net.minecraft.world.level.GameType gameMode() { return net.minecraft.world.level.GameType.SURVIVAL; }
     @Override public Level level() { return world; }
@@ -31,6 +31,9 @@ public class CustomHungerOracle {
     @Override public void playSound(SoundEvent sound,float volume,float pitch) { }
     @Override public void spawnItemParticles(ItemStack stack,int count) { for(int i=0;i<count*4;i++) rng.nextFloat(); }
     @Override public boolean addEffect(MobEffectInstance effect,Entity source) {
+      if(effect.getEffect()==net.minecraft.world.effect.MobEffects.POISON) {
+        if(poison==null) poison=new MobEffectInstance(effect); else poison.update(effect); return true;
+      }
       if(active==null) active=new MobEffectInstance(effect); else active.update(effect); return true;
     }
   }
@@ -45,13 +48,14 @@ public class CustomHungerOracle {
     String[] cases={
       "{\"consume_seconds\":0,\"has_consume_particles\":false,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"probability\":1,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":20},{\"id\":\"minecraft:hunger\",\"duration\":10,\"amplifier\":2}]},{\"type\":\"minecraft:apply_effects\",\"probability\":0,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":900,\"amplifier\":3}]}]}",
       "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"probability\":0.35,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":70,\"amplifier\":1}]},{\"type\":\"minecraft:apply_effects\",\"probability\":0.8,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":300}]}]}",
-      "{\"consume_seconds\":0.25,\"has_consume_particles\":false,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":-1,\"amplifier\":1,\"ambient\":true,\"show_particles\":false}]}]}"
+      "{\"consume_seconds\":0.25,\"has_consume_particles\":false,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":-1,\"amplifier\":1,\"ambient\":true,\"show_particles\":false}]}]}",
+      "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"probability\":0.35,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":70,\"amplifier\":1},{\"id\":\"minecraft:poison\",\"duration\":100}]},{\"type\":\"minecraft:apply_effects\",\"probability\":0.8,\"effects\":[{\"id\":\"minecraft:poison\",\"duration\":20,\"amplifier\":2}]}]}"
     };
     var out=new JsonArray();
     for(int index=0;index<cases.length;index++) {
       var consumable=Consumable.CODEC.parse(JsonOps.INSTANCE,JsonParser.parseString(cases[index])).getOrThrow();
       for(int seed=0;seed<40;seed++) {
-        player.rng=RandomSource.create(seed); player.food=new FoodData(); player.active=null;
+        player.rng=RandomSource.create(seed); player.food=new FoodData(); player.active=null; player.poison=null;
         var stack=new ItemStack(Items.APPLE); var food=stack.get(DataComponents.FOOD);
         for(int remaining=consumable.consumeTicks();remaining>0;remaining--)
           if(consumable.shouldEmitParticlesAndSounds(remaining)) consumable.emitParticlesAndSounds(player.rng,player,stack,5);
@@ -62,6 +66,11 @@ public class CustomHungerOracle {
           row.addProperty("duration",player.active.getDuration()); row.addProperty("amplifier",player.active.getAmplifier());
           var child=(MobEffectInstance)hidden.get(player.active);
           if(child!=null) { row.addProperty("hidden_duration",child.getDuration()); row.addProperty("hidden_amplifier",child.getAmplifier()); }
+        }
+        if(player.poison!=null) {
+          row.addProperty("poison_duration",player.poison.getDuration()); row.addProperty("poison_amplifier",player.poison.getAmplifier());
+          var child=(MobEffectInstance)hidden.get(player.poison);
+          if(child!=null) { row.addProperty("poison_hidden_duration",child.getDuration()); row.addProperty("poison_hidden_amplifier",child.getAmplifier()); }
         }
         row.addProperty("next_bits",Float.floatToRawIntBits(player.rng.nextFloat())); out.add(row);
       }

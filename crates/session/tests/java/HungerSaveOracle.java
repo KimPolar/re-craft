@@ -15,6 +15,7 @@ public class HungerSaveOracle {
     TestPlayer() { super(null,null); }
     @Override public GameType gameMode() { return GameType.SURVIVAL; }
     @Override public void causeFoodExhaustion(float value) { }
+    @Override public float getHealth() { return 1.0f; }
   }
   public static void main(String[] args) throws Exception {
     net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -35,8 +36,9 @@ public class HungerSaveOracle {
         while(event<updates.size() && (updates.get(event).isJsonPrimitive()?updates.get(event).getAsInt():updates.get(event).getAsJsonObject().get("tick").getAsInt())==tick) {
           var entry=updates.get(event);
           var object=entry.isJsonObject()?entry.getAsJsonObject():null;
-          var incoming=object==null?new MobEffectInstance(MobEffects.HUNGER,600,0):new MobEffectInstance(MobEffects.HUNGER,object.get("duration").getAsInt(),object.get("amplifier").getAsInt(),object.get("ambient").getAsBoolean(),object.get("visible").getAsBoolean(),object.get("show_icon").getAsBoolean());
-          var existing=effects.stream().filter(e->e.getEffect()==MobEffects.HUNGER).findFirst();
+          var kind=object!=null && object.has("kind") && object.get("kind").getAsString().equals("poison") ? MobEffects.POISON : MobEffects.HUNGER;
+          var incoming=object==null?new MobEffectInstance(kind,600,0):new MobEffectInstance(kind,object.get("duration").getAsInt(),object.get("amplifier").getAsInt(),object.get("ambient").getAsBoolean(),object.get("visible").getAsBoolean(),object.get("show_icon").getAsBoolean());
+          var existing=effects.stream().filter(e->e.getEffect()==kind).findFirst();
           if(existing.isPresent()) existing.get().update(incoming);
           else effects.add(incoming);
           event++;

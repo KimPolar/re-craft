@@ -19985,6 +19985,104 @@ mod tests {
     }
 
     #[test]
+    fn combined_draft_includes_placed_chest_and_consumed_player_item() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let source = fixture_chunk_document(home);
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+                (
+                    "Inventory".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("Slot".into(), Tag::Byte(0)),
+                            ("id".into(), Tag::String("minecraft:chest".into())),
+                            ("count".into(), Tag::Int(1)),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        session.set_random_tick_speed(0);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(session.inventory.slot(PlayerSlot::Storage(0)).is_none());
+        let target = session.origin + IVec3::new(8, 2, 7);
+        assert_eq!(
+            session
+                .world
+                .block(target.x, target.y, target.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        struct HeightTags;
+        impl native_resources::packs::ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:chest".into(),
+        ]);
+        let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
+        let partial = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::from([(home, &source)]),
+                &clock,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+            )
+            .unwrap();
+        let player_doc = partial.player_and_terrain().player();
+        assert!(
+            matches!(player_doc.value.get("Inventory"),Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        let chunk = partial.player_and_terrain().chunks()[&home].document();
+        let Some(Tag::List { values, .. }) = chunk.value.get("block_entities") else {
+            panic!("missing chest entity")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("x"), Some(&Tag::Int(target.x)));
+        assert_eq!(values[0].get("y"), Some(&Tag::Int(target.y)));
+        assert_eq!(values[0].get("z"), Some(&Tag::Int(target.z)));
+        assert!(partial.entity_chunks().is_empty());
+        let plan = partial
+            .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
+            .unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+    }
+
+    #[test]
     fn combined_draft_rejects_uncoordinated_orb_awards() {
         use native_persistence::nbt::{NamedTag, Tag};
         let player = NamedTag {

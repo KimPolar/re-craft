@@ -2147,6 +2147,83 @@ mod tests {
     }
 
     #[test]
+    fn uncoordinated_chest_aborts_entire_save_before_staging() {
+        use crate::edit::BlockEntityMutation;
+
+        let world = test_world();
+        let (path, mut region, outside) = fixture(world.path());
+        let level = fs::read(world.path().join("level.dat")).unwrap();
+        let first = editable_chunk(0);
+        let second = editable_chunk(1);
+        store_record(&mut region, 0, 2, &first, 1);
+        store_record(&mut region, 1, 2, &second, 1);
+        fs::write(&path, &region).unwrap();
+
+        let good = block_draft(
+            &first,
+            ChunkPos { x: 0, z: 0 },
+            "minecraft:stone",
+            "minecraft:dirt",
+        );
+        let mut chest = draft_chunk_blocks(
+            &second,
+            ChunkPos { x: 1, z: 0 },
+            &[BlockChange {
+                x: 16,
+                y: 0,
+                z: 0,
+                expected: block_state("minecraft:stone"),
+                replacement: block_state("minecraft:chest"),
+            }],
+        )
+        .unwrap();
+        chest
+            .rebuild_heightmaps(
+                HeightBounds {
+                    min_y: 0,
+                    max_y: 16,
+                },
+                |state| {
+                    let is_air = state.name.matches("minecraft:air");
+                    Ok(BlockHeightFlags {
+                        is_air,
+                        blocks_motion: !is_air,
+                        blocks_motion_no_leaves: !is_air,
+                        has_fluid: false,
+                    })
+                },
+            )
+            .unwrap();
+        chest
+            .stage_block_entity_mutations(&[BlockEntityMutation {
+                expected: None,
+                replacement: Some(Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:chest".into())),
+                    ("x".into(), Tag::Int(16)),
+                    ("y".into(), Tag::Int(0)),
+                    ("z".into(), Tag::Int(0)),
+                ])),
+            }])
+            .unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(dimension.clone(), good, 2).unwrap();
+        plan.add_chunk(dimension, chest, 2).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let error = guard.write_plan(plan, |_, _| Ok(())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("block entity edits require a coordinated world save")
+        );
+        assert_eq!(fs::read(&path).unwrap(), region);
+        assert_eq!(fs::read(path.with_file_name("c.2.0.mcc")).unwrap(), outside);
+        assert_eq!(fs::read(world.path().join("level.dat")).unwrap(), level);
+        assert!(!world.path().join(".minecraft-native-backups").exists());
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
     fn playable_reader_shares_lock_until_last_session_owner_is_dropped() {
         use crate::world::WorldReader;
         let world = test_world();

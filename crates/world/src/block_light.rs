@@ -200,6 +200,17 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
         "minecraft:redstone_block" if state.properties.is_empty() => (15, 0),
+        "minecraft:chest" | "minecraft:trapped_chest"
+            if state.properties.len() == 3 && facing() =>
+        {
+            if !matches!(
+                state.properties.get("type").map(String::as_str),
+                Some("single" | "left" | "right")
+            ) {
+                return None;
+            }
+            (u8::from(boolean("waterlogged")?), 0)
+        }
         name if name == "minecraft:lever"
             || native_core::button::Button::from_id(name).is_some() =>
         {
@@ -1076,6 +1087,54 @@ mod tests {
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn chest_light_is_transparent_with_water_attenuating_direct_sky() {
+        for name in ["minecraft:chest", "minecraft:trapped_chest"] {
+            for facing in ["north", "south", "west", "east"] {
+                for kind in ["single", "left", "right"] {
+                    for wet in [false, true] {
+                        let chest = BlockState {
+                            name: name.into(),
+                            properties: [
+                                ("facing".into(), facing.into()),
+                                ("type".into(), kind.into()),
+                                ("waterlogged".into(), wet.to_string()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        };
+                        let light = light_properties(&chest).unwrap();
+                        assert_eq!(light.opacity, u8::from(wet));
+                        assert_eq!(light.emission, 0);
+                        assert!(!light.has_faces);
+                        assert!(light_change(&state("air", None), &chest).is_none());
+                        assert_eq!(
+                            crate::sky_light::sky_change_for_edit(
+                                Some(&state("air", None)),
+                                &chest
+                            ),
+                            wet
+                        );
+                    }
+                }
+            }
+        }
+        let mut invalid = BlockState {
+            name: "minecraft:chest".into(),
+            properties: [
+                ("facing".into(), "north".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        invalid.properties.insert("type".into(), "invalid".into());
+        assert!(light_properties(&invalid).is_none());
+        invalid.properties.remove("waterlogged");
+        assert!(light_properties(&invalid).is_none());
     }
     fn fixture() -> (
         World,
@@ -2304,12 +2363,36 @@ mod tests {
                 states.push(state(name, Some(lit)));
             }
         }
+        for name in ["chest", "trapped_chest"] {
+            for facing in ["north", "south", "west", "east"] {
+                for kind in ["single", "left", "right"] {
+                    for waterlogged in ["false", "true"] {
+                        states.push(BlockState {
+                            name: format!("minecraft:{name}"),
+                            properties: [
+                                ("facing", facing),
+                                ("type", kind),
+                                ("waterlogged", waterlogged),
+                            ]
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                        });
+                    }
+                }
+            }
+        }
         let cases: Vec<_> = states
             .iter()
             .map(|s| {
                 let mut row = serde_json::json!({"name": s.name});
                 if let Some(lit) = s.properties.get("lit") {
                     row["lit"] = serde_json::json!(lit == "true");
+                }
+                if let Some(facing) = s.properties.get("facing") {
+                    row["facing"] = serde_json::json!(facing);
+                    row["type"] = serde_json::json!(s.properties["type"]);
+                    row["waterlogged"] = serde_json::json!(s.properties["waterlogged"] == "true");
                 }
                 row
             })

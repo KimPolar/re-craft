@@ -47,6 +47,23 @@ pub(crate) fn atmospheric_fog_color(
     std::array::from_fn(|i| fog[i] + amount * (sky[i] - fog[i]))
 }
 
+pub(crate) fn weather_darken_sky(mut color: [f32; 3], rain: f32, thunder: f32) -> [f32; 3] {
+    if rain > 0.0 {
+        let red_green = 1.0 - rain * 0.5;
+        let blue = 1.0 - rain * 0.4;
+        color = [
+            (color[0] * red_green).clamp(0.0, 1.0),
+            (color[1] * red_green).clamp(0.0, 1.0),
+            (color[2] * blue).clamp(0.0, 1.0),
+        ];
+    }
+    if thunder > 0.0 {
+        let scale = 1.0 - thunder * 0.5;
+        color = color.map(|component| (component * scale).clamp(0.0, 1.0));
+    }
+    color
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub yaw: f32,
@@ -186,6 +203,9 @@ pub fn run_play(
             weather_frame: None,
             sky_background_tick: None,
             sky_background_revision: None,
+            fog_color_previous: None,
+            fog_color_current: None,
+            fog_is_background: false,
             sky_background_previous: None,
             sky_background_current: None,
             sky_fog_previous: None,
@@ -296,6 +316,9 @@ struct PlayState {
     weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
     sky_background_tick: Option<u64>,
     sky_background_revision: Option<u64>,
+    fog_color_previous: Option<[f32; 3]>,
+    fog_color_current: Option<[f32; 3]>,
+    fog_is_background: bool,
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
@@ -725,6 +748,8 @@ impl Viewer {
                 });
                 if let Some(crate::sky_background::BackgroundSample {
                     color: value,
+                    background_is_fog,
+                    fog_color,
                     fog_range,
                     sky_mix,
                 }) = value
@@ -736,6 +761,14 @@ impl Viewer {
                             Some(play.sky_background_current.unwrap_or(value));
                     }
                     play.sky_background_current = Some(value);
+                    play.fog_is_background = background_is_fog;
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.fog_color_previous.is_none()
+                        || play.fog_color_current.is_none()
+                    {
+                        play.fog_color_previous = play.fog_color_current.or(fog_color);
+                    }
+                    play.fog_color_current = fog_color;
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_fog_previous.is_none()
                         || play.sky_fog_current.is_none()
@@ -758,18 +791,41 @@ impl Viewer {
                 (play.sky_background_previous, play.sky_background_current)
             {
                 let partial = play.session.partial_tick().clamp(0.0, 1.0);
-                let mut color =
+                let color =
                     std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
-                if let (Some((previous_sky, previous_end)), Some((current_sky, current_end))) =
-                    (play.sky_mix_previous, play.sky_mix_current)
+                let mut fog_color = match (play.fog_color_previous, play.fog_color_current) {
+                    (Some(previous), Some(current)) => Some(std::array::from_fn(|i| {
+                        previous[i] + partial * (current[i] - previous[i])
+                    })),
+                    _ => None,
+                };
+                if let (
+                    Some(fog),
+                    Some((previous_sky, previous_end)),
+                    Some((current_sky, current_end)),
+                ) = (fog_color, play.sky_mix_previous, play.sky_mix_current)
                 {
                     let sky = std::array::from_fn(|i| {
                         previous_sky[i] + partial * (current_sky[i] - previous_sky[i])
                     });
+                    let (rain, thunder) = snapshot.weather.map_or((0.0, 0.0), |weather| {
+                        (weather.rain_at(partial), weather.thunder_at(partial))
+                    });
+                    let sky = weather_darken_sky(sky, rain, thunder);
                     let end = previous_end + partial * (current_end - previous_end);
-                    color = atmospheric_fog_color(color, sky, end, play.streamer.radius().max(2));
+                    fog_color = Some(atmospheric_fog_color(
+                        fog,
+                        sky,
+                        end,
+                        play.streamer.radius().max(2),
+                    ));
                 }
-                renderer.set_sky_color(color);
+                renderer.set_sky_color(if play.fog_is_background {
+                    fog_color.unwrap_or(color)
+                } else {
+                    color
+                });
+                renderer.set_fog_color(fog_color);
                 renderer.set_fog_range(match (play.sky_fog_previous, play.sky_fog_current) {
                     (Some(previous), Some(current)) => Some(std::array::from_fn(|i| {
                         previous[i] + partial * (current[i] - previous[i])

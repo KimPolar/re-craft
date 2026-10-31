@@ -207,6 +207,8 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     sky_clear: wgpu::Color,
     sky_rgb: Option<[f32; 3]>,
+    fog_rgb: Option<[f32; 3]>,
+    fog_color: Option<[f32; 3]>,
     fog_range: Option<[f32; 2]>,
     fog_buffer: wgpu::Buffer,
     fog_bind_group: wgpu::BindGroup,
@@ -285,6 +287,17 @@ pub struct Renderer {
     pub backend_name: String,
 }
 
+fn color_for_target(component: f32, srgb: bool) -> f64 {
+    let c = f64::from(component.clamp(0.0, 1.0));
+    if !srgb {
+        c
+    } else if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 impl Renderer {
     pub fn set_weather_textures(
         &mut self,
@@ -311,16 +324,27 @@ impl Renderer {
         self.fog_range = range;
     }
 
+    pub fn set_fog_color(&mut self, color: Option<[f32; 3]>) {
+        if self.fog_rgb == color {
+            return;
+        }
+        self.fog_rgb = color;
+        self.fog_color =
+            color.map(|rgb| rgb.map(|c| color_for_target(c, self.config.format.is_srgb()) as f32));
+    }
+
     fn update_fog(&mut self, eye: Vec3) {
         let range = self.fog_range;
         let uniform = FogUniform {
             eye: [eye.x, eye.y, eye.z, 0.0],
-            color: [
-                self.sky_clear.r as f32,
-                self.sky_clear.g as f32,
-                self.sky_clear.b as f32,
-                1.0,
-            ],
+            color: {
+                let rgb = self.fog_color.unwrap_or([
+                    self.sky_clear.r as f32,
+                    self.sky_clear.g as f32,
+                    self.sky_clear.b as f32,
+                ]);
+                [rgb[0], rgb[1], rgb[2], 1.0]
+            },
             range: range.map_or([0.0, 1.0, 0.0, 0.0], |r| [r[0], r[1], 1.0, 0.0]),
         };
         if self.fog_last != Some(uniform) {
@@ -334,16 +358,7 @@ impl Renderer {
             return;
         }
         self.sky_rgb = Some(color);
-        let convert = |component: f32| {
-            let c = f64::from(component.clamp(0.0, 1.0));
-            if !self.config.format.is_srgb() {
-                c
-            } else if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
+        let convert = |component: f32| color_for_target(component, self.config.format.is_srgb());
         self.sky_clear = wgpu::Color {
             r: convert(color[0]),
             g: convert(color[1]),
@@ -1210,6 +1225,8 @@ impl Renderer {
                 a: 1.0,
             },
             sky_rgb: None,
+            fog_rgb: None,
+            fog_color: None,
             fog_range: None,
             fog_buffer,
             fog_bind_group,

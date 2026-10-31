@@ -58,6 +58,14 @@ public class SkyBackgroundOracle {
             var color = ARGB.srgbLerp(t, new Vector3f(0.2f, 0.6f, 0.9f), new Vector3f(0.8f, 0.3f, 0.05f));
             var row = new JsonArray(); row.add(color.x()); row.add(color.y()); row.add(color.z()); output.add(row);
         }
+        var weatherDarken = net.minecraft.client.renderer.fog.environment.AtmosphericFogEnvironment.class
+            .getDeclaredMethod("applyWeatherDarken", org.joml.Vector3fc.class, float.class, float.class);
+        weatherDarken.setAccessible(true);
+        for (var item : input.getAsJsonArray("weatherCases")) {
+            var c = item.getAsJsonObject();
+            var result = (org.joml.Vector3fc) weatherDarken.invoke(null, new Vector3f(0.8f, 0.3f, 0.05f), c.get("rain").getAsFloat(), c.get("thunder").getAsFloat());
+            var row = new JsonArray(); row.add(result.x()); row.add(result.y()); row.add(result.z()); output.add(row);
+        }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }
 }

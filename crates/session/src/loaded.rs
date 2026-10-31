@@ -6379,6 +6379,54 @@ impl LoadedSession {
         self.place_plain_solid(hit, "minecraft:lodestone")
     }
 
+    fn use_lodestone_compass(&mut self, position: IVec3) -> Option<crate::inventory::PlayerSlot> {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        if !self
+            .world
+            .state(id)
+            .is_some_and(|state| state.name == "minecraft:lodestone" && state.properties.is_empty())
+        {
+            return None;
+        }
+        let main = crate::inventory::PlayerSlot::Storage(self.inventory.selected());
+        let hand = if self
+            .inventory
+            .slot(main)
+            .is_some_and(|item| item.id() == "minecraft:compass")
+        {
+            main
+        } else {
+            crate::placement_input_hand(&self.inventory)
+        };
+        let target = crate::lodestone::Tracker::linked(
+            native_resources::packs::ResourceId::parse(&self.world.dimension).ok()?,
+            add(self.origin, position)?,
+        );
+        let overflow = Arc::make_mut(&mut self.inventory).bind_lodestone_compass(
+            hand,
+            &target,
+            self.game_mode == GameMode::Creative,
+        )?;
+        if let Some(stack) = overflow {
+            self.dropped_items.drop_player(
+                stack,
+                self.origin,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+        Some(hand)
+    }
+
     fn place_plain_solid(
         &mut self,
         hit: ShapeRayHit,
@@ -9873,6 +9921,8 @@ impl LoadedSession {
                         ));
                         let off = self.inventory.slot(crate::inventory::PlayerSlot::Offhand);
                         let bypass = self.sneak && (main.is_some() || off.is_some());
+                        let main_compass =
+                            main.is_some_and(|item| item.id() == "minecraft:compass");
                         let table = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:crafting_table"));
                         let chest = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:chest" | "minecraft:trapped_chest")));
                         let ore = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).and_then(redstone_ore_lit).is_some());
@@ -9927,6 +9977,18 @@ impl LoadedSession {
                                 {
                                     self.first_person.swing.start(crate::animation::Hand::Main);
                                 }
+                            } else if self.game_mode.allows_basic_building()
+                                && main_compass
+                                && let Some(hand) = self.use_lodestone_compass(hit.position)
+                            {
+                                handled = true;
+                                let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+                                    crate::animation::Hand::Off
+                                } else {
+                                    crate::animation::Hand::Main
+                                };
+                                self.first_person.swing.start(swing);
+                                self.first_person.used(swing);
                             } else if self.food_use.start_hand(
                                 &self.inventory,
                                 main_hand,
@@ -9936,6 +9998,17 @@ impl LoadedSession {
                                 && self.use_tool(hit.position, hit.face))
                             {
                                 handled = true;
+                            } else if self.game_mode.allows_basic_building()
+                                && let Some(hand) = self.use_lodestone_compass(hit.position)
+                            {
+                                handled = true;
+                                let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+                                    crate::animation::Hand::Off
+                                } else {
+                                    crate::animation::Hand::Main
+                                };
+                                self.first_person.swing.start(swing);
+                                self.first_person.used(swing);
                             } else if self.game_mode.allows_basic_building()
                                 && let Some(hand) = self
                                     .place_button(hit)
@@ -13758,6 +13831,156 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compass_use_on_lodestone_updates_the_correct_hand() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_random_tick_speed(0);
+                session.set_game_mode(mode);
+                let position = IVec3::new(8, 2, 6);
+                let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+                assert!(session.set(position, lodestone));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:compass".into(), 1, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let target = crate::lodestone::Tracker::linked(
+                    native_resources::packs::ResourceId::parse(&session.world.dimension).unwrap(),
+                    session.origin + position,
+                );
+                let linked = if mode == GameMode::Survival {
+                    hand
+                } else {
+                    PlayerSlot::Storage(if hand == PlayerSlot::Storage(0) { 1 } else { 0 })
+                };
+                if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                    assert_eq!(
+                        session
+                            .inventory
+                            .slot(linked)
+                            .and_then(|item| item.components().get("minecraft:lodestone_tracker"))
+                            .and_then(crate::lodestone::Tracker::parse),
+                        Some(target),
+                        "{mode:?} {hand:?}"
+                    );
+                } else {
+                    assert!(
+                        session
+                            .inventory
+                            .slot(hand)
+                            .unwrap()
+                            .components()
+                            .get("minecraft:lodestone_tracker")
+                            .is_none()
+                    );
+                }
+                if mode == GameMode::Creative {
+                    assert!(
+                        session
+                            .inventory
+                            .slot(hand)
+                            .unwrap()
+                            .components()
+                            .get("minecraft:lodestone_tracker")
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offhand_compass_works_after_a_main_hand_item_passes() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let position = IVec3::new(8, 2, 6);
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(position, lodestone));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:stick".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        inventory.set_slot(
+            PlayerSlot::Offhand,
+            ItemStack::new("minecraft:compass".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let target = crate::lodestone::Tracker::linked(
+            native_resources::packs::ResourceId::parse(&session.world.dimension).unwrap(),
+            session.origin + position,
+        );
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Offhand)
+                .unwrap()
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(crate::lodestone::Tracker::parse),
+            Some(target)
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:stick"
+        );
+    }
+
+    #[test]
+    fn compass_passes_on_other_blocks_to_allow_offhand_placement() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:compass".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        inventory.set_slot(
+            PlayerSlot::Offhand,
+            ItemStack::new("minecraft:snow_block".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 8, 2, session.origin.z + 7)
+                .unwrap()
+                .name,
+            "minecraft:snow_block"
+        );
+        assert!(session.inventory.slot(PlayerSlot::Offhand).is_none());
+        assert!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .is_none()
+        );
     }
 
     #[test]

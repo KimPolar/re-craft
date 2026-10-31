@@ -229,4 +229,51 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn binding_preserves_custom_data_and_defers_unknown_components() {
+        use crate::inventory::{ItemStack, PlayerInventory, PlayerSlot};
+        let tracker = Tracker::linked(
+            ResourceId::parse("minecraft:overworld").unwrap(),
+            IVec3::new(9, 4, -2),
+        );
+        let custom = Tag::Compound(vec![("marker".into(), Tag::Int(42))]);
+        let components = Tag::Compound(vec![("minecraft:custom_data".into(), custom.clone())]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:compass".into(), 2, 64, components),
+        );
+        assert_eq!(
+            inventory.bind_lodestone_compass(PlayerSlot::Storage(0), &tracker, false),
+            Some(None)
+        );
+        let original = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        let linked = inventory.slot(PlayerSlot::Storage(1)).unwrap();
+        assert_eq!(original.count(), 1);
+        assert_eq!(
+            linked.components().get("minecraft:custom_data"),
+            Some(&custom)
+        );
+        assert_eq!(
+            linked
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(Tracker::parse),
+            Some(tracker.clone())
+        );
+        let unsupported = ItemStack::new(
+            "minecraft:compass".into(),
+            1,
+            64,
+            Tag::Compound(vec![("example:unknown".into(), Tag::Int(1))]),
+        )
+        .unwrap();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(unsupported.clone()));
+        assert_eq!(
+            inventory.bind_lodestone_compass(PlayerSlot::Storage(0), &tracker, false),
+            None
+        );
+        assert_eq!(inventory.slot(PlayerSlot::Storage(0)), Some(&unsupported));
+    }
 }

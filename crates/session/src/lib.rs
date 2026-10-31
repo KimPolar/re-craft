@@ -1778,6 +1778,7 @@ fn tool_hands(inventory: &PlayerInventory, sneaking: bool) -> [Option<(PlayerSlo
     let passes = item.is_none_or(|item| {
         inventory::ordinary_return_supported(item)
             && (item.id() == "minecraft:stick"
+                || item.id() == "minecraft:compass"
                 || item.id().ends_with("_pickaxe")
                 || item.id().ends_with("_sword"))
     });
@@ -1896,6 +1897,7 @@ fn placement_input_hand(inventory: &PlayerInventory) -> PlayerSlot {
     if inventory.slot(main).is_none_or(|item| {
         inventory::ordinary_return_supported(item)
             && (item.id() == "minecraft:stick"
+                || item.id() == "minecraft:compass"
                 || item.id().ends_with("_pickaxe")
                 || item.id().ends_with("_sword")
                 || ordinary_tool_kind(item).is_some())

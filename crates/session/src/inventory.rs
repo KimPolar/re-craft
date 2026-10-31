@@ -1336,6 +1336,42 @@ impl PlayerInventory {
         true
     }
 
+    /// Apply a compass's use on a lodestone. The outer option indicates that
+    /// the interaction was handled; the inner option is an overflow drop.
+    pub fn bind_lodestone_compass(
+        &mut self,
+        hand: PlayerSlot,
+        tracker: &crate::lodestone::Tracker,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if !matches!(hand, PlayerSlot::Offhand) && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if source.id != "minecraft:compass" || !ordinary_return_supported(source) {
+            return None;
+        }
+        let mut linked = source.with_count(1)?;
+        let Tag::Compound(components) = &mut linked.components else {
+            return None;
+        };
+        components.retain(|(name, _)| {
+            !name.matches("minecraft:lodestone_tracker")
+                && !name.matches("!minecraft:lodestone_tracker")
+        });
+        components.push(("minecraft:lodestone_tracker".into(), tracker.to_nbt()));
+        if !creative && source.count == 1 {
+            self.set_slot(hand, Some(linked));
+            return Some(None);
+        }
+        if !creative && !self.consume_held(hand) {
+            return None;
+        }
+        let mut remainder = Some(linked);
+        self.pickup_stack(&mut remainder, creative);
+        Some(remainder)
+    }
+
     /// Add a supported dropped stack using Java's selected-slot, offhand,
     /// other-stack, then empty-slot order. The remainder stays in `source`.
     pub fn pickup_stack(&mut self, source: &mut Option<ItemStack>, creative: bool) -> bool {

@@ -66,6 +66,34 @@ impl Settings {
     }
 }
 
+/// Delay used when a flowing fluid is recalculated. Java only samples the
+/// world RNG when non-falling lava rises and the height above is not masked by
+/// another lava block. `sample_four` must return an integer in `0..4`.
+pub fn spread_delay(
+    settings: Settings,
+    kind: FluidKind,
+    old: Option<FluidState>,
+    next: Option<FluidState>,
+    same_fluid_above: bool,
+    sample_four: impl FnOnce() -> u32,
+) -> u64 {
+    let delay = settings.delay(kind);
+    if kind == FluidKind::Lava
+        && !same_fluid_above
+        && let (Some(old), Some(next)) = (old, next)
+        && old.kind == kind
+        && next.kind == kind
+        && !old.falling
+        && !next.falling
+        && next.own_height() > old.own_height()
+        && sample_four() != 0
+    {
+        delay * 4
+    } else {
+        delay
+    }
+}
+
 /// The block produced at a position during one fluid tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangedBlock {

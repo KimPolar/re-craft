@@ -8242,6 +8242,25 @@ impl LoadedSession {
                 fluid.kind,
                 settings,
             );
+            let next = changes
+                .iter()
+                .find_map(|change| {
+                    (change.position == relative).then_some(match change.block {
+                        fluid_sim::ChangedBlock::Fluid(next) => Some(next),
+                        _ => None,
+                    })
+                })
+                .flatten();
+            let delay = if fluid.kind == FluidKind::Lava && next.is_some() {
+                let above_same = add(relative, IVec3::Y).is_some_and(|above| {
+                    matches!(self.simulation_cell(above), fluid_sim::Cell::Fluid(state) if state.kind == fluid.kind)
+                });
+                fluid_sim::spread_delay(settings, fluid.kind, Some(fluid), next, above_same, || {
+                    self.level_random.next_int_bound(4).expect("positive bound") as u32
+                })
+            } else {
+                settings.delay(fluid.kind)
+            };
             for change in changes {
                 let id = match change.block {
                     fluid_sim::ChangedBlock::Air => self.states[0],
@@ -8252,9 +8271,7 @@ impl LoadedSession {
                     && change.position == relative
                     && let fluid_sim::ChangedBlock::Fluid(next) = change.block
                 {
-                    // A changed flowing state schedules itself again. Lava's
-                    // random fourfold delay is not implemented yet.
-                    self.schedule_fluid(relative, next, settings.delay(next.kind));
+                    self.schedule_fluid(relative, next, delay);
                 }
             }
         }
@@ -25988,6 +26005,112 @@ mod tests {
                     matches!(session.simulation_cell(wall), fluid_sim::Cell::Fluid(f) if f.kind == FluidKind::Lava)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rising_lava_schedules_randomized_delay_and_preserves_rng_order() {
+        use native_core::random::LegacyRandom;
+        for fast in [false, true] {
+            for seed in -12..=12 {
+                let mut session = session();
+                session.set_fast_lava(fast);
+                let pos = IVec3::new(8, 2, 8);
+                let current = FluidState {
+                    kind: FluidKind::Lava,
+                    amount: 3,
+                    source: false,
+                    falling: false,
+                };
+                let source = FluidState {
+                    kind: FluidKind::Lava,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                };
+                let current_id = session.intern_liquid(current);
+                let source_id = session.intern_liquid(source);
+                assert!(session.set_with_notify(pos, current_id, false));
+                assert!(session.set_with_notify(pos + IVec3::NEG_X, source_id, false));
+                assert!(session.set_with_notify(pos + IVec3::NEG_Y, session.states[3], false));
+                session.fluid_ticks.clear();
+                session.fluid_pending.clear();
+                session.level_random = LegacyRandom::new(seed);
+                let mut expected_random = LegacyRandom::new(seed);
+                let multiplier = if expected_random.next_int_bound(4).unwrap() == 0 {
+                    1
+                } else {
+                    4
+                };
+                session.schedule_fluid(pos, current, 0);
+                session.advance_fluid_ticks();
+                let absolute = session.origin + pos;
+                let expected_delay = if fast { 10 } else { 30 } * multiplier;
+                let due: Vec<_> = session
+                    .fluid_ticks
+                    .iter()
+                    .filter_map(|(order, scheduled)| {
+                        (scheduled.key.x == absolute.x
+                            && scheduled.key.y == absolute.y
+                            && scheduled.key.z == absolute.z
+                            && !scheduled.key.source)
+                            .then_some(order.0)
+                    })
+                    .collect();
+                assert_eq!(due, [i128::from(expected_delay)], "fast={fast} seed={seed}");
+                assert_eq!(
+                    session.level_random.next_int(),
+                    expected_random.next_int(),
+                    "fast={fast} seed={seed}"
+                );
+                assert!(
+                    matches!(session.simulation_cell(pos), fluid_sim::Cell::Fluid(state) if state.amount == if fast { 7 } else { 6 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn falling_and_receding_lava_do_not_consume_delay_rng() {
+        use native_core::random::LegacyRandom;
+        for above in [false, true] {
+            let mut session = session();
+            let pos = IVec3::new(8, 2, 8);
+            let current = FluidState {
+                kind: FluidKind::Lava,
+                amount: 3,
+                source: false,
+                falling: false,
+            };
+            let source = FluidState {
+                kind: FluidKind::Lava,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let current_id = session.intern_liquid(current);
+            let source_id = session.intern_liquid(source);
+            assert!(session.set_with_notify(pos, current_id, false));
+            assert!(session.set_with_notify(pos + IVec3::NEG_Y, session.states[3], false));
+            if above {
+                assert!(session.set_with_notify(pos + IVec3::Y, source_id, false));
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            session.level_random = LegacyRandom::new(90210);
+            let mut expected = session.level_random.clone();
+            session.schedule_fluid(pos, current, 0);
+            session.advance_fluid_ticks();
+            assert_eq!(
+                session.level_random.next_int(),
+                expected.next_int(),
+                "above={above}"
+            );
+            assert!(if above {
+                matches!(session.simulation_cell(pos), fluid_sim::Cell::Fluid(state) if state.falling)
+            } else {
+                session.simulation_cell(pos) == fluid_sim::Cell::Air
+            });
         }
     }
 

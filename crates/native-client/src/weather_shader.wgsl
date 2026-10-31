@@ -31,7 +31,7 @@ fn vertex(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>, @locatio
 fn fragment(input: Output) -> @location(0) vec4<f32> {
     let texel = textureSample(weather_texture, weather_sampler, input.uv);
     let alpha = texel.a * input.opacity;
-    if alpha < 0.003921569 { discard; }
+    if alpha < 0.1 { discard; }
     var fog_amount = 0.0;
     if fog.range.z > 0.5 && input.distance > fog.range.x {
         if input.distance >= fog.range.y { fog_amount = 1.0; }

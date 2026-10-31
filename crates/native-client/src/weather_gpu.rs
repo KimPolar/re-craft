@@ -448,6 +448,82 @@ mod tests {
             assert_eq!(&data[..8], &[255, 0, 0, 255, 0, 0, 255, 255]);
             drop(data);
             readback.unmap();
+            let mut faded = WeatherMesh {
+                rain: quad(-1.0, 0.0),
+                snow: quad(0.0, 1.0),
+            };
+            for vertex in &mut faded.rain {
+                vertex.opacity = 0.05;
+            }
+            gpu.update(&device, &queue, &faded).unwrap();
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color.create_view(&Default::default()),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth.create_view(&Default::default()),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                gpu.draw(&mut pass, &pipeline, &light_binding, &fog_binding);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                extent,
+            );
+            queue.submit([encoder.finish()]);
+            let (sender, receiver) = mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = sender.send(r);
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(15)),
+                })
+                .unwrap();
+            receiver
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+                .unwrap();
+            let data = readback.slice(..).get_mapped_range().unwrap();
+            assert_eq!(
+                &data[..8],
+                &[0, 0, 0, 255, 0, 0, 255, 255],
+                "pixels below the 0.1 alpha cutoff must be discarded"
+            );
+            drop(data);
+            readback.unmap();
             if let Some(error) = errors.pop().await {
                 panic!("GPU validation: {error}");
             }

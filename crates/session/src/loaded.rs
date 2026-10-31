@@ -5566,6 +5566,97 @@ impl LoadedSession {
         Some(placed_soil(block, blocked))
     }
 
+    fn place_slab(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if crate::slab_mining::material(held.id()).is_none()
+            || !crate::inventory::ordinary_return_supported(held)
+            || !self.vanilla_block_ids.as_ref()?.contains(held.id())
+            || !hit.location.is_finite()
+        {
+            return None;
+        }
+        let name = held.id().to_owned();
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let clicked = self.world.state(clicked)?;
+        let replace_clicked = if clicked.name == name {
+            crate::slab_placement::can_replace(
+                clicked,
+                &name,
+                true,
+                hit.face,
+                hit.location.y,
+                hit.position.y,
+            )?
+        } else {
+            ordinary_can_replace(clicked)?
+        };
+        let target = if replace_clicked {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let existing_state = self.world.state(existing)?;
+        let same = existing_state.name == name;
+        let replace = if same {
+            crate::slab_placement::can_replace(
+                existing_state,
+                &name,
+                replace_clicked,
+                hit.face,
+                hit.location.y,
+                target.y,
+            )?
+        } else {
+            ordinary_can_replace(existing_state)?
+        };
+        if !replace {
+            return None;
+        }
+        let wet = self
+            .ordinary_fluid(existing)
+            .is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source);
+        let block =
+            crate::slab_placement::placement(&name, hit.face, hit.location.y, target.y, wet, same)?;
+        let shape = block_shape(&block)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(block);
+        self.set(target, id).then_some(hand)
+    }
+
     fn place_stairs(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
         let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
@@ -6488,10 +6579,17 @@ impl LoadedSession {
         // Stage this loot first so they cannot be overwritten afterward.
         let checked_drops =
             checked_drops.map(|drops| self.dropped_items.stage_player_block_drops(drops));
-        let replacement = if (stair || slab)
-            && self
-                .simulated_fluid(id)
-                .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+        let replacement = if (slab
+            && self.world.state(id).is_some_and(|state| {
+                state
+                    .properties
+                    .get("waterlogged")
+                    .is_some_and(|value| value == "true")
+            }))
+            || (stair
+                && self
+                    .simulated_fluid(id)
+                    .is_some_and(|fluid| fluid.kind == FluidKind::Water))
         {
             self.intern_liquid(FluidState {
                 kind: FluidKind::Water,
@@ -9173,6 +9271,7 @@ impl LoadedSession {
                         let block_item = main.is_some_and(|item| {
                             Block::from_item_id(item.id()).is_some()
                                 || crate::stair_items::is_stair_item(item.id())
+                                || crate::slab_mining::material(item.id()).is_some()
                                 || native_core::button::Button::from_id(item.id()).is_some()
                                 || matches!(
                                     item.id(),
@@ -9235,6 +9334,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_snow_block(hit))
                                     .or_else(|| self.place_chest(hit))
+                                    .or_else(|| self.place_slab(hit))
                                     .or_else(|| self.place_stairs(hit))
                             {
                                 handled = true;
@@ -10894,7 +10994,9 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         || native_core::button::Button::from_id(&block.name).is_some()
     {
         block_outline(block).is_some()
-    } else if crate::stair_items::is_stair_item(&block.name) {
+    } else if crate::stair_items::is_stair_item(&block.name)
+        || crate::slab_mining::material(&block.name).is_some()
+    {
         native_world::collision::slab_stair_solid(block) == Some(true)
     } else if block.name == "minecraft:redstone_lamp" {
         redstone_lamp_lit(block).is_some()
@@ -12306,6 +12408,7 @@ mod tests {
                 ("top", false),
                 ("top", true),
                 ("double", false),
+                ("double", true),
             ] {
                 let mut session = session();
                 session.set_vanilla_block_ids(Arc::clone(&ids));
@@ -13267,6 +13370,157 @@ mod tests {
                     if mode == GameMode::Survival { 1 } else { 2 }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn slab_item_uses_both_hands_and_game_mode_consumption() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:stone".into(),
+                    "minecraft:oak_slab".into(),
+                ])));
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:oak_slab".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let block = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                let placed = matches!(mode, GameMode::Survival | GameMode::Creative);
+                assert_eq!(
+                    block.name,
+                    if placed {
+                        "minecraft:oak_slab"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slabs_merge_in_clicked_or_adjacent_cell_and_obey_collision() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for adjacent in [false, true] {
+            for collision in [false, true] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:water".into(),
+                    "minecraft:stone".into(),
+                    "minecraft:oak_slab".into(),
+                ])));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new("minecraft:oak_slab".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                let pos = IVec3::new(4, 2, 4);
+                let block = session.intern_block(state(
+                    "minecraft:oak_slab",
+                    &[("type", "bottom"), ("waterlogged", "true")],
+                ));
+                session.set_with_notify(pos, block, false);
+                let clicked = if adjacent { pos + IVec3::NEG_X } else { pos };
+                if adjacent {
+                    session.set_with_notify(clicked, session.states[3], false);
+                }
+                if collision {
+                    session.player.position = Vec3::new(4.5, 2.5, 4.5);
+                }
+                let hit = ShapeRayHit {
+                    position: clicked,
+                    face: IVec3::X,
+                    location: DVec3::new(4.0, if adjacent { 2.25 } else { 2.75 }, 4.5),
+                    inside: false,
+                };
+                assert_eq!(
+                    session.place_slab(hit).is_some(),
+                    !collision,
+                    "adjacent={adjacent}"
+                );
+                let after = session
+                    .world
+                    .block(session.origin.x + 4, 2, session.origin.z + 4)
+                    .unwrap();
+                assert_eq!(
+                    after.properties["type"],
+                    if collision { "bottom" } else { "double" }
+                );
+                assert_eq!(
+                    after.properties["waterlogged"],
+                    if collision { "true" } else { "false" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placed_slab_keeps_source_water_but_not_flowing_water() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for source in [false, true] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:water".into(),
+                "minecraft:stone".into(),
+                "minecraft:oak_slab".into(),
+            ])));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:oak_slab".into(), 2, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            let target = IVec3::new(4, 2, 4);
+            session.set_with_notify(target + IVec3::NEG_Y, session.states[3], false);
+            let water = session.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: if source { 8 } else { 3 },
+                source,
+                falling: false,
+            });
+            session.set_with_notify(target, water, false);
+            let hit = ShapeRayHit {
+                position: target + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::new(4.5, 2.0, 4.5),
+                inside: false,
+            };
+            assert_eq!(session.place_slab(hit), Some(PlayerSlot::Storage(0)));
+            let block = session
+                .world
+                .block(session.origin.x + 4, 2, session.origin.z + 4)
+                .unwrap();
+            assert_eq!(block.properties["type"], "bottom");
+            assert_eq!(block.properties["waterlogged"] == "true", source);
         }
     }
 
@@ -18046,6 +18300,28 @@ mod tests {
                 .unwrap()
                 .id(),
             "minecraft:oak_stairs"
+        );
+    }
+
+    #[test]
+    fn pick_block_selects_slab_item_from_its_block_state() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        session.set_player_inventory(PlayerInventory::default());
+        let slab = session.intern_block(state(
+            "minecraft:oak_slab",
+            &[("type", "top"), ("waterlogged", "true")],
+        ));
+        assert!(session.set(IVec3::new(8, 2, 6), slab));
+        session.submit_command(PlayerCommand::PickBlock);
+        session.update(TICK);
+        let inventory = &session.snapshot().inventory;
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(inventory.selected()))
+                .unwrap()
+                .id(),
+            "minecraft:oak_slab"
         );
     }
 

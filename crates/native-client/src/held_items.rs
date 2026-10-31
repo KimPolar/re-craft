@@ -134,6 +134,9 @@ struct ModelKey {
     trim_material: Option<String>,
     dye: Option<u32>,
     glint: bool,
+    lodestone_tracker: bool,
+    /// Raw numeric-property bits. A missing owner yields zero in Java.
+    compass_angle: u32,
 }
 
 impl ModelKey {
@@ -143,6 +146,8 @@ impl ModelKey {
             trim_material: None,
             dye: None,
             glint: false,
+            lodestone_tracker: false,
+            compass_angle: 0.0_f32.to_bits(),
         }
     }
 
@@ -167,6 +172,15 @@ impl ModelKey {
             trim_material,
             dye,
             glint: item.has_glint(),
+            lodestone_tracker: item
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .is_some()
+                && item
+                    .components()
+                    .get("!minecraft:lodestone_tracker")
+                    .is_none(),
+            compass_angle: 0.0_f32.to_bits(),
         }
     }
 }
@@ -175,6 +189,108 @@ fn selected_model<'a>(mut entry: &'a Value, key: &ModelKey) -> Result<&'a Value>
     for _ in 0..32 {
         match entry.get("type").and_then(Value::as_str) {
             Some("minecraft:model" | "model") => return Ok(entry),
+            Some("minecraft:condition" | "condition") => {
+                ensure!(
+                    matches!(
+                        entry.get("property").and_then(Value::as_str),
+                        Some("minecraft:has_component" | "has_component")
+                    ),
+                    "unsupported item condition"
+                );
+                ensure!(
+                    matches!(
+                        entry.get("component").and_then(Value::as_str),
+                        Some("minecraft:lodestone_tracker" | "lodestone_tracker")
+                    ),
+                    "unsupported item condition component"
+                );
+                let ignore_default = match entry.get("ignore_default") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    _ => bail!("invalid ignore_default"),
+                };
+                ensure!(
+                    !ignore_default || key.id == "minecraft:compass",
+                    "unknown component prototype"
+                );
+                entry = entry
+                    .get(if key.lodestone_tracker {
+                        "on_true"
+                    } else {
+                        "on_false"
+                    })
+                    .context("item condition has no selected model")?;
+            }
+            Some("minecraft:range_dispatch" | "range_dispatch") => {
+                ensure!(
+                    matches!(
+                        entry.get("property").and_then(Value::as_str),
+                        Some("minecraft:compass" | "compass")
+                    ),
+                    "unsupported numeric item property"
+                );
+                ensure!(
+                    matches!(
+                        entry.get("target").and_then(Value::as_str),
+                        Some("spawn" | "lodestone" | "recovery")
+                    ),
+                    "unsupported compass target"
+                );
+                let scale = match entry.get("scale") {
+                    None => 1.0,
+                    Some(value) => value.as_f64().context("invalid item range scale")? as f32,
+                };
+                ensure!(scale.is_finite(), "invalid item range scale");
+                let value = f32::from_bits(key.compass_angle) * scale;
+                let entries = entry
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .context("missing item range entries")?;
+                ensure!(entries.len() <= 4096, "too many item range entries");
+                let mut sorted = Vec::with_capacity(entries.len());
+                for candidate in entries {
+                    let threshold = candidate
+                        .get("threshold")
+                        .and_then(Value::as_f64)
+                        .context("invalid item range threshold")?
+                        as f32;
+                    ensure!(threshold.is_finite(), "invalid item range threshold");
+                    let model = candidate.get("model").context("missing item range model")?;
+                    sorted.push((threshold, model));
+                }
+                sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let index = if value.is_nan() {
+                    None
+                } else if sorted.len() < 16 {
+                    sorted
+                        .iter()
+                        .position(|(threshold, _)| *threshold > value)
+                        .unwrap_or(sorted.len())
+                        .checked_sub(1)
+                } else {
+                    // Arrays.binarySearch(float[], float) chooses the first
+                    // encountered equal midpoint, even for duplicate keys.
+                    let mut low = 0_usize;
+                    let mut high = sorted.len();
+                    let mut found = None;
+                    while low < high {
+                        let mid = low + (high - low - 1) / 2;
+                        match sorted[mid].0.total_cmp(&value) {
+                            std::cmp::Ordering::Less => low = mid + 1,
+                            std::cmp::Ordering::Greater => high = mid,
+                            std::cmp::Ordering::Equal => {
+                                found = Some(mid);
+                                break;
+                            }
+                        }
+                    }
+                    found.or_else(|| low.checked_sub(1))
+                };
+                entry = index
+                    .map(|index| sorted[index].1)
+                    .or_else(|| entry.get("fallback"))
+                    .context("item range has no matching model")?;
+            }
             Some("minecraft:select" | "select") => {
                 ensure!(
                     matches!(
@@ -789,6 +905,135 @@ impl ItemModelCache {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn compass_conditions_and_ranges_choose_component_and_threshold() {
+        let definition = serde_json::json!({"type":"minecraft:condition","property":"minecraft:has_component","component":"minecraft:lodestone_tracker",
+            "on_false":{"type":"minecraft:range_dispatch","property":"minecraft:compass","target":"spawn","scale":32.0,
+                "entries":[{"threshold":15.5,"model":{"type":"minecraft:model","model":"half"}},{"threshold":0.0,"model":{"type":"minecraft:model","model":"zero"}}],
+                "fallback":{"type":"minecraft:model","model":"fallback"}},
+            "on_true":{"type":"minecraft:model","model":"linked"}});
+        let mut key = ModelKey::plain("minecraft:compass");
+        assert_eq!(selected_model(&definition, &key).unwrap()["model"], "zero");
+        key.compass_angle = (15.5_f32 / 32.0).to_bits();
+        assert_eq!(selected_model(&definition, &key).unwrap()["model"], "half");
+        key.compass_angle = (-0.1_f32).to_bits();
+        assert_eq!(
+            selected_model(&definition, &key).unwrap()["model"],
+            "fallback"
+        );
+        key.compass_angle = f32::NAN.to_bits();
+        assert_eq!(
+            selected_model(&definition, &key).unwrap()["model"],
+            "fallback"
+        );
+        key.lodestone_tracker = true;
+        assert_eq!(
+            selected_model(&definition, &key).unwrap()["model"],
+            "linked"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn compass_and_recovery_compass_models_load_all_vanilla_frames() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut loader = open_loader(&game, &[]);
+        for id in ["minecraft:compass", "minecraft:recovery_compass"] {
+            for linked in [false, true] {
+                if id == "minecraft:recovery_compass" && linked {
+                    continue;
+                }
+                for frame in 0..32 {
+                    let mut key = ModelKey::plain(id);
+                    key.lodestone_tracker = linked;
+                    key.compass_angle = (frame as f32 / 32.0).to_bits();
+                    let model = loader
+                        .load_visual(&key)
+                        .unwrap_or_else(|error| panic!("{id} {linked} {frame}: {error:#}"));
+                    assert_eq!(model.sprite_layers.len(), 1);
+                    assert!(!model.quads.is_empty());
+                    assert!(crate::item_gui::render(&model).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn compass_range_boundaries_match_java() {
+        use std::process::Command;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut stack = ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CompassRangeOracle.java");
+        let output = temp.path().join("ranges.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CompassRangeOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("CompassRangeOracle")
+                .arg(version.join("26.3.jar"))
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 33 * 3 * 3);
+        let definitions: HashMap<_, Value> = ["compass", "recovery_compass"]
+            .into_iter()
+            .map(|id| {
+                let bytes = stack
+                    .read_asset(&format!("assets/minecraft/items/{id}.json"))
+                    .unwrap()
+                    .unwrap();
+                (id, serde_json::from_slice(&bytes).unwrap())
+            })
+            .collect();
+        for row in rows {
+            let id = row["id"].as_str().unwrap();
+            let mut key = ModelKey::plain(&format!("minecraft:{id}"));
+            key.lodestone_tracker = row["linked"].as_bool().unwrap();
+            key.compass_angle = row["bits"].as_i64().unwrap() as i32 as u32;
+            let model = selected_model(&definitions[id]["model"], &key)
+                .ok()
+                .and_then(|v| v["model"].as_str());
+            assert_eq!(model, row["model"].as_str(), "{row}");
+        }
+    }
 
     #[test]
     fn select_uses_trim_material_and_palette_preserves_alpha() {

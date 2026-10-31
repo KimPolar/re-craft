@@ -4745,6 +4745,68 @@ mod inventory_tests {
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn compass_icons_load_into_hotbar_and_inventory() {
+        use native_persistence::nbt::Tag;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&directory, &[]).unwrap()));
+        let mut inventory = PlayerInventory::default();
+        let compass =
+            ItemStack::new("minecraft:compass".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(compass.clone()));
+        let before = ui.compose((1280, 720), &inventory, 0).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let after = loop {
+            if let Some(canvas) = ui.compose((1280, 720), &inventory, 0)
+                && ui.held_models.get_item(&compass).is_some()
+            {
+                break canvas;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compass model did not load"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let origin = (after.width / 2 - 91 + 3, after.height - 19);
+        let changed = (origin.1..origin.1 + 16)
+            .flat_map(|y| (origin.0..origin.0 + 16).map(move |x| (y * after.width + x) as usize))
+            .filter(|&i| before.pixels[i] != after.pixels[i])
+            .count();
+        assert!(changed > 32, "hotbar should display the loaded compass");
+        inventory.toggle();
+        let canvas = ui.compose((1280, 720), &inventory, 0).unwrap();
+        let (x, y) = (canvas.width / 2 - 88 + 8, canvas.height / 2 - 83 + 142);
+        let icon = ui
+            .held_models
+            .get_item(&compass)
+            .unwrap()
+            .gui_icon
+            .as_ref()
+            .unwrap()
+            .clone();
+        let visible = (0..16)
+            .flat_map(|dy| (0..16).map(move |dx| (dx, dy)))
+            .filter(|&(dx, dy)| {
+                let pixel = icon.get_pixel(dx, dy).0;
+                if pixel[3] != 255 {
+                    return false;
+                }
+                let value =
+                    canvas.pixels[((y + dy as i32) * canvas.width + x + dx as i32) as usize];
+                value & 0x00ff_ffff
+                    == (((pixel[0] as u32) << 16) | ((pixel[1] as u32) << 8) | pixel[2] as u32)
+            })
+            .count();
+        assert!(
+            visible > 32,
+            "inventory should display the loaded compass pixels"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn enchanted_hotbar_and_inventory_use_cached_glint_masks() {
         use native_persistence::nbt::Tag;
         let directory = std::env::var_os("MINECRAFT_DIR")

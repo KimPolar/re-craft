@@ -74,6 +74,19 @@ fn inline_installed(
     }
 }
 
+fn find_spline(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("minecraft:spline") {
+                return Some(value.clone());
+            }
+            object.values().find_map(find_spline)
+        }
+        Value::Array(items) => items.iter().find_map(find_spline),
+        _ => None,
+    }
+}
+
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
 fn seeded_noise_functions_and_interpolation_match_java() {
@@ -196,6 +209,70 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         }
         fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"rust_expression":id,"java_expression":java_expression}));
     }
+    for id in [
+        "overworld/offset",
+        "overworld/factor",
+        "overworld/jaggedness",
+        "overworld_large_biomes/offset",
+        "overworld_large_biomes/factor",
+        "overworld_large_biomes/jaggedness",
+        "overworld_amplified/offset",
+        "overworld_amplified/factor",
+        "overworld_amplified/jaggedness",
+    ] {
+        let path = format!("data/minecraft/worldgen/density_function/{id}.json");
+        let bytes = sources.read_builtin_data(&path).unwrap().unwrap();
+        let document: Value = serde_json::from_slice(&bytes).unwrap();
+        let rust_expression = find_spline(&document).expect("missing installed spline");
+        let mut noise_ids = std::collections::BTreeSet::new();
+        let java_expression = inline_installed(
+            rust_expression.clone(),
+            &mut sources,
+            &mut data,
+            &mut noise_ids,
+        );
+        let mut noises = serde_json::Map::new();
+        for name in &noise_ids {
+            let path = format!(
+                "data/minecraft/worldgen/noise/{}.json",
+                name.strip_prefix("minecraft:").unwrap()
+            );
+            noises.insert(
+                name.clone(),
+                serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+            );
+        }
+        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"rust_expression":rust_expression,"java_expression":java_expression}));
+    }
+    for id in [
+        "minecraft:overworld/offset",
+        "minecraft:overworld/factor",
+        "minecraft:overworld/jaggedness",
+        "minecraft:overworld/depth",
+        "minecraft:overworld_large_biomes/offset",
+        "minecraft:overworld_large_biomes/factor",
+        "minecraft:overworld_large_biomes/jaggedness",
+        "minecraft:overworld_large_biomes/depth",
+        "minecraft:overworld_amplified/offset",
+        "minecraft:overworld_amplified/factor",
+        "minecraft:overworld_amplified/jaggedness",
+        "minecraft:overworld_amplified/depth",
+    ] {
+        let mut noise_ids = std::collections::BTreeSet::new();
+        let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);
+        let mut noises = serde_json::Map::new();
+        for name in &noise_ids {
+            let path = format!(
+                "data/minecraft/worldgen/noise/{}.json",
+                name.strip_prefix("minecraft:").unwrap()
+            );
+            noises.insert(
+                name.clone(),
+                serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+            );
+        }
+        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"unblended":true,"rust_expression":id,"java_expression":java_expression}));
+    }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -222,6 +299,9 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     WorldgenRandom::Xoroshiro
                 };
                 let mut compiler = DensityCompiler::with_world_seed(&mut data, seed, algorithm);
+                if fixtures[index]["unblended"].as_bool() == Some(true) {
+                    compiler = compiler.without_old_chunk_blending();
+                }
                 let function = compiler
                     .compile(&fixtures[index]["rust_expression"])
                     .unwrap();

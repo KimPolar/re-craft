@@ -49,6 +49,8 @@ impl Interval {
     pub fn bounds(min: f32, max: f32) -> Self {
         if min.is_nan() || max.is_nan() {
             Self::NAI
+        } else if min == 0.0 && max == 1.0 {
+            Self { min: 0.0, max: 1.0 }
         } else {
             Self { min, max }
         }

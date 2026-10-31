@@ -18,7 +18,9 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 mod interval;
+mod spline;
 use interval::Interval;
+use spline::Spline;
 
 const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 100_000;
@@ -103,6 +105,9 @@ enum Node {
         noise: Arc<NormalNoise>,
         kind: ShiftKind,
     },
+    Spline(Spline),
+    UnblendedAlpha,
+    UnblendedOffset,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -373,6 +378,9 @@ impl DensityFunction {
                     noise.sample_scaled_volume(x, y, z, 0.25, 0.25) * 4.0
                 }
             },
+            Node::Spline(spline) => spline.sample(x, y, z, volume, memo),
+            Node::UnblendedAlpha => 1.0,
+            Node::UnblendedOffset => 0.0,
         }
     }
 }
@@ -393,7 +401,12 @@ fn squeeze(a: f32) -> f32 {
 
 fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
-        Node::Constant(_) | Node::Gradient { .. } | Node::Shift { .. } => vec![],
+        Node::Constant(_)
+        | Node::Gradient { .. }
+        | Node::Shift { .. }
+        | Node::Spline(_)
+        | Node::UnblendedAlpha
+        | Node::UnblendedOffset => vec![],
         Node::Reference(value)
         | Node::Cache(value)
         | Node::Clamp { input: value, .. }
@@ -413,7 +426,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         } => vec![alpha, first, second],
         Node::Noise { shifts, .. } => shifts.iter().collect(),
     };
-    let depth = 1 + children.iter().map(|child| child.1).max().unwrap_or(0);
+    let mut depth = 1 + children.iter().map(|child| child.1).max().unwrap_or(0);
     let mut work = children
         .iter()
         .fold(1usize, |sum, child| sum.saturating_add(child.2));
@@ -424,8 +437,13 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         );
         work = 1usize.saturating_add(input.2.saturating_mul(8));
     }
-    let has_interpolation =
+    let mut has_interpolation =
         matches!(node, Node::Interpolated { .. }) || children.iter().any(|child| child.3);
+    if let Node::Spline(spline) = &node {
+        depth = 1 + spline.depth();
+        work = 1usize.saturating_add(spline.work());
+        has_interpolation = spline.has_interpolation();
+    }
     ensure!(depth <= MAX_DEPTH, "density function exceeds maximum depth");
     ensure!(
         work <= MAX_NODES,
@@ -480,6 +498,9 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             let (min, max) = noise.range();
             Interval::bounds(min, max).mul(Interval::exact(4.0))
         }
+        Node::Spline(spline) => spline.range(),
+        Node::UnblendedAlpha => Interval::bounds(0.0, 1.0),
+        Node::UnblendedOffset => Interval::bounds(f32::NEG_INFINITY, f32::INFINITY),
     };
     Ok(Arc::new(DensityFunction(
         node,
@@ -495,11 +516,13 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     resources: &'a mut P,
     cache: BTreeMap<ResourceId, Arc<DensityFunction>>,
     cache_nodes: BTreeMap<String, Arc<DensityFunction>>,
+    spline_coordinates: BTreeMap<String, Arc<DensityFunction>>,
     active: BTreeSet<ResourceId>,
     nodes: usize,
     noise_factory: Option<WorldNoiseFactory>,
     world_seed: Option<i64>,
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
+    unblended: bool,
 }
 
 enum WorldNoiseFactory {
@@ -520,11 +543,13 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             resources,
             cache: BTreeMap::new(),
             cache_nodes: BTreeMap::new(),
+            spline_coordinates: BTreeMap::new(),
             active: BTreeSet::new(),
             nodes: 0,
             noise_factory: None,
             world_seed: None,
             noises: BTreeMap::new(),
+            unblended: false,
         }
     }
 
@@ -541,6 +566,12 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
         compiler.noise_factory = Some(noise_factory);
         compiler.world_seed = Some(seed);
         compiler
+    }
+
+    /// Use only where no older chunk data needs terrain blending.
+    pub fn without_old_chunk_blending(mut self) -> Self {
+        self.unblended = true;
+        self
     }
 
     fn noise(&mut self, name: &str) -> Result<Arc<NormalNoise>> {
@@ -668,6 +699,15 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
         }
         let node = match id.path.as_str() {
             "constant" => Node::Constant(number(field("value")?)?),
+            "blend_alpha" | "blend_offset" => {
+                ensure!(self.unblended, "terrain blending context is required");
+                if id.path == "blend_alpha" {
+                    Node::UnblendedAlpha
+                } else {
+                    Node::UnblendedOffset
+                }
+            }
+            "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
             "shift_a" | "shift_b" | "shift" => {
                 let name = field("noise")?
                     .as_str()
@@ -1102,5 +1142,46 @@ mod tests {
             b.sample(12, -100, 23).to_bits(),
             b.sample(12, 100, 23).to_bits()
         );
+    }
+
+    #[test]
+    fn spline_validates_structure_and_interns_equal_coordinates() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        assert!(
+            compiler
+                .compile(&json!({"type":"spline","spline":{"coordinate":0,"points":[]}}))
+                .is_err()
+        );
+        let previous_coordinates = compiler.spline_coordinates.len();
+        let coordinate = json!({"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":8,"from_value":0,"to_value":1});
+        let inner =
+            json!({"coordinate":coordinate,"points":[{"location":0,"value":2,"derivative":0}]});
+        let value = json!({"type":"spline","spline":{"coordinate":coordinate,"points":[{"location":0,"value":inner,"derivative":0},{"location":1,"value":3,"derivative":0}]}});
+        let compiled = compiler.compile(&value).unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        assert_eq!(evaluator.sample(&compiled, 0, 0, 0), 2.0);
+        assert_eq!(compiler.spline_coordinates.len(), previous_coordinates + 1);
+        let large = compiler
+            .compile(&json!({"type":"spline","spline":123456789.0}))
+            .unwrap();
+        assert_eq!(large.sample(0, 0, 0), 123456789.0_f32);
+    }
+
+    #[test]
+    fn unblended_defaults_require_explicit_context_and_keep_java_ranges() {
+        let mut data = Data::default();
+        assert!(
+            DensityCompiler::new(&mut data)
+                .compile(&json!({"type":"blend_alpha"}))
+                .is_err()
+        );
+        let mut compiler = DensityCompiler::new(&mut data).without_old_chunk_blending();
+        let alpha = compiler.compile(&json!({"type":"blend_alpha"})).unwrap();
+        let offset = compiler.compile(&json!({"type":"blend_offset"})).unwrap();
+        assert_eq!(alpha.sample(1, 2, 3), 1.0);
+        assert_eq!(alpha.range(), (0.0, 1.0));
+        assert_eq!(offset.sample(1, 2, 3), 0.0);
+        assert_eq!(offset.range(), (f32::NEG_INFINITY, f32::INFINITY));
     }
 }

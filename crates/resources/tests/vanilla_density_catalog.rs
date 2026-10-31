@@ -15,7 +15,7 @@ fn catalog_compiles_installed_density_functions() {
     let ids = sources.list_data("worldgen/density_function").unwrap();
     let mut compiler = DensityCompiler::with_world_seed(&mut sources, 0, WorldgenRandom::Xoroshiro);
     let mut supported = Vec::new();
-    for id in ids {
+    for id in &ids {
         let name = format!("{}:{}", id.namespace, id.path);
         if compiler.compile_id(&name).is_ok() {
             supported.push(name);
@@ -39,6 +39,36 @@ fn catalog_compiles_installed_density_functions() {
     ] {
         assert!(
             supported.iter().any(|name| name == expected),
+            "missing {expected}"
+        );
+    }
+    drop(compiler);
+    let mut compiler = DensityCompiler::with_world_seed(&mut sources, 0, WorldgenRandom::Xoroshiro)
+        .without_old_chunk_blending();
+    let mut unblended = Vec::new();
+    for id in &ids {
+        let name = format!("{}:{}", id.namespace, id.path);
+        if compiler.compile_id(&name).is_ok() {
+            unblended.push(name);
+        }
+    }
+    println!("unblended supported: {} {:?}", unblended.len(), unblended);
+    for expected in [
+        "minecraft:overworld/offset",
+        "minecraft:overworld/factor",
+        "minecraft:overworld/jaggedness",
+        "minecraft:overworld/depth",
+        "minecraft:overworld_large_biomes/offset",
+        "minecraft:overworld_large_biomes/factor",
+        "minecraft:overworld_large_biomes/jaggedness",
+        "minecraft:overworld_large_biomes/depth",
+        "minecraft:overworld_amplified/offset",
+        "minecraft:overworld_amplified/factor",
+        "minecraft:overworld_amplified/jaggedness",
+        "minecraft:overworld_amplified/depth",
+    ] {
+        assert!(
+            unblended.iter().any(|name| name == expected),
             "missing {expected}"
         );
     }

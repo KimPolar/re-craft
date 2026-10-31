@@ -137,6 +137,34 @@ fn pure_functions_match_java_sampler() {
         json!({"type":"cache","input":{"type":"clamp","input":gradient,"min":-0.5,"max":0.5}}),
     );
     expressions.push(json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":{"type":"add","left":cached,"right":cached}}));
+    let spline = json!({"coordinate":gradient,"points":[
+        {"location":-1.0,"value":-0.25,"derivative":0.75},
+        {"location":0.0,"value":0.5,"derivative":-0.3},
+        {"location":1.0,"value":1.25,"derivative":0.2}
+    ]});
+    let inner = json!({"coordinate":reverse,"points":[
+        {"location":-1.0,"value":-0.5,"derivative":0.2},
+        {"location":0.25,"value":0.25,"derivative":-0.1},
+        {"location":0.75,"value":1.0,"derivative":0.0}
+    ]});
+    let nested = json!({"coordinate":gradient,"points":[
+        {"location":-0.75,"value":inner,"derivative":0.3},
+        {"location":0.5,"value":-0.2,"derivative":-0.4},
+        {"location":1.25,"value":inner,"derivative":0.0}
+    ]});
+    expressions.push(json!({"type":"spline","spline":0.75}));
+    expressions.push(json!({"type":"spline","spline":spline}));
+    expressions.push(json!({"type":"spline","spline":nested}));
+    expressions.push(json!({"type":"cache","input":{"type":"spline","spline":nested}}));
+    expressions.push(json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":{"type":"spline","spline":nested}}));
+    expressions
+        .push(json!({"type":"min","left":{"type":"spline","spline":spline},"right":gradient}));
+    expressions.push(json!({"type":"spline","spline":{"coordinate":gradient,"points":[{"location":0.0,"value":0.5,"derivative":0.0}]}}));
+    expressions.push(json!({"type":"spline","spline":{"coordinate":gradient,"points":[{"location":0.0,"value":0.5,"derivative":0.0},{"location":0.0,"value":-0.5,"derivative":0.0},{"location":1.0,"value":0.25,"derivative":0.0}]}}));
+    for derivative in [0.0, 1.0] {
+        expressions.push(json!({"type":"spline","spline":{"coordinate":infinity,"points":[{"location":0.0,"value":0.5,"derivative":derivative}]}}));
+    }
+    expressions.push(json!({"type":"spline","spline":{"coordinate":{"type":"add","left":infinity,"right":negative_infinity},"points":[{"location":0.0,"value":0.5,"derivative":0.0}]}}));
     let input = temp.path().join("expressions.json");
     std::fs::write(&input, serde_json::to_vec(&expressions).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))

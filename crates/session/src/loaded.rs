@@ -5419,6 +5419,28 @@ impl LoadedSession {
         (ordinary_can_replace(self.world.state(existing)?) == Some(true)).then_some(target)
     }
 
+    /// Java's server-created falling blocks obstruct placement, but falling
+    /// blocks loaded through the entity-type constructor do not set that flag.
+    fn falling_blocks_clear_placement(&self, relative: IVec3, shape: &[Aabb]) -> bool {
+        let Some(absolute) = add(self.origin, relative) else {
+            return false;
+        };
+        let origin = absolute.as_dvec3();
+        !self
+            .falling_sand
+            .iter()
+            .filter(|entity| entity.source.is_none())
+            .any(|entity| {
+                let bounds = entity.motion.bounds();
+                shape.iter().any(|part| {
+                    let min = origin + part.min.as_dvec3();
+                    let max = origin + part.max.as_dvec3();
+                    let overlap = max.min(bounds.max) - min.max(bounds.min);
+                    overlap.cmpgt(DVec3::splat(1.0e-7)).all()
+                })
+            })
+    }
+
     fn snowy_setting(&self, name: &str) -> Option<bool> {
         if !self.vanilla_block_ids.as_ref()?.contains(name) {
             return None;
@@ -5590,6 +5612,9 @@ impl LoadedSession {
         }
         let placed = state("minecraft:snow", &[("layers", &layers.to_string())]);
         let shape = block_shape(&placed)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
         let min = self.player.position
             + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
         let max = self.player.position
@@ -5639,6 +5664,10 @@ impl LoadedSession {
         };
         if button_can_replace(self.world.state(existing)?) != Some(true)
             || player_intersects_block(self.player, target, Block::Stone)
+            || !self.falling_blocks_clear_placement(
+                target,
+                native_world::collision::demo_shape(Block::Stone),
+            )
         {
             return None;
         }
@@ -5763,6 +5792,10 @@ impl LoadedSession {
         };
         if self.world.state(id).and_then(button_can_replace) != Some(true)
             || player_intersects_block(self.player, target, Block::Stone)
+            || !self.falling_blocks_clear_placement(
+                target,
+                native_world::collision::demo_shape(Block::Stone),
+            )
         {
             return None;
         }
@@ -5882,6 +5915,9 @@ impl LoadedSession {
             },
         )?;
         let shape = block_shape(&placed)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
         let min = self.player.position
             + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
         let max = self.player.position
@@ -8755,6 +8791,10 @@ impl LoadedSession {
                                 && let Some(target) = self.ordinary_placement_target(hit)
                                 && let Some(block) = self.placement_block(target, block)
                                 && !player_intersects_block(self.player, target, block)
+                                && self.falling_blocks_clear_placement(
+                                    target,
+                                    native_world::collision::demo_shape(block),
+                                )
                                 && {
                                     self.placement_id_at(target, block.orient_for_face(hit.face))
                                         .is_some_and(|id| self.set(target, id))
@@ -10887,6 +10927,252 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn falling_entity_placement_collisions_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FallingPlacementCollisionOracle.java");
+        let output = temp.path().join("collisions.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FallingPlacementCollisionOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FallingPlacementCollisionOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "falling collision oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 10 * 2 * 12 * 9);
+        let mut session = session();
+        session.origin = IVec3::ZERO;
+        for row in rows {
+            let block = row["block"].as_u64().unwrap();
+            let state = match block {
+                0 => state("minecraft:stone", &[]),
+                9 => state(
+                    "minecraft:chest",
+                    &[
+                        ("type", "single"),
+                        ("facing", "north"),
+                        ("waterlogged", "false"),
+                    ],
+                ),
+                _ => state("minecraft:snow", &[("layers", &block.to_string())]),
+            };
+            let shape = block_shape(&state).unwrap();
+            let position = DVec3::new(row["x"].as_f64().unwrap(), row["y"].as_f64().unwrap(), 0.5);
+            let motion = crate::falling_block::AirborneMotion {
+                position,
+                velocity: DVec3::ZERO,
+                age: 0,
+                no_gravity: false,
+            };
+            session.falling_sand.clear();
+            session.falling_sand.push(FallingSand {
+                motion,
+                previous: position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: if row["fresh"].as_bool().unwrap() {
+                    None
+                } else {
+                    Some(Arc::new(native_persistence::nbt::Tag::Compound(vec![])))
+                },
+                created: None,
+            });
+            assert_eq!(
+                session.falling_blocks_clear_placement(IVec3::ZERO, &shape),
+                row["clear"].as_bool().unwrap(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn created_falling_block_prevents_player_placement() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for fresh in [false, true] {
+            let mut session = session();
+            let target = IVec3::new(8, 2, 7);
+            let position = (session.origin + target).as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
+            let motion = crate::falling_block::AirborneMotion {
+                position,
+                velocity: DVec3::ZERO,
+                age: 1,
+                no_gravity: true,
+            };
+            session.falling_sand.push(FallingSand {
+                motion,
+                previous: position,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: if fresh {
+                    None
+                } else {
+                    Some(Arc::new(Tag::Compound(vec![])))
+                },
+                created: None,
+            });
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            let Cell::State(id) = cell(
+                &session.world,
+                session.origin,
+                session.bounds,
+                target,
+                session.states[0],
+            ) else {
+                panic!("missing target")
+            };
+            assert_eq!(
+                session.world.state(id).unwrap().name,
+                if fresh {
+                    "minecraft:air"
+                } else {
+                    "minecraft:stone"
+                }
+            );
+            assert_eq!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .count(),
+                if fresh { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn falling_blocks_respect_special_placement_shapes() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        for item in [
+            "minecraft:snow",
+            "minecraft:snow_block",
+            "minecraft:redstone_block",
+            "minecraft:chest",
+        ] {
+            let mut session = session();
+            session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+            let position = IVec3::new(4, 1, 4);
+            let absolute = session.origin + position;
+            let chunk = ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
+            };
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(chunk, SavedBlockEntities::Empty);
+            let entity_pos = absolute.as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
+            let motion = crate::falling_block::AirborneMotion {
+                position: entity_pos,
+                velocity: DVec3::ZERO,
+                age: 0,
+                no_gravity: true,
+            };
+            session.falling_sand.push(FallingSand {
+                motion,
+                previous: entity_pos,
+                fall_distance: 0.0,
+                fall_distance_verified: true,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+                created: None,
+            });
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(item.into(), 2, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: position + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            if item == "minecraft:snow" {
+                assert!(session.place_snow(hit).is_some());
+                let layer = ShapeRayHit { position, ..hit };
+                assert!(session.place_snow(layer).is_none());
+            } else {
+                let placed = match item {
+                    "minecraft:snow_block" => session.place_snow_block(hit),
+                    "minecraft:redstone_block" => session.place_redstone(hit),
+                    "minecraft:chest" => session.place_chest(hit),
+                    _ => unreachable!(),
+                };
+                assert!(placed.is_none(), "{item}");
+                session.falling_sand.clear();
+                let placed = match item {
+                    "minecraft:snow_block" => session.place_snow_block(hit),
+                    "minecraft:redstone_block" => session.place_redstone(hit),
+                    "minecraft:chest" => session.place_chest(hit),
+                    _ => unreachable!(),
+                };
+                assert_eq!(placed, Some(PlayerSlot::Storage(0)), "{item}");
+            }
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod fluid_sim;
 pub mod lighting;
 pub mod loaded;
 pub mod movement;
+pub mod poi;
 pub mod raycast;
 pub mod sky_light;
 pub mod sky_propagation;

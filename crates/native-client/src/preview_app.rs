@@ -2294,6 +2294,7 @@ mod tests {
             experience_orbs: Arc::clone(&previous.experience_orbs),
             system_messages: Arc::clone(&previous.system_messages),
             locked_chest_message: previous.locked_chest_message.clone(),
+            weather: previous.weather,
             tick: previous.tick,
             origin: glam::IVec3::new(16_000_016, 0, -16_000_000),
             world_revision: previous.world_revision,

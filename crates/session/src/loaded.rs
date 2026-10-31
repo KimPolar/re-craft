@@ -2833,6 +2833,15 @@ impl LoadedSession {
         self.can_have_weather = can_have_weather;
         self.weather = data.map(crate::weather::Weather::new);
         self.advance_weather = advance_weather;
+        let visual = self.weather_visual();
+        Arc::make_mut(&mut self.snapshot).weather = visual;
+    }
+
+    fn weather_visual(&self) -> Option<crate::weather::WeatherVisual> {
+        match self.can_have_weather? {
+            false => Some(crate::weather::WeatherVisual::default()),
+            true => self.weather.as_ref().map(crate::weather::Weather::visual),
+        }
     }
 
     fn global_rain(&self) -> Option<bool> {
@@ -2975,6 +2984,7 @@ impl LoadedSession {
             experience_orbs: self.experience_orbs.snapshot(),
             system_messages: Arc::clone(&self.system_messages),
             locked_chest_message: self.locked_chest_message.clone(),
+            weather: self.weather_visual(),
             tick: self.tick,
             origin: self.origin,
             world_revision: self.revision,
@@ -3084,6 +3094,7 @@ impl LoadedSession {
             experience_orbs: Arc::from([]),
             system_messages: Arc::from([]),
             locked_chest_message: None,
+            weather: None,
             tick: 0,
             origin,
             world_revision: 0,
@@ -12286,6 +12297,7 @@ impl GameSession for LoadedSession {
                 experience_orbs: self.experience_orbs.snapshot(),
                 system_messages: Arc::clone(&self.system_messages),
                 locked_chest_message: self.locked_chest_message.clone(),
+                weather: self.weather_visual(),
                 tick: self.tick,
                 origin: self.origin,
                 world_revision: self.revision,
@@ -13863,6 +13875,38 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.weather.as_ref().unwrap().data, data);
         assert_eq!(session.global_rain(), Some(false));
+    }
+
+    #[test]
+    fn weather_snapshots_are_immutable_and_independent_of_frame_rate() {
+        let mut fast = session();
+        let mut slow = session();
+        let weather = native_persistence::world::SavedWeather {
+            rain_time: 1,
+            thunder_time: 1,
+            ..Default::default()
+        };
+        for session in [&mut fast, &mut slow] {
+            session.set_weather(Some(true), Some(weather), true);
+            session.set_random_tick_speed(0);
+        }
+        let before = fast.snapshot();
+        for _ in 0..20 {
+            fast.update(Duration::from_millis(5));
+        }
+        slow.update(Duration::from_millis(100));
+        assert_eq!(fast.snapshot().weather, slow.snapshot().weather);
+        assert_eq!(before.weather.unwrap().rain, 0.0);
+        let visual = fast.snapshot().weather.unwrap();
+        assert_eq!(visual.previous_rain, 0.01);
+        assert_eq!(visual.rain, 0.02);
+        fast.set_weather(None, None, true);
+        assert_eq!(fast.snapshot().weather, None);
+        fast.set_weather(Some(false), None, true);
+        assert_eq!(
+            fast.snapshot().weather,
+            Some(crate::weather::WeatherVisual::default())
+        );
     }
 
     #[test]

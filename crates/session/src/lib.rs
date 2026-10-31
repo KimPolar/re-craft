@@ -448,6 +448,8 @@ pub struct WorldSnapshot {
     /// Recent messages are shared between snapshots and copied only on change.
     pub system_messages: Arc<[SystemMessage]>,
     pub locked_chest_message: Option<Arc<LockedChestMessage>>,
+    /// Unknown when saved weather or dimension capability was not resolved.
+    pub weather: Option<weather::WeatherVisual>,
     pub tick: u64,
     /// Absolute block origin for relative player and mesh coordinates.
     pub origin: IVec3,
@@ -634,6 +636,7 @@ impl LocalSession {
             experience_orbs: Arc::from([]),
             system_messages: Arc::from([]),
             locked_chest_message: None,
+            weather: Some(weather::WeatherVisual::default()),
             tick: 0,
             origin: IVec3::ZERO,
             world_revision: world.revision(),
@@ -800,6 +803,7 @@ impl LocalSession {
             experience_orbs: self.experience_orbs.snapshot(),
             system_messages: Arc::clone(&self.snapshot.system_messages),
             locked_chest_message: self.snapshot.locked_chest_message.clone(),
+            weather: self.snapshot.weather,
             tick: self.tick,
             origin: IVec3::ZERO,
             world_revision: self.world.revision(),
@@ -1859,6 +1863,7 @@ impl GameSession for LocalSession {
                 experience_orbs: self.experience_orbs.snapshot(),
                 system_messages: Arc::clone(&self.snapshot.system_messages),
                 locked_chest_message: self.snapshot.locked_chest_message.clone(),
+                weather: self.snapshot.weather,
                 tick: self.tick,
                 origin: IVec3::ZERO,
                 world_revision: self.world.revision(),

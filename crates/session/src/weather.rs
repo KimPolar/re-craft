@@ -8,19 +8,55 @@ pub struct Weather {
     pub data: SavedWeather,
     pub rain_level: f32,
     pub thunder_level: f32,
+    previous_rain_level: f32,
+    previous_thunder_level: f32,
+}
+
+/// Tick endpoints shared with the renderer; interpolation never mutates simulation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeatherVisual {
+    pub previous_rain: f32,
+    pub rain: f32,
+    pub previous_thunder: f32,
+    pub thunder: f32,
+}
+
+impl WeatherVisual {
+    pub fn rain_at(self, partial: f32) -> f32 {
+        self.previous_rain + partial.clamp(0.0, 1.0) * (self.rain - self.previous_rain)
+    }
+
+    /// Level.getThunderLevel interpolates thunder and multiplies it by rain.
+    pub fn thunder_at(self, partial: f32) -> f32 {
+        (self.previous_thunder + partial.clamp(0.0, 1.0) * (self.thunder - self.previous_thunder))
+            * self.rain_at(partial)
+    }
 }
 
 impl Weather {
     /// Mirrors ServerLevel.prepareWeather on initial load.
     pub fn new(data: SavedWeather) -> Self {
+        let rain = if data.raining { 1.0 } else { 0.0 };
+        let thunder = if data.raining && data.thundering {
+            1.0
+        } else {
+            0.0
+        };
         Self {
-            rain_level: if data.raining { 1.0 } else { 0.0 },
-            thunder_level: if data.raining && data.thundering {
-                1.0
-            } else {
-                0.0
-            },
+            rain_level: rain,
+            thunder_level: thunder,
+            previous_rain_level: rain,
+            previous_thunder_level: thunder,
             data,
+        }
+    }
+
+    pub fn visual(&self) -> WeatherVisual {
+        WeatherVisual {
+            previous_rain: self.previous_rain_level,
+            rain: self.rain_level,
+            previous_thunder: self.previous_thunder_level,
+            thunder: self.thunder_level,
         }
     }
 
@@ -33,6 +69,8 @@ impl Weather {
         if !can_have_weather {
             return;
         }
+        self.previous_rain_level = self.rain_level;
+        self.previous_thunder_level = self.thunder_level;
         if advance_weather {
             let data = &mut self.data;
             if data.clear_weather_time > 0 {
@@ -119,5 +157,22 @@ mod tests {
         weather.tick(false, true, &mut random);
         assert_eq!(weather.rain_level, 0.01);
         assert_eq!(weather.data.rain_time, 1);
+    }
+
+    #[test]
+    fn visual_endpoints_interpolate_rain_and_thunder_independently() {
+        let mut weather = Weather::new(SavedWeather::default());
+        weather.data.raining = true;
+        weather.data.thundering = true;
+        let mut random = LegacyRandom::new(1);
+        weather.tick(true, false, &mut random);
+        let visual = weather.visual();
+        assert_eq!(visual.rain_at(0.0), 0.0);
+        assert_eq!(visual.rain_at(0.5), 0.005);
+        assert_eq!(visual.rain_at(1.0), 0.01);
+        assert_eq!(visual.thunder_at(0.5), 0.005_f32 * 0.005_f32);
+        weather.tick(true, false, &mut random);
+        assert_eq!(weather.visual().previous_rain, 0.01);
+        assert_eq!(visual.rain, 0.01, "published snapshot stays unchanged");
     }
 }

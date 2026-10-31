@@ -81,6 +81,7 @@ pub enum Material {
     Dirt,
     Sand,
     Gravel,
+    Snow,
     DirtPath,
     Stone,
     StoneBricks,
@@ -115,6 +116,7 @@ impl Material {
             "minecraft:dirt_path" => Some(Self::DirtPath),
             "minecraft:sand" | "minecraft:red_sand" => Some(Self::Sand),
             "minecraft:gravel" => Some(Self::Gravel),
+            "minecraft:snow" => Some(Self::Snow),
             "minecraft:stone" => Some(Self::Stone),
             "minecraft:stone_bricks" => Some(Self::StoneBricks),
             "minecraft:stone_button" => Some(Self::StoneButton),
@@ -196,6 +198,7 @@ impl Material {
             Self::Grass | Self::Gravel => 0.6,
             Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton | Self::Lever => 0.5,
             Self::DirtPath => 0.65,
+            Self::Snow => 0.1,
             Self::RedstoneLamp => 0.3,
             Self::RedstoneBlock => 5.0,
             Self::Stone | Self::StoneBricks => 1.5,
@@ -220,6 +223,7 @@ impl Material {
                 | Self::Cobblestone
                 | Self::RedstoneBlock
                 | Self::Ore { .. }
+                | Self::Snow
         )
     }
 }
@@ -309,6 +313,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::DirtPath
                 | Material::Sand
                 | Material::Gravel
+                | Material::Snow
         ),
         "pickaxe" => matches!(
             material,
@@ -333,6 +338,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
     Some(MiningProperties {
         speed: if effective { speed } else { 1.0 },
         correct_for_drops: !material.needs_tool()
+            || (kind == "shovel" && material == Material::Snow && effective)
             || (kind == "pickaxe"
                 && effective
                 && match material {
@@ -414,7 +420,8 @@ pub fn destroy_speed(base_speed: f32, context: MiningContext) -> f32 {
 /// Items with unresolved components may have tool, enchantment or mining overrides.
 pub(crate) fn basic_hand(item: Option<&ItemStack>) -> bool {
     item.is_none_or(|item| {
-        ordinary_item_default_max(item.id()) == Some(64) && ordinary_return_supported(item)
+        matches!(ordinary_item_default_max(item.id()), Some(16 | 64))
+            && ordinary_return_supported(item)
     })
 }
 

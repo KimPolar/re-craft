@@ -2260,7 +2260,9 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:redstone_ore"
         | "minecraft:deepslate_redstone_ore"
         | "minecraft:nether_gold_ore"
-        | "minecraft:nether_quartz_ore" => Some(64),
+        | "minecraft:nether_quartz_ore"
+        | "minecraft:snow"
+        | "minecraft:snow_block" => Some(64),
         _ => None,
     }
 }
@@ -2390,7 +2392,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         return Some(max);
     }
     let name = id.strip_prefix("minecraft:")?;
-    if name == "ender_pearl" {
+    if matches!(name, "ender_pearl" | "snowball") {
         return Some(16);
     }
     if STACKABLE_ITEMS.contains(&name) {

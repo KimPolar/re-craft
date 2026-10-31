@@ -134,6 +134,7 @@ fn ore_experience_and_silk_touch_match_vanilla() {
         "deepslate_redstone_ore",
         "nether_gold_ore",
         "nether_quartz_ore",
+        "snow",
     ];
     let mut cases = Vec::new();
     for seed in -50..50 {
@@ -2558,7 +2559,7 @@ fn supported_redstone_conductors_match_java_states() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-fn ore_mining_and_harvest_tiers_match_vanilla() {
+fn ore_and_snow_mining_and_harvest_tiers_match_vanilla() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -2638,7 +2639,7 @@ fn ore_mining_and_harvest_tiers_match_vanilla() {
         checked += 1;
     }
     assert_eq!(checked, ores.len() * 7 * 5 * 4);
-    eprintln!("Compared {checked} ore/tool cases with Minecraft 26.3");
+    eprintln!("Compared {checked} ore and snow tool cases with Minecraft 26.3");
 }
 
 #[test]

@@ -1662,6 +1662,39 @@ impl ItemEntities {
         Ok(())
     }
 
+    pub(crate) fn prepare_player_block_drops(
+        &self,
+        name: &str,
+        properties: &std::collections::BTreeMap<String, String>,
+        hand: Option<&ItemStack>,
+        tables: Option<&BlockLootTables>,
+    ) -> anyhow::Result<(Vec<Drop>, LegacyRandom)> {
+        let tables = tables.ok_or_else(|| anyhow::anyhow!("block loot table unavailable"))?;
+        let enchantments = hand
+            .map(crate::inventory::item_enchantments)
+            .transpose()?
+            .unwrap_or_default();
+        let tool = BasicTool {
+            item: hand.map(ItemStack::id),
+            count: hand.map_or(0, ItemStack::count),
+            enchantments: &enchantments,
+        };
+        let mut random = self.random.clone();
+        let drops = tables.drops_with_entity_at(name, properties, tool, Some(&mut random))?;
+        Ok((drops, random))
+    }
+
+    pub(crate) fn stage_player_block_drops(
+        &mut self,
+        (drops, random): (Vec<Drop>, LegacyRandom),
+    ) -> (Vec<Drop>, LegacyRandom) {
+        (drops, std::mem::replace(&mut self.random, random))
+    }
+
+    pub(crate) fn restore_drop_random(&mut self, random: LegacyRandom) {
+        self.random = random;
+    }
+
     /// Spawn a previously evaluated block-interaction loot table.
     pub fn drop_interaction(
         &mut self,

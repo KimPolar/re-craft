@@ -6065,28 +6065,67 @@ impl LoadedSession {
             self.finish_breaking_chest(relative, id);
             return;
         }
+        let hand = self
+            .inventory
+            .slot(crate::inventory::PlayerSlot::Storage(
+                self.inventory.selected(),
+            ))
+            .cloned();
+        let properties = mining::Material::from_block_name(&name)
+            .and_then(|material| mining::mining_properties(material, hand.as_ref()));
+        let snow_drops = if name == "minecraft:snow"
+            && self.game_mode != GameMode::Creative
+            && self.block_drops
+            && properties.is_some_and(|properties| properties.correct_for_drops)
+        {
+            let Some(state) = self.world.state(id) else {
+                return;
+            };
+            if native_world::collision::snow_layers(state).is_none() {
+                return;
+            }
+            match self.dropped_items.prepare_player_block_drops(
+                &name,
+                &state.properties,
+                hand.as_ref(),
+                self.loot.as_deref(),
+            ) {
+                Ok(drops) => Some(drops),
+                Err(error) => {
+                    self.stream_errors.push(format!("snow loot: {error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Neighbor notifications may spawn drops and consume the same RNG.
+        // Stage this loot first so they cannot be overwritten afterward.
+        let snow_drops = snow_drops.map(|drops| self.dropped_items.stage_player_block_drops(drops));
         if self.set(relative, self.states[0]) {
-            let hand = self
-                .inventory
-                .slot(crate::inventory::PlayerSlot::Storage(
-                    self.inventory.selected(),
-                ))
-                .cloned();
-            let properties = mining::Material::from_block_name(&name)
-                .and_then(|material| mining::mining_properties(material, hand.as_ref()));
             let damage = properties.map_or(0, |properties| properties.damage_per_block);
             if self.game_mode != GameMode::Creative && damage != 0 {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
             }
-            self.dropped_items.drop_block(
-                absolute,
-                &name,
-                hand.as_ref(),
-                self.game_mode,
-                self.block_drops,
-                self.loot.as_deref(),
-            );
+            if let Some((drops, _)) = snow_drops {
+                self.dropped_items.drop_interaction(
+                    absolute,
+                    IVec3::ZERO,
+                    native_resources::transforms::DropStrategy::FromMiddle,
+                    drops,
+                    true,
+                );
+            } else if name != "minecraft:snow" {
+                self.dropped_items.drop_block(
+                    absolute,
+                    &name,
+                    hand.as_ref(),
+                    self.game_mode,
+                    self.block_drops,
+                    self.loot.as_deref(),
+                );
+            }
             if self.game_mode != GameMode::Creative
                 && properties.is_some_and(|p| p.correct_for_drops)
             {
@@ -6106,6 +6145,8 @@ impl LoadedSession {
                         .push(format!("ore experience for {name}: {error:#}")),
                 }
             }
+        } else if let Some((_, random)) = snow_drops {
+            self.dropped_items.restore_drop_random(random);
         }
     }
 
@@ -10629,6 +10670,185 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn snow_mining_uses_original_layers_and_tool_enchantments() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for layers in 1..=8 {
+            for silk in [false, true] {
+                let mut session = session();
+                session.set_block_loot(Arc::clone(&loot));
+                session
+                    .set_saved_breathing(
+                        Default::default(),
+                        crate::player_data::SavedAttribute::with_base(0.0),
+                        Arc::clone(&registry),
+                    )
+                    .unwrap();
+                let components = if silk {
+                    Tag::Compound(vec![(
+                        "minecraft:enchantments".into(),
+                        Tag::Compound(vec![("minecraft:silk_touch".into(), Tag::Int(1))]),
+                    )])
+                } else {
+                    Tag::Compound(vec![])
+                };
+                let tool =
+                    ItemStack::new("minecraft:iron_shovel".into(), 1, 1, components).unwrap();
+                assert!(
+                    Arc::make_mut(&mut session.inventory)
+                        .set_slot(PlayerSlot::Storage(0), Some(tool))
+                );
+                let relative = IVec3::new(8, 2, 6);
+                let id = session
+                    .intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+                assert!(session.set(relative, id));
+                session.finish_breaking(session.origin + relative);
+                assert_eq!(
+                    session
+                        .world
+                        .block(
+                            (session.origin + relative).x,
+                            (session.origin + relative).y,
+                            (session.origin + relative).z
+                        )
+                        .unwrap()
+                        .name,
+                    "minecraft:air"
+                );
+                let drops = session.dropped_items.snapshot();
+                assert_eq!(drops.len(), 1, "layers={layers}, silk={silk}");
+                assert_eq!(
+                    drops[0].stack.id(),
+                    if !silk {
+                        "minecraft:snowball"
+                    } else if layers == 8 {
+                        "minecraft:snow_block"
+                    } else {
+                        "minecraft:snow"
+                    }
+                );
+                assert_eq!(
+                    drops[0].stack.count(),
+                    if silk && layers == 8 { 1 } else { layers }
+                );
+                assert_eq!(drops[0].stack.max_count(), Some(if silk { 64 } else { 16 }));
+                assert_eq!(
+                    session
+                        .inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage"),
+                    Some(&Tag::Int(1))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_snow_loot_does_not_destroy_block_or_damage_tool() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceProvider;
+        struct UnsupportedLoot;
+        impl ResourceProvider for UnsupportedLoot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/snow.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"minecraft:location_check","predicate":{}},"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        for with_unsupported_table in [false, true] {
+            let mut session = session();
+            if with_unsupported_table {
+                session.set_block_loot(Arc::new(
+                    BlockLootTables::load(&mut UnsupportedLoot).unwrap(),
+                ));
+            }
+            let tool = ItemStack::new("minecraft:iron_shovel".into(), 1, 1, Tag::Compound(vec![]))
+                .unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool))
+            );
+            let relative = IVec3::new(8, 2, 6);
+            let id = session.intern_block(state("minecraft:snow", &[("layers", "3")]));
+            assert!(session.set(relative, id));
+            session.finish_breaking(session.origin + relative);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id)
+            );
+            assert!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .components()
+                    .get("minecraft:damage")
+                    .is_none()
+            );
+            assert!(session.dropped_items.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn snow_breaking_respects_player_loot_and_game_rules() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceProvider;
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/snow.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"minecraft:entity_properties","entity":"this","predicate":{}},"entries":[{"type":"minecraft:item","name":"minecraft:diamond","condition":{"type":"minecraft:match_block","blocks":"minecraft:snow","state":{"layers":"3"}}}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut LootSource).unwrap());
+        for (shovel, mode, enabled, expected) in [
+            (true, GameMode::Survival, true, 1),
+            (true, GameMode::Survival, false, 0),
+            (true, GameMode::Creative, true, 0),
+            (false, GameMode::Survival, true, 0),
+        ] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            session.set_game_mode(mode);
+            session.set_block_drops(enabled);
+            if shovel {
+                let tool =
+                    ItemStack::new("minecraft:iron_shovel".into(), 1, 1, Tag::Compound(vec![]))
+                        .unwrap();
+                assert!(
+                    Arc::make_mut(&mut session.inventory)
+                        .set_slot(PlayerSlot::Storage(0), Some(tool))
+                );
+            }
+            let relative = IVec3::new(8, 2, 6);
+            let id = session.intern_block(state("minecraft:snow", &[("layers", "3")]));
+            assert!(session.set(relative, id));
+            session.finish_breaking(session.origin + relative);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == session.states[0])
+            );
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), expected);
+            if expected == 1 {
+                assert_eq!(drops[0].stack.id(), "minecraft:diamond");
+            }
+        }
     }
 
     fn fixture_snow_tags(

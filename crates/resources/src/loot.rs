@@ -583,6 +583,38 @@ impl BlockLootTables {
         properties: Option<&BTreeMap<String, String>>,
         random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
+        self.drops_at(
+            block,
+            properties,
+            BasicTool {
+                item: None,
+                count: 0,
+                enchantments: &[],
+            },
+            false,
+            random,
+        )
+    }
+
+    /// Evaluate a player block break using the state and tool before destruction.
+    pub fn drops_with_entity_at(
+        &self,
+        block: &str,
+        properties: &BTreeMap<String, String>,
+        tool: BasicTool<'_>,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
+        self.drops_at(block, Some(properties), tool, true, random)
+    }
+
+    fn drops_at(
+        &self,
+        block: &str,
+        properties: Option<&BTreeMap<String, String>>,
+        tool: BasicTool<'_>,
+        entity_present: bool,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
         let block = ResourceId::parse(block)?;
         let block_name = format!("{}:{}", block.namespace, block.path);
         let id = ResourceId {
@@ -599,14 +631,10 @@ impl BlockLootTables {
         });
         Self::evaluate(
             table,
-            BasicTool {
-                item: None,
-                count: 0,
-                enchantments: &[],
-            },
+            tool,
             random,
             LootContext {
-                entity_present: Some(false),
+                entity_present: Some(entity_present),
                 block: state.as_ref(),
             },
         )

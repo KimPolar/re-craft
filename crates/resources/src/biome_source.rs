@@ -1,5 +1,5 @@
 //! Multi-noise biome selection from the active world data packs.
-//! The built-in overworld and End biome builders are not yet implemented.
+//! The built-in End biome builder is not yet implemented.
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -10,6 +10,7 @@ use crate::{
     noise_router::NoiseRouter,
     packs::{ResourceId, ResourceProvider},
 };
+mod overworld;
 
 const DIMENSIONS: usize = 7;
 const BRANCHING: usize = 19;
@@ -330,6 +331,8 @@ impl BiomeSource {
                     )?;
                     if preset.namespace == "minecraft" && preset.path == "nether" {
                         nether_entries(&registry)?
+                    } else if preset.namespace == "minecraft" && preset.path == "overworld" {
+                        overworld::entries(&registry)?
                     } else {
                         bail!(
                             "unsupported biome preset {}:{}",

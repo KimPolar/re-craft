@@ -15,8 +15,9 @@ public class BiomeSourceOracle {
     for(var group:document.getAsJsonArray("groups")) {
       var object=group.getAsJsonObject();
       Climate.ParameterList<String> parameters;
-      if(object.has("nether")) {
-        var preset=MultiNoiseBiomeSourceParameterList.knownPresets().get(MultiNoiseBiomeSourceParameterList.Preset.NETHER);
+      if(object.has("nether") || object.has("overworld")) {
+        var key=object.has("nether")?MultiNoiseBiomeSourceParameterList.Preset.NETHER:MultiNoiseBiomeSourceParameterList.Preset.OVERWORLD;
+        var preset=MultiNoiseBiomeSourceParameterList.knownPresets().get(key);
         var entries=new ArrayList<Pair<Climate.ParameterPoint,String>>();
         for(var entry:preset.values()) entries.add(Pair.of(entry.getFirst(),entry.getSecond().identifier().toString()));
         parameters=new Climate.ParameterList<>(entries);

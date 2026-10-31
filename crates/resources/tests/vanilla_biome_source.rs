@@ -35,7 +35,7 @@ fn run(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
-fn climate_index_and_nether_preset_match_java() {
+fn climate_index_and_vanilla_presets_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -77,6 +77,8 @@ fn climate_index_and_nether_preset_match_java() {
     ] {
         data.biomes.push(ResourceId::parse(name).unwrap());
     }
+    data.biomes
+        .extend(stack.list_data("worldgen/biome").unwrap());
     let mut groups = vec![json!({"nether":true})];
     let mut sources = vec![
         BiomeSource::load(
@@ -102,14 +104,62 @@ fn climate_index_and_nether_preset_match_java() {
         sources.push(BiomeSource::load(&mut data, &value).unwrap());
         groups.push(value);
     }
+    let overworld_path =
+        "data/minecraft/worldgen/multi_noise_biome_source_parameter_list/overworld.json";
+    data.files.insert(
+        overworld_path.into(),
+        stack.read_builtin_data(overworld_path).unwrap().unwrap(),
+    );
+    sources.push(
+        BiomeSource::load(
+            &mut data,
+            &json!({"type":"multi_noise","preset":"minecraft:overworld"}),
+        )
+        .unwrap(),
+    );
+    groups.push(json!({"overworld":true}));
     let mut targets = Vec::new();
-    for i in 0..800 {
+    let boundaries = [
+        -1.2_f32,
+        -1.05,
+        -1.0,
+        -0.93333334,
+        -0.7666667,
+        -0.56666666,
+        -0.455,
+        -0.4,
+        -0.26666668,
+        -0.19,
+        -0.11,
+        -0.05,
+        0.0,
+        0.03,
+        0.05,
+        0.2,
+        0.26666668,
+        0.3,
+        0.4,
+        0.55,
+        0.56666666,
+        0.7666667,
+        0.8,
+        0.93333334,
+        1.0,
+        1.1,
+    ];
+    let mut state = 726_134_903_715_329_u64;
+    for i in 0..3000 {
         let point: Vec<f32> = (0..6)
             .map(|axis| {
-                if i % 7 == 0 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if i % 17 == 0 {
                     0.0
+                } else if i % 7 == 0 {
+                    boundaries[((state >> 32) as usize + axis) % boundaries.len()]
                 } else {
-                    ((i * (axis * 2 + 5) + axis * 11) % 31 - 15) as f32 / 10.0
+                    ((state >> 32) as u32 % 60_001) as f32 / 20_000.0 - 1.5
                 }
             })
             .collect();
@@ -153,6 +203,6 @@ fn climate_index_and_nether_preset_match_java() {
             _ => {}
         }
     }
-    assert_eq!(group, Some(7));
-    assert_eq!(samples, 8 * 800);
+    assert_eq!(group, Some(8));
+    assert_eq!(samples, 9 * 3000);
 }

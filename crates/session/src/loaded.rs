@@ -365,6 +365,8 @@ pub struct LoadedSession {
     tick_dirty_chunks: BTreeSet<ChunkPos>,
     tick_chunks_needing_dirty: BTreeSet<ChunkPos>,
     block_edits: BTreeMap<ChunkPos, BTreeMap<(i32, i32, i32), RecordedBlockEdit>>,
+    poi_edits: BTreeMap<ChunkPos, Vec<RecordedPoiEdit>>,
+    poi_edited_positions: BTreeSet<BlockPosition>,
     parked_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
     entity_chunks: BTreeMap<ChunkPos, SavedEntityData>,
     item_chunks_seen: BTreeSet<ChunkPos>,
@@ -586,6 +588,13 @@ struct RecordedBlockEdit {
     /// None means the source section had no known block data.
     original: Option<BlockStateId>,
     current: BlockStateId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecordedPoiEdit {
+    position: BlockPosition,
+    original: Option<BlockStateId>,
+    replacement: BlockStateId,
 }
 
 #[derive(Clone, Default)]
@@ -1605,6 +1614,90 @@ impl LoadedSession {
         )
     }
 
+    /// Chunks with recorded POI transitions, including changes later undone.
+    pub fn dirty_poi_chunk_positions(&self) -> BTreeSet<ChunkPos> {
+        self.poi_edits.keys().copied().collect()
+    }
+
+    /// Stage recorded POI transitions against a valid saved POI chunk and a
+    /// verified terrain source. The caller must supply the POI captured at
+    /// session load and validate every block state against its registry. This
+    /// draft does not include villager ticket changes or authorize saving.
+    pub fn draft_poi_chunk(
+        &self,
+        position: ChunkPos,
+        terrain_source: &native_persistence::nbt::NamedTag,
+        poi_source: &native_persistence::world::SavedPoiChunk,
+        mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+    ) -> anyhow::Result<native_persistence::poi::PoiDraft> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            poi_source.position
+                == native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z
+                },
+            "POI source belongs to another chunk"
+        );
+        let events = self
+            .poi_edits
+            .get(&position)
+            .context("chunk has no recorded POI transitions")?;
+        // This checks every edited block against the original terrain and the
+        // currently resident or parked chunk before constructing POI changes.
+        self.draft_changed_chunk(position, terrain_source)?;
+        let edits = self
+            .block_edits
+            .get(&position)
+            .context("POI terrain history is unavailable")?;
+        let mut first = BTreeSet::new();
+        let mut last = BTreeMap::new();
+        let mut changes = Vec::with_capacity(events.len());
+        for event in events {
+            let key = (event.position.x, event.position.y, event.position.z);
+            let edit = edits
+                .get(&key)
+                .context("POI block history is unavailable")?;
+            let old = self
+                .world
+                .state(
+                    event
+                        .original
+                        .context("POI transition has no original state")?,
+                )
+                .context("POI transition old state is unavailable")?;
+            let new = self
+                .world
+                .state(event.replacement)
+                .context("POI transition new state is unavailable")?;
+            if first.insert(key) {
+                let initial = self
+                    .world
+                    .state(edit.original.context("POI block source is unavailable")?)
+                    .context("POI block source state is unavailable")?;
+                validate_state(initial)?;
+                validate_state(old)?;
+                ensure!(
+                    native_world::poi::for_state(initial) == native_world::poi::for_state(old),
+                    "initial POI transition does not match terrain source"
+                );
+            }
+            last.insert(key, event.replacement);
+            changes.push(native_persistence::poi::PoiBlockChange {
+                position: [key.0, key.1, key.2],
+                expected: old.clone(),
+                replacement: new.clone(),
+            });
+        }
+        for (key, final_state) in last {
+            ensure!(
+                edits[&key].current == final_state,
+                "POI history does not match current terrain"
+            );
+        }
+        native_persistence::poi::draft_ordered_block_changes(poi_source, &changes, validate_state)
+    }
+
     /// Combine block edits and supported block ticks in memory only.
     /// The result is not yet safe to write as a playable chunk.
     pub fn draft_changed_chunk_with_block_ticks(
@@ -2518,6 +2611,8 @@ impl LoadedSession {
             tick_dirty_chunks: BTreeSet::new(),
             tick_chunks_needing_dirty: BTreeSet::new(),
             block_edits: BTreeMap::new(),
+            poi_edits: BTreeMap::new(),
+            poi_edited_positions: BTreeSet::new(),
             parked_chunks: BTreeMap::new(),
             entity_chunks: BTreeMap::new(),
             item_chunks_seen: BTreeSet::new(),
@@ -7177,6 +7272,15 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
+        let poi_position = BlockPosition {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+        };
+        let record_poi = self.poi_edited_positions.contains(&poi_position)
+            || original_state
+                .as_ref()
+                .is_none_or(|state| native_world::poi::change(state, &replacement_state).is_some());
         self.sky_lighting.record(
             BlockPosition {
                 x: pos.x,
@@ -7264,6 +7368,17 @@ impl LoadedSession {
                 original,
                 current: id,
             });
+        if record_poi {
+            self.poi_edited_positions.insert(poi_position);
+            self.poi_edits
+                .entry(chunk_pos)
+                .or_default()
+                .push(RecordedPoiEdit {
+                    position: poi_position,
+                    original,
+                    replacement: id,
+                });
+        }
         self.dirty_chunks.insert(chunk_pos);
         if !self.pending_stair_updates.is_empty()
             && self.stair_voxels(old).is_some()
@@ -24416,6 +24531,167 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn poi_history_keeps_remove_and_recreate_when_terrain_returns_to_original() {
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{NamedTag, Tag, TagType},
+            palette::BlockState as SavedState,
+            world::{ChunkPos as SavedChunkPos, SavedPoiChunk},
+        };
+        let (mut world, origin, player) = fixture();
+        let position = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let absolute = origin + IVec3::new(4, 0, 4);
+        let bed_state = state(
+            "minecraft:red_bed",
+            &[("facing", "north"), ("occupied", "false"), ("part", "head")],
+        );
+        let bed_id = world.intern_state(bed_state.clone());
+        world
+            .set_block_id(absolute.x, absolute.y, absolute.z, bed_id)
+            .unwrap();
+        let original = fixture_chunk_document(position);
+        let saved_bed = SavedState {
+            name: bed_state.name.as_str().into(),
+            properties: bed_state
+                .properties
+                .iter()
+                .map(|(k, v)| (k.as_str().into(), v.as_str().into()))
+                .collect(),
+        };
+        let terrain = draft_chunk_blocks(
+            &original,
+            SavedChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            &[BlockChange {
+                x: absolute.x,
+                y: absolute.y,
+                z: absolute.z,
+                expected: SavedState {
+                    name: "minecraft:stone".into(),
+                    properties: vec![],
+                },
+                replacement: saved_bed,
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let poi_source = SavedPoiChunk {
+            position: SavedChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            sections: BTreeMap::new(),
+            document: Arc::new(NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "Sections".into(),
+                        Tag::Compound(vec![(
+                            "0".into(),
+                            Tag::Compound(vec![
+                                ("Valid".into(), Tag::Byte(1)),
+                                (
+                                    "Records".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![
+                                            (
+                                                "pos".into(),
+                                                Tag::IntArray(vec![
+                                                    absolute.x, absolute.y, absolute.z,
+                                                ]),
+                                            ),
+                                            ("type".into(), Tag::String("minecraft:home".into())),
+                                            ("free_tickets".into(), Tag::Int(0)),
+                                        ])],
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            }),
+        };
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let relative = IVec3::new(4, 0, 4);
+        assert!(session.set(relative, session.states[0]));
+        assert!(session.set(relative, bed_id));
+        assert_eq!(
+            session.dirty_poi_chunk_positions(),
+            BTreeSet::from([position])
+        );
+        let draft = session
+            .draft_poi_chunk(position, &terrain, &poi_source, |_| Ok(()))
+            .unwrap();
+        let section = draft
+            .document()
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("0")
+            .unwrap();
+        let Some(Tag::List { values, .. }) = section.get("Records") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("free_tickets"), Some(&Tag::Int(1)));
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        let mut stale_poi = (*poi_source.document).clone();
+        let Tag::Compound(fields) = &mut stale_poi.value else {
+            panic!()
+        };
+        fields.push(("external".into(), Tag::Int(1)));
+        assert!(
+            draft
+                .add_to_save_plan(
+                    &mut plan,
+                    native_persistence::world::DimensionId::parse("overworld").unwrap(),
+                    &stale_poi,
+                    1
+                )
+                .is_err()
+        );
+        draft
+            .add_to_save_plan(
+                &mut plan,
+                native_persistence::world::DimensionId::parse("overworld").unwrap(),
+                &poi_source.document,
+                1,
+            )
+            .unwrap();
+        assert_eq!(plan.poi_chunk_count(), 1);
+        assert!(
+            session
+                .draft_poi_chunk(position, &original, &poi_source, |_| Ok(()))
+                .is_err(),
+            "stale terrain source must be rejected"
+        );
+        session.poi_edits.get_mut(&position).unwrap()[1].original = Some(bed_id);
+        assert!(
+            session
+                .draft_poi_chunk(position, &terrain, &poi_source, |_| Ok(()))
+                .is_err(),
+            "discontinuous history must be rejected"
+        );
     }
 
     #[test]

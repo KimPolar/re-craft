@@ -900,6 +900,24 @@ fn prepare_existing_world(
             None
         };
         session.set_weather(can_weather, weather, rules.advance_weather);
+        if can_weather == Some(true) {
+            let climates = native_resources::biome_climate::load_world_climates(&mut resources);
+            let sea_level = reader.saved_dimension_generators().and_then(|saved| {
+                preview_lighting::generator_sea_level(
+                    &mut resources,
+                    reader.dimension(),
+                    saved.as_ref(),
+                )
+            });
+            match (climates, sea_level) {
+                (Ok(climates), Ok(sea_level)) => {
+                    session.set_precipitation_environment(Arc::new(climates), sea_level)
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("Precipitation environment unavailable: {error:#}")
+                }
+            }
+        }
         let clocks = reader.world_clocks_document().and_then(|source| {
             let mut clocks = source
                 .as_ref()

@@ -1,6 +1,6 @@
 //! The 26.3 biome climate rules used to distinguish rain and snow.
 
-use std::sync::OnceLock;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use native_core::{random::LegacyRandom, simplex::Simplex2D};
@@ -26,6 +26,20 @@ pub struct BiomeClimate {
     pub has_precipitation: bool,
     pub temperature: f32,
     pub modifier: TemperatureModifier,
+}
+
+/// Invalid individual entries remain unavailable instead of receiving a guess.
+pub fn load_world_climates(
+    source: &mut impl ResourceProvider,
+) -> Result<BTreeMap<String, BiomeClimate>> {
+    let mut result = BTreeMap::new();
+    for id in source.list_data("worldgen/biome")? {
+        let name = format!("{}:{}", id.namespace, id.path);
+        if let Ok(Some(climate)) = BiomeClimate::load_world(source, &name) {
+            result.insert(name, climate);
+        }
+    }
+    Ok(result)
 }
 
 impl BiomeClimate {

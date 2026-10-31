@@ -7,6 +7,99 @@ use native_world::lighting::LightmapSettings;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Resolve the generator's sea level without substituting overworld defaults.
+pub fn generator_sea_level(
+    source: &mut impl ResourceProvider,
+    dimension: &DimensionId,
+    saved: Option<&BTreeMap<DimensionId, native_persistence::nbt::Tag>>,
+) -> Result<Option<i32>> {
+    use native_persistence::nbt::Tag;
+    let path = format!(
+        "data/{}/dimension/{}.json",
+        dimension.namespace, dimension.path
+    );
+    let (kind, settings) = if let Some(bytes) = source.read_data(&path)? {
+        let dimension: Value = serde_json::from_slice(&bytes)?;
+        let generator = dimension.get("generator").context("missing generator")?;
+        let kind = generator
+            .get("type")
+            .and_then(Value::as_str)
+            .context("missing generator type")?
+            .to_owned();
+        let settings = (kind == "minecraft:noise" || kind == "noise")
+            .then(|| generator.get("settings"))
+            .flatten()
+            .map(|value| {
+                if let Some(name) = value.as_str() {
+                    Ok(GeneratorSettings::Named(name.to_owned()))
+                } else if let Some(level) = value.get("sea_level").and_then(Value::as_i64) {
+                    Ok(GeneratorSettings::Inline(i32::try_from(level)?))
+                } else {
+                    bail!("unsupported inline noise settings")
+                }
+            })
+            .transpose()?;
+        (kind, settings)
+    } else {
+        let Some(generator) = saved.and_then(|saved| saved.get(dimension)) else {
+            return Ok(None);
+        };
+        let Some(Tag::String(kind)) = generator.get("type") else {
+            bail!("missing generator type")
+        };
+        let kind = String::from_utf16(&kind.0)?;
+        let settings = match if kind == "minecraft:noise" || kind == "noise" {
+            generator.get("settings")
+        } else {
+            None
+        } {
+            Some(Tag::String(name)) => Some(GeneratorSettings::Named(String::from_utf16(&name.0)?)),
+            Some(value @ Tag::Compound(_)) => Some(GeneratorSettings::Inline(
+                value
+                    .get("sea_level")
+                    .and_then(Tag::as_java_int)
+                    .context("inline noise settings have no sea level")?,
+            )),
+            Some(_) => bail!("invalid generator settings"),
+            None => None,
+        };
+        (kind, settings)
+    };
+    let kind = ResourceId::parse(&kind)?;
+    if kind.namespace != "minecraft" {
+        return Ok(None);
+    }
+    match kind.path.as_str() {
+        "flat" => Ok(Some(-63)),
+        "debug" => Ok(Some(63)),
+        "noise" => match settings.context("noise generator has no settings")? {
+            GeneratorSettings::Inline(level) => Ok(Some(level)),
+            GeneratorSettings::Named(name) => {
+                let id = ResourceId::parse(&name)?;
+                let path = format!(
+                    "data/{}/worldgen/noise_settings/{}.json",
+                    id.namespace, id.path
+                );
+                let data = source
+                    .read_data(&path)?
+                    .with_context(|| format!("missing {path}"))?;
+                let value: Value = serde_json::from_slice(&data)?;
+                let level = value
+                    .get("sea_level")
+                    .and_then(Value::as_i64)
+                    .context("noise settings have no sea level")?;
+                Ok(Some(i32::try_from(level)?))
+            }
+        },
+        _ => Ok(None),
+    }
+}
+
+enum GeneratorSettings {
+    Named(String),
+    Inline(i32),
+}
+
 /// Java bakes the active data-pack dimension registry before falling back to
 /// the level stems stored in world_gen_settings.dat.
 pub fn resolve_dimension_type(
@@ -467,6 +560,61 @@ impl PreviewLighting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sea_level_uses_active_dimension_and_noise_settings() {
+        use native_persistence::nbt::Tag;
+        struct Data {
+            dimension: Option<&'static [u8]>,
+        }
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/dimension/overworld.json" => self.dimension.map(<[u8]>::to_vec),
+                    "data/example/worldgen/noise_settings/custom.json" => {
+                        Some(br#"{"sea_level":77}"#.to_vec())
+                    }
+                    _ => None,
+                })
+            }
+        }
+        let dimension = DimensionId::parse("minecraft:overworld").unwrap();
+        let generator = Tag::Compound(vec![
+            ("type".into(), Tag::String("minecraft:noise".into())),
+            ("settings".into(), Tag::String("example:custom".into())),
+        ]);
+        let saved = BTreeMap::from([(dimension.clone(), generator)]);
+        let mut data = Data { dimension: None };
+        assert_eq!(
+            generator_sea_level(&mut data, &dimension, Some(&saved)).unwrap(),
+            Some(77)
+        );
+        data.dimension =
+            Some(br#"{"generator":{"type":"minecraft:noise","settings":{"sea_level":21}}}"#);
+        assert_eq!(
+            generator_sea_level(&mut data, &dimension, Some(&saved)).unwrap(),
+            Some(21)
+        );
+        data.dimension =
+            Some(br#"{"generator":{"type":"minecraft:flat","settings":{"layers":[]}}}"#);
+        assert_eq!(
+            generator_sea_level(&mut data, &dimension, Some(&saved)).unwrap(),
+            Some(-63)
+        );
+        data.dimension = Some(br#"{"generator":{"type":"example:unknown"}}"#);
+        assert_eq!(
+            generator_sea_level(&mut data, &dimension, Some(&saved)).unwrap(),
+            None
+        );
+        data.dimension = None;
+        assert_eq!(
+            generator_sea_level(&mut data, &dimension, None).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn weather_topology_rejects_extra_weather_levels_and_unknown_types() {

@@ -316,6 +316,8 @@ pub struct LoadedSession {
     weather: Option<crate::weather::Weather>,
     can_have_weather: Option<bool>,
     advance_weather: bool,
+    biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
+    generator_sea_level: Option<i32>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
@@ -2843,6 +2845,56 @@ impl LoadedSession {
         }
     }
 
+    pub fn set_precipitation_environment(
+        &mut self,
+        climates: Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>,
+        sea_level: Option<i32>,
+    ) {
+        self.biome_climates = Some(climates);
+        self.generator_sea_level = sea_level;
+    }
+
+    /// Level.isRainingAt checks the sky, motion-blocking height and biome.
+    /// Unknown or pending light and missing biome data are never guessed.
+    fn rain_at(&self, relative: IVec3) -> Option<bool> {
+        if !self.global_rain()? {
+            return Some(false);
+        }
+        let pos = add(self.origin, relative)?;
+        let chunk_pos = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        let chunk = self.world.chunks.get(&chunk_pos)?;
+        if !chunk.block_light_correct || !self.sky_lighting.is_current() {
+            return None;
+        }
+        if self.world.light(pos.x, pos.y, pos.z, true)? < 15 {
+            return Some(false);
+        }
+        let highest = self.spawn_heightmaps.get(&chunk_pos)?.highest(
+            SpawnHeightmapKind::MotionBlocking,
+            pos.x,
+            pos.z,
+        )?;
+        if highest.checked_add(1)? > pos.y {
+            return Some(false);
+        }
+        // biome_at_block intentionally falls back to quart lookup without a seed;
+        // gameplay must instead wait for the exact zoomed biome.
+        self.world.biome_zoom_seed()?;
+        let biome = self.world.biome_at_block(pos.x, pos.y, pos.z)?;
+        let climate = self.biome_climates.as_ref()?.get(biome)?;
+        if !climate.has_precipitation {
+            return Some(false);
+        }
+        let sea = self.generator_sea_level?;
+        Some(
+            climate.precipitation_at(pos.x, pos.y, pos.z, sea)
+                == native_resources::biome_climate::Precipitation::Rain,
+        )
+    }
+
     pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
         self.vanilla_block_ids = Some(ids);
         self.soil_deferred_revision = None;
@@ -3072,6 +3124,8 @@ impl LoadedSession {
             weather: None,
             can_have_weather: None,
             advance_weather: true,
+            biome_climates: None,
+            generator_sea_level: None,
             vanilla_block_ids: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
@@ -7895,11 +7949,7 @@ impl LoadedSession {
         let Some(moisture) = farmland_moisture(state) else {
             return None;
         };
-        // A globally dry level is definitive. During rain the sky, heightmap
-        // and biome precipitation still need to be checked per block.
-        let rain = self
-            .global_rain()
-            .and_then(|raining| (!raining).then_some(false));
+        let rain = add(relative, IVec3::Y).and_then(|above| self.rain_at(above));
         if moisture == 7 && rain.is_none() {
             return None;
         }
@@ -13813,6 +13863,135 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.weather.as_ref().unwrap().data, data);
         assert_eq!(session.global_rain(), Some(false));
+    }
+
+    #[test]
+    fn rain_requires_known_sky_height_and_zoomed_biome() {
+        use native_resources::biome_climate::{BiomeClimate, TemperatureModifier};
+        let mut session = session();
+        let chunk_pos = session.player_chunk().unwrap();
+        {
+            let world = Arc::make_mut(&mut session.world);
+            let biome = world.intern_biome("minecraft:plains".into());
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            chunk.block_light_correct = true;
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+            section.biomes = Some(Box::new([biome; native_world::loaded::BIOME_COUNT]));
+        }
+        let soil = IVec3::new(8, 3, 8);
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "2")]));
+        {
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks.as_mut().unwrap()[8 + 8 * 16 + 3 * 256] = farmland;
+        }
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(chunk_pos, None))
+            .unwrap();
+        session.set_has_skylight(true).unwrap();
+        session.set_weather(
+            Some(true),
+            Some(native_persistence::world::SavedWeather {
+                raining: true,
+                ..Default::default()
+            }),
+            false,
+        );
+        let climate = BiomeClimate {
+            has_precipitation: true,
+            temperature: 0.8,
+            modifier: TemperatureModifier::None,
+        };
+        let configure = |session: &mut LoadedSession, climate, sea| {
+            session.set_precipitation_environment(
+                Arc::new(BTreeMap::from([("minecraft:plains".into(), climate)])),
+                sea,
+            );
+        };
+        configure(&mut session, climate, Some(63));
+        let pos = IVec3::new(8, 4, 8);
+        assert_eq!(session.rain_at(pos), None, "biome zoom seed is required");
+        Arc::make_mut(&mut session.world).set_biome_world_seed(Some(42));
+        assert_eq!(session.rain_at(pos), Some(true));
+        assert_eq!(
+            session.rain_at(IVec3::new(8, 2, 6)),
+            Some(false),
+            "motion-blocking height obstructs rain"
+        );
+        configure(
+            &mut session,
+            BiomeClimate {
+                temperature: 0.0,
+                ..climate
+            },
+            Some(63),
+        );
+        assert_eq!(
+            session.rain_at(pos),
+            Some(false),
+            "snow does not hydrate farmland"
+        );
+        configure(
+            &mut session,
+            BiomeClimate {
+                has_precipitation: false,
+                ..climate
+            },
+            None,
+        );
+        assert_eq!(
+            session.rain_at(pos),
+            Some(false),
+            "dry biome needs no sea level"
+        );
+        configure(&mut session, climate, None);
+        assert_eq!(
+            session.rain_at(pos),
+            None,
+            "unknown sea level is not guessed"
+        );
+        {
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light =
+                Some(Box::new([0; LIGHT_BYTES]));
+        }
+        assert_eq!(session.rain_at(pos), Some(false), "blocked sky is dry");
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&chunk_pos)
+                .unwrap(),
+        )
+        .block_light_correct = false;
+        assert_eq!(session.rain_at(pos), None, "uncertain light is not used");
+        {
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            chunk.block_light_correct = true;
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).sky_light =
+                Some(Box::new([0xff; LIGHT_BYTES]));
+        }
+        configure(&mut session, climate, Some(63));
+        assert!(session.random_tick_farmland_at(soil));
+        let soil_state = session
+            .world
+            .block(session.origin.x + soil.x, soil.y, session.origin.z + soil.z)
+            .unwrap();
+        assert_eq!(
+            soil_state.properties.get("moisture").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            session.rain_at(pos),
+            None,
+            "pending sky-light work is not trusted"
+        );
     }
 
     #[test]
@@ -23193,7 +23372,7 @@ mod tests {
                 Ok(None)
             }
             fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
-                Ok(vec![br#"{"values":["minecraft:stone","minecraft:ice","minecraft:dirt","minecraft:grass_block","minecraft:stone_bricks"]}"#.to_vec()])
+                Ok(vec![br#"{"values":["minecraft:stone","minecraft:ice","minecraft:dirt","minecraft:grass_block","minecraft:stone_bricks","minecraft:farmland"]}"#.to_vec()])
             }
         }
         let registry = [
@@ -23203,6 +23382,7 @@ mod tests {
             "dirt",
             "grass_block",
             "stone_bricks",
+            "farmland",
             "water",
         ]
         .into_iter()

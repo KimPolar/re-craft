@@ -55,6 +55,10 @@ pub(crate) struct SkyLighting {
 }
 
 impl SkyLighting {
+    pub(crate) fn is_current(&self) -> bool {
+        self.enabled && self.pending.is_empty()
+    }
+
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.invalidate();

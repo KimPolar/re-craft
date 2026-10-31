@@ -1078,6 +1078,40 @@ impl WorldReader {
         Ok(Some(document))
     }
 
+    /// Preserve the saved generator so callers can resolve its settings using
+    /// the active data-pack registry before making simulation decisions.
+    pub fn saved_dimension_generators(&self) -> Result<Option<BTreeMap<DimensionId, Tag>>> {
+        let Some(document) = self.saved_world_gen_document()? else {
+            return Ok(None);
+        };
+        let dimensions = document
+            .value
+            .get("data")
+            .and_then(|data| data.get("dimensions"))
+            .context("world generation data is missing dimensions")?;
+        let Tag::Compound(entries) = dimensions else {
+            bail!("world generation dimensions must be a compound");
+        };
+        let mut result = BTreeMap::new();
+        for (name, stem) in entries {
+            let id = DimensionId::parse(
+                &String::from_utf16(&name.0).context("invalid dimension identifier")?,
+            )?;
+            let generator = stem
+                .get("generator")
+                .context("dimension generator is missing")?;
+            ensure!(
+                matches!(generator, Tag::Compound(_)),
+                "dimension generator must be a compound"
+            );
+            ensure!(
+                result.insert(id, generator.clone()).is_none(),
+                "duplicate dimension identifier"
+            );
+        }
+        Ok(Some(result))
+    }
+
     /// Read the world seed from the 26.3 world-generation saved data.
     pub fn saved_world_seed(&self) -> Result<Option<i64>> {
         let Some(document) = self.saved_world_gen_document()? else {

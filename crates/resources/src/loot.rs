@@ -519,24 +519,38 @@ impl BlockLootTables {
     /// Read tables and referenced predicates from the configured world data packs.
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut result = Self::default();
-        let names = BASIC_BLOCKS
-            .into_iter()
-            .chain(native_core::stairs::ITEMS.iter().copied())
-            .chain(
-                native_core::button::Button::ALL
-                    .into_iter()
-                    .map(|button| button.id().strip_prefix("minecraft:").unwrap()),
-            )
-            .chain(
-                native_core::wood::Planks::ALL
-                    .into_iter()
-                    .map(|planks| planks.id().strip_prefix("minecraft:").unwrap())
-                    .chain(std::iter::once("crafting_table")),
-            )
-            .chain(
-                native_core::wood::Wood::all()
-                    .map(|wood| wood.id().strip_prefix("minecraft:").unwrap()),
-            );
+        let names =
+            BASIC_BLOCKS
+                .into_iter()
+                .chain(native_core::stairs::ITEMS.iter().copied())
+                .chain(
+                    native_core::button::Button::ALL
+                        .into_iter()
+                        .map(|button| button.id().strip_prefix("minecraft:").unwrap()),
+                )
+                .chain(
+                    native_core::wood::Planks::ALL
+                        .into_iter()
+                        .map(|planks| planks.id().strip_prefix("minecraft:").unwrap())
+                        .chain(std::iter::once("crafting_table")),
+                )
+                .chain(
+                    native_core::wood::Wood::all()
+                        .map(|wood| wood.id().strip_prefix("minecraft:").unwrap()),
+                )
+                .map(str::to_owned)
+                .chain(native_core::stairs::ITEMS.iter().map(|name| {
+                    format!("{}_slab", name.strip_suffix("_stairs").expect("stair item"))
+                }))
+                .chain(
+                    [
+                        "cut_red_sandstone_slab",
+                        "cut_sandstone_slab",
+                        "petrified_oak_slab",
+                        "smooth_stone_slab",
+                    ]
+                    .map(str::to_owned),
+                );
         for name in names {
             let id = ResourceId::parse(&format!("minecraft:blocks/{name}"))?;
             let path = format!("data/{}/loot_table/{}.json", id.namespace, id.path);

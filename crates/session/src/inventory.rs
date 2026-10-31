@@ -2391,6 +2391,9 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
     if crate::stair_items::is_stair_item(id) {
         return Some(64);
     }
+    if crate::slab_mining::material(id).is_some() {
+        return Some(64);
+    }
     if native_core::button::Button::from_id(id).is_some() && id.starts_with("minecraft:") {
         return Some(64);
     }

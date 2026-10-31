@@ -113,11 +113,18 @@ pub enum Material {
         hardness_tenths: u8,
         tool: StairTool,
     },
+    Slab {
+        hardness_tenths: u8,
+        tool: StairTool,
+    },
     Unbreakable,
 }
 
 impl Material {
     pub fn from_block_name(name: &str) -> Option<Self> {
+        if let Some(material) = crate::slab_mining::material(name) {
+            return Some(material);
+        }
         if let Some(material) = crate::stair_mining::material(name) {
             return Some(material);
         }
@@ -224,6 +231,9 @@ impl Material {
             Self::CraftingTable | Self::Chest => 2.5,
             Self::Stair {
                 hardness_tenths, ..
+            }
+            | Self::Slab {
+                hardness_tenths, ..
             } => f32::from(hardness_tenths) / 10.0,
             Self::Ore { deepslate, .. } => {
                 if deepslate {
@@ -247,6 +257,10 @@ impl Material {
                 | Self::Snow
                 | Self::SnowBlock
                 | Self::Stair {
+                    tool: StairTool::Pickaxe | StairTool::StonePickaxe,
+                    ..
+                }
+                | Self::Slab {
                     tool: StairTool::Pickaxe | StairTool::StonePickaxe,
                     ..
                 }
@@ -329,6 +343,9 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 Material::Stair {
                     tool: StairTool::Shears,
                     ..
+                } | Material::Slab {
+                    tool: StairTool::Shears,
+                    ..
                 }
             ) {
                 5.0
@@ -374,6 +391,10 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                     tool: StairTool::Pickaxe | StairTool::StonePickaxe,
                     ..
                 }
+                | Material::Slab {
+                    tool: StairTool::Pickaxe | StairTool::StonePickaxe,
+                    ..
+                }
         ),
         "axe" => matches!(
             material,
@@ -383,6 +404,10 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::Wood
                 | Material::WoodButton
                 | Material::Stair {
+                    tool: StairTool::Axe,
+                    ..
+                }
+                | Material::Slab {
                     tool: StairTool::Axe,
                     ..
                 }
@@ -408,6 +433,10 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                         harvest_tier >= required
                     }
                     Material::Stair {
+                        tool: StairTool::StonePickaxe,
+                        ..
+                    }
+                    | Material::Slab {
                         tool: StairTool::StonePickaxe,
                         ..
                     } => !matches!(tier, "wooden" | "golden"),

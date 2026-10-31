@@ -269,8 +269,7 @@ pub fn basic_progress(material: Material, on_ground: bool, eyes_in_water: bool) 
     speed / material.hardness() / if material.needs_tool() { 100.0 } else { 30.0 }
 }
 
-/// Mining properties for ordinary, unenchanted item prototypes and basic blocks.
-/// Unknown component patches and custom tools are deliberately left unresolved.
+/// Mining properties for ordinary and custom tool components.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MiningProperties {
     pub speed: f32,
@@ -308,6 +307,9 @@ impl Default for MiningContext {
 }
 
 pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option<MiningProperties> {
+    if item.is_some_and(|item| item.components().get("minecraft:tool").is_some()) {
+        return None;
+    }
     if basic_hand(item) {
         return Some(MiningProperties {
             speed: 1.0,
@@ -423,6 +425,9 @@ pub fn mining_properties_with_tags(
     tags: u16,
 ) -> Option<MiningProperties> {
     use native_resources::mining_tags as t;
+    if item.is_some_and(|item| item.components().get("minecraft:tool").is_some()) {
+        return None;
+    }
     if basic_hand(item) {
         return Some(MiningProperties {
             speed: 1.0,
@@ -492,6 +497,23 @@ pub fn mining_properties_with_tags(
         damage_per_block: 1,
         can_destroy_in_creative: true,
     })
+}
+
+/// Evaluate a saved custom tool component against the world's active block tags.
+pub fn mining_properties_with_custom_tool(
+    material: Material,
+    item: &ItemStack,
+    block: &str,
+    tags: &native_resources::mining_tags::MiningTags,
+) -> Option<MiningProperties> {
+    if !ordinary_return_supported(item) {
+        return None;
+    }
+    crate::custom_tool::Tool::parse(item.components().get("minecraft:tool")?)?.properties(
+        material,
+        block,
+        Some(tags),
+    )
 }
 
 /// Vanilla progress with the supported default tool component and no effects.
@@ -564,6 +586,7 @@ pub fn destroy_speed(base_speed: f32, context: MiningContext) -> f32 {
 pub(crate) fn basic_hand(item: Option<&ItemStack>) -> bool {
     item.is_none_or(|item| {
         ordinary_return_supported(item)
+            && item.components().get("minecraft:tool").is_none()
             && (matches!(ordinary_item_default_max(item.id()), Some(16 | 64))
                 || item.components().get("!minecraft:tool").is_some())
     })
@@ -583,12 +606,17 @@ pub(crate) struct Candidate {
     /// `None` retains the experimental instant-break behavior for unsupported blocks.
     pub material: Option<Material>,
     pub tags: Option<u16>,
+    /// A custom component must not fall back to the default item rules.
+    pub custom: Option<Option<MiningProperties>>,
 }
 
 fn candidate_properties(
     candidate: Candidate,
     hand: Option<&ItemStack>,
 ) -> Option<MiningProperties> {
+    if let Some(properties) = candidate.custom {
+        return properties;
+    }
     let material = candidate.material?;
     match candidate.tags {
         Some(tags) => mining_properties_with_tags(material, hand, tags),
@@ -669,15 +697,27 @@ impl Mining {
             return None;
         }
         if creative {
-            if mining_properties(Material::Dirt, hand)
-                .is_some_and(|properties| !properties.can_destroy_in_creative)
-            {
+            let creative_allowed = hand
+                .and_then(|item| item.components().get("minecraft:tool"))
+                .map(|component| {
+                    crate::custom_tool::Tool::parse(component).map(|tool| tool.creative())
+                })
+                .unwrap_or_else(|| {
+                    Some(
+                        mining_properties(Material::Dirt, hand)
+                            .is_none_or(|properties| properties.can_destroy_in_creative),
+                    )
+                });
+            if creative_allowed != Some(true) {
                 return None;
             }
             self.cooldown = 5;
             return Some(target.position);
         }
         if target.material == Some(Material::Unbreakable) {
+            return None;
+        }
+        if target.custom == Some(None) {
             return None;
         }
         if candidate_properties(target, hand).is_none() {
@@ -767,12 +807,15 @@ impl Mining {
         if target.material.is_none() {
             return self.begin(Some(target), hand, false, context);
         }
+        let Some(properties) = candidate_properties(target, hand) else {
+            self.active = None;
+            return None;
+        };
         let active = self.active.as_mut().expect("same target has active state");
         active.candidate = target;
         active.progress += progress_with_properties(
             target.material.expect("known material"),
-            candidate_properties(target, hand)
-                .expect("active tool has supported mining properties"),
+            properties,
             context,
         );
         if active.progress >= 1.0 {
@@ -804,6 +847,7 @@ mod tests {
             position,
             material: Some(material),
             tags: None,
+            custom: None,
         }
     }
 
@@ -910,6 +954,7 @@ mod tests {
                 position: IVec3::ZERO,
                 material,
                 tags: None,
+                custom: None,
             };
             let mut mining = Mining::default();
             assert!(mining.press(Some(target), Some(&sword), true).is_none());
@@ -938,6 +983,7 @@ mod tests {
                     position: IVec3::ZERO,
                     material,
                     tags: None,
+                    custom: None,
                 };
                 let mut mining = Mining::default();
                 assert_eq!(mining.press(Some(target), Some(&item), creative), None);
@@ -966,6 +1012,7 @@ mod tests {
                 position: IVec3::ZERO,
                 material: Some(Material::Stone),
                 tags,
+                custom: None,
             };
             let properties = candidate_properties(target, Some(&item)).unwrap();
             assert_eq!(properties.speed, 1.0);
@@ -977,6 +1024,49 @@ mod tests {
                 mining.press(Some(target), Some(&item), true),
                 Some(IVec3::ZERO)
             );
+        }
+    }
+
+    #[test]
+    fn custom_tool_creative_permission_and_unresolved_rules_are_respected() {
+        use native_persistence::nbt::TagType;
+        for (allowed, expected) in [(false, None), (true, Some(IVec3::ZERO))] {
+            let component = Tag::Compound(vec![
+                (
+                    "rules".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+                (
+                    "can_destroy_blocks_in_creative".into(),
+                    Tag::Byte(i8::from(allowed)),
+                ),
+            ]);
+            let item = ItemStack::new(
+                "minecraft:diamond_pickaxe".into(),
+                1,
+                1,
+                Tag::Compound(vec![("minecraft:tool".into(), component)]),
+            )
+            .unwrap();
+            let target = Candidate {
+                position: IVec3::ZERO,
+                material: Some(Material::Stone),
+                tags: None,
+                custom: Some(None),
+            };
+            let mut creative = Mining::default();
+            assert_eq!(creative.press(Some(target), Some(&item), true), expected);
+            let mut survival = Mining::default();
+            assert_eq!(survival.press(Some(target), Some(&item), false), None);
+            for _ in 0..20 {
+                assert_eq!(
+                    survival.tick(Some(target), Some(&item), false, true, false),
+                    None
+                );
+            }
         }
     }
 

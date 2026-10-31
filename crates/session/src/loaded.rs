@@ -6361,6 +6361,17 @@ impl LoadedSession {
                 .mining_tags
                 .as_ref()
                 .and_then(|tags| tags.for_block(&block.name)),
+            custom: self
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Storage(
+                    self.inventory.selected(),
+                ))
+                .filter(|item| item.components().get("minecraft:tool").is_some())
+                .map(|item| {
+                    mining::Material::from_block_name(&block.name).and_then(|material| {
+                        self.mining_properties_for(&block.name, material, Some(item))
+                    })
+                }),
         })
     }
 
@@ -6370,6 +6381,14 @@ impl LoadedSession {
         material: mining::Material,
         hand: Option<&ItemStack>,
     ) -> Option<mining::MiningProperties> {
+        if let Some(item) = hand.filter(|item| item.components().get("minecraft:tool").is_some()) {
+            return mining::mining_properties_with_custom_tool(
+                material,
+                item,
+                name,
+                self.mining_tags.as_deref()?,
+            );
+        }
         match &self.mining_tags {
             Some(tags) => {
                 mining::mining_properties_with_tags(material, hand, tags.for_block(name)?)
@@ -12372,6 +12391,12 @@ mod tests {
             fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Ok(None)
             }
+            fn list_data(
+                &mut self,
+                _: &str,
+            ) -> anyhow::Result<Vec<native_resources::packs::ResourceId>> {
+                Ok(Vec::new())
+            }
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 let id = if path.ends_with("/stone_stairs.json") {
                     "minecraft:stone_stairs"
@@ -12474,6 +12499,98 @@ mod tests {
                     Some(&Tag::Int(damage))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn custom_tool_tag_controls_mining_and_damage_in_loaded_world() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{Tag, TagType};
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:mineable").unwrap()])
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    if path.ends_with("/example/tags/block/mineable.json") {
+                        br#"{"values":["minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    },
+                ])
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/stone.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone"}]}]}"#.to_vec()))
+            }
+        }
+        for (tag, expected_break, expected_damage) in [
+            ("#example:mineable", true, Some(3)),
+            ("#example:missing", false, None),
+        ] {
+            let registry = BTreeSet::from(["minecraft:air".into(), "minecraft:stone".into()]);
+            let mut data = Data;
+            let tags =
+                native_resources::mining_tags::MiningTags::load(&mut data, &registry).unwrap();
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(registry));
+            session.set_mining_tags(Arc::new(tags));
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut data).unwrap()));
+            let rule = Tag::Compound(vec![
+                ("blocks".into(), Tag::String(tag.into())),
+                ("speed".into(), Tag::Float(6.0)),
+                ("correct_for_drops".into(), Tag::Byte(1)),
+            ]);
+            let component = Tag::Compound(vec![
+                (
+                    "rules".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![rule],
+                    },
+                ),
+                ("damage_per_block".into(), Tag::Int(3)),
+            ]);
+            let stack = ItemStack::new(
+                "minecraft:iron_axe".into(),
+                1,
+                1,
+                Tag::Compound(vec![("minecraft:tool".into(), component)]),
+            )
+            .unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(stack))
+            );
+            let pos = IVec3::new(8, 2, 6);
+            session.set_with_notify(pos, session.states[3], false);
+            session.update(TICK * 3);
+            session.submit_command(PlayerCommand::Break);
+            for _ in 0..10 {
+                session.update(TICK);
+            }
+            let block = session
+                .world
+                .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                .unwrap();
+            assert_eq!(block.name == "minecraft:air", expected_break, "{tag}");
+            assert_eq!(
+                session.dropped_items.snapshot().len(),
+                usize::from(expected_break)
+            );
+            assert_eq!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .components()
+                    .get("minecraft:damage")
+                    .and_then(Tag::as_java_int),
+                expected_damage
+            );
         }
     }
 

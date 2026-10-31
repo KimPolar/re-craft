@@ -2490,6 +2490,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             64
+        } else if name.matches("minecraft:tool") {
+            crate::custom_tool::Tool::parse(value)?;
+            128
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {
@@ -2524,6 +2527,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         seen |= flag;
     }
     if seen & 24 == 24 {
+        return None;
+    }
+    if seen & 192 == 192 {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

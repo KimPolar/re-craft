@@ -1,4 +1,4 @@
-//! Active 26.3 block tags used by the default tool components.
+//! Active 26.3 block tags used by tool components.
 
 use crate::{
     heightmap_tags::resolve,
@@ -47,6 +47,7 @@ const ROOTS: [(&str, u16); 16] = [
 #[derive(Clone, Debug)]
 pub struct MiningTags {
     flags: BTreeMap<String, u16>,
+    tags: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl MiningTags {
@@ -58,7 +59,11 @@ impl MiningTags {
             .collect::<Result<Vec<_>>>()?;
         let mut raw = BTreeMap::new();
         let mut failed = BTreeSet::new();
+        let available = provider.list_data("tags/block")?;
         for (id, _) in &roots {
+            read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
+        }
+        for id in &available {
             read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
         }
         let mut cache = BTreeMap::new();
@@ -77,11 +82,26 @@ impl MiningTags {
                     .expect("resolved block belongs to registry") |= mask;
             }
         }
-        Ok(Self { flags })
+        // A malformed unrelated tag must not prevent the default tools from
+        // loading. References to that tag remain unresolved for custom tools.
+        for id in available {
+            let _ = resolve(&id, &raw, registry, &mut cache, &mut BTreeSet::new());
+        }
+        let tags = cache
+            .into_iter()
+            .map(|(id, values)| (format!("{}:{}", id.namespace, id.path), values))
+            .collect();
+        Ok(Self { flags, tags })
     }
 
     pub fn for_block(&self, block: &str) -> Option<u16> {
         self.flags.get(block).copied()
+    }
+
+    /// `None` means the tag or block could not be resolved in this world.
+    pub fn contains(&self, tag: &str, block: &str) -> Option<bool> {
+        self.flags.get(block)?;
+        Some(self.tags.get(tag)?.contains(block))
     }
 }
 
@@ -96,6 +116,18 @@ mod tests {
         }
         fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
             Ok(self.0.get(path).cloned().unwrap_or_default())
+        }
+        fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+            Ok(self
+                .0
+                .keys()
+                .filter_map(|path| {
+                    let path = path.strip_prefix("data/")?;
+                    let (namespace, path) = path.split_once("/tags/block/")?;
+                    let path = path.strip_suffix(".json")?;
+                    ResourceId::parse(&format!("{namespace}:{path}")).ok()
+                })
+                .collect())
         }
     }
     #[test]
@@ -126,6 +158,16 @@ mod tests {
         assert_eq!(tags.for_block("minecraft:stone"), Some(0));
         assert_eq!(tags.for_block("minecraft:oak_stairs"), Some(PICKAXE));
         assert_eq!(tags.for_block("example:absent"), None);
+        assert_eq!(
+            tags.contains("example:group", "minecraft:oak_stairs"),
+            Some(true)
+        );
+        assert_eq!(
+            tags.contains("example:group", "minecraft:stone"),
+            Some(false)
+        );
+        assert_eq!(tags.contains("example:absent", "minecraft:stone"), None);
+        assert_eq!(tags.contains("example:group", "example:absent"), None);
     }
 
     #[test]

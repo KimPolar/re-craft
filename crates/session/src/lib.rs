@@ -20,6 +20,7 @@ pub mod animation;
 pub mod camera;
 pub mod chest_lid;
 pub mod chest_placement;
+mod custom_tool;
 mod equipment_attributes;
 pub use equipment_attributes::ArmorValues;
 pub mod equippable;
@@ -673,6 +674,11 @@ impl LocalSession {
             position: hit.position,
             material,
             tags: None,
+            custom: self
+                .inventory
+                .slot(PlayerSlot::Storage(self.inventory.selected()))
+                .filter(|item| item.components().get("minecraft:tool").is_some())
+                .map(|_| None),
         })
     }
 

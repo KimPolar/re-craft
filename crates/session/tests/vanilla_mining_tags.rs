@@ -10,6 +10,103 @@ use std::{path::PathBuf, process::Command};
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn custom_tool_components_saved_by_java_match_mining() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let version = game.join("versions/26.3");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for lib in manifest["libraries"].as_array().unwrap() {
+        if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let cp = std::env::join_paths(paths).unwrap();
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+        .join("bin");
+    let source = temp.path().join("CustomToolOracle.java");
+    let stacks = temp.path().join("stacks.nbt");
+    let output = temp.path().join("results.bin");
+    std::fs::write(&source, include_str!("java/CustomToolOracle.java")).unwrap();
+    for command in [
+        Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source),
+        Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("CustomToolOracle")
+            .arg(&stacks)
+            .arg(&output),
+    ] {
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "Java oracle failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_block_ids().unwrap();
+    let tags = native_resources::mining_tags::MiningTags::load(&mut resources, &registry).unwrap();
+    let nbt = native_persistence::nbt::read(&std::fs::read(stacks).unwrap()).unwrap();
+    let Tag::List { values, .. } = nbt.value.get("stacks").unwrap() else {
+        panic!("missing stacks")
+    };
+    assert_eq!(values.len(), 6);
+    let bytes = std::fs::read(output).unwrap();
+    assert_eq!(bytes.len(), 6 * 3 * 10);
+    let mut offset = 0;
+    for stack in values {
+        let Tag::String(id) = stack.get("id").unwrap() else {
+            panic!("missing ID")
+        };
+        let id = id.to_string_lossy();
+        let components = stack.get("components").unwrap().clone();
+        let max =
+            native_session::inventory::saved_item_max(&id, &components).expect("custom tool patch");
+        let count = stack.get("count").and_then(Tag::as_java_int).unwrap_or(1) as u32;
+        let item = ItemStack::new(id.clone(), count, max, components).unwrap();
+        for block in ["minecraft:stone", "minecraft:dirt", "minecraft:oak_stairs"] {
+            let properties = mining::mining_properties_with_custom_tool(
+                Material::from_block_name(block).unwrap(),
+                &item,
+                block,
+                &tags,
+            )
+            .unwrap();
+            assert_eq!(
+                properties.speed.to_bits(),
+                u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                "{id} {block}"
+            );
+            assert_eq!(
+                properties.correct_for_drops,
+                bytes[offset + 4] != 0,
+                "{id} {block}"
+            );
+            assert_eq!(
+                properties.damage_per_block,
+                u32::from_be_bytes(bytes[offset + 5..offset + 9].try_into().unwrap())
+            );
+            assert_eq!(properties.can_destroy_in_creative, bytes[offset + 9] != 0);
+            offset += 10;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn removed_tool_component_matches_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

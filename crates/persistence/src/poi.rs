@@ -24,6 +24,154 @@ pub struct PoiRefreshDraft {
     pub changed: bool,
 }
 
+/// A POI chunk reconstructed from its captured source and ordered edits.
+/// The source remains optional because Java may not have written a POI entry.
+pub struct ReconciledPoiDraft {
+    source: Option<NamedTag>,
+    document: NamedTag,
+    position: ChunkPos,
+    discarded_positions: BTreeSet<[i32; 3]>,
+}
+
+impl ReconciledPoiDraft {
+    pub fn source(&self) -> Option<&NamedTag> {
+        self.source.as_ref()
+    }
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+    pub fn discarded_positions(&self) -> &BTreeSet<[i32; 3]> {
+        &self.discarded_positions
+    }
+
+    /// Adds only this POI part of a save; other effects still require validation.
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut crate::save::WorldSavePlan,
+        dimension: crate::world::DimensionId,
+        source: Option<&NamedTag>,
+        timestamp: u32,
+    ) -> Result<()> {
+        let expected = self.source.as_ref().map(crate::nbt::write).transpose()?;
+        let actual = source.map(crate::nbt::write).transpose()?;
+        ensure!(
+            expected == actual,
+            "POI source differs from the draft source"
+        );
+        plan.add_poi_chunk(
+            dimension,
+            self.position,
+            source,
+            &self.document,
+            timestamp,
+            |_, _| Ok(()),
+        )
+    }
+}
+
+/// Reconcile affected sections against their original terrain, then replay
+/// block transitions. The caller must establish terrain provenance and validate
+/// the registry; this incomplete draft does not authorize gameplay saving.
+pub fn reconcile_and_draft_block_changes(
+    source: Option<&SavedPoiChunk>,
+    position: ChunkPos,
+    original_world: &native_world::loaded::World,
+    changes: &[PoiBlockChange],
+    mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+    mut validate_type: impl FnMut(&JavaString) -> Result<()>,
+) -> Result<ReconciledPoiDraft> {
+    let captured = source.map(|chunk| (*chunk.document).clone());
+    let mut current = source
+        .map(|chunk| decode_poi_chunk((*chunk.document).clone(), position))
+        .transpose()?;
+    if let Some(chunk) = source {
+        ensure!(
+            chunk.position == position,
+            "POI source belongs to another chunk"
+        );
+    }
+    let mut sections = BTreeSet::new();
+    for change in changes {
+        let [x, y, z] = change.position;
+        ensure!(
+            x.div_euclid(16) == position.x && z.div_euclid(16) == position.z,
+            "POI change is outside its chunk"
+        );
+        validate_state(&change.expected)?;
+        validate_state(&change.replacement)?;
+        if poi::change(&change.expected, &change.replacement).is_some() {
+            sections.insert(i8::try_from(y.div_euclid(16)).context("POI section is out of range")?);
+        }
+    }
+    ensure!(
+        !sections.is_empty(),
+        "no POI transition requires reconciliation"
+    );
+    let mut discarded_positions = BTreeSet::new();
+    for y in &sections {
+        let refresh = refresh_section(
+            current.as_ref(),
+            position,
+            *y,
+            original_world,
+            &mut validate_state,
+            &mut validate_type,
+        )?;
+        discarded_positions.extend(refresh.discarded_positions);
+        current = refresh
+            .document
+            .map(|document| decode_poi_chunk(document, position))
+            .transpose()?;
+    }
+    // Adding a POI to an empty section causes Java to create that section.
+    let mut document = current
+        .map(|chunk| (*chunk.document).clone())
+        .unwrap_or_else(|| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        });
+    let Tag::Compound(root) = &mut document.value else {
+        unreachable!()
+    };
+    let Tag::Compound(raw_sections) = &mut root
+        .iter_mut()
+        .find(|(key, _)| key.matches("Sections"))
+        .unwrap()
+        .1
+    else {
+        unreachable!()
+    };
+    for y in sections {
+        let name = y.to_string();
+        if !raw_sections.iter().any(|(key, _)| key.matches(&name)) {
+            raw_sections.push((
+                name.as_str().into(),
+                Tag::Compound(vec![
+                    ("Valid".into(), Tag::Byte(1)),
+                    (
+                        "Records".into(),
+                        Tag::List {
+                            element_type: TagType::End,
+                            values: vec![],
+                        },
+                    ),
+                ]),
+            ));
+        }
+    }
+    let prepared = decode_poi_chunk(document, position)?;
+    let draft = draft_changes(&prepared, changes, true, true, validate_state)?;
+    Ok(ReconciledPoiDraft {
+        source: captured,
+        document: draft.document,
+        position,
+        discarded_positions,
+    })
+}
+
 /// Reconcile a missing or invalid POI section with a complete loaded block section.
 /// A valid existing section is left untouched, as in Java 26.3. For invalid
 /// sections, Java retains any previous record at the same position, even if its
@@ -250,7 +398,7 @@ pub fn draft_block_changes(
     changes: &[PoiBlockChange],
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
-    draft_changes(source, changes, false, validate_state)
+    draft_changes(source, changes, false, false, validate_state)
 }
 
 /// Apply transitions in their original order, retaining intermediate POI
@@ -260,13 +408,14 @@ pub fn draft_ordered_block_changes(
     changes: &[PoiBlockChange],
     validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
-    draft_changes(source, changes, true, validate_state)
+    draft_changes(source, changes, true, false, validate_state)
 }
 
 fn draft_changes(
     source: &SavedPoiChunk,
     changes: &[PoiBlockChange],
     ordered: bool,
+    java_stale_poi: bool,
     mut validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
     let original = (*source.document).clone();
@@ -302,10 +451,21 @@ fn draft_changes(
             .records
             .iter()
             .position(|record| record.position == change.position);
-        match (before, index) {
-            (None, None) => {}
-            (Some(kind), Some(index)) if section.records[index].type_id.matches(kind.id) => {}
-            _ => bail!("existing POI does not match the expected block state"),
+        if java_stale_poi {
+            // Java removes by position regardless of the old record's type.
+            // Adding the same type to an occupied position leaves it untouched.
+            if before.is_none()
+                && let (Some(index), Some(kind)) = (index, after)
+                && section.records[index].type_id.matches(kind.id)
+            {
+                continue;
+            }
+        } else {
+            match (before, index) {
+                (None, None) => {}
+                (Some(kind), Some(index)) if section.records[index].type_id.matches(kind.id) => {}
+                _ => bail!("existing POI does not match the expected block state"),
+            }
         }
         let Tag::Compound(root) = &mut document.value else {
             unreachable!()
@@ -688,5 +848,105 @@ mod tests {
         assert!(section.valid);
         assert_eq!(section.records[0].position, [2, 4, 0]);
         assert_eq!(section.records[0].free_tickets, 32);
+    }
+
+    #[test]
+    fn reconcile_missing_and_invalid_sources_before_ordered_changes() {
+        let pos = ChunkPos { x: 0, z: 0 };
+        let air = state("air", &[]);
+        let bell = state("bell", &[]);
+        let empty_world = terrain(&[]);
+        let created = reconcile_and_draft_block_changes(
+            None,
+            pos,
+            &empty_world,
+            &[edit(3, air.clone(), bell.clone())],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(created.source().is_none());
+        let result = decode_poi_chunk(created.document().clone(), pos).unwrap();
+        assert_eq!(result.sections[&0].records[0].position, [3, 4, 0]);
+        assert_eq!(result.sections[&0].records[0].free_tickets, 32);
+        let mut plan = crate::save::WorldSavePlan::new();
+        assert!(
+            created
+                .add_to_save_plan(
+                    &mut plan,
+                    crate::world::DimensionId::parse("overworld").unwrap(),
+                    Some(created.document()),
+                    1
+                )
+                .is_err()
+        );
+        created
+            .add_to_save_plan(
+                &mut plan,
+                crate::world::DimensionId::parse("overworld").unwrap(),
+                None,
+                1,
+            )
+            .unwrap();
+
+        let old = source(false);
+        let world = terrain(&[(1, "composter")]);
+        let updated = reconcile_and_draft_block_changes(
+            Some(&old),
+            pos,
+            &world,
+            &[edit(2, air, bell)],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(updated.discarded_positions(), &BTreeSet::from([[0, 4, 0]]));
+        let result = decode_poi_chunk(updated.document().clone(), pos).unwrap();
+        assert!(result.sections[&0].valid);
+        assert_eq!(result.sections[&0].records.len(), 2);
+        assert_eq!(result.sections[&0].records[0].position, [1, 4, 0]);
+        assert_eq!(result.sections[&0].records[1].position, [2, 4, 0]);
+        let mut plan = crate::save::WorldSavePlan::new();
+        assert!(
+            updated
+                .add_to_save_plan(
+                    &mut plan,
+                    crate::world::DimensionId::parse("overworld").unwrap(),
+                    Some(&old.document),
+                    1
+                )
+                .is_err(),
+            "unknown fields of a discarded POI must stop a write"
+        );
+        let stale = source(false);
+        let world = terrain(&[(0, "bell"), (1, "composter")]);
+        let removed = reconcile_and_draft_block_changes(
+            Some(&stale),
+            pos,
+            &world,
+            &[edit(0, state("bell", &[]), state("air", &[]))],
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let result = decode_poi_chunk(removed.document().clone(), pos).unwrap();
+        assert!(
+            !result.sections[&0]
+                .records
+                .iter()
+                .any(|record| record.position == [0, 4, 0])
+        );
+        let mut plan = crate::save::WorldSavePlan::new();
+        assert!(
+            removed
+                .add_to_save_plan(
+                    &mut plan,
+                    crate::world::DimensionId::parse("overworld").unwrap(),
+                    Some(&stale.document),
+                    1
+                )
+                .is_err(),
+            "unknown retained record data must not be silently discarded"
+        );
     }
 }

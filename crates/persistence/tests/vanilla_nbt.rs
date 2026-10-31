@@ -442,6 +442,12 @@ public class PoiOracle {
     runtime.refresh(add -> { add.accept(new BlockPos(-1,-1,0), meeting); add.accept(new BlockPos(-3,-3,2), meeting); });
     refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
     NbtIo.write(refreshRoot, Path.of(args[0], "refresh-expected.nbt"));
+    runtime.remove(new BlockPos(-3,-3,2));
+    refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
+    NbtIo.write(refreshRoot, Path.of(args[0], "reconciled-expected.nbt"));
+    runtime.remove(new BlockPos(-1,-1,0));
+    refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
+    NbtIo.write(refreshRoot, Path.of(args[0], "reconciled-stale-expected.nbt"));
     var occupied = new PoiSection.Packed(true, List.of(new PoiRecord.Packed(new BlockPos(-1,-1,0), home, 0)));
     var orderedSections = new CompoundTag(); orderedSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, occupied).getOrThrow());
     var orderedRoot = new CompoundTag(); orderedRoot.putInt("DataVersion", 5023); orderedRoot.put("Sections", orderedSections);
@@ -611,6 +617,46 @@ public class PoiOracle {
         records(actual.document.as_ref().unwrap()),
         records(&expected)
     );
+    let reconciled = native_persistence::poi::reconcile_and_draft_block_changes(
+        Some(&source),
+        source.position,
+        &world,
+        &[PoiBlockChange {
+            position: [-3, -3, 2],
+            expected: state("bell", &[]),
+            replacement: state("air", &[]),
+        }],
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let expected =
+        nbt::read(&std::fs::read(temp.path().join("reconciled-expected.nbt")).unwrap()).unwrap();
+    assert_eq!(records(reconciled.document()), records(&expected));
+    let reconciled = native_persistence::poi::reconcile_and_draft_block_changes(
+        Some(&source),
+        source.position,
+        &world,
+        &[
+            PoiBlockChange {
+                position: [-3, -3, 2],
+                expected: state("bell", &[]),
+                replacement: state("air", &[]),
+            },
+            PoiBlockChange {
+                position: [-1, -1, 0],
+                expected: state("bell", &[]),
+                replacement: state("air", &[]),
+            },
+        ],
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let expected =
+        nbt::read(&std::fs::read(temp.path().join("reconciled-stale-expected.nbt")).unwrap())
+            .unwrap();
+    assert_eq!(records(reconciled.document()), records(&expected));
     let ordered_source = SavedPoiChunk {
         position: source.position,
         document: Arc::new(

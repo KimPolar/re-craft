@@ -12,6 +12,7 @@ use zip::ZipArchive;
 
 pub mod asset_index;
 pub mod biome_climate;
+pub mod biome_source;
 pub mod biomes;
 pub mod block_registry;
 pub mod blockstates;

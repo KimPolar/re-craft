@@ -93,6 +93,22 @@ impl DensityEvaluator {
         y: i32,
         z: i32,
     ) -> [f32; N] {
+        self.sample_refs(
+            std::array::from_fn(|index| functions[index].as_ref()),
+            x,
+            y,
+            z,
+        )
+    }
+
+    /// Sample related graphs without cloning their shared references.
+    pub fn sample_refs<const N: usize>(
+        &mut self,
+        functions: [&DensityFunction; N],
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> [f32; N] {
         self.memo.clear();
         self.memo.volume = None;
         std::array::from_fn(|index| {

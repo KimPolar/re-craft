@@ -195,6 +195,25 @@ impl NoiseRouter {
         evaluator.sample_array(&self.functions, x, y, z)
     }
 
+    /// The six climate fields, sharing one point-sampling cache.
+    pub fn sample_climate(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> [f32; 6] {
+        let fields = [
+            RouterField::Temperature,
+            RouterField::Vegetation,
+            RouterField::Continents,
+            RouterField::Erosion,
+            RouterField::Depth,
+            RouterField::Ridges,
+        ];
+        evaluator.sample_refs(fields.map(|field| self.function(field).as_ref()), x, y, z)
+    }
+
     /// Sample a unit-step block volume in Z, X, Y order.
     pub fn sample_block_volume(
         &self,

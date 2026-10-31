@@ -11,11 +11,12 @@ use sha1::{Digest, Sha1};
 use zip::ZipArchive;
 
 pub mod asset_index;
-pub mod biomes;
 pub mod biome_climate;
+pub mod biomes;
 pub mod block_registry;
 pub mod blockstates;
 pub mod datapacks;
+pub mod density;
 pub mod enchantments;
 pub mod entity_collision;
 pub mod fluid_environment;

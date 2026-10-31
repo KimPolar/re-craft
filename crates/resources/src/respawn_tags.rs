@@ -83,6 +83,25 @@ pub fn load_farmland_maintainers(
     .context("cannot resolve farmland maintenance tag")
 }
 
+/// Resolve the active tag used by snowy grass, podzol and mycelium.
+pub fn load_snow_tag(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:snow")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve snowy block tag")
+}
+
 /// Active data-pack overrides used by SnowLayerBlock.canSurvive.
 #[derive(Clone, Debug)]
 pub struct SnowSupportTags {
@@ -328,6 +347,50 @@ mod tests {
         assert_eq!(
             load_farmland_maintainers(&mut provider, &registry).unwrap(),
             BTreeSet::from(["minecraft:stone".into()])
+        );
+    }
+
+    #[test]
+    fn snowy_tag_resolves_active_data_pack_overrides() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/snow.json".into(),
+                vec![
+                    br#"{"values":["minecraft:snow"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#example:custom_snow"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/example/tags/block/custom_snow.json".into(),
+                vec![br#"{"values":["minecraft:stone"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from(["minecraft:stone".into(), "minecraft:snow".into()]);
+        assert_eq!(
+            load_snow_tag(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:stone".into()])
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_snowy_tag_contains_vanilla_snow_blocks() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = source.vanilla_block_ids().unwrap();
+        let tag = load_snow_tag(&mut source, &registry).unwrap();
+        assert_eq!(
+            tag,
+            [
+                "minecraft:snow",
+                "minecraft:snow_block",
+                "minecraft:powder_snow"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         );
     }
 

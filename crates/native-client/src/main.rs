@@ -994,6 +994,10 @@ fn prepare_existing_world(
                     Ok(tags) => session.set_snow_support_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Snow support tags are unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_snow_tag(&mut resources, &registry) {
+                    Ok(tag) => session.set_snowy_tag(Arc::new(tag)),
+                    Err(error) => eprintln!("Snowy block tag is unavailable: {error:#}"),
+                }
             }
             Err(error) => eprintln!("Block tags are unavailable: {error:#}"),
         }

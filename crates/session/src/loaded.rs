@@ -357,6 +357,7 @@ pub struct LoadedSession {
     uncoordinated_falling_lifecycle: bool,
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     snow_support_tags: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
+    snowy_tag: Option<Arc<BTreeSet<String>>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
@@ -1986,6 +1987,10 @@ impl LoadedSession {
         self.snow_support_tags = Some(tags);
     }
 
+    pub fn set_snowy_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.snowy_tag = Some(tag);
+    }
+
     pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.bounce_suppression_tag = Some(tag);
     }
@@ -2343,6 +2348,7 @@ impl LoadedSession {
             uncoordinated_falling_lifecycle: false,
             falling_fire_tag: None,
             snow_support_tags: None,
+            snowy_tag: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             saved_clock_source: None,
@@ -5308,6 +5314,74 @@ impl LoadedSession {
         }
     }
 
+    fn placement_id_at(&mut self, position: IVec3, block: Block) -> Option<BlockStateId> {
+        if !matches!(block, Block::Grass | Block::Podzol | Block::Mycelium) {
+            return Some(self.placement_id(block));
+        }
+        let Cell::State(above) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            add(position, IVec3::Y)?,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let name = &self.world.state(above)?.name;
+        let snowy = self.snowy_setting(name)?;
+        Some(self.intern_block(state(
+            block.item_id()?,
+            &[("snowy", if snowy { "true" } else { "false" })],
+        )))
+    }
+
+    fn snowy_setting(&self, name: &str) -> Option<bool> {
+        if !self.vanilla_block_ids.as_ref()?.contains(name) {
+            return None;
+        }
+        Some(self.snowy_tag.as_ref()?.contains(name))
+    }
+
+    fn update_snowy_below(&mut self, above: IVec3, below: IVec3, id: BlockStateId) {
+        let Some(current) = self.world.state(id) else {
+            return;
+        };
+        if !matches!(
+            current.name.as_str(),
+            "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+        ) || current.properties.len() != 1
+            || !matches!(
+                current.properties.get("snowy").map(String::as_str),
+                Some("true" | "false")
+            )
+        {
+            return;
+        }
+        let Cell::State(above_id) =
+            cell(&self.world, self.origin, self.bounds, above, self.states[0])
+        else {
+            return;
+        };
+        let Some(snowy) = self
+            .world
+            .state(above_id)
+            .and_then(|state| self.snowy_setting(&state.name))
+        else {
+            return;
+        };
+        if current
+            .properties
+            .get("snowy")
+            .is_some_and(|value| (value == "true") == snowy)
+        {
+            return;
+        }
+        let mut updated = current.clone();
+        updated.properties.insert("snowy".into(), snowy.to_string());
+        let id = self.intern_block(updated);
+        self.set(below, id);
+    }
+
     fn soil_cover(&self, soil: SoilKind, name: &str) -> Option<bool> {
         if soil == SoilKind::Path && is_vanilla_fence_gate(name) {
             return Some(false);
@@ -7762,6 +7836,9 @@ impl LoadedSession {
             ) else {
                 continue;
             };
+            if direction == IVec3::NEG_Y {
+                self.update_snowy_below(position, neighbor, id);
+            }
             if self
                 .world
                 .state(id)
@@ -8596,8 +8673,8 @@ impl LoadedSession {
                                 && let Some(block) = self.placement_block(target, block)
                                 && !player_intersects_block(self.player, target, block)
                                 && {
-                                    let id = self.placement_id(block.orient_for_face(hit.face));
-                                    self.set(target, id)
+                                    self.placement_id_at(target, block.orient_for_face(hit.face))
+                                        .is_some_and(|id| self.set(target, id))
                                 }
                             {
                                 handled = true;
@@ -10723,6 +10800,212 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn snowy_placement_and_neighbor_updates_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SnowyBlockOracle.java");
+        let output = temp.path().join("snowy.json");
+        std::fs::write(&source, include_str!("../tests/java/SnowyBlockOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("SnowyBlockOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "snowy oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let output: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let names: BTreeSet<_> = output["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:podzol"
+            ])
+        );
+        let registry: Arc<BTreeSet<String>> = Arc::new(
+            ["air", "stone", "dirt", "snow", "snow_block", "powder_snow"]
+                .into_iter()
+                .map(|id| format!("minecraft:{id}"))
+                .collect(),
+        );
+        let tag: Arc<BTreeSet<String>> = Arc::new(
+            ["stone", "snow", "snow_block"]
+                .into_iter()
+                .map(|id| format!("minecraft:{id}"))
+                .collect(),
+        );
+        let rows = output["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3 * 6 * 2 * 6);
+        for row in rows {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::clone(&registry));
+            session.set_snowy_tag(Arc::clone(&tag));
+            let pos = IVec3::new(4, 2, 4);
+            let block = row["block"].as_str().unwrap();
+            let upper = row["above"].as_str().unwrap();
+            let initial = row["initial"].as_bool().unwrap();
+            let direction = match row["direction"].as_str().unwrap() {
+                "up" => IVec3::Y,
+                "down" => IVec3::NEG_Y,
+                "east" => IVec3::X,
+                "west" => IVec3::NEG_X,
+                "south" => IVec3::Z,
+                "north" => IVec3::NEG_Z,
+                _ => unreachable!(),
+            };
+            let upper_id = session.intern_block(if upper == "minecraft:snow" {
+                state(upper, &[("layers", "1")])
+            } else {
+                state(upper, &[])
+            });
+            assert!(
+                session.set_with_notify(pos + IVec3::Y, upper_id, false)
+                    || upper == "minecraft:air"
+            );
+            let placed = session
+                .placement_id_at(pos, Block::from_item_id(block).unwrap())
+                .unwrap();
+            assert_eq!(
+                session.world.state(placed).unwrap().properties["snowy"],
+                row["placed"].as_bool().unwrap().to_string(),
+                "{row}"
+            );
+            let initial_id = session.intern_block(state(
+                block,
+                &[("snowy", if initial { "true" } else { "false" })],
+            ));
+            assert!(session.set_with_notify(pos, initial_id, false));
+            let source = pos + direction;
+            if direction != IVec3::Y {
+                session.set_with_notify(source, upper_id, false);
+            }
+            session.notify_one_block(source, session.states[0], upper_id);
+            let Cell::State(id) = cell(
+                &session.world,
+                session.origin,
+                session.bounds,
+                pos,
+                session.states[0],
+            ) else {
+                panic!("missing target")
+            };
+            assert_eq!(
+                session.world.state(id).unwrap().properties["snowy"],
+                row["updated"].as_bool().unwrap().to_string(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn snowy_blocks_follow_active_tag_on_placement_and_neighbor_changes() {
+        let mut session = session();
+        let ids: BTreeSet<String> = ["air", "stone", "snow", "snow_block", "powder_snow", "dirt"]
+            .into_iter()
+            .map(|id| format!("minecraft:{id}"))
+            .collect();
+        session.set_vanilla_block_ids(Arc::new(ids));
+        session.set_snowy_tag(Arc::new(
+            ["snow", "snow_block", "powder_snow"]
+                .into_iter()
+                .map(|id| format!("minecraft:{id}"))
+                .collect(),
+        ));
+        let ground = IVec3::new(4, 1, 4);
+        for block in [Block::Grass, Block::Podzol, Block::Mycelium] {
+            let id = session.placement_id_at(ground, block).unwrap();
+            session.set(ground, id);
+            assert_eq!(
+                session.world.state(id).unwrap().properties["snowy"],
+                "false"
+            );
+            for upper in ["snow", "snow_block", "powder_snow"] {
+                let name = format!("minecraft:{upper}");
+                let upper = if upper == "snow" {
+                    state(&name, &[("layers", "1")])
+                } else {
+                    state(&name, &[])
+                };
+                let upper_id = session.intern_block(upper);
+                assert!(session.set(ground + IVec3::Y, upper_id));
+                let Cell::State(id) = cell(
+                    &session.world,
+                    session.origin,
+                    session.bounds,
+                    ground,
+                    session.states[0],
+                ) else {
+                    panic!("ground missing")
+                };
+                assert_eq!(session.world.state(id).unwrap().properties["snowy"], "true");
+                assert!(session.set(ground + IVec3::Y, session.states[0]));
+                let Cell::State(id) = cell(
+                    &session.world,
+                    session.origin,
+                    session.bounds,
+                    ground,
+                    session.states[0],
+                ) else {
+                    panic!("ground missing")
+                };
+                assert_eq!(
+                    session.world.state(id).unwrap().properties["snowy"],
+                    "false"
+                );
+            }
+        }
+        session.set_snowy_tag(Arc::new(BTreeSet::from(["minecraft:stone".into()])));
+        assert!(session.set(ground + IVec3::Y, session.states[3]));
+        for block in [Block::Grass, Block::Podzol, Block::Mycelium] {
+            let id = session.placement_id_at(ground, block).unwrap();
+            assert_eq!(session.world.state(id).unwrap().properties["snowy"], "true");
+        }
+        let unknown = session.intern_block(state("example:unknown", &[]));
+        assert!(session.set(ground + IVec3::Y, unknown));
+        assert!(session.placement_id_at(ground, Block::Grass).is_none());
     }
 
     #[test]

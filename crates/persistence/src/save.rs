@@ -71,6 +71,7 @@ pub struct WorldSavePlan {
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedWorldClocks>,
     weather: Option<PlannedWeather>,
+    level_time: Option<PlannedLevelTime>,
 }
 
 struct PlannedChunk {
@@ -117,6 +118,11 @@ struct PlannedWeather {
     document: crate::nbt::NamedTag,
 }
 
+struct PlannedLevelTime {
+    source_nbt: Vec<u8>,
+    document: nbt::NamedTag,
+}
+
 impl WorldSavePlan {
     pub fn new() -> Self {
         Self::default()
@@ -153,6 +159,10 @@ impl WorldSavePlan {
 
     pub fn has_weather(&self) -> bool {
         self.weather.is_some()
+    }
+
+    pub fn has_level_time(&self) -> bool {
+        self.level_time.is_some()
     }
 
     /// Add a POI chunk to a coordinated partial transaction. The caller must
@@ -332,6 +342,20 @@ impl WorldSavePlan {
         });
         Ok(())
     }
+
+    /// Stage a time-only level.dat update and preserve every other NBT field.
+    pub fn add_level_time(&mut self, source: &nbt::NamedTag, time: i64) -> Result<()> {
+        ensure!(
+            self.level_time.is_none(),
+            "world save plan contains duplicate level data"
+        );
+        let document = crate::world::WorldReader::update_level_game_time(source, time)?;
+        self.level_time = Some(PlannedLevelTime {
+            source_nbt: nbt::write(source)?,
+            document,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -342,6 +366,7 @@ pub struct WorldSaveResult {
     pub player_paths: Vec<PathBuf>,
     pub world_clocks_path: Option<PathBuf>,
     pub weather_path: Option<PathBuf>,
+    pub level_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
 }
 
@@ -654,7 +679,8 @@ impl WorldWriteGuard {
                 || !plan.poi_chunks.is_empty()
                 || !plan.players.is_empty()
                 || plan.world_clocks.is_some()
-                || plan.weather.is_some(),
+                || plan.weather.is_some()
+                || plan.level_time.is_some(),
             "world save plan is empty"
         );
         let mut groups = BTreeMap::<(RegionKind, DimensionId, i32, i32), Vec<RegionChange>>::new();
@@ -737,7 +763,8 @@ impl WorldWriteGuard {
             groups.len()
                 + plan.players.len()
                 + plan.world_clocks.is_some() as usize
-                + plan.weather.is_some() as usize,
+                + plan.weather.is_some() as usize
+                + 2 * plan.level_time.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut absent_dependencies = Vec::new();
@@ -784,6 +811,7 @@ impl WorldWriteGuard {
         let mut player_paths = Vec::with_capacity(plan.players.len());
         let mut world_clocks_path = None;
         let mut weather_path = None;
+        let mut level_path = None;
 
         for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
@@ -997,13 +1025,14 @@ impl WorldWriteGuard {
                 canonical.parent() == Some(player_directory.as_path()),
                 "player data resolves outside its directory"
             );
-            let current = nbt::read_gzip(File::open(&canonical)?)
+            let original_bytes = nbt::decompress_limited(File::open(&canonical)?)?;
+            let current = nbt::read_gzip(original_bytes.as_slice())
                 .context("cannot decode current player data")?;
             ensure!(
                 nbt::write(&current)? == planned.source_nbt,
                 "player data changed after its draft was created"
             );
-            let original_hash = hash_file(&canonical)?;
+            let original_hash: [u8; 32] = Sha256::digest(&original_bytes).into();
             let player_backup_dir = backup.path().join("players");
             fs::create_dir_all(&player_backup_dir)?;
             let player_backup = player_backup_dir.join(&filename);
@@ -1061,7 +1090,7 @@ impl WorldWriteGuard {
                 canonical.parent() == Some(clock_directory.as_path()),
                 "world clock data resolves outside its directory"
             );
-            let original_bytes = fs::read(&canonical)?;
+            let original_bytes = nbt::decompress_limited(File::open(&canonical)?)?;
             let compressed = original_bytes.starts_with(&[0x1f, 0x8b]);
             let current = if compressed {
                 nbt::read_gzip(original_bytes.as_slice())
@@ -1073,7 +1102,7 @@ impl WorldWriteGuard {
                 nbt::write(&current)? == planned.source_nbt,
                 "world clock data changed after its draft was created"
             );
-            let original_hash = hash_file(&canonical)?;
+            let original_hash: [u8; 32] = Sha256::digest(&original_bytes).into();
             let clock_backup_dir = backup.path().join("world-data");
             fs::create_dir_all(&clock_backup_dir)?;
             let clock_backup = clock_backup_dir.join("world_clocks.dat");
@@ -1162,7 +1191,7 @@ impl WorldWriteGuard {
                                 .is_ok_and(|actual| &actual == expected)),
                         "weather data changed after its draft was created"
                     );
-                    let original_hash = hash_file(&canonical)?;
+                    let original_hash: [u8; 32] = Sha256::digest(&bytes).into();
                     let backup_dir = backup.path().join("world-data");
                     fs::create_dir_all(&backup_dir)?;
                     let weather_backup = backup_dir.join("weather.dat");
@@ -1218,10 +1247,97 @@ impl WorldWriteGuard {
             weather_path = Some(target);
         }
 
+        if let Some(planned) = &plan.level_time {
+            let path = self.root.join("level.dat");
+            let meta = fs::symlink_metadata(&path).context("cannot inspect level data")?;
+            ensure!(
+                meta.is_file() && ordinary(&meta),
+                "level data must be an ordinary file"
+            );
+            let canonical = path.canonicalize()?;
+            ensure!(
+                canonical.parent() == Some(self.root.as_path()),
+                "level data resolves outside the world"
+            );
+            let original = nbt::decompress_limited(File::open(&canonical)?)?;
+            let current =
+                nbt::read_gzip(original.as_slice()).context("cannot decode level data")?;
+            crate::world::WorldReader::validate_level_game_time(&current)?;
+            ensure!(
+                nbt::write(&current)? == planned.source_nbt,
+                "level data changed after its draft was created"
+            );
+            let original_hash: [u8; 32] = Sha256::digest(&original).into();
+            let backup_dir = backup.path().join("world-data");
+            fs::create_dir_all(&backup_dir)?;
+            let level_backup = backup_dir.join("level.dat");
+            copy_sync(&canonical, &level_backup)?;
+
+            let old = self.root.join("level.dat_old");
+            let old_source = match fs::symlink_metadata(&old) {
+                Ok(meta) => {
+                    ensure!(
+                        meta.is_file() && ordinary(&meta),
+                        "level.dat_old must be an ordinary file"
+                    );
+                    let old = old.canonicalize()?;
+                    ensure!(
+                        old.parent() == Some(self.root.as_path()),
+                        "level.dat_old resolves outside the world"
+                    );
+                    let hash = hash_file(&old)?;
+                    let old_backup = backup_dir.join("level.dat_old");
+                    copy_sync(&old, &old_backup)?;
+                    Some((old, old_backup, hash))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("cannot inspect level.dat_old"),
+            };
+            let mut old_stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&self.root)?;
+            old_stage.write_all(&original)?;
+            old_stage.flush()?;
+            old_stage.as_file().sync_all()?;
+            let (old_target, old_backup, old_hash) = match old_source {
+                Some((path, backup, hash)) => (path, Some(backup), Some(hash)),
+                None => (old, None, None),
+            };
+            replacements.push(crate::save_transaction::Replacement {
+                target: old_target,
+                backup: old_backup,
+                stage: old_stage,
+                original_hash: old_hash,
+            });
+
+            let replacement = nbt::write(&planned.document)?;
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&replacement)?;
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&self.root)?;
+            stage.write_all(&gzip.finish()?)?;
+            stage.flush()?;
+            stage.as_file().sync_all()?;
+            let staged = nbt::read_gzip(File::open(stage.path())?)?;
+            ensure!(
+                nbt::write(&staged)? == replacement,
+                "staged level data failed the NBT round-trip check"
+            );
+            crate::world::WorldReader::validate_level_game_time(&staged)?;
+            replacements.push(crate::save_transaction::Replacement {
+                target: canonical.clone(),
+                backup: Some(level_backup),
+                stage,
+                original_hash: Some(original_hash),
+            });
+            level_path = Some(canonical);
+        }
+
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}\nlevel={}",
             region_paths.len(),
             plan.chunks.len(),
             entity_region_paths.len(),
@@ -1231,7 +1347,8 @@ impl WorldWriteGuard {
             absent_dependencies.len(),
             plan.players.len(),
             plan.world_clocks.is_some() as usize,
-            plan.weather.is_some() as usize
+            plan.weather.is_some() as usize,
+            plan.level_time.is_some() as usize
         )?;
         note.sync_all()?;
         let backup_directory = backup.keep();
@@ -1255,6 +1372,7 @@ impl WorldWriteGuard {
             player_paths,
             world_clocks_path,
             weather_path,
+            level_path,
             backup_directory,
         })
     }
@@ -1814,6 +1932,73 @@ mod tests {
             .prefix("world-")
             .tempdir_in(root)
             .unwrap()
+    }
+
+    #[test]
+    fn level_time_plan_preserves_data_and_rotates_previous_level() {
+        for old_exists in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let path = world.path().join("level.dat");
+            let (_, initial) = anvil::read_level_document(world.path()).unwrap();
+            let mut source =
+                crate::world::WorldReader::update_level_game_time(&initial, 17).unwrap();
+            let Tag::Compound(root) = &mut source.value else {
+                unreachable!()
+            };
+            root.push(("future_root".into(), Tag::Long(42)));
+            let Tag::Compound(data) = &mut root
+                .iter_mut()
+                .find(|(key, _)| key.matches("Data"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            data.push(("future_data".into(), Tag::String("keep".into())));
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&nbt::write(&source).unwrap()).unwrap();
+            let original = gzip.finish().unwrap();
+            fs::write(&path, &original).unwrap();
+            let old = world.path().join("level.dat_old");
+            if old_exists {
+                fs::write(&old, b"older backup").unwrap();
+            }
+            let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+            let mut plan = WorldSavePlan::new();
+            plan.add_level_time(&source, i64::MIN + 10).unwrap();
+            assert!(plan.has_level_time());
+            assert!(plan.add_level_time(&source, 1).is_err());
+            let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+            assert_eq!(result.level_path, Some(path.canonicalize().unwrap()));
+            let saved = nbt::read_gzip(File::open(&path).unwrap()).unwrap();
+            assert_eq!(
+                crate::world::WorldReader::validate_level_game_time(&saved).unwrap(),
+                i64::MIN + 10
+            );
+            assert_eq!(saved.value.get("future_root"), Some(&Tag::Long(42)));
+            assert_eq!(
+                saved.value.get("Data").unwrap().get("future_data"),
+                Some(&Tag::String("keep".into()))
+            );
+            assert_eq!(fs::read(&old).unwrap(), original);
+            assert_eq!(
+                fs::read(result.backup_directory.join("world-data/level.dat")).unwrap(),
+                original
+            );
+            if old_exists {
+                assert_eq!(
+                    fs::read(result.backup_directory.join("world-data/level.dat_old")).unwrap(),
+                    b"older backup"
+                );
+            }
+            let after = fs::read(&path).unwrap();
+            let mut stale = WorldSavePlan::new();
+            stale.add_level_time(&source, 99).unwrap();
+            assert!(guard.write_plan(stale, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), after);
+            assert_eq!(fs::read(&old).unwrap(), original);
+        }
     }
 
     #[test]
@@ -3174,6 +3359,9 @@ mod tests {
     fn world_save_plan_commits_multiple_chunks_across_regions_atomically() {
         let world = test_world();
         let (region_zero, original_zero, outside) = fixture(world.path());
+        let level_path = world.path().join("level.dat");
+        let original_level_bytes = fs::read(&level_path).unwrap();
+        let (_, level_source) = anvil::read_level_document(world.path()).unwrap();
         let player_data_dir = world.path().join("players/data");
         fs::create_dir_all(&player_data_dir).unwrap();
         let player_uuid = [0x1234_5678, 0x2345_6789, 0x3456_789a, 0x4567_89ab];
@@ -3327,6 +3515,7 @@ mod tests {
         .unwrap();
         plan.add_world_clocks(&clock_source, &clock_states).unwrap();
         plan.add_weather(Some(&weather_source), weather).unwrap();
+        plan.add_level_time(&level_source, 12345).unwrap();
         assert_eq!(plan.chunk_count(), 3);
 
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
@@ -3354,6 +3543,18 @@ mod tests {
         assert_eq!(
             result.world_clocks_path,
             Some(clock_path.canonicalize().unwrap())
+        );
+        assert_eq!(result.level_path, Some(level_path.canonicalize().unwrap()));
+        assert_eq!(
+            fs::read(world.path().join("level.dat_old")).unwrap(),
+            original_level_bytes
+        );
+        assert_eq!(
+            crate::world::WorldReader::validate_level_game_time(
+                &nbt::read_gzip(File::open(&level_path).unwrap()).unwrap()
+            )
+            .unwrap(),
+            12345
         );
         assert_eq!(
             result.weather_path,

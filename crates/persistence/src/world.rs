@@ -1061,6 +1061,72 @@ impl WorldReader {
         Ok(data.get("Time").and_then(Tag::as_java_long).unwrap_or(0))
     }
 
+    /// Validate the parts of level.dat needed for a lossless time-only update.
+    pub fn validate_level_game_time(source: &NamedTag) -> Result<i64> {
+        let Tag::Compound(root) = &source.value else {
+            bail!("level root must be a compound")
+        };
+        ensure!(
+            root.iter().filter(|(name, _)| name.matches("Data")).count() == 1,
+            "level must contain exactly one Data compound"
+        );
+        let Tag::Compound(fields) = source.value.get("Data").context("level data is missing")?
+        else {
+            bail!("level Data must be a compound")
+        };
+        ensure!(
+            fields
+                .iter()
+                .filter(|(name, _)| name.matches("DataVersion"))
+                .count()
+                == 1,
+            "level must contain exactly one DataVersion"
+        );
+        ensure!(
+            source
+                .value
+                .get("Data")
+                .and_then(|data| data.get("DataVersion"))
+                == Some(&Tag::Int(TARGET_DATA_VERSION)),
+            "unsupported level DataVersion"
+        );
+        ensure!(
+            fields
+                .iter()
+                .filter(|(name, _)| name.matches("Time"))
+                .count()
+                <= 1,
+            "duplicate level Time"
+        );
+        match source.value.get("Data").and_then(|data| data.get("Time")) {
+            None => Ok(0),
+            Some(value) => value.as_java_long().context("level Time must be numeric"),
+        }
+    }
+
+    /// Replace only game time, retaining every other level.dat tag.
+    pub fn update_level_game_time(source: &NamedTag, time: i64) -> Result<NamedTag> {
+        Self::validate_level_game_time(source)?;
+        let mut document = source.clone();
+        let Tag::Compound(root) = &mut document.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root
+            .iter_mut()
+            .find(|(key, _)| key.matches("Data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        replace_clock_field(data, "Time", Tag::Long(time));
+        ensure!(
+            Self::validate_level_game_time(&document)? == time,
+            "level time did not round-trip"
+        );
+        Ok(document)
+    }
+
     fn saved_world_gen_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/world_gen_settings.dat");
         let file = match File::open(&path) {
@@ -2513,6 +2579,51 @@ mod tests {
                 WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
             assert_eq!(reader.game_time().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn updating_level_time_rejects_ambiguous_or_unrecognized_data() {
+        let source = level(TARGET_DATA_VERSION);
+        let updated = WorldReader::update_level_game_time(&source, i64::MAX).unwrap();
+        assert_eq!(
+            WorldReader::validate_level_game_time(&updated).unwrap(),
+            i64::MAX
+        );
+        let mut duplicate = source.clone();
+        {
+            let Tag::Compound(root) = &mut duplicate.value else {
+                unreachable!()
+            };
+            let Tag::Compound(data) = &mut root
+                .iter_mut()
+                .find(|(name, _)| name.matches("Data"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            data.push(("Time".into(), Tag::Long(1)));
+            data.push(("Time".into(), Tag::Long(2)));
+        }
+        assert!(WorldReader::update_level_game_time(&duplicate, 3).is_err());
+        {
+            let Tag::Compound(root) = &mut duplicate.value else {
+                unreachable!()
+            };
+            let Tag::Compound(data) = &mut root
+                .iter_mut()
+                .find(|(name, _)| name.matches("Data"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            data.pop();
+            data.pop();
+            data.push(("Time".into(), Tag::String("unsupported".into())));
+        }
+        assert!(WorldReader::update_level_game_time(&duplicate, 3).is_err());
+        assert!(WorldReader::update_level_game_time(&level(1), 3).is_err());
     }
 
     #[test]

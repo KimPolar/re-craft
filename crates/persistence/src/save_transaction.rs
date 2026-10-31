@@ -316,6 +316,7 @@ fn valid_created_target(value: &str, version: u32) -> bool {
     valid_created_entity_region(value)
         || (version >= 4 && valid_created_poi_region(value))
         || (version >= 5 && valid_created_weather(value))
+        || (version >= 6 && value == "level.dat_old")
 }
 
 fn valid_created_weather(value: &str) -> bool {
@@ -334,7 +335,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6),
         "unsupported transaction version"
     );
     ensure!(
@@ -579,6 +580,11 @@ fn prepare(
     }
     let manifest = Manifest {
         version: if records
+            .iter()
+            .any(|record| record.original.is_none() && record.target == "level.dat_old")
+        {
+            6
+        } else if records
             .iter()
             .any(|record| record.original.is_none() && valid_created_weather(&record.target))
         {
@@ -1071,6 +1077,19 @@ mod tests {
     }
 
     #[test]
+    fn changed_existing_source_is_rejected_before_transaction_is_recorded() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (files, dependencies) = replacements(&root);
+        let target = files[0].target.clone();
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(prepare(&root, &backup, files, dependencies).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
     fn created_weather_recovery_is_versioned_and_refuses_unrelated_paths() {
         let weather = "data/minecraft/weather.dat";
         assert!(!valid_created_target(weather, 4));
@@ -1110,6 +1129,87 @@ mod tests {
         fs::write(&target, b"new weather").unwrap();
         assert!(recover(&root).unwrap());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn created_level_backup_is_versioned_and_rolled_back_without_clobbering() {
+        assert!(!valid_created_target("level.dat_old", 5));
+        assert!(valid_created_target("level.dat_old", 6));
+        assert!(!valid_created_target("level.dat", 6));
+        assert!(!valid_created_target("level.dat_old_extra", 6));
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join("level.dat_old");
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(&root)
+            .unwrap();
+        stage.write_all(b"new backup").unwrap();
+        let file = Replacement {
+            target: target.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        };
+        let mut prepared = prepare(&root, &backup, vec![file], vec![]).unwrap();
+        assert_eq!(prepared.manifest.version, 6);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        fs::write(&target, b"new backup").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn interrupted_level_rotation_restores_level_and_terrain_together() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let level = root.join("level.dat");
+        let old = root.join("level.dat_old");
+        fs::write(&level, b"original level").unwrap();
+        fs::write(backup.join("level-original"), b"original level").unwrap();
+        let (mut files, dependencies) = replacements(&root);
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(&root)
+            .unwrap();
+        stage.write_all(b"new level").unwrap();
+        files.push(Replacement {
+            target: level.clone(),
+            backup: Some(backup.join("level-original")),
+            stage,
+            original_hash: Some(hash_file(&level).unwrap()),
+        });
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(&root)
+            .unwrap();
+        stage.write_all(b"original level").unwrap();
+        files.push(Replacement {
+            target: old.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        });
+        let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
+        assert_eq!(prepared.manifest.version, 6);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        replace_one(&root, &prepared.manifest.files[3], prepared.files.remove(2)).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(1)).unwrap();
+        assert_eq!(fs::read(&level).unwrap(), b"new level");
+        drop(prepared);
+        assert!(recover(&root).unwrap());
+        assert_eq!(fs::read(&level).unwrap(), b"original level");
+        assert!(!old.exists());
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
     }
 
     #[test]

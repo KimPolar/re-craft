@@ -31,6 +31,7 @@ fn weather_timer_and_intensities_match_java() {
     let output = temp.path().join("weather.json");
     let saved_data = temp.path().join("weather.dat");
     let rust_data = temp.path().join("rust-weather.dat");
+    let rust_level = temp.path().join("rust-level.dat");
     let state = SavedWeather {
         clear_weather_time: 37,
         rain_time: 239,
@@ -49,6 +50,26 @@ fn weather_timer_and_intensities_match_java() {
         file.write_all(&native_persistence::nbt::write(&document).unwrap())
             .unwrap();
         file.finish().unwrap();
+        let level = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "Data".into(),
+                native_persistence::nbt::Tag::Compound(vec![(
+                    "DataVersion".into(),
+                    native_persistence::nbt::Tag::Int(5023),
+                )]),
+            )]),
+        };
+        let level =
+            native_persistence::world::WorldReader::update_level_game_time(&level, i64::MIN + 10)
+                .unwrap();
+        let mut file = flate2::write::GzEncoder::new(
+            std::fs::File::create(&rust_level).unwrap(),
+            flate2::Compression::default(),
+        );
+        file.write_all(&native_persistence::nbt::write(&level).unwrap())
+            .unwrap();
+        file.finish().unwrap();
     }
     std::fs::write(&source, include_str!("java/WeatherOracle.java")).unwrap();
     for command in [
@@ -62,7 +83,8 @@ fn weather_timer_and_intensities_match_java() {
             .arg("WeatherOracle")
             .arg(&output)
             .arg(&saved_data)
-            .arg(&rust_data),
+            .arg(&rust_data)
+            .arg(&rust_level),
     ] {
         let result = command.output().unwrap();
         assert!(

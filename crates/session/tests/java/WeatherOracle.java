@@ -51,6 +51,9 @@ public class WeatherOracle {
         var rustDocument = NbtIo.readCompressed(Path.of(args[2]), NbtAccounter.unlimitedHeap());
         var rustWeather = WeatherData.CODEC.parse(NbtOps.INSTANCE, rustDocument.get("data")).getOrThrow();
         if (rustWeather.getClearWeatherTime() != 37 || rustWeather.getRainTime() != 239 || rustWeather.getThunderTime() != 919 || !rustWeather.isRaining() || rustWeather.isThundering()) throw new AssertionError("Rust weather document differs");
+        var levelDocument = NbtIo.readCompressed(Path.of(args[3]), NbtAccounter.unlimitedHeap());
+        var levelData = new com.mojang.serialization.Dynamic<>(NbtOps.INSTANCE, levelDocument.get("Data"));
+        if (levelData.get("Time").asLong(0) != -9223372036854775798L) throw new AssertionError("Rust level time differs");
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); var u=(sun.misc.Unsafe)f.get(null);
         var world=(World)u.allocateInstance(World.class); var rules=(Rules)u.allocateInstance(Rules.class);
         var server=(Server)u.allocateInstance(Server.class); server.list=(Players)u.allocateInstance(Players.class);

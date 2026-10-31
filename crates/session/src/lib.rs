@@ -55,6 +55,7 @@ mod stair_items;
 mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
+pub mod weather;
 pub mod world_spawn;
 
 #[cfg(test)]

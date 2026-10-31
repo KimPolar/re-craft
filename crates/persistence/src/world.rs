@@ -20,6 +20,16 @@ const REGION_SIDE: i32 = 32;
 const MAX_AREA_RADIUS: u32 = 32;
 const MAX_OPEN_REGIONS: usize = 32;
 
+/// The shared 26.3 weather data saved in `data/minecraft/weather.dat`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SavedWeather {
+    pub clear_weather_time: i32,
+    pub rain_time: i32,
+    pub thunder_time: i32,
+    pub raining: bool,
+    pub thundering: bool,
+}
+
 /// A 26.3 world clock. Ticks advance in single precision like the Java server.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SavedClock {
@@ -668,6 +678,7 @@ pub struct DataPackSettings {
 pub struct FluidGameRules {
     pub random_tick_speed: i32,
     pub advance_time: bool,
+    pub advance_weather: bool,
     pub water_source_conversion: bool,
     pub lava_source_conversion: bool,
     pub block_drops: bool,
@@ -685,6 +696,7 @@ impl Default for FluidGameRules {
         Self {
             random_tick_speed: 3,
             advance_time: true,
+            advance_weather: true,
             water_source_conversion: true,
             lava_source_conversion: false,
             block_drops: true,
@@ -735,6 +747,62 @@ fn nbt_bool(tag: &Tag) -> Option<bool> {
         Tag::Float(value) => *value != 0.0,
         Tag::Double(value) => *value != 0.0,
         _ => return None,
+    })
+}
+
+/// Decode a 26.3 weather saved-data document without changing unknown fields.
+pub fn parse_weather_data(root: &NamedTag) -> Result<SavedWeather> {
+    let Tag::Compound(fields) = &root.value else {
+        bail!("weather root must be a compound")
+    };
+    for name in ["DataVersion", "data"] {
+        ensure!(
+            fields.iter().filter(|(key, _)| key.matches(name)).count() == 1,
+            "weather document must contain exactly one {name}"
+        );
+    }
+    match root.value.get("DataVersion") {
+        Some(Tag::Int(TARGET_DATA_VERSION)) => {}
+        Some(Tag::Int(version)) => {
+            bail!("unsupported weather DataVersion {version}; expected {TARGET_DATA_VERSION}")
+        }
+        _ => bail!("weather document is missing integer DataVersion"),
+    }
+    let data = root
+        .value
+        .get("data")
+        .context("weather document is missing data")?;
+    let Tag::Compound(fields) = data else {
+        bail!("weather data must be a compound")
+    };
+    for name in [
+        "clear_weather_time",
+        "rain_time",
+        "thunder_time",
+        "raining",
+        "thundering",
+    ] {
+        ensure!(
+            fields.iter().filter(|(key, _)| key.matches(name)).count() == 1,
+            "weather data must contain exactly one {name}"
+        );
+    }
+    let integer = |name| -> Result<i32> {
+        data.get(name)
+            .and_then(Tag::as_java_int)
+            .with_context(|| format!("weather {name} must be a number"))
+    };
+    let boolean = |name| -> Result<bool> {
+        data.get(name)
+            .and_then(nbt_bool)
+            .with_context(|| format!("weather {name} must be a boolean"))
+    };
+    Ok(SavedWeather {
+        clear_weather_time: integer("clear_weather_time")?,
+        rain_time: integer("rain_time")?,
+        thunder_time: integer("thunder_time")?,
+        raining: boolean("raining")?,
+        thundering: boolean("thundering")?,
     })
 }
 
@@ -1248,6 +1316,29 @@ impl WorldReader {
             .unwrap_or_else(|| Ok(BTreeMap::new()))
     }
 
+    /// The server uses a zero-initialized weather state when this file is absent.
+    pub fn weather_data(&self) -> Result<SavedWeather> {
+        let path = self.root.join("data/minecraft/weather.dat");
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SavedWeather::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot open {}", path.display()));
+            }
+        };
+        let bytes = nbt::decompress_limited(file)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let root = if bytes.starts_with(&[0x1f, 0x8b]) {
+            nbt::read_gzip(bytes.as_slice())
+        } else {
+            nbt::read(&bytes)
+        }
+        .with_context(|| format!("invalid {}", path.display()))?;
+        parse_weather_data(&root)
+    }
+
     /// Serialize updated clock states while retaining unrecognized NBT fields.
     /// The supplied map is expected to contain the complete set of loaded clocks.
     pub fn update_world_clock_document(
@@ -1397,6 +1488,7 @@ impl WorldReader {
         Ok(FluidGameRules {
             random_tick_speed,
             advance_time: read("advance_time", true)?,
+            advance_weather: read("advance_weather", true)?,
             water_source_conversion: read("water_source_conversion", true)?,
             lava_source_conversion: read("lava_source_conversion", false)?,
             block_drops: read("block_drops", true)?,
@@ -1836,6 +1928,68 @@ mod tests {
                 ]),
             )]),
         }
+    }
+
+    #[test]
+    fn weather_saved_data_reads_only_26_3_and_never_changes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let reader =
+            WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        assert_eq!(reader.weather_data().unwrap(), SavedWeather::default());
+        let path = dir.path().join("data/minecraft/weather.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![
+                        ("clear_weather_time".into(), Tag::Int(23)),
+                        ("rain_time".into(), Tag::Int(-1)),
+                        ("thunder_time".into(), Tag::Int(50)),
+                        ("raining".into(), Tag::Byte(1)),
+                        ("thundering".into(), Tag::Byte(0)),
+                        ("future".into(), Tag::String("preserve".into())),
+                    ]),
+                ),
+            ]),
+        };
+        for compressed in [false, true] {
+            if compressed {
+                write_gzip(&path, &document)
+            } else {
+                std::fs::write(&path, nbt::write(&document).unwrap()).unwrap()
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                reader.weather_data().unwrap(),
+                SavedWeather {
+                    clear_weather_time: 23,
+                    rain_time: -1,
+                    thunder_time: 50,
+                    raining: true,
+                    thundering: false
+                }
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        if let Tag::Compound(fields) = &mut document.value {
+            fields[0].1 = Tag::Int(TARGET_DATA_VERSION - 1);
+        }
+        write_gzip(&path, &document);
+        assert!(reader.weather_data().is_err());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields[0].1 = Tag::Int(TARGET_DATA_VERSION);
+        let Tag::Compound(data) = &mut fields[1].1 else {
+            unreachable!()
+        };
+        data.push(("raining".into(), Tag::Byte(0)));
+        write_gzip(&path, &document);
+        assert!(reader.weather_data().is_err());
     }
 
     #[test]
@@ -2406,6 +2560,7 @@ mod tests {
                         ("minecraft:respawn_radius".into(), Tag::Int(7)),
                         ("minecraft:random_tick_speed".into(), Tag::Int(9)),
                         ("minecraft:advance_time".into(), Tag::Byte(0)),
+                        ("minecraft:advance_weather".into(), Tag::Byte(0)),
                     ]),
                 ),
             ]),
@@ -2421,6 +2576,7 @@ mod tests {
                 FluidGameRules {
                     random_tick_speed: 9,
                     advance_time: false,
+                    advance_weather: false,
                     water_source_conversion: false,
                     lava_source_conversion: true,
                     block_drops: false,

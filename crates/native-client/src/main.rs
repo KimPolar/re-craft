@@ -55,6 +55,8 @@ mod text_component;
 mod toggle_key;
 mod video_ui;
 mod visual_look;
+#[cfg(test)]
+mod weather_column_tests;
 #[cfg(all(test, target_os = "windows"))]
 mod window_test;
 

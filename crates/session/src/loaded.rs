@@ -267,8 +267,8 @@ pub struct LoadedSession {
     random_tick_speed: u32,
     random_block_position: native_core::random::BlockRandomPosition,
     random_tick_revision: Option<u64>,
-    random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, usize)>,
-    active_random_tick_sections: Vec<(ChunkPos, i8, usize)>,
+    random_tick_sections: BTreeMap<(ChunkPos, i8), (std::sync::Weak<Section>, RandomTickCounts)>,
+    active_random_tick_sections: Vec<(ChunkPos, i8, RandomTickCounts)>,
     flight_speed: f32,
     walking_speed: f32,
     flight: crate::physics::FlightState,
@@ -528,6 +528,12 @@ struct RecordedBlockEdit {
     /// None means the source section had no known block data.
     original: Option<BlockStateId>,
     current: BlockStateId,
+}
+
+#[derive(Clone, Default)]
+struct RandomTickCounts {
+    lit_ores: usize,
+    snow: Arc<[usize]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5798,19 +5804,29 @@ impl LoadedSession {
         self.set(relative, id)
     }
 
-    /// Cache only sections containing a currently lit redstone ore. Unchanged
-    /// sections are reused across world revisions, including streamed chunks.
+    /// Cache known randomly ticking blocks in each immutable section.
     fn refresh_random_tick_sections(&mut self) {
         if self.random_tick_revision == Some(self.revision) {
             return;
         }
-        let lit_ids: Vec<_> = (0..self.world.state_count())
-            .filter_map(|index| {
-                let id = BlockStateId(u32::try_from(index).ok()?);
-                (self.world.state(id).and_then(redstone_ore_lit) == Some(true)).then_some(id)
+        let kinds: Vec<_> = (0..self.world.state_count())
+            .map(|index| {
+                let Some(id) = u32::try_from(index).ok().map(BlockStateId) else {
+                    return 0;
+                };
+                let Some(state) = self.world.state(id) else {
+                    return 0;
+                };
+                if redstone_ore_lit(state) == Some(true) {
+                    1
+                } else if native_world::collision::snow_layers(state).is_some() {
+                    2
+                } else {
+                    0
+                }
             })
             .collect();
-        if lit_ids.is_empty() {
+        if !kinds.iter().any(|kind| *kind != 0) {
             self.random_tick_sections.clear();
             self.active_random_tick_sections.clear();
             self.random_tick_revision = Some(self.revision);
@@ -5832,9 +5848,18 @@ impl LoadedSession {
                 if same {
                     continue;
                 }
-                let active = section.blocks.as_ref().map_or(0, |blocks| {
-                    blocks.iter().filter(|id| lit_ids.contains(id)).count()
-                });
+                let mut active = RandomTickCounts::default();
+                let mut snow = Vec::new();
+                if let Some(blocks) = &section.blocks {
+                    for (index, id) in blocks.iter().enumerate() {
+                        match kinds.get(id.0 as usize) {
+                            Some(1) => active.lit_ores += 1,
+                            Some(2) => snow.push(index),
+                            _ => {}
+                        }
+                    }
+                }
+                active.snow = snow.into();
                 self.random_tick_sections
                     .insert(key, (Arc::downgrade(section), active));
             }
@@ -5845,7 +5870,11 @@ impl LoadedSession {
             .random_tick_sections
             .iter()
             .filter_map(|(&(chunk, section), (_, active))| {
-                (*active > 0).then_some((chunk, section, *active))
+                (active.lit_ores > 0 || !active.snow.is_empty()).then_some((
+                    chunk,
+                    section,
+                    active.clone(),
+                ))
             })
             .collect();
         self.random_tick_revision = Some(self.revision);
@@ -5865,7 +5894,13 @@ impl LoadedSession {
                 continue;
             };
             let y = i32::from(section) * 16;
+            let mut snow_active = self.snow_can_melt_in_section(chunk, section, &active.snow);
             for index in 0..self.random_tick_speed {
+                if active.lit_ores == 0 && !snow_active {
+                    self.random_block_position
+                        .skip(self.random_tick_speed - index);
+                    break;
+                }
                 let [dx, dy, dz] = self.random_block_position.next_section_offset();
                 let Some(absolute) = x
                     .checked_add(dx)
@@ -5875,17 +5910,111 @@ impl LoadedSession {
                     continue;
                 };
                 if let Some(relative) = subtract(absolute, self.origin) {
-                    if self.set_redstone_ore_lit(relative, false) {
-                        active -= 1;
-                        if active == 0 {
-                            self.random_block_position
-                                .skip(self.random_tick_speed - index - 1);
-                            break;
-                        }
+                    let changed = if self.set_redstone_ore_lit(relative, false) {
+                        active.lit_ores = active.lit_ores.saturating_sub(1);
+                        true
+                    } else {
+                        self.melt_snow_at(relative, absolute)
+                    };
+                    if changed {
+                        snow_active = self.snow_can_melt_in_section(chunk, section, &active.snow);
                     }
                 }
             }
         }
+    }
+
+    /// Check actual snow positions so a high randomTickSpeed can skip dark or
+    /// unavailable sections without looping for every sampled coordinate.
+    fn snow_can_melt_in_section(&self, chunk: ChunkPos, section_y: i8, snow: &[usize]) -> bool {
+        if snow.is_empty()
+            || !self.pending_light.is_empty()
+            || !self
+                .dropped_items
+                .can_drop_block_without_entity("minecraft:snow", self.loot.as_deref())
+        {
+            return false;
+        }
+        let Some(chunk) = self.world.chunks.get(&chunk) else {
+            return false;
+        };
+        if !chunk.block_light_correct {
+            return false;
+        }
+        let Some(section) = chunk.sections.get(&section_y) else {
+            return false;
+        };
+        let (Some(blocks), Some(light)) = (&section.blocks, &section.block_light) else {
+            return false;
+        };
+        snow.iter().any(|&index| {
+            let Some(state) = blocks.get(index).and_then(|id| self.world.state(*id)) else {
+                return false;
+            };
+            if native_world::collision::snow_layers(state).is_none() {
+                return false;
+            }
+            light.get(index / 2).is_some_and(|value| {
+                let light = if index % 2 == 0 {
+                    value & 15
+                } else {
+                    value >> 4
+                };
+                crate::snow::melts_in_block_light(light)
+            })
+        })
+    }
+
+    fn melt_snow_at(&mut self, relative: IVec3, absolute: IVec3) -> bool {
+        if !self.pending_light.is_empty() {
+            return false;
+        }
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        if self
+            .world
+            .state(id)
+            .and_then(native_world::collision::snow_layers)
+            .is_none()
+        {
+            return false;
+        }
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        if !self
+            .world
+            .chunks
+            .get(&chunk)
+            .is_some_and(|chunk| chunk.block_light_correct)
+            || !self
+                .world
+                .light(absolute.x, absolute.y, absolute.z, false)
+                .is_some_and(crate::snow::melts_in_block_light)
+        {
+            return false;
+        }
+        if self
+            .dropped_items
+            .drop_block_without_entity(
+                absolute,
+                "minecraft:snow",
+                self.block_drops,
+                self.loot.as_deref(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.set(relative, self.states[0])
     }
 
     fn mining_target(&self) -> Option<mining::Candidate> {
@@ -22842,6 +22971,151 @@ mod tests {
             session.update(TICK);
             assert!(
                 matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if session.world.state(id).and_then(redstone_ore_lit) == Some(true))
+            );
+        }
+    }
+
+    #[test]
+    fn snow_random_ticks_use_block_light_and_non_entity_loot() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct LootSource {
+            unsupported: bool,
+        }
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                if path != "data/minecraft/loot_table/blocks/snow.json" {
+                    return Ok(None);
+                }
+                Ok(Some(if self.unsupported {
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"example:unknown"},"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#.to_vec()
+                } else {
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","modifier":{"type":"minecraft:set_count","count":2}}]}]}"#.to_vec()
+                }))
+            }
+        }
+        let seed = (0..10000)
+            .find(|&seed| {
+                let [x, y, z] =
+                    native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+                (3..=12).contains(&x) && (3..=12).contains(&y) && (3..=12).contains(&z)
+            })
+            .unwrap();
+        let coordinate = IVec3::from_array(
+            native_core::random::BlockRandomPosition::new(seed).next_section_offset(),
+        );
+        for (light, drops, unsupported, expected_melt) in [
+            (0, true, false, false),
+            (11, true, false, false),
+            (12, true, false, true),
+            (15, false, false, true),
+            (15, true, true, false),
+        ] {
+            for layers in [1, 8] {
+                let mut session = session();
+                session.set_block_drops(drops);
+                session.set_block_loot(Arc::new(
+                    BlockLootTables::load(&mut LootSource { unsupported }).unwrap(),
+                ));
+                let snow = session
+                    .intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+                let home = session.player_chunk().unwrap();
+                let world = Arc::make_mut(&mut session.world);
+                let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+                chunk.block_light_correct = true;
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                let index = coordinate.x as usize
+                    + coordinate.z as usize * 16
+                    + coordinate.y as usize * 256;
+                section.blocks.as_mut().unwrap()[index] = snow;
+                let mut block_light = Box::new([0; LIGHT_BYTES]);
+                block_light[index / 2] = if index % 2 == 0 { light } else { light << 4 };
+                section.block_light = Some(block_light);
+                section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+                session.revision += 1;
+                session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+                session.set_random_tick_speed(1);
+                session.advance_random_block_ticks();
+                let absolute = session.origin + coordinate;
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    if expected_melt {
+                        "minecraft:air"
+                    } else {
+                        "minecraft:snow"
+                    },
+                    "light={light} drops={drops} layers={layers} unsupported={unsupported}"
+                );
+                let items = session.dropped_items.snapshot();
+                assert_eq!(items.len(), usize::from(expected_melt && drops));
+                if let Some(item) = items.first() {
+                    assert_eq!(item.stack.id(), "minecraft:stick");
+                    assert_eq!(item.stack.count(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dark_snow_random_ticks_skip_without_changing_random_sequence() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/snow.json")
+                    .then(|| br#"{"type":"minecraft:block","pools":[]}"#.to_vec()))
+            }
+        }
+        for light in [0_u8, 12] {
+            let mut session = session();
+            let seed = 123;
+            let pos = IVec3::from_array(
+                native_core::random::BlockRandomPosition::new(seed).next_section_offset(),
+            );
+            let snow = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+            assert!(session.set(pos, snow));
+            session.pending_light.clear();
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut LootSource).unwrap()));
+            let home = session.player_chunk().unwrap();
+            let chunk = Arc::make_mut(
+                Arc::make_mut(&mut session.world)
+                    .chunks
+                    .get_mut(&home)
+                    .unwrap(),
+            );
+            chunk.block_light_correct = true;
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light = Some(Box::new([light | (light << 4); LIGHT_BYTES]));
+            session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+            session.set_random_tick_speed(i32::MAX as u32);
+            let mut expected = native_core::random::BlockRandomPosition::new(seed);
+            expected.skip(i32::MAX as u32);
+            session.advance_random_block_ticks();
+            assert_eq!(
+                session.random_block_position.next_section_offset(),
+                expected.next_section_offset()
+            );
+            let absolute = session.origin + pos;
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                if light == 0 {
+                    "minecraft:snow"
+                } else {
+                    "minecraft:air"
+                }
             );
         }
     }

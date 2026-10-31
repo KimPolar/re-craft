@@ -1626,6 +1626,38 @@ impl ItemEntities {
         }
     }
 
+    /// Evaluate non-entity loot before changing the block, so unsupported data
+    /// packs cannot silently erase their drops.
+    pub(crate) fn can_drop_block_without_entity(
+        &self,
+        name: &str,
+        tables: Option<&BlockLootTables>,
+    ) -> bool {
+        let Some(tables) = tables else {
+            return false;
+        };
+        let mut random = self.random.clone();
+        tables.drops_without_entity(name, Some(&mut random)).is_ok()
+    }
+
+    pub(crate) fn drop_block_without_entity(
+        &mut self,
+        position: IVec3,
+        name: &str,
+        enabled: bool,
+        tables: Option<&BlockLootTables>,
+    ) -> anyhow::Result<()> {
+        let tables = tables.ok_or_else(|| anyhow::anyhow!("block loot table unavailable"))?;
+        // Commit the RNG only after the complete evaluation succeeds.
+        let mut random = self.random.clone();
+        let drops = tables.drops_without_entity(name, Some(&mut random))?;
+        self.random = random;
+        if enabled {
+            self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops, None);
+        }
+        Ok(())
+    }
+
     /// Spawn a previously evaluated block-interaction loot table.
     pub fn drop_interaction(
         &mut self,

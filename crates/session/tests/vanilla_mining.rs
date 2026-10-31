@@ -981,6 +981,41 @@ public class FallingCollisionOracle {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn snow_random_tick_light_gate_matches_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("SnowMeltOracle.java");
+    let output = temp.path().join("snow-melt.json");
+    std::fs::write(&source, include_str!("java/SnowMeltOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("SnowMeltOracle")
+        .arg(&output));
+    let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(rows.len(), 256);
+    for row in rows {
+        assert_eq!(row["saw_block"].as_bool(), Some(true), "{row}");
+        assert_eq!(row["saw_sky"].as_bool(), Some(false), "{row}");
+        assert_eq!(
+            native_session::snow::melts_in_block_light(row["block"].as_u64().unwrap() as u8),
+            row["reached_loot"].as_bool().unwrap(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn falling_block_landing_replacement_matches_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

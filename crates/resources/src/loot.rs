@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 37] = [
+const BASIC_BLOCKS: [&str; 38] = [
     "grass_block",
     "dirt",
     "sand",
@@ -48,6 +48,7 @@ const BASIC_BLOCKS: [&str; 37] = [
     "nether_quartz_ore",
     "chest",
     "trapped_chest",
+    "snow",
 ];
 
 /// Loot functions consume both floating-point and bounded integer random values.
@@ -95,6 +96,7 @@ pub struct Drop {
 #[derive(Clone, Debug)]
 enum Condition {
     Always,
+    ThisEntityPresent,
     Tool(ToolPredicate),
     All(Vec<Condition>),
     Any(Vec<Condition>),
@@ -131,16 +133,22 @@ pub struct BasicTool<'a> {
 impl Condition {
     fn fully_supported(&self) -> bool {
         match self {
-            Self::Unsupported(_) => false,
+            Self::Unsupported(_) | Self::ThisEntityPresent => false,
             Self::Tool(predicate) => predicate.unsupported.is_none(),
             Self::All(values) | Self::Any(values) => values.iter().all(Self::fully_supported),
             Self::Not(value) => value.fully_supported(),
             _ => true,
         }
     }
-    fn test(&self, tool: BasicTool<'_>, random: &mut Option<&mut dyn LootRandom>) -> Result<bool> {
+    fn test(
+        &self,
+        tool: BasicTool<'_>,
+        random: &mut Option<&mut dyn LootRandom>,
+        entity_present: Option<bool>,
+    ) -> Result<bool> {
         match self {
             Self::Always => Ok(true),
+            Self::ThisEntityPresent => entity_present.context("loot entity context is unavailable"),
             Self::Tool(predicate) => {
                 if let Some(reason) = &predicate.unsupported {
                     bail!("unsupported tool predicate: {reason}");
@@ -178,7 +186,7 @@ impl Condition {
             }
             Self::All(conditions) => {
                 for condition in conditions {
-                    if !condition.test(tool, random)? {
+                    if !condition.test(tool, random, entity_present)? {
                         return Ok(false);
                     }
                 }
@@ -186,13 +194,13 @@ impl Condition {
             }
             Self::Any(conditions) => {
                 for condition in conditions {
-                    if condition.test(tool, random)? {
+                    if condition.test(tool, random, entity_present)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            Self::Not(condition) => Ok(!condition.test(tool, random)?),
+            Self::Not(condition) => Ok(!condition.test(tool, random, entity_present)?),
             Self::TableBonus(enchantment, chances) => {
                 let level = tool
                     .enchantments
@@ -236,8 +244,9 @@ impl Modifier {
         drop: &mut Drop,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
+        entity_present: Option<bool>,
     ) -> Result<()> {
-        if !self.condition.test(tool, random)? {
+        if !self.condition.test(tool, random, entity_present)? {
             return Ok(());
         }
         match &self.kind {
@@ -344,8 +353,9 @@ impl Entry {
         &self,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
+        entity_present: Option<bool>,
     ) -> Result<Option<(u32, Option<Drop>)>> {
-        if !self.condition.test(tool, random)? {
+        if !self.condition.test(tool, random, entity_present)? {
             return Ok(None);
         }
         let (weight, mut value) = match &self.kind {
@@ -361,7 +371,7 @@ impl Entry {
             EntryKind::Alternatives(children) => {
                 let mut selected = None;
                 for child in children {
-                    if let Some(value) = child.expand(tool, random)? {
+                    if let Some(value) = child.expand(tool, random, entity_present)? {
                         selected = Some(value);
                         break;
                     }
@@ -375,7 +385,7 @@ impl Entry {
         };
         if let Some(drop) = &mut value {
             for modifier in &self.modifiers {
-                modifier.apply(drop, tool, random)?;
+                modifier.apply(drop, tool, random, entity_present)?;
             }
             if drop.count == 0 {
                 value = None;
@@ -505,7 +515,7 @@ impl BlockLootTables {
             .interaction_tables
             .get(id)
             .context("interaction loot table is not supported or was not loaded")?;
-        Self::evaluate(table, tool, None)
+        Self::evaluate(table, tool, None, None)
     }
 
     pub fn drops(&self, block: &str, tool: BasicTool<'_>) -> Result<Vec<Drop>> {
@@ -528,24 +538,53 @@ impl BlockLootTables {
             .tables
             .get(&id)
             .context("block loot table is not supported or was not loaded")?;
-        Self::evaluate(table, tool, random)
+        Self::evaluate(table, tool, random, None)
+    }
+
+    /// Evaluate a block drop caused by a non-entity event such as snow melting.
+    pub fn drops_without_entity(
+        &self,
+        block: &str,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
+        let block = ResourceId::parse(block)?;
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        let table = self
+            .tables
+            .get(&id)
+            .context("block loot table is not supported or was not loaded")?;
+        Self::evaluate(
+            table,
+            BasicTool {
+                item: None,
+                count: 0,
+                enchantments: &[],
+            },
+            random,
+            Some(false),
+        )
     }
 
     fn evaluate(
         table: &Table,
         tool: BasicTool<'_>,
         mut random: Option<&mut dyn LootRandom>,
+        entity_present: Option<bool>,
     ) -> Result<Vec<Drop>> {
         let mut drops = Vec::new();
         for pool in &table.pools {
-            if !pool.condition.test(tool, &mut random)? {
+            if !pool.condition.test(tool, &mut random, entity_present)? {
                 continue;
             }
             for _ in 0..pool.rolls {
                 let mut selected = None;
                 let mut expanded = 0;
                 for entry in &pool.entries {
-                    if let Some((weight, value)) = entry.expand(tool, &mut random)?
+                    if let Some((weight, value)) =
+                        entry.expand(tool, &mut random, entity_present)?
                         && weight > 0
                     {
                         expanded += 1;
@@ -558,10 +597,10 @@ impl BlockLootTables {
                 );
                 if let Some(mut drop) = selected {
                     for modifier in &pool.modifiers {
-                        modifier.apply(&mut drop, tool, &mut random)?;
+                        modifier.apply(&mut drop, tool, &mut random, entity_present)?;
                     }
                     for modifier in &table.modifiers {
-                        modifier.apply(&mut drop, tool, &mut random)?;
+                        modifier.apply(&mut drop, tool, &mut random, entity_present)?;
                     }
                     if drop.count > 0 {
                         drops.push(drop);
@@ -815,6 +854,14 @@ fn parse_condition(
         .context("loot condition has no type")?;
     Ok(match kind {
         "minecraft:survives_explosion" => Condition::Always,
+        "minecraft:entity_properties"
+            if value.get("entity").and_then(Value::as_str) == Some("this")
+                && value
+                    .get("predicate")
+                    .is_some_and(|p| p.as_object().is_some_and(|p| p.is_empty())) =>
+        {
+            Condition::ThisEntityPresent
+        }
         "minecraft:match_tool" => Condition::Tool(parse_tool(value.get("predicate"), provider)?),
         "minecraft:table_bonus" => {
             let enchantment = ResourceId::parse(
@@ -1032,6 +1079,38 @@ mod tests {
         fn put(&mut self, path: &str, json: &str) {
             self.data.insert(path.into(), json.as_bytes().to_vec());
         }
+    }
+
+    #[test]
+    fn non_entity_snow_loot_honors_conditions_and_custom_tables() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/snow.json", r#"{"type":"minecraft:block","pools":[{"condition":{"type":"minecraft:entity_properties","entity":"this","predicate":{}},"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]},{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let drops = tables.drops_without_entity("minecraft:snow", None).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item, ResourceId::parse("minecraft:stick").unwrap());
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        assert!(tables.drops("minecraft:snow", tool).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_snow_melt_loot_has_no_entity_drop() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        assert!(
+            tables
+                .drops_without_entity("minecraft:snow", None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

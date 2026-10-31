@@ -7359,7 +7359,12 @@ impl LoadedSession {
             return false;
         };
         let waterloggable = fluid == "minecraft:water" && bucket_waterloggable(block) == Some(true);
+        let replaceable_plant = matches!(
+            block.name.as_str(),
+            "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush"
+        ) && block.properties.is_empty();
         if !waterloggable
+            && !replaceable_plant
             && !matches!(
                 block.name.as_str(),
                 "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
@@ -7412,6 +7417,45 @@ impl LoadedSession {
                 tick: self.tick.saturating_add(1),
             });
         } else {
+            if replaceable_plant {
+                let Some(absolute) = add(self.origin, target) else {
+                    return false;
+                };
+                let chunk = ChunkPos {
+                    x: absolute.x.div_euclid(16),
+                    z: absolute.z.div_euclid(16),
+                };
+                if !self
+                    .world
+                    .chunks
+                    .get(&chunk)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+                    || i8::try_from(absolute.y.div_euclid(16)).is_err()
+                {
+                    return false;
+                }
+                let block = block.clone();
+                if !self.dropped_items.can_drop_block_without_entity(
+                    &block.name,
+                    &block.properties,
+                    self.loot.as_deref(),
+                ) || self
+                    .dropped_items
+                    .drop_block_without_entity(
+                        absolute,
+                        &block.name,
+                        &block.properties,
+                        self.block_drops,
+                        self.loot.as_deref(),
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                if !self.set(target, self.states[0]) {
+                    return false;
+                }
+            }
             let id = self.intern_block(replacement);
             if id != existing && !self.set(target, id) {
                 return false;
@@ -14164,6 +14208,117 @@ mod tests {
     }
 
     #[test]
+    fn bucket_replaces_plants_using_configured_loot() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(["short_grass", "fern", "dead_bush"].iter().any(|name| path.ends_with(&format!("/{name}.json")))
+                    .then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut Loot).unwrap());
+        for plant in ["short_grass", "fern", "dead_bush"] {
+            for (bucket, fluid) in [
+                ("minecraft:water_bucket", "minecraft:water"),
+                ("minecraft:lava_bucket", "minecraft:lava"),
+            ] {
+                for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                    for drops in [false, true] {
+                        for mode in [GameMode::Survival, GameMode::Creative] {
+                            let mut session = session();
+                            session.set_block_loot(Arc::clone(&loot));
+                            session.set_block_drops(drops);
+                            session.set_game_mode(mode);
+                            session.set_water_evaporation_environment(bucket_environment(false));
+                            session.player.position.y = 1.3;
+                            session.player.position.z = 9.5;
+                            session.motion.position.y = 1.3;
+                            session.motion.position.z = 9.5;
+                            let target = IVec3::new(8, 2, 7);
+                            let id =
+                                session.intern_block(state(&format!("minecraft:{plant}"), &[]));
+                            session.set_with_notify(target, id, false);
+                            let mut inventory = PlayerInventory::default();
+                            inventory.set_slot(
+                                hand,
+                                ItemStack::new(bucket.into(), 1, 1, Tag::Compound(vec![])),
+                            );
+                            session.set_player_inventory(inventory);
+                            session.submit_command(PlayerCommand::Place);
+                            session.update(TICK);
+                            let absolute = session.origin + target;
+                            assert_eq!(
+                                session
+                                    .world
+                                    .block(absolute.x, absolute.y, absolute.z)
+                                    .unwrap()
+                                    .name,
+                                fluid
+                            );
+                            assert_eq!(session.dropped_items.snapshot().len(), usize::from(drops));
+                            if drops {
+                                assert_eq!(
+                                    session.dropped_items.snapshot()[0].stack.id(),
+                                    "minecraft:diamond"
+                                );
+                            }
+                            assert_eq!(
+                                session.inventory.slot(hand).unwrap().id(),
+                                if mode == GameMode::Creative {
+                                    bucket
+                                } else {
+                                    "minecraft:bucket"
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_preserves_plants_when_loot_is_unknown_or_water_evaporates() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for evaporates in [false, true] {
+            let mut session = session();
+            session.set_water_evaporation_environment(bucket_environment(evaporates));
+            session.player.position.y = 1.3;
+            session.motion.position.y = 1.3;
+            let target = IVec3::new(8, 2, 7);
+            let id = session.intern_block(state("minecraft:short_grass", &[]));
+            session.set_with_notify(target, id, false);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            assert_eq!(session.try_empty_bucket(PlayerSlot::Storage(0)), evaporates);
+            let p = session.origin + target;
+            assert_eq!(
+                session.world.block(p.x, p.y, p.z).unwrap().name,
+                "minecraft:short_grass"
+            );
+            assert_eq!(
+                session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                if evaporates {
+                    "minecraft:bucket"
+                } else {
+                    "minecraft:water_bucket"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn sneaking_places_water_next_to_a_waterloggable_block() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
@@ -14434,7 +14589,20 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 312);
+        assert_eq!(rows.len(), 336);
+        struct PlantLoot;
+        impl native_resources::packs::ResourceProvider for PlantLoot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(["short_grass", "fern", "dead_bush"]
+                    .iter()
+                    .any(|name| path.ends_with(&format!("/{name}.json")))
+                    .then(|| br#"{"type":"minecraft:block","pools":[]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut PlantLoot).unwrap());
         for row in rows {
             let mut session = session();
             session.sneak = row["sneak"].as_bool().unwrap();
@@ -14444,6 +14612,13 @@ mod tests {
             let clicked = IVec3::new(8, 2, 6);
             let adjacent = clicked + IVec3::Z;
             let initial = row["initial"].as_str().unwrap();
+            if matches!(initial, "short_grass" | "fern" | "dead_bush") {
+                assert_eq!(
+                    row["destroyed"].as_bool().unwrap(),
+                    row["lava"].as_bool().unwrap() || !row["evaporates"].as_bool().unwrap(),
+                    "{row}"
+                );
+            }
             if initial.starts_with("slab_") {
                 let wet = if initial == "slab_wet" {
                     "true"
@@ -14472,6 +14647,12 @@ mod tests {
                     &[("facing", "north"), ("type", kind), ("waterlogged", wet)],
                 ));
                 session.set_with_notify(clicked, id, false);
+            } else if matches!(initial, "short_grass" | "fern" | "dead_bush") {
+                let id = session.intern_block(state(&format!("minecraft:{initial}"), &[]));
+                session.set_with_notify(adjacent, id, false);
+                session.player.position.y = 1.3;
+                session.motion.position.y = 1.3;
+                session.set_block_loot(Arc::clone(&loot));
             } else {
                 let name = format!("minecraft:{initial}");
                 let level = row["level"].as_i64().unwrap().to_string();
@@ -14501,6 +14682,9 @@ mod tests {
                     "minecraft:water" => format!("water_{}", block.properties["level"]),
                     "minecraft:lava" => format!("lava_{}", block.properties["level"]),
                     "minecraft:stone_slab" => format!("slab_{}", block.properties["waterlogged"]),
+                    "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush" => {
+                        block.name.strip_prefix("minecraft:").unwrap().into()
+                    }
                     "minecraft:chest" | "minecraft:trapped_chest" => format!(
                         "{}_{}_{}",
                         block.name.strip_prefix("minecraft:").unwrap(),

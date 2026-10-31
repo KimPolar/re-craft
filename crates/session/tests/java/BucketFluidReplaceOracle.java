@@ -25,11 +25,12 @@ public class BucketFluidReplaceOracle {
   }
   static class World extends ClientLevel {
     Map<BlockPos,BlockState> blocks; EnvironmentAttributeSystem environment; RandomSource rng;
-    SoundEvent sound; SoundSource category; float volume,pitch; BlockPos soundPosition;
+    SoundEvent sound; SoundSource category; float volume,pitch; BlockPos soundPosition; boolean destroyed;
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
     @Override public BlockState getBlockState(BlockPos pos) { return blocks.getOrDefault(pos,Blocks.AIR.defaultBlockState()); }
     @Override public boolean isClientSide() { return false; }
     @Override public boolean setBlock(BlockPos pos,BlockState state,int flags,int depth) { if(getBlockState(pos)==state) return false; blocks.put(pos,state); return true; }
+    @Override public boolean destroyBlock(BlockPos pos,boolean drops,Entity entity,int depth) { destroyed=true; blocks.put(pos,Blocks.AIR.defaultBlockState()); return true; }
     @Override public EnvironmentAttributeSystem environmentAttributes() { return environment; }
     @Override public RandomSource getRandom() { return rng; }
     @Override public void playSound(Entity e,BlockPos p,SoundEvent s,SoundSource c,float v,float pitch) { sound=s; category=c; volume=v; this.pitch=pitch; soundPosition=p; }
@@ -42,16 +43,19 @@ public class BucketFluidReplaceOracle {
     if(state.is(Blocks.WATER)) return "water_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.LAVA)) return "lava_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.STONE_SLAB)) return "slab_"+state.getValue(SlabBlock.WATERLOGGED);
+    if(state.is(Blocks.SHORT_GRASS)) return "short_grass";
+    if(state.is(Blocks.FERN)) return "fern";
+    if(state.is(Blocks.DEAD_BUSH)) return "dead_bush";
     if(state.is(Blocks.CHEST) || state.is(Blocks.TRAPPED_CHEST)) return (state.is(Blocks.CHEST)?"chest_":"trapped_chest_")+state.getValue(ChestBlock.TYPE).getSerializedName()+"_"+state.getValue(ChestBlock.WATERLOGGED);
     throw new AssertionError(state);
   }
   static void run(JsonArray out,World world,Player player,boolean lava,boolean evaporates,boolean sneak,String initial,int level) {
-    player.sneak=sneak; world.blocks=new HashMap<>(); world.rng=RandomSource.create(123); world.sound=null; world.soundPosition=null;
+    player.sneak=sneak; world.blocks=new HashMap<>(); world.rng=RandomSource.create(123); world.sound=null; world.soundPosition=null; world.destroyed=false;
     boolean slab=initial.startsWith("slab_");
     boolean chest=initial.startsWith("chest_") || initial.startsWith("trapped_chest_");
     BlockState clicked=slab?Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(SlabBlock.WATERLOGGED,initial.equals("slab_wet")):chest?(initial.startsWith("trapped_")?Blocks.TRAPPED_CHEST:Blocks.CHEST).defaultBlockState().setValue(ChestBlock.TYPE,new ChestType[]{ChestType.SINGLE,ChestType.LEFT,ChestType.RIGHT}[level]).setValue(ChestBlock.WATERLOGGED,initial.endsWith("_wet")):Blocks.STONE.defaultBlockState();
     world.blocks.put(CLICKED,clicked);
-    if(!slab && !chest) world.blocks.put(ADJACENT,(initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level));
+    if(!slab && !chest) world.blocks.put(ADJACENT,switch(initial) { case "short_grass" -> Blocks.SHORT_GRASS.defaultBlockState(); case "fern" -> Blocks.FERN.defaultBlockState(); case "dead_bush" -> Blocks.DEAD_BUSH.defaultBlockState(); default -> (initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level); });
     world.environment=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributes.WATER_EVAPORATES, base -> evaporates).build();
     var bucket=(BucketItem)(lava?Items.LAVA_BUCKET:Items.WATER_BUCKET);
     var hit=new BlockHitResult(new Vec3(0.5,0.75,1.0),Direction.SOUTH,CLICKED,false);
@@ -59,6 +63,7 @@ public class BucketFluidReplaceOracle {
     boolean success=bucket.emptyContents(player,world,target,hit);
     var row=new JsonObject(); row.addProperty("lava",lava); row.addProperty("evaporates",evaporates); row.addProperty("sneak",sneak); row.addProperty("initial",initial); row.addProperty("level",level); row.addProperty("success",success);
     row.addProperty("clicked",describe(world.getBlockState(CLICKED))); row.addProperty("adjacent",describe(world.getBlockState(ADJACENT))); row.addProperty("next_random",world.rng.nextInt());
+    row.addProperty("destroyed",world.destroyed);
     if(world.sound!=null) { row.addProperty("sound",world.sound.location().toString()); row.addProperty("sound_z",world.soundPosition.getZ()); row.addProperty("volume_bits",Float.floatToRawIntBits(world.volume)); row.addProperty("pitch_bits",Float.floatToRawIntBits(world.pitch)); }
     out.add(row);
   }
@@ -77,6 +82,8 @@ public class BucketFluidReplaceOracle {
       run(out,world,player,false,evaporates,sneak,initial,0);
     for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"chest_dry","chest_wet","trapped_chest_dry","trapped_chest_wet"}) for(int type=0;type<3;type++)
       run(out,world,player,false,evaporates,sneak,initial,type);
+    for(boolean lava:new boolean[]{false,true}) for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"short_grass","fern","dead_bush"})
+      run(out,world,player,lava,evaporates,sneak,initial,0);
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));
   }
 }

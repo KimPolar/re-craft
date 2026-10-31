@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 40] = [
+const BASIC_BLOCKS: [&str; 45] = [
     "grass_block",
     "dirt",
     "sand",
@@ -51,6 +51,11 @@ const BASIC_BLOCKS: [&str; 40] = [
     "trapped_chest",
     "snow",
     "snow_block",
+    "short_grass",
+    "fern",
+    "dead_bush",
+    "fire",
+    "soul_fire",
 ];
 
 /// Loot functions consume both floating-point and bounded integer random values.
@@ -107,6 +112,7 @@ enum Condition {
     All(Vec<Condition>),
     Any(Vec<Condition>),
     Not(Box<Condition>),
+    RandomChance(f32),
     TableBonus(ResourceId, Vec<f32>),
     Unsupported(String),
 }
@@ -235,6 +241,12 @@ impl Condition {
                 Ok(false)
             }
             Self::Not(condition) => Ok(!condition.test(tool, random, context)?),
+            Self::RandomChance(chance) => {
+                let random = random
+                    .as_mut()
+                    .context("random loot requires a random source")?;
+                Ok(random.next_float() < *chance)
+            }
             Self::TableBonus(enchantment, chances) => {
                 let level = tool
                     .enchantments
@@ -764,10 +776,10 @@ fn parse_table(
         );
     }
     let mut visiting = BTreeSet::new();
-    let pools = json
-        .get("pools")
-        .and_then(Value::as_array)
-        .context("loot table has no pools")?;
+    let pools = match json.get("pools") {
+        None => &[][..],
+        Some(value) => value.as_array().context("invalid loot pools")?.as_slice(),
+    };
     ensure!(pools.len() <= 128, "too many loot pools");
     let mut parsed = Vec::new();
     for pool in pools {
@@ -1050,6 +1062,10 @@ fn parse_condition(
             Condition::ThisEntityPresent
         }
         "minecraft:match_tool" => Condition::Tool(parse_tool(value.get("predicate"), provider)?),
+        "minecraft:random_chance" => match value.get("chance").and_then(Value::as_f64) {
+            Some(chance) if (chance as f32).is_finite() => Condition::RandomChance(chance as f32),
+            _ => Condition::Unsupported("unsupported random chance provider".into()),
+        },
         "minecraft:table_bonus" => {
             let enchantment = ResourceId::parse(
                 value
@@ -1269,6 +1285,122 @@ mod tests {
     }
 
     #[test]
+    fn random_chance_uses_one_float_even_at_extreme_probabilities() {
+        for (chance, draw, expected) in [
+            (-1.0, 0.0, false),
+            (0.0, 0.0, false),
+            (0.125, 0.124, true),
+            (0.125, 0.125, false),
+            (1.0, 0.999, true),
+            (2.0, 0.999, true),
+        ] {
+            let mut source = Memory::default();
+            source.put("data/minecraft/loot_table/blocks/short_grass.json", &format!(r#"{{"type":"minecraft:block","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"minecraft:wheat_seeds","condition":{{"type":"minecraft:random_chance","chance":{chance}}}}}]}}]}}"#));
+            let tables = BlockLootTables::load(&mut source).unwrap();
+            let mut calls = 0;
+            let mut random = || {
+                calls += 1;
+                draw
+            };
+            let drops = tables
+                .drops_without_entity("minecraft:short_grass", Some(&mut random))
+                .unwrap();
+            assert_eq!(!drops.is_empty(), expected, "chance={chance} draw={draw}");
+            assert_eq!(calls, 1);
+            assert!(
+                tables
+                    .drops_without_entity("minecraft:short_grass", None)
+                    .is_err()
+            );
+        }
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/short_grass.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds","condition":{"type":"minecraft:random_chance","chance":{"type":"example:unsupported"}}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        assert!(
+            tables
+                .drops_without_entity("minecraft:short_grass", Some(&mut || 0.0))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn random_chance_matches_java_26_3() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("RandomChanceOracle.java");
+        let output = temp.path().join("random_chance.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RandomChanceOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("RandomChanceOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 768);
+        let mut row = 0;
+        for chance in [-0.5_f32, 0.0, 0.125, 0.5, 1.0, 1.5] {
+            let mut source = Memory::default();
+            source.put("data/minecraft/loot_table/blocks/short_grass.json", &format!(r#"{{"type":"minecraft:block","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"minecraft:wheat_seeds","condition":{{"type":"minecraft:random_chance","chance":{chance}}}}}]}}]}}"#));
+            let table = BlockLootTables::load(&mut source).unwrap();
+            for seed in 0..128 {
+                let mut random = native_core::random::LegacyRandom::new(seed);
+                let drops = table
+                    .drops_without_entity("minecraft:short_grass", Some(&mut random))
+                    .unwrap();
+                assert_eq!(
+                    !drops.is_empty(),
+                    rows[row][0].as_bool().unwrap(),
+                    "{chance} {seed}"
+                );
+                assert_eq!(
+                    random.next_int(),
+                    rows[row][1].as_i64().unwrap() as i32,
+                    "{chance} {seed}"
+                );
+                row += 1;
+            }
+        }
+    }
+
+    #[test]
     fn block_state_conditions_evaluate_original_properties_and_reject_missing_context() {
         let mut source = Memory::default();
         source.put("data/minecraft/loot_table/blocks/snow.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:match_block","blocks":"minecraft:snow","state":{"layers":"3"}}}]}]}"#);
@@ -1320,6 +1452,30 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_plant_and_fire_loot_is_evaluated_without_a_tool() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        for block in ["short_grass", "fern", "dead_bush", "fire", "soul_fire"] {
+            for seed in 0..128 {
+                let mut random = native_core::random::LegacyRandom::new(seed);
+                let drops = tables
+                    .drops_without_entity(&format!("minecraft:{block}"), Some(&mut random))
+                    .unwrap();
+                assert!(
+                    drops
+                        .iter()
+                        .all(|drop| matches!(drop.item.path.as_str(), "wheat_seeds" | "stick")),
+                    "{block} {seed} {drops:?}"
+                );
+            }
+        }
     }
 
     #[test]

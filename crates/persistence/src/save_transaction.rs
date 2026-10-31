@@ -259,9 +259,9 @@ fn relative_path_key(value: &str) -> Result<String> {
     Ok(normalized.to_lowercase())
 }
 
-/// New targets are limited to vanilla entity region files. A corrupt recovery
-/// record must not turn rollback into deletion of an arbitrary world file.
-fn valid_created_entity_region(value: &str) -> bool {
+/// A corrupt recovery record must not turn rollback into deletion of an
+/// arbitrary world file. Only explicitly supported region paths are allowed.
+fn valid_created_region(value: &str, kind: &str) -> bool {
     let components: Option<Vec<_>> = Path::new(value)
         .components()
         .map(|part| match part {
@@ -277,7 +277,7 @@ fn valid_created_entity_region(value: &str) -> bool {
     {
         return false;
     }
-    if parts.len() < 5 || parts[0] != "dimensions" || parts[parts.len() - 2] != "entities" {
+    if parts.len() < 5 || parts[0] != "dimensions" || parts[parts.len() - 2] != kind {
         return false;
     }
     let namespace = parts[1];
@@ -296,13 +296,33 @@ fn valid_created_entity_region(value: &str) -> bool {
     name == format!("r.{x}.{z}.mca")
 }
 
+fn valid_created_entity_region(value: &str) -> bool {
+    valid_created_region(value, "entities")
+}
+
+fn valid_created_poi_region(value: &str) -> bool {
+    valid_created_region(value, "poi")
+}
+
 fn valid_entity_directory(value: &str) -> bool {
     valid_created_entity_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
 }
 
+fn valid_poi_directory(value: &str) -> bool {
+    valid_created_poi_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
+}
+
+fn valid_created_target(value: &str, version: u32) -> bool {
+    valid_created_entity_region(value) || (version >= 4 && valid_created_poi_region(value))
+}
+
+fn valid_absent_directory(value: &str, version: u32) -> bool {
+    valid_entity_directory(value) || (version >= 4 && valid_poi_directory(value))
+}
+
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3),
+        matches!(manifest.version, 1 | 2 | 3 | 4),
         "unsupported transaction version"
     );
     ensure!(
@@ -336,7 +356,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                 ensure!(valid_digest(original), "invalid transaction hash");
             }
             (None, None) if manifest.version >= 2 => ensure!(
-                valid_created_entity_region(&record.target),
+                valid_created_target(&record.target, manifest.version),
                 "invalid created region path"
             ),
             _ => bail!("invalid transaction original"),
@@ -359,8 +379,8 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     );
     for target in &manifest.absent_dependencies {
         ensure!(
-            valid_created_entity_region(target),
-            "invalid absent entity region path"
+            valid_created_target(target, manifest.version),
+            "invalid absent region path"
         );
         ensure!(
             targets.insert(relative_path_key(target)?),
@@ -373,8 +393,8 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     );
     for directory in &manifest.absent_directories {
         ensure!(
-            valid_entity_directory(directory),
-            "invalid absent entity directory path"
+            valid_absent_directory(directory, manifest.version),
+            "invalid absent region directory path"
         );
         let key = relative_path_key(directory)?;
         ensure!(targets.insert(key.clone()), "duplicate transaction target");
@@ -522,8 +542,8 @@ fn prepare(
             Dependency::Absent { target } => {
                 let target = relative(root, target)?;
                 ensure!(
-                    valid_created_entity_region(&target),
-                    "invalid absent entity region path"
+                    valid_created_target(&target, 4),
+                    "invalid absent region path"
                 );
                 ensure!(
                     !checked_target(root, &target)?.1,
@@ -534,8 +554,8 @@ fn prepare(
             Dependency::AbsentDirectory { target } => {
                 let target_relative = relative(root, target)?;
                 ensure!(
-                    valid_entity_directory(&target_relative),
-                    "invalid absent entity directory path"
+                    valid_absent_directory(&target_relative, 4),
+                    "invalid absent region directory path"
                 );
                 ensure!(
                     !checked_directory(root, target)?.1,
@@ -546,7 +566,18 @@ fn prepare(
         }
     }
     let manifest = Manifest {
-        version: if !absent_directories.is_empty() {
+        version: if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
+            || absent_dependencies
+                .iter()
+                .any(|target| valid_created_poi_region(target))
+            || absent_directories
+                .iter()
+                .any(|target| valid_poi_directory(target))
+        {
+            4
+        } else if !absent_directories.is_empty() {
             3
         } else if !absent_dependencies.is_empty()
             || records.iter().any(|record| record.original.is_none())
@@ -974,6 +1005,21 @@ mod tests {
         }
     }
 
+    fn created_poi_region(root: &Path) -> Replacement {
+        let target = root.join("dimensions/minecraft/overworld/poi/r.-1.0.mca");
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-region-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new poi region").unwrap();
+        Replacement {
+            target,
+            backup: None,
+            original_hash: None,
+            stage,
+        }
+    }
+
     #[test]
     fn new_file_commits_without_overwriting_an_existing_target() {
         let dir = fixture();
@@ -1030,6 +1076,122 @@ mod tests {
             relative_path_key("dimensions/minecraft/overworld/entities/r.0.0.mca").unwrap(),
             relative_path_key("dimensions\\minecraft\\overworld\\entities\\r.0.0.mca").unwrap()
         );
+    }
+
+    #[test]
+    fn poi_creation_paths_require_new_manifest_and_stay_inside_dimension() {
+        let poi = "dimensions/minecraft/overworld/poi/r.-1.0.mca";
+        assert!(valid_created_poi_region(poi));
+        assert!(valid_created_target(poi, 4));
+        assert!(!valid_created_target(poi, 3));
+        assert!(valid_poi_directory("dimensions/example/deep/world/poi"));
+        assert!(!valid_absent_directory(
+            "dimensions/example/deep/world/poi",
+            3
+        ));
+        for invalid in [
+            "players/data/r.0.0.mca",
+            "dimensions/minecraft/overworld/region/r.0.0.mca",
+            "dimensions/minecraft/overworld/poi/r.01.0.mca",
+            "dimensions/minecraft/../poi/r.0.0.mca",
+            "dimensions/minecraft/overworld/poi/session.lock",
+        ] {
+            assert!(!valid_created_target(invalid, 4), "{invalid}");
+        }
+        let mut manifest = Manifest {
+            version: 3,
+            files: vec![FileRecord {
+                target: poi.into(),
+                backup: None,
+                original: None,
+                replacement: "0".repeat(64),
+                stage: None,
+            }],
+            dependencies: vec![],
+            absent_dependencies: vec![],
+            absent_directories: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.version = 4;
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn absent_poi_directory_is_checked_before_recovery() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (files, mut dependencies) = replacements(&root);
+        let missing = root.join("dimensions/minecraft/overworld/poi");
+        dependencies.push(Dependency::AbsentDirectory {
+            target: missing.clone(),
+        });
+        let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
+        assert_eq!(prepared.manifest.version, 4);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::create_dir(&missing).unwrap();
+        assert!(recover(&root).is_err());
+        fs::remove_dir(&missing).unwrap();
+        assert!(recover(&root).unwrap());
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
+    }
+
+    #[test]
+    fn new_poi_region_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_POI_REGION_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let (mut files, deps) = replacements(&root);
+        files.push(created_poi_region(&root));
+        let mut prepared = prepare(
+            &root,
+            &root.join(".minecraft-native-backups/transaction-fixture"),
+            files,
+            deps,
+        )
+        .unwrap();
+        assert_eq!(prepared.manifest.version, 4);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(1)).unwrap();
+        std::process::exit(24);
+    }
+
+    #[test]
+    fn crash_recovery_restores_terrain_and_removes_created_poi_region() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("dimensions/minecraft/overworld/poi")).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "save_transaction::tests::new_poi_region_crash_helper",
+                "--nocapture",
+            ])
+            .env("NATIVE_POI_REGION_CRASH_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(24),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let poi = root.join("dimensions/minecraft/overworld/poi/r.-1.0.mca");
+        let terrain = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        assert_eq!(fs::read(&poi).unwrap(), b"new poi region");
+        assert_eq!(fs::read(&terrain).unwrap(), NEW_REGION);
+        fs::write(&poi, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&terrain).unwrap(), NEW_REGION);
+        fs::write(&poi, b"new poi region").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!poi.exists());
+        assert_eq!(fs::read(terrain).unwrap(), OLD_REGION);
     }
 
     #[test]

@@ -1,5 +1,4 @@
 //! Multi-noise biome selection from the active world data packs.
-//! The built-in End biome builder is not yet implemented.
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -269,17 +268,24 @@ impl ClimateVolume {
         &self,
         source: &'a mut BiomeSource,
         quart: [i32; 3],
-    ) -> Option<&'a ResourceId> {
-        Some(source.select(self.get(quart)?))
+    ) -> Result<&'a ResourceId> {
+        source.select(
+            self.get(quart)
+                .context("climate sample is outside the volume")?,
+        )
     }
 }
 enum SourceKind {
     Fixed(ResourceId),
     Multi(ClimateTree),
+    End([ResourceId; 5]),
 }
 impl BiomeSource {
-    pub fn is_fixed(&self) -> bool {
-        matches!(self.kind, SourceKind::Fixed(_))
+    pub fn is_end(&self) -> bool {
+        matches!(self.kind, SourceKind::End(_))
+    }
+    pub fn uses_bulk_climate(&self) -> bool {
+        matches!(self.kind, SourceKind::Multi(_))
     }
     /// Parse the generator's active biome_source definition. Unknown presets fail.
     pub fn load(provider: &mut impl ResourceProvider, value: &Value) -> Result<Self> {
@@ -346,6 +352,25 @@ impl BiomeSource {
                 };
                 SourceKind::Multi(ClimateTree::new(entries)?)
             }
+            "the_end" => {
+                let ids = [
+                    "the_end",
+                    "end_highlands",
+                    "end_midlands",
+                    "small_end_islands",
+                    "end_barrens",
+                ]
+                .map(|name| ResourceId::parse(name).expect("valid vanilla biome ID"));
+                for id in &ids {
+                    ensure!(
+                        registry.contains(id),
+                        "End biome {}:{} is missing",
+                        id.namespace,
+                        id.path
+                    );
+                }
+                SourceKind::End(ids)
+            }
             _ => bail!("unsupported biome source {}:{}", kind.namespace, kind.path),
         };
         Ok(Self {
@@ -354,27 +379,17 @@ impl BiomeSource {
         })
     }
     /// Select from six single-precision climate components in Java's order.
-    pub fn select(&mut self, climate: [f32; 6]) -> &ResourceId {
+    pub fn select(&mut self, climate: [f32; 6]) -> Result<&ResourceId> {
         match &self.kind {
-            SourceKind::Fixed(biome) => biome,
-            SourceKind::Multi(tree) => {
-                let mut target = [0i64; DIMENSIONS];
-                for (slot, value) in target.iter_mut().zip(climate) {
-                    *slot = quantize(value);
-                }
-                let leaf = tree
-                    .search_node(tree.root, &target, self.previous)
-                    .expect("tree has at least one biome");
-                self.previous = Some(leaf);
-                let NodeKind::Leaf(index) = tree.nodes[leaf].kind else {
-                    unreachable!()
-                };
-                &tree.biomes[index]
+            SourceKind::Fixed(biome) => Ok(biome),
+            SourceKind::Multi(tree) => Ok(select_tree(tree, &mut self.previous, climate)),
+            SourceKind::End(_) => {
+                bail!("End biome selection requires quart coordinates and erosion")
             }
         }
     }
-    /// Sample the noise router at a noise-biome (quart) coordinate. Chunk-volume
-    /// interpolation uses a separate Java path; use `ClimateVolume` for that.
+    /// Sample a noise-biome (quart) coordinate. Multi-noise chunk generation
+    /// uses `ClimateVolume`; the End uses point sampling even for chunks.
     pub fn sample_quart(
         &mut self,
         router: &NoiseRouter,
@@ -382,9 +397,59 @@ impl BiomeSource {
         quart: [i32; 3],
     ) -> &ResourceId {
         let [x, y, z] = quart.map(|v| v.wrapping_mul(4));
-        let climate = router.sample_climate(evaluator, x, y, z);
-        self.select(climate)
+        match &self.kind {
+            SourceKind::Fixed(id) => return id,
+            SourceKind::End(ids) => {
+                let sx = x >> 4;
+                let sz = z >> 4;
+                if i64::from(sx) * i64::from(sx) + i64::from(sz) * i64::from(sz) <= 4096 {
+                    return &ids[0];
+                }
+                let center_x = sx.wrapping_mul(2).wrapping_add(1).wrapping_mul(8);
+                let center_z = sz.wrapping_mul(2).wrapping_add(1).wrapping_mul(8);
+                let erosion = router.sample(
+                    evaluator,
+                    crate::noise_router::RouterField::Erosion,
+                    center_x,
+                    y,
+                    center_z,
+                );
+                let index = if erosion > 0.25 {
+                    1
+                } else if erosion >= -0.0625 {
+                    2
+                } else if erosion < -0.21875 {
+                    3
+                } else {
+                    4
+                };
+                return &ids[index];
+            }
+            SourceKind::Multi(tree) => {
+                let climate = router.sample_climate(evaluator, x, y, z);
+                select_tree(tree, &mut self.previous, climate)
+            }
+        }
     }
+}
+
+fn select_tree<'a>(
+    tree: &'a ClimateTree,
+    previous: &mut Option<usize>,
+    climate: [f32; 6],
+) -> &'a ResourceId {
+    let mut target = [0i64; DIMENSIONS];
+    for (slot, value) in target.iter_mut().zip(climate) {
+        *slot = quantize(value);
+    }
+    let leaf = tree
+        .search_node(tree.root, &target, *previous)
+        .expect("tree has at least one biome");
+    *previous = Some(leaf);
+    let NodeKind::Leaf(index) = tree.nodes[leaf].kind else {
+        unreachable!()
+    };
+    &tree.biomes[index]
 }
 
 fn parse_parameter(value: &Value) -> Result<Interval> {
@@ -527,10 +592,16 @@ mod tests {
         };
         let definition = json!({"type":"multi_noise","biomes":[point("example:a",json!(-1)),point("example:b",json!(1))]});
         let mut source = BiomeSource::load(&mut data, &definition).unwrap();
-        assert_eq!(source.select([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).path, "b");
-        assert_eq!(source.select([0.0; 6]).path, "b");
-        assert_eq!(source.select([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).path, "a");
-        assert_eq!(source.select([0.0; 6]).path, "a");
+        assert_eq!(
+            source.select([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().path,
+            "b"
+        );
+        assert_eq!(source.select([0.0; 6]).unwrap().path, "b");
+        assert_eq!(
+            source.select([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().path,
+            "a"
+        );
+        assert_eq!(source.select([0.0; 6]).unwrap().path, "a");
         let settings = json!({"noise":{"min_y":-16,"height":32},"legacy_random_source":false,
             "noise_router":{"final_density":0,"temperature":{"type":"gradient","axis":"y",
                 "from_coordinate":-16,"to_coordinate":16,"from_value":-1,"to_value":1},

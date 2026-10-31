@@ -159,10 +159,12 @@ pub struct TerrainGenerator {
     source: BiomeSource,
     surface: SurfaceRule,
     seed: i64,
+    min_y: i32,
+    height: i32,
 }
 impl TerrainGenerator {
     /// The caller must guarantee no old-chunk blending or structure adjustment.
-    /// For now the dimension and noise-settings height ranges must match.
+    /// The dimension must fully contain the noise-settings height range.
     pub fn without_terrain_adjustments(
         provider: &mut impl ResourceProvider,
         definition: &Value,
@@ -211,22 +213,38 @@ impl TerrainGenerator {
         drop(compiler);
         let noise =
             NoiseStageGenerator::from_json_without_terrain_adjustments(provider, &bytes, seed)?;
+        let end = min_y
+            .checked_add(height)
+            .context("dimension height overflow")?;
+        let noise_end = noise
+            .router()
+            .min_y
+            .checked_add(noise.router().height)
+            .context("noise height overflow")?;
         ensure!(
-            noise.router().min_y == min_y && noise.router().height == height && height > 0,
-            "dimension and noise settings height ranges must match"
+            height > 0
+                && height % 16 == 0
+                && min_y % 16 == 0
+                && noise.router().height > 0
+                && min_y <= noise.router().min_y
+                && end >= noise_end
+                && height <= 4096,
+            "dimension must fully contain the noise height range"
         );
         Ok(Self {
             noise,
             source,
             surface,
             seed,
+            min_y,
+            height,
         })
     }
     pub fn min_y(&self) -> i32 {
-        self.noise.router().min_y
+        self.min_y
     }
     pub fn height(&self) -> i32 {
-        self.noise.router().height
+        self.height
     }
     pub fn biome_neighborhood(&self) -> Result<BiomeNeighborhood> {
         BiomeNeighborhood::new(self.seed, self.min_y(), self.height())
@@ -246,15 +264,27 @@ impl TerrainGenerator {
         let height = self.height();
         let min = [x, min_y.div_euclid(4), z];
         let sy = (height / 4) as usize;
-        let climate = if self.source.is_fixed() {
-            None
-        } else {
+        let climate = if self.source.uses_bulk_climate() {
             Some(ClimateVolume::sample(
                 self.noise.router(),
                 evaluator,
                 min,
                 [4, sy as u32, 4],
             )?)
+        } else {
+            None
+        };
+        let end = self.source.is_end();
+        let end_y_independent = end
+            && !self
+                .noise
+                .router()
+                .function(native_resources::noise_router::RouterField::Erosion)
+                .depends_on_y();
+        let mut end_cache = if end {
+            vec![None; if end_y_independent { 1 } else { sy }]
+        } else {
+            Vec::new()
         };
         let mut values = vec![None; 16 * sy];
         // ChunkAccess walks sections bottom-up, then local X, Y, Z.
@@ -268,11 +298,24 @@ impl TerrainGenerator {
                             climate
                                 .select(&mut self.source, point)
                                 .context("climate sample is absent")?
+                                .clone()
+                        } else if end {
+                            let index = if end_y_independent { 0 } else { y as usize };
+                            if end_cache[index].is_none() {
+                                end_cache[index] = Some(
+                                    self.source
+                                        .sample_quart(self.noise.router(), evaluator, point)
+                                        .clone(),
+                                );
+                            }
+                            end_cache[index].as_ref().unwrap().clone()
                         } else {
-                            self.source.select([0.0; 6])
+                            self.source
+                                .sample_quart(self.noise.router(), evaluator, point)
+                                .clone()
                         };
                         let index = (lz as usize * 4 + lx as usize) * sy + y as usize;
-                        values[index] = Some(biome.clone());
+                        values[index] = Some(biome);
                     }
                 }
             }
@@ -294,7 +337,10 @@ impl TerrainGenerator {
         classify: impl FnMut(&Value) -> Result<SurfaceBlockKind>,
     ) -> Result<SurfaceStageChunk> {
         neighborhood.validate(chunk, self.seed, self.min_y(), self.height())?;
-        let blocks = self.noise.generate(evaluator, chunk[0], chunk[1])?;
+        let blocks = self
+            .noise
+            .generate(evaluator, chunk[0], chunk[1])?
+            .expand_to_dimension(self.min_y(), self.height())?;
         let preliminary = self
             .noise
             .preliminary_surface(evaluator, chunk[0], chunk[1])?;
@@ -330,7 +376,7 @@ mod tests {
             Ok(None)
         }
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
-            Ok(if path == "data/minecraft/worldgen/biome/plains.json" {
+            Ok(if path.starts_with("data/minecraft/worldgen/biome/") {
                 Some(br#"{"has_precipitation":true,"temperature":0.8}"#.to_vec())
             } else if path.starts_with("data/minecraft/worldgen/noise/") {
                 Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
@@ -340,7 +386,17 @@ mod tests {
         }
         fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
             ensure!(folder == "worldgen/biome", "unexpected registry");
-            Ok(vec![ResourceId::parse("minecraft:plains")?])
+            [
+                "plains",
+                "the_end",
+                "end_highlands",
+                "end_midlands",
+                "small_end_islands",
+                "end_barrens",
+            ]
+            .into_iter()
+            .map(ResourceId::parse)
+            .collect()
         }
     }
     fn definition() -> Value {
@@ -356,7 +412,7 @@ mod tests {
     fn generates_biomes_and_surface_only_with_complete_matching_neighbors() {
         let mut data = Data;
         assert!(
-            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, -64, 384)
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, -16, 16)
                 .is_err()
         );
         let mut generator =
@@ -412,5 +468,42 @@ mod tests {
         let biome = Arc::clone(neighbors.chunk([0, 0]).unwrap());
         assert!(wrong.insert(biome).is_err());
         assert!(QuartBiomeChunk::from_values([0, 0], 42, 0, 16, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn end_chunk_respects_y_dependent_datapack_erosion() {
+        let mut data = Data;
+        let mut config = definition();
+        config["biome_source"] = json!({"type":"minecraft:the_end"});
+        config["settings"]["noise_router"]["erosion"] = json!({"type":"gradient","axis":"y",
+            "from_coordinate":0,"to_coordinate":16,"from_value":-0.5,"to_value":0.7});
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        let chunk = generator
+            .generate_biomes([65, 0], &mut DensityEvaluator::default())
+            .unwrap();
+        let names: Vec<_> = chunk.values()[0..4]
+            .iter()
+            .map(|id| id.path.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "small_end_islands",
+                "end_barrens",
+                "end_midlands",
+                "end_highlands"
+            ]
+        );
+        for column in chunk.values().chunks_exact(4) {
+            assert_eq!(
+                column.iter().map(|id| id.path.as_str()).collect::<Vec<_>>(),
+                names
+            );
+        }
+        let center = generator
+            .generate_biomes([0, 0], &mut DensityEvaluator::default())
+            .unwrap();
+        assert!(center.values().iter().all(|id| id.path == "the_end"));
     }
 }

@@ -322,6 +322,10 @@ enum Unary {
 }
 
 impl DensityFunction {
+    /// Whether the compiled graph can vary with Y.
+    pub fn depends_on_y(&self) -> bool {
+        self.5 & 2 != 0
+    }
     /// The interval reported by Java's density function before compilation.
     pub fn range(&self) -> (f32, f32) {
         (self.4.min, self.4.max)

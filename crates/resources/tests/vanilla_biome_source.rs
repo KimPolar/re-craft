@@ -188,7 +188,7 @@ fn climate_index_and_vanilla_presets_match_java() {
             }
             Some("P") => {
                 let point: [f32; 6] = targets[index].clone().try_into().unwrap();
-                let selected = sources[group.unwrap()].select(point);
+                let selected = sources[group.unwrap()].select(point).unwrap();
                 let actual = format!("{}:{}", selected.namespace, selected.path);
                 assert_eq!(
                     actual,

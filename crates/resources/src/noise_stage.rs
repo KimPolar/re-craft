@@ -77,6 +77,58 @@ pub struct NoiseStageChunk {
 }
 
 impl NoiseStageChunk {
+    /// Expand a noise volume inside a larger generation-height range. Areas
+    /// outside the noise volume start as air, just as an empty chunk does.
+    /// Clipping is rejected because it changes interpolation-volume semantics.
+    pub fn expand_to_dimension(self, min_y: i32, height: i32) -> Result<Self> {
+        ensure!(
+            height > 0 && min_y % 16 == 0 && height % 16 == 0,
+            "invalid dimension height range"
+        );
+        let end = min_y
+            .checked_add(height)
+            .context("dimension height overflow")?;
+        let noise_end = self
+            .min_y
+            .checked_add(self.height)
+            .context("noise height overflow")?;
+        ensure!(
+            self.height > 0 && min_y <= self.min_y && end >= noise_end,
+            "dimension clips the noise volume"
+        );
+        if min_y == self.min_y && height == self.height {
+            return Ok(self);
+        }
+        let count = usize::try_from(height)?
+            .checked_mul(256)
+            .context("dimension volume size overflow")?;
+        ensure!(
+            count <= 1_048_576,
+            "dimension volume exceeds maximum sample count"
+        );
+        let mut materials = vec![NoiseMaterial::Air; count];
+        let mut fluid_updates = vec![false; count];
+        let source_height = self.height as usize;
+        let target_height = height as usize;
+        let offset = (self.min_y - min_y) as usize;
+        for column in 0..256 {
+            let source = column * source_height..(column + 1) * source_height;
+            let target =
+                column * target_height + offset..column * target_height + offset + source_height;
+            materials[target.clone()].copy_from_slice(&self.materials[source.clone()]);
+            fluid_updates[target].copy_from_slice(&self.fluid_updates[source]);
+        }
+        Ok(Self {
+            chunk_x: self.chunk_x,
+            chunk_z: self.chunk_z,
+            min_y,
+            height,
+            default_block: self.default_block,
+            default_fluid: self.default_fluid,
+            materials,
+            fluid_updates,
+        })
+    }
     pub fn chunk_position(&self) -> [i32; 2] {
         [self.chunk_x, self.chunk_z]
     }
@@ -527,5 +579,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn noise_volume_expands_without_clipping_or_losing_materials() {
+        let mut data = Data;
+        let mut evaluator = DensityEvaluator::default();
+        let generator = NoiseStageGenerator::from_json_without_terrain_adjustments(
+            &mut data,
+            &serde_json::to_vec(&definition()).unwrap(),
+            0,
+        )
+        .unwrap();
+        let clipped = generator.generate(&mut evaluator, 0, 0).unwrap();
+        assert!(clipped.expand_to_dimension(-16, 16).is_err());
+        let expanded = generator
+            .generate(&mut evaluator, -1, 2)
+            .unwrap()
+            .expand_to_dimension(-16, 48)
+            .unwrap();
+        assert_eq!(expanded.chunk_position(), [-1, 2]);
+        assert_eq!(expanded.get(0, -1, 0), Some(NoiseMaterial::Air));
+        assert_eq!(expanded.get(0, 7, 0), Some(NoiseMaterial::DefaultFluid));
+        assert_eq!(expanded.get(0, 16, 0), Some(NoiseMaterial::Air));
+        assert_eq!(expanded.fluid_updates().len(), 16 * 16 * 48);
     }
 }

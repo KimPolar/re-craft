@@ -778,18 +778,50 @@ pub struct ItemModelCache {
     frame_started: bool,
     active: HashSet<ModelKey>,
     previous_active: HashSet<ModelKey>,
+    compass: CompassCache,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CompassContext {
+    pub dimension: String,
+    pub owner: glam::DVec3,
+    pub yaw_degrees: f32,
+    pub tick: i64,
+}
+
+#[derive(Default)]
+struct CompassCache {
+    definitions: HashMap<String, Arc<Value>>,
+    definition_rx: Option<mpsc::Receiver<(String, Arc<Value>)>>,
+    variants: HashMap<(ModelKey, String), ModelKey>,
+    context: Option<CompassContext>,
+    wobbler: crate::compass_motion::Wobbler,
 }
 
 impl ItemModelCache {
     pub fn new(loader: Arc<Mutex<Loader>>) -> Self {
         let (request, incoming) = mpsc::sync_channel::<ModelKey>(32);
         let (outgoing, response) = mpsc::channel();
+        let (definition_tx, definition_rx) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(key) = incoming.recv() {
                 let model = loader
                     .lock()
                     .ok()
-                    .and_then(|mut loader| loader.load_visual(&key).ok())
+                    .and_then(|mut loader| {
+                        let model = loader.load_visual(&key).ok();
+                        if matches!(
+                            key.id.as_str(),
+                            "minecraft:compass" | "minecraft:recovery_compass"
+                        ) && let Ok(id) = ResourceId::parse(&key.id)
+                            && let Ok(Some(bytes)) =
+                                loader.stack.read_asset(&id.asset_path("items", "json"))
+                            && let Ok(definition) = serde_json::from_slice::<Value>(&bytes)
+                        {
+                            let _ = definition_tx.send((key.id.clone(), Arc::new(definition)));
+                        }
+                        model
+                    })
                     .map(|mut model| {
                         if key.glint {
                             if let Some((icon, pixels)) = crate::item_gui::render_with_glint(&model)
@@ -819,7 +851,25 @@ impl ItemModelCache {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache {
+                definition_rx: Some(definition_rx),
+                ..Default::default()
+            },
         }
+    }
+
+    pub(crate) fn set_compass_context(&mut self, context: CompassContext) -> bool {
+        let changed = self.compass.context.as_ref() != Some(&context);
+        self.compass.context = Some(context);
+        changed
+    }
+
+    fn compass_variant(&self, key: &ModelKey) -> Option<(ModelKey, String)> {
+        let definition = self.compass.definitions.get(&key.id)?;
+        let selected = selected_model(definition.get("model")?, key).ok()?;
+        let mut base = key.clone();
+        base.compass_angle = 0.0_f32.to_bits();
+        Some((base, serde_json::to_string(selected).ok()?))
     }
 
     /// Protect models used in this and the preceding frame. Eviction runs only
@@ -833,7 +883,15 @@ impl ItemModelCache {
     /// Returns true when a completed request can change the visible preview.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
+        if let Some(receiver) = &self.compass.definition_rx {
+            for (id, definition) in receiver.try_iter() {
+                self.compass.definitions.insert(id, definition);
+            }
+        }
         for (id, model) in self.response.try_iter() {
+            if let Some(variant) = self.compass_variant(&id) {
+                self.compass.variants.insert(variant, id.clone());
+            }
             if let Some(entry) = self.entries.get_mut(&id) {
                 if let Entry::Ready { bytes, .. } = entry {
                     self.bytes = self.bytes.saturating_sub(*bytes);
@@ -868,6 +926,7 @@ impl ItemModelCache {
             if let Some(Entry::Ready { bytes, .. }) = self.entries.remove(&oldest) {
                 self.bytes = self.bytes.saturating_sub(bytes);
             }
+            self.compass.variants.retain(|_, key| key != &oldest);
         }
     }
 
@@ -876,10 +935,64 @@ impl ItemModelCache {
     }
 
     pub fn get_item(&mut self, item: &ItemStack) -> Option<Arc<HeldModel>> {
+        let mut key = ModelKey::from_item(item);
+        if key.id == "minecraft:compass"
+            && key.lodestone_tracker
+            && let Some(definition) = self.compass.definitions.get(&key.id)
+            && definition
+                .pointer("/model/property")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "minecraft:has_component" | "has_component"))
+            && definition
+                .pointer("/model/on_true/type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "minecraft:range_dispatch" | "range_dispatch"))
+            && definition
+                .pointer("/model/on_true/property")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
+            && definition
+                .pointer("/model/on_true/target")
+                .and_then(Value::as_str)
+                == Some("lodestone")
+            && definition
+                .pointer("/model/on_true/wobble")
+                .is_none_or(|value| value.as_bool() == Some(true))
+            && let Some(context) = self.compass.context.as_ref()
+            && let Some(tracker) = item
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(native_session::lodestone::Tracker::parse)
+            && let Some(target) = tracker.target
+            && format!("{}:{}", target.dimension.namespace, target.dimension.path)
+                == context.dimension
+            && let Some(angle) = crate::compass_motion::local_target_angle(
+                &mut self.compass.wobbler,
+                context.tick,
+                context.yaw_degrees,
+                context.owner,
+                target.position,
+            )
+        {
+            key.compass_angle = angle.to_bits();
+        }
+        self.get_key(key)
+    }
+
+    pub(crate) fn get_item_without_compass_context(
+        &mut self,
+        item: &ItemStack,
+    ) -> Option<Arc<HeldModel>> {
         self.get_key(ModelKey::from_item(item))
     }
 
-    fn get_key(&mut self, key: ModelKey) -> Option<Arc<HeldModel>> {
+    fn get_key(&mut self, mut key: ModelKey) -> Option<Arc<HeldModel>> {
+        let variant = self.compass_variant(&key);
+        if let Some(existing) = variant.as_ref().and_then(|v| self.compass.variants.get(v))
+            && self.entries.contains_key(existing)
+        {
+            key = existing.clone();
+        }
         if let Some(entry) = self.entries.get(&key) {
             if self.frame_started {
                 self.active.insert(key);
@@ -890,6 +1003,9 @@ impl ItemModelCache {
             };
         }
         if self.request.try_send(key.clone()).is_ok() {
+            if let Some(variant) = variant {
+                self.compass.variants.insert(variant, key.clone());
+            }
             if self.frame_started {
                 self.active.insert(key.clone());
             }
@@ -932,6 +1048,41 @@ mod tests {
             selected_model(&definition, &key).unwrap()["model"],
             "linked"
         );
+    }
+
+    #[test]
+    fn compass_model_cache_reuses_selected_resource_pack_variant() {
+        let (request, requests) = mpsc::sync_channel(16);
+        let (_results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+            compass: CompassCache::default(),
+        };
+        cache.compass.definitions.insert("minecraft:compass".into(), Arc::new(serde_json::json!({
+            "model":{"type":"minecraft:range_dispatch","property":"minecraft:compass","target":"lodestone","scale":1.0,
+            "entries":[{"threshold":0.0,"model":{"type":"minecraft:model","model":"first"}},
+            {"threshold":0.12345,"model":{"type":"minecraft:model","model":"second"}}]}
+        })));
+        let mut key = ModelKey::plain("minecraft:compass");
+        key.compass_angle = 0.13_f32.to_bits();
+        assert!(cache.get_key(key.clone()).is_none());
+        assert_eq!(requests.try_recv().unwrap(), key);
+        key.compass_angle = 0.91_f32.to_bits();
+        assert!(cache.get_key(key.clone()).is_none());
+        assert!(
+            requests.try_recv().is_err(),
+            "same selected model must reuse the pending request"
+        );
+        key.compass_angle = 0.12344_f32.to_bits();
+        assert!(cache.get_key(key.clone()).is_none());
+        assert_eq!(requests.try_recv().unwrap(), key);
     }
 
     #[test]
@@ -1425,6 +1576,7 @@ public class PaletteOracle {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache::default(),
         };
         let model = test_model();
         let size = estimated_bytes(&model);
@@ -1476,6 +1628,7 @@ public class PaletteOracle {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache::default(),
         };
         let model = test_model();
         let size = estimated_bytes(&model);
@@ -1510,6 +1663,7 @@ public class PaletteOracle {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache::default(),
         };
         cache.begin_frame();
         for index in 0..80 {
@@ -1557,6 +1711,7 @@ public class PaletteOracle {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache::default(),
         };
         cache.begin_frame();
         for index in 0..(MAX_ACTIVE_MODELS + 40) {
@@ -1590,6 +1745,7 @@ public class PaletteOracle {
             frame_started: false,
             active: HashSet::new(),
             previous_active: HashSet::new(),
+            compass: CompassCache::default(),
         };
         let model = test_model();
         let size = estimated_bytes(&model);

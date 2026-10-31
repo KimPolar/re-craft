@@ -162,6 +162,8 @@ pub struct GameUi {
     pointer_slot: Option<PlayerSlot>,
     recipe_book: RecipeBookUi,
     last_draw: Option<DrawKey>,
+    compass_inventory_revision: Option<u64>,
+    compass_visible: bool,
     pre_blur_hud: Option<Canvas>,
     hud: HudDisplay,
     experience: crate::experience_hud::Display,
@@ -213,6 +215,8 @@ impl GameUi {
             pointer_slot: None,
             recipe_book: RecipeBookUi::default(),
             last_draw: None,
+            compass_inventory_revision: None,
+            compass_visible: false,
             pre_blur_hud: None,
             hud: HudDisplay::default(),
             experience: crate::experience_hud::Display::new(
@@ -1459,6 +1463,40 @@ impl GameUi {
         partial: f32,
     ) -> Result<()> {
         self.held_models.begin_frame();
+        let dimension = match &snapshot.world {
+            native_session::SessionWorld::Demo(_) => "minecraft:overworld",
+            native_session::SessionWorld::Loaded(world) => world.dimension.as_str(),
+        };
+        let context = crate::held_items::CompassContext {
+            dimension: dimension.to_owned(),
+            owner: snapshot.origin.as_dvec3() + snapshot.player.position.as_dvec3(),
+            yaw_degrees: snapshot.player.yaw.to_degrees() - 180.0,
+            tick: snapshot.tick.min(i64::MAX as u64) as i64,
+        };
+        let context_changed = self.held_models.set_compass_context(context);
+        if self.compass_inventory_revision != Some(snapshot.inventory.revision()) {
+            let has_linked = |item: &ItemStack| {
+                item.id() == "minecraft:compass"
+                    && item
+                        .components()
+                        .get("minecraft:lodestone_tracker")
+                        .is_some()
+            };
+            let slots = (0..36)
+                .map(PlayerSlot::Storage)
+                .chain((0..4).map(PlayerSlot::Armor))
+                .chain((0..9).map(PlayerSlot::Crafting))
+                .chain((0..54).map(PlayerSlot::Chest))
+                .chain(std::iter::once(PlayerSlot::Offhand));
+            self.compass_visible = slots
+                .into_iter()
+                .any(|slot| snapshot.inventory.slot(slot).is_some_and(has_linked))
+                || snapshot.inventory.cursor().is_some_and(has_linked);
+            self.compass_inventory_revision = Some(snapshot.inventory.revision());
+        }
+        if context_changed && self.compass_visible {
+            self.last_draw = None;
+        }
         self.sync_death(snapshot);
         if !Arc::ptr_eq(&self.snapshot_messages, &snapshot.system_messages) {
             self.snapshot_messages = Arc::clone(&snapshot.system_messages);
@@ -1494,7 +1532,10 @@ impl GameUi {
         let dropped_models = snapshot
             .dropped_items
             .iter()
-            .map(|item| self.held_models.get_item(&item.stack))
+            .map(|item| {
+                self.held_models
+                    .get_item_without_compass_context(&item.stack)
+            })
             .collect::<Vec<_>>();
         let falling_models = snapshot
             .falling_blocks
@@ -4802,6 +4843,84 @@ mod inventory_tests {
         assert!(
             visible > 32,
             "inventory should display the loaded compass pixels"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn linked_compass_models_change_with_player_position() {
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceId;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&directory, &[]).unwrap()));
+        let tracker = native_session::lodestone::Tracker::linked(
+            ResourceId::parse("minecraft:overworld").unwrap(),
+            glam::IVec3::new(100, 64, 0),
+        );
+        let compass = ItemStack::new(
+            "minecraft:compass".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:lodestone_tracker".into(),
+                tracker.to_nbt(),
+            )]),
+        )
+        .unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(compass.clone()));
+        let context = |x| crate::held_items::CompassContext {
+            dimension: "minecraft:overworld".into(),
+            owner: glam::DVec3::new(x, 64.0, 0.5),
+            yaw_degrees: -180.0,
+            tick: 10,
+        };
+        let load = |ui: &mut GameUi, x| {
+            ui.held_models.set_compass_context(context(x));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_item(&compass) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "linked compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // The first request learns the pack definition asynchronously. Resolve
+        // again after it arrives so the actual position selects the model.
+        load(&mut ui, 0.5);
+        let east = load(&mut ui, 0.5);
+        let west = load(&mut ui, 200.5);
+        assert_ne!(
+            east.gui_icon.as_ref().unwrap().as_raw(),
+            west.gui_icon.as_ref().unwrap().as_raw()
+        );
+        ui.last_draw = None;
+        let canvas = ui.compose((1280, 720), &inventory, 10).unwrap();
+        let icon = west.gui_icon.as_ref().unwrap();
+        let (x, y) = (canvas.width / 2 - 91 + 3, canvas.height - 19);
+        let visible = (0..16)
+            .flat_map(|dy| (0..16).map(move |dx| (dx, dy)))
+            .filter(|&(dx, dy)| {
+                let pixel = icon.get_pixel(dx, dy).0;
+                if pixel[3] != 255 {
+                    return false;
+                }
+                let value =
+                    canvas.pixels[((y + dy as i32) * canvas.width + x + dx as i32) as usize];
+                value & 0x00ff_ffff
+                    == (((pixel[0] as u32) << 16) | ((pixel[1] as u32) << 8) | pixel[2] as u32)
+            })
+            .count();
+        assert!(
+            visible > 32,
+            "hotbar should show the model for the updated position"
         );
     }
 

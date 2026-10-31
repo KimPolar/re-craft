@@ -8,6 +8,7 @@ mod breaking_render;
 mod chat_hud;
 mod chest_model;
 mod chunk_stream;
+mod compass_motion;
 mod death_ui;
 mod equipment_visual;
 mod experience_hud;

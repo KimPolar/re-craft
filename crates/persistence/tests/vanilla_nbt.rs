@@ -393,6 +393,79 @@ fn run_checked(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_poi_sections_are_decoded_from_dimension_region() {
+    let game = minecraft_dir();
+    let java = java_bin();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("PoiOracle.java");
+    std::fs::write(&source, r#"
+import java.nio.file.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.*;
+import net.minecraft.world.entity.ai.village.poi.*;
+public class PoiOracle {
+  public static void main(String[] args) throws Exception {
+    SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var home = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.HOME);
+    var ops = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
+    var first = new PoiSection.Packed(true, List.of(new PoiRecord.Packed(new BlockPos(-1,-1,0), home, 1)));
+    var second = new PoiSection.Packed(false, List.of(new PoiRecord.Packed(new BlockPos(-16,3,15), home, 0)));
+    var sections = new CompoundTag();
+    sections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, first).getOrThrow());
+    sections.put("0", PoiSection.Packed.CODEC.encodeStart(ops, second).getOrThrow());
+    var root = new CompoundTag(); root.putInt("DataVersion", 5023); root.put("Sections", sections);
+    NbtIo.write(root, Path.of(args[0], "poi.nbt"));
+    var data = new CompoundTag(); data.putInt("DataVersion", 5023);
+    var level = new CompoundTag(); level.put("Data", data);
+    NbtIo.writeCompressed(level, Path.of(args[0], "level.dat"));
+  }
+}
+"#).unwrap();
+    let cp = classpath(&game, Some(temp.path()));
+    run_checked(
+        Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source),
+    );
+    run_checked(
+        Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("PoiOracle")
+            .arg(temp.path()),
+    );
+    let bytes = std::fs::read(temp.path().join("poi.nbt")).unwrap();
+    let mut region = vec![0u8; 3 * 4096];
+    assert!(bytes.len() + 5 <= 4096);
+    region[31 * 4..32 * 4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+    region[8192..8196].copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+    region[8196] = 3;
+    region[8197..8197 + bytes.len()].copy_from_slice(&bytes);
+    let poi = temp.path().join("dimensions/minecraft/overworld/poi");
+    std::fs::create_dir_all(&poi).unwrap();
+    std::fs::write(poi.join("r.-1.0.mca"), region).unwrap();
+    let mut reader =
+        WorldReader::open(temp.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+    let chunk = reader.read_poi_chunk(-1, 0).unwrap().unwrap();
+    assert_eq!(*chunk.document, nbt::read(&bytes).unwrap());
+    for (y, valid, position, free) in [(-1, true, [-1, -1, 0], 1), (0, false, [-16, 3, 15], 0)] {
+        let section = &chunk.sections[&y];
+        assert_eq!(section.valid, valid);
+        assert_eq!(section.records.len(), 1);
+        assert_eq!(section.records[0].position, position);
+        assert_eq!(section.records[0].type_id, "minecraft:home".into());
+        assert_eq!(section.records[0].free_tickets, free);
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn allow_commands_matches_java_level_settings() {
     let game = minecraft_dir();
     let java = java_bin();

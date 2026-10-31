@@ -1,7 +1,7 @@
 //! Read-only access to complete 26.3 chunk documents and their decoded sections.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
@@ -106,6 +106,14 @@ impl DimensionId {
             .join(&self.namespace)
             .join(&self.path)
             .join("entities")
+    }
+
+    pub(crate) fn poi_region_dir(&self, world: &Path) -> PathBuf {
+        world
+            .join("dimensions")
+            .join(&self.namespace)
+            .join(&self.path)
+            .join("poi")
     }
 }
 
@@ -252,6 +260,28 @@ pub struct ChunkPos {
 pub struct SavedEntityChunk {
     pub position: ChunkPos,
     pub document: Arc<NamedTag>,
+}
+
+/// A decoded POI region entry with its complete original NBT retained.
+/// This does not reconcile POIs with blocks or authorize writing a world.
+#[derive(Clone)]
+pub struct SavedPoiChunk {
+    pub position: ChunkPos,
+    pub document: Arc<NamedTag>,
+    pub sections: BTreeMap<i32, SavedPoiSection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedPoiSection {
+    pub valid: bool,
+    pub records: Vec<SavedPoiRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedPoiRecord {
+    pub position: [i32; 3],
+    pub type_id: JavaString,
+    pub free_tickets: i32,
 }
 
 impl SavedEntityChunk {
@@ -614,6 +644,8 @@ pub struct WorldReader {
     region_usage: VecDeque<(i32, i32)>,
     entity_regions: BTreeMap<(i32, i32), RegionReader>,
     entity_region_usage: VecDeque<(i32, i32)>,
+    poi_regions: BTreeMap<(i32, i32), RegionReader>,
+    poi_region_usage: VecDeque<(i32, i32)>,
 }
 
 /// The saved pack order and feature flags, before discovery of newly added packs.
@@ -843,6 +875,8 @@ impl WorldReader {
             self.region_usage.clear();
             self.entity_regions.clear();
             self.entity_region_usage.clear();
+            self.poi_regions.clear();
+            self.poi_region_usage.clear();
         }
     }
     /// Inspect a world without acquiring the Java session lock. This is only
@@ -884,6 +918,8 @@ impl WorldReader {
             region_usage: VecDeque::new(),
             entity_regions: BTreeMap::new(),
             entity_region_usage: VecDeque::new(),
+            poi_regions: BTreeMap::new(),
+            poi_region_usage: VecDeque::new(),
         })
     }
 
@@ -1405,6 +1441,21 @@ impl WorldReader {
         .transpose()
     }
 
+    /// Missing POI storage is distinct from a decoded empty entry: Java can
+    /// populate or rebuild it when loading the corresponding terrain sections.
+    pub fn read_poi_chunk(&mut self, x: i32, z: i32) -> Result<Option<SavedPoiChunk>> {
+        let directory = self.dimension.poi_region_dir(&self.root);
+        read_region_document(
+            &directory,
+            x,
+            z,
+            &mut self.poi_regions,
+            &mut self.poi_region_usage,
+        )?
+        .map(|document| decode_poi_chunk(document, ChunkPos { x, z }))
+        .transpose()
+    }
+
     pub fn read_area(&mut self, center: ChunkPos, radius: u32) -> Result<ChunkArea> {
         ensure!(
             radius <= MAX_AREA_RADIUS,
@@ -1485,6 +1536,106 @@ fn read_region_document(
     usage.push_back(region_pos);
     let reader = regions.get_mut(&region_pos).context("region cache error")?;
     reader.read_chunk(x, z)
+}
+
+fn decode_poi_chunk(document: NamedTag, expected: ChunkPos) -> Result<SavedPoiChunk> {
+    use crate::nbt::TagType;
+    fn field<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
+        let Tag::Compound(fields) = tag else {
+            bail!("POI value must be a compound")
+        };
+        let mut matches = fields.iter().filter(|(key, _)| key.matches(name));
+        let value = matches.next().map(|(_, value)| value);
+        ensure!(matches.next().is_none(), "duplicate POI field {name}");
+        Ok(value)
+    }
+    match field(&document.value, "DataVersion")? {
+        Some(Tag::Int(TARGET_DATA_VERSION)) => {}
+        Some(Tag::Int(version)) => {
+            bail!("unsupported POI DataVersion {version}; expected {TARGET_DATA_VERSION}")
+        }
+        _ => bail!("POI chunk is missing integer DataVersion"),
+    }
+    let Some(Tag::Compound(raw_sections)) = field(&document.value, "Sections")? else {
+        bail!("POI chunk Sections must be a compound")
+    };
+    let mut sections = BTreeMap::new();
+    let mut positions = BTreeSet::new();
+    for (name, raw_section) in raw_sections {
+        let key = String::from_utf16(&name.0).context("invalid POI section name")?;
+        let y: i32 = key.parse().context("invalid POI section coordinate")?;
+        ensure!(key == y.to_string(), "noncanonical POI section coordinate");
+        let valid = field(raw_section, "Valid")?
+            .and_then(nbt_bool)
+            .unwrap_or(false);
+        let records = match field(raw_section, "Records")? {
+            Some(Tag::List {
+                element_type: TagType::Compound,
+                values,
+            }) => values.as_slice(),
+            Some(Tag::List {
+                element_type: TagType::End,
+                values,
+            }) if values.is_empty() => values.as_slice(),
+            _ => bail!("POI section Records must be a list of compounds"),
+        };
+        let mut decoded = Vec::with_capacity(records.len());
+        for record in records {
+            let coordinates = match field(record, "pos")? {
+                Some(Tag::IntArray(values)) => values.clone(),
+                Some(Tag::ByteArray(values)) => {
+                    values.iter().map(|v| i32::from(*v as i8)).collect()
+                }
+                Some(Tag::LongArray(values)) => values.iter().map(|v| *v as i32).collect(),
+                Some(Tag::List { values, .. }) => values
+                    .iter()
+                    .map(|v| v.as_java_int().context("POI position must contain numbers"))
+                    .collect::<Result<Vec<_>>>()?,
+                _ => bail!("POI position must be an integer sequence"),
+            };
+            let position: [i32; 3] = coordinates
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("POI position must contain three coordinates"))?;
+            ensure!(
+                position[0].div_euclid(16) == expected.x
+                    && position[2].div_euclid(16) == expected.z
+                    && position[1].div_euclid(16) == y,
+                "POI position does not match its chunk and section"
+            );
+            ensure!(positions.insert(position), "duplicate POI position");
+            let Some(Tag::String(type_id)) = field(record, "type")? else {
+                bail!("POI type must be a string")
+            };
+            let free_tickets = match field(record, "free_tickets")? {
+                None => 0,
+                Some(value) => value
+                    .as_java_int()
+                    .context("POI free_tickets must be a number")?,
+            };
+            decoded.push(SavedPoiRecord {
+                position,
+                type_id: type_id.clone(),
+                free_tickets,
+            });
+        }
+        ensure!(
+            sections
+                .insert(
+                    y,
+                    SavedPoiSection {
+                        valid,
+                        records: decoded
+                    }
+                )
+                .is_none(),
+            "duplicate POI section"
+        );
+    }
+    Ok(SavedPoiChunk {
+        position: expected,
+        document: Arc::new(document),
+        sections,
+    })
 }
 
 pub(crate) fn decode_entity_chunk(
@@ -2392,6 +2543,122 @@ mod tests {
                 .entities()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn poi_regions_decode_preserve_originals_and_are_dimension_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let make = |x: i32, marker: i32| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("unknown".into(), Tag::Int(marker)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "-1".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("pos".into(), Tag::IntArray(vec![x, -1, 0])),
+                                        ("type".into(), Tag::String("minecraft:home".into())),
+                                        ("free_tickets".into(), Tag::Int(1)),
+                                        ("future".into(), Tag::String("preserved".into())),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let mut files = Vec::new();
+        for (index, name) in ["overworld", "the_nether"].into_iter().enumerate() {
+            let dimension = DimensionId::parse(name).unwrap();
+            let directory = dimension.poi_region_dir(dir.path());
+            std::fs::create_dir_all(&directory).unwrap();
+            let source = make(-1, index as i32);
+            let bytes = nbt::write(&source).unwrap();
+            let mut region = vec![0u8; 3 * 4096];
+            region[31 * 4..32 * 4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+            region[8192..8196].copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+            region[8196] = 3;
+            region[8197..8197 + bytes.len()].copy_from_slice(&bytes);
+            let path = directory.join("r.-1.0.mca");
+            std::fs::write(&path, &region).unwrap();
+            files.push((path, region, source));
+        }
+        let mut reader =
+            WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        assert!(reader.read_poi_chunk(0, 0).unwrap().is_none());
+        for (index, name) in ["overworld", "the_nether", "overworld"]
+            .into_iter()
+            .enumerate()
+        {
+            let source_index = if index == 1 { 1 } else { 0 };
+            reader.set_dimension(DimensionId::parse(name).unwrap());
+            let chunk = reader.read_poi_chunk(-1, 0).unwrap().unwrap();
+            assert_eq!(*chunk.document, files[source_index].2);
+            let section = &chunk.sections[&-1];
+            assert!(section.valid);
+            assert_eq!(section.records[0].position, [-1, -1, 0]);
+            assert_eq!(section.records[0].type_id, "minecraft:home".into());
+            assert_eq!(section.records[0].free_tickets, 1);
+            assert_eq!(reader.poi_regions.len(), 1);
+        }
+        for (path, bytes, _) in &files {
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
+        assert!(decode_poi_chunk(make(0, 0), ChunkPos { x: -1, z: 0 }).is_err());
+        let mut duplicate = make(-1, 0);
+        let Tag::Compound(root) = &mut duplicate.value else {
+            unreachable!()
+        };
+        root.push(("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)));
+        assert!(decode_poi_chunk(duplicate, ChunkPos { x: -1, z: 0 }).is_err());
+
+        let mut duplicate = make(-1, 0);
+        let Tag::Compound(root) = &mut duplicate.value else {
+            unreachable!()
+        };
+        let Tag::Compound(sections) = &mut root[2].1 else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0].1 else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut section[1].1 else {
+            unreachable!()
+        };
+        values.push(values[0].clone());
+        assert!(decode_poi_chunk(duplicate, ChunkPos { x: -1, z: 0 }).is_err());
+
+        let mut defaults = make(-1, 0);
+        let Tag::Compound(root) = &mut defaults.value else {
+            unreachable!()
+        };
+        let Tag::Compound(sections) = &mut root[2].1 else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0].1 else {
+            unreachable!()
+        };
+        section.remove(0);
+        let Tag::List { values, .. } = &mut section[0].1 else {
+            unreachable!()
+        };
+        let Tag::Compound(record) = &mut values[0] else {
+            unreachable!()
+        };
+        record.retain(|(name, _)| !name.matches("free_tickets"));
+        let chunk = decode_poi_chunk(defaults, ChunkPos { x: -1, z: 0 }).unwrap();
+        assert!(!chunk.sections[&-1].valid);
+        assert_eq!(chunk.sections[&-1].records[0].free_tickets, 0);
     }
 
     #[test]

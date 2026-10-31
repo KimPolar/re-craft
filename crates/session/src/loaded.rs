@@ -423,6 +423,7 @@ pub struct LoadedSession {
     water_source_conversion: bool,
     lava_source_conversion: bool,
     block_notifications: VecDeque<(IVec3, BlockStateId, BlockStateId)>,
+    pending_stair_updates: BTreeMap<ChunkPos, BTreeSet<BlockPosition>>,
     notifying_blocks: bool,
 }
 
@@ -2429,6 +2430,7 @@ impl LoadedSession {
             water_source_conversion: true,
             lava_source_conversion: false,
             block_notifications: VecDeque::new(),
+            pending_stair_updates: BTreeMap::new(),
             notifying_blocks: false,
         };
         for (pos, ticks) in saved_ticks {
@@ -5098,6 +5100,7 @@ impl LoadedSession {
             }
         }
         if changed {
+            self.retry_stair_updates();
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
             self.sky_lighting.streaming_changed();
@@ -6877,6 +6880,16 @@ impl LoadedSession {
                 current: id,
             });
         self.dirty_chunks.insert(chunk_pos);
+        if !self.pending_stair_updates.is_empty()
+            && self.stair_voxels(old).is_some()
+            && self.stair_voxels(id).is_none()
+        {
+            self.clear_pending_stair(BlockPosition {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            });
+        }
         if let Some(light_change) = relight {
             self.light_generation = self.light_generation.wrapping_add(1);
             let position = BlockPosition {
@@ -7965,6 +7978,168 @@ impl LoadedSession {
         self.notifying_blocks = false;
     }
 
+    fn clear_pending_stair(&mut self, pos: BlockPosition) {
+        if self.pending_stair_updates.is_empty() {
+            return;
+        }
+        let origin = IVec3::new(pos.x, pos.y, pos.z);
+        for direction in [IVec3::ZERO, IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
+            let Some(neighbor) = add(origin, direction) else {
+                continue;
+            };
+            let chunk = ChunkPos {
+                x: neighbor.x.div_euclid(16),
+                z: neighbor.z.div_euclid(16),
+            };
+            if let Some(pending) = self.pending_stair_updates.get_mut(&chunk) {
+                pending.remove(&pos);
+                if pending.is_empty() {
+                    self.pending_stair_updates.remove(&chunk);
+                }
+            }
+        }
+    }
+
+    fn retry_stair_updates(&mut self) {
+        let ready: Vec<_> = self
+            .pending_stair_updates
+            .keys()
+            .copied()
+            .filter(|pos| {
+                self.world
+                    .chunks
+                    .get(pos)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            })
+            .collect();
+        let mut positions = BTreeSet::new();
+        for pos in ready {
+            if let Some(pending) = self.pending_stair_updates.remove(&pos) {
+                positions.extend(pending);
+            }
+        }
+        for pos in positions {
+            let relative = match (
+                pos.x.checked_sub(self.origin.x),
+                pos.y.checked_sub(self.origin.y),
+                pos.z.checked_sub(self.origin.z),
+            ) {
+                (Some(x), Some(y), Some(z)) => IVec3::new(x, y, z),
+                _ => continue,
+            };
+            if let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                relative,
+                self.states[0],
+            ) {
+                self.update_stair_shape(relative, id);
+            } else {
+                let chunk = ChunkPos {
+                    x: pos.x.div_euclid(16),
+                    z: pos.z.div_euclid(16),
+                };
+                self.pending_stair_updates
+                    .entry(chunk)
+                    .or_default()
+                    .insert(pos);
+            }
+        }
+    }
+
+    fn update_stair_shape(&mut self, position: IVec3, id: BlockStateId) -> bool {
+        if self.stair_voxels(id).is_none() {
+            return false;
+        }
+        let Some(block) = self.world.state(id).cloned() else {
+            return false;
+        };
+        let Some(stair) = native_world::stairs::Stair::from_state(&block) else {
+            return false;
+        };
+        let result = native_world::stairs::shape(stair, |direction| {
+            let Some(pos) = add(position, direction) else {
+                return native_world::stairs::Neighbor::Unknown;
+            };
+            let Cell::State(other) =
+                cell(&self.world, self.origin, self.bounds, pos, self.states[0])
+            else {
+                return native_world::stairs::Neighbor::Unknown;
+            };
+            let Some(state) = self.world.state(other) else {
+                return native_world::stairs::Neighbor::Unknown;
+            };
+            if self.stair_voxels(other).is_some() {
+                return native_world::stairs::Stair::from_state(state).map_or(
+                    native_world::stairs::Neighbor::Unknown,
+                    native_world::stairs::Neighbor::Stair,
+                );
+            }
+            if state.name.ends_with("_stairs")
+                || !self
+                    .vanilla_block_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&state.name))
+            {
+                native_world::stairs::Neighbor::Unknown
+            } else {
+                native_world::stairs::Neighbor::Other
+            }
+        });
+        let Some(absolute) = add(self.origin, position) else {
+            return false;
+        };
+        let absolute = BlockPosition {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+        };
+        self.clear_pending_stair(absolute);
+        let Some(shape) = result else {
+            for direction in [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z] {
+                let Some(neighbor) = add(position, direction) else {
+                    continue;
+                };
+                if matches!(
+                    cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        neighbor,
+                        self.states[0]
+                    ),
+                    Cell::Missing
+                ) && let Some(neighbor) = add(self.origin, neighbor)
+                {
+                    let chunk = ChunkPos {
+                        x: neighbor.x.div_euclid(16),
+                        z: neighbor.z.div_euclid(16),
+                    };
+                    self.pending_stair_updates
+                        .entry(chunk)
+                        .or_default()
+                        .insert(absolute);
+                }
+            }
+            return false;
+        };
+        if block
+            .properties
+            .get("shape")
+            .is_some_and(|old| old == shape)
+        {
+            return false;
+        }
+        let mut next = block;
+        next.properties.insert("shape".into(), shape.into());
+        if let Some(fluid) = self.simulated_fluid(id) {
+            self.schedule_fluid(position, fluid, self.fluid_settings().delay(fluid.kind));
+        }
+        let next = self.intern_block(next);
+        self.set(position, next)
+    }
+
     fn notify_one_block(&mut self, position: IVec3, old: BlockStateId, new: BlockStateId) {
         let settings = self.fluid_settings();
         let old_name = self.world.state(old).map(|state| state.name.as_str());
@@ -8008,6 +8183,9 @@ impl LoadedSession {
             };
             if direction == IVec3::NEG_Y {
                 self.update_snowy_below(position, neighbor, id);
+            }
+            if direction.y == 0 && self.update_stair_shape(neighbor, id) {
+                continue;
             }
             if self
                 .world
@@ -26632,6 +26810,200 @@ mod tests {
             && key.z == absolute.z
             && key.kind == FluidKind::Water
             && key.source));
+    }
+
+    #[test]
+    fn neighboring_stairs_update_corners_and_preserve_water() {
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:oak_stairs".into(),
+            "minecraft:stone_stairs".into(),
+        ])));
+        let pos = IVec3::new(8, 3, 8);
+        let stair = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "true"),
+            ],
+        ));
+        let turn = session.intern_block(state(
+            "minecraft:stone_stairs",
+            &[
+                ("facing", "west"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        session.set_with_notify(pos, stair, false);
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        assert!(session.set(pos + IVec3::NEG_Z, turn));
+        let block = |session: &LoadedSession| match cell(
+            &session.world,
+            session.origin,
+            session.bounds,
+            pos,
+            session.states[0],
+        ) {
+            Cell::State(id) => session.world.state(id).unwrap().clone(),
+            _ => panic!("missing stair"),
+        };
+        let corner = block(&session);
+        assert_eq!(
+            corner.properties.get("shape").map(String::as_str),
+            Some("outer_left")
+        );
+        assert_eq!(
+            corner.properties.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+        let absolute = session.origin + pos;
+        assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+            && key.y == absolute.y
+            && key.z == absolute.z
+            && key.kind == FluidKind::Water
+            && key.source));
+        assert!(session.set(pos + IVec3::NEG_Z, session.states[0]));
+        assert_eq!(
+            block(&session).properties.get("shape").map(String::as_str),
+            Some("straight")
+        );
+
+        let unusual = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "bottom"),
+                ("shape", "inner_right"),
+                ("waterlogged", "true"),
+            ],
+        ));
+        session.set_with_notify(pos, unusual, false);
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        assert!(session.set(pos + IVec3::Y, session.states[3]));
+        assert_eq!(
+            block(&session).properties.get("shape").map(String::as_str),
+            Some("inner_right")
+        );
+        assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+            && key.y == absolute.y
+            && key.z == absolute.z
+            && key.kind == FluidKind::Water
+            && key.source));
+    }
+
+    #[test]
+    fn stair_shape_waits_for_unloaded_required_neighbors() {
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:oak_stairs".into(),
+        ])));
+        let pos = IVec3::new(0, 3, 8);
+        let stair = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "west"),
+                ("half", "bottom"),
+                ("shape", "inner_right"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        session.set_with_notify(pos, stair, false);
+        assert!(session.set(pos + IVec3::X, session.states[3]));
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, pos, session.states[0]), Cell::State(id) if id == stair)
+        );
+        let west = ChunkPos {
+            x: session.origin.x.div_euclid(16) - 1,
+            z: session.origin.z.div_euclid(16),
+        };
+        assert!(session.pending_stair_updates.contains_key(&west));
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let front = incoming.intern_state(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "south"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[15 + 8 * 16 + 3 * 256] = front;
+        incoming.chunks.insert(
+            west,
+            Arc::new(Chunk {
+                position: west,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(west, incoming);
+        session.apply_streaming();
+        let Cell::State(updated) = cell(
+            &session.world,
+            session.origin,
+            session.bounds,
+            pos,
+            session.states[0],
+        ) else {
+            panic!("missing stair")
+        };
+        assert_eq!(
+            session
+                .world
+                .state(updated)
+                .unwrap()
+                .properties
+                .get("shape")
+                .map(String::as_str),
+            Some("outer_left")
+        );
+        assert!(!session.pending_stair_updates.contains_key(&west));
+    }
+
+    #[test]
+    fn removed_stair_clears_deferred_neighbor_update() {
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:oak_stairs".into(),
+        ])));
+        let pos = IVec3::new(0, 3, 8);
+        let stair = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "west"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        session.set_with_notify(pos, stair, false);
+        assert!(session.set(pos + IVec3::X, session.states[3]));
+        assert!(!session.pending_stair_updates.is_empty());
+        assert!(session.set(pos, session.states[0]));
+        assert!(session.pending_stair_updates.is_empty());
     }
 
     #[test]

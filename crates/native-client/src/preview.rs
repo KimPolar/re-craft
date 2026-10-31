@@ -544,6 +544,7 @@ impl PreviewMaterials {
                         .select_indices(blockstates::positional_seed(
                             position.x, position.y, position.z,
                         ))?;
+                let mut cached_tints: [Option<(i32, [f32; 3])>; 4] = [None; 4];
                 for (group, selected) in block.baked.groups.iter().zip(selections) {
                     let weighted = group.get(selected).context("invalid selected model")?;
                     let model = &weighted.model;
@@ -587,7 +588,22 @@ impl PreviewMaterials {
                             lighting.nether_cardinal,
                         );
                         let levels = model_light(world, position, quad, lighting.has_skylight);
-                        let tint = tint(state, quad.tint_index, world, biome_colors, position);
+                        let tint = if quad.tint_index < 0 {
+                            [1.0; 3]
+                        } else if let Some((_, value)) = cached_tints
+                            .iter()
+                            .flatten()
+                            .find(|(index, _)| *index == quad.tint_index)
+                        {
+                            *value
+                        } else {
+                            let value = tint(state, quad.tint_index, world, biome_colors, position);
+                            if let Some(slot) = cached_tints.iter_mut().find(|slot| slot.is_none())
+                            {
+                                *slot = Some((quad.tint_index, value));
+                            }
+                            value
+                        };
                         let block_position = relative_position(position, origin);
                         let vertices = std::array::from_fn(|i| {
                             let vertex = quad.vertices[[0, 1, 2, 0, 2, 3][i]];
@@ -751,6 +767,7 @@ pub struct IncrementalPreview {
     chunks: BTreeMap<ChunkPos, CachedChunkMesh>,
     materials: Option<(MaterialsKey, PreviewMaterials)>,
     origin: Option<IVec3>,
+    biome_zoom_seed: Option<Option<i64>>,
     generation: u64,
     #[cfg(test)]
     last_rebuilt: usize,
@@ -972,6 +989,10 @@ impl IncrementalPreview {
             self.origin = Some(requested_origin);
             self.chunks.clear();
         }
+        if self.biome_zoom_seed != Some(world.biome_zoom_seed()) {
+            self.biome_zoom_seed = Some(world.biome_zoom_seed());
+            self.chunks.clear();
+        }
         let origin = self.origin.expect("mesh origin is initialized");
         let materials = &self
             .materials
@@ -1185,7 +1206,7 @@ fn biome_tint(
     kind: BiomeTint,
 ) -> [f32; 3] {
     let biome = world
-        .biome(position.x, position.y, position.z)
+        .biome_at_block(position.x, position.y, position.z)
         .and_then(|name| biomes.get(name));
     rgb(match kind {
         BiomeTint::Grass => biome.map_or(0x91bd5a, BiomeColors::grass),
@@ -1640,6 +1661,22 @@ mod tests {
             .prepare(&world, &mut source, IVec3::ZERO, 128)
             .unwrap();
         let reads = source.0;
+        world.set_biome_world_seed(Some(12345));
+        let seeded = cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 2);
+        assert!(Arc::ptr_eq(&first.atlas, &seeded.atlas));
+        cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 0);
+        world.set_biome_world_seed(None);
+        cache
+            .prepare(&world, &mut source, IVec3::ZERO, 128)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 2);
+        assert_eq!(source.0, reads);
         let removed = world.chunks.remove(&far).unwrap();
         let scene = cache
             .prepare(&world, &mut source, IVec3::ZERO, 128)

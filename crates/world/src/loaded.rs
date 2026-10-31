@@ -182,6 +182,8 @@ pub struct Chunk {
 #[derive(Clone, Debug, Default)]
 pub struct World {
     pub dimension: String,
+    /// Hashed world seed for Java's block-position biome selection, when known.
+    biome_zoom_seed: Option<i64>,
     /// The resolved registry ID of this dimension's type, when available.
     /// This travels with snapshots so streamed mesh work uses the same type.
     pub dimension_type: Option<String>,
@@ -485,6 +487,27 @@ impl World {
         self.biome_by_id(*section.biomes.as_ref()?.get(index)?)
     }
 
+    pub fn set_biome_world_seed(&mut self, seed: Option<i64>) {
+        self.biome_zoom_seed = seed.map(crate::biome_zoom::obfuscate_seed);
+    }
+
+    pub fn biome_zoom_seed(&self) -> Option<i64> {
+        self.biome_zoom_seed
+    }
+
+    /// Block-position lookup; without a saved seed, use the available quart data directly.
+    pub fn biome_at_block(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+        let Some(seed) = self.biome_zoom_seed else {
+            return self.biome(x, y, z);
+        };
+        let quart = crate::biome_zoom::quart_position(seed, glam::IVec3::new(x, y, z));
+        self.biome(
+            quart.x.checked_mul(4)?,
+            quart.y.checked_mul(4)?,
+            quart.z.checked_mul(4)?,
+        )
+    }
+
     pub fn light(&self, x: i32, y: i32, z: i32, sky: bool) -> Option<u8> {
         let (section, local) = self.section_and_local(x, y, z)?;
         let data = if sky {
@@ -533,6 +556,59 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_biomes_use_the_saved_seed_while_noise_biomes_remain_direct() {
+        let mut world = World::new("minecraft:overworld");
+        let ids: Vec<_> = (0..64)
+            .map(|i| world.intern_biome(format!("example:biome_{i}")))
+            .collect();
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: None,
+                        biomes: Some(Box::new(std::array::from_fn(|i| ids[i]))),
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let seed = 12345;
+        let mut changed = 0;
+        for x in 3..12 {
+            for y in 3..12 {
+                for z in 3..12 {
+                    assert_eq!(world.biome_at_block(x, y, z), world.biome(x, y, z));
+                }
+            }
+        }
+        world.set_biome_world_seed(Some(seed));
+        let snapshot = world.clone();
+        for x in 3..12 {
+            for y in 3..12 {
+                for z in 3..12 {
+                    let quart = crate::biome_zoom::quart_position(
+                        crate::biome_zoom::obfuscate_seed(seed),
+                        glam::IVec3::new(x, y, z),
+                    );
+                    let expected =
+                        format!("example:biome_{}", quart.x + quart.z * 4 + quart.y * 16);
+                    assert_eq!(world.biome_at_block(x, y, z), Some(expected.as_str()));
+                    assert_eq!(snapshot.biome_at_block(x, y, z), Some(expected.as_str()));
+                    changed += usize::from(world.biome_at_block(x, y, z) != world.biome(x, y, z));
+                }
+            }
+        }
+        assert!(changed > 0);
+    }
 
     #[test]
     fn registry_deduplicates_complete_states_without_losing_properties() {

@@ -1137,6 +1137,7 @@ dependencies = [
  "native-core",
  "native-resources",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

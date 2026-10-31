@@ -928,6 +928,7 @@ fn java_and_rust_read_each_others_nbt() {
     }
     let mut reader =
         WorldReader::open(&world, DimensionId::parse("minecraft:overworld").unwrap()).unwrap();
+    assert_eq!(reader.saved_world_seed().unwrap(), Some(12345));
     use native_persistence::world::SavedClock;
     let clocks = reader.world_clocks().unwrap();
     let initial = [

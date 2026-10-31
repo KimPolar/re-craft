@@ -983,13 +983,7 @@ impl WorldReader {
         }
     }
 
-    /// Read the dimension/type mappings in the shared 26.3 world-generation
-    /// saved data. Active data-pack dimension definitions take precedence when
-    /// Java bakes its dimension registry; the caller must apply that layer.
-    /// A missing file is distinct from a missing dimension entry.
-    pub fn saved_dimension_types(
-        &self,
-    ) -> Result<Option<BTreeMap<DimensionId, SavedDimensionType>>> {
+    fn saved_world_gen_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/world_gen_settings.dat");
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -1013,6 +1007,44 @@ impl WorldReader {
             ),
             _ => bail!("{} is missing integer DataVersion", path.display()),
         }
+        Ok(Some(document))
+    }
+
+    /// Read the world seed from the 26.3 world-generation saved data.
+    pub fn saved_world_seed(&self) -> Result<Option<i64>> {
+        let Some(document) = self.saved_world_gen_document()? else {
+            return Ok(None);
+        };
+        let data = document
+            .value
+            .get("data")
+            .context("world generation data is missing")?;
+        let Tag::Compound(entries) = data else {
+            bail!("world generation data must be a compound")
+        };
+        let mut seeds = entries.iter().filter(|(name, _)| name.matches("seed"));
+        let seed = match seeds.next() {
+            Some((_, Tag::Long(value))) => *value,
+            Some((_, Tag::Int(value))) => i64::from(*value),
+            Some((_, Tag::Short(value))) => i64::from(*value),
+            Some((_, Tag::Byte(value))) => i64::from(*value),
+            Some(_) => bail!("world seed must be an integer"),
+            None => bail!("world generation data is missing seed"),
+        };
+        ensure!(seeds.next().is_none(), "duplicate world seeds");
+        Ok(Some(seed))
+    }
+
+    /// Read the dimension/type mappings in the shared 26.3 world-generation
+    /// saved data. Active data-pack dimension definitions take precedence when
+    /// Java bakes its dimension registry; the caller must apply that layer.
+    /// A missing file is distinct from a missing dimension entry.
+    pub fn saved_dimension_types(
+        &self,
+    ) -> Result<Option<BTreeMap<DimensionId, SavedDimensionType>>> {
+        let Some(document) = self.saved_world_gen_document()? else {
+            return Ok(None);
+        };
         let dimensions = document
             .value
             .get("data")
@@ -2136,6 +2168,46 @@ mod tests {
             ),
         );
         assert!(reader.saved_dimension_types().is_err());
+    }
+
+    #[test]
+    fn reads_26_3_world_seed_and_rejects_invalid_saved_data() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let reader =
+            WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        assert_eq!(reader.saved_world_seed().unwrap(), None);
+        let path = dir.path().join("data/minecraft/world_gen_settings.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let document = |version, entries| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(version)),
+                ("data".into(), Tag::Compound(entries)),
+            ]),
+        };
+        for seed in [i64::MIN, -987654321, 0, i64::MAX] {
+            write_gzip(
+                &path,
+                &document(TARGET_DATA_VERSION, vec![("seed".into(), Tag::Long(seed))]),
+            );
+            assert_eq!(reader.saved_world_seed().unwrap(), Some(seed));
+        }
+        write_gzip(
+            &path,
+            &document(TARGET_DATA_VERSION, vec![("seed".into(), Tag::Int(-17))]),
+        );
+        assert_eq!(reader.saved_world_seed().unwrap(), Some(-17));
+        for entries in [
+            vec![],
+            vec![("seed".into(), Tag::String("bad".into()))],
+            vec![("seed".into(), Tag::Long(1)), ("seed".into(), Tag::Long(2))],
+        ] {
+            write_gzip(&path, &document(TARGET_DATA_VERSION, entries));
+            assert!(reader.saved_world_seed().is_err());
+        }
+        write_gzip(&path, &document(1, vec![("seed".into(), Tag::Long(1))]));
+        assert!(reader.saved_world_seed().is_err());
     }
 
     #[test]

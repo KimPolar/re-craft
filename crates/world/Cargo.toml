@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 glam.workspace = true
 native-core = { path = "../core" }
+sha2.workspace = true
 
 [dev-dependencies]
 native-resources = { path = "../resources" }

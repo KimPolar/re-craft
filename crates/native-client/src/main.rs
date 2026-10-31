@@ -701,6 +701,10 @@ fn prepare_existing_world(
         BTreeMap::new()
     };
     let mut world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
+    match reader.saved_world_seed() {
+        Ok(seed) => world.set_biome_world_seed(seed),
+        Err(error) => eprintln!("Cannot read the world seed for biome colors: {error:#}"),
+    }
     let origin = IVec3::new(
         center
             .x

@@ -2385,6 +2385,9 @@ const STACKABLE_ITEMS: &[&str] = &[
 /// Vanilla defaults for ordinary items whose inventory behavior is implemented.
 /// This does not mean their use, placement, tools, or rendering are complete.
 pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
+    if crate::stair_items::is_stair_item(id) {
+        return Some(64);
+    }
     if native_core::button::Button::from_id(id).is_some() && id.starts_with("minecraft:") {
         return Some(64);
     }

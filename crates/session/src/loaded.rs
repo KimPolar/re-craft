@@ -5560,6 +5560,62 @@ impl LoadedSession {
         Some(placed_soil(block, blocked))
     }
 
+    fn place_stairs(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if !crate::stair_items::is_stair_item(held.id())
+            || !crate::inventory::ordinary_return_supported(held)
+            || !self.vanilla_block_ids.as_ref()?.contains(held.id())
+            || !self.player.yaw.is_finite()
+            || !hit.location.is_finite()
+        {
+            return None;
+        }
+        let name = held.id().to_owned();
+        let target = self.ordinary_placement_target(hit)?;
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let wet = self
+            .ordinary_fluid(existing)
+            .is_some_and(|state| state.kind == FluidKind::Water && state.source);
+        let block = crate::stair_placement::placement(
+            &name,
+            self.player.yaw,
+            hit.face,
+            hit.location.y,
+            target.y,
+            wet,
+            |direction| self.stair_neighbor(target, direction),
+        )?;
+        let shape = block_shape(&block)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(block);
+        self.set(target, id).then_some(hand)
+    }
+
     /// Snow uses the active support tags before testing the upper collision face.
     fn snow_can_survive(&self, target: IVec3) -> Option<bool> {
         let tags = self.snow_support_tags.as_ref()?;
@@ -8048,6 +8104,33 @@ impl LoadedSession {
         }
     }
 
+    fn stair_neighbor(&self, position: IVec3, direction: IVec3) -> native_world::stairs::Neighbor {
+        use native_world::stairs::{Neighbor, Stair};
+        let Some(pos) = add(position, direction) else {
+            return Neighbor::Unknown;
+        };
+        let Cell::State(other) = cell(&self.world, self.origin, self.bounds, pos, self.states[0])
+        else {
+            return Neighbor::Unknown;
+        };
+        let Some(state) = self.world.state(other) else {
+            return Neighbor::Unknown;
+        };
+        if self.stair_voxels(other).is_some() {
+            return Stair::from_state(state).map_or(Neighbor::Unknown, Neighbor::Stair);
+        }
+        if state.name.ends_with("_stairs")
+            || !self
+                .vanilla_block_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&state.name))
+        {
+            Neighbor::Unknown
+        } else {
+            Neighbor::Other
+        }
+    }
+
     fn update_stair_shape(&mut self, position: IVec3, id: BlockStateId) -> bool {
         if self.stair_voxels(id).is_none() {
             return false;
@@ -8059,33 +8142,7 @@ impl LoadedSession {
             return false;
         };
         let result = native_world::stairs::shape(stair, |direction| {
-            let Some(pos) = add(position, direction) else {
-                return native_world::stairs::Neighbor::Unknown;
-            };
-            let Cell::State(other) =
-                cell(&self.world, self.origin, self.bounds, pos, self.states[0])
-            else {
-                return native_world::stairs::Neighbor::Unknown;
-            };
-            let Some(state) = self.world.state(other) else {
-                return native_world::stairs::Neighbor::Unknown;
-            };
-            if self.stair_voxels(other).is_some() {
-                return native_world::stairs::Stair::from_state(state).map_or(
-                    native_world::stairs::Neighbor::Unknown,
-                    native_world::stairs::Neighbor::Stair,
-                );
-            }
-            if state.name.ends_with("_stairs")
-                || !self
-                    .vanilla_block_ids
-                    .as_ref()
-                    .is_some_and(|ids| ids.contains(&state.name))
-            {
-                native_world::stairs::Neighbor::Unknown
-            } else {
-                native_world::stairs::Neighbor::Other
-            }
+            self.stair_neighbor(position, direction)
         });
         let Some(absolute) = add(self.origin, position) else {
             return false;
@@ -9024,6 +9081,7 @@ impl LoadedSession {
                         let ore = matches!(cell(&self.world, self.origin, self.bounds, hit.position, self.states[0]), Cell::State(id) if self.world.state(id).and_then(redstone_ore_lit).is_some());
                         let block_item = main.is_some_and(|item| {
                             Block::from_item_id(item.id()).is_some()
+                                || crate::stair_items::is_stair_item(item.id())
                                 || native_core::button::Button::from_id(item.id()).is_some()
                                 || matches!(
                                     item.id(),
@@ -9086,6 +9144,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_snow_block(hit))
                                     .or_else(|| self.place_chest(hit))
+                                    .or_else(|| self.place_stairs(hit))
                             {
                                 handled = true;
                                 let swing = if hand == crate::inventory::PlayerSlot::Offhand {
@@ -10744,6 +10803,8 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         || native_core::button::Button::from_id(&block.name).is_some()
     {
         block_outline(block).is_some()
+    } else if crate::stair_items::is_stair_item(&block.name) {
+        native_world::collision::slab_stair_solid(block) == Some(true)
     } else if block.name == "minecraft:redstone_lamp" {
         redstone_lamp_lit(block).is_some()
     } else if block.name == "minecraft:snow" {
@@ -12474,6 +12535,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stair_item_uses_either_hand_and_game_mode_consumption() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:stone".into(),
+                    "minecraft:oak_stairs".into(),
+                ])));
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:oak_stairs".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let block = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                let placed = matches!(mode, GameMode::Survival | GameMode::Creative);
+                assert_eq!(
+                    block.name,
+                    if placed {
+                        "minecraft:oak_stairs"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placed_stairs_retain_only_source_water_and_respect_collision() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for source in [false, true] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:water".into(),
+                "minecraft:stone".into(),
+                "minecraft:oak_stairs".into(),
+            ])));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:oak_stairs".into(), 2, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            let target = IVec3::new(4, 2, 4);
+            session.set_with_notify(target + IVec3::NEG_Y, session.states[3], false);
+            let water = session.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: if source { 8 } else { 3 },
+                source,
+                falling: false,
+            });
+            session.set_with_notify(target, water, false);
+            let hit = ShapeRayHit {
+                position: target + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::new(4.5, 2.0, 4.5),
+                inside: false,
+            };
+            assert_eq!(session.place_stairs(hit), Some(PlayerSlot::Storage(0)));
+            let placed = session
+                .world
+                .block(session.origin.x + 4, 2, session.origin.z + 4)
+                .unwrap();
+            assert_eq!(
+                placed.properties["waterlogged"],
+                if source { "true" } else { "false" }
+            );
+            assert_eq!(placed.properties["half"], "bottom");
+        }
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:oak_stairs".into(),
+        ])));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:oak_stairs".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.player.position = Vec3::new(4.5, 2.0, 4.5);
+        session.set_with_notify(IVec3::new(4, 1, 4), session.states[3], false);
+        let hit = ShapeRayHit {
+            position: IVec3::new(4, 1, 4),
+            face: IVec3::Y,
+            location: DVec3::new(4.5, 2.0, 4.5),
+            inside: false,
+        };
+        assert!(session.place_stairs(hit).is_none());
     }
 
     #[test]
@@ -17109,6 +17286,33 @@ mod tests {
                 .unwrap()
                 .id(),
             "minecraft:stone"
+        );
+    }
+
+    #[test]
+    fn pick_block_selects_stair_item_from_its_block_state() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        session.set_player_inventory(PlayerInventory::default());
+        let stair = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "south"),
+                ("half", "top"),
+                ("shape", "inner_left"),
+                ("waterlogged", "true"),
+            ],
+        ));
+        assert!(session.set(IVec3::new(8, 2, 6), stair));
+        session.submit_command(PlayerCommand::PickBlock);
+        session.update(TICK);
+        let inventory = &session.snapshot().inventory;
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(inventory.selected()))
+                .unwrap()
+                .id(),
+            "minecraft:oak_stairs"
         );
     }
 

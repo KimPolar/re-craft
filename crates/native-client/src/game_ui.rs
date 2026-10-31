@@ -81,6 +81,7 @@ enum PauseButton {
     MenuBlur,
     VideoBlur,
     VideoDistance,
+    VideoBlend,
 }
 
 impl PauseButton {
@@ -745,6 +746,7 @@ impl GameUi {
                             VideoControl::Inactivity => PauseButton::Inactivity,
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
                             VideoControl::RenderDistance => PauseButton::VideoDistance,
+                            VideoControl::BiomeBlend => PauseButton::VideoBlend,
                         })
                 }
             }
@@ -955,6 +957,20 @@ impl GameUi {
                 }
                 PauseAction::None
             }
+            PauseButton::VideoBlend => {
+                if mouse {
+                    let (width, _) = self.logical_size();
+                    self.video_ui.start_control_slider(
+                        width,
+                        self.cursor.0,
+                        VideoControl::BiomeBlend,
+                        &mut self.video,
+                    );
+                } else {
+                    self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
+                }
+                PauseAction::None
+            }
             PauseButton::VideoDistance => {
                 if mouse {
                     let (width, _) = self.logical_size();
@@ -1012,6 +1028,7 @@ impl GameUi {
                 | PauseButton::Framerate
                 | PauseButton::VideoBlur
                 | PauseButton::VideoDistance
+                | PauseButton::VideoBlend
                 | PauseButton::GlintSpeed
                 | PauseButton::FovEffectScale
                 | PauseButton::GlintStrength
@@ -1084,6 +1101,7 @@ impl GameUi {
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
+                    Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
                     _ => None,
                 };
                 if focused_control.is_some_and(|control| {
@@ -1221,6 +1239,7 @@ impl GameUi {
                     {
                         buttons.push(PauseButton::Inactivity);
                     }
+                    buttons.push(PauseButton::VideoBlend);
                     buttons.push(PauseButton::VideoDistance);
                     buttons.push(PauseButton::VideoBlur);
                     buttons.push(PauseButton::Done);
@@ -1249,7 +1268,11 @@ impl GameUi {
             if self.pause_page == PausePage::Video
                 && matches!(
                     self.pause_focus,
-                    Some(PauseButton::VideoBlur | PauseButton::VideoDistance)
+                    Some(
+                        PauseButton::VideoBlur
+                            | PauseButton::VideoDistance
+                            | PauseButton::VideoBlend
+                    )
                 )
             {
                 let (_, h) = self.logical_size();
@@ -1257,6 +1280,8 @@ impl GameUi {
                     h,
                     if self.pause_focus == Some(PauseButton::VideoBlur) {
                         VideoControl::MenuBlur
+                    } else if self.pause_focus == Some(PauseButton::VideoBlend) {
+                        VideoControl::BiomeBlend
                     } else {
                         VideoControl::RenderDistance
                     },
@@ -1347,6 +1372,13 @@ impl GameUi {
             self.video_dirty |= self
                 .fov_ui
                 .arrow(key == KeyCode::ArrowRight, &mut self.video);
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Video
+            && self.pause_focus == Some(PauseButton::VideoBlend)
+            && self.video_ui.keyboard_adjust
+            && matches!(key, KeyCode::ArrowLeft | KeyCode::ArrowRight)
+        {
+            self.video_ui.blend_arrow(key == KeyCode::ArrowRight);
             self.last_draw = None;
         } else if self.pause_page == PausePage::Video
             && self.pause_focus == Some(PauseButton::VideoDistance)
@@ -1656,7 +1688,12 @@ impl GameUi {
                         (native_session::loaded::PlantParticleKind::DeadBush, _, _) => [0.6; 3],
                         (_, native_session::SessionWorld::Loaded(world), Some(biomes)) => {
                             *plant_colors.entry(*position).or_insert_with(|| {
-                                crate::preview::grass_particle_tint(world, biomes, *position)
+                                crate::preview::grass_particle_tint(
+                                    world,
+                                    biomes,
+                                    *position,
+                                    self.video.biome_blend,
+                                )
                             })
                         }
                         _ => [
@@ -2629,6 +2666,7 @@ impl GameUi {
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
+                    Some(PauseButton::VideoBlend) => Some(VideoControl::BiomeBlend),
                     _ => None,
                 };
                 self.video_ui
@@ -4046,6 +4084,14 @@ mod inventory_tests {
         assert_eq!(ui.video_settings().max_fps, 250);
         ui.pause_scroll(-100.0);
         assert_eq!(ui.pause_focus, None);
+        ui.pause_key(KeyCode::Tab, false);
+        assert_eq!(ui.pause_focus, Some(PauseButton::VideoBlend));
+        ui.pause_key(KeyCode::Enter, false);
+        ui.pause_key(KeyCode::ArrowRight, false);
+        ui.advance_video_settings(
+            std::time::Instant::now() + std::time::Duration::from_millis(601),
+        );
+        assert_eq!(ui.video_settings().biome_blend, 3);
         ui.pause_key(KeyCode::Tab, false);
         assert_eq!(ui.pause_focus, Some(PauseButton::VideoDistance));
         ui.pause_key(KeyCode::Enter, false);

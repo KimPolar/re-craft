@@ -224,6 +224,8 @@ impl SoundSettings {
 pub struct VideoSettings {
     /// Render distance in chunks; Java's default is 12.
     pub render_distance: u8,
+    /// Radius of the square biome-color average, in blocks.
+    pub biome_blend: u8,
     pub vsync: bool,
     /// 260 is the vanilla unlimited setting; lower values are frames per second.
     pub max_fps: u16,
@@ -274,6 +276,7 @@ impl Default for VideoSettings {
     fn default() -> Self {
         Self {
             render_distance: 12,
+            biome_blend: 2,
             vsync: true,
             max_fps: 120,
             fov: 70,
@@ -302,6 +305,11 @@ impl Default for VideoSettings {
 impl VideoSettings {
     fn valid(self) -> Self {
         Self {
+            biome_blend: if self.biome_blend <= 7 {
+                self.biome_blend
+            } else {
+                2
+            },
             render_distance: if (2..=32).contains(&self.render_distance) {
                 self.render_distance
             } else {
@@ -513,6 +521,7 @@ mod tests {
             resource_packs: vec![PathBuf::from("pack.zip")],
             video: VideoSettings {
                 render_distance: 24,
+                biome_blend: 7,
                 vsync: false,
                 max_fps: 260,
                 fov: 95,
@@ -573,6 +582,7 @@ mod tests {
         assert_eq!(
             VideoSettings {
                 render_distance: 1,
+                biome_blend: 8,
                 vsync: false,
                 max_fps: 0,
                 fov: 111,

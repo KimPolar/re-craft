@@ -185,6 +185,8 @@ pub fn run_play(
             sky_settings: None,
             requested_revision: 0,
             scene_revision: 0,
+            requested_blend: video.biome_blend,
+            scene_blend: video.biome_blend,
         }),
         video,
         audio,
@@ -289,6 +291,8 @@ struct PlayState {
     sky_settings: Option<native_world::lighting::LightmapSettings>,
     requested_revision: u64,
     scene_revision: u64,
+    requested_blend: u8,
+    scene_blend: u8,
 }
 
 struct Viewer {
@@ -327,6 +331,18 @@ struct Viewer {
     #[cfg(debug_assertions)]
     total_frames: u64,
     error: Option<anyhow::Error>,
+}
+
+fn obsolete_mesh(
+    revision: u64,
+    blend: u8,
+    scene_revision: u64,
+    scene_blend: u8,
+    requested_blend: u8,
+) -> bool {
+    blend != requested_blend
+        || revision < scene_revision
+        || (revision == scene_revision && blend == scene_blend)
 }
 
 impl Viewer {
@@ -574,20 +590,30 @@ impl Viewer {
             return Ok(());
         };
         let snapshot = play.session.snapshot();
-        if snapshot.world_revision != play.requested_revision {
+        if snapshot.world_revision != play.requested_revision
+            || self.video.biome_blend != play.requested_blend
+        {
             let world = snapshot
                 .world
                 .loaded()
                 .context("play session returned the wrong world type")?;
             play.mesher.submit(MeshJob {
                 revision: snapshot.world_revision,
+                biome_blend: self.video.biome_blend,
                 origin: snapshot.origin,
                 world: Arc::clone(world),
             });
             play.requested_revision = snapshot.world_revision;
+            play.requested_blend = self.video.biome_blend;
         }
         while let Some(result) = play.mesher.try_result()? {
-            if result.revision <= play.scene_revision {
+            if obsolete_mesh(
+                result.revision,
+                result.biome_blend,
+                play.scene_revision,
+                play.scene_blend,
+                self.video.biome_blend,
+            ) {
                 continue;
             }
             let scene = match result.scene {
@@ -609,6 +635,7 @@ impl Viewer {
             self.camera.eye =
                 eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());
             play.scene_revision = result.revision;
+            play.scene_blend = result.biome_blend;
             println!("World play mesh updated: revision {}", result.revision);
         }
         Ok(())
@@ -1545,6 +1572,15 @@ impl ApplicationHandler for Viewer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_results_obey_world_revision_and_current_biome_blend() {
+        use super::obsolete_mesh;
+        assert!(!obsolete_mesh(5, 3, 5, 2, 3));
+        assert!(obsolete_mesh(5, 2, 5, 2, 3));
+        assert!(obsolete_mesh(4, 3, 5, 2, 3));
+        assert!(obsolete_mesh(5, 2, 5, 2, 2));
+        assert!(!obsolete_mesh(6, 2, 5, 2, 2));
+    }
     use super::*;
 
     #[cfg(target_os = "windows")]
@@ -1607,6 +1643,7 @@ mod tests {
                 self.world.set_block_id(9, 1, 8, self.stone).unwrap();
                 self.worker.submit(MeshJob {
                     revision: 1,
+                    biome_blend: 0,
                     origin: glam::IVec3::ZERO,
                     world: Arc::new(self.world.clone()),
                 });
@@ -2118,6 +2155,7 @@ mod tests {
                         }
                         self.worker.submit(MeshJob {
                             revision: self.revision + 1,
+                            biome_blend: 0,
                             origin: glam::IVec3::ZERO,
                             world: Arc::new(self.world.clone()),
                         });

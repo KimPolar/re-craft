@@ -15,12 +15,14 @@ use std::{
 
 pub struct MeshJob {
     pub revision: u64,
+    pub biome_blend: u8,
     pub origin: IVec3,
     pub world: Arc<World>,
 }
 
 pub struct MeshResult {
     pub revision: u64,
+    pub biome_blend: u8,
     pub scene: Result<PreviewScene>,
 }
 
@@ -38,7 +40,15 @@ pub struct MeshWorker {
 impl MeshWorker {
     pub fn start(mut resources: ResourceStack) -> Result<Self> {
         let mut cache = IncrementalPreview::default();
-        Self::with_builder(move |job| cache.prepare(&job.world, &mut resources, job.origin, 4096))
+        Self::with_builder(move |job| {
+            cache.prepare_with_blend(
+                &job.world,
+                &mut resources,
+                job.origin,
+                4096,
+                job.biome_blend,
+            )
+        })
     }
 
     fn with_builder(
@@ -66,8 +76,16 @@ impl MeshWorker {
                         queue.pending.take().expect("pending mesh job was checked")
                     };
                     let revision = job.revision;
+                    let biome_blend = job.biome_blend;
                     let scene = build(&job);
-                    if sender.send(MeshResult { revision, scene }).is_err() {
+                    if sender
+                        .send(MeshResult {
+                            revision,
+                            biome_blend,
+                            scene,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -113,6 +131,7 @@ mod tests {
     fn job(revision: u64) -> MeshJob {
         MeshJob {
             revision,
+            biome_blend: 0,
             origin: IVec3::ZERO,
             world: Arc::new(World::new("minecraft:overworld")),
         }
@@ -152,6 +171,43 @@ mod tests {
                 .revision,
             3
         );
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_settings_for_the_same_world_revision_keep_the_latest_blend() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = MeshWorker::with_builder(move |job| {
+            started_tx.send(job.biome_blend).unwrap();
+            if job.biome_blend == 2 {
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            anyhow::bail!("test build")
+        })
+        .unwrap();
+        let mut first = job(1);
+        first.biome_blend = 2;
+        worker.submit(first);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
+        let mut next = job(1);
+        next.biome_blend = 3;
+        worker.submit(next);
+        let mut latest = job(1);
+        latest.biome_blend = 7;
+        worker.submit(latest);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            worker
+                .results
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .biome_blend,
+            2
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 7);
+        let result = worker.results.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!((result.revision, result.biome_blend), (1, 7));
         assert!(started_rx.try_recv().is_err());
     }
 }

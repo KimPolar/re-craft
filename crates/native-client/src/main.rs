@@ -1261,7 +1261,13 @@ fn prepare_existing_world(
             .world
             .loaded()
             .context("saved-world session has no loaded world")?;
-        let mut scene = preview::PreviewScene::prepare(loaded_world, &mut resources, origin, 4096)?;
+        let mut scene = preview::PreviewScene::prepare_with_blend(
+            loaded_world,
+            &mut resources,
+            origin,
+            4096,
+            video.biome_blend,
+        )?;
         scene.warnings.extend(pack_warnings);
         for warning in scene.warnings.iter().take(20) {
             eprintln!("preview issue: {warning}");

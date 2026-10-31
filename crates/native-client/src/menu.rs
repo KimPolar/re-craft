@@ -83,6 +83,7 @@ enum ButtonId {
     VideoInactivity,
     VideoBlur,
     VideoDistance,
+    VideoBlend,
     Accessibility,
     ViewBobbing,
     FovEffectScale,
@@ -1249,6 +1250,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
+            ButtonId::VideoBlend => Some(VideoControl::BiomeBlend),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -1603,6 +1605,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoFps, VideoControl::Framerate),
                     (ButtonId::VideoVsync, VideoControl::Vsync),
                     (ButtonId::VideoInactivity, VideoControl::Inactivity),
+                    (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
                 ] {
@@ -1613,8 +1616,10 @@ impl<'a> Menu<'a> {
                         rect.y,
                         rect.w,
                         String::new(),
-                        matches!(id, ButtonId::VideoBlur | ButtonId::VideoDistance)
-                            || self.video_ui.visible(h, rect),
+                        matches!(
+                            id,
+                            ButtonId::VideoBlur | ButtonId::VideoDistance | ButtonId::VideoBlend
+                        ) || self.video_ui.visible(h, rect),
                     );
                 }
                 add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
@@ -1873,6 +1878,15 @@ impl<'a> Menu<'a> {
                     &mut self.state.video,
                 );
             }
+            ButtonId::VideoBlend => {
+                let (width, _) = self.logical_size();
+                self.video_ui.start_control_slider(
+                    width,
+                    self.cursor.0,
+                    VideoControl::BiomeBlend,
+                    &mut self.state.video,
+                );
+            }
             ButtonId::VideoDistance => {
                 let (width, _) = self.logical_size();
                 self.video_ui.start_control_slider(
@@ -2015,6 +2029,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoFps
                     | ButtonId::VideoBlur
                     | ButtonId::VideoDistance
+                    | ButtonId::VideoBlend
                     | ButtonId::VideoVsync
                     | ButtonId::VideoInactivity
                     | ButtonId::OptionsFov
@@ -2466,6 +2481,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
+                        Some(ButtonId::VideoBlend) => Some(VideoControl::BiomeBlend),
                         _ => None,
                     };
                     self.video_ui
@@ -2621,6 +2637,7 @@ impl<'a> Menu<'a> {
                         | ButtonId::VideoInactivity
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
+                        | ButtonId::VideoBlend
                         | ButtonId::ViewBobbing
                 )
             {
@@ -2896,6 +2913,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::MouseWheelSensitivity
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoBlend
                                 | ButtonId::OptionsFov
                                 | ButtonId::FovEffectScale
                                 | ButtonId::GlintSpeed
@@ -2917,6 +2935,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoFps
                                 | ButtonId::VideoBlur
                                 | ButtonId::VideoDistance
+                                | ButtonId::VideoBlend
                                 | ButtonId::VideoVsync
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
@@ -3160,6 +3179,12 @@ impl ApplicationHandler for Menu<'_> {
                         .fov_ui
                         .arrow(code == Some(KeyCode::ArrowRight), &mut self.state.video);
                 } else if self.state.screen == Screen::Video
+                    && self.focused == Some(ButtonId::VideoBlend)
+                    && self.video_ui.keyboard_adjust
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
+                {
+                    self.video_ui.blend_arrow(code == Some(KeyCode::ArrowRight));
+                } else if self.state.screen == Screen::Video
                     && self.focused == Some(ButtonId::VideoDistance)
                     && self.video_ui.keyboard_adjust
                     && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight))
@@ -3211,7 +3236,11 @@ impl ApplicationHandler for Menu<'_> {
                         if self.state.screen == Screen::Video
                             && matches!(
                                 self.focused,
-                                Some(ButtonId::VideoBlur | ButtonId::VideoDistance)
+                                Some(
+                                    ButtonId::VideoBlur
+                                        | ButtonId::VideoDistance
+                                        | ButtonId::VideoBlend
+                                )
                             )
                         {
                             let (_, h) = self.logical_size();
@@ -3219,6 +3248,8 @@ impl ApplicationHandler for Menu<'_> {
                                 h,
                                 if self.focused == Some(ButtonId::VideoBlur) {
                                     VideoControl::MenuBlur
+                                } else if self.focused == Some(ButtonId::VideoBlend) {
+                                    VideoControl::BiomeBlend
                                 } else {
                                     VideoControl::RenderDistance
                                 },
@@ -3240,7 +3271,10 @@ impl ApplicationHandler for Menu<'_> {
                         self.video_ui.keyboard_adjust = matches!(
                             self.focused,
                             Some(
-                                ButtonId::VideoFps | ButtonId::VideoBlur | ButtonId::VideoDistance
+                                ButtonId::VideoFps
+                                    | ButtonId::VideoBlur
+                                    | ButtonId::VideoDistance
+                                    | ButtonId::VideoBlend
                             )
                         );
                         self.fov_ui.keyboard_adjust = self.focused == Some(ButtonId::OptionsFov);
@@ -3290,7 +3324,10 @@ impl ApplicationHandler for Menu<'_> {
                             self.fov_ui.keyboard_adjust = !self.fov_ui.keyboard_adjust;
                         } else if matches!(
                             id,
-                            ButtonId::VideoFps | ButtonId::VideoBlur | ButtonId::VideoDistance
+                            ButtonId::VideoFps
+                                | ButtonId::VideoBlur
+                                | ButtonId::VideoDistance
+                                | ButtonId::VideoBlend
                         ) {
                             self.video_ui.keyboard_adjust = !self.video_ui.keyboard_adjust;
                         } else if matches!(
@@ -4533,6 +4570,8 @@ mod tests {
                 self.menu
                     .video_ui
                     .ensure_control_visible(height, VideoControl::RenderDistance);
+                click(&mut self.menu, event_loop, ButtonId::VideoBlend, true);
+                assert_eq!(self.menu.state.video.biome_blend, 2);
                 click(&mut self.menu, event_loop, ButtonId::VideoDistance, true);
                 assert_eq!(self.menu.state.video.render_distance, 12);
                 self.menu
@@ -4543,6 +4582,7 @@ mod tests {
                 click(&mut self.menu, event_loop, ButtonId::Done, false);
                 assert_eq!(self.menu.state.screen, Screen::Options);
                 assert_eq!(self.menu.state.video.render_distance, 32);
+                assert_eq!(self.menu.state.video.biome_blend, 7);
                 assert!(!self.menu.state.video_dirty);
                 let path = self.menu.state.settings_path.as_ref().unwrap();
                 let loaded: Settings =

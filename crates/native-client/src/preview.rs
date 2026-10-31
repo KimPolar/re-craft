@@ -1,7 +1,7 @@
 //! Read-only terrain preparation for loaded 26.3 worlds.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Cursor,
     sync::Arc,
 };
@@ -416,7 +416,13 @@ impl PreviewMaterials {
         })
     }
 
-    fn mesh_chunk(&self, world: &World, chunk: &Chunk, origin: IVec3) -> Result<ChunkMesh> {
+    fn mesh_chunk(
+        &self,
+        world: &World,
+        chunk: &Chunk,
+        origin: IVec3,
+        blend: u8,
+    ) -> Result<ChunkMesh> {
         let Self {
             atlas,
             models,
@@ -430,6 +436,7 @@ impl PreviewMaterials {
         let mut opaque = Vec::new();
         let mut translucent = Vec::new();
         let mut chest_lids = Vec::new();
+        let mut colors = TintCache::new(world, biome_colors, blend);
         let base_x = chunk
             .position
             .x
@@ -485,7 +492,7 @@ impl PreviewMaterials {
                     }
                     .context("missing fluid materials")?;
                     let tint = if liquid.kind == FluidKind::Water {
-                        biome_tint(world, biome_colors, position, BiomeTint::Water)
+                        colors.get(position, BiomeTint::Water)
                     } else {
                         [1.0; 3]
                     };
@@ -597,7 +604,7 @@ impl PreviewMaterials {
                         {
                             *value
                         } else {
-                            let value = tint(state, quad.tint_index, world, biome_colors, position);
+                            let value = tint(state, quad.tint_index, &mut colors, position);
                             if let Some(slot) = cached_tints.iter_mut().find(|slot| slot.is_none())
                             {
                                 *slot = Some((quad.tint_index, value));
@@ -665,11 +672,22 @@ impl PreviewMaterials {
 }
 
 impl PreviewScene {
+    #[cfg(any(test, debug_assertions))]
     pub fn prepare(
         world: &World,
         source: &mut impl ResourceProvider,
         origin: IVec3,
         max_atlas_side: u32,
+    ) -> Result<Self> {
+        Self::prepare_with_blend(world, source, origin, max_atlas_side, 0)
+    }
+
+    pub fn prepare_with_blend(
+        world: &World,
+        source: &mut impl ResourceProvider,
+        origin: IVec3,
+        max_atlas_side: u32,
+        blend: u8,
     ) -> Result<Self> {
         let mut states = BTreeSet::new();
         let mut biomes = BTreeSet::new();
@@ -681,7 +699,7 @@ impl PreviewScene {
         let materials = PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes)?;
         let mut chunks = BTreeMap::new();
         for (&position, chunk) in &world.chunks {
-            let mesh = materials.mesh_chunk(world, chunk, origin)?;
+            let mesh = materials.mesh_chunk(world, chunk, origin, blend)?;
             chunks.insert(position, Arc::new(mesh));
         }
         Ok(Self {
@@ -768,6 +786,7 @@ pub struct IncrementalPreview {
     materials: Option<(MaterialsKey, PreviewMaterials)>,
     origin: Option<IVec3>,
     biome_zoom_seed: Option<Option<i64>>,
+    biome_blend: Option<u8>,
     generation: u64,
     #[cfg(test)]
     last_rebuilt: usize,
@@ -856,6 +875,7 @@ fn same_neighbor_boundary(a: &Chunk, b: &Chunk, dx: i32, dz: i32) -> bool {
 }
 
 impl IncrementalPreview {
+    #[cfg(test)]
     pub fn prepare(
         &mut self,
         world: &World,
@@ -863,6 +883,22 @@ impl IncrementalPreview {
         requested_origin: IVec3,
         max_atlas_side: u32,
     ) -> Result<PreviewScene> {
+        self.prepare_with_blend(world, source, requested_origin, max_atlas_side, 0)
+    }
+
+    pub fn prepare_with_blend(
+        &mut self,
+        world: &World,
+        source: &mut impl ResourceProvider,
+        requested_origin: IVec3,
+        max_atlas_side: u32,
+        blend: u8,
+    ) -> Result<PreviewScene> {
+        let blend = blend.min(7);
+        if self.biome_blend != Some(blend) {
+            self.biome_blend = Some(blend);
+            self.chunks.clear();
+        }
         self.usage.retain(|pos, _| world.chunks.contains_key(pos));
         self.chunks.retain(|pos, _| world.chunks.contains_key(pos));
         for (&pos, chunk) in &world.chunks {
@@ -1010,7 +1046,7 @@ impl IncrementalPreview {
                 .get(&pos)
                 .is_none_or(|old| !same_neighborhood(&old.neighbors, &neighbors))
             {
-                let mut mesh = materials.mesh_chunk(world, chunk, origin)?;
+                let mut mesh = materials.mesh_chunk(world, chunk, origin, blend)?;
                 if let Some(previous) = self.chunks.get(&pos) {
                     mesh.reuse_unchanged_layers(&previous.mesh);
                 }
@@ -1183,7 +1219,7 @@ fn fluid_light(
     (get(false).max(emitted), get(true))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BiomeTint {
     Grass,
     Foliage,
@@ -1199,36 +1235,86 @@ fn rgb(color: u32) -> [f32; 3] {
     ]
 }
 
-fn biome_tint(
-    world: &World,
-    biomes: &BTreeMap<String, BiomeColors>,
-    position: IVec3,
-    kind: BiomeTint,
-) -> [f32; 3] {
-    let biome = world
-        .biome_at_block(position.x, position.y, position.z)
-        .and_then(|name| biomes.get(name));
-    rgb(match kind {
-        BiomeTint::Grass => biome.map_or(0x91bd5a, BiomeColors::grass),
-        BiomeTint::Foliage => biome.map_or(0x7ab847, |b| b.foliage),
-        BiomeTint::DryFoliage => biome.map_or(0xae9d77, |b| b.dry_foliage),
-        BiomeTint::Water => biome.map_or(0x3f76e4, |b| b.water),
-    })
+struct TintCache<'a> {
+    world: &'a World,
+    biomes: &'a BTreeMap<String, BiomeColors>,
+    radius: i32,
+    samples: HashMap<IVec3, [u32; 4]>,
+    rows: HashMap<(IVec3, BiomeTint), [u32; 3]>,
+}
+
+impl<'a> TintCache<'a> {
+    fn new(world: &'a World, biomes: &'a BTreeMap<String, BiomeColors>, radius: u8) -> Self {
+        Self {
+            world,
+            biomes,
+            radius: i32::from(radius.min(7)),
+            samples: HashMap::new(),
+            rows: HashMap::new(),
+        }
+    }
+
+    fn sample(&mut self, position: IVec3, kind: BiomeTint) -> u32 {
+        let colors = self.samples.entry(position).or_insert_with(|| {
+            let biome = self
+                .world
+                .biome_at_block(position.x, position.y, position.z)
+                .and_then(|name| self.biomes.get(name));
+            [
+                biome.map_or(0x91bd5a, BiomeColors::grass),
+                biome.map_or(0x7ab847, |b| b.foliage),
+                biome.map_or(0xae9d77, |b| b.dry_foliage),
+                biome.map_or(0x3f76e4, |b| b.water),
+            ]
+        });
+        colors[kind as usize]
+    }
+
+    fn get(&mut self, position: IVec3, kind: BiomeTint) -> [f32; 3] {
+        if self.radius == 0 {
+            return rgb(self.sample(position, kind));
+        }
+        let mut sums = [0_u32; 3];
+        for dz in -self.radius..=self.radius {
+            let row = IVec3::new(position.x, position.y, position.z.wrapping_add(dz));
+            let row_sum = if let Some(value) = self.rows.get(&(row, kind)) {
+                *value
+            } else {
+                let mut sum = [0_u32; 3];
+                for dx in -self.radius..=self.radius {
+                    let color = self.sample(IVec3::new(row.x.wrapping_add(dx), row.y, row.z), kind);
+                    sum[0] += (color >> 16) & 255;
+                    sum[1] += (color >> 8) & 255;
+                    sum[2] += color & 255;
+                }
+                self.rows.insert((row, kind), sum);
+                sum
+            };
+            for i in 0..3 {
+                sums[i] += row_sum[i];
+            }
+        }
+        let side = (self.radius * 2 + 1) as u32;
+        let count = side * side;
+        rgb(((sums[0] / count) << 16) | ((sums[1] / count) << 8) | (sums[2] / count))
+    }
 }
 
 pub(crate) fn grass_particle_tint(
     world: &World,
     biomes: &BTreeMap<String, BiomeColors>,
     position: IVec3,
+    blend: u8,
 ) -> [f32; 3] {
-    biome_tint(world, biomes, position, BiomeTint::Grass).map(|component| component * 0.6)
+    TintCache::new(world, biomes, blend)
+        .get(position, BiomeTint::Grass)
+        .map(|component| component * 0.6)
 }
 
 fn tint(
     state: &BlockState,
     index: i32,
-    world: &World,
-    biomes: &BTreeMap<String, BiomeColors>,
+    colors: &mut TintCache<'_>,
     mut position: IVec3,
 ) -> [f32; 3] {
     if index < 0 {
@@ -1269,9 +1355,9 @@ fn tint(
             | "minecraft:mangrove_leaves"
             | "minecraft:vine",
             0,
-        ) => biome_tint(world, biomes, position, BiomeTint::Foliage),
-        ("minecraft:leaf_litter", 0) => biome_tint(world, biomes, position, BiomeTint::DryFoliage),
-        ("minecraft:water_cauldron", 0) => biome_tint(world, biomes, position, BiomeTint::Water),
+        ) => colors.get(position, BiomeTint::Foliage),
+        ("minecraft:leaf_litter", 0) => colors.get(position, BiomeTint::DryFoliage),
+        ("minecraft:water_cauldron", 0) => colors.get(position, BiomeTint::Water),
         (
             "minecraft:grass_block"
             | "minecraft:fern"
@@ -1284,7 +1370,7 @@ fn tint(
             0,
         )
         | ("minecraft:pink_petals" | "minecraft:wildflowers", 1) => {
-            biome_tint(world, biomes, position, BiomeTint::Grass)
+            colors.get(position, BiomeTint::Grass)
         }
         ("minecraft:attached_melon_stem" | "minecraft:attached_pumpkin_stem", 0) => rgb(0xe0c71c),
         ("minecraft:melon_stem" | "minecraft:pumpkin_stem", 0) => {
@@ -2639,6 +2725,42 @@ mod tests {
                 .translucent_quads()
                 .any(|quad| quad.center.x > 3.0 && quad.vertices[0].tint == rgb(0xabcdef))
         );
+        for radius in 0..=7 {
+            let mut actual = TintCache::new(&world, &scene.biome_colors, radius);
+            let mut raw = TintCache::new(&world, &scene.biome_colors, 0);
+            for x in -2..=8 {
+                let position = IVec3::new(x, 0, 0);
+                let expected = native_world::biome_blend::blend(position, radius, |p| {
+                    raw.sample(p, BiomeTint::Water)
+                });
+                assert_eq!(actual.get(position, BiomeTint::Water), rgb(expected));
+            }
+        }
+        let mut cache = IncrementalPreview::default();
+        let first = cache
+            .prepare_with_blend(&world, &mut source, IVec3::ZERO, 128, 0)
+            .unwrap();
+        let blended = cache
+            .prepare_with_blend(&world, &mut source, IVec3::ZERO, 128, 2)
+            .unwrap();
+        let expected = TintCache::new(&world, &blended.biome_colors, 2)
+            .get(IVec3::new(4, 0, 0), BiomeTint::Water);
+        assert!(
+            blended
+                .translucent_quads()
+                .any(|quad| quad.center.x > 3.0 && quad.vertices[0].tint == expected)
+        );
+        let full =
+            PreviewScene::prepare_with_blend(&world, &mut source, IVec3::ZERO, 128, 2).unwrap();
+        assert_same_mesh(&blended, &full);
+        assert_eq!(cache.last_rebuilt, 1);
+        assert!(Arc::ptr_eq(&first.atlas, &blended.atlas));
+        assert!(!Arc::ptr_eq(&first.chunks[&pos], &blended.chunks[&pos]));
+        let again = cache
+            .prepare_with_blend(&world, &mut source, IVec3::ZERO, 128, 2)
+            .unwrap();
+        assert_eq!(cache.last_rebuilt, 0);
+        assert!(Arc::ptr_eq(&blended.chunks[&pos], &again.chunks[&pos]));
         assert_eq!(
             tint(
                 &BlockState {
@@ -2646,8 +2768,7 @@ mod tests {
                     properties: BTreeMap::new()
                 },
                 0,
-                &world,
-                &BTreeMap::new(),
+                &mut TintCache::new(&world, &BTreeMap::new(), 0),
                 IVec3::ZERO
             ),
             rgb(0x80a755)

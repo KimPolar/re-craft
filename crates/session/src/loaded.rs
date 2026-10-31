@@ -739,23 +739,36 @@ impl LoadedSession {
                         show_icon: true,
                     }],
                     crate::survival::FoodRandomEvent::StatusGroup { effects, .. } => effects,
-                    crate::survival::FoodRandomEvent::RemovePoison => {
-                        let tracking = self.ensure_effect_save_tracking();
-                        tracking
-                            .status_updates
-                            .push(crate::player_data::StatusUpdate {
-                                kind: crate::survival::FoodStatusKind::Poison,
-                                update: crate::player_data::HungerUpdate {
-                                    tick: tracking.ticks,
-                                    duration: 0,
-                                    amplifier: 0,
-                                    ambient: false,
-                                    visible: false,
-                                    show_icon: false,
-                                },
-                                remove: true,
-                            });
-                        self.fall.remove_poison();
+                    crate::survival::FoodRandomEvent::RemoveStatuses(effects) => {
+                        for kind in effects {
+                            let active = match kind {
+                                crate::survival::FoodStatusKind::Hunger => {
+                                    self.fall.effects().hunger.is_some()
+                                }
+                                crate::survival::FoodStatusKind::Poison => {
+                                    self.fall.effects().poison.is_some()
+                                }
+                            };
+                            if !active {
+                                continue;
+                            }
+                            let tracking = self.ensure_effect_save_tracking();
+                            tracking
+                                .status_updates
+                                .push(crate::player_data::StatusUpdate {
+                                    kind,
+                                    update: crate::player_data::HungerUpdate {
+                                        tick: tracking.ticks,
+                                        duration: 0,
+                                        amplifier: 0,
+                                        ambient: false,
+                                        visible: false,
+                                        show_icon: false,
+                                    },
+                                    remove: true,
+                                });
+                            self.fall.remove_status(kind);
+                        }
                         continue;
                     }
                     _ => Vec::new(),
@@ -27825,6 +27838,119 @@ mod tests {
         assert_eq!(
             native_persistence::nbt::write(&original).unwrap(),
             original_bytes
+        );
+    }
+
+    #[test]
+    fn custom_consumable_removes_and_reapplies_statuses_in_save_order() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:hunger".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:poison".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        let remove = Tag::Compound(vec![
+            (
+                "type".into(),
+                Tag::String("minecraft:remove_effects".into()),
+            ),
+            (
+                "effects".into(),
+                Tag::List {
+                    element_type: TagType::String,
+                    values: vec![
+                        Tag::String("minecraft:hunger".into()),
+                        Tag::String("minecraft:poison".into()),
+                    ],
+                },
+            ),
+        ]);
+        let apply = Tag::Compound(vec![
+            ("type".into(), Tag::String("minecraft:apply_effects".into())),
+            (
+                "effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:poison".into())),
+                        ("duration".into(), Tag::Int(14)),
+                    ])],
+                },
+            ),
+        ]);
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![remove, apply],
+                    },
+                ),
+            ]),
+        )]);
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, components),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(!session.snapshot().hunger_effect);
+        assert!(session.snapshot().poison_effect);
+        assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 13);
+        let updates = &session
+            .effect_save_tracking
+            .as_ref()
+            .unwrap()
+            .status_updates;
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| (update.kind, update.remove))
+                .collect::<Vec<_>>(),
+            vec![
+                (crate::survival::FoodStatusKind::Hunger, true),
+                (crate::survival::FoodStatusKind::Poison, true),
+                (crate::survival::FoodStatusKind::Poison, false),
+            ]
+        );
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
         );
     }
 

@@ -106,10 +106,26 @@ struct StatusGroup {
 }
 
 #[derive(Clone, Debug)]
+enum ConsumeStatusAction {
+    Apply(StatusGroup),
+    Remove(Vec<FoodStatusKind>),
+}
+
+#[derive(Clone, Debug)]
 struct CustomConsumable {
     ticks: i32,
     particles: bool,
-    effects: Vec<StatusGroup>,
+    effects: Vec<ConsumeStatusAction>,
+}
+
+fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<FoodStatusKind> {
+    if value.matches("minecraft:hunger") || value.matches("hunger") {
+        Some(FoodStatusKind::Hunger)
+    } else if value.matches("minecraft:poison") || value.matches("poison") {
+        Some(FoodStatusKind::Poison)
+    } else {
+        None
+    }
 }
 
 fn parse_status_effect(value: &Tag) -> Option<StatusApplication> {
@@ -123,15 +139,7 @@ fn parse_status_effect(value: &Tag) -> Option<StatusApplication> {
             let Tag::String(value) = value else {
                 return None;
             };
-            id = Some(
-                if value.matches("minecraft:hunger") || value.matches("hunger") {
-                    FoodStatusKind::Hunger
-                } else if value.matches("minecraft:poison") || value.matches("poison") {
-                    FoodStatusKind::Poison
-                } else {
-                    return None;
-                },
-            );
+            id = Some(parse_status_kind(value)?);
         } else if name.matches("duration") && duration.is_none() {
             duration = value.as_java_int().filter(|value| *value >= -1);
             duration?;
@@ -222,6 +230,58 @@ fn parse_status_group(value: &Tag, collect: bool) -> Option<StatusGroup> {
     })
 }
 
+fn parse_consume_action(value: &Tag, collect: bool) -> Option<ConsumeStatusAction> {
+    let Tag::Compound(fields) = value else {
+        return None;
+    };
+    let mut kind = None;
+    let mut effects = None;
+    for (name, value) in fields {
+        if name.matches("type") && kind.is_none() {
+            let Tag::String(value) = value else {
+                return None;
+            };
+            kind = Some(value);
+        } else if name.matches("effects") && effects.is_none() {
+            effects = Some(value);
+        }
+    }
+    let kind = kind?;
+    if kind.matches("minecraft:apply_effects") || kind.matches("apply_effects") {
+        return Some(ConsumeStatusAction::Apply(parse_status_group(
+            value, collect,
+        )?));
+    }
+    if !kind.matches("minecraft:remove_effects") && !kind.matches("remove_effects") {
+        return None;
+    }
+    if fields.len() != 2 {
+        return None;
+    }
+    let mut result = Vec::new();
+    let mut add = |entry: &Tag| -> Option<()> {
+        let Tag::String(id) = entry else { return None };
+        let status = parse_status_kind(id)?;
+        if collect {
+            result.push(status);
+        }
+        Some(())
+    };
+    match effects? {
+        value @ Tag::String(_) => add(value)?,
+        Tag::List {
+            element_type,
+            values,
+        } if *element_type == native_persistence::nbt::TagType::String || values.is_empty() => {
+            for value in values {
+                add(value)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(ConsumeStatusAction::Remove(result))
+}
+
 fn parse_consumable(value: &Tag, collect: bool) -> Option<CustomConsumable> {
     let Tag::Compound(fields) = value else {
         return None;
@@ -252,7 +312,7 @@ fn parse_consumable(value: &Tag, collect: bool) -> Option<CustomConsumable> {
             }
             let mut result = Vec::new();
             for value in values {
-                let group = parse_status_group(value, collect)?;
+                let group = parse_consume_action(value, collect)?;
                 if collect {
                     result.push(group);
                 }
@@ -414,7 +474,7 @@ pub(crate) enum FoodRandomEvent {
         probability: f32,
         effects: Vec<StatusApplication>,
     },
-    RemovePoison,
+    RemoveStatuses(Vec<FoodStatusKind>),
 }
 
 impl FoodRandomEvent {
@@ -431,7 +491,7 @@ impl FoodRandomEvent {
                 }
             }
             Self::StatusGroup { probability, .. } => return random.next_float() < *probability,
-            Self::RemovePoison => return true,
+            Self::RemoveStatuses(_) => return true,
         };
         random.next_bool();
         for _ in 0..3 + u32::from(particles) * 4 {
@@ -612,7 +672,7 @@ impl FoodUse {
                 _ => None,
             }
         {
-            custom_groups.push(StatusGroup {
+            custom_groups.push(ConsumeStatusAction::Apply(StatusGroup {
                 probability,
                 effects: vec![StatusApplication {
                     kind,
@@ -622,21 +682,27 @@ impl FoodUse {
                     visible: true,
                     show_icon: true,
                 }],
-            });
+            }));
         }
         if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
             self.events.push(FoodRandomEvent::Finish {
                 causes_hunger,
                 particles: food.consume_particles,
             });
-            self.events.extend(custom_groups.into_iter().map(|group| {
-                FoodRandomEvent::StatusGroup {
-                    probability: group.probability,
-                    effects: group.effects,
-                }
-            }));
+            self.events
+                .extend(custom_groups.into_iter().map(|action| match action {
+                    ConsumeStatusAction::Apply(group) => FoodRandomEvent::StatusGroup {
+                        probability: group.probability,
+                        effects: group.effects,
+                    },
+                    ConsumeStatusAction::Remove(effects) => {
+                        FoodRandomEvent::RemoveStatuses(effects)
+                    }
+                }));
             if remove_poison {
-                self.events.push(FoodRandomEvent::RemovePoison);
+                self.events.push(FoodRandomEvent::RemoveStatuses(vec![
+                    FoodStatusKind::Poison,
+                ]));
             }
             vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
             vitals.saturation =
@@ -1188,7 +1254,9 @@ mod tests {
                                 assert_eq!(effects.len(), 1);
                                 applied = Some(effects[0]);
                             }
-                            FoodRandomEvent::RemovePoison => removed = true,
+                            FoodRandomEvent::RemoveStatuses(ref effects) => {
+                                removed = effects.contains(&FoodStatusKind::Poison)
+                            }
                             _ => {}
                         }
                     }
@@ -1449,7 +1517,7 @@ mod tests {
                     usage
                         .take_events()
                         .iter()
-                        .any(|event| matches!(event, FoodRandomEvent::RemovePoison))
+                        .any(|event| matches!(event, FoodRandomEvent::RemoveStatuses(effects) if effects.contains(&FoodStatusKind::Poison)))
                 );
                 let hand = inventory.slot(PlayerSlot::Storage(0)).unwrap();
                 if mode == GameMode::Creative {
@@ -1568,6 +1636,54 @@ mod tests {
             (19, 0)
         );
         assert_eq!(session.snapshot().vitals.food, 14);
+    }
+
+    #[test]
+    fn unsupported_removal_target_does_not_partially_consume() {
+        for target in ["minecraft:weakness", "#minecraft:some_tag"] {
+            let component = Tag::Compound(vec![(
+                "on_consume_effects".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        (
+                            "type".into(),
+                            Tag::String("minecraft:remove_effects".into()),
+                        ),
+                        (
+                            "effects".into(),
+                            Tag::List {
+                                element_type: native_persistence::nbt::TagType::String,
+                                values: vec![
+                                    Tag::String("minecraft:poison".into()),
+                                    Tag::String(target.into()),
+                                ],
+                            },
+                        ),
+                    ])],
+                },
+            )]);
+            let components = Tag::Compound(vec![("minecraft:consumable".into(), component)]);
+            assert_eq!(saved_item_max("minecraft:apple", &components), None);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:apple".into(), 1, 64, components),
+            );
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                ..Default::default()
+            };
+            assert!(!FoodUse::default().start_hand(
+                &mut inventory,
+                PlayerSlot::Storage(0),
+                &mut vitals,
+                GameMode::Survival
+            ));
+            assert!(inventory.slot(PlayerSlot::Storage(0)).is_some());
+            assert_eq!(vitals.food, 10);
+        }
     }
 
     #[test]
@@ -1699,6 +1815,15 @@ mod tests {
                 ("amplifier".into(), Tag::Byte(amplifier)),
             ])
         };
+        let remove = |effects| {
+            Tag::Compound(vec![
+                (
+                    "type".into(),
+                    Tag::String("minecraft:remove_effects".into()),
+                ),
+                ("effects".into(), effects),
+            ])
+        };
         let cases = [
             Tag::Compound(vec![
                 ("consume_seconds".into(), Tag::Float(0.0)),
@@ -1751,10 +1876,55 @@ mod tests {
                     },
                 ),
             ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            remove(Tag::String("minecraft:poison".into())),
+                            group(0.35, vec![poison(100, 0)]),
+                        ],
+                    },
+                ),
+            ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            remove(Tag::List {
+                                element_type: native_persistence::nbt::TagType::String,
+                                values: vec![
+                                    Tag::String("minecraft:hunger".into()),
+                                    Tag::String("minecraft:poison".into()),
+                                ],
+                            }),
+                            group(0.8, vec![poison(20, 2)]),
+                        ],
+                    },
+                ),
+            ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![remove(Tag::List {
+                            element_type: native_persistence::nbt::TagType::String,
+                            values: vec![],
+                        })],
+                    },
+                ),
+            ]),
         ];
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 160);
+        assert_eq!(rows.len(), 280);
         for row in rows {
             let case = row["case"].as_u64().unwrap() as usize;
             let components =
@@ -1780,28 +1950,48 @@ mod tests {
                     usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
                 }
             }
-            let mut active: Option<EffectDuration> = None;
-            let mut active_poison: Option<EffectDuration> = None;
+            let mut active = (case >= 4).then_some(EffectDuration {
+                duration: 50,
+                amplifier: 0,
+                hidden: None,
+            });
+            let mut active_poison = (case >= 4).then_some(EffectDuration {
+                duration: 200,
+                amplifier: 1,
+                hidden: None,
+            });
             for event in usage.take_events() {
-                if event.apply(&mut random)
-                    && let FoodRandomEvent::StatusGroup { effects, .. } = event
-                {
-                    for effect in effects {
-                        let incoming = EffectDuration {
-                            duration: effect.duration,
-                            amplifier: effect.amplifier,
-                            hidden: None,
-                        };
-                        let target = match effect.kind {
-                            FoodStatusKind::Hunger => &mut active,
-                            FoodStatusKind::Poison => &mut active_poison,
-                        };
-                        if let Some(existing) = target {
-                            existing.merge(incoming);
-                        } else {
-                            *target = Some(incoming);
+                if !event.apply(&mut random) {
+                    continue;
+                }
+                match event {
+                    FoodRandomEvent::StatusGroup { effects, .. } => {
+                        for effect in effects {
+                            let incoming = EffectDuration {
+                                duration: effect.duration,
+                                amplifier: effect.amplifier,
+                                hidden: None,
+                            };
+                            let target = match effect.kind {
+                                FoodStatusKind::Hunger => &mut active,
+                                FoodStatusKind::Poison => &mut active_poison,
+                            };
+                            if let Some(existing) = target {
+                                existing.merge(incoming);
+                            } else {
+                                *target = Some(incoming);
+                            }
                         }
                     }
+                    FoodRandomEvent::RemoveStatuses(effects) => {
+                        for effect in effects {
+                            match effect {
+                                FoodStatusKind::Hunger => active = None,
+                                FoodStatusKind::Poison => active_poison = None,
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             assert_eq!(

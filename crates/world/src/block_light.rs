@@ -408,6 +408,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:sand"
         | "minecraft:red_sand"
         | "minecraft:bedrock"
+        | "minecraft:lodestone"
         | "minecraft:obsidian"
         | "minecraft:netherrack"
         | "minecraft:blackstone"
@@ -2354,6 +2355,7 @@ mod tests {
             "deepslate_lapis_ore",
             "emerald_ore",
             "deepslate_emerald_ore",
+            "lodestone",
             "snow_block",
         ] {
             states.push(state(name, None));

@@ -911,7 +911,7 @@ mod tests {
                 (sun.sample(tick)[0] - row["sun"].as_f64().unwrap() as f32).abs() < 0.0001,
                 "sun tick {tick}"
             );
-            let rgba = sunset.sample(tick);
+            let rgba = sunset.apply(tick, [0.0; 4]);
             for (i, value) in rgba.iter().enumerate() {
                 assert!(
                     (*value - row["sunset"][i].as_f64().unwrap() as f32).abs() < 0.000002,

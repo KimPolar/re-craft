@@ -87,9 +87,118 @@ struct FogTrack {
     modifier: FloatModifier,
 }
 
-pub(crate) struct SunsetColorTrack {
-    rgb: SkyTrack,
-    alpha: SkyTrack,
+#[derive(Clone, Copy)]
+enum SunsetColorLayer {
+    Override([f32; 4]),
+    Multiply([f32; 4]),
+    Add([f32; 3]),
+    Subtract([f32; 3]),
+    AlphaBlend([f32; 4]),
+    BlendToGray { brightness: f32, factor: f32 },
+}
+
+impl SunsetColorLayer {
+    fn parse(value: &Value) -> Result<Self> {
+        if !value.is_object() {
+            return Ok(Self::Override(argb(value)?));
+        }
+        let id = ResourceId::parse(
+            value
+                .get("modifier")
+                .and_then(Value::as_str)
+                .context("missing color modifier")?,
+        )?;
+        ensure!(id.namespace == "minecraft", "unsupported color modifier");
+        let arg = value.get("argument").context("missing color argument")?;
+        match id.path.as_str() {
+            "override" => Ok(Self::Override(argb(arg)?)),
+            "multiply" => Ok(Self::Multiply(argb(arg)?)),
+            "add" => Ok(Self::Add(rgb(arg)?)),
+            "subtract" => Ok(Self::Subtract(rgb(arg)?)),
+            "alpha_blend" => Ok(Self::AlphaBlend(argb(arg)?)),
+            "blend_to_gray" => {
+                let parse = |name| -> Result<f32> {
+                    let n = arg
+                        .get(name)
+                        .and_then(Value::as_f64)
+                        .context("missing gray parameter")? as f32;
+                    ensure!((0.0..=1.0).contains(&n), "invalid gray parameter");
+                    Ok(n)
+                };
+                Ok(Self::BlendToGray {
+                    brightness: parse("brightness")?,
+                    factor: parse("factor")?,
+                })
+            }
+            _ => bail!("unsupported color modifier"),
+        }
+    }
+
+    fn apply(self, base: [f32; 4]) -> [f32; 4] {
+        match self {
+            Self::Override(value) => value,
+            Self::Multiply(value) => std::array::from_fn(|i| base[i] * value[i]),
+            Self::Add(value) => [
+                (base[0] + value[0]).min(1.0),
+                (base[1] + value[1]).min(1.0),
+                (base[2] + value[2]).min(1.0),
+                base[3],
+            ],
+            Self::Subtract(value) => [
+                (base[0] - value[0]).max(0.0),
+                (base[1] - value[1]).max(0.0),
+                (base[2] - value[2]).max(0.0),
+                base[3],
+            ],
+            Self::AlphaBlend(value) => {
+                if value[3] == 0.0 {
+                    return base;
+                }
+                if value[3] == 1.0 {
+                    return value;
+                }
+                let alpha = value[3] + base[3] * (1.0 - value[3]);
+                std::array::from_fn(|i| {
+                    if i == 3 {
+                        alpha
+                    } else {
+                        (value[i] * value[3] + base[i] * (alpha - value[3])) / alpha
+                    }
+                })
+            }
+            Self::BlendToGray { brightness, factor } => {
+                let gray = ((base[0] * 0.3 + base[1] * 0.59 + base[2] * 0.11) * brightness)
+                    .clamp(0.0, 1.0);
+                [
+                    base[0] + factor * (gray - base[0]),
+                    base[1] + factor * (gray - base[1]),
+                    base[2] + factor * (gray - base[2]),
+                    base[3],
+                ]
+            }
+        }
+    }
+}
+
+pub(crate) enum SunsetColorTrack {
+    Color {
+        rgb: SkyTrack,
+        alpha: SkyTrack,
+        operation: SunsetColorOperation,
+    },
+    Gray {
+        brightness: SkyTrack,
+        factor: SkyTrack,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SunsetColorOperation {
+    Override,
+    Multiply,
+    Add,
+    Subtract,
+    AlphaBlend,
 }
 
 fn argb(value: &Value) -> Result<[f32; 4]> {
@@ -118,45 +227,122 @@ fn argb(value: &Value) -> Result<[f32; 4]> {
 
 impl SunsetColorTrack {
     pub(crate) fn parse(timeline: &Value, track: &Value) -> Result<Self> {
-        let mut rgb = track.clone();
-        let mut alpha = track.clone();
+        let operation = match track.get("modifier") {
+            None => "override",
+            Some(value) => value.as_str().context("invalid color track modifier")?,
+        };
+        let id = ResourceId::parse(operation)?;
+        ensure!(
+            id.namespace == "minecraft",
+            "unsupported color track modifier"
+        );
+        let mut first = track.clone();
+        let mut second = track.clone();
+        first
+            .as_object_mut()
+            .context("invalid color track")?
+            .insert("modifier".into(), Value::String("override".into()));
+        second
+            .as_object_mut()
+            .context("invalid color track")?
+            .insert("modifier".into(), Value::String("override".into()));
         let original = track
             .get("keyframes")
             .and_then(Value::as_array)
             .context("missing color keyframes")?;
-        for ((rgb, alpha), frame) in rgb["keyframes"]
+        for ((first, second), frame) in first["keyframes"]
             .as_array_mut()
             .context("invalid color frames")?
             .iter_mut()
             .zip(
-                alpha["keyframes"]
+                second["keyframes"]
                     .as_array_mut()
                     .context("invalid alpha frames")?
                     .iter_mut(),
             )
             .zip(original)
         {
-            let color = argb(frame.get("value").context("missing color")?)?;
-            let packed = ((color[0] * 255.0).round() as u32) << 16
-                | ((color[1] * 255.0).round() as u32) << 8
-                | (color[2] * 255.0).round() as u32;
-            rgb["value"] = Value::from(packed);
-            alpha["value"] = Value::from(color[3]);
+            let value = frame.get("value").context("missing color")?;
+            let layer = SunsetColorLayer::parse(
+                &serde_json::json!({"modifier": operation, "argument": value}),
+            )?;
+            if let SunsetColorLayer::BlendToGray { brightness, factor } = layer {
+                first["value"] = Value::from(brightness);
+                second["value"] = Value::from(factor);
+            } else {
+                let color = match layer {
+                    SunsetColorLayer::Override(v)
+                    | SunsetColorLayer::Multiply(v)
+                    | SunsetColorLayer::AlphaBlend(v) => v,
+                    SunsetColorLayer::Add(v) | SunsetColorLayer::Subtract(v) => {
+                        [v[0], v[1], v[2], 0.0]
+                    }
+                    SunsetColorLayer::BlendToGray { .. } => unreachable!(),
+                };
+                let packed = ((color[0] * 255.0).round() as u32) << 16
+                    | ((color[1] * 255.0).round() as u32) << 8
+                    | (color[2] * 255.0).round() as u32;
+                first["value"] = Value::from(packed);
+                second["value"] = Value::from(color[3]);
+            }
         }
-        Ok(Self {
-            rgb: SkyTrack::parse(timeline, &rgb, false)?,
-            alpha: SkyTrack::parse(timeline, &alpha, true)?,
+        if id.path == "blend_to_gray" {
+            return Ok(Self::Gray {
+                brightness: SkyTrack::parse(timeline, &first, true)?,
+                factor: SkyTrack::parse(timeline, &second, true)?,
+            });
+        }
+        let operation = match id.path.as_str() {
+            "override" => SunsetColorOperation::Override,
+            "multiply" => SunsetColorOperation::Multiply,
+            "add" => SunsetColorOperation::Add,
+            "subtract" => SunsetColorOperation::Subtract,
+            "alpha_blend" => SunsetColorOperation::AlphaBlend,
+            _ => bail!("unsupported color track modifier"),
+        };
+        Ok(Self::Color {
+            rgb: SkyTrack::parse(timeline, &first, false)?,
+            alpha: SkyTrack::parse(timeline, &second, true)?,
+            operation,
         })
     }
-    pub(crate) fn sample(&self, ticks: i64) -> [f32; 4] {
-        let color = self.rgb.sample(ticks);
-        [color[0], color[1], color[2], self.alpha.sample(ticks)[0]]
+    fn clock(&self) -> &ResourceId {
+        match self {
+            Self::Color { rgb, .. } => &rgb.clock,
+            Self::Gray { brightness, .. } => &brightness.clock,
+        }
+    }
+    pub(crate) fn apply(&self, ticks: i64, base: [f32; 4]) -> [f32; 4] {
+        let layer = match self {
+            Self::Gray { brightness, factor } => SunsetColorLayer::BlendToGray {
+                brightness: brightness.sample(ticks)[0],
+                factor: factor.sample(ticks)[0],
+            },
+            Self::Color {
+                rgb,
+                alpha,
+                operation,
+            } => {
+                let color = rgb.sample(ticks);
+                let rgba = [color[0], color[1], color[2], alpha.sample(ticks)[0]];
+                match operation {
+                    SunsetColorOperation::Override => SunsetColorLayer::Override(rgba),
+                    SunsetColorOperation::Multiply => SunsetColorLayer::Multiply(rgba),
+                    SunsetColorOperation::Add => SunsetColorLayer::Add(color),
+                    SunsetColorOperation::Subtract => SunsetColorLayer::Subtract(color),
+                    SunsetColorOperation::AlphaBlend => SunsetColorLayer::AlphaBlend(rgba),
+                }
+            }
+        };
+        layer.apply(base)
     }
 }
 
 struct SunsetTimeline {
     base_angle: f32,
     base_color: [f32; 4],
+    biome_angles: BTreeMap<String, Option<Option<FloatLayer>>>,
+    biome_colors: BTreeMap<String, Option<Option<SunsetColorLayer>>>,
     angle: Vec<FogTrack>,
     color: Vec<SunsetColorTrack>,
 }
@@ -182,38 +368,53 @@ impl SunsetTimeline {
             .map(FloatLayer::parse)
             .transpose()?
             .map_or(0.0, |v| v.apply(0.0));
-        let base_color = match named_attribute(attributes, "visual/sunrise_sunset_color")? {
-            None => [0.0; 4],
-            Some(v) if v.is_object() => {
-                let modifier = ResourceId::parse(
-                    v.get("modifier")
-                        .and_then(Value::as_str)
-                        .context("missing color modifier")?,
-                )?;
-                ensure!(
-                    modifier.namespace == "minecraft",
-                    "unsupported color modifier"
-                );
-                let color = argb(v.get("argument").context("missing color argument")?)?;
-                match modifier.path.as_str() {
-                    "override" => color,
-                    "multiply" => [0.0; 4],
-                    _ => bail!("unsupported color modifier"),
-                }
-            }
-            Some(v) => argb(v)?,
-        };
+        let base_color = named_attribute(attributes, "visual/sunrise_sunset_color")?
+            .map(SunsetColorLayer::parse)
+            .transpose()?
+            .map_or([0.0; 4], |layer| layer.apply([0.0; 4]));
         Ok(Self {
             base_angle,
             base_color,
+            biome_angles: BTreeMap::new(),
+            biome_colors: BTreeMap::new(),
             angle: Vec::new(),
             color: Vec::new(),
         })
     }
 
-    fn sample(&self, mut clock: impl FnMut(&ResourceId) -> Option<i64>) -> Option<(f32, [f32; 4])> {
-        let mut angle = self.base_angle;
-        let mut color = self.base_color;
+    fn sample(
+        &self,
+        grouped: &[(&str, f64)],
+        mut clock: impl FnMut(&ResourceId) -> Option<i64>,
+    ) -> Option<(f32, [f32; 4])> {
+        let mut total = 0.0;
+        let mut result: Option<(f32, [f32; 4])> = None;
+        for &(id, weight) in grouped {
+            let angle = self
+                .biome_angles
+                .get(id)?
+                .as_ref()?
+                .map_or(self.base_angle, |layer| layer.apply(self.base_angle));
+            let color = self
+                .biome_colors
+                .get(id)?
+                .as_ref()?
+                .map_or(self.base_color, |layer| layer.apply(self.base_color));
+            total += weight;
+            result = Some(match result {
+                None => (angle, color),
+                Some((prior_angle, prior_color)) => {
+                    let fraction = (weight / total) as f32;
+                    (
+                        prior_angle + fraction * (angle - prior_angle),
+                        std::array::from_fn(|i| {
+                            prior_color[i] + fraction * (color[i] - prior_color[i])
+                        }),
+                    )
+                }
+            });
+        }
+        let (mut angle, mut color) = result?;
         for track in &self.angle {
             angle = FloatLayer {
                 value: track.track.sample(clock(&track.track.clock)?)[0],
@@ -222,12 +423,7 @@ impl SunsetTimeline {
             .apply(angle);
         }
         for track in &self.color {
-            let value = track.sample(clock(&track.rgb.clock)?);
-            color = if track.rgb.multiply {
-                std::array::from_fn(|i| color[i] * value[i])
-            } else {
-                value
-            };
+            color = track.apply(clock(track.clock())?, color);
         }
         Some((angle, color))
     }
@@ -416,23 +612,27 @@ impl SkyBackground {
                 .with_context(|| format!("missing {path}"))?;
             let biome: Value =
                 serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
-            if sunset.is_some() {
-                let attributes = biome.get("attributes");
-                if !matches!(named_attribute(attributes, "visual/sun_angle"), Ok(None))
-                    || !matches!(
-                        named_attribute(attributes, "visual/sunrise_sunset_color"),
-                        Ok(None)
-                    )
-                {
-                    sunset = None;
-                }
-            }
             let layer = biome
                 .get("attributes")
                 .map(|attributes| find_color_attribute(attributes, attribute))
                 .transpose()?
                 .flatten();
             let name = format!("{}:{}", id.namespace, id.path);
+            if let Some(sunset) = &mut sunset {
+                let attributes = biome.get("attributes");
+                sunset.biome_angles.insert(
+                    name.clone(),
+                    named_attribute(attributes, "visual/sun_angle")
+                        .and_then(|layer| layer.map(FloatLayer::parse).transpose())
+                        .ok(),
+                );
+                sunset.biome_colors.insert(
+                    name.clone(),
+                    named_attribute(attributes, "visual/sunrise_sunset_color")
+                        .and_then(|layer| layer.map(SunsetColorLayer::parse).transpose())
+                        .ok(),
+                );
+            }
             fog_biomes.insert(name.clone(), fog_layers(biome.get("attributes")).ok());
             fog_color_biomes.insert(
                 name.clone(),
@@ -625,7 +825,7 @@ impl SkyBackground {
             sunset: self
                 .sunset
                 .as_ref()
-                .and_then(|sunset| sunset.sample(&mut clock_ticks)),
+                .and_then(|sunset| sunset.sample(&grouped, &mut clock_ticks)),
         })
     }
 }
@@ -750,6 +950,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsupported_sunset_layer_is_limited_to_sampled_biomes() {
+        let mut sunset = SunsetTimeline::new(None).unwrap();
+        sunset.biome_angles.insert("known".into(), Some(None));
+        sunset.biome_colors.insert("known".into(), Some(None));
+        sunset.biome_angles.insert("unknown".into(), None);
+        sunset.biome_colors.insert("unknown".into(), Some(None));
+        assert_eq!(
+            sunset.sample(&[("known", 1.0)], |_| None),
+            Some((0.0, [0.0; 4]))
+        );
+        assert!(
+            sunset
+                .sample(&[("known", 0.5), ("unknown", 0.5)], |_| None)
+                .is_none()
+        );
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn blended_sky_color_matches_java_sampler() {
         use native_resources::packs::ResourceStack;
@@ -773,8 +991,8 @@ mod tests {
         .unwrap();
         let track = &day["tracks"]["minecraft:visual/sky_color"];
         let biomes = [
-            json!({"minecraft:visual/sky_color":"#abcdef","minecraft:visual/fog_color":"#330808","minecraft:visual/fog_start_distance":{"modifier":"add","argument":5.0},"minecraft:visual/fog_end_distance":50.0}),
-            json!({"minecraft:visual/sky_color":{"modifier":"multiply","argument":"#7295ff"},"minecraft:visual/fog_color":"#1b4745","minecraft:visual/fog_start_distance":-10.0,"minecraft:visual/fog_end_distance":{"modifier":"multiply","argument":0.5}}),
+            json!({"minecraft:visual/sky_color":"#abcdef","minecraft:visual/fog_color":"#330808","minecraft:visual/fog_start_distance":{"modifier":"add","argument":5.0},"minecraft:visual/fog_end_distance":50.0,"minecraft:visual/sun_angle":350.0,"minecraft:visual/sunrise_sunset_color":{"modifier":"multiply","argument":"#80ff8040"}}),
+            json!({"minecraft:visual/sky_color":{"modifier":"multiply","argument":"#7295ff"},"minecraft:visual/fog_color":"#1b4745","minecraft:visual/fog_start_distance":-10.0,"minecraft:visual/fog_end_distance":{"modifier":"multiply","argument":0.5},"minecraft:visual/sun_angle":{"modifier":"add","argument":-25.0},"minecraft:visual/sunrise_sunset_color":{"modifier":"alpha_blend","argument":"#8060d020"}}),
             json!({}),
         ];
         let mut cases = Vec::new();
@@ -812,7 +1030,21 @@ mod tests {
                 }
             }
         }
-        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases,"sunriseCases":sunrise_cases});
+        let modifier_values = [
+            ("override", json!("#a020a0f0"), json!("#7080c040")),
+            ("multiply", json!("#a020a0f0"), json!("#7080c040")),
+            ("add", json!("#20a0f0"), json!("#80c040")),
+            ("subtract", json!("#20a0f0"), json!("#80c040")),
+            ("alpha_blend", json!("#a020a0f0"), json!("#7080c040")),
+            (
+                "blend_to_gray",
+                json!({"brightness":0.3,"factor":0.8}),
+                json!({"brightness":0.9,"factor":0.2}),
+            ),
+        ];
+        let sunset_modifier_cases: Vec<_> = modifier_values.iter().map(|(name, value, _)| json!({"attributes":{"minecraft:visual/sunrise_sunset_color":{"modifier":name,"argument":value}}})).collect();
+        let sunset_track_cases: Vec<_> = modifier_values.iter().map(|(name, a, b)| json!({"track":{"modifier":name,"keyframes":[{"ticks":0,"value":a},{"ticks":10,"value":b}]},"ticks":[0,3,7,10,17]})).collect();
+        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases,"sunriseCases":sunrise_cases,"sunsetModifierCases":sunset_modifier_cases,"sunsetTrackCases":sunset_track_cases});
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SkyBackgroundOracle.java");
         let input_file = temp.path().join("input.json");
@@ -886,9 +1118,40 @@ mod tests {
             ("b".into(), Some(fog_layers(Some(&biomes[1])).unwrap())),
             ("c".into(), Some([None; 3])),
         ]);
+        let mut sunset_biomes = SunsetTimeline::new(None).unwrap();
+        sunset_biomes.base_angle = 20.0;
+        sunset_biomes.base_color = [0.2, 0.4, 0.6, 0.8];
+        for (name, biome) in ["a", "b", "c"].into_iter().zip(&biomes) {
+            sunset_biomes.biome_angles.insert(
+                name.into(),
+                Some(
+                    named_attribute(Some(biome), "visual/sun_angle")
+                        .unwrap()
+                        .map(FloatLayer::parse)
+                        .transpose()
+                        .unwrap(),
+                ),
+            );
+            sunset_biomes.biome_colors.insert(
+                name.into(),
+                Some(
+                    named_attribute(Some(biome), "visual/sunrise_sunset_color")
+                        .unwrap()
+                        .map(SunsetColorLayer::parse)
+                        .transpose()
+                        .unwrap(),
+                ),
+            );
+        }
         assert_eq!(
             expected.len(),
-            cases.len() + 6 + fog_color_cases.len() + weather_cases.len() + sunrise_cases.len()
+            cases.len()
+                + 6
+                + fog_color_cases.len()
+                + weather_cases.len()
+                + sunrise_cases.len()
+                + sunset_modifier_cases.len()
+                + sunset_track_cases.len() * 5
         );
         for (case, expected) in cases.iter().zip(&expected) {
             let p = &case["position"];
@@ -916,6 +1179,14 @@ mod tests {
                 Some(["a", "b", "c"][(x + 3 * y + 7 * z).rem_euclid(3) as usize])
             })
             .unwrap();
+            let (angle, color) = sunset_biomes.sample(&grouped, |_| Some(0)).unwrap();
+            assert!((angle - expected[8]).abs() < 0.0001, "angle case {case}");
+            for i in 0..4 {
+                assert!(
+                    (color[i] - expected[9 + i]).abs() < 0.000002,
+                    "sunset biome case {case}, channel {i}"
+                );
+            }
             let mut distance =
                 interpolate_fog(&grouped, &fog_distance_layers, [10.0, 96.0, 512.0]).unwrap();
             distance[1] *= fog_distance_track.sample(case["tick"].as_i64().unwrap())[0];
@@ -1002,6 +1273,38 @@ mod tests {
                 );
             }
         }
+        let mut offset =
+            cases.len() + 6 + fog_color_cases.len() + weather_cases.len() + sunrise_cases.len();
+        for case in &sunset_modifier_cases {
+            let layer = SunsetColorLayer::parse(
+                &case["attributes"]["minecraft:visual/sunrise_sunset_color"],
+            )
+            .unwrap();
+            let actual = layer.apply([0.2, 0.4, 0.6, 0.8]);
+            for i in 0..4 {
+                assert!(
+                    (actual[i] - expected[offset][i]).abs() < 0.000002,
+                    "modifier {case}, channel {i}"
+                );
+            }
+            offset += 1;
+        }
+        let test_timeline = json!({"clock":"minecraft:overworld", "period_ticks":20});
+        for case in &sunset_track_cases {
+            let track = SunsetColorTrack::parse(&test_timeline, &case["track"]).unwrap();
+            for tick in case["ticks"].as_array().unwrap() {
+                let actual = track.apply(tick.as_i64().unwrap(), [0.2, 0.4, 0.6, 0.8]);
+                for i in 0..4 {
+                    assert!(
+                        (actual[i] - expected[offset][i]).abs() < 0.000002,
+                        "track {case} tick {tick}, channel {i}: {} != {}",
+                        actual[i],
+                        expected[offset][i]
+                    );
+                }
+                offset += 1;
+            }
+        }
         let overworld = SkyBackground::load(&mut resources, "minecraft:overworld", -64, 320)
             .unwrap()
             .unwrap();
@@ -1026,10 +1329,10 @@ mod tests {
                 .sunset
                 .as_ref()
                 .unwrap()
-                .sample(|_| Some(tick))
+                .sample(&[("minecraft:plains", 1.0)], |_| Some(tick))
                 .unwrap();
             assert_eq!(angle, sun.sample(tick)[0]);
-            assert_eq!(color, sunset.sample(tick));
+            assert_eq!(color, sunset.apply(tick, [0.0; 4]));
         }
         let nether = SkyBackground::load(&mut resources, "minecraft:the_nether", 0, 128)
             .unwrap()
@@ -1172,12 +1475,18 @@ mod tests {
                 Data.list_data(folder)
             }
         }
-        assert!(
-            SkyBackground::load(&mut ModifiedBiome, "example:test", 0, 16)
-                .unwrap()
-                .unwrap()
+        let modified = SkyBackground::load(&mut ModifiedBiome, "example:test", 0, 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            modified
                 .sunset
-                .is_none()
+                .as_ref()
+                .unwrap()
+                .sample(&[("example:test", 1.0)], |_| Some(0))
+                .unwrap()
+                .0,
+            15.0
         );
     }
 

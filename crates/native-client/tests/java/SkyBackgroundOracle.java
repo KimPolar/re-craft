@@ -43,6 +43,9 @@ public class SkyBackgroundOracle {
             var fogStart = interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_START_DISTANCE, 10f);
             var fogEnd = interpolator.applyAttributeLayer(EnvironmentAttributes.FOG_END_DISTANCE, 96f);
             row.add(fogStart); row.add(fogSampler.applyTimeBased(fogEnd, tickId));
+            row.add(interpolator.applyAttributeLayer(EnvironmentAttributes.SUN_ANGLE, 20f));
+            var sunset = interpolator.applyAttributeLayer(EnvironmentAttributes.SUNRISE_SUNSET_COLOR, new org.joml.Vector4f(0.2f,0.4f,0.6f,0.8f));
+            row.add(sunset.x()); row.add(sunset.y()); row.add(sunset.z()); row.add(sunset.w());
         }
         for (String operation : List.of("override", "add", "subtract", "multiply", "minimum", "maximum")) {
             var object = JsonParser.parseString("{\"minecraft:visual/fog_start_distance\":{\"modifier\":\"" + operation + "\",\"argument\":3.0}}");
@@ -74,6 +77,23 @@ public class SkyBackgroundOracle {
             var result = c.get("chunks").getAsInt() >= 4 && direction > 0f && c.get("alpha").getAsFloat() > 0f
                 ? ARGB.srgbLerp(direction * c.get("alpha").getAsFloat(), fog, color) : fog;
             var row = new JsonArray(); row.add(result.x()); row.add(result.y()); row.add(result.z()); output.add(row);
+        }
+        for (var item : input.getAsJsonArray("sunsetModifierCases")) {
+            var c = item.getAsJsonObject();
+            var map = EnvironmentAttributeMap.CODEC.parse(JsonOps.INSTANCE, c.get("attributes")).getOrThrow();
+            var spatial = new SpatialAttributeInterpolator(); spatial.accumulate(1.0, map);
+            var color = spatial.applyAttributeLayer(EnvironmentAttributes.SUNRISE_SUNSET_COLOR, new org.joml.Vector4f(0.2f,0.4f,0.6f,0.8f));
+            var row = new JsonArray(); row.add(color.x()); row.add(color.y()); row.add(color.z()); row.add(color.w()); output.add(row);
+        }
+        for (var item : input.getAsJsonArray("sunsetTrackCases")) {
+            var c = item.getAsJsonObject();
+            var sunsetTrack = AttributeTrack.createCodec(EnvironmentAttributes.SUNRISE_SUNSET_COLOR).parse(JsonOps.INSTANCE, c.get("track")).getOrThrow();
+            var sunsetSampler = sunsetTrack.bakeSampler(EnvironmentAttributes.SUNRISE_SUNSET_COLOR, Holder.direct(new WorldClock()), Optional.of(20), manager);
+            for (var tick : c.getAsJsonArray("ticks")) {
+                clock.loadFrom(new ClockState(tick.getAsLong(),0,1,false));
+                var color = sunsetSampler.applyTimeBased(new org.joml.Vector4f(0.2f,0.4f,0.6f,0.8f), ++tickId);
+                var row = new JsonArray(); row.add(color.x()); row.add(color.y()); row.add(color.z()); row.add(color.w()); output.add(row);
+            }
         }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }

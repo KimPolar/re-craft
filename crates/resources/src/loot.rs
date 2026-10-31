@@ -97,6 +97,10 @@ pub struct Drop {
 enum Condition {
     Always,
     ThisEntityPresent,
+    BlockState {
+        blocks: Vec<ResourceId>,
+        properties: BTreeMap<String, String>,
+    },
     Tool(ToolPredicate),
     All(Vec<Condition>),
     Any(Vec<Condition>),
@@ -130,10 +134,22 @@ pub struct BasicTool<'a> {
     pub enchantments: &'a [(ResourceId, u32)],
 }
 
+/// Block state supplied by the event that produced loot.
+pub struct LootBlockState<'a> {
+    pub name: &'a str,
+    pub properties: &'a BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LootContext<'a> {
+    entity_present: Option<bool>,
+    block: Option<&'a LootBlockState<'a>>,
+}
+
 impl Condition {
     fn fully_supported(&self) -> bool {
         match self {
-            Self::Unsupported(_) | Self::ThisEntityPresent => false,
+            Self::Unsupported(_) | Self::ThisEntityPresent | Self::BlockState { .. } => false,
             Self::Tool(predicate) => predicate.unsupported.is_none(),
             Self::All(values) | Self::Any(values) => values.iter().all(Self::fully_supported),
             Self::Not(value) => value.fully_supported(),
@@ -144,11 +160,21 @@ impl Condition {
         &self,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
-        entity_present: Option<bool>,
+        context: LootContext<'_>,
     ) -> Result<bool> {
         match self {
             Self::Always => Ok(true),
-            Self::ThisEntityPresent => entity_present.context("loot entity context is unavailable"),
+            Self::ThisEntityPresent => context
+                .entity_present
+                .context("loot entity context is unavailable"),
+            Self::BlockState { blocks, properties } => {
+                let state = context.block.context("loot block state is unavailable")?;
+                let id = ResourceId::parse(state.name)?;
+                Ok(blocks.contains(&id)
+                    && properties
+                        .iter()
+                        .all(|(key, value)| state.properties.get(key) == Some(value)))
+            }
             Self::Tool(predicate) => {
                 if let Some(reason) = &predicate.unsupported {
                     bail!("unsupported tool predicate: {reason}");
@@ -186,7 +212,7 @@ impl Condition {
             }
             Self::All(conditions) => {
                 for condition in conditions {
-                    if !condition.test(tool, random, entity_present)? {
+                    if !condition.test(tool, random, context)? {
                         return Ok(false);
                     }
                 }
@@ -194,13 +220,13 @@ impl Condition {
             }
             Self::Any(conditions) => {
                 for condition in conditions {
-                    if condition.test(tool, random, entity_present)? {
+                    if condition.test(tool, random, context)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            Self::Not(condition) => Ok(!condition.test(tool, random, entity_present)?),
+            Self::Not(condition) => Ok(!condition.test(tool, random, context)?),
             Self::TableBonus(enchantment, chances) => {
                 let level = tool
                     .enchantments
@@ -244,9 +270,9 @@ impl Modifier {
         drop: &mut Drop,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
-        entity_present: Option<bool>,
+        context: LootContext<'_>,
     ) -> Result<()> {
-        if !self.condition.test(tool, random, entity_present)? {
+        if !self.condition.test(tool, random, context)? {
             return Ok(());
         }
         match &self.kind {
@@ -353,9 +379,9 @@ impl Entry {
         &self,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
-        entity_present: Option<bool>,
+        context: LootContext<'_>,
     ) -> Result<Option<(u32, Option<Drop>)>> {
-        if !self.condition.test(tool, random, entity_present)? {
+        if !self.condition.test(tool, random, context)? {
             return Ok(None);
         }
         let (weight, mut value) = match &self.kind {
@@ -371,7 +397,7 @@ impl Entry {
             EntryKind::Alternatives(children) => {
                 let mut selected = None;
                 for child in children {
-                    if let Some(value) = child.expand(tool, random, entity_present)? {
+                    if let Some(value) = child.expand(tool, random, context)? {
                         selected = Some(value);
                         break;
                     }
@@ -385,7 +411,7 @@ impl Entry {
         };
         if let Some(drop) = &mut value {
             for modifier in &self.modifiers {
-                modifier.apply(drop, tool, random, entity_present)?;
+                modifier.apply(drop, tool, random, context)?;
             }
             if drop.count == 0 {
                 value = None;
@@ -515,7 +541,7 @@ impl BlockLootTables {
             .interaction_tables
             .get(id)
             .context("interaction loot table is not supported or was not loaded")?;
-        Self::evaluate(table, tool, None, None)
+        Self::evaluate(table, tool, None, LootContext::default())
     }
 
     pub fn drops(&self, block: &str, tool: BasicTool<'_>) -> Result<Vec<Drop>> {
@@ -538,7 +564,7 @@ impl BlockLootTables {
             .tables
             .get(&id)
             .context("block loot table is not supported or was not loaded")?;
-        Self::evaluate(table, tool, random, None)
+        Self::evaluate(table, tool, random, LootContext::default())
     }
 
     /// Evaluate a block drop caused by a non-entity event such as snow melting.
@@ -547,7 +573,18 @@ impl BlockLootTables {
         block: &str,
         random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
+        self.drops_without_entity_at(block, None, random)
+    }
+
+    /// Evaluate a non-entity block event with the original block properties.
+    pub fn drops_without_entity_at(
+        &self,
+        block: &str,
+        properties: Option<&BTreeMap<String, String>>,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
         let block = ResourceId::parse(block)?;
+        let block_name = format!("{}:{}", block.namespace, block.path);
         let id = ResourceId {
             namespace: block.namespace,
             path: format!("blocks/{}", block.path),
@@ -556,6 +593,10 @@ impl BlockLootTables {
             .tables
             .get(&id)
             .context("block loot table is not supported or was not loaded")?;
+        let state = properties.map(|properties| LootBlockState {
+            name: &block_name,
+            properties,
+        });
         Self::evaluate(
             table,
             BasicTool {
@@ -564,7 +605,10 @@ impl BlockLootTables {
                 enchantments: &[],
             },
             random,
-            Some(false),
+            LootContext {
+                entity_present: Some(false),
+                block: state.as_ref(),
+            },
         )
     }
 
@@ -572,19 +616,18 @@ impl BlockLootTables {
         table: &Table,
         tool: BasicTool<'_>,
         mut random: Option<&mut dyn LootRandom>,
-        entity_present: Option<bool>,
+        context: LootContext<'_>,
     ) -> Result<Vec<Drop>> {
         let mut drops = Vec::new();
         for pool in &table.pools {
-            if !pool.condition.test(tool, &mut random, entity_present)? {
+            if !pool.condition.test(tool, &mut random, context)? {
                 continue;
             }
             for _ in 0..pool.rolls {
                 let mut selected = None;
                 let mut expanded = 0;
                 for entry in &pool.entries {
-                    if let Some((weight, value)) =
-                        entry.expand(tool, &mut random, entity_present)?
+                    if let Some((weight, value)) = entry.expand(tool, &mut random, context)?
                         && weight > 0
                     {
                         expanded += 1;
@@ -597,10 +640,10 @@ impl BlockLootTables {
                 );
                 if let Some(mut drop) = selected {
                     for modifier in &pool.modifiers {
-                        modifier.apply(&mut drop, tool, &mut random, entity_present)?;
+                        modifier.apply(&mut drop, tool, &mut random, context)?;
                     }
                     for modifier in &table.modifiers {
-                        modifier.apply(&mut drop, tool, &mut random, entity_present)?;
+                        modifier.apply(&mut drop, tool, &mut random, context)?;
                     }
                     if drop.count > 0 {
                         drops.push(drop);
@@ -854,6 +897,53 @@ fn parse_condition(
         .context("loot condition has no type")?;
     Ok(match kind {
         "minecraft:survives_explosion" => Condition::Always,
+        "minecraft:match_block" => {
+            let object = value.as_object().context("invalid block predicate")?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "blocks" | "state"))
+            {
+                Condition::Unsupported("unknown match_block field".into())
+            } else {
+                let ids = value
+                    .get("blocks")
+                    .context("block predicate has no blocks")?;
+                let ids: Vec<&Value> = match ids {
+                    Value::Array(ids) => ids.iter().collect(),
+                    _ => vec![ids],
+                };
+                if ids.is_empty()
+                    || ids.len() > 128
+                    || ids
+                        .iter()
+                        .any(|id| id.as_str().is_none_or(|id| id.starts_with('#')))
+                {
+                    Condition::Unsupported("unsupported block selector".into())
+                } else {
+                    let blocks = ids
+                        .into_iter()
+                        .map(|id| ResourceId::parse(id.as_str().unwrap()))
+                        .collect::<Result<_>>()?;
+                    let mut properties = BTreeMap::new();
+                    let mut supported = true;
+                    if let Some(value) = value.get("state") {
+                        let state = value.as_object().context("invalid block state predicate")?;
+                        for (key, value) in state {
+                            if let Some(value) = value.as_str() {
+                                properties.insert(key.clone(), value.to_owned());
+                            } else {
+                                supported = false;
+                            }
+                        }
+                    }
+                    if supported {
+                        Condition::BlockState { blocks, properties }
+                    } else {
+                        Condition::Unsupported("unsupported block property predicate".into())
+                    }
+                }
+            }
+        }
         "minecraft:entity_properties"
             if value.get("entity").and_then(Value::as_str) == Some("this")
                 && value
@@ -1079,6 +1169,28 @@ mod tests {
         fn put(&mut self, path: &str, json: &str) {
             self.data.insert(path.into(), json.as_bytes().to_vec());
         }
+    }
+
+    #[test]
+    fn block_state_conditions_evaluate_original_properties_and_reject_missing_context() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/snow.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:match_block","blocks":"minecraft:snow","state":{"layers":"3"}}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        assert!(tables.drops_without_entity("minecraft:snow", None).is_err());
+        for layers in 1..=8 {
+            let properties = BTreeMap::from([("layers".into(), layers.to_string())]);
+            let drops = tables
+                .drops_without_entity_at("minecraft:snow", Some(&properties), None)
+                .unwrap();
+            assert_eq!(drops.len(), usize::from(layers == 3));
+        }
+        let properties = BTreeMap::new();
+        assert!(
+            tables
+                .drops_without_entity_at("minecraft:snow", Some(&properties), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

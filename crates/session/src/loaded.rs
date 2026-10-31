@@ -5927,12 +5927,7 @@ impl LoadedSession {
     /// Check actual snow positions so a high randomTickSpeed can skip dark or
     /// unavailable sections without looping for every sampled coordinate.
     fn snow_can_melt_in_section(&self, chunk: ChunkPos, section_y: i8, snow: &[usize]) -> bool {
-        if snow.is_empty()
-            || !self.pending_light.is_empty()
-            || !self
-                .dropped_items
-                .can_drop_block_without_entity("minecraft:snow", self.loot.as_deref())
-        {
+        if snow.is_empty() || !self.pending_light.is_empty() {
             return false;
         }
         let Some(chunk) = self.world.chunks.get(&chunk) else {
@@ -5947,8 +5942,12 @@ impl LoadedSession {
         let (Some(blocks), Some(light)) = (&section.blocks, &section.block_light) else {
             return false;
         };
+        let mut loot_by_state = HashMap::new();
         snow.iter().any(|&index| {
-            let Some(state) = blocks.get(index).and_then(|id| self.world.state(*id)) else {
+            let Some(id) = blocks.get(index) else {
+                return false;
+            };
+            let Some(state) = self.world.state(*id) else {
                 return false;
             };
             if native_world::collision::snow_layers(state).is_none() {
@@ -5961,6 +5960,13 @@ impl LoadedSession {
                     value >> 4
                 };
                 crate::snow::melts_in_block_light(light)
+                    && *loot_by_state.entry(id.0).or_insert_with(|| {
+                        self.dropped_items.can_drop_block_without_entity(
+                            "minecraft:snow",
+                            &state.properties,
+                            self.loot.as_deref(),
+                        )
+                    })
             })
         })
     }
@@ -5978,12 +5984,10 @@ impl LoadedSession {
         ) else {
             return false;
         };
-        if self
-            .world
-            .state(id)
-            .and_then(native_world::collision::snow_layers)
-            .is_none()
-        {
+        let Some(state) = self.world.state(id) else {
+            return false;
+        };
+        if native_world::collision::snow_layers(state).is_none() {
             return false;
         }
         let chunk = ChunkPos {
@@ -6007,6 +6011,7 @@ impl LoadedSession {
             .drop_block_without_entity(
                 absolute,
                 "minecraft:snow",
+                &state.properties,
                 self.block_drops,
                 self.loot.as_deref(),
             )
@@ -22992,7 +22997,7 @@ mod tests {
                 Ok(Some(if self.unsupported {
                     br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"example:unknown"},"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#.to_vec()
                 } else {
-                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","modifier":{"type":"minecraft:set_count","count":2}}]}]}"#.to_vec()
+                    br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:match_block","blocks":"minecraft:snow","state":{"layers":"1"}},"modifier":{"type":"minecraft:set_count","count":2}}]}]}"#.to_vec()
                 }))
             }
         }
@@ -23053,7 +23058,10 @@ mod tests {
                     "light={light} drops={drops} layers={layers} unsupported={unsupported}"
                 );
                 let items = session.dropped_items.snapshot();
-                assert_eq!(items.len(), usize::from(expected_melt && drops));
+                assert_eq!(
+                    items.len(),
+                    usize::from(expected_melt && drops && layers == 1)
+                );
                 if let Some(item) = items.first() {
                     assert_eq!(item.stack.id(), "minecraft:stick");
                     assert_eq!(item.stack.count(), 2);

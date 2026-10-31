@@ -981,6 +981,63 @@ public class FallingCollisionOracle {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn block_loot_state_predicates_match_java() {
+    use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+    struct Source {
+        wanted: u8,
+    }
+    impl ResourceProvider for Source {
+        fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            if path != "data/minecraft/loot_table/blocks/snow.json" {
+                return Ok(None);
+            }
+            Ok(Some(serde_json::to_vec(
+                &serde_json::json!({"type":"minecraft:block", "pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:match_block","blocks":"minecraft:snow","state":{"layers":self.wanted.to_string()}}}]}]}),
+            )?))
+        }
+    }
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    native_resources::packs::ResourceStack::open(&game).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("LootBlockStateOracle.java");
+    let output = temp.path().join("loot-state.json");
+    std::fs::write(&source, include_str!("java/LootBlockStateOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    let java = java_bin();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LootBlockStateOracle")
+        .arg(&output));
+    let expected: Vec<bool> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(expected.len(), 64);
+    for wanted in 1..=8 {
+        let tables = BlockLootTables::load(&mut Source { wanted }).unwrap();
+        for actual in 1_u8..=8 {
+            let state = std::collections::BTreeMap::from([("layers".into(), actual.to_string())]);
+            let drops = tables
+                .drops_without_entity_at("minecraft:snow", Some(&state), None)
+                .unwrap();
+            assert_eq!(
+                !drops.is_empty(),
+                expected[(usize::from(wanted) - 1) * 8 + usize::from(actual) - 1],
+                "wanted={wanted} actual={actual}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn snow_random_tick_light_gate_matches_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)

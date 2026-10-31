@@ -1,6 +1,7 @@
 //! World-seeded density noise and cell-volume checks against Java 26.3.
 use native_resources::{
     density::{DensityCompiler, DensityEvaluator, WorldgenRandom},
+    noise_router::{NoiseRouter, RouterField},
     packs::{ResourceProvider, ResourceStack},
 };
 use serde_json::{Value, json};
@@ -348,6 +349,35 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             json!({"id":"minecraft:terrain","rust_expression":value,"java_expression":value}),
         );
     }
+    for name in ["overworld", "nether", "end"] {
+        let path = format!("data/minecraft/worldgen/noise_settings/{name}.json");
+        let bytes = sources.read_builtin_data(&path).unwrap().unwrap();
+        let settings: Value = serde_json::from_slice(&bytes).unwrap();
+        data.0.insert(path, bytes);
+        let mode = if settings["legacy_random_source"].as_bool().unwrap() {
+            0
+        } else {
+            1
+        };
+        for field in RouterField::ALL {
+            let expression = settings["noise_router"][field.name()].clone();
+            let mut noise_ids = std::collections::BTreeSet::new();
+            let java =
+                inline_installed(expression.clone(), &mut sources, &mut data, &mut noise_ids);
+            let mut noises = serde_json::Map::new();
+            for id in &noise_ids {
+                let path = format!(
+                    "data/minecraft/worldgen/noise/{}.json",
+                    id.strip_prefix("minecraft:").unwrap()
+                );
+                noises.insert(
+                    id.clone(),
+                    serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+                );
+            }
+            fixtures.push(json!({"id":"minecraft:terrain","noises":noises,"router_settings":format!("minecraft:{name}"),"router_field":field.name(),"router_mode":mode,"rust_expression":expression,"java_expression":java}));
+        }
+    }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -374,16 +404,37 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 } else {
                     WorldgenRandom::Xoroshiro
                 };
-                let mut compiler = DensityCompiler::with_world_seed(&mut data, seed, algorithm);
-                if fixtures[index]["unblended"].as_bool() == Some(true) {
-                    compiler = compiler.without_old_chunk_blending();
-                }
-                if fixtures[index]["no_structures"].as_bool() == Some(true) {
-                    compiler = compiler.without_structure_terrain_adjustment();
-                }
-                let function = compiler
-                    .compile(&fixtures[index]["rust_expression"])
-                    .unwrap();
+                let function = if let Some(name) = fixtures[index]["router_settings"].as_str() {
+                    let router =
+                        NoiseRouter::load_without_terrain_adjustments(&mut data, name, seed)
+                            .unwrap();
+                    assert_eq!(router.random, algorithm);
+                    let field = RouterField::ALL
+                        .into_iter()
+                        .find(|field| {
+                            field.name() == fixtures[index]["router_field"].as_str().unwrap()
+                        })
+                        .unwrap();
+                    let all = router.sample_all(&mut evaluator, -17, -64, 49);
+                    assert_eq!(
+                        all[field as usize].to_bits(),
+                        router.sample(&mut evaluator, field, -17, -64, 49).to_bits(),
+                        "shared router sampling {name} {}",
+                        field.name()
+                    );
+                    std::sync::Arc::clone(router.function(field))
+                } else {
+                    let mut compiler = DensityCompiler::with_world_seed(&mut data, seed, algorithm);
+                    if fixtures[index]["unblended"].as_bool() == Some(true) {
+                        compiler = compiler.without_old_chunk_blending();
+                    }
+                    if fixtures[index]["no_structures"].as_bool() == Some(true) {
+                        compiler = compiler.without_structure_terrain_adjustment();
+                    }
+                    compiler
+                        .compile(&fixtures[index]["rust_expression"])
+                        .unwrap()
+                };
                 let (min, max) = function.range();
                 assert_eq!(
                     (min.to_bits(), max.to_bits()),
@@ -419,7 +470,17 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             _ => {}
         }
     }
-    assert_eq!(groups, fixtures.len() * 10);
+    assert_eq!(
+        groups,
+        fixtures
+            .iter()
+            .map(|fixture| if fixture.get("router_mode").is_some() {
+                5
+            } else {
+                10
+            })
+            .sum::<usize>()
+    );
     assert_eq!(samples, groups * 24);
     assert_eq!(end_samples, 3 * 10 * 80);
 }

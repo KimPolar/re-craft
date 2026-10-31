@@ -45,6 +45,20 @@ impl DensityEvaluator {
         self.memo.clear();
         function.evaluate_cached(x, y, z, false, &mut self.memo)
     }
+
+    /// Sample related functions at one position, reusing their shared caches.
+    pub fn sample_array<const N: usize>(
+        &mut self,
+        functions: &[Arc<DensityFunction>; N],
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> [f32; N] {
+        self.memo.clear();
+        std::array::from_fn(|index| {
+            functions[index].evaluate_cached(x, y, z, false, &mut self.memo)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -954,8 +968,8 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                         )
                     };
                     let noise = Arc::new(match factory {
-                        WorldNoiseFactory::Legacy(factory) => {
-                            make_noise(&mut factory.random_for("minecraft:terrain"))
+                        WorldNoiseFactory::Legacy(_) => {
+                            make_noise(&mut LegacyRandom::new(self.world_seed.unwrap()))
                         }
                         WorldNoiseFactory::Xoroshiro(factory) => BlendedNoise::new(
                             &mut factory.random_for("minecraft:terrain"),

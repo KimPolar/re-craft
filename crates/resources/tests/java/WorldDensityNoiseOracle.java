@@ -69,6 +69,8 @@ public class WorldDensityNoiseOracle {
             var identityNames = new IdentityHashMap<NormalNoise,String>();
             bindNoiseNames(function, fixture.get("java_expression"), identityNames);
             for (int mode=0;mode<2;mode++) for (long seed:seeds) {
+                if (fixture.has("router_mode") && fixture.get("router_mode").getAsInt() != mode) continue;
+                boolean legacy = mode == 0;
                 RandomSource root=mode==0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
                 var factory=root.forkPositional();
                 var ctx=new DensityFunction.CompileContext() {
@@ -79,7 +81,10 @@ public class WorldDensityNoiseOracle {
                         if (name.equals("minecraft:nether/vegetation")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed + 1));
                         return noise.value().create(factory.fromHashOf(Identifier.parse(name)));
                     }
-                    public RandomSource createRandom(Identifier name) { return factory.fromHashOf(name); }
+                    public RandomSource createRandom(Identifier name) {
+                        if (legacy && name.equals(Identifier.parse("minecraft:terrain"))) return new LegacyRandomSource(seed);
+                        return factory.fromHashOf(name);
+                    }
                     public RandomSource createEndIslandRandom() { return new LegacyRandomSource(seed); }
                 };
                 var sampler=new DensityFunctionCompiler(ctx).getSampler(function);

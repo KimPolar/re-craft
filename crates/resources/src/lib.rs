@@ -28,6 +28,7 @@ pub mod loot;
 pub mod mining_tags;
 pub mod models;
 pub mod noise;
+pub mod noise_router;
 pub mod packs;
 pub mod recipes;
 pub mod respawn_environment;

@@ -37,13 +37,8 @@ impl SurfaceInputs for Inputs {
     fn density(&mut self, value: &Value, _: bool, _: &SurfacePosition) -> anyhow::Result<f32> {
         Ok(value.as_f64().expect("synthetic density constant") as f32)
     }
-    fn special_rule(
-        &mut self,
-        _: &str,
-        _: &Value,
-        _: &SurfacePosition,
-    ) -> anyhow::Result<Option<Arc<Value>>> {
-        anyhow::bail!("unexpected special rule")
+    fn bandlands(&mut self, _: &SurfacePosition) -> anyhow::Result<Arc<Value>> {
+        anyhow::bail!("unexpected bandlands")
     }
 }
 fn run(c: &mut Command) -> String {

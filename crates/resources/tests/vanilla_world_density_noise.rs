@@ -48,13 +48,8 @@ impl SurfaceInputs for OreInputs<'_> {
     fn density(&mut self, v: &Value, in_chunk: bool, p: &SurfacePosition) -> anyhow::Result<f32> {
         self.density.sample(v, in_chunk, p.x, p.y, p.z)
     }
-    fn special_rule(
-        &mut self,
-        _: &str,
-        _: &Value,
-        _: &SurfacePosition,
-    ) -> anyhow::Result<Option<Arc<Value>>> {
-        anyhow::bail!("unexpected special rule")
+    fn bandlands(&mut self, _: &SurfacePosition) -> anyhow::Result<Arc<Value>> {
+        anyhow::bail!("unexpected bandlands")
     }
 }
 fn run(command: &mut Command) -> String {

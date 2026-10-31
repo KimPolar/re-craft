@@ -4,7 +4,8 @@ use native_resources::{
     density::WorldgenRandom,
     packs::{ResourceId, ResourceProvider, ResourceStack},
     surface_rules::{
-        SurfaceInputs, SurfaceNoise, SurfacePosition, SurfaceRandom, SurfaceRuleCompiler,
+        SurfaceBands, SurfaceInputs, SurfaceNoise, SurfacePosition, SurfaceRandom,
+        SurfaceRuleCompiler,
     },
 };
 use serde_json::{Value, json};
@@ -18,7 +19,10 @@ impl ResourceProvider for Data {
         Ok(self.0.get(path).cloned())
     }
 }
-struct Inputs<'a>(&'a mut SurfaceNoise);
+struct Inputs<'a> {
+    noise: &'a mut SurfaceNoise,
+    bands: &'a SurfaceBands,
+}
 impl SurfaceInputs for Inputs<'_> {
     fn biome_matches(&mut self, _: &Value, _: &SurfacePosition) -> Result<bool> {
         anyhow::bail!("unexpected biome")
@@ -27,7 +31,7 @@ impl SurfaceInputs for Inputs<'_> {
         anyhow::bail!("unexpected temperature")
     }
     fn noise(&mut self, id: &ResourceId, is_3d: bool, p: &SurfacePosition) -> Result<f64> {
-        Ok(f64::from(self.0.sample(id, is_3d, p.x, p.y, p.z)?))
+        Ok(f64::from(self.noise.sample(id, is_3d, p.x, p.y, p.z)?))
     }
     fn positional_random(&mut self, _: &ResourceId, _: &SurfacePosition) -> Result<f32> {
         anyhow::bail!("unexpected random")
@@ -38,13 +42,8 @@ impl SurfaceInputs for Inputs<'_> {
     fn density(&mut self, _: &Value, _: bool, _: &SurfacePosition) -> Result<f32> {
         anyhow::bail!("unexpected density")
     }
-    fn special_rule(
-        &mut self,
-        _: &str,
-        _: &Value,
-        _: &SurfacePosition,
-    ) -> Result<Option<Arc<Value>>> {
-        anyhow::bail!("unexpected special")
+    fn bandlands(&mut self, p: &SurfacePosition) -> Result<Arc<Value>> {
+        self.bands.at(self.noise, p.x, p.y, p.z)
     }
 }
 fn run(c: &mut Command) -> String {
@@ -92,6 +91,7 @@ fn seeded_surface_noise_and_depth_match_java() {
     for name in [
         "minecraft:surface",
         "minecraft:surface_secondary",
+        "minecraft:clay_bands_offset",
         "minecraft:patch",
         "minecraft:nether_state_selector",
         "minecraft:calcite",
@@ -128,28 +128,31 @@ fn seeded_surface_noise_and_depth_match_java() {
             rules.insert((id.clone(), is_3d), compiler.compile(&rule).unwrap());
         }
     }
+    let band_rule = compiler.compile(&json!({"type":"bandlands"})).unwrap();
+    assert!(
+        band_rule
+            .noise_dependencies()
+            .contains(&ResourceId::parse("minecraft:clay_bands_offset").unwrap())
+    );
     drop(compiler);
     let mut sampler = None;
+    let mut bands = None;
     let (mut groups, mut samples, mut depths) = (0, 0, 0);
+    let (mut band_slots, mut band_samples) = (0, 0);
     for line in output.lines() {
         let f: Vec<_> = line.split_whitespace().collect();
         match f.first().copied() {
             Some("S") => {
                 let mode: i32 = f[1].parse().unwrap();
                 let seed: i64 = f[2].parse().unwrap();
-                sampler = Some(
-                    SurfaceNoise::load(
-                        &mut data,
-                        seed,
-                        if mode == 0 {
-                            WorldgenRandom::Legacy
-                        } else {
-                            WorldgenRandom::Xoroshiro
-                        },
-                        names.clone(),
-                    )
-                    .unwrap(),
-                );
+                let algorithm = if mode == 0 {
+                    WorldgenRandom::Legacy
+                } else {
+                    WorldgenRandom::Xoroshiro
+                };
+                bands = Some(SurfaceBands::new(seed, algorithm));
+                sampler =
+                    Some(SurfaceNoise::load(&mut data, seed, algorithm, names.clone()).unwrap());
                 groups += 1;
             }
             Some("P") => {
@@ -185,12 +188,62 @@ fn seeded_surface_noise_and_depth_match_java() {
                 };
                 for (is_3d, index) in [(false, 7), (true, 8)] {
                     let actual = rules[&(id.clone(), is_3d)]
-                        .evaluate(&position, &mut Inputs(&mut *s))
+                        .evaluate(
+                            &position,
+                            &mut Inputs {
+                                noise: &mut *s,
+                                bands: bands.as_ref().unwrap(),
+                            },
+                        )
                         .unwrap()
                         .is_some();
                     assert_eq!(actual, int(index) != 0, "noise threshold {line}");
                 }
                 samples += 1;
+            }
+            Some("B") => {
+                let index: usize = f[1].parse().unwrap();
+                assert_eq!(
+                    bands.as_ref().unwrap().bands()[index].id(),
+                    f[2],
+                    "band {line}"
+                );
+                band_slots += 1;
+            }
+            Some("K") => {
+                let x: i32 = f[1].parse().unwrap();
+                let y: i32 = f[2].parse().unwrap();
+                let z: i32 = f[3].parse().unwrap();
+                let position = SurfacePosition {
+                    x,
+                    y,
+                    z,
+                    min_y: -64,
+                    height: 384,
+                    sea_level: 63,
+                    stone_above: 0,
+                    stone_below: 0,
+                    surface_depth: 0,
+                    surface_secondary: 0.0,
+                    water_height: i32::MIN,
+                    min_surface_level: 0,
+                    gradient_x: 0,
+                    gradient_z: 0,
+                };
+                let result = band_rule.evaluate(
+                    &position,
+                    &mut Inputs {
+                        noise: sampler.as_mut().unwrap(),
+                        bands: bands.as_ref().unwrap(),
+                    },
+                );
+                if f[4] == "ERR" {
+                    assert!(result.is_err(), "expected Java index error: {line}");
+                } else {
+                    let state = result.unwrap().unwrap();
+                    assert_eq!(state.as_str().unwrap(), f[4], "bandlands {line}");
+                }
+                band_samples += 1;
             }
             Some("D") => {
                 let x: i32 = f[1].parse().unwrap();
@@ -214,6 +267,8 @@ fn seeded_surface_noise_and_depth_match_java() {
     assert_eq!(groups, 10);
     assert_eq!(samples, 10 * 14 * names.len());
     assert_eq!(depths, 10 * 14);
+    assert_eq!(band_slots, 10 * 192);
+    assert_eq!(band_samples, 10 * 14 * 13);
     assert!(
         sampler
             .unwrap()

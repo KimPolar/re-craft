@@ -53,13 +53,7 @@ pub trait SurfaceInputs {
         in_chunk: bool,
         position: &SurfacePosition,
     ) -> Result<f32>;
-    /// Bandlands requires its independently generated terracotta bands.
-    fn special_rule(
-        &mut self,
-        kind: &str,
-        definition: &Value,
-        position: &SurfacePosition,
-    ) -> Result<Option<Arc<Value>>>;
+    fn bandlands(&mut self, position: &SurfacePosition) -> Result<Arc<Value>>;
 }
 
 pub enum SurfaceRandom {
@@ -77,6 +71,19 @@ impl SurfaceRandom {
         match self {
             Self::Legacy(r) => r.next_double(),
             Self::Xoroshiro(r) => r.next_double(),
+        }
+    }
+    fn next_int_bound(&mut self, bound: i32) -> i32 {
+        match self {
+            Self::Legacy(r) => r.next_int_bound(bound),
+            Self::Xoroshiro(r) => r.next_int_bound(bound),
+        }
+        .expect("positive random bound")
+    }
+    fn next_bool(&mut self) -> bool {
+        match self {
+            Self::Legacy(r) => r.next_bool(),
+            Self::Xoroshiro(r) => r.next_bool(),
         }
     }
 }
@@ -131,6 +138,107 @@ impl SurfaceRandomFactory {
             PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.at(x, y, z)),
             PositionalFactory::Xoroshiro(factory) => SurfaceRandom::Xoroshiro(factory.at(x, y, z)),
         }
+    }
+    fn root_named(&self, name: &str) -> SurfaceRandom {
+        match &self.root {
+            PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.random_for(name)),
+            PositionalFactory::Xoroshiro(factory) => {
+                SurfaceRandom::Xoroshiro(factory.random_for(name))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum TerracottaBand {
+    Plain,
+    Orange,
+    Yellow,
+    Brown,
+    Red,
+    White,
+    LightGray,
+}
+impl TerracottaBand {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Plain => "minecraft:terracotta",
+            Self::Orange => "minecraft:orange_terracotta",
+            Self::Yellow => "minecraft:yellow_terracotta",
+            Self::Brown => "minecraft:brown_terracotta",
+            Self::Red => "minecraft:red_terracotta",
+            Self::White => "minecraft:white_terracotta",
+            Self::LightGray => "minecraft:light_gray_terracotta",
+        }
+    }
+}
+
+/// The 192 seeded terracotta layers used by the bandlands material rule.
+pub struct SurfaceBands {
+    bands: [TerracottaBand; 192],
+    states: [Arc<Value>; 7],
+    offset_noise: ResourceId,
+}
+impl SurfaceBands {
+    pub fn new(seed: i64, algorithm: WorldgenRandom) -> Self {
+        use TerracottaBand::*;
+        let random = SurfaceRandomFactory::new(seed, algorithm);
+        let mut random = random.root_named("minecraft:clay_bands");
+        let mut bands = [Plain; 192];
+        let mut index = 0usize;
+        while index < bands.len() {
+            index += (random.next_int_bound(5) + 1) as usize;
+            if index < bands.len() {
+                bands[index] = Orange;
+            }
+            index += 1;
+        }
+        for (color, base) in [(Yellow, 1), (Brown, 2), (Red, 1)] {
+            let count = 6 + random.next_int_bound(10);
+            for _ in 0..count {
+                let length = (base + random.next_int_bound(3)) as usize;
+                let start = random.next_int_bound(192) as usize;
+                for slot in bands.iter_mut().skip(start).take(length) {
+                    *slot = color;
+                }
+            }
+        }
+        let count = 9 + random.next_int_bound(7);
+        let mut index = 0usize;
+        for _ in 0..count {
+            if index >= bands.len() {
+                break;
+            }
+            bands[index] = White;
+            if index > 1 && random.next_bool() {
+                bands[index - 1] = LightGray;
+            }
+            if index + 1 < bands.len() && random.next_bool() {
+                bands[index + 1] = LightGray;
+            }
+            index += (4 + random.next_int_bound(16)) as usize;
+        }
+        let colors = [Plain, Orange, Yellow, Brown, Red, White, LightGray];
+        Self {
+            bands,
+            states: colors.map(|color| Arc::new(Value::String(color.id().into()))),
+            offset_noise: ResourceId::parse("minecraft:clay_bands_offset")
+                .expect("valid identifier"),
+        }
+    }
+    pub fn bands(&self) -> &[TerracottaBand; 192] {
+        &self.bands
+    }
+    pub fn at(&self, noise: &mut SurfaceNoise, x: i32, y: i32, z: i32) -> Result<Arc<Value>> {
+        let offset = noise.sample(&self.offset_noise, false, x, 0, z)? * 4.0;
+        // Math.round(float) rounds ties toward positive infinity.
+        let offset = (f64::from(offset) + 0.5).floor() as i32;
+        let index = y.wrapping_add(offset).wrapping_add(192) % 192;
+        ensure!(index >= 0, "Java bandlands index is negative at Y={y}");
+        Ok(Arc::clone(
+            &self.states[self.bands[index as usize] as usize],
+        ))
     }
 }
 
@@ -511,7 +619,7 @@ enum RuleNode {
     Sequence(Vec<Arc<RuleNode>>),
     Conditional(Arc<Condition>, Arc<RuleNode>),
     OreVein(OreVein),
-    Special(&'static str, Value),
+    Bandlands,
 }
 struct OreVein {
     ore: Arc<Value>,
@@ -533,6 +641,11 @@ impl RuleNode {
             Self::Conditional(condition, rule) => {
                 condition.collect_noises(out);
                 rule.collect_noises(out);
+            }
+            Self::Bandlands => {
+                out.insert(
+                    ResourceId::parse("minecraft:clay_bands_offset").expect("valid identifier"),
+                );
             }
             _ => {}
         }
@@ -578,14 +691,14 @@ impl RuleNode {
                 }
                 Ok(Some(Arc::clone(&rule.filler)))
             }
-            Self::Special(kind, definition) => inputs.special_rule(kind, definition, p),
+            Self::Bandlands => Ok(Some(inputs.bandlands(p)?)),
         }
     }
 }
 
 pub struct SurfaceRule(Arc<RuleNode>);
 impl SurfaceRule {
-    /// Registry noise names used by noise-threshold conditions in this rule tree.
+    /// Registry noise names used by conditions and bandlands in this rule tree.
     pub fn noise_dependencies(&self) -> BTreeSet<ResourceId> {
         let mut result = BTreeSet::new();
         self.0.collect_noises(&mut result);
@@ -692,7 +805,7 @@ impl<'a, P: ResourceProvider> SurfaceRuleCompiler<'a, P> {
                 self.condition(required(value, "if_true")?, depth + 1)?,
                 self.rule(required(value, "then_run")?, depth + 1)?,
             ),
-            "bandlands" => RuleNode::Special("bandlands", value.clone()),
+            "bandlands" => RuleNode::Bandlands,
             "ore_vein" => {
                 let raw_chance = number(value, "raw_ore_chance")? as f32;
                 ensure!((0.0..=1.0).contains(&raw_chance), "invalid raw ore chance");
@@ -859,13 +972,8 @@ mod tests {
         fn density(&mut self, _: &Value, _: bool, _: &SurfacePosition) -> Result<f32> {
             bail!("unexpected density")
         }
-        fn special_rule(
-            &mut self,
-            _: &str,
-            _: &Value,
-            _: &SurfacePosition,
-        ) -> Result<Option<Arc<Value>>> {
-            bail!("special rules unavailable")
+        fn bandlands(&mut self, _: &SurfacePosition) -> Result<Arc<Value>> {
+            bail!("bandlands unavailable")
         }
     }
     fn position() -> SurfacePosition {
@@ -942,13 +1050,8 @@ mod tests {
                 self.reads.push((v, in_chunk));
                 Ok(v)
             }
-            fn special_rule(
-                &mut self,
-                _: &str,
-                _: &Value,
-                _: &SurfacePosition,
-            ) -> Result<Option<Arc<Value>>> {
-                bail!("unexpected special")
+            fn bandlands(&mut self, _: &SurfacePosition) -> Result<Arc<Value>> {
+                bail!("unexpected bandlands")
             }
         }
         let mut data = Data(BTreeMap::new());
@@ -1067,5 +1170,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn terracotta_bands_are_deterministic_and_rule_requires_context() {
+        for algorithm in [WorldgenRandom::Legacy, WorldgenRandom::Xoroshiro] {
+            let first = SurfaceBands::new(12345, algorithm);
+            let same = SurfaceBands::new(12345, algorithm);
+            let other = SurfaceBands::new(54321, algorithm);
+            assert_eq!(first.bands(), same.bands());
+            assert_ne!(first.bands(), other.bands());
+            for band in first.bands() {
+                assert!(band.id().ends_with("terracotta"));
+            }
+        }
+        let mut data = Data(BTreeMap::new());
+        let rule = SurfaceRuleCompiler::new(&mut data)
+            .compile(&json!({"type":"bandlands"}))
+            .unwrap();
+        assert!(
+            rule.noise_dependencies()
+                .contains(&ResourceId::parse("minecraft:clay_bands_offset").unwrap())
+        );
+        assert!(rule.evaluate(&position(), &mut Inputs).is_err());
     }
 }

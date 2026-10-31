@@ -2,6 +2,8 @@
 //! Aquifer application and world integration are separate stages.
 use anyhow::{Context, Result, ensure};
 
+pub mod cave;
+
 /// Bit order matches Java: local X, local Z, then Y.
 pub struct CarvingMask {
     min_y: i32,

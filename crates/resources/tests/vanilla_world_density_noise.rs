@@ -400,6 +400,32 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 fixture["chunk_height"] = settings["noise"]["height"].clone();
                 if name != "overworld" {
                     fixture["simple_noise"] = json!(name);
+                } else {
+                    let mut aquifers = serde_json::Map::new();
+                    for (key, expression) in settings["aquifers"].as_object().unwrap() {
+                        aquifers.insert(
+                            key.clone(),
+                            inline_installed(
+                                expression.clone(),
+                                &mut sources,
+                                &mut data,
+                                &mut noise_ids,
+                            ),
+                        );
+                    }
+                    let mut noises = serde_json::Map::new();
+                    for id in &noise_ids {
+                        let path = format!(
+                            "data/minecraft/worldgen/noise/{}.json",
+                            id.strip_prefix("minecraft:").unwrap()
+                        );
+                        noises.insert(
+                            id.clone(),
+                            serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+                        );
+                    }
+                    fixture["noises"] = Value::Object(noises);
+                    fixture["java_aquifers"] = Value::Object(aquifers);
                 }
             }
             fixtures.push(fixture);
@@ -576,6 +602,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     NoiseMaterial::DefaultFluid => {
                         if name == "minecraft:the_end" || name == "minecraft:end" {
                             3
+                        } else if name == "minecraft:overworld" {
+                            1
                         } else {
                             2
                         }
@@ -587,6 +615,11 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     actual,
                     fields[1].parse::<i32>().unwrap(),
                     "material {name} mode {mode} seed {seed} index {material_index}"
+                );
+                assert_eq!(
+                    chunk.fluid_updates()[material_index],
+                    fields[2] == "1",
+                    "fluid update {name} index {material_index}"
                 );
                 material_index += 1;
                 material_samples += 1;
@@ -628,5 +661,5 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     assert_eq!(volume_samples, expected_volume_samples);
     assert_eq!(chunk_samples, 16 * 16 * (384 + 128 + 128));
     assert_eq!(fluid_cases, 7 * 16 * 7);
-    assert_eq!(material_samples, 2 * 16 * 16 * 128);
+    assert_eq!(material_samples, 16 * 16 * (384 + 2 * 128));
 }

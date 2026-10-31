@@ -100,6 +100,52 @@ impl DensityEvaluator {
         })
     }
 
+    /// Java's 4-block-spaced, Y=0 surface volume in Z/X order.
+    /// Interpolated graphs need general stepped-volume interpolation and are rejected.
+    pub fn sample_quart_surface(
+        &mut self,
+        function: &DensityFunction,
+        min_x: i32,
+        min_z: i32,
+        size_x: u32,
+        size_z: u32,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            !function.3 && function.6,
+            "interpolated stepped surface volumes are not supported"
+        );
+        ensure!(
+            size_x > 0 && size_z > 0,
+            "surface dimensions must be positive"
+        );
+        let count = (size_x as usize)
+            .checked_mul(size_z as usize)
+            .context("surface size overflow")?;
+        ensure!(count <= 1_048_576, "surface exceeds maximum sample count");
+        let max_x = i64::from(min_x) + i64::from(size_x - 1) * 4;
+        let max_z = i64::from(min_z) + i64::from(size_z - 1) * 4;
+        let max = [
+            i32::try_from(max_x).context("surface X overflow")?,
+            0,
+            i32::try_from(max_z).context("surface Z overflow")?,
+        ];
+        self.memo.volume = Some(BlockVolume {
+            min: [min_x, 0, min_z],
+            max,
+        });
+        let mut output = Vec::with_capacity(count);
+        for z in 0..size_z {
+            for x in 0..size_x {
+                self.memo.clear();
+                let px = (i64::from(min_x) + i64::from(x) * 4) as i32;
+                let pz = (i64::from(min_z) + i64::from(z) * 4) as i32;
+                output.push(function.evaluate_cached(px, 0, pz, true, &mut self.memo));
+            }
+        }
+        self.memo.volume = None;
+        Ok(output)
+    }
+
     /// Evaluate a unit-step block volume in Java's Z, X, Y buffer order.
     /// Slices enclosing interpolated functions are not yet supported in bulk.
     pub fn sample_block_volume(

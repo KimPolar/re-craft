@@ -19,6 +19,8 @@ import net.minecraft.world.level.levelgen.densityfunction.DensityFunctionCompile
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 import net.minecraft.world.level.levelgen.densityfunction.DensityBuffer;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
+import net.minecraft.world.level.levelgen.densityfunction.DensitySampler;
+import net.minecraft.world.level.levelgen.densityfunction.DensitySamplerSet;
 import net.minecraft.world.level.levelgen.synth.Noise;
 import net.minecraft.world.level.levelgen.synth.NormalNoise;
 import net.minecraft.world.level.levelgen.Aquifer;
@@ -74,6 +76,17 @@ public class WorldDensityNoiseOracle {
             var function=DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE,fixture.get("java_expression")).getOrThrow();
             var identityNames = new IdentityHashMap<NormalNoise,String>();
             bindNoiseNames(function, fixture.get("java_expression"), identityNames);
+                Aquifer.Config localAquifer = null;
+                if (fixture.has("java_aquifers")) {
+                    var aq=fixture.getAsJsonObject("java_aquifers");
+                    String[] fields={"barrier","fluid_level_floodedness","fluid_level_spread","lava","exclusion","surface_level"};
+                    var functions=new DensityFunction[fields.length];
+                    for(int j=0;j<fields.length;j++) {
+                        functions[j]=DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE,aq.get(fields[j])).getOrThrow();
+                        bindNoiseNames(functions[j],aq.get(fields[j]),identityNames);
+                    }
+                    localAquifer=new Aquifer.Config(functions[0],functions[1],functions[2],functions[3],functions[4],functions[5]);
+                }
             for (int mode=0;mode<2;mode++) for (long seed:seeds) {
                 if (fixture.has("router_mode") && fixture.get("router_mode").getAsInt() != mode) continue;
                 boolean legacy = mode == 0;
@@ -93,7 +106,8 @@ public class WorldDensityNoiseOracle {
                     }
                     public RandomSource createEndIslandRandom() { return new LegacyRandomSource(seed); }
                 };
-                var sampler=new DensityFunctionCompiler(ctx).getSampler(function);
+                var compiler=new DensityFunctionCompiler(ctx);
+                var sampler=compiler.getSampler(function);
                 var range=function.range();
                 System.out.printf("S %d %d %d %d %d%n",i,mode,seed,Float.floatToRawIntBits(range.min()),Float.floatToRawIntBits(range.max()));
                 for (var p:points) {
@@ -114,19 +128,22 @@ public class WorldDensityNoiseOracle {
                     var buffer=DensityBuffer.createUnpooled(volume.size());
                     sampler.sampleVolume(SamplerContext.EMPTY_UNCACHED,buffer,volume);
                     for (int j=0;j<buffer.size();j++) System.out.printf("C %d%n",Float.floatToRawIntBits(buffer.get(j)));
-                    if (fixture.has("simple_noise")) {
-                        boolean nether=fixture.get("simple_noise").getAsString().equals("nether");
-                        var fluid=nether?Blocks.LAVA.defaultBlockState():Blocks.AIR.defaultBlockState();
-                        int sea=nether?32:0;
+                    if (fixture.has("simple_noise") || localAquifer != null) {
+                        boolean nether=fixture.has("simple_noise") && fixture.get("simple_noise").getAsString().equals("nether");
+                        var fluid=localAquifer!=null?Blocks.WATER.defaultBlockState():nether?Blocks.LAVA.defaultBlockState():Blocks.AIR.defaultBlockState();
+                        int sea=localAquifer!=null?63:nether?32:0;
                         var setting=new NoiseGeneratorSettings(null,Blocks.STONE.defaultBlockState(),fluid,null,null,java.util.List.of(),sea,false,java.util.Optional.empty(),true,null);
                         var method=NoiseBasedChunkGenerator.class.getDeclaredMethod("createFluidPicker", NoiseGeneratorSettings.class);
                         method.setAccessible(true);
-                        var aquifer=Aquifer.createDisabled((Aquifer.FluidPicker)method.invoke(null,setting));
+                        var picker=(Aquifer.FluidPicker)method.invoke(null,setting);
+                        DensitySamplerSet samplerSet=f -> new DensitySampler.Bound(compiler.getSampler(f),SamplerContext.EMPTY_UNCACHED);
+                        var aquifer=localAquifer==null?Aquifer.createDisabled(picker):localAquifer.create(samplerSet,factory.fromHashOf(Identifier.withDefaultNamespace("aquifer")).forkPositional(),volume,picker);
                         for (int j=0;j<buffer.size();j++) {
                             int y=minY+j%height;
-                            var state=aquifer.computeSubstance(0,y,0,buffer.get(j));
+                            int x=90*16+(j/height)%16,z=-60*16+(j/height)/16;
+                            var state=aquifer.computeSubstance(x,y,z,buffer.get(j));
                             int code=state==null?0:state.is(Blocks.WATER)?1:state.is(Blocks.LAVA)?2:state.is(Blocks.AIR)?3:-1;
-                            System.out.printf("M %d%n",code);
+                            System.out.printf("M %d %d%n",code,aquifer.shouldScheduleFluidUpdate()?1:0);
                         }
                     }
                 }

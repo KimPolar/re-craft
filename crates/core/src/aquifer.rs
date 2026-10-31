@@ -55,6 +55,39 @@ pub struct AquiferGenerator<T> {
     skip_sampling_above_y: i32,
 }
 
+/// Coordinates for the constructor's stepped surface volume, in Z/X order.
+#[derive(Clone, Copy, Debug)]
+pub struct AquiferSurfaceArea {
+    pub min_x: i32,
+    pub min_z: i32,
+    pub size_x: u32,
+    pub size_z: u32,
+}
+
+impl AquiferSurfaceArea {
+    pub fn for_chunk(chunk_x: i32, chunk_z: i32) -> Option<Self> {
+        fn axis(chunk: i32) -> Option<(i32, u32)> {
+            let origin = chunk.checked_mul(16)?;
+            let min_grid = origin.checked_sub(5)?.div_euclid(16);
+            let max_grid = origin.checked_add(10)?.div_euclid(16).checked_add(1)?;
+            let min = min_grid.checked_mul(16)?;
+            let max = max_grid.checked_mul(16)?.checked_add(9)? & !3;
+            Some((
+                min,
+                u32::try_from((i64::from(max) - i64::from(min)) / 4 + 1).ok()?,
+            ))
+        }
+        let (min_x, size_x) = axis(chunk_x)?;
+        let (min_z, size_z) = axis(chunk_z)?;
+        Some(Self {
+            min_x,
+            min_z,
+            size_x,
+            size_z,
+        })
+    }
+}
+
 impl<T: AquiferBlock> AquiferGenerator<T> {
     pub fn new(seed: i64, legacy: bool, skip_sampling_above_y: i32) -> Self {
         Self {
@@ -63,6 +96,43 @@ impl<T: AquiferBlock> AquiferGenerator<T> {
             statuses: HashMap::new(),
             skip_sampling_above_y,
         }
+    }
+
+    /// Initialize the skip threshold and cached surfaces from Java-order volume values.
+    pub fn from_surface_volume(
+        seed: i64,
+        legacy: bool,
+        area: AquiferSurfaceArea,
+        values: &[f32],
+    ) -> Result<Self, &'static str> {
+        let count = (area.size_x as usize)
+            .checked_mul(area.size_z as usize)
+            .ok_or("surface size overflow")?;
+        if area.size_x == 0 || area.size_z == 0 || values.len() != count {
+            return Err("invalid surface volume size");
+        }
+        let mut generator = Self::new(seed, legacy, 0);
+        let mut max = i32::MIN;
+        for z in 0..area.size_z {
+            for x in 0..area.size_x {
+                let px = i32::try_from(i64::from(area.min_x) + i64::from(x) * 4)
+                    .map_err(|_| "surface X overflow")?;
+                let pz = i32::try_from(i64::from(area.min_z) + i64::from(z) * 4)
+                    .map_err(|_| "surface Z overflow")?;
+                let height = java_floor(f64::from(
+                    values[(z as usize) * (area.size_x as usize) + x as usize],
+                ));
+                generator.levels.surfaces.insert((px, pz), height);
+                max = max.max(height);
+            }
+        }
+        generator.skip_sampling_above_y = max
+            .wrapping_add(20)
+            .div_euclid(12)
+            .wrapping_sub(1)
+            .wrapping_mul(12)
+            .wrapping_add(10);
+        Ok(generator)
     }
 
     pub fn sample<S: AquiferSampler<Block = T>>(
@@ -631,5 +701,24 @@ mod tests {
         assert!(initial > 0);
         assert_eq!(generator.sample(&mut sampler, 0, 0, 0, -1.0), first);
         assert_eq!(sampler.surfaces, initial);
+    }
+
+    #[test]
+    fn chunk_surface_volume_sets_skip_and_primed_cache() {
+        let area = super::AquiferSurfaceArea::for_chunk(0, -1).unwrap();
+        assert_eq!(
+            (area.min_x, area.min_z, area.size_x, area.size_z),
+            (-16, -32, 11, 11)
+        );
+        let values = vec![10.75; (area.size_x * area.size_z) as usize];
+        let generator =
+            super::AquiferGenerator::<Block>::from_surface_volume(0, false, area, &values).unwrap();
+        assert_eq!(generator.skip_sampling_above_y, 22);
+        assert_eq!(generator.levels.surfaces.len(), 121);
+        assert_eq!(generator.levels.surfaces[&(-16, -32)], 10);
+        assert!(
+            super::AquiferGenerator::<Block>::from_surface_volume(0, false, area, &values[..120])
+                .is_err()
+        );
     }
 }

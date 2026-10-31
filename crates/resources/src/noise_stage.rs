@@ -1,11 +1,15 @@
-//! Noise-stage material selection when the generator has no aquifer config.
+//! Noise-stage material selection with optional local aquifers.
 //! This is not a complete chunk: surface rules, biomes and features are separate.
 use anyhow::{Context, Result, ensure};
+use native_core::aquifer::{
+    AquiferBlock, AquiferGenerator, AquiferSampler, AquiferSurfaceArea, FluidStatus,
+};
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::{
-    density::DensityEvaluator,
+    density::{DensityCompiler, DensityEvaluator, DensityFunction, WorldgenRandom},
     noise_router::NoiseRouter,
     packs::{ResourceId, ResourceProvider},
 };
@@ -69,6 +73,7 @@ pub struct NoiseStageChunk {
     default_block: Value,
     default_fluid: Value,
     materials: Vec<NoiseMaterial>,
+    fluid_updates: Vec<bool>,
 }
 
 impl NoiseStageChunk {
@@ -92,6 +97,10 @@ impl NoiseStageChunk {
     pub fn materials(&self) -> &[NoiseMaterial] {
         &self.materials
     }
+    /// Aquifer update flags in the same order as materials.
+    pub fn fluid_updates(&self) -> &[bool] {
+        &self.fluid_updates
+    }
     pub fn get(&self, x: u8, y: i32, z: u8) -> Option<NoiseMaterial> {
         if x >= 16 || z >= 16 || y < self.min_y || y >= self.min_y + self.height {
             return None;
@@ -110,11 +119,85 @@ pub struct NoiseStageGenerator {
     default_block: Value,
     default_fluid: Value,
     sea_level: i32,
+    seed: i64,
+    aquifer: Option<AquiferFunctions>,
+}
+
+struct AquiferFunctions {
+    barrier: Arc<DensityFunction>,
+    floodedness: Arc<DensityFunction>,
+    spread: Arc<DensityFunction>,
+    lava: Arc<DensityFunction>,
+    exclusion: Arc<DensityFunction>,
+    surface: Arc<DensityFunction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AquiferMaterial {
+    Air,
+    Water,
+    Lava,
+}
+impl AquiferBlock for AquiferMaterial {
+    fn air() -> Self {
+        Self::Air
+    }
+    fn lava() -> Self {
+        Self::Lava
+    }
+    fn is_air(self) -> bool {
+        self == Self::Air
+    }
+    fn is_water(self) -> bool {
+        self == Self::Water
+    }
+    fn is_lava(self) -> bool {
+        self == Self::Lava
+    }
+}
+struct NoiseAquiferSampler<'a> {
+    functions: &'a AquiferFunctions,
+    evaluator: &'a mut DensityEvaluator,
+    sea: i32,
+}
+impl AquiferSampler for NoiseAquiferSampler<'_> {
+    type Block = AquiferMaterial;
+    fn global(&mut self, _: i32, y: i32, _: i32) -> FluidStatus<Self::Block> {
+        if y < self.sea.min(-54) {
+            FluidStatus {
+                level: -54,
+                block: AquiferMaterial::Lava,
+            }
+        } else {
+            FluidStatus {
+                level: self.sea,
+                block: AquiferMaterial::Water,
+            }
+        }
+    }
+    fn barrier(&mut self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.barrier, x, y, z)
+    }
+    fn surface(&mut self, x: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.surface, x, 0, z)
+    }
+    fn exclusion(&mut self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.exclusion, x, y, z)
+    }
+    fn floodedness(&mut self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.floodedness, x, y, z)
+    }
+    fn spread(&mut self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.spread, x, y, z)
+    }
+    fn lava(&mut self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluator.sample(&self.functions.lava, x, y, z)
+    }
 }
 
 impl NoiseStageGenerator {
     /// Load only if older-chunk blending and structure terrain adjustments are absent.
-    /// A configured local aquifer is rejected instead of substituting global fluids.
+    /// Local aquifers currently require the default water block state.
     pub fn load_without_terrain_adjustments(
         provider: &mut impl ResourceProvider,
         name: &str,
@@ -143,18 +226,54 @@ impl NoiseStageGenerator {
         );
         let materials: Materials =
             serde_json::from_slice(bytes).context("invalid noise material settings")?;
-        ensure!(
-            materials.aquifers.is_none(),
-            "local aquifer generation is not implemented"
-        );
         validate_state_encoding(&materials.default_block).context("invalid default block")?;
         validate_state_encoding(&materials.default_fluid).context("invalid default fluid")?;
         let router = NoiseRouter::from_json_without_terrain_adjustments(provider, bytes, seed)?;
+        let aquifer = if let Some(config) = materials.aquifers {
+            let state = &materials.default_fluid;
+            let name = state
+                .as_str()
+                .or_else(|| state.get("id").and_then(Value::as_str));
+            let water = name
+                .and_then(|name| ResourceId::parse(name).ok())
+                .is_some_and(|id| id.namespace == "minecraft" && id.path == "water")
+                && state
+                    .get("properties")
+                    .is_none_or(|v| v.as_object().is_some_and(|p| p.is_empty()));
+            ensure!(
+                water,
+                "local aquifers currently require the default minecraft:water state"
+            );
+            let object = config.as_object().context("aquifers must be an object")?;
+            let mut compiler = DensityCompiler::with_world_seed(provider, seed, router.random)
+                .without_old_chunk_blending()
+                .without_structure_terrain_adjustment();
+            let mut compile = |name: &str| -> Result<Arc<DensityFunction>> {
+                let value = object
+                    .get(name)
+                    .with_context(|| format!("missing aquifer field {name}"))?;
+                compiler
+                    .compile(value)
+                    .with_context(|| format!("in aquifer field {name}"))
+            };
+            Some(AquiferFunctions {
+                barrier: compile("barrier")?,
+                floodedness: compile("fluid_level_floodedness")?,
+                spread: compile("fluid_level_spread")?,
+                lava: compile("lava")?,
+                exclusion: compile("exclusion")?,
+                surface: compile("surface_level")?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             router,
             default_block: materials.default_block,
             default_fluid: materials.default_fluid,
             sea_level: materials.sea_level,
+            seed,
+            aquifer,
         })
     }
 
@@ -167,10 +286,55 @@ impl NoiseStageGenerator {
         let density = self.router.sample_chunk_density(evaluator, x, z)?;
         let min_y = density.min_y();
         let height = density.height();
-        let materials = if height == 0 {
-            Vec::new()
+        let (materials, fluid_updates) = if height == 0 {
+            (Vec::new(), Vec::new())
+        } else if let Some(functions) = &self.aquifer {
+            let area = AquiferSurfaceArea::for_chunk(x, z)
+                .context("chunk aquifer surface coordinates overflow")?;
+            let surface = evaluator.sample_quart_surface(
+                &functions.surface,
+                area.min_x,
+                area.min_z,
+                area.size_x,
+                area.size_z,
+            )?;
+            let mut aquifer = AquiferGenerator::from_surface_volume(
+                self.seed,
+                self.router.random == WorldgenRandom::Legacy,
+                area,
+                &surface,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let mut sampler = NoiseAquiferSampler {
+                functions,
+                evaluator,
+                sea: self.sea_level,
+            };
+            let origin_x = x.checked_mul(16).context("chunk X overflow")?;
+            let origin_z = z.checked_mul(16).context("chunk Z overflow")?;
+            let mut materials = Vec::with_capacity(density.values().len());
+            let mut updates = Vec::with_capacity(density.values().len());
+            for (i, &value) in density.values().iter().enumerate() {
+                let column = i / height as usize;
+                let bx = origin_x
+                    .checked_add((column % 16) as i32)
+                    .context("block X overflow")?;
+                let bz = origin_z
+                    .checked_add((column / 16) as i32)
+                    .context("block Z overflow")?;
+                let by = min_y + (i % height as usize) as i32;
+                let result = aquifer.sample(&mut sampler, bx, by, bz, f64::from(value));
+                materials.push(match result.block {
+                    None => NoiseMaterial::DefaultBlock,
+                    Some(AquiferMaterial::Air) => NoiseMaterial::Air,
+                    Some(AquiferMaterial::Water) => NoiseMaterial::DefaultFluid,
+                    Some(AquiferMaterial::Lava) => NoiseMaterial::Lava,
+                });
+                updates.push(result.schedule_fluid_update);
+            }
+            (materials, updates)
         } else {
-            density
+            let materials: Vec<_> = density
                 .values()
                 .iter()
                 .enumerate()
@@ -181,7 +345,9 @@ impl NoiseStageGenerator {
                         self.sea_level,
                     )
                 })
-                .collect()
+                .collect();
+            let updates = vec![false; materials.len()];
+            (materials, updates)
         };
         Ok(NoiseStageChunk {
             chunk_x: x,
@@ -191,6 +357,7 @@ impl NoiseStageGenerator {
             default_block: self.default_block.clone(),
             default_fluid: self.default_fluid.clone(),
             materials,
+            fluid_updates,
         })
     }
 }
@@ -211,7 +378,7 @@ mod tests {
             "noise_router":{"final_density":-1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":0}})
     }
     #[test]
-    fn global_fluid_edges_and_unimplemented_aquifers_are_explicit() {
+    fn global_fluid_edges_and_aquifer_config_validation() {
         assert_eq!(
             select_without_aquifer(f32::NAN, 0, 32),
             NoiseMaterial::DefaultFluid
@@ -242,6 +409,34 @@ mod tests {
         assert_eq!(chunk.default_block, definition()["default_block"]);
         let mut aquifer = definition();
         aquifer["aquifers"] = json!({});
+        assert!(
+            NoiseStageGenerator::from_json_without_terrain_adjustments(
+                &mut data,
+                &serde_json::to_vec(&aquifer).unwrap(),
+                0
+            )
+            .is_err()
+        );
+        aquifer["aquifers"] = json!({"barrier":0,"fluid_level_floodedness":1,"fluid_level_spread":0,"lava":0,"exclusion":0,"surface_level":30});
+        let generator = NoiseStageGenerator::from_json_without_terrain_adjustments(
+            &mut data,
+            &serde_json::to_vec(&aquifer).unwrap(),
+            0,
+        )
+        .unwrap();
+        let chunk = generator.generate(&mut evaluator, -1, 2).unwrap();
+        assert_eq!(chunk.get(0, 7, 0), Some(NoiseMaterial::DefaultFluid));
+        assert_eq!(chunk.get(0, 8, 0), Some(NoiseMaterial::Air));
+        aquifer["default_fluid"] = json!("water");
+        assert!(
+            NoiseStageGenerator::from_json_without_terrain_adjustments(
+                &mut data,
+                &serde_json::to_vec(&aquifer).unwrap(),
+                0
+            )
+            .is_ok()
+        );
+        aquifer["default_fluid"] = json!("minecraft:lava");
         assert!(
             NoiseStageGenerator::from_json_without_terrain_adjustments(
                 &mut data,

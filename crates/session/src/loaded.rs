@@ -6379,6 +6379,185 @@ impl LoadedSession {
         self.place_plain_solid(hit, "minecraft:lodestone")
     }
 
+    /// Query known POI records and replay later lodestone transitions.
+    fn known_lodestone_poi(&self, position: IVec3) -> Option<bool> {
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        // The newest decisive transition overrides the captured record. Walk
+        // backwards so a frequently edited position normally stops at once.
+        if let Some(edits) = self.poi_edits.get(&chunk) {
+            for edit in edits.iter().rev().filter(|edit| {
+                edit.position.x == position.x
+                    && edit.position.y == position.y
+                    && edit.position.z == position.z
+            }) {
+                let old = edit.original.and_then(|id| self.world.state(id))?;
+                let new = self.world.state(edit.replacement)?;
+                let old_lodestone = old.name == "minecraft:lodestone" && old.properties.is_empty();
+                let new_lodestone = new.name == "minecraft:lodestone" && new.properties.is_empty();
+                if old.name == "minecraft:lodestone" && !old_lodestone
+                    || new.name == "minecraft:lodestone" && !new_lodestone
+                {
+                    return None;
+                }
+                if old_lodestone != new_lodestone {
+                    return Some(new_lodestone);
+                }
+                if native_world::poi::change(old, new).is_some() {
+                    return None;
+                }
+            }
+        }
+        let source = self.poi_chunks.get(&chunk);
+        let section = match source {
+            Some(SavedPoiData::Present(source)) => source.sections.get(&position.y.div_euclid(16)),
+            _ => None,
+        };
+        let record = section.and_then(|section| {
+            section
+                .records
+                .iter()
+                .find(|record| record.position == position.to_array())
+        });
+        let record_is_lodestone = |record: &native_persistence::world::SavedPoiRecord| {
+            let id = String::from_utf16(&record.type_id.0).ok()?;
+            match id.as_str() {
+                "minecraft:lodestone" => Some(true),
+                "minecraft:armorer"
+                | "minecraft:butcher"
+                | "minecraft:cartographer"
+                | "minecraft:cleric"
+                | "minecraft:farmer"
+                | "minecraft:fisherman"
+                | "minecraft:fletcher"
+                | "minecraft:leatherworker"
+                | "minecraft:librarian"
+                | "minecraft:mason"
+                | "minecraft:shepherd"
+                | "minecraft:toolsmith"
+                | "minecraft:weaponsmith"
+                | "minecraft:home"
+                | "minecraft:meeting"
+                | "minecraft:beehive"
+                | "minecraft:bee_nest"
+                | "minecraft:nether_portal"
+                | "minecraft:test_instance"
+                | "minecraft:lightning_rod" => Some(false),
+                _ => None,
+            }
+        };
+        let present = if section.is_some_and(|section| section.valid) {
+            match record {
+                Some(record) => record_is_lodestone(record),
+                None => Some(false),
+            }
+        } else if matches!(
+            source,
+            Some(SavedPoiData::Missing | SavedPoiData::Present(_))
+        ) {
+            // Java refreshes missing or invalid POI sections as their terrain is
+            // loaded. Resolve only original states whose POI mapping is certain.
+            let original = (|| {
+                let terrain = self.world.chunks.get(&chunk)?;
+                if terrain.status.as_deref() != Some("minecraft:full") {
+                    return None;
+                }
+                let y = i8::try_from(position.y.div_euclid(16)).ok()?;
+                terrain.sections.get(&y)?.blocks.as_ref()?;
+                let key = (position.x, position.y, position.z);
+                let id = match self
+                    .block_edits
+                    .get(&chunk)
+                    .and_then(|edits| edits.get(&key))
+                {
+                    Some(edit) => edit.original?,
+                    None => self.world.block_id(position.x, position.y, position.z)?,
+                };
+                let state = self.world.state(id)?;
+                if !state.properties.is_empty() {
+                    return None;
+                }
+                match state.name.as_str() {
+                    "minecraft:lodestone" => Some(true),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    | "minecraft:stone" | "minecraft:dirt" => Some(false),
+                    _ => None,
+                }
+            })();
+            match original {
+                Some(false) => Some(false),
+                Some(true) => match record {
+                    Some(record) => record_is_lodestone(record),
+                    None => Some(true),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        present
+    }
+
+    fn tick_lodestone_compasses(&mut self) {
+        use crate::inventory::PlayerSlot;
+        let Ok(dimension) = native_resources::packs::ResourceId::parse(&self.world.dimension)
+        else {
+            return;
+        };
+        let mut cache = BTreeMap::new();
+        let mut updates = Vec::new();
+        let slots = (0..36)
+            .map(PlayerSlot::Storage)
+            .chain((0..4).map(PlayerSlot::Armor))
+            .chain(std::iter::once(PlayerSlot::Offhand));
+        for slot in slots {
+            let Some(item) = self
+                .inventory
+                .slot(slot)
+                .filter(|item| item.id() == "minecraft:compass")
+            else {
+                continue;
+            };
+            let Some(mut tracker) = item
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(crate::lodestone::Tracker::parse)
+            else {
+                continue;
+            };
+            let Some(target) = tracker.target.as_ref() else {
+                continue;
+            };
+            if !tracker.tracked || target.dimension != dimension {
+                continue;
+            }
+            let pos = target.position;
+            let in_bounds = (-30_000_000..30_000_000).contains(&pos.x)
+                && (-30_000_000..30_000_000).contains(&pos.z)
+                && (self.bounds.min_y..self.bounds.max_y).contains(&pos.y);
+            let poi = if in_bounds {
+                *cache
+                    .entry(pos.to_array())
+                    .or_insert_with(|| self.known_lodestone_poi(pos))
+            } else {
+                None
+            };
+            if tracker.update_target(&dimension, in_bounds, poi)
+                && let Some(updated) = item.with_lodestone_tracker(&tracker)
+            {
+                updates.push((slot, updated));
+            }
+        }
+        if !updates.is_empty() {
+            let inventory = Arc::make_mut(&mut self.inventory);
+            for (slot, item) in updates {
+                inventory.set_slot(slot, Some(item));
+            }
+        }
+    }
+
     fn use_lodestone_compass(&mut self, position: IVec3) -> Option<crate::inventory::PlayerSlot> {
         let Cell::State(id) = cell(
             &self.world,
@@ -10114,6 +10293,7 @@ impl LoadedSession {
             self.stream_errors
                 .push(format!("player armor equipment: {error:#}"));
         }
+        self.tick_lodestone_compasses();
         self.food_use
             .prepare(&self.inventory, self.vitals, self.game_mode);
         // baseTick reads the previous equipment attributes before detecting changes.
@@ -13981,6 +14161,291 @@ mod tests {
                 .get("minecraft:lodestone_tracker")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn compass_ticks_follow_known_poi_edits_and_preserve_unknown_targets() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let pos = IVec3::new(8, 2, 6);
+        let absolute = session.origin + pos;
+        let target = crate::lodestone::Tracker::linked(
+            native_resources::packs::ResourceId::parse("minecraft:overworld").unwrap(),
+            absolute,
+        );
+        let components = Tag::Compound(vec![
+            ("minecraft:lodestone_tracker".into(), target.to_nbt()),
+            (
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("kept".into(), Tag::Int(7))]),
+            ),
+        ]);
+        let mut inventory = PlayerInventory::default();
+        for slot in [
+            PlayerSlot::Storage(2),
+            PlayerSlot::Offhand,
+            PlayerSlot::Armor(0),
+        ] {
+            inventory.set_slot(
+                slot,
+                ItemStack::new("minecraft:compass".into(), 1, 64, components.clone()),
+            );
+        }
+        session.set_player_inventory(inventory);
+        session.update(TICK);
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(2))
+                .unwrap()
+                .components(),
+            &components
+        );
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(pos, lodestone));
+        session.update(TICK);
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Offhand)
+                .unwrap()
+                .components(),
+            &components
+        );
+        let before = Arc::clone(&session.inventory);
+        assert!(session.set(pos, session.states[0]));
+        session.update(TICK);
+        for slot in [
+            PlayerSlot::Storage(2),
+            PlayerSlot::Offhand,
+            PlayerSlot::Armor(0),
+        ] {
+            let item = session.inventory.slot(slot).unwrap();
+            let tracker = item
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(crate::lodestone::Tracker::parse)
+                .unwrap();
+            assert!(tracker.target.is_none());
+            assert!(tracker.tracked);
+            assert_eq!(
+                item.components().get("minecraft:custom_data"),
+                components.get("minecraft:custom_data")
+            );
+            assert_eq!(before.slot(slot).unwrap().components(), &components);
+        }
+    }
+
+    #[test]
+    fn compass_tick_uses_valid_saved_poi_instead_of_current_block() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let pos = session.origin + IVec3::new(8, 2, 6);
+        let home = session.player_chunk().unwrap();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                (
+                    "DataVersion".into(),
+                    Tag::Int(native_persistence::world::TARGET_DATA_VERSION),
+                ),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("pos".into(), Tag::IntArray(pos.to_array().to_vec())),
+                                        ("type".into(), Tag::String("minecraft:lodestone".into())),
+                                        ("free_tickets".into(), Tag::Int(0)),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let source = native_persistence::world::SavedPoiChunk::from_document(
+            document,
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+        )
+        .unwrap();
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Present(Arc::new(source)))
+            .unwrap();
+        let target = crate::lodestone::Tracker::linked(
+            native_resources::packs::ResourceId::parse("minecraft:overworld").unwrap(),
+            pos,
+        );
+        let components = Tag::Compound(vec![(
+            "minecraft:lodestone_tracker".into(),
+            target.to_nbt(),
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:compass".into(), 1, 64, components.clone()),
+        );
+        session.set_player_inventory(inventory);
+        // The fixture has stone at this position; the valid saved POI still wins.
+        session.update(TICK);
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .components(),
+            &components
+        );
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(IVec3::new(8, 2, 6), lodestone));
+        assert!(session.set(IVec3::new(8, 2, 6), session.states[0]));
+        session.update(TICK);
+        assert!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .components()
+                .get("minecraft:lodestone_tracker")
+                .and_then(crate::lodestone::Tracker::parse)
+                .unwrap()
+                .target
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compass_queries_missing_poi_from_loaded_terrain() {
+        let (mut world, origin, player) = fixture();
+        let id = world.intern_state(state("minecraft:lodestone", &[]));
+        let pos = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let chunk = Arc::make_mut(world.chunks.get_mut(&pos).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[8 + 6 * 16 + 2 * 256] = id;
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let target = origin + IVec3::new(8, 2, 6);
+        assert_eq!(session.known_lodestone_poi(target), None);
+        session
+            .set_initial_poi_chunk(pos, SavedPoiData::Missing)
+            .unwrap();
+        assert_eq!(session.known_lodestone_poi(target), Some(true));
+        assert_eq!(
+            session.known_lodestone_poi(origin + IVec3::new(9, 2, 6)),
+            Some(false)
+        );
+        assert!(session.set(IVec3::new(8, 2, 6), session.states[0]));
+        assert_eq!(session.known_lodestone_poi(target), Some(false));
+    }
+
+    #[test]
+    fn compass_refresh_of_invalid_poi_retains_record_type_at_lodestone() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        for (kind, expected) in [
+            (None, true),
+            (Some("minecraft:lodestone"), true),
+            (Some("minecraft:meeting"), false),
+        ] {
+            let (mut world, origin, player) = fixture();
+            let id = world.intern_state(state("minecraft:lodestone", &[]));
+            let pos = ChunkPos {
+                x: origin.x.div_euclid(16),
+                z: origin.z.div_euclid(16),
+            };
+            let chunk = Arc::make_mut(world.chunks.get_mut(&pos).unwrap());
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap()[8 + 6 * 16 + 2 * 256] = id;
+            let target = origin + IVec3::new(8, 2, 6);
+            let records = kind
+                .into_iter()
+                .map(|name| {
+                    Tag::Compound(vec![
+                        ("pos".into(), Tag::IntArray(target.to_array().to_vec())),
+                        ("type".into(), Tag::String(name.into())),
+                        ("free_tickets".into(), Tag::Int(0)),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    (
+                        "DataVersion".into(),
+                        Tag::Int(native_persistence::world::TARGET_DATA_VERSION),
+                    ),
+                    (
+                        "Sections".into(),
+                        Tag::Compound(vec![(
+                            "0".into(),
+                            Tag::Compound(vec![
+                                ("Valid".into(), Tag::Byte(0)),
+                                (
+                                    "Records".into(),
+                                    Tag::List {
+                                        element_type: if records.is_empty() {
+                                            TagType::End
+                                        } else {
+                                            TagType::Compound
+                                        },
+                                        values: records,
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            };
+            let poi = native_persistence::world::SavedPoiChunk::from_document(
+                document,
+                native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+            )
+            .unwrap();
+            let mut session = LoadedSession::new(
+                world,
+                origin,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session
+                .set_initial_poi_chunk(pos, SavedPoiData::Present(Arc::new(poi)))
+                .unwrap();
+            assert_eq!(
+                session.known_lodestone_poi(target),
+                Some(expected),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

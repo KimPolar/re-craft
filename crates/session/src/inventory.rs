@@ -77,6 +77,35 @@ impl ItemStack {
         &self.components
     }
 
+    /// Replace an existing tracker without changing any other saved component.
+    pub(crate) fn with_lodestone_tracker(
+        &self,
+        tracker: &crate::lodestone::Tracker,
+    ) -> Option<Self> {
+        if self.id != "minecraft:compass" {
+            return None;
+        }
+        let mut item = self.clone();
+        let Tag::Compound(fields) = &mut item.components else {
+            return None;
+        };
+        if fields
+            .iter()
+            .any(|(name, _)| name.matches("!minecraft:lodestone_tracker"))
+        {
+            return None;
+        }
+        let mut matches = fields
+            .iter_mut()
+            .filter(|(name, _)| name.matches("minecraft:lodestone_tracker"));
+        let (_, value) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        *value = tracker.to_nbt();
+        Some(item)
+    }
+
     /// Whether the item displays the Java 26.3 enchantment glint. Saved stacks
     /// may still contain a component patch rather than the complete prototype.
     pub fn has_glint(&self) -> bool {

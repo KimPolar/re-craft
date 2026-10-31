@@ -1,6 +1,7 @@
 //! Player health and the vanilla food-data tick.
 
 use crate::inventory::{ItemStack, PlayerInventory, PlayerSlot, saved_item_max};
+use native_persistence::nbt::Tag;
 use native_persistence::world::Difficulty;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ pub struct FoodProperties {
     pub nutrition: i32,
     pub saturation: f32,
     pub use_ticks: u8,
+    pub can_always_eat: bool,
 }
 
 pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
@@ -36,6 +38,95 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         nutrition,
         saturation: nutrition as f32 * modifier * 2.0,
         use_ticks: if id == "minecraft:dried_kelp" { 16 } else { 32 },
+        can_always_eat: false,
+    })
+}
+
+/// The supported, effect-free subset of a saved FOOD component.
+pub(crate) fn custom_food(value: &Tag) -> Option<(i32, f32, bool)> {
+    let Tag::Compound(fields) = value else {
+        return None;
+    };
+    let (mut nutrition, mut saturation, mut always) = (None, None, None);
+    for (name, value) in fields {
+        if name.matches("nutrition") && nutrition.is_none() {
+            nutrition = value.as_java_int().filter(|&value| value >= 0);
+            nutrition?;
+        } else if name.matches("saturation") && saturation.is_none() {
+            let number = crate::player_data::numeric_double(value)? as f32;
+            if !number.is_finite() {
+                return None;
+            }
+            saturation = Some(number);
+        } else if name.matches("can_always_eat") && always.is_none() {
+            always = match value {
+                Tag::Byte(0) => Some(false),
+                Tag::Byte(1) => Some(true),
+                _ => return None,
+            };
+        } else {
+            return None;
+        }
+    }
+    Some((nutrition?, saturation?, always.unwrap_or(false)))
+}
+
+/// Effect-free consumables with ordinary eating animation and a representable
+/// positive duration. Unsupported effects/remainders must not be discarded.
+pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<u8> {
+    let Tag::Compound(fields) = value else {
+        return None;
+    };
+    let (mut seconds, mut animation, mut effects) = (None, false, false);
+    for (name, value) in fields {
+        if name.matches("consume_seconds") && seconds.is_none() {
+            let number = crate::player_data::numeric_double(value)? as f32;
+            if !number.is_finite() {
+                return None;
+            }
+            seconds = Some(number);
+        } else if name.matches("animation") && !animation {
+            if !matches!(value, Tag::String(value) if value.matches("eat")) {
+                return None;
+            }
+            animation = true;
+        } else if name.matches("on_consume_effects") && !effects {
+            if !matches!(value, Tag::List { values, .. } if values.is_empty()) {
+                return None;
+            }
+            effects = true;
+        } else {
+            return None;
+        }
+    }
+    let ticks = (seconds.unwrap_or(1.6_f32) * 20.0) as i32;
+    u8::try_from(ticks).ok().filter(|ticks| *ticks > 0)
+}
+
+fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
+    let components = item.components();
+    if components.get("!minecraft:food").is_some()
+        || components.get("!minecraft:consumable").is_some()
+    {
+        return None;
+    }
+    let default = ordinary_food(item.id());
+    let (nutrition, saturation, can_always_eat) = match components.get("minecraft:food") {
+        Some(food) => custom_food(food)?,
+        None => {
+            let food = default?;
+            (food.nutrition, food.saturation, food.can_always_eat)
+        }
+    };
+    let use_ticks = match components.get("minecraft:consumable") {
+        Some(consumable) => custom_consumable_ticks(consumable)?,
+        None => default?.use_ticks,
+    };
+    Some(FoodProperties {
+        nutrition,
+        saturation,
+        use_ticks,
+        can_always_eat,
     })
 }
 
@@ -90,7 +181,7 @@ impl FoodUse {
         let Some(item) = inventory.slot(hand) else {
             return false;
         };
-        let Some(food) = ordinary_food(item.id()) else {
+        let Some(food) = food_properties(item) else {
             return false;
         };
         if saved_item_max(item.id(), item.components()) != item.max_count()
@@ -99,7 +190,7 @@ impl FoodUse {
             return false;
         }
         if mode != crate::GameMode::Spectator
-            && (vitals.food < 20 || mode == crate::GameMode::Creative)
+            && (vitals.food < 20 || food.can_always_eat || mode == crate::GameMode::Creative)
         {
             self.active = Some(Eating {
                 hand,
@@ -741,6 +832,243 @@ mod tests {
             GameMode::Survival
         ));
         assert!(!use_state.is_active());
+    }
+
+    #[test]
+    fn custom_food_and_consumable_change_hunger_and_use_duration() {
+        let mut session = LocalSession::demo();
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:food".into(),
+                Tag::Compound(vec![
+                    ("nutrition".into(), Tag::Int(7)),
+                    ("saturation".into(), Tag::Float(3.5)),
+                    ("can_always_eat".into(), Tag::Byte(1)),
+                ]),
+            ),
+            (
+                "minecraft:consumable".into(),
+                Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.25))]),
+            ),
+        ]);
+        assert_eq!(saved_item_max("minecraft:apple", &components), Some(64));
+        let item = ItemStack::new("minecraft:apple".into(), 2, 64, components).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(PlayerVitals {
+            food: 20,
+            saturation: 1.0,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..4 {
+            session.update(Duration::from_millis(50));
+        }
+        assert_eq!(session.snapshot().vitals.saturation, 1.0);
+        session.update(Duration::from_millis(50));
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.vitals.food, 20);
+        assert_eq!(snapshot.vitals.saturation, 4.5);
+        assert_eq!(
+            snapshot
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nonfood_item_requires_both_custom_components() {
+        let food = Tag::Compound(vec![
+            ("nutrition".into(), Tag::Int(3)),
+            ("saturation".into(), Tag::Float(1.0)),
+        ]);
+        let consumable = Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.1))]);
+        for (components, expected) in [
+            (vec![("minecraft:food".into(), food.clone())], false),
+            (
+                vec![("minecraft:consumable".into(), consumable.clone())],
+                false,
+            ),
+            (
+                vec![
+                    ("minecraft:food".into(), food),
+                    ("minecraft:consumable".into(), consumable),
+                ],
+                true,
+            ),
+        ] {
+            let components = Tag::Compound(components);
+            assert_eq!(saved_item_max("minecraft:dirt", &components), Some(64));
+            let item = ItemStack::new("minecraft:dirt".into(), 1, 64, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut state = FoodUse::default();
+            assert_eq!(
+                state.start_hand(
+                    &inventory,
+                    PlayerSlot::Storage(0),
+                    PlayerVitals {
+                        food: 10,
+                        ..Default::default()
+                    },
+                    GameMode::Survival
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn removed_and_unsupported_food_components_do_not_use_defaults() {
+        for components in [
+            Tag::Compound(vec![("!minecraft:food".into(), Tag::Compound(vec![]))]),
+            Tag::Compound(vec![(
+                "!minecraft:consumable".into(),
+                Tag::Compound(vec![]),
+            )]),
+            Tag::Compound(vec![(
+                "minecraft:consumable".into(),
+                Tag::Compound(vec![(
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![Tag::Compound(vec![])],
+                    },
+                )]),
+            )]),
+        ] {
+            let item = ItemStack::new("minecraft:apple".into(), 1, 64, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut state = FoodUse::default();
+            assert!(!state.start_hand(
+                &inventory,
+                PlayerSlot::Storage(0),
+                PlayerVitals {
+                    food: 1,
+                    ..Default::default()
+                },
+                GameMode::Survival
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn custom_food_components_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FoodComponentsOracle.java");
+        let output = temp.path().join("food.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FoodComponentsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("FoodComponentsOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for row in result["food"].as_array().unwrap() {
+            let food = Tag::Compound(vec![
+                (
+                    "nutrition".into(),
+                    Tag::Int(row["nutrition"].as_i64().unwrap() as i32),
+                ),
+                (
+                    "saturation".into(),
+                    Tag::Float(row["saturation"].as_f64().unwrap() as f32),
+                ),
+                (
+                    "can_always_eat".into(),
+                    Tag::Byte(i8::from(row["always"].as_bool().unwrap())),
+                ),
+            ]);
+            let components = Tag::Compound(vec![
+                ("minecraft:food".into(), food),
+                (
+                    "minecraft:consumable".into(),
+                    Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.05))]),
+                ),
+            ]);
+            let item = ItemStack::new("minecraft:apple".into(), 1, 64, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 13,
+                saturation: 1.25,
+                ..Default::default()
+            };
+            let mut use_state = FoodUse::default();
+            assert!(use_state.start_hand(
+                &inventory,
+                PlayerSlot::Storage(0),
+                vitals,
+                GameMode::Survival
+            ));
+            use_state.tick(&mut inventory, &mut vitals, GameMode::Survival);
+            assert_eq!(
+                vitals.food,
+                row["result_food"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+            assert_eq!(
+                vitals.saturation,
+                row["result_saturation"].as_f64().unwrap() as f32,
+                "{row}"
+            );
+        }
+        for row in result["times"].as_array().unwrap() {
+            let component = Tag::Compound(vec![(
+                "consume_seconds".into(),
+                Tag::Float(row["seconds"].as_f64().unwrap() as f32),
+            )]);
+            assert_eq!(
+                custom_consumable_ticks(&component),
+                Some(row["ticks"].as_u64().unwrap() as u8),
+                "{row}"
+            );
+        }
     }
 
     #[test]

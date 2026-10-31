@@ -2572,6 +2572,22 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             512
+        } else if name.matches("minecraft:food") {
+            crate::survival::custom_food(value)?;
+            1024
+        } else if name.matches("!minecraft:food") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            2048
+        } else if name.matches("minecraft:consumable") {
+            crate::survival::custom_consumable_ticks(value)?;
+            4096
+        } else if name.matches("!minecraft:consumable") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            8192
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {
@@ -2612,6 +2628,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & 768 == 768 {
+        return None;
+    }
+    if seen & 3072 == 3072 || seen & 12288 == 12288 {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

@@ -1,7 +1,7 @@
 //! The context-independent subset of 26.3 density functions.
 //!
-//! Unsupported functions are errors: treating noise or interpolation as a
-//! constant would silently produce a different world.
+//! Unsupported functions are errors: treating noise as a constant would
+//! silently produce a different world.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -17,7 +17,7 @@ const MAX_NODES: usize = 100_000;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
-pub struct DensityFunction(Node, usize, usize);
+pub struct DensityFunction(Node, usize, usize, bool);
 
 #[derive(Debug)]
 enum Node {
@@ -46,6 +46,16 @@ enum Node {
         inside: Arc<DensityFunction>,
         outside: Arc<DensityFunction>,
     },
+    Lerp {
+        alpha: Arc<DensityFunction>,
+        first: Arc<DensityFunction>,
+        second: Arc<DensityFunction>,
+    },
+    Interpolated {
+        input: Arc<DensityFunction>,
+        cell_xz: i32,
+        cell_y: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,9 +78,15 @@ enum Unary {
 impl DensityFunction {
     /// Samples using the single-precision operations used by the 26.3 sampler.
     pub fn sample(&self, x: i32, y: i32, z: i32) -> f32 {
+        self.evaluate(x, y, z, false)
+    }
+
+    // Java's volume and single-point samplers differ in their multiplication
+    // fast path. InterpolatedFunction samples its eight corners in a volume.
+    fn evaluate(&self, x: i32, y: i32, z: i32, volume: bool) -> f32 {
         match &self.0 {
             Node::Constant(v) => *v,
-            Node::Reference(v) => v.sample(x, y, z),
+            Node::Reference(v) => v.evaluate(x, y, z, volume),
             Node::Gradient {
                 axis,
                 from,
@@ -82,13 +98,18 @@ impl DensityFunction {
                 *value + (coordinate.wrapping_sub(*from) as f32) * *factor
             }
             Node::Binary { op, left, right } => {
-                let a = left.sample(x, y, z);
+                let a = left.evaluate(x, y, z, volume);
                 let left_constant = matches!(left.0, Node::Constant(_));
                 let right_constant = matches!(right.0, Node::Constant(_));
-                if matches!(op, Binary::Mul) && !left_constant && !right_constant && a == 0.0 {
+                if !volume
+                    && matches!(op, Binary::Mul)
+                    && !left_constant
+                    && !right_constant
+                    && a == 0.0
+                {
                     return 0.0;
                 }
-                let b = right.sample(x, y, z);
+                let b = right.evaluate(x, y, z, volume);
                 match op {
                     Binary::Add if left_constant => b + a,
                     Binary::Add => a + b,
@@ -98,7 +119,7 @@ impl DensityFunction {
                 }
             }
             Node::Unary { op, input } => {
-                let a = input.sample(x, y, z);
+                let a = input.evaluate(x, y, z, volume);
                 match op {
                     Unary::Abs => a.abs(),
                     Unary::Square => a * a,
@@ -137,21 +158,81 @@ impl DensityFunction {
                 inside,
                 outside,
             } => {
-                let v = input.sample(x, y, z);
+                let v = input.evaluate(x, y, z, volume);
                 if v >= *min && v < *max {
-                    inside.sample(x, y, z)
+                    inside.evaluate(x, y, z, volume)
                 } else {
-                    outside.sample(x, y, z)
+                    outside.evaluate(x, y, z, volume)
                 }
+            }
+            Node::Lerp {
+                alpha,
+                first,
+                second,
+            } => {
+                let alpha = alpha.evaluate(x, y, z, volume);
+                if alpha == 0.0 {
+                    return first.evaluate(x, y, z, volume);
+                }
+                if alpha == 1.0 {
+                    return second.evaluate(x, y, z, volume);
+                }
+                lerp(
+                    alpha,
+                    first.evaluate(x, y, z, volume),
+                    second.evaluate(x, y, z, volume),
+                )
+            }
+            Node::Interpolated {
+                input,
+                cell_xz,
+                cell_y,
+            } => {
+                debug_assert!(!volume, "nested interpolation is not supported");
+                let rx = x.rem_euclid(*cell_xz);
+                let ry = y.rem_euclid(*cell_y);
+                let rz = z.rem_euclid(*cell_xz);
+                if rx == 0 && ry == 0 && rz == 0 {
+                    return input.evaluate(x, y, z, false);
+                }
+                let (x0, y0, z0) = (x.wrapping_sub(rx), y.wrapping_sub(ry), z.wrapping_sub(rz));
+                let (x1, y1, z1) = (
+                    x0.wrapping_add(*cell_xz),
+                    y0.wrapping_add(*cell_y),
+                    z0.wrapping_add(*cell_xz),
+                );
+                let (tx, ty, tz) = (
+                    rx as f32 / *cell_xz as f32,
+                    ry as f32 / *cell_y as f32,
+                    rz as f32 / *cell_xz as f32,
+                );
+                let corner = |x, y, z| input.evaluate(x, y, z, true);
+                let z0_plane = lerp(
+                    ty,
+                    lerp(tx, corner(x0, y0, z0), corner(x1, y0, z0)),
+                    lerp(tx, corner(x0, y1, z0), corner(x1, y1, z0)),
+                );
+                let z1_plane = lerp(
+                    ty,
+                    lerp(tx, corner(x0, y0, z1), corner(x1, y0, z1)),
+                    lerp(tx, corner(x0, y1, z1), corner(x1, y1, z1)),
+                );
+                lerp(tz, z0_plane, z1_plane)
             }
         }
     }
 }
 
+fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
+    first + alpha * (second - first)
+}
+
 fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
         Node::Constant(_) | Node::Gradient { .. } => vec![],
-        Node::Reference(value) | Node::Unary { input: value, .. } => vec![value],
+        Node::Reference(value)
+        | Node::Unary { input: value, .. }
+        | Node::Interpolated { input: value, .. } => vec![value],
         Node::Binary { left, right, .. } => vec![left, right],
         Node::Range {
             input,
@@ -159,17 +240,36 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             outside,
             ..
         } => vec![input, inside, outside],
+        Node::Lerp {
+            alpha,
+            first,
+            second,
+        } => vec![alpha, first, second],
     };
     let depth = 1 + children.iter().map(|child| child.1).max().unwrap_or(0);
-    let work = children
+    let mut work = children
         .iter()
         .fold(1usize, |sum, child| sum.saturating_add(child.2));
+    if let Node::Interpolated { input, .. } = &node {
+        ensure!(
+            !input.3,
+            "nested interpolated density functions are not supported"
+        );
+        work = 1usize.saturating_add(input.2.saturating_mul(8));
+    }
+    let has_interpolation =
+        matches!(node, Node::Interpolated { .. }) || children.iter().any(|child| child.3);
     ensure!(depth <= MAX_DEPTH, "density function exceeds maximum depth");
     ensure!(
         work <= MAX_NODES,
         "density function exceeds maximum sampling work"
     );
-    Ok(Arc::new(DensityFunction(node, depth, work)))
+    Ok(Arc::new(DensityFunction(
+        node,
+        depth,
+        work,
+        has_interpolation,
+    )))
 }
 
 /// Resolves functions from the active data-pack stack, including its overrides.
@@ -327,6 +427,24 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 inside: self.expression(field("when_in_range")?, depth + 1)?,
                 outside: self.expression(field("when_out_of_range")?, depth + 1)?,
             },
+            "lerp" => Node::Lerp {
+                alpha: self.expression(field("alpha")?, depth + 1)?,
+                first: self.expression(field("first")?, depth + 1)?,
+                second: self.expression(field("second")?, depth + 1)?,
+            },
+            "interpolated" => {
+                let cell_xz = integer(field("cell_size_xz")?)?;
+                let cell_y = integer(field("cell_size_y")?)?;
+                ensure!(
+                    cell_xz > 0 && cell_y > 0,
+                    "interpolation cell sizes must be positive"
+                );
+                Node::Interpolated {
+                    input: self.expression(field("input")?, depth + 1)?,
+                    cell_xz,
+                    cell_y,
+                }
+            }
             _ => bail!("unsupported density function type {kind}"),
         };
         make(node)
@@ -446,5 +564,16 @@ mod tests {
                 .compile(&json!({"type":"min", "left":0, "right":1}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn interpolation_validates_cells_and_rejects_nested_volume_sampling() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        for (xz, y) in [(0, 1), (1, -1)] {
+            assert!(compiler.compile(&json!({"type":"interpolated", "input":1, "cell_size_xz":xz, "cell_size_y":y})).is_err());
+        }
+        let inner = json!({"type":"interpolated", "input":1, "cell_size_xz":4, "cell_size_y":8});
+        assert!(compiler.compile(&json!({"type":"interpolated", "input":{"type":"add", "left":inner, "right":1}, "cell_size_xz":4, "cell_size_y":8})).is_err());
     }
 }

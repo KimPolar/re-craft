@@ -84,6 +84,21 @@ fn pure_functions_match_java_sampler() {
     expressions.push(json!({"type":"minecraft:mul", "left":zero, "right":negative}));
     expressions.push(json!({"type":"minecraft:mul", "left":zero, "right":-1.0}));
     expressions.push(json!({"type":"minecraft:sub", "left":zero, "right":0.0}));
+    for alpha in [json!(0.0), json!(1.0), json!(0.375), gradient.clone()] {
+        expressions.push(
+            json!({"type":"minecraft:lerp", "alpha":alpha, "first":gradient, "second":reverse}),
+        );
+        expressions
+            .push(json!({"type":"minecraft:lerp", "alpha":alpha, "first":-0.75, "second":reverse}));
+        expressions
+            .push(json!({"type":"minecraft:lerp", "alpha":alpha, "first":gradient, "second":0.25}));
+    }
+    let nonlinear = json!({"type":"minecraft:mul", "left":{"type":"minecraft:square", "input":gradient}, "right":reverse});
+    for (cell_xz, cell_y) in [(4, 8), (3, 5), (1, 1), (9, 7)] {
+        expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":cell_xz, "cell_size_y":cell_y, "input":nonlinear}));
+    }
+    expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"minecraft:mul", "left":zero, "right":negative}}));
+    expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"minecraft:lerp", "alpha":gradient, "first":nonlinear, "second":reverse}}));
     let input = temp.path().join("expressions.json");
     std::fs::write(&input, serde_json::to_vec(&expressions).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -113,5 +128,5 @@ fn pure_functions_match_java_sampler() {
         );
         count += 1;
     }
-    assert_eq!(count, expressions.len() * 8);
+    assert_eq!(count, expressions.len() * 52);
 }

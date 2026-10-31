@@ -345,6 +345,7 @@ pub struct LoadedSession {
     breathing_effects: crate::survival::BreathingEffects,
     effect_save_tracking: Option<EffectSaveTracking>,
     effect_save_invalid: bool,
+    unresolved_player_damage: bool,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
@@ -1597,6 +1598,10 @@ impl LoadedSession {
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
+        anyhow::ensure!(
+            !self.unresolved_player_damage,
+            "player damage could not be resolved during this session"
+        );
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -2909,6 +2914,7 @@ impl LoadedSession {
             breathing_effects: crate::survival::BreathingEffects::default(),
             effect_save_tracking: None,
             effect_save_invalid: false,
+            unresolved_player_damage: false,
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
@@ -10510,6 +10516,7 @@ impl LoadedSession {
             {
                 self.stream_errors
                     .push(format!("player drowning damage: {error:#}"));
+                self.unresolved_player_damage = true;
             }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
@@ -10550,6 +10557,7 @@ impl LoadedSession {
             self.stream_errors
                 .push(format!("player poison damage: {error:#}"));
             self.effect_save_invalid = true;
+            self.unresolved_player_damage = true;
         }
         self.fall
             .effects()
@@ -10957,6 +10965,7 @@ impl LoadedSession {
             {
                 self.stream_errors
                     .push(format!("player fall damage: {error:#}"));
+                self.unresolved_player_damage = true;
             }
             if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
@@ -11156,6 +11165,7 @@ impl LoadedSession {
                 ) {
                     self.stream_errors
                         .push(format!("player starvation damage: {error:#}"));
+                    self.unresolved_player_damage = true;
                 }
             } else {
                 self.vitals.apply_food_effect(effect, self.game_mode);
@@ -25309,6 +25319,77 @@ mod tests {
         // Drowning is processed first and suppresses the weaker starvation hit.
         assert_eq!(session.vitals.health, 14.0);
         assert_eq!(session.vitals.air, 0);
+    }
+
+    #[test]
+    fn unresolved_damage_blocks_all_player_save_drafts() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        for cause in ["fall", "drown", "starve", "poison"] {
+            let mut session = session();
+            let effects = crate::survival::FallEffects {
+                poison: (cause == "poison").then_some(crate::survival::EffectDuration {
+                    amplifier: 0,
+                    duration: 25,
+                    hidden: None,
+                }),
+                ..Default::default()
+            };
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                effects,
+                Arc::new(OxygenEnchantments::default()),
+            );
+            match cause {
+                "fall" => session.motion.position = DVec3::new(8.5, 9.0, 8.5),
+                "drown" => {
+                    let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                    for x in 7..=9 {
+                        for y in 1..=3 {
+                            for z in 7..=9 {
+                                assert!(session.set(IVec3::new(x, y, z), water));
+                            }
+                        }
+                    }
+                    session.vitals.air = -19;
+                }
+                "starve" => {
+                    session.set_survival_rules(crate::survival::SurvivalRules {
+                        difficulty: native_persistence::world::Difficulty::Hard,
+                        ..Default::default()
+                    });
+                    session.vitals.food = 0;
+                    session.vitals.saturation = 0.0;
+                    session.vitals.food_tick_timer = 79;
+                }
+                _ => {}
+            }
+            for _ in 0..40 {
+                session.update(TICK);
+                if session.unresolved_player_damage {
+                    break;
+                }
+            }
+            assert!(session.unresolved_player_damage, "{cause}");
+            assert!(
+                session
+                    .stream_errors
+                    .iter()
+                    .any(|error| error.contains(&format!("player {cause}"))
+                        || (cause == "starve" && error.contains("player starvation"))),
+                "{cause}: {:?}",
+                session.stream_errors
+            );
+            let error = session.draft_player_state(&source).unwrap_err().to_string();
+            assert!(
+                error.contains("player damage could not be resolved"),
+                "{cause}: {error}"
+            );
+        }
     }
 
     #[test]

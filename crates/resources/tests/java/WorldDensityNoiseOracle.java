@@ -27,6 +27,10 @@ import net.minecraft.world.level.levelgen.Aquifer;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.levelgen.material.MaterialRuleContext;
+import net.minecraft.world.level.levelgen.material.rule.OreVeinRule;
 
 public class WorldDensityNoiseOracle {
     // Codec-decoded noise values may compare equal even when their registry names
@@ -87,6 +91,15 @@ public class WorldDensityNoiseOracle {
                     }
                     localAquifer=new Aquifer.Config(functions[0],functions[1],functions[2],functions[3],functions[4],functions[5]);
                 }
+            DensityFunction[] oreFunctions=null;
+            if (fixture.has("java_ore_functions")) {
+                var definitions=fixture.getAsJsonArray("java_ore_functions");
+                oreFunctions=new DensityFunction[3];
+                for(int j=0;j<3;j++) {
+                    oreFunctions[j]=DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE,definitions.get(j)).getOrThrow();
+                    bindNoiseNames(oreFunctions[j],definitions.get(j),identityNames);
+                }
+            }
             for (int mode=0;mode<2;mode++) for (long seed:seeds) {
                 if (fixture.has("router_mode") && fixture.get("router_mode").getAsInt() != mode) continue;
                 boolean legacy = mode == 0;
@@ -112,6 +125,36 @@ public class WorldDensityNoiseOracle {
                 System.out.printf("S %d %d %d %d %d%n",i,mode,seed,Float.floatToRawIntBits(range.min()),Float.floatToRawIntBits(range.max()));
                 for (var p:points) {
                     System.out.printf("P %d %d %d %d%n",p[0],p[1],p[2],Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,p[0],p[1],p[2])));
+                }
+                if (oreFunctions!=null && (seed==0 || seed==2345)) {
+                    var min=fixture.getAsJsonObject("ore_min_by_seed").getAsJsonArray(Long.toString(seed));var size=fixture.getAsJsonArray("ore_size");
+                    int minX=min.get(0).getAsInt(),minY=min.get(1).getAsInt(),minZ=min.get(2).getAsInt();
+                    int sx=size.get(0).getAsInt(),sy=size.get(1).getAsInt(),sz=size.get(2).getAsInt();
+                    var volume=new DensityVolume(sx,sy,sz,minX,minY,minZ);
+                    DensitySamplerSet set=f -> new DensitySampler.Bound(compiler.getSampler(f),SamplerContext.EMPTY_UNCACHED);
+                    var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");unsafeField.setAccessible(true);
+                    var unsafe=(sun.misc.Unsafe)unsafeField.get(null);
+                    var rs=(RandomState)unsafe.allocateInstance(RandomState.class);
+                    var randoms=new java.util.concurrent.ConcurrentHashMap<>();
+                    var oreName=Identifier.withDefaultNamespace("ore");randoms.put(oreName,factory.fromHashOf(oreName).forkPositional());
+                    var randomField=RandomState.class.getDeclaredField("positionalRandoms");randomField.setAccessible(true);randomField.set(rs,randoms);
+                    var ctor=MaterialRuleContext.class.getDeclaredConstructors()[0];ctor.setAccessible(true);
+                    var materialContext=(MaterialRuleContext)ctor.newInstance(null,rs,volume,set,null,null,java.util.Set.of());
+                    var rx=MaterialRuleContext.class.getDeclaredField("blockX");rx.setAccessible(true);
+                    var ry=MaterialRuleContext.class.getDeclaredField("blockY");ry.setAccessible(true);
+                    var rz=MaterialRuleContext.class.getDeclaredField("blockZ");rz.setAccessible(true);
+                    var ruleJson=fixture.getAsJsonObject("rust_ore_rule");
+                    var ore=BlockState.CODEC.parse(JsonOps.INSTANCE,ruleJson.get("ore_block")).getOrThrow();
+                    var raw=BlockState.CODEC.parse(JsonOps.INSTANCE,ruleJson.get("raw_ore_block")).getOrThrow();
+                    var filler=BlockState.CODEC.parse(JsonOps.INSTANCE,ruleJson.get("filler_block")).getOrThrow();
+                    var oreRule=new OreVeinRule(ore,raw,filler,ruleJson.get("raw_ore_chance").getAsFloat(),oreFunctions[0],oreFunctions[1],oreFunctions[2]).compile(materialContext);
+                    for(int z=0;z<sz;z++) for(int x=0;x<sx;x++) for(int y=0;y<sy;y++) {
+                        int bx=minX+x,by=minY+y,bz=minZ+z;rx.setInt(materialContext,bx);ry.setInt(materialContext,by);rz.setInt(materialContext,bz);
+                        var block=oreRule.tryApply(bx,by,bz);
+                        int code=block==null?0:block==ore?1:block==raw?2:block==filler?3:-1;
+                        if(code<0)throw new AssertionError(block);
+                        System.out.printf("O %d%n",code);
+                    }
                 }
                 if (fixture.has("volume_min")) {
                     var min=fixture.getAsJsonArray("volume_min");

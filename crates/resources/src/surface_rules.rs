@@ -1,7 +1,7 @@
 //! Data-driven 26.3 material rules. Evaluation requires a real surface context;
 //! callers supply biome, noise, density, and terrain information.
 use crate::{
-    density::WorldgenRandom,
+    density::{DensityCompiler, DensityEvaluator, DensityFunction, WorldgenRandom},
     packs::{ResourceId, ResourceProvider},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -11,7 +11,7 @@ use native_core::{
 };
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -115,6 +115,107 @@ impl SurfaceRandomFactory {
         match factory {
             PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.at(x, y, z)),
             PositionalFactory::Xoroshiro(factory) => SurfaceRandom::Xoroshiro(factory.at(x, y, z)),
+        }
+    }
+}
+
+struct SurfaceDensityEntry {
+    function: Arc<DensityFunction>,
+    volume: Option<Vec<f32>>,
+}
+
+/// A world-seeded density context scoped to one block volume.
+/// Density definitions and Java-order volume buffers are compiled at most once.
+pub struct SurfaceDensitySampler<'a, P: ResourceProvider> {
+    compiler: DensityCompiler<'a, P>,
+    evaluator: DensityEvaluator,
+    min: [i32; 3],
+    max: [i32; 3],
+    size: [u32; 3],
+    entries: HashMap<Value, SurfaceDensityEntry>,
+}
+impl<'a, P: ResourceProvider> SurfaceDensitySampler<'a, P> {
+    /// The caller must guarantee no old-chunk blending or structure adjustment.
+    pub fn without_terrain_adjustments(
+        provider: &'a mut P,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Self> {
+        ensure!(
+            size.iter().all(|n| *n > 0),
+            "surface density volume dimensions must be positive"
+        );
+        let count = size
+            .iter()
+            .try_fold(1usize, |n, x| n.checked_mul(*x as usize))
+            .context("surface density volume size overflow")?;
+        ensure!(
+            count <= 1_048_576,
+            "surface density volume exceeds maximum sample count"
+        );
+        let mut max = [0; 3];
+        for axis in 0..3 {
+            max[axis] = i32::try_from(i64::from(min[axis]) + i64::from(size[axis]) - 1)
+                .context("surface density volume coordinates overflow")?;
+        }
+        Ok(Self {
+            compiler: DensityCompiler::with_world_seed(provider, seed, algorithm)
+                .without_old_chunk_blending()
+                .without_structure_terrain_adjustment(),
+            evaluator: DensityEvaluator::default(),
+            min,
+            max,
+            size,
+            entries: HashMap::new(),
+        })
+    }
+    pub fn sample(
+        &mut self,
+        definition: &Value,
+        in_chunk: bool,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<f32> {
+        if !self.entries.contains_key(definition) {
+            let function = self
+                .compiler
+                .compile(definition)
+                .context("invalid material density function")?;
+            self.entries.insert(
+                definition.clone(),
+                SurfaceDensityEntry {
+                    function,
+                    volume: None,
+                },
+            );
+        }
+        let entry = self
+            .entries
+            .get_mut(definition)
+            .expect("density entry was inserted");
+        if in_chunk
+            && [x, y, z]
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| v >= self.min[i] && v <= self.max[i])
+        {
+            if entry.volume.is_none() {
+                entry.volume = Some(self.evaluator.sample_block_volume(
+                    &entry.function,
+                    self.min,
+                    self.size,
+                )?);
+            }
+            let rx = (i64::from(x) - i64::from(self.min[0])) as usize;
+            let ry = (i64::from(y) - i64::from(self.min[1])) as usize;
+            let rz = (i64::from(z) - i64::from(self.min[2])) as usize;
+            let index = (rz * self.size[0] as usize + rx) * self.size[1] as usize + ry;
+            Ok(entry.volume.as_ref().unwrap()[index])
+        } else {
+            Ok(self.evaluator.sample(&entry.function, x, y, z))
         }
     }
 }
@@ -724,5 +825,42 @@ mod tests {
         assert_eq!(inputs.randoms, 1);
         def["raw_ore_chance"] = json!(1.1);
         assert!(compiler.compile(&def).is_err());
+    }
+
+    #[test]
+    fn surface_density_sampler_validates_and_reuses_volume() {
+        let mut data = Data(BTreeMap::new());
+        assert!(
+            SurfaceDensitySampler::without_terrain_adjustments(
+                &mut data,
+                0,
+                WorldgenRandom::Legacy,
+                [0; 3],
+                [0, 1, 1]
+            )
+            .is_err()
+        );
+        let mut sampler = SurfaceDensitySampler::without_terrain_adjustments(
+            &mut data,
+            0,
+            WorldgenRandom::Legacy,
+            [-2, -4, 3],
+            [4, 8, 4],
+        )
+        .unwrap();
+        let def = json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,
+            "input":{"type":"gradient","axis":"y","from_coordinate":-16,"to_coordinate":16,"from_value":-1,"to_value":1}});
+        let first = sampler.sample(&def, true, -1, -3, 4).unwrap();
+        assert_eq!(
+            first.to_bits(),
+            sampler.sample(&def, true, -1, -3, 4).unwrap().to_bits()
+        );
+        assert_eq!(sampler.entries.len(), 1);
+        assert_eq!(sampler.entries[&def].volume.as_ref().unwrap().len(), 128);
+        let outside = sampler.sample(&def, true, 20, 5, 20).unwrap();
+        assert_eq!(
+            outside.to_bits(),
+            sampler.sample(&def, false, 20, 5, 20).unwrap().to_bits()
+        );
     }
 }

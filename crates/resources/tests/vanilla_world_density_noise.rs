@@ -1,11 +1,17 @@
 //! World-seeded density noise and cell-volume checks against Java 26.3.
+use native_resources::packs::ResourceId;
 use native_resources::{
     density::{DensityCompiler, DensityEvaluator, WorldgenRandom},
     noise_router::{NoiseRouter, RouterField},
     noise_stage::{NoiseMaterial, NoiseStageGenerator, select_without_aquifer},
     packs::{ResourceProvider, ResourceStack},
+    surface_rules::{
+        SurfaceDensitySampler, SurfaceInputs, SurfacePosition, SurfaceRandom, SurfaceRandomFactory,
+        SurfaceRuleCompiler,
+    },
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
 struct Data(BTreeMap<String, Vec<u8>>);
@@ -15,6 +21,40 @@ impl ResourceProvider for Data {
     }
     fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(self.0.get(path).cloned())
+    }
+}
+struct OreInputs<'a> {
+    density: SurfaceDensitySampler<'a, Data>,
+    random: SurfaceRandomFactory,
+}
+impl SurfaceInputs for OreInputs<'_> {
+    fn biome_matches(&mut self, _: &Value, _: &SurfacePosition) -> anyhow::Result<bool> {
+        anyhow::bail!("unexpected biome")
+    }
+    fn cold_enough_to_snow(&mut self, _: &SurfacePosition) -> anyhow::Result<bool> {
+        anyhow::bail!("unexpected temperature")
+    }
+    fn noise(&mut self, _: &ResourceId, _: bool, _: &SurfacePosition) -> anyhow::Result<f64> {
+        anyhow::bail!("unexpected noise")
+    }
+    fn positional_random(&mut self, _: &ResourceId, _: &SurfacePosition) -> anyhow::Result<f32> {
+        anyhow::bail!("unexpected gradient random")
+    }
+    fn ore_random(&mut self, p: &SurfacePosition) -> anyhow::Result<SurfaceRandom> {
+        Ok(self
+            .random
+            .at(&ResourceId::parse("minecraft:ore")?, p.x, p.y, p.z))
+    }
+    fn density(&mut self, v: &Value, in_chunk: bool, p: &SurfacePosition) -> anyhow::Result<f32> {
+        self.density.sample(v, in_chunk, p.x, p.y, p.z)
+    }
+    fn special_rule(
+        &mut self,
+        _: &str,
+        _: &Value,
+        _: &SurfacePosition,
+    ) -> anyhow::Result<Option<Arc<Value>>> {
+        anyhow::bail!("unexpected special rule")
     }
 }
 fn run(command: &mut Command) -> String {
@@ -431,6 +471,41 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             fixtures.push(fixture);
         }
     }
+    for ore in ["copper", "iron"] {
+        let path = format!("data/minecraft/worldgen/material_rule/overworld/{ore}_ore_vein.json");
+        let original: Value =
+            serde_json::from_slice(&sources.read_builtin_data(&path).unwrap().unwrap()).unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        let mut functions = Vec::new();
+        for field in ["density", "richness", "filler_gap"] {
+            functions.push(inline_installed(
+                original[field].clone(),
+                &mut sources,
+                &mut data,
+                &mut names,
+            ));
+        }
+        let mut noises = serde_json::Map::new();
+        for id in &names {
+            let path = format!(
+                "data/minecraft/worldgen/noise/{}.json",
+                id.strip_prefix("minecraft:").unwrap()
+            );
+            noises.insert(
+                id.clone(),
+                serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+            );
+        }
+        let mins = if ore == "copper" {
+            json!({"0":[-1024,0,-704],"2345":[-1024,0,592]})
+        } else {
+            json!({"0":[-1008,-60,-928],"2345":[-1024,-60,-880]})
+        };
+        fixtures.push(json!({"id":"minecraft:terrain","noises":noises,"router_mode":1,
+            "rust_expression":original["density"],"java_expression":functions[0],
+            "java_ore_functions":functions,"rust_ore_rule":original,"ore_min_by_seed":mins,"ore_size":[16,64,16],
+            "surface_density":true,"volume_min":[-17,-60,31],"volume_size":[5,9,5]}));
+    }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -452,6 +527,13 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     let mut material_index = 0;
     let mut material_samples = 0;
     let mut fluid_cases = 0;
+    let mut ore_values = None;
+    let mut ore_index = 0;
+    let mut ore_samples = 0;
+    let mut ore_nonempty = 0;
+    let mut ore_hits = BTreeMap::new();
+    let mut surface_density_values = None;
+    let mut surface_density_samples = 0;
     for line in output.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         match fields.first().copied() {
@@ -509,6 +591,9 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 chunk_index = 0;
                 material_chunk = None;
                 material_index = 0;
+                ore_values = None;
+                ore_index = 0;
+                surface_density_values = None;
                 groups += 1;
             }
             Some("P") | Some("Q") => {
@@ -552,6 +637,44 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     expected,
                     "volume fixture {index} mode {mode} seed {seed} at {x},{y},{z}"
                 );
+                if fixtures[*index].get("surface_density").is_some() {
+                    let surface = surface_density_values.get_or_insert_with(|| {
+                        let algorithm = if *mode == 0 {
+                            WorldgenRandom::Legacy
+                        } else {
+                            WorldgenRandom::Xoroshiro
+                        };
+                        let mut density = SurfaceDensitySampler::without_terrain_adjustments(
+                            &mut data, *seed, algorithm, min, size,
+                        )
+                        .unwrap();
+                        let mut values = Vec::new();
+                        for z in 0..size[2] {
+                            for x in 0..size[0] {
+                                for y in 0..size[1] {
+                                    values.push(
+                                        density
+                                            .sample(
+                                                &fixtures[*index]["rust_expression"],
+                                                true,
+                                                min[0] + x as i32,
+                                                min[1] + y as i32,
+                                                min[2] + z as i32,
+                                            )
+                                            .unwrap(),
+                                    );
+                                }
+                            }
+                        }
+                        values
+                    });
+                    assert_eq!(
+                        surface[(z * size[0] as usize + x) * size[1] as usize + y].to_bits(),
+                        expected,
+                        "material density fixture {index} at {x},{y},{z}"
+                    );
+                    surface_density_samples += 1;
+                }
                 volume_samples += 1;
             }
             Some("C") => {
@@ -624,6 +747,77 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 material_index += 1;
                 material_samples += 1;
             }
+            Some("O") => {
+                let (index, mode, seed, _) = compiled.as_ref().unwrap();
+                let fixture = &fixtures[*index];
+                let values = ore_values.get_or_insert_with(|| {
+                    let mut compiler = SurfaceRuleCompiler::new(&mut data);
+                    let rule = compiler.compile(&fixture["rust_ore_rule"]).unwrap();
+                    drop(compiler);
+                    let min = [0, 1, 2].map(|i| {
+                        fixture["ore_min_by_seed"][seed.to_string()][i]
+                            .as_i64()
+                            .unwrap() as i32
+                    });
+                    let size = [0, 1, 2].map(|i| fixture["ore_size"][i].as_u64().unwrap() as u32);
+                    let algorithm = if *mode == 0 {
+                        WorldgenRandom::Legacy
+                    } else {
+                        WorldgenRandom::Xoroshiro
+                    };
+                    let density = SurfaceDensitySampler::without_terrain_adjustments(
+                        &mut data, *seed, algorithm, min, size,
+                    )
+                    .unwrap();
+                    let mut inputs = OreInputs {
+                        density,
+                        random: SurfaceRandomFactory::new(*seed, algorithm),
+                    };
+                    let mut result = Vec::new();
+                    for z in 0..size[2] {
+                        for x in 0..size[0] {
+                            for y in 0..size[1] {
+                                let p = SurfacePosition {
+                                    x: min[0] + x as i32,
+                                    y: min[1] + y as i32,
+                                    z: min[2] + z as i32,
+                                    min_y: -64,
+                                    height: 384,
+                                    sea_level: 63,
+                                    stone_above: 0,
+                                    stone_below: 0,
+                                    surface_depth: 0,
+                                    surface_secondary: 0.0,
+                                    water_height: i32::MIN,
+                                    min_surface_level: 0,
+                                    gradient_x: 0,
+                                    gradient_z: 0,
+                                };
+                                let block = rule.evaluate(&p, &mut inputs).unwrap();
+                                let code = match block.as_deref() {
+                                    None => 0,
+                                    Some(v) if *v == fixture["rust_ore_rule"]["ore_block"] => 1,
+                                    Some(v) if *v == fixture["rust_ore_rule"]["raw_ore_block"] => 2,
+                                    Some(v) if *v == fixture["rust_ore_rule"]["filler_block"] => 3,
+                                    _ => panic!("unexpected ore block"),
+                                };
+                                result.push(code);
+                            }
+                        }
+                    }
+                    result
+                });
+                let actual = values[ore_index];
+                let expected: i32 = fields[1].parse().unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "ore fixture {index} seed {seed} index {ore_index}"
+                );
+                ore_nonempty += usize::from(actual != 0);
+                *ore_hits.entry((*index, *seed)).or_insert(0usize) += usize::from(actual != 0);
+                ore_index += 1;
+                ore_samples += 1;
+            }
             _ => {}
         }
     }
@@ -662,4 +856,12 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     assert_eq!(chunk_samples, 16 * 16 * (384 + 128 + 128));
     assert_eq!(fluid_cases, 7 * 16 * 7);
     assert_eq!(material_samples, 16 * 16 * (384 + 2 * 128));
+    assert_eq!(ore_samples, 2 * 2 * 16 * 64 * 16);
+    assert_eq!(surface_density_samples, 2 * 5 * 5 * 9 * 5);
+    assert!(ore_nonempty > 0, "ore fixtures must exercise filled veins");
+    assert_eq!(ore_hits.len(), 4);
+    assert!(
+        ore_hits.values().all(|hits| *hits > 0),
+        "every ore and seed must exercise filled veins: {ore_hits:?}"
+    );
 }

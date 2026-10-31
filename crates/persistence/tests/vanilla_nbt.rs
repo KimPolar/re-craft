@@ -430,6 +430,18 @@ public class PoiOracle {
     sections.put("0", PoiSection.Packed.CODEC.encodeStart(ops, second).getOrThrow());
     var root = new CompoundTag(); root.putInt("DataVersion", 5023); root.put("Sections", sections);
     NbtIo.write(root, Path.of(args[0], "poi.nbt"));
+    var invalid = new PoiSection.Packed(false, List.of(
+      new PoiRecord.Packed(new BlockPos(-1,-1,0), home, 0),
+      new PoiRecord.Packed(new BlockPos(-2,-2,1), home, 1)));
+    var refreshSections = new CompoundTag();
+    refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, invalid).getOrThrow());
+    var refreshRoot = new CompoundTag(); refreshRoot.putInt("DataVersion", 5023); refreshRoot.put("Sections", refreshSections);
+    NbtIo.write(refreshRoot, Path.of(args[0], "refresh-source.nbt"));
+    var meeting = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.MEETING);
+    var runtime = invalid.unpack(() -> {});
+    runtime.refresh(add -> { add.accept(new BlockPos(-1,-1,0), meeting); add.accept(new BlockPos(-3,-3,2), meeting); });
+    refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
+    NbtIo.write(refreshRoot, Path.of(args[0], "refresh-expected.nbt"));
     var data = new CompoundTag(); data.putInt("DataVersion", 5023);
     var level = new CompoundTag(); level.put("Data", data);
     NbtIo.writeCompressed(level, Path.of(args[0], "level.dat"));
@@ -507,6 +519,90 @@ public class PoiOracle {
             .arg("PoiOracle")
             .arg(temp.path())
             .arg(&edited),
+    );
+    use native_persistence::{
+        poi::refresh_section,
+        world::{ChunkPos, SavedPoiChunk},
+    };
+    use native_world::loaded::{self, BLOCK_COUNT};
+    use std::{collections::BTreeMap, sync::Arc};
+    let source = SavedPoiChunk {
+        position: ChunkPos { x: -1, z: 0 },
+        document: Arc::new(
+            nbt::read(&std::fs::read(temp.path().join("refresh-source.nbt")).unwrap()).unwrap(),
+        ),
+        sections: BTreeMap::new(),
+    };
+    let mut world = loaded::World::new("minecraft:overworld");
+    let air = world.intern_state(state("air", &[]));
+    let bell = world.intern_state(state("bell", &[]));
+    let mut blocks = Box::new([air; BLOCK_COUNT]);
+    blocks[15 + 15 * 256] = bell;
+    blocks[13 + 2 * 16 + 13 * 256] = bell;
+    let position = loaded::ChunkPos { x: -1, z: 0 };
+    world.chunks.insert(
+        position,
+        Arc::new(loaded::Chunk {
+            position,
+            status: Some("minecraft:full".into()),
+            block_light_correct: false,
+            sections: BTreeMap::from([(
+                -1,
+                Arc::new(loaded::Section {
+                    blocks: Some(blocks),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                }),
+            )]),
+        }),
+    );
+    let actual = refresh_section(
+        Some(&source),
+        source.position,
+        -1,
+        &world,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        actual.discarded_positions,
+        [[-2, -2, 1]].into_iter().collect()
+    );
+    let expected =
+        nbt::read(&std::fs::read(temp.path().join("refresh-expected.nbt")).unwrap()).unwrap();
+    let records = |doc: &NamedTag| -> BTreeMap<Vec<i32>, (String, i32)> {
+        let section = doc.value.get("Sections").unwrap().get("-1").unwrap();
+        assert_eq!(section.get("Valid"), Some(&Tag::Byte(1)));
+        let Some(Tag::List { values, .. }) = section.get("Records") else {
+            panic!()
+        };
+        values
+            .iter()
+            .map(|record| {
+                let Some(Tag::IntArray(pos)) = record.get("pos") else {
+                    panic!()
+                };
+                let Some(Tag::String(kind)) = record.get("type") else {
+                    panic!()
+                };
+                (
+                    pos.clone(),
+                    (
+                        kind.to_string_lossy(),
+                        record
+                            .get("free_tickets")
+                            .and_then(Tag::as_java_int)
+                            .unwrap_or(0),
+                    ),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        records(actual.document.as_ref().unwrap()),
+        records(&expected)
     );
 }
 

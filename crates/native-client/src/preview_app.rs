@@ -2216,6 +2216,7 @@ mod tests {
             game_mode: previous.game_mode,
             vitals: previous.vitals,
             hunger_effect: previous.hunger_effect,
+            poison_effect: previous.poison_effect,
             experience: previous.experience,
             death: previous.death,
             armor: previous.armor,

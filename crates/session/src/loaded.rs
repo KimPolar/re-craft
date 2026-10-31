@@ -396,6 +396,7 @@ pub struct LoadedSession {
     ground_support: Option<IVec3>,
     fall: crate::fall::FallTracker,
     damage_cooldown: crate::fall::DamageCooldown,
+    player_effect_tick: i32,
     accumulated: Duration,
     tick: u64,
     revision: u64,
@@ -1341,6 +1342,7 @@ impl LoadedSession {
         self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
         Arc::make_mut(&mut self.snapshot).hunger_effect = self.fall.effects().hunger.is_some();
+        Arc::make_mut(&mut self.snapshot).poison_effect = self.fall.effects().poison.is_some();
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -2710,6 +2712,7 @@ impl LoadedSession {
             game_mode: self.game_mode,
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
+            poison_effect: self.fall.effects().poison.is_some(),
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
@@ -2818,6 +2821,7 @@ impl LoadedSession {
             game_mode: GameMode::default(),
             vitals: crate::survival::PlayerVitals::default(),
             hunger_effect: false,
+            poison_effect: false,
             experience: crate::experience::Experience::default(),
             death: None,
             armor: Some(crate::ArmorValues::default()),
@@ -2956,6 +2960,7 @@ impl LoadedSession {
             ground_support: None,
             fall: crate::fall::FallTracker::default(),
             damage_cooldown: crate::fall::DamageCooldown::default(),
+            player_effect_tick: 0,
             accumulated: Duration::ZERO,
             tick: 0,
             revision: 0,
@@ -5308,6 +5313,7 @@ impl LoadedSession {
         self.movement_speed_cache = None;
         self.fall.reset_after_death();
         self.damage_cooldown = crate::fall::DamageCooldown::default();
+        self.player_effect_tick = 0;
         self.breathing_effects = crate::survival::BreathingEffects::default();
         self.effect_save_invalid = true;
         if let Some((attribute, _)) = &mut self.oxygen_equipment {
@@ -9946,6 +9952,7 @@ impl LoadedSession {
             return;
         }
         self.damage_cooldown.tick();
+        self.player_effect_tick = self.player_effect_tick.wrapping_add(1);
         self.use_repeat.advance_tick();
         let mut repeated_use = false;
         loop {
@@ -10523,6 +10530,22 @@ impl LoadedSession {
                     .as_ref()
                     .is_some_and(|effect| effect.duration != -1 && effect.duration <= 1)
             });
+        if self.vitals.health > 1.0
+            && self.fall.effects().poison_due(self.player_effect_tick)
+            && let Err(error) = self.fall.damage(
+                1.0,
+                "minecraft:magic",
+                &self.inventory,
+                self.armor.value(),
+                &mut self.vitals,
+                self.game_mode,
+                Some(&mut self.damage_cooldown),
+            )
+        {
+            self.stream_errors
+                .push(format!("player poison damage: {error:#}"));
+            self.effect_save_invalid = true;
+        }
         self.fall
             .effects()
             .apply_hunger(&mut self.vitals, self.game_mode);
@@ -11333,6 +11356,7 @@ impl GameSession for LoadedSession {
                 game_mode: self.game_mode,
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
+                poison_effect: self.fall.effects().poison.is_some(),
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),
@@ -27372,6 +27396,119 @@ mod tests {
                 .unwrap()
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn poison_with_unknown_damage_tags_blocks_effect_save_draft() {
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                poison: Some(crate::survival::EffectDuration {
+                    amplifier: 0,
+                    duration: 25,
+                    hidden: None,
+                }),
+                ..Default::default()
+            },
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.update(TICK);
+        assert_eq!(session.vitals.health, 20.0);
+        assert!(session.effect_save_invalid);
+        assert!(
+            session
+                .stream_errors
+                .iter()
+                .any(|error| error.contains("poison damage"))
+        );
+    }
+
+    #[test]
+    fn saved_poison_ticks_through_the_shared_damage_pipeline() {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if path == "tags/damage_type" {
+                    [
+                        "bypasses_cooldown",
+                        "bypasses_armor",
+                        "bypasses_effects",
+                        "bypasses_resistance",
+                        "bypasses_enchantments",
+                    ]
+                    .into_iter()
+                    .map(|name| ResourceId::parse(&format!("minecraft:{name}")))
+                    .collect()
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                if path.contains("tags/damage_type/") {
+                    Ok(Some(if path.ends_with("bypasses_armor.json") {
+                        br#"{"values":["minecraft:magic"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let mut session = session();
+        session.set_survival_rules(crate::survival::SurvivalRules {
+            natural_health_regeneration: false,
+            ..Default::default()
+        });
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "active_effects".into(),
+                native_persistence::nbt::Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: vec![native_persistence::nbt::Tag::Compound(vec![
+                        (
+                            "id".into(),
+                            native_persistence::nbt::Tag::String("minecraft:poison".into()),
+                        ),
+                        ("duration".into(), native_persistence::nbt::Tag::Int(25)),
+                    ])],
+                },
+            )]),
+        };
+        let effects = crate::player_data::read_saved_fall_effects(&original).unwrap();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            effects,
+            Arc::new(OxygenEnchantments::load(&mut Data).unwrap()),
+        );
+        session.vitals.health = 1.5;
+        session.update(TICK);
+        assert_eq!(session.snapshot().vitals.health, 0.5);
+        assert!(session.snapshot().poison_effect);
+        for _ in 0..24 {
+            session.update(TICK);
+        }
+        assert_eq!(session.snapshot().vitals.health, 0.5);
+        assert!(!session.snapshot().poison_effect);
+        let advanced = crate::player_data::advance_saved_effects(&original, 25)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(advanced, native_persistence::nbt::Tag::List { values, .. } if values.is_empty())
+        );
+        assert!(
+            session.stream_errors.is_empty(),
+            "{:?}",
+            session.stream_errors
         );
     }
 

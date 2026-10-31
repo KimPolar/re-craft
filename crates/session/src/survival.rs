@@ -728,9 +728,27 @@ pub struct FallEffects {
     pub haste: Option<EffectDuration>,
     pub mining_fatigue: Option<EffectDuration>,
     pub hunger: Option<EffectDuration>,
+    pub poison: Option<EffectDuration>,
 }
 
 impl FallEffects {
+    /// Java uses the entity tick count for an infinite effect and its remaining
+    /// duration otherwise. Java masks the shift distance to five bits.
+    pub(crate) fn poison_due(&self, entity_tick: i32) -> bool {
+        self.poison.as_ref().is_some_and(|effect| {
+            if !effect.has_time() {
+                return false;
+            }
+            let interval = 25_i32 >> (u32::from(effect.amplifier) & 31);
+            let elapsed = if effect.duration == -1 {
+                entity_tick
+            } else {
+                effect.duration
+            };
+            interval <= 0 || elapsed % interval == 0
+        })
+    }
+
     pub fn apply_hunger(&self, vitals: &mut PlayerVitals, mode: crate::GameMode) {
         if let Some(effect) = &self.hunger
             && effect.has_time()
@@ -752,6 +770,7 @@ impl FallEffects {
         EffectDuration::tick(&mut self.haste);
         EffectDuration::tick(&mut self.mining_fatigue);
         EffectDuration::tick(&mut self.hunger);
+        EffectDuration::tick(&mut self.poison);
     }
 }
 
@@ -1533,6 +1552,96 @@ mod tests {
                 row["next_bits"].as_i64().unwrap() as i32 as u32,
                 "{row}"
             );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn poison_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PoisonEffectOracle.java");
+        let output = temp.path().join("poison.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PoisonEffectOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("PoisonEffectOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java poison oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 256);
+        for row in rows {
+            let mut health = row["health"].as_f64().unwrap() as f32;
+            let mut effects = FallEffects {
+                poison: Some(EffectDuration {
+                    amplifier: row["amplifier"].as_u64().unwrap() as u8,
+                    duration: row["duration"].as_i64().unwrap() as i32,
+                    hidden: None,
+                }),
+                ..Default::default()
+            };
+            for (index, expected) in row["ticks"].as_array().unwrap().iter().enumerate() {
+                let hit = health > 1.0 && effects.poison_due(index as i32 + 1);
+                if hit {
+                    health -= 1.0;
+                }
+                effects.tick();
+                assert_eq!(hit, expected["hit"].as_bool().unwrap(), "{row}");
+                assert_eq!(
+                    health.to_bits(),
+                    expected["health_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    effects.poison.is_some(),
+                    expected["active"].as_bool().unwrap(),
+                    "{row}"
+                );
+                if let Some(effect) = &effects.poison {
+                    assert_eq!(
+                        effect.duration,
+                        expected["duration"].as_i64().unwrap() as i32,
+                        "{row}"
+                    );
+                }
+            }
         }
     }
 

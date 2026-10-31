@@ -403,6 +403,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "haste") => &mut effects.haste,
             ("minecraft", "mining_fatigue") => &mut effects.mining_fatigue,
             ("minecraft", "hunger") => &mut effects.hunger,
+            ("minecraft", "poison") => &mut effects.poison,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1239,6 +1240,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "conduit_power"
                         | "breath_of_the_nautilus"
                         | "hunger"
+                        | "poison"
                 ),
             "unsupported status effect {id}"
         );

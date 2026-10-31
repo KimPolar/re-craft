@@ -17,6 +17,7 @@ pub struct HudDisplay {
     absorption: i32,
     food: i32,
     hunger_effect: bool,
+    poison_effect: bool,
     empty_saturation: bool,
     hardcore: bool,
     air: Option<AirBubbles>,
@@ -75,6 +76,7 @@ impl HudDisplay {
             absorption,
             food: vitals.food,
             hunger_effect: false,
+            poison_effect: false,
             empty_saturation: vitals.saturation <= 0.0,
             hardcore: vitals.hardcore,
             air,
@@ -88,6 +90,11 @@ impl HudDisplay {
 
     pub fn with_hunger_effect(mut self, hunger_effect: bool) -> Self {
         self.hunger_effect = hunger_effect;
+        self
+    }
+
+    pub fn with_poison_effect(mut self, poison_effect: bool) -> Self {
+        self.poison_effect = poison_effect;
         self
     }
 
@@ -120,6 +127,10 @@ enum Sprite {
     HeartHalf,
     HeartHardcoreFull,
     HeartHardcoreHalf,
+    HeartPoisonedFull,
+    HeartPoisonedHalf,
+    HeartPoisonedHardcoreFull,
+    HeartPoisonedHardcoreHalf,
     AbsorptionFull,
     AbsorptionHalf,
     AbsorptionHardcoreFull,
@@ -147,6 +158,10 @@ impl Sprite {
             Self::HeartHalf => &sprites.heart_half,
             Self::HeartHardcoreFull => &sprites.heart_hardcore_full,
             Self::HeartHardcoreHalf => &sprites.heart_hardcore_half,
+            Self::HeartPoisonedFull => &sprites.heart_poisoned_full,
+            Self::HeartPoisonedHalf => &sprites.heart_poisoned_half,
+            Self::HeartPoisonedHardcoreFull => &sprites.heart_poisoned_hardcore_full,
+            Self::HeartPoisonedHardcoreHalf => &sprites.heart_poisoned_hardcore_half,
             Self::AbsorptionFull => &sprites.absorption_full,
             Self::AbsorptionHalf => &sprites.absorption_half,
             Self::AbsorptionHardcoreFull => &sprites.absorption_hardcore_full,
@@ -234,11 +249,15 @@ fn placements(hud: HudDisplay, width: i32, height: i32, tick: u64) -> Vec<Placem
         }
         if units < hud.health {
             let half = units + 1 == hud.health;
-            let sprite = match (hud.hardcore, half) {
-                (false, false) => Sprite::HeartFull,
-                (false, true) => Sprite::HeartHalf,
-                (true, false) => Sprite::HeartHardcoreFull,
-                (true, true) => Sprite::HeartHardcoreHalf,
+            let sprite = match (hud.poison_effect, hud.hardcore, half) {
+                (false, false, false) => Sprite::HeartFull,
+                (false, false, true) => Sprite::HeartHalf,
+                (false, true, false) => Sprite::HeartHardcoreFull,
+                (false, true, true) => Sprite::HeartHardcoreHalf,
+                (true, false, false) => Sprite::HeartPoisonedFull,
+                (true, false, true) => Sprite::HeartPoisonedHalf,
+                (true, true, false) => Sprite::HeartPoisonedHardcoreFull,
+                (true, true, true) => Sprite::HeartPoisonedHardcoreHalf,
             };
             result.push(Placement { sprite, x, y });
         }
@@ -345,6 +364,10 @@ mod tests {
             Sprite::HeartHalf => "hud/heart/half",
             Sprite::HeartHardcoreFull => "hud/heart/hardcore_full",
             Sprite::HeartHardcoreHalf => "hud/heart/hardcore_half",
+            Sprite::HeartPoisonedFull => "hud/heart/poisoned_full",
+            Sprite::HeartPoisonedHalf => "hud/heart/poisoned_half",
+            Sprite::HeartPoisonedHardcoreFull => "hud/heart/poisoned_hardcore_full",
+            Sprite::HeartPoisonedHardcoreHalf => "hud/heart/poisoned_hardcore_half",
             Sprite::AbsorptionFull => "hud/heart/absorbing_full",
             Sprite::AbsorptionHalf => "hud/heart/absorbing_half",
             Sprite::AbsorptionHardcoreFull => "hud/heart/absorbing_hardcore_full",
@@ -358,6 +381,37 @@ mod tests {
             Sprite::Air => "hud/air",
             Sprite::AirBursting => "hud/air_bursting",
             Sprite::AirEmpty => "hud/air_empty",
+        }
+    }
+
+    #[test]
+    fn poison_uses_pack_heart_sprites_including_hardcore_and_half_hearts() {
+        for hardcore in [false, true] {
+            let vitals = PlayerVitals {
+                health: 19.0,
+                hardcore,
+                ..Default::default()
+            };
+            let sprites: Vec<_> = placements(
+                HudDisplay::new(vitals, GameMode::Survival).with_poison_effect(true),
+                320,
+                240,
+                1,
+            )
+            .into_iter()
+            .map(|placement| placement.sprite)
+            .collect();
+            assert!(sprites.contains(&if hardcore {
+                Sprite::HeartPoisonedHardcoreFull
+            } else {
+                Sprite::HeartPoisonedFull
+            }));
+            assert!(sprites.contains(&if hardcore {
+                Sprite::HeartPoisonedHardcoreHalf
+            } else {
+                Sprite::HeartPoisonedHalf
+            }));
+            assert!(!sprites.contains(&Sprite::HeartFull));
         }
     }
 
@@ -430,11 +484,11 @@ public class SurvivalHudOracle {
     static final class TestPlayer extends Player {
         TestLevel testLevel;
         FoodData food;
-        int air; boolean eyes; boolean hunger; int armor;
+        int air; boolean eyes; boolean hunger; boolean poison; int armor;
         TestPlayer() { super(null, null); }
         @Override public Level level() { return testLevel; }
         @Override public FoodData getFoodData() { return food; }
-        @Override public boolean hasEffect(Holder<MobEffect> effect) { return hunger && effect == net.minecraft.world.effect.MobEffects.HUNGER; }
+        @Override public boolean hasEffect(Holder<MobEffect> effect) { return (hunger && effect == net.minecraft.world.effect.MobEffects.HUNGER) || (poison && effect == net.minecraft.world.effect.MobEffects.POISON); }
         @Override public boolean isFullyFrozen() { return false; }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
         @Override public int getAirSupply() { return air; }
@@ -474,6 +528,7 @@ public class SurvivalHudOracle {
             player.armor = c.has("armor") ? c.get("armor").getAsInt() : 0;
             player.eyes = c.has("eyes") && c.get("eyes").getAsBoolean();
             player.hunger = c.has("hunger") && c.get("hunger").getAsBoolean();
+            player.poison = c.has("poison") && c.get("poison").getAsBoolean();
             int tick = c.get("tick").getAsInt(); ticks.setInt(hud, tick); ((RandomSource) rng.get(hud)).setSeed((long)(tick * 312871));
             int health = (int)Math.ceil(c.get("health").getAsFloat());
             int absorb = (int)Math.ceil(c.get("absorption").getAsFloat());
@@ -577,6 +632,15 @@ public class SurvivalHudOracle {
                 cases.push(json!({"health":3,"max_health":20.0,"absorption":0,"food":food,"saturation":0.0,"hardcore":false,"tick":tick,"hunger":true}));
             }
         }
+        for health in [1.0, 3.0, 9.5, 19.0, 20.0] {
+            for hardcore in [false, true] {
+                for absorption in [0.0, 1.0, 4.0] {
+                    for tick in [0, 1, 21, 62] {
+                        cases.push(json!({"health":health,"max_health":20.0,"absorption":absorption,"food":20,"saturation":5.0,"hardcore":hardcore,"tick":tick,"poison":true}));
+                    }
+                }
+            }
+        }
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SurvivalHudOracle.java");
         let input = temp.path().join("input.json");
@@ -619,7 +683,8 @@ public class SurvivalHudOracle {
                     armor: case["armor"].as_f64().unwrap_or(0.0),
                     toughness: 0.0,
                 }))
-                .with_hunger_effect(case["hunger"].as_bool().unwrap_or(false)),
+                .with_hunger_effect(case["hunger"].as_bool().unwrap_or(false))
+                .with_poison_effect(case["poison"].as_bool().unwrap_or(false)),
                 320,
                 240,
                 case["tick"].as_u64().unwrap(),

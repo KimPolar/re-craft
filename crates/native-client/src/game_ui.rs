@@ -1589,7 +1589,8 @@ impl GameUi {
         self.hud =
             HudDisplay::with_air(snapshot.vitals, snapshot.game_mode, snapshot.eyes_in_water)
                 .with_armor(snapshot.armor)
-                .with_hunger_effect(snapshot.hunger_effect);
+                .with_hunger_effect(snapshot.hunger_effect)
+                .with_poison_effect(snapshot.poison_effect);
         self.experience =
             crate::experience_hud::Display::new(snapshot.experience, snapshot.game_mode);
     }

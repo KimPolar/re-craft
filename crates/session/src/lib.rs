@@ -371,6 +371,7 @@ pub struct WorldSnapshot {
     pub game_mode: GameMode,
     pub vitals: survival::PlayerVitals,
     pub hunger_effect: bool,
+    pub poison_effect: bool,
     pub experience: experience::Experience,
     pub death: Option<DeathInfo>,
     /// None means the equipped modifiers could not be resolved safely.
@@ -461,6 +462,7 @@ pub struct LocalSession {
     ground_without_support: bool,
     fall: fall::FallTracker,
     damage_cooldown: fall::DamageCooldown,
+    player_effect_tick: i32,
     accumulated: Duration,
     tick: u64,
     snapshot: Arc<WorldSnapshot>,
@@ -524,6 +526,7 @@ impl LocalSession {
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
             hunger_effect: false,
+            poison_effect: false,
             experience: experience::Experience::default(),
             death: None,
             armor: Some(ArmorValues::default()),
@@ -591,6 +594,7 @@ impl LocalSession {
             ground_without_support: false,
             fall: fall::FallTracker::default(),
             damage_cooldown: fall::DamageCooldown::default(),
+            player_effect_tick: 0,
             accumulated: Duration::ZERO,
             tick: 0,
             snapshot,
@@ -686,6 +690,7 @@ impl LocalSession {
             game_mode: self.game_mode,
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
+            poison_effect: self.fall.effects().poison.is_some(),
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
@@ -952,6 +957,7 @@ impl LocalSession {
             return;
         }
         self.damage_cooldown.tick();
+        self.player_effect_tick = self.player_effect_tick.wrapping_add(1);
         self.use_repeat.advance_tick();
         let mut repeated_use = false;
         loop {
@@ -1325,6 +1331,20 @@ impl LocalSession {
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
         self.process_food_events();
+        if self.vitals.health > 1.0
+            && self.fall.effects().poison_due(self.player_effect_tick)
+            && let Err(error) = self.fall.damage(
+                1.0,
+                "minecraft:magic",
+                &self.inventory,
+                self.armor.value(),
+                &mut self.vitals,
+                self.game_mode,
+                Some(&mut self.damage_cooldown),
+            )
+        {
+            eprintln!("player poison damage: {error:#}");
+        }
         self.fall
             .effects()
             .apply_hunger(&mut self.vitals, self.game_mode);
@@ -1687,6 +1707,7 @@ impl LocalSession {
         self.previous_sneak = false;
         self.fall_distance = 0.0;
         self.damage_cooldown = fall::DamageCooldown::default();
+        self.player_effect_tick = 0;
         self.ground_without_support = false;
         self.fall = fall::FallTracker::default();
         self.food_use = survival::FoodUse::default();
@@ -1728,6 +1749,7 @@ impl GameSession for LocalSession {
                 game_mode: self.game_mode,
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
+                poison_effect: self.fall.effects().poison.is_some(),
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),

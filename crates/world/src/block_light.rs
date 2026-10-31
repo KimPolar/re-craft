@@ -431,6 +431,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:bamboo_mosaic"
         | "minecraft:soul_sand"
         | "minecraft:soul_soil"
+        | "minecraft:snow_block"
         | "minecraft:smooth_stone"
             if state.properties.is_empty() =>
         {
@@ -2294,6 +2295,7 @@ mod tests {
             "deepslate_lapis_ore",
             "emerald_ore",
             "deepslate_emerald_ore",
+            "snow_block",
         ] {
             states.push(state(name, None));
         }

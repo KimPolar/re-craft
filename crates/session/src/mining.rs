@@ -82,6 +82,7 @@ pub enum Material {
     Sand,
     Gravel,
     Snow,
+    SnowBlock,
     DirtPath,
     Stone,
     StoneBricks,
@@ -117,6 +118,7 @@ impl Material {
             "minecraft:sand" | "minecraft:red_sand" => Some(Self::Sand),
             "minecraft:gravel" => Some(Self::Gravel),
             "minecraft:snow" => Some(Self::Snow),
+            "minecraft:snow_block" => Some(Self::SnowBlock),
             "minecraft:stone" => Some(Self::Stone),
             "minecraft:stone_bricks" => Some(Self::StoneBricks),
             "minecraft:stone_button" => Some(Self::StoneButton),
@@ -199,6 +201,7 @@ impl Material {
             Self::Dirt | Self::Sand | Self::StoneButton | Self::WoodButton | Self::Lever => 0.5,
             Self::DirtPath => 0.65,
             Self::Snow => 0.1,
+            Self::SnowBlock => 0.2,
             Self::RedstoneLamp => 0.3,
             Self::RedstoneBlock => 5.0,
             Self::Stone | Self::StoneBricks => 1.5,
@@ -224,6 +227,7 @@ impl Material {
                 | Self::RedstoneBlock
                 | Self::Ore { .. }
                 | Self::Snow
+                | Self::SnowBlock
         )
     }
 }
@@ -314,6 +318,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::Sand
                 | Material::Gravel
                 | Material::Snow
+                | Material::SnowBlock
         ),
         "pickaxe" => matches!(
             material,
@@ -338,7 +343,9 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
     Some(MiningProperties {
         speed: if effective { speed } else { 1.0 },
         correct_for_drops: !material.needs_tool()
-            || (kind == "shovel" && material == Material::Snow && effective)
+            || (kind == "shovel"
+                && matches!(material, Material::Snow | Material::SnowBlock)
+                && effective)
             || (kind == "pickaxe"
                 && effective
                 && match material {

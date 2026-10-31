@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 38] = [
+const BASIC_BLOCKS: [&str; 39] = [
     "grass_block",
     "dirt",
     "sand",
@@ -49,6 +49,7 @@ const BASIC_BLOCKS: [&str; 38] = [
     "chest",
     "trapped_chest",
     "snow",
+    "snow_block",
 ];
 
 /// Loot functions consume both floating-point and bounded integer random values.

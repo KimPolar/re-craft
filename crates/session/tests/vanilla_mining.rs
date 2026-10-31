@@ -134,7 +134,6 @@ fn ore_experience_and_silk_touch_match_vanilla() {
         "deepslate_redstone_ore",
         "nether_gold_ore",
         "nether_quartz_ore",
-        "snow",
     ];
     let mut cases = Vec::new();
     for seed in -50..50 {
@@ -2595,6 +2594,8 @@ fn ore_and_snow_mining_and_harvest_tiers_match_vanilla() {
         "deepslate_redstone_ore",
         "nether_gold_ore",
         "nether_quartz_ore",
+        "snow",
+        "snow_block",
     ];
     run(Command::new(java.join("java.exe"))
         .arg("-classpath")

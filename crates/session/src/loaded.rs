@@ -5450,6 +5450,44 @@ impl LoadedSession {
         self.set(target, id).then_some(hand)
     }
 
+    fn place_snow_block(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if held.id() != "minecraft:snow_block" || held.max_count().is_none() {
+            return None;
+        }
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let target = if button_can_replace(self.world.state(clicked)?)? {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        if button_can_replace(self.world.state(existing)?) != Some(true)
+            || player_intersects_block(self.player, target, Block::Stone)
+        {
+            return None;
+        }
+        let id = self.intern_block(state("minecraft:snow_block", &[]));
+        self.set(target, id).then_some(hand)
+    }
+
     /// Test candidate supports in Java's view-dependent order. An unknown
     /// earlier support cannot safely be skipped in favour of a later one.
     fn place_button(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -6073,7 +6111,13 @@ impl LoadedSession {
             .cloned();
         let properties = mining::Material::from_block_name(&name)
             .and_then(|material| mining::mining_properties(material, hand.as_ref()));
-        let snow_drops = if name == "minecraft:snow"
+        if matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block")
+            && self.game_mode != GameMode::Creative
+            && properties.is_none()
+        {
+            return;
+        }
+        let snow_drops = if matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block")
             && self.game_mode != GameMode::Creative
             && self.block_drops
             && properties.is_some_and(|properties| properties.correct_for_drops)
@@ -6081,7 +6125,9 @@ impl LoadedSession {
             let Some(state) = self.world.state(id) else {
                 return;
             };
-            if native_world::collision::snow_layers(state).is_none() {
+            if (name == "minecraft:snow" && native_world::collision::snow_layers(state).is_none())
+                || (name == "minecraft:snow_block" && !state.properties.is_empty())
+            {
                 return;
             }
             match self.dropped_items.prepare_player_block_drops(
@@ -6116,7 +6162,7 @@ impl LoadedSession {
                     drops,
                     true,
                 );
-            } else if name != "minecraft:snow" {
+            } else if !matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block") {
                 self.dropped_items.drop_block(
                     absolute,
                     &name,
@@ -8474,6 +8520,7 @@ impl LoadedSession {
                                         | "minecraft:redstone_block"
                                         | "minecraft:lever"
                                         | "minecraft:snow"
+                                        | "minecraft:snow_block"
                                         | "minecraft:chest"
                                         | "minecraft:trapped_chest"
                                 )
@@ -8526,6 +8573,7 @@ impl LoadedSession {
                                     .place_button(hit)
                                     .or_else(|| self.place_redstone(hit))
                                     .or_else(|| self.place_snow(hit))
+                                    .or_else(|| self.place_snow_block(hit))
                                     .or_else(|| self.place_chest(hit))
                             {
                                 handled = true;
@@ -10184,13 +10232,18 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         block_outline(block).is_some()
     } else if block.name == "minecraft:redstone_lamp" {
         redstone_lamp_lit(block).is_some()
+    } else if block.name == "minecraft:snow" {
+        native_world::collision::snow_layers(block).is_some()
     } else if matches!(
         block.name.as_str(),
         "minecraft:chest" | "minecraft:trapped_chest"
     ) {
         block_shape(block).is_some()
     } else {
-        block.name == "minecraft:redstone_block" && block.properties.is_empty()
+        matches!(
+            block.name.as_str(),
+            "minecraft:redstone_block" | "minecraft:snow_block"
+        ) && block.properties.is_empty()
     };
     if !supported {
         return None;
@@ -10799,6 +10852,201 @@ mod tests {
                     .is_none()
             );
             assert!(session.dropped_items.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn snow_block_placement_and_mining_use_vanilla_loot() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for silk in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&registry),
+                )
+                .unwrap();
+            let relative = IVec3::new(4, 1, 4);
+            let stack = ItemStack::new("minecraft:snow_block".into(), 1, 64, Tag::Compound(vec![]))
+                .unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(stack))
+            );
+            let hit = ShapeRayHit {
+                position: relative + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(session.place_snow_block(hit), Some(PlayerSlot::Storage(0)));
+            let pos = session.origin + relative;
+            let placed = session.world.block(pos.x, pos.y, pos.z).unwrap();
+            assert_eq!(placed.name, "minecraft:snow_block");
+            assert_eq!(
+                picked_loaded_block_item(placed).unwrap().id(),
+                "minecraft:snow_block"
+            );
+            let components = if silk {
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("minecraft:silk_touch".into(), Tag::Int(1))]),
+                )])
+            } else {
+                Tag::Compound(vec![])
+            };
+            let tool = ItemStack::new("minecraft:iron_shovel".into(), 1, 1, components).unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool))
+            );
+            session.finish_breaking(pos);
+            assert_eq!(
+                session.world.block(pos.x, pos.y, pos.z).unwrap().name,
+                "minecraft:air"
+            );
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(
+                drops[0].stack.id(),
+                if silk {
+                    "minecraft:snow_block"
+                } else {
+                    "minecraft:snowball"
+                }
+            );
+            assert_eq!(drops[0].stack.count(), if silk { 1 } else { 4 });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn snowballs_craft_snow_block_in_player_inventory() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{packs::ResourceStack, recipes::CraftingRecipes};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let recipes = CraftingRecipes::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        for index in 0..4 {
+            let snowball =
+                ItemStack::new("minecraft:snowball".into(), 1, 16, Tag::Compound(vec![])).unwrap();
+            assert!(inventory.set_slot(PlayerSlot::Crafting(index), Some(snowball)));
+        }
+        inventory.refresh_crafting(&recipes);
+        let output = inventory.slot(PlayerSlot::CraftResult).unwrap();
+        assert_eq!((output.id(), output.count()), ("minecraft:snow_block", 1));
+        assert!(inventory.take_crafting_result(&recipes));
+        assert_eq!(inventory.cursor().unwrap().id(), "minecraft:snow_block");
+        assert!((0..4).all(|index| inventory.slot(PlayerSlot::Crafting(index)).is_none()));
+    }
+
+    #[test]
+    fn snow_block_placement_replaces_thin_snow_and_respects_collision() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_player_inventory(PlayerInventory::default());
+        let stack =
+            ItemStack::new("minecraft:snow_block".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        assert!(Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Offhand, Some(stack)));
+        let pos = IVec3::new(4, 1, 4);
+        let snow = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+        assert!(session.set(pos, snow));
+        let hit = ShapeRayHit {
+            position: pos,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        session.player.position = Vec3::new(4.5, 1.0, 4.5);
+        assert!(session.place_snow_block(hit).is_none());
+        session.player.position = Vec3::new(8.5, 1.0, 8.5);
+        assert_eq!(session.place_snow_block(hit), Some(PlayerSlot::Offhand));
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, pos, session.states[0]), Cell::State(id) if session.world.state(id).unwrap().name == "minecraft:snow_block")
+        );
+    }
+
+    #[test]
+    fn snow_block_use_consumes_only_in_survival() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:snow_block".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let target = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                assert_eq!(
+                    target.name,
+                    if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                        "minecraft:snow_block"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snow_break_is_deferred_for_unknown_tool_components() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for name in ["minecraft:snow", "minecraft:snow_block"] {
+            let mut session = session();
+            let item =
+                ItemStack::unresolved("example:unknown_tool".into(), 1, Tag::Compound(vec![]))
+                    .unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(item))
+            );
+            let relative = IVec3::new(4, 1, 4);
+            let block = if name == "minecraft:snow" {
+                state(name, &[("layers", "1")])
+            } else {
+                state(name, &[])
+            };
+            let id = session.intern_block(block);
+            assert!(session.set(relative, id));
+            session.finish_breaking(session.origin + relative);
+            assert!(
+                matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(current) if current == id)
+            );
         }
     }
 

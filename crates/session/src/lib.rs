@@ -466,7 +466,12 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
-    fn spawn_food_remainders(&mut self) {
+    fn process_food_events(&mut self) {
+        for event in self.food_use.take_events() {
+            if event.apply(&mut self.player_random) {
+                self.fall.add_hunger(600, 0);
+            }
+        }
         for stack in self.food_use.take_drops() {
             self.dropped_items.drop_player(
                 stack,
@@ -1269,7 +1274,7 @@ impl LocalSession {
                 }
                 PlayerCommand::Place => {}
             }
-            self.spawn_food_remainders();
+            self.process_food_events();
             update_recipe_unlocks(
                 &mut self.inventory,
                 &before_inventory,
@@ -1305,7 +1310,11 @@ impl LocalSession {
         }
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
-        self.spawn_food_remainders();
+        self.process_food_events();
+        self.fall
+            .effects()
+            .apply_hunger(&mut self.vitals, self.game_mode);
+        self.fall.tick_effects();
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
@@ -1527,7 +1536,7 @@ impl LocalSession {
         if self.death.is_none() {
             self.food_use
                 .tick(&mut self.inventory, &mut self.vitals, self.game_mode);
-            self.spawn_food_remainders();
+            self.process_food_events();
         }
         self.selected_block = selected_inventory_block(&self.inventory);
         self.first_person.item_use = self.food_use.visual_state();

@@ -277,7 +277,11 @@ fn food_ticks_match_vanilla_with_mocked_damage() {
             "{id}"
         );
         assert_eq!(properties["always"], false, "{id}");
-        assert_eq!(properties["effects"], 0, "{id}");
+        assert_eq!(
+            properties["effects"],
+            if id == "minecraft:rotten_flesh" { 1 } else { 0 },
+            "{id}"
+        );
         assert_eq!(
             properties["remainder"].as_bool().unwrap(),
             matches!(
@@ -287,7 +291,7 @@ fn food_ticks_match_vanilla_with_mocked_damage() {
             "{id}"
         );
     }
-    assert_eq!(tested_foods, 30);
+    assert_eq!(tested_foods, 31);
     let results: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     for (case, ticks) in cases.iter().zip(results.as_array().unwrap()) {
         let difficulty = match case["difficulty"].as_str().unwrap() {

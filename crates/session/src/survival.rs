@@ -6,8 +6,8 @@ use native_persistence::world::Difficulty;
 use native_resources::packs::ResourceId;
 use std::sync::Arc;
 
-/// Foods without consumption effects. Known container remainders are handled
-/// separately after the food is consumed.
+/// Supported food properties. Consumption effects and container remainders
+/// are handled separately after the food is consumed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FoodProperties {
     pub nutrition: i32,
@@ -24,6 +24,7 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         "beetroot" => (1, 0.6),
         "carrot" => (3, 0.6),
         "cod" | "salmon" | "cookie" | "sweet_berries" | "glow_berries" => (2, 0.1),
+        "rotten_flesh" => (4, 0.1),
         "cooked_beef" | "cooked_porkchop" => (8, 0.8),
         "cooked_chicken" | "mushroom_stew" | "beetroot_soup" => (6, 0.6),
         "rabbit_stew" => (10, 0.6),
@@ -210,6 +211,35 @@ pub struct FoodUse {
     held: bool,
     repeat: bool,
     drops: Vec<ItemStack>,
+    events: Vec<FoodRandomEvent>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FoodRandomEvent {
+    ParticlePulse(u8),
+    Finish { causes_hunger: bool },
+}
+
+impl FoodRandomEvent {
+    /// Advance the player's stream for the sound and particle calculations
+    /// Java performs even when their visual output is not yet rendered.
+    pub(crate) fn apply(self, random: &mut native_core::random::LegacyRandom) -> bool {
+        let particles = match self {
+            Self::ParticlePulse(count) => count,
+            Self::Finish { .. } => 16,
+        };
+        random.next_bool();
+        for _ in 0..3 + u32::from(particles) * 4 {
+            random.next_float();
+        }
+        if let Self::Finish { causes_hunger } = self {
+            for _ in 0..3 {
+                random.next_float();
+            }
+            return causes_hunger && random.next_float() < 0.8;
+        }
+        false
+    }
 }
 
 impl FoodUse {
@@ -219,6 +249,10 @@ impl FoodUse {
 
     pub(crate) fn take_drops(&mut self) -> Vec<ItemStack> {
         std::mem::take(&mut self.drops)
+    }
+
+    pub(crate) fn take_events(&mut self) -> Vec<FoodRandomEvent> {
+        std::mem::take(&mut self.events)
     }
 
     pub fn visual_state(&self) -> Option<crate::animation::ItemUseState> {
@@ -325,6 +359,11 @@ impl FoodUse {
         let Some(active) = &mut self.active else {
             return;
         };
+        let elapsed = active.food.use_ticks - active.remaining;
+        let threshold = (active.food.use_ticks as f32 * 0.21875_f32) as i32;
+        if elapsed > threshold && active.remaining % 4 == 0 {
+            self.events.push(FoodRandomEvent::ParticlePulse(5));
+        }
         active.remaining = active.remaining.saturating_sub(1);
         if active.remaining != 0 {
             return;
@@ -343,7 +382,12 @@ impl FoodUse {
         food: FoodProperties,
     ) {
         let remainder = inventory.slot(hand).and_then(food_remainder);
+        let causes_hunger = inventory.slot(hand).is_some_and(|item| {
+            item.id() == "minecraft:rotten_flesh"
+                && item.components().get("minecraft:consumable").is_none()
+        });
         if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
+            self.events.push(FoodRandomEvent::Finish { causes_hunger });
             vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
             vitals.saturation =
                 (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
@@ -423,6 +467,30 @@ pub struct EffectDuration {
 }
 
 impl EffectDuration {
+    fn shorter_than(&self, other: &Self) -> bool {
+        self.duration != -1 && (other.duration == -1 || self.duration < other.duration)
+    }
+
+    /// Merge the timing and amplifier of a matching Java effect instance.
+    pub(crate) fn merge(&mut self, incoming: Self) {
+        if incoming.amplifier > self.amplifier {
+            if incoming.shorter_than(self) {
+                let old = self.clone();
+                self.hidden = Some(Box::new(old));
+            }
+            self.amplifier = incoming.amplifier;
+            self.duration = incoming.duration;
+        } else if self.shorter_than(&incoming) {
+            if incoming.amplifier == self.amplifier {
+                self.duration = incoming.duration;
+            } else if let Some(hidden) = &mut self.hidden {
+                hidden.merge(incoming);
+            } else {
+                self.hidden = Some(Box::new(incoming));
+            }
+        }
+    }
+
     fn has_time(&self) -> bool {
         self.duration == -1 || self.duration > 0
     }
@@ -728,6 +796,232 @@ impl PlayerVitals {
 mod tests {
     use super::*;
     use crate::{GameMode, GameSession, LocalSession, PlayerCommand};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn rotten_flesh_random_and_hunger_merge_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("RottenFleshOracle.java");
+        let output = temp.path().join("rotten.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RottenFleshOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("RottenFleshOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows["samples"].as_array().unwrap().len(), 100);
+        for row in rows["samples"].as_array().unwrap() {
+            let item = ItemStack::new(
+                "minecraft:rotten_flesh".into(),
+                1,
+                64,
+                Tag::Compound(vec![]),
+            )
+            .unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            assert!(usage.start_hand(
+                &mut inventory,
+                PlayerSlot::Storage(0),
+                &mut vitals,
+                GameMode::Survival
+            ));
+            let mut hunger = false;
+            for _ in 0..32 {
+                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                for event in usage.take_events() {
+                    hunger |= event.apply(&mut random);
+                }
+            }
+            assert_eq!(hunger, row["applied"].as_bool().unwrap(), "{row}");
+            if hunger {
+                assert_eq!(row["duration"], 600);
+                assert_eq!(row["amplifier"], 0);
+            }
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
+        for row in rows["merges"].as_array().unwrap() {
+            let mut effect = EffectDuration {
+                duration: row["initial_duration"].as_i64().unwrap() as i32,
+                amplifier: row["initial_amplifier"].as_u64().unwrap() as u8,
+                hidden: None,
+            };
+            effect.merge(EffectDuration {
+                duration: 600,
+                amplifier: 0,
+                hidden: None,
+            });
+            assert_eq!(
+                effect.duration,
+                row["duration"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+            assert_eq!(
+                effect.amplifier,
+                row["amplifier"].as_u64().unwrap() as u8,
+                "{row}"
+            );
+            assert_eq!(
+                effect.hidden.as_ref().map(|v| (v.duration, v.amplifier)),
+                row["hidden_duration"].as_i64().map(|duration| (
+                    duration as i32,
+                    row["hidden_amplifier"].as_u64().unwrap() as u8
+                )),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotten_flesh_applies_hunger_and_respects_consumable_override() {
+        for seed in 0..8 {
+            for overridden in [false, true] {
+                let components = if overridden {
+                    Tag::Compound(vec![("minecraft:consumable".into(), Tag::Compound(vec![]))])
+                } else {
+                    Tag::Compound(vec![])
+                };
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new("minecraft:rotten_flesh".into(), 1, 64, components),
+                );
+                let mut session = LocalSession::demo();
+                session.player_random = native_core::random::LegacyRandom::new(seed);
+                session.set_player_inventory(inventory);
+                session.set_player_vitals(PlayerVitals {
+                    food: 10,
+                    saturation: 0.0,
+                    ..Default::default()
+                });
+                session.submit_command(PlayerCommand::Place);
+                for _ in 0..32 {
+                    session.update(Duration::from_millis(50));
+                }
+                let snapshot = session.snapshot();
+                assert_eq!(snapshot.vitals.food, 14);
+                assert!(snapshot.inventory.slot(PlayerSlot::Storage(0)).is_none());
+                let mut random = native_core::random::LegacyRandom::new(seed);
+                for _ in 0..6 {
+                    FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                }
+                let expected = FoodRandomEvent::Finish {
+                    causes_hunger: !overridden,
+                }
+                .apply(&mut random);
+                assert_eq!(
+                    snapshot.hunger_effect, expected,
+                    "seed {seed}, override {overridden}"
+                );
+                if expected {
+                    assert_eq!(
+                        session.fall.effects().hunger.as_ref().unwrap().duration,
+                        600
+                    );
+                    session.update(Duration::from_millis(50));
+                    assert_eq!(session.snapshot().vitals.exhaustion, 0.005);
+                    assert_eq!(
+                        session.fall.effects().hunger.as_ref().unwrap().duration,
+                        599
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotten_flesh_outcome_is_independent_of_frame_cadence() {
+        let run = |frame_ms: u64| {
+            let mut session = LocalSession::demo();
+            session.player_random = native_core::random::LegacyRandom::new(99);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:rotten_flesh".into(),
+                    2,
+                    64,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            session.set_player_vitals(PlayerVitals {
+                food: 5,
+                saturation: 0.0,
+                ..Default::default()
+            });
+            session.submit_command(PlayerCommand::UseHeld(true));
+            session.submit_command(PlayerCommand::Place);
+            for _ in 0..(4_000 / frame_ms) {
+                session.update(Duration::from_millis(frame_ms));
+            }
+            (
+                session.snapshot(),
+                session.fall.effects().hunger.clone(),
+                session.player_random.next_float().to_bits(),
+            )
+        };
+        let (slow, slow_effect, slow_random) = run(100);
+        let (fast, fast_effect, fast_random) = run(5);
+        assert_eq!(slow.tick, fast.tick);
+        assert_eq!(slow.vitals, fast.vitals);
+        assert_eq!(
+            slow.inventory.slot(PlayerSlot::Storage(0)),
+            fast.inventory.slot(PlayerSlot::Storage(0))
+        );
+        assert_eq!(slow_effect, fast_effect);
+        assert_eq!(slow_random, fast_random);
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

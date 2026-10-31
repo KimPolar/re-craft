@@ -114,6 +114,19 @@ impl FallTracker {
         &self.effects
     }
 
+    pub(crate) fn add_hunger(&mut self, duration: i32, amplifier: u8) {
+        let incoming = crate::survival::EffectDuration {
+            duration,
+            amplifier,
+            hidden: None,
+        };
+        if let Some(effect) = &mut self.effects.hunger {
+            effect.merge(incoming);
+        } else {
+            self.effects.hunger = Some(incoming);
+        }
+    }
+
     pub fn reset_after_death(&mut self) {
         self.safe.clear_modifiers();
         self.multiplier.clear_modifiers();

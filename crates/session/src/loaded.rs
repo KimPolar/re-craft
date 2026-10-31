@@ -705,7 +705,14 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
-    fn spawn_food_remainders(&mut self) {
+    fn process_food_events(&mut self) {
+        for event in self.food_use.take_events() {
+            if event.apply(&mut self.player_random) {
+                self.fall.add_hunger(600, 0);
+                // Adding effects is not yet reflected in the saved NBT draft.
+                self.effect_save_invalid = true;
+            }
+        }
         for stack in self.food_use.take_drops() {
             self.dropped_items.drop_player(
                 stack,
@@ -10335,7 +10342,7 @@ impl LoadedSession {
                 }
                 PlayerCommand::Place => {}
             }
-            self.spawn_food_remainders();
+            self.process_food_events();
             self.collect_closed_chest();
             update_recipe_unlocks(
                 &mut self.inventory,
@@ -10372,7 +10379,7 @@ impl LoadedSession {
         self.tick_lodestone_compasses();
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
-        self.spawn_food_remainders();
+        self.process_food_events();
         // baseTick reads the previous equipment attributes before detecting changes.
         let breathing_oxygen = self.oxygen_bonus;
         let breathing_oxygen_valid = self.oxygen_valid;
@@ -11046,7 +11053,7 @@ impl LoadedSession {
         if self.death.is_none() {
             self.food_use
                 .tick(&mut self.inventory, &mut self.vitals, self.game_mode);
-            self.spawn_food_remainders();
+            self.process_food_events();
         }
         self.selected = selected_inventory_block(&self.inventory);
         self.first_person.item_use = self.food_use.visual_state();
@@ -27278,6 +27285,64 @@ mod tests {
         assert!(!second.hunger_effect);
         assert_eq!(second.vitals.exhaustion, 0.02);
         assert!(first.hunger_effect);
+    }
+
+    #[test]
+    fn eaten_rotten_flesh_preserves_stronger_hunger_and_blocks_untracked_save() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let seed = (0..100)
+            .find(|&seed| {
+                let mut random = native_core::random::LegacyRandom::new(seed);
+                for _ in 0..6 {
+                    crate::survival::FoodRandomEvent::ParticlePulse(5).apply(&mut random);
+                }
+                crate::survival::FoodRandomEvent::Finish {
+                    causes_hunger: true,
+                }
+                .apply(&mut random)
+            })
+            .unwrap();
+        let mut session = session();
+        session.player_random = native_core::random::LegacyRandom::new(seed);
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                hunger: Some(crate::survival::EffectDuration {
+                    duration: 100,
+                    amplifier: 1,
+                    hidden: None,
+                }),
+                ..Default::default()
+            },
+            Arc::new(native_resources::enchantments::OxygenEnchantments::default()),
+        );
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:rotten_flesh".into(),
+                1,
+                64,
+                Tag::Compound(vec![]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..32 {
+            session.update(TICK);
+        }
+        let hunger = session.fall.effects().hunger.as_ref().unwrap();
+        assert_eq!((hunger.duration, hunger.amplifier), (68, 1));
+        let hidden = hunger.hidden.as_ref().unwrap();
+        assert_eq!((hidden.duration, hidden.amplifier), (600, 0));
+        assert!(session.effect_save_invalid);
+        assert_eq!(session.snapshot().vitals.food, 14);
     }
 
     #[test]

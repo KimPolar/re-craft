@@ -87,6 +87,152 @@ struct FogTrack {
     modifier: FloatModifier,
 }
 
+pub(crate) struct SunsetColorTrack {
+    rgb: SkyTrack,
+    alpha: SkyTrack,
+}
+
+fn argb(value: &Value) -> Result<[f32; 4]> {
+    let packed = if let Some(s) = value.as_str() {
+        ensure!(
+            s.len() == 9 && s.starts_with('#'),
+            "color must be #AARRGGBB"
+        );
+        u32::from_str_radix(&s[1..], 16).context("invalid ARGB color")?
+    } else if let Some(n) = value.as_i64() {
+        ensure!(
+            (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&n),
+            "ARGB color out of range"
+        );
+        n as u32
+    } else {
+        bail!("invalid ARGB color")
+    };
+    Ok([
+        ((packed >> 16) & 255) as f32 / 255.0,
+        ((packed >> 8) & 255) as f32 / 255.0,
+        (packed & 255) as f32 / 255.0,
+        ((packed >> 24) & 255) as f32 / 255.0,
+    ])
+}
+
+impl SunsetColorTrack {
+    pub(crate) fn parse(timeline: &Value, track: &Value) -> Result<Self> {
+        let mut rgb = track.clone();
+        let mut alpha = track.clone();
+        let original = track
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .context("missing color keyframes")?;
+        for ((rgb, alpha), frame) in rgb["keyframes"]
+            .as_array_mut()
+            .context("invalid color frames")?
+            .iter_mut()
+            .zip(
+                alpha["keyframes"]
+                    .as_array_mut()
+                    .context("invalid alpha frames")?
+                    .iter_mut(),
+            )
+            .zip(original)
+        {
+            let color = argb(frame.get("value").context("missing color")?)?;
+            let packed = ((color[0] * 255.0).round() as u32) << 16
+                | ((color[1] * 255.0).round() as u32) << 8
+                | (color[2] * 255.0).round() as u32;
+            rgb["value"] = Value::from(packed);
+            alpha["value"] = Value::from(color[3]);
+        }
+        Ok(Self {
+            rgb: SkyTrack::parse(timeline, &rgb, false)?,
+            alpha: SkyTrack::parse(timeline, &alpha, true)?,
+        })
+    }
+    pub(crate) fn sample(&self, ticks: i64) -> [f32; 4] {
+        let color = self.rgb.sample(ticks);
+        [color[0], color[1], color[2], self.alpha.sample(ticks)[0]]
+    }
+}
+
+struct SunsetTimeline {
+    base_angle: f32,
+    base_color: [f32; 4],
+    angle: Vec<FogTrack>,
+    color: Vec<SunsetColorTrack>,
+}
+
+fn named_attribute<'a>(attributes: Option<&'a Value>, name: &str) -> Result<Option<&'a Value>> {
+    let Some(attributes) = attributes else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for (key, value) in attributes.as_object().context("invalid attributes")? {
+        let id = ResourceId::parse(key)?;
+        if id.namespace == "minecraft" && id.path == name {
+            ensure!(found.is_none(), "duplicate attribute {name}");
+            found = Some(value);
+        }
+    }
+    Ok(found)
+}
+
+impl SunsetTimeline {
+    fn new(attributes: Option<&Value>) -> Result<Self> {
+        let base_angle = named_attribute(attributes, "visual/sun_angle")?
+            .map(FloatLayer::parse)
+            .transpose()?
+            .map_or(0.0, |v| v.apply(0.0));
+        let base_color = match named_attribute(attributes, "visual/sunrise_sunset_color")? {
+            None => [0.0; 4],
+            Some(v) if v.is_object() => {
+                let modifier = ResourceId::parse(
+                    v.get("modifier")
+                        .and_then(Value::as_str)
+                        .context("missing color modifier")?,
+                )?;
+                ensure!(
+                    modifier.namespace == "minecraft",
+                    "unsupported color modifier"
+                );
+                let color = argb(v.get("argument").context("missing color argument")?)?;
+                match modifier.path.as_str() {
+                    "override" => color,
+                    "multiply" => [0.0; 4],
+                    _ => bail!("unsupported color modifier"),
+                }
+            }
+            Some(v) => argb(v)?,
+        };
+        Ok(Self {
+            base_angle,
+            base_color,
+            angle: Vec::new(),
+            color: Vec::new(),
+        })
+    }
+
+    fn sample(&self, mut clock: impl FnMut(&ResourceId) -> Option<i64>) -> Option<(f32, [f32; 4])> {
+        let mut angle = self.base_angle;
+        let mut color = self.base_color;
+        for track in &self.angle {
+            angle = FloatLayer {
+                value: track.track.sample(clock(&track.track.clock)?)[0],
+                modifier: track.modifier,
+            }
+            .apply(angle);
+        }
+        for track in &self.color {
+            let value = track.sample(clock(&track.rgb.clock)?);
+            color = if track.rgb.multiply {
+                std::array::from_fn(|i| color[i] * value[i])
+            } else {
+                value
+            };
+        }
+        Some((angle, color))
+    }
+}
+
 impl FogTrack {
     fn parse(index: usize, timeline: &Value, value: &Value) -> Result<Self> {
         let modifier = match value.get("modifier") {
@@ -188,6 +334,7 @@ pub struct SkyBackground {
     fog_sky_base: Option<[f32; 3]>,
     fog_sky_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
     fog_sky_tracks: Option<Vec<SkyTrack>>,
+    sunset: Option<SunsetTimeline>,
     min_y: i32,
     max_y: i32,
 }
@@ -199,6 +346,7 @@ pub struct BackgroundSample {
     pub fog_color: Option<[f32; 3]>,
     pub fog_range: Option<[f32; 2]>,
     pub sky_mix: Option<([f32; 3], f32)>,
+    pub sunset: Option<(f32, [f32; 4])>,
 }
 
 impl SkyBackground {
@@ -251,6 +399,7 @@ impl SkyBackground {
             None
         };
         let mut fog_biomes = BTreeMap::new();
+        let mut sunset = SunsetTimeline::new(dimension.get("attributes")).ok();
         let mut fog_sky_biomes = BTreeMap::new();
         let mut fog_color_biomes = BTreeMap::new();
         let fog_color_base = match dimension.get("attributes") {
@@ -267,6 +416,17 @@ impl SkyBackground {
                 .with_context(|| format!("missing {path}"))?;
             let biome: Value =
                 serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
+            if sunset.is_some() {
+                let attributes = biome.get("attributes");
+                if !matches!(named_attribute(attributes, "visual/sun_angle"), Ok(None))
+                    || !matches!(
+                        named_attribute(attributes, "visual/sunrise_sunset_color"),
+                        Ok(None)
+                    )
+                {
+                    sunset = None;
+                }
+            }
             let layer = biome
                 .get("attributes")
                 .map(|attributes| find_color_attribute(attributes, attribute))
@@ -305,6 +465,22 @@ impl SkyBackground {
             let mut found = false;
             for (name, value) in entries {
                 let id = ResourceId::parse(name)?;
+                if id.namespace == "minecraft" && id.path == "visual/sun_angle" && sunset.is_some()
+                {
+                    match FogTrack::parse(0, &timeline, value) {
+                        Ok(track) => sunset.as_mut().unwrap().angle.push(track),
+                        Err(_) => sunset = None,
+                    }
+                }
+                if id.namespace == "minecraft"
+                    && id.path == "visual/sunrise_sunset_color"
+                    && sunset.is_some()
+                {
+                    match SunsetColorTrack::parse(&timeline, value) {
+                        Ok(track) => sunset.as_mut().unwrap().color.push(track),
+                        Err(_) => sunset = None,
+                    }
+                }
                 if id.namespace == "minecraft"
                     && let Some(index) = match id.path.as_str() {
                         "visual/fog_start_distance" => Some(0),
@@ -364,6 +540,7 @@ impl SkyBackground {
             fog_sky_base,
             fog_sky_biomes,
             fog_sky_tracks,
+            sunset,
             min_y,
             max_y,
         }))
@@ -445,6 +622,10 @@ impl SkyBackground {
             fog_color,
             fog_range,
             sky_mix,
+            sunset: self
+                .sunset
+                .as_ref()
+                .and_then(|sunset| sunset.sample(&mut clock_ticks)),
         })
     }
 }
@@ -622,7 +803,16 @@ mod tests {
                 weather_cases.push(json!({"rain":rain,"thunder":thunder}));
             }
         }
-        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases});
+        let mut sunrise_cases = Vec::new();
+        for angle in [-180.0, -0.1, 0.0, 0.1, 90.0, 180.0, 270.0] {
+            for forward in [-1.0, -0.3, 0.0, 0.4, 1.0] {
+                for chunks in [3, 4, 12] {
+                    sunrise_cases
+                        .push(json!({"angle":angle,"forward":forward,"chunks":chunks,"alpha":0.6}));
+                }
+            }
+        }
+        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases,"sunriseCases":sunrise_cases});
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SkyBackgroundOracle.java");
         let input_file = temp.path().join("input.json");
@@ -698,7 +888,7 @@ mod tests {
         ]);
         assert_eq!(
             expected.len(),
-            cases.len() + 6 + fog_color_cases.len() + weather_cases.len()
+            cases.len() + 6 + fog_color_cases.len() + weather_cases.len() + sunrise_cases.len()
         );
         for (case, expected) in cases.iter().zip(&expected) {
             let p = &case["position"];
@@ -794,6 +984,24 @@ mod tests {
                 );
             }
         }
+        for (case, expected) in sunrise_cases
+            .iter()
+            .zip(&expected[cases.len() + 6 + fog_color_cases.len() + weather_cases.len()..])
+        {
+            let actual = crate::preview_app::sunrise_fog_color(
+                [0.2, 0.6, 0.9],
+                case["angle"].as_f64().unwrap() as f32,
+                [0.9, 0.4, 0.1, 0.6],
+                case["forward"].as_f64().unwrap() as f32,
+                case["chunks"].as_u64().unwrap() as u32,
+            );
+            for i in 0..3 {
+                assert!(
+                    (actual[i] - expected[i]).abs() < 0.000002,
+                    "sunrise {case}, channel {i}"
+                );
+            }
+        }
         let overworld = SkyBackground::load(&mut resources, "minecraft:overworld", -64, 320)
             .unwrap()
             .unwrap();
@@ -805,6 +1013,24 @@ mod tests {
         assert!(overworld.fog_base.is_some());
         assert!(overworld.fog_tracks.is_some());
         assert!(overworld.fog_color_tracks.is_some());
+        assert!(overworld.sunset.is_some());
+        let sun =
+            SkyTrack::parse(&day, &day["tracks"]["minecraft:visual/sun_angle"], true).unwrap();
+        let sunset = SunsetColorTrack::parse(
+            &day,
+            &day["tracks"]["minecraft:visual/sunrise_sunset_color"],
+        )
+        .unwrap();
+        for tick in [0, 6000, 12000, 12512, 18000, 23272] {
+            let (angle, color) = overworld
+                .sunset
+                .as_ref()
+                .unwrap()
+                .sample(|_| Some(tick))
+                .unwrap();
+            assert_eq!(angle, sun.sample(tick)[0]);
+            assert_eq!(color, sunset.sample(tick));
+        }
         let nether = SkyBackground::load(&mut resources, "minecraft:the_nether", 0, 128)
             .unwrap()
             .unwrap();
@@ -929,6 +1155,30 @@ mod tests {
         assert_eq!(background.tracks.len(), 1);
         assert!(background.tracks[0].multiply);
         assert_eq!(background.tracks[0].sample(10), [0.0; 3]);
+        struct ModifiedBiome;
+        impl ResourceProvider for ModifiedBiome {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Data.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/example/worldgen/biome/test.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"attributes":{"visual/sun_angle":15.0}}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Data.list_data(folder)
+            }
+        }
+        assert!(
+            SkyBackground::load(&mut ModifiedBiome, "example:test", 0, 16)
+                .unwrap()
+                .unwrap()
+                .sunset
+                .is_none()
+        );
     }
 
     #[test]
@@ -982,6 +1232,7 @@ mod tests {
             fog_sky_base: None,
             fog_sky_biomes: BTreeMap::new(),
             fog_sky_tracks: None,
+            sunset: None,
             min_y: 0,
             max_y: 16,
         };
@@ -992,7 +1243,8 @@ mod tests {
                 background_is_fog: false,
                 fog_color: None,
                 fog_range: None,
-                sky_mix: None
+                sky_mix: None,
+                sunset: None
             })
         );
         assert_eq!(
@@ -1002,7 +1254,8 @@ mod tests {
                 background_is_fog: false,
                 fog_color: None,
                 fog_range: None,
-                sky_mix: None
+                sky_mix: None,
+                sunset: None
             })
         );
         assert!(

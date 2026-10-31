@@ -228,8 +228,87 @@ pub(crate) struct SkyTrack {
     period: Option<i32>,
     factor: bool,
     pub(crate) multiply: bool,
-    constant_easing: bool,
+    easing: TrackEasing,
     frames: Vec<(i32, [f32; 3])>,
+}
+
+#[derive(Clone, Copy)]
+enum TrackEasing {
+    Linear,
+    Constant,
+    Cubic { x: [f32; 3], y: [f32; 3] },
+}
+
+impl TrackEasing {
+    fn parse(value: Option<&Value>) -> Result<Self> {
+        match value {
+            None => Ok(Self::Linear),
+            Some(Value::String(name)) if name == "linear" => Ok(Self::Linear),
+            Some(Value::String(name)) if name == "constant" => Ok(Self::Constant),
+            Some(value) => {
+                let controls = value
+                    .get("cubic_bezier")
+                    .and_then(Value::as_array)
+                    .context("unsupported easing")?;
+                ensure!(controls.len() == 4, "invalid cubic easing controls");
+                let mut c = [0.0_f32; 4];
+                for (out, value) in c.iter_mut().zip(controls) {
+                    *out = value.as_f64().context("invalid cubic control")? as f32;
+                    ensure!(out.is_finite(), "non-finite cubic control");
+                }
+                ensure!(
+                    (0.0..=1.0).contains(&c[0]) && (0.0..=1.0).contains(&c[2]),
+                    "invalid cubic x control"
+                );
+                let curve = |a, b| [3.0 * a - 3.0 * b + 1.0, -6.0 * a + 3.0 * b, 3.0 * a];
+                Ok(Self::Cubic {
+                    x: curve(c[0], c[2]),
+                    y: curve(c[1], c[3]),
+                })
+            }
+        }
+    }
+
+    fn apply(self, input: f32) -> f32 {
+        match self {
+            Self::Linear => input,
+            Self::Constant => 0.0,
+            Self::Cubic { x, y } => {
+                let sample =
+                    |curve: [f32; 3], t: f32| ((curve[0] * t + curve[1]) * t + curve[2]) * t;
+                let mut t = input;
+                for _ in 0..4 {
+                    let error = sample(x, t) - input;
+                    if error.abs() < 1.0e-5 {
+                        return sample(y, t);
+                    }
+                    let gradient = (3.0 * x[0] * t + 2.0 * x[1]) * t + x[2];
+                    if gradient < 1.0e-5 {
+                        break;
+                    }
+                    t -= (error / gradient).clamp(-0.25, 0.25);
+                }
+                let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+                while lo < hi {
+                    let error = sample(x, t) - input;
+                    if error.abs() < 1.0e-5 {
+                        break;
+                    }
+                    if error < 0.0 {
+                        lo = t;
+                    } else {
+                        hi = t;
+                    }
+                    let next = (hi + lo) / 2.0;
+                    if next == t {
+                        break;
+                    }
+                    t = next;
+                }
+                sample(y, t)
+            }
+        }
+    }
 }
 
 impl SkyTimeline {
@@ -355,12 +434,7 @@ impl SkyTrack {
             "multiply" | "minecraft:multiply" => true,
             _ => bail!("unsupported sky light modifier"),
         };
-        let constant_easing = match track.get("ease") {
-            None => false,
-            Some(Value::String(s)) if s == "linear" => false,
-            Some(Value::String(s)) if s == "constant" => true,
-            _ => bail!("unsupported sky light easing"),
-        };
+        let easing = TrackEasing::parse(track.get("ease"))?;
         let values = track
             .get("keyframes")
             .and_then(Value::as_array)
@@ -402,7 +476,7 @@ impl SkyTrack {
             period,
             factor,
             multiply,
-            constant_easing,
+            easing,
             frames,
         })
     }
@@ -436,10 +510,9 @@ impl SkyTrack {
         if ticks >= i64::from(end) {
             return b;
         }
-        if self.constant_easing {
-            return a;
-        }
-        let delta = ticks.wrapping_sub(i64::from(start)) as f32 / end.wrapping_sub(start) as f32;
+        let delta = self
+            .easing
+            .apply(ticks.wrapping_sub(i64::from(start)) as f32 / end.wrapping_sub(start) as f32);
         std::array::from_fn(|i| a[i] + delta * (b[i] - a[i]))
     }
 }
@@ -769,11 +842,13 @@ mod tests {
         .unwrap();
         let factor = &day["tracks"]["minecraft:visual/sky_light_factor"];
         let color = &day["tracks"]["minecraft:visual/sky_light_color"];
+        let sun = &day["tracks"]["minecraft:visual/sun_angle"];
+        let sunset = &day["tracks"]["minecraft:visual/sunrise_sunset_color"];
         let ticks: Vec<i64> = (-1000..=25000)
             .step_by(37)
             .chain([730, 11270, 13140, 22860, 0, 24000])
             .collect();
-        let input = serde_json::json!({"factor":factor,"color":color,"ticks":ticks});
+        let input = serde_json::json!({"factor":factor,"color":color,"sun":sun,"sunset":sunset,"ticks":ticks});
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SkyTimelineOracle.java");
         let input_file = temp.path().join("input.json");
@@ -828,8 +903,21 @@ mod tests {
             sky_color: [1.0; 3],
             ..Default::default()
         };
+        let sun = SkyTrack::parse(&day, sun, true).unwrap();
+        let sunset = crate::sky_background::SunsetColorTrack::parse(&day, sunset).unwrap();
         assert_eq!(ticks.len(), oracle.len());
         for (tick, row) in ticks.into_iter().zip(oracle) {
+            assert!(
+                (sun.sample(tick)[0] - row["sun"].as_f64().unwrap() as f32).abs() < 0.0001,
+                "sun tick {tick}"
+            );
+            let rgba = sunset.sample(tick);
+            for (i, value) in rgba.iter().enumerate() {
+                assert!(
+                    (*value - row["sunset"][i].as_f64().unwrap() as f32).abs() < 0.000002,
+                    "sunset tick {tick}, channel {i}"
+                );
+            }
             let actual = environment.sample(&base, |_| Some(tick)).unwrap();
             assert!(
                 (actual.sky_factor - row["factor"].as_f64().unwrap() as f32).abs() < 0.000001,

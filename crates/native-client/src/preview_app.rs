@@ -64,6 +64,45 @@ pub(crate) fn weather_darken_sky(mut color: [f32; 3], rain: f32, thunder: f32) -
     color
 }
 
+pub(crate) fn sunrise_fog_color(
+    fog: [f32; 3],
+    sun_angle: f32,
+    color: [f32; 4],
+    forward_x: f32,
+    chunks: u32,
+) -> [f32; 3] {
+    if chunks < 4 || color[3] <= 0.0 {
+        return fog;
+    }
+    let radians = sun_angle * 0.017453292_f32;
+    let sign = if native_session::physics::java_sin(f64::from(radians), false) > 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let direction = forward_x * sign;
+    if direction <= 0.0 {
+        return fog;
+    }
+    let amount = direction * color[3];
+    std::array::from_fn(|i| fog[i] + amount * (color[i] - fog[i]))
+}
+
+fn interpolate_sun_angle(previous: f32, current: f32, partial: f32) -> f32 {
+    let mut delta = (current - previous) % 360.0;
+    if delta >= 180.0 {
+        delta -= 360.0;
+    }
+    if delta < -180.0 {
+        delta += 360.0;
+    }
+    if delta.abs() >= 90.0 {
+        current
+    } else {
+        previous + partial * delta
+    }
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub yaw: f32,
@@ -208,6 +247,8 @@ pub fn run_play(
             fog_color_previous: None,
             fog_color_current: None,
             fog_is_background: false,
+            sunset_previous: None,
+            sunset_current: None,
             sky_background_previous: None,
             sky_background_current: None,
             sky_fog_previous: None,
@@ -323,6 +364,8 @@ struct PlayState {
     fog_color_previous: Option<[f32; 3]>,
     fog_color_current: Option<[f32; 3]>,
     fog_is_background: bool,
+    sunset_previous: Option<(f32, [f32; 4])>,
+    sunset_current: Option<(f32, [f32; 4])>,
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
@@ -769,6 +812,7 @@ impl Viewer {
                     fog_color,
                     fog_range,
                     sky_mix,
+                    sunset,
                 }) = value
                 {
                     if play.sky_background_tick != Some(snapshot.tick)
@@ -786,6 +830,13 @@ impl Viewer {
                         play.fog_color_previous = play.fog_color_current.or(fog_color);
                     }
                     play.fog_color_current = fog_color;
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.sunset_previous.is_none()
+                        || play.sunset_current.is_none()
+                    {
+                        play.sunset_previous = play.sunset_current.or(sunset);
+                    }
+                    play.sunset_current = sunset;
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_fog_previous.is_none()
                         || play.sky_fog_current.is_none()
@@ -816,6 +867,21 @@ impl Viewer {
                     })),
                     _ => None,
                 };
+                if let (Some(fog), Some((old_angle, old_color)), Some((new_angle, new_color))) =
+                    (fog_color, play.sunset_previous, play.sunset_current)
+                {
+                    let angle = interpolate_sun_angle(old_angle, new_angle, partial);
+                    let color = std::array::from_fn(|i| {
+                        old_color[i] + partial * (new_color[i] - old_color[i])
+                    });
+                    fog_color = Some(sunrise_fog_color(
+                        fog,
+                        angle,
+                        color,
+                        self.camera.direction().x,
+                        play.streamer.radius().max(2),
+                    ));
+                }
                 if let (
                     Some(fog),
                     Some((previous_sky, previous_end)),
@@ -1698,6 +1764,12 @@ impl ApplicationHandler for Viewer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sun_angle_interpolation_wraps_and_snaps_large_changes() {
+        assert_eq!(super::interpolate_sun_angle(359.0, 1.0, 0.5), 360.0);
+        assert_eq!(super::interpolate_sun_angle(1.0, 359.0, 0.5), 0.0);
+        assert_eq!(super::interpolate_sun_angle(0.0, 90.0, 0.5), 90.0);
+    }
     #[test]
     fn mesh_results_obey_world_revision_and_current_biome_blend() {
         use super::obsolete_mesh;

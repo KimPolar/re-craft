@@ -66,6 +66,15 @@ public class SkyBackgroundOracle {
             var result = (org.joml.Vector3fc) weatherDarken.invoke(null, new Vector3f(0.8f, 0.3f, 0.05f), c.get("rain").getAsFloat(), c.get("thunder").getAsFloat());
             var row = new JsonArray(); row.add(result.x()); row.add(result.y()); row.add(result.z()); output.add(row);
         }
+        for (var item : input.getAsJsonArray("sunriseCases")) {
+            var c = item.getAsJsonObject();
+            var fog = new Vector3f(0.2f, 0.6f, 0.9f);
+            var color = new Vector3f(0.9f, 0.4f, 0.1f);
+            float direction = c.get("forward").getAsFloat() * (Mth.sin(c.get("angle").getAsFloat() * 0.017453292f) > 0f ? -1f : 1f);
+            var result = c.get("chunks").getAsInt() >= 4 && direction > 0f && c.get("alpha").getAsFloat() > 0f
+                ? ARGB.srgbLerp(direction * c.get("alpha").getAsFloat(), fog, color) : fog;
+            var row = new JsonArray(); row.add(result.x()); row.add(result.y()); row.add(result.z()); output.add(row);
+        }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }
 }

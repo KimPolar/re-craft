@@ -1287,6 +1287,100 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
     }))
 }
 
+/// Replay known food-applied hunger effects at the point they occurred between
+/// base ticks. Unknown effect data still prevents a draft from being written.
+pub fn replay_saved_hunger_effects(
+    player: &NamedTag,
+    ticks: u64,
+    hunger_updates: &[u64],
+) -> Result<Option<Tag>> {
+    fn as_player(effects: Option<Tag>) -> NamedTag {
+        NamedTag {
+            name: "".into(),
+            value: Tag::Compound(
+                effects
+                    .map(|value| ("active_effects".into(), value))
+                    .into_iter()
+                    .collect(),
+            ),
+        }
+    }
+
+    fn new_hunger(root: bool) -> Tag {
+        let mut fields = vec![("duration".into(), Tag::Int(600))];
+        if root {
+            fields.insert(0, ("id".into(), Tag::String("minecraft:hunger".into())));
+        }
+        Tag::Compound(fields)
+    }
+
+    fn merge(effect: &mut Tag, depth: usize) -> Result<()> {
+        ensure!(depth <= 256, "status effect nesting is too deep");
+        let duration = match effect.get("duration") {
+            Some(Tag::Int(value)) => *value,
+            None => 0,
+            _ => bail!("invalid hunger duration"),
+        };
+        let amplifier = match effect.get("amplifier") {
+            Some(Tag::Byte(value)) => *value as u8,
+            None => 0,
+            _ => bail!("invalid hunger amplifier"),
+        };
+        if duration != -1 && duration < 600 {
+            if amplifier == 0 {
+                set_field(effect, "duration", Some(Tag::Int(600)))?;
+            } else if let Some(mut hidden) = effect.get("hidden_effect").cloned() {
+                merge(&mut hidden, depth + 1)?;
+                set_field(effect, "hidden_effect", Some(hidden))?;
+            } else {
+                ensure!(depth < 256, "status effect nesting is too deep");
+                set_field(effect, "hidden_effect", Some(new_hunger(false)))?;
+            }
+        }
+        // Food-created effects are non-ambient, visible and show their icon.
+        set_field(effect, "ambient", Some(Tag::Byte(0)))?;
+        set_field(effect, "show_particles", Some(Tag::Byte(1)))?;
+        set_field(effect, "show_icon", Some(Tag::Byte(1)))?;
+        Ok(())
+    }
+
+    let mut effects = advance_saved_effects(player, 0)?;
+    let mut elapsed = 0;
+    for &event_tick in hunger_updates {
+        ensure!(
+            event_tick >= elapsed && event_tick <= ticks,
+            "invalid hunger update order"
+        );
+        effects = advance_saved_effects(&as_player(effects), event_tick - elapsed)?;
+        let mut list = effects.unwrap_or(Tag::List {
+            element_type: TagType::Compound,
+            values: Vec::new(),
+        });
+        let Tag::List {
+            element_type,
+            values,
+        } = &mut list
+        else {
+            unreachable!()
+        };
+        *element_type = TagType::Compound;
+        if let Some(effect) = values.iter_mut().find(|effect| {
+            effect
+                .get("id")
+                .and_then(text)
+                .and_then(|id| ResourceId::parse(&id).ok())
+                .is_some_and(|id| id.namespace == "minecraft" && id.path == "hunger")
+        }) {
+            merge(effect, 0)?;
+        } else {
+            values.push(new_hunger(true));
+        }
+        effects = Some(list);
+        elapsed = event_tick;
+    }
+    advance_saved_effects(&as_player(effects), ticks - elapsed)
+}
+
 fn validate_max_health_for_draft(player: &NamedTag) -> Result<f32> {
     let Some(attributes) = unique_field(&player.value, "attributes")? else {
         return Ok(20.0);
@@ -1898,6 +1992,161 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hunger_replay_rejects_bad_timeline_and_unrecognized_effects() {
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert!(replay_saved_hunger_effects(&original, 3, &[2, 1]).is_err());
+        assert!(replay_saved_hunger_effects(&original, 3, &[4]).is_err());
+        let invalid = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:weakness".into())),
+                        ("duration".into(), Tag::Int(5)),
+                    ])],
+                },
+            )]),
+        };
+        assert!(replay_saved_hunger_effects(&invalid, 3, &[1]).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn hunger_effect_replay_matches_java_saved_components() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("HungerSaveOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/HungerSaveOracle.java")).unwrap();
+        let mut input = Vec::new();
+        let mut originals = vec![None];
+        for duration in [5, 400, 600, 1000, -1] {
+            for amplifier in [0, 1, 2] {
+                for hidden in [false, true] {
+                    let mut fields = vec![
+                        ("id".into(), Tag::String("minecraft:hunger".into())),
+                        ("duration".into(), Tag::Int(duration)),
+                        ("amplifier".into(), Tag::Byte(amplifier)),
+                        ("ambient".into(), Tag::Byte(1)),
+                        ("show_particles".into(), Tag::Byte(0)),
+                        ("show_icon".into(), Tag::Byte(0)),
+                    ];
+                    if hidden {
+                        fields.push((
+                            "hidden_effect".into(),
+                            Tag::Compound(vec![
+                                ("duration".into(), Tag::Int(900)),
+                                ("amplifier".into(), Tag::Byte(0)),
+                                ("show_particles".into(), Tag::Byte(0)),
+                            ]),
+                        ));
+                    }
+                    originals.push(Some(Tag::Compound(fields)));
+                }
+            }
+        }
+        for effect in originals {
+            for (ticks, events) in [
+                (40, vec![]),
+                (40, vec![0]),
+                (40, vec![0, 0, 5]),
+                (40, vec![12, 32, 34]),
+                (700, vec![3, 34]),
+            ] {
+                let mut initial = vec![];
+                if let Some(effect) = effect.clone() {
+                    initial.push(effect);
+                    initial.push(Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:water_breathing".into())),
+                        ("duration".into(), Tag::Int(60)),
+                    ]));
+                }
+                let original = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(
+                        (!initial.is_empty())
+                            .then_some((
+                                "active_effects".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: initial,
+                                },
+                            ))
+                            .into_iter()
+                            .collect(),
+                    ),
+                };
+                let output = replay_saved_hunger_effects(&original, ticks, &events).unwrap();
+                let draft = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(
+                        output
+                            .map(|value| ("active_effects".into(), value))
+                            .into_iter()
+                            .collect(),
+                    ),
+                };
+                let index = input.len();
+                std::fs::write(
+                    temp.path().join(format!("source{index}.nbt")),
+                    native_persistence::nbt::write(&original).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    temp.path().join(format!("draft{index}.nbt")),
+                    native_persistence::nbt::write(&draft).unwrap(),
+                )
+                .unwrap();
+                input.push(serde_json::json!({"ticks":ticks,"events":events}));
+            }
+        }
+        let cases = temp.path().join("cases.json");
+        std::fs::write(&cases, serde_json::to_vec(&input).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("HungerSaveOracle")
+                .arg(temp.path())
+                .arg(&cases),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java hunger save oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
 
     #[test]
     fn saved_fall_effects_survive_hidden_effect_promotion_in_draft() {

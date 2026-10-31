@@ -488,6 +488,7 @@ struct EffectSaveTracking {
     water_efficiency: crate::player_data::SavedAttribute,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     ticks: u64,
+    hunger_updates: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -705,12 +706,26 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
+    fn ensure_effect_save_tracking(&mut self) -> &mut EffectSaveTracking {
+        self.effect_save_tracking
+            .get_or_insert_with(|| EffectSaveTracking {
+                breathing: self.breathing_effects.clone(),
+                fall: self.fall.effects().clone(),
+                movement_speed: self.movement_speed_attribute.clone(),
+                gravity: self.gravity_attribute.clone(),
+                water_efficiency: self.water_efficiency_attribute.clone(),
+                mining_attributes: self.mining_attributes.clone(),
+                ticks: 0,
+                hunger_updates: Vec::new(),
+            })
+    }
+
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
             if event.apply(&mut self.player_random) {
+                let tracking = self.ensure_effect_save_tracking();
+                tracking.hunger_updates.push(tracking.ticks);
                 self.fall.add_hunger(600, 0);
-                // Adding effects is not yet reflected in the saved NBT draft.
-                self.effect_save_invalid = true;
             }
         }
         for stack in self.food_use.take_drops() {
@@ -1606,16 +1621,23 @@ impl LoadedSession {
                 !self.effect_save_invalid,
                 "player effects changed outside the tracked tick sequence"
             );
-            let (initial_breathing, initial_fall, effect_ticks) = match &self.effect_save_tracking {
-                Some(tracking) => (&tracking.breathing, &tracking.fall, tracking.ticks),
-                None => (&self.breathing_effects, self.fall.effects(), 0),
-            };
+            let (initial_breathing, initial_fall, effect_ticks, updates) =
+                match &self.effect_save_tracking {
+                    Some(tracking) => (
+                        &tracking.breathing,
+                        &tracking.fall,
+                        tracking.ticks,
+                        tracking.hunger_updates.as_slice(),
+                    ),
+                    None => (&self.breathing_effects, self.fall.effects(), 0, &[][..]),
+                };
             anyhow::ensure!(
                 crate::player_data::read_saved_breathing_effects(original)? == *initial_breathing
                     && crate::player_data::read_saved_fall_effects(original)? == *initial_fall,
                 "saved player effects do not match the initial session state"
             );
-            let effects = crate::player_data::advance_saved_effects(original, effect_ticks)?;
+            let effects =
+                crate::player_data::replay_saved_hunger_effects(original, effect_ticks, updates)?;
             let advanced = native_persistence::nbt::NamedTag {
                 name: "".into(),
                 value: native_persistence::nbt::Tag::Compound(
@@ -10449,17 +10471,7 @@ impl LoadedSession {
                 self.sprint = crate::physics::SprintState::default();
             }
         }
-        let tracking = self
-            .effect_save_tracking
-            .get_or_insert_with(|| EffectSaveTracking {
-                breathing: self.breathing_effects.clone(),
-                fall: self.fall.effects().clone(),
-                movement_speed: self.movement_speed_attribute.clone(),
-                gravity: self.gravity_attribute.clone(),
-                water_efficiency: self.water_efficiency_attribute.clone(),
-                mining_attributes: self.mining_attributes.clone(),
-                ticks: 0,
-            });
+        let tracking = self.ensure_effect_save_tracking();
         tracking.ticks = tracking.ticks.saturating_add(1);
         self.breathing_effects.tick();
         let transitions =
@@ -27288,9 +27300,29 @@ mod tests {
     }
 
     #[test]
-    fn eaten_rotten_flesh_preserves_stronger_hunger_and_blocks_untracked_save() {
+    fn eaten_rotten_flesh_preserves_stronger_hunger_and_tracks_save() {
         use crate::inventory::{ItemStack, PlayerSlot};
-        use native_persistence::nbt::Tag;
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:hunger".into())),
+                            ("duration".into(), Tag::Int(100)),
+                            ("amplifier".into(), Tag::Byte(1)),
+                            ("ambient".into(), Tag::Byte(1)),
+                            ("show_particles".into(), Tag::Byte(0)),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let original_bytes = native_persistence::nbt::write(&original).unwrap();
         let seed = (0..100)
             .find(|&seed| {
                 let mut random = native_core::random::LegacyRandom::new(seed);
@@ -27341,8 +27373,25 @@ mod tests {
         assert_eq!((hunger.duration, hunger.amplifier), (68, 1));
         let hidden = hunger.hidden.as_ref().unwrap();
         assert_eq!((hidden.duration, hidden.amplifier), (600, 0));
-        assert!(session.effect_save_invalid);
+        assert!(!session.effect_save_invalid);
+        assert_eq!(
+            session
+                .effect_save_tracking
+                .as_ref()
+                .unwrap()
+                .hunger_updates,
+            vec![32]
+        );
         assert_eq!(session.snapshot().vitals.food, 14);
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        assert_eq!(
+            native_persistence::nbt::write(&original).unwrap(),
+            original_bytes
+        );
     }
 
     #[test]

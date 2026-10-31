@@ -395,6 +395,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             if field.name() == "final_density" {
                 fixture["volume_min"] = json!([-17, -5, 31]);
                 fixture["volume_size"] = json!([5, 9, 5]);
+                fixture["chunk_min_y"] = settings["noise"]["min_y"].clone();
+                fixture["chunk_height"] = settings["noise"]["height"].clone();
             }
             fixtures.push(fixture);
         }
@@ -413,6 +415,9 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     let mut end_samples = 0;
     let mut volume_samples = 0;
     let mut volume_values = None;
+    let mut chunk_values = None;
+    let mut chunk_index = 0;
+    let mut chunk_samples = 0;
     for line in output.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         match fields.first().copied() {
@@ -466,6 +471,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 );
                 compiled = Some((index, mode, seed, function));
                 volume_values = None;
+                chunk_values = None;
+                chunk_index = 0;
                 groups += 1;
             }
             Some("P") | Some("Q") => {
@@ -511,6 +518,25 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 );
                 volume_samples += 1;
             }
+            Some("C") => {
+                let (index, mode, seed, _) = compiled.as_ref().unwrap();
+                let name = fixtures[*index]["router_settings"].as_str().unwrap();
+                let chunk = chunk_values.get_or_insert_with(|| {
+                    let router =
+                        NoiseRouter::load_without_terrain_adjustments(&mut data, name, *seed)
+                            .unwrap();
+                    router
+                        .sample_chunk_density(&mut evaluator, 90, -60)
+                        .unwrap()
+                });
+                assert_eq!(
+                    chunk.values()[chunk_index].to_bits(),
+                    fields[1].parse::<i32>().unwrap() as u32,
+                    "chunk {name} mode {mode} seed {seed} index {chunk_index}"
+                );
+                chunk_index += 1;
+                chunk_samples += 1;
+            }
             _ => {}
         }
     }
@@ -546,4 +572,5 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         })
         .sum();
     assert_eq!(volume_samples, expected_volume_samples);
+    assert_eq!(chunk_samples, 16 * 16 * (384 + 128 + 128));
 }

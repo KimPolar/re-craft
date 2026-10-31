@@ -62,7 +62,41 @@ struct Definition {
     noise_router: serde_json::Map<String, Value>,
 }
 
-/// A point-sampling view of one active noise-settings definition.
+/// Density values before aquifers, blocks, biomes, surfaces and structures.
+pub struct ChunkDensity {
+    chunk_x: i32,
+    chunk_z: i32,
+    min_y: i32,
+    height: i32,
+    values: Vec<f32>,
+}
+
+impl ChunkDensity {
+    pub fn chunk_position(&self) -> [i32; 2] {
+        [self.chunk_x, self.chunk_z]
+    }
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+    /// Density buffer in Java's Z, X, Y order.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    pub fn get(&self, local_x: u8, y: i32, local_z: u8) -> Option<f32> {
+        if local_x >= 16 || local_z >= 16 || y < self.min_y || y >= self.min_y + self.height {
+            return None;
+        }
+        let index = ((usize::from(local_z) * 16 + usize::from(local_x)) * self.height as usize)
+            + (y - self.min_y) as usize;
+        self.values.get(index).copied()
+    }
+}
+
+/// A density-sampling view of one active noise-settings definition.
 pub struct NoiseRouter {
     pub min_y: i32,
     pub height: i32,
@@ -171,6 +205,46 @@ impl NoiseRouter {
     ) -> Result<Vec<f32>> {
         evaluator.sample_block_volume(self.function(field), min, size)
     }
+
+    /// Sample a whole chunk's noise-stage density without modifying a world.
+    pub fn sample_chunk_density(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Result<ChunkDensity> {
+        ensure!(
+            (-2032..=2031).contains(&self.min_y)
+                && (0..=4064).contains(&self.height)
+                && self.min_y % 16 == 0
+                && self.height % 16 == 0
+                && self.min_y + self.height <= 2032,
+            "invalid noise vertical range"
+        );
+        let x = chunk_x
+            .checked_mul(16)
+            .context("chunk X exceeds block-coordinate range")?;
+        let z = chunk_z
+            .checked_mul(16)
+            .context("chunk Z exceeds block-coordinate range")?;
+        let values = if self.height == 0 {
+            Vec::new()
+        } else {
+            self.sample_block_volume(
+                evaluator,
+                RouterField::FinalDensity,
+                [x, self.min_y, z],
+                [16, self.height as u32, 16],
+            )?
+        };
+        Ok(ChunkDensity {
+            chunk_x,
+            chunk_z,
+            min_y: self.min_y,
+            height: self.height,
+            values,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +302,32 @@ mod tests {
                 .unwrap(),
             vec![1.0; 8]
         );
+        let chunk = router.sample_chunk_density(&mut evaluator, -2, 3).unwrap();
+        assert_eq!(
+            (chunk.chunk_x, chunk.chunk_z, chunk.min_y, chunk.height),
+            (-2, 3, -64, 384)
+        );
+        assert_eq!(chunk.values().len(), 16 * 16 * 384);
+        assert_eq!(chunk.get(15, -64, 0), Some(1.0));
+        assert_eq!(chunk.get(0, 320, 0), None);
+        assert_eq!(chunk.get(16, 0, 0), None);
+        assert!(
+            router
+                .sample_chunk_density(&mut evaluator, i32::MAX, 0)
+                .is_err()
+        );
+        let mut zero_height = definition();
+        zero_height["noise"]["height"] = json!(0);
+        let empty = NoiseRouter::from_json_without_terrain_adjustments(
+            &mut data,
+            &serde_json::to_vec(&zero_height).unwrap(),
+            7,
+        )
+        .unwrap()
+        .sample_chunk_density(&mut evaluator, 0, 0)
+        .unwrap();
+        assert!(empty.values().is_empty());
+        assert_eq!(empty.get(0, -64, 0), None);
         for (i, field) in RouterField::ALL.into_iter().enumerate() {
             assert_eq!(
                 router.sample(&mut evaluator, field, 4, 5, 6),

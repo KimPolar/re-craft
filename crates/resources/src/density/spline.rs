@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::{
     DensityCompiler, DensityFunction, MAX_DEPTH, MAX_NODES, SampleMemo,
     interval::{self, Interval},
-    lerp,
+    lerp, memo_key,
 };
 use crate::packs::ResourceProvider;
 
@@ -168,7 +168,7 @@ impl Spline {
             }
             unreachable!()
         };
-        let key = (Arc::as_ptr(coordinate) as usize, x, y, z, volume);
+        let key = memo_key(coordinate, x, y, z, volume);
         let position = if let Some(value) = memo.get(&key) {
             *value
         } else {

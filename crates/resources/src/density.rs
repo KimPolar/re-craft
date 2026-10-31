@@ -56,6 +56,22 @@ impl DerefMut for SampleMemo {
     }
 }
 
+fn memo_key(
+    function: &DensityFunction,
+    x: i32,
+    y: i32,
+    z: i32,
+    volume: bool,
+) -> (usize, i32, i32, i32, bool) {
+    (
+        function as *const DensityFunction as usize,
+        if function.5 & 1 == 0 { 0 } else { x },
+        if function.5 & 2 == 0 { 0 } else { y },
+        if function.5 & 4 == 0 { 0 } else { z },
+        volume,
+    )
+}
+
 /// Reuse cache storage across samples; each sample starts with an empty cache.
 #[derive(Default)]
 pub struct DensityEvaluator {
@@ -104,7 +120,7 @@ impl DensityEvaluator {
             .iter()
             .try_fold(1usize, |total, n| total.checked_mul(*n as usize))
             .context("volume size overflow")?;
-        ensure!(count <= 1_000_000, "volume exceeds maximum sample count");
+        ensure!(count <= 1_048_576, "volume exceeds maximum sample count");
         let mut max = [0; 3];
         for axis in 0..3 {
             max[axis] = i64::from(min[axis])
@@ -278,7 +294,7 @@ impl DensityFunction {
             Node::Constant(v) => *v,
             Node::Reference(v) => v.evaluate_cached(x, y, z, volume, memo),
             Node::Cache(input) => {
-                let key = (self as *const Self as usize, x, y, z, volume);
+                let key = memo_key(self, x, y, z, volume);
                 if let Some(value) = memo.get(&key) {
                     return *value;
                 }
@@ -615,7 +631,7 @@ fn interpolate_block_volume(
         };
     }
     let mut corner = |x, y, z| {
-        let key = (Arc::as_ptr(input) as usize, x, y, z, true);
+        let key = memo_key(input, x, y, z, true);
         if let Some(value) = memo.get(&key) {
             return *value;
         }
@@ -1620,6 +1636,11 @@ mod tests {
         let mut memo = SampleMemo::default();
         let value = function.evaluate_cached(1, 5, 3, false, &mut memo);
         assert_eq!(value, 1.0);
+        assert_eq!(memo.len(), 1);
+        assert_eq!(
+            function.evaluate_cached(100, 5, -100, false, &mut memo),
+            1.0
+        );
         assert_eq!(memo.len(), 1);
         function.evaluate_cached(1, 5, 3, true, &mut memo);
         assert_eq!(memo.len(), 2);

@@ -104,6 +104,13 @@ public class WorldDensityNoiseOracle {
                     for(int z=0;z<volume.sizeZ();z++) for(int x=0;x<volume.sizeX();x++) for(int y=0;y<volume.sizeY();y++)
                         System.out.printf("V %d %d %d %d%n",x,y,z,Float.floatToRawIntBits(buffer.get(volume.indexUnchecked(x,y,z))));
                 }
+                if (fixture.has("chunk_height") && seed == 0) {
+                    int minY=fixture.get("chunk_min_y").getAsInt(), height=fixture.get("chunk_height").getAsInt();
+                    var volume=new DensityVolume(16,height,16,90*16,minY,-60*16);
+                    var buffer=DensityBuffer.createUnpooled(volume.size());
+                    sampler.sampleVolume(SamplerContext.EMPTY_UNCACHED,buffer,volume);
+                    for (int j=0;j<buffer.size();j++) System.out.printf("C %d%n",Float.floatToRawIntBits(buffer.get(j)));
+                }
                 if (fixture.has("end_fixture")) for (int j=0;j<80;j++) {
                     int x=(j*7919)%90000-45000, z=(j*3571)%90000-45000, y=j-40;
                     System.out.printf("Q %d %d %d %d%n",x,y,z,Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,x,y,z)));

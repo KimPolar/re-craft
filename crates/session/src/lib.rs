@@ -483,6 +483,7 @@ impl LocalSession {
                                 .add_status(effect.kind, effect.duration, effect.amplifier);
                         }
                     }
+                    survival::FoodRandomEvent::RemovePoison => self.fall.remove_poison(),
                     _ => {}
                 }
             }

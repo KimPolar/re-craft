@@ -156,6 +156,10 @@ impl FallTracker {
         &self.effects
     }
 
+    pub(crate) fn remove_poison(&mut self) {
+        self.effects.poison = None;
+    }
+
     pub(crate) fn add_hunger(&mut self, duration: i32, amplifier: u8) {
         self.add_status(crate::survival::FoodStatusKind::Hunger, duration, amplifier);
     }

@@ -26,6 +26,7 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         "carrot" => (3, 0.6),
         "cod" | "salmon" | "cookie" | "sweet_berries" | "glow_berries" => (2, 0.1),
         "rotten_flesh" => (4, 0.1),
+        "honey_bottle" => (6, 0.1),
         "chicken" | "poisonous_potato" => (2, 0.3),
         "spider_eye" => (2, 0.8),
         "cooked_beef" | "cooked_porkchop" => (8, 0.8),
@@ -43,9 +44,13 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
     Some(FoodProperties {
         nutrition,
         saturation: nutrition as f32 * modifier * 2.0,
-        use_ticks: if id == "minecraft:dried_kelp" { 16 } else { 32 },
-        can_always_eat: false,
-        consume_particles: true,
+        use_ticks: match id {
+            "minecraft:dried_kelp" => 16,
+            "minecraft:honey_bottle" => 40,
+            _ => 32,
+        },
+        can_always_eat: id == "minecraft:honey_bottle",
+        consume_particles: id != "minecraft:honey_bottle",
     })
 }
 
@@ -331,6 +336,14 @@ fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
     if let Some(template) = components.get("minecraft:use_remainder") {
         return parse_use_remainder(template);
     }
+    if item.id() == "minecraft:honey_bottle" {
+        return ItemStack::new(
+            "minecraft:glass_bottle".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        );
+    }
     matches!(
         item.id(),
         "minecraft:mushroom_stew" | "minecraft:rabbit_stew" | "minecraft:beetroot_soup"
@@ -401,6 +414,7 @@ pub(crate) enum FoodRandomEvent {
         probability: f32,
         effects: Vec<StatusApplication>,
     },
+    RemovePoison,
 }
 
 impl FoodRandomEvent {
@@ -417,6 +431,7 @@ impl FoodRandomEvent {
                 }
             }
             Self::StatusGroup { probability, .. } => return random.next_float() < *probability,
+            Self::RemovePoison => return true,
         };
         random.next_bool();
         for _ in 0..3 + u32::from(particles) * 4 {
@@ -574,6 +589,10 @@ impl FoodUse {
         food: FoodProperties,
     ) {
         let remainder = inventory.slot(hand).and_then(food_remainder);
+        let remove_poison = inventory.slot(hand).is_some_and(|item| {
+            item.id() == "minecraft:honey_bottle"
+                && item.components().get("minecraft:consumable").is_none()
+        });
         let causes_hunger = inventory.slot(hand).is_some_and(|item| {
             item.id() == "minecraft:rotten_flesh"
                 && item.components().get("minecraft:consumable").is_none()
@@ -616,6 +635,9 @@ impl FoodUse {
                     effects: group.effects,
                 }
             }));
+            if remove_poison {
+                self.events.push(FoodRandomEvent::RemovePoison);
+            }
             vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
             vitals.saturation =
                 (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
@@ -1118,10 +1140,27 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 300);
+        assert_eq!(rows.len(), 400);
         for row in rows {
             let id = format!("minecraft:{}", row["item"].as_str().unwrap());
-            let item = ItemStack::new(id, 1, 64, Tag::Compound(vec![])).unwrap();
+            let max = row["max_stack"].as_u64().unwrap() as u32;
+            let item = ItemStack::new(id, 1, max, Tag::Compound(vec![])).unwrap();
+            let food = food_properties(&item).unwrap();
+            assert_eq!(
+                food.use_ticks,
+                row["ticks"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+            assert_eq!(
+                food.can_always_eat,
+                row["always"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                food.consume_particles,
+                row["particles"].as_bool().unwrap(),
+                "{row}"
+            );
             let mut inventory = PlayerInventory::default();
             inventory.set_slot(PlayerSlot::Storage(0), Some(item));
             let mut inventory = Arc::new(inventory);
@@ -1139,17 +1178,28 @@ mod tests {
                 GameMode::Survival
             ));
             let mut applied = None;
-            for _ in 0..32 {
+            let mut removed = false;
+            for _ in 0..food.use_ticks {
                 usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
                 for event in usage.take_events() {
-                    if event.apply(&mut random)
-                        && let FoodRandomEvent::StatusGroup { effects, .. } = event
-                    {
-                        assert_eq!(effects.len(), 1);
-                        applied = Some(effects[0]);
+                    if event.apply(&mut random) {
+                        match event {
+                            FoodRandomEvent::StatusGroup { effects, .. } => {
+                                assert_eq!(effects.len(), 1);
+                                applied = Some(effects[0]);
+                            }
+                            FoodRandomEvent::RemovePoison => removed = true,
+                            _ => {}
+                        }
                     }
                 }
             }
+            assert_eq!(removed, row["poison_removed"].as_bool().unwrap(), "{row}");
+            assert_eq!(
+                inventory.slot(PlayerSlot::Storage(0)).map(|item| item.id()),
+                row["remainder"].as_str(),
+                "{row}"
+            );
             assert_eq!(vitals.food, row["food"].as_i64().unwrap() as i32, "{row}");
             assert_eq!(
                 vitals.saturation.to_bits(),
@@ -1359,6 +1409,58 @@ mod tests {
                         session.fall.effects().hunger.as_ref().unwrap().duration,
                         599
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn honey_bottle_remainder_handles_stacks_and_creative_mode() {
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            for count in [1, 2] {
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new(
+                        "minecraft:honey_bottle".into(),
+                        count,
+                        16,
+                        Tag::Compound(vec![]),
+                    ),
+                );
+                let mut inventory = Arc::new(inventory);
+                let mut vitals = PlayerVitals {
+                    food: 20,
+                    saturation: 0.0,
+                    ..Default::default()
+                };
+                let mut usage = FoodUse::default();
+                assert!(usage.start_hand(
+                    &mut inventory,
+                    PlayerSlot::Storage(0),
+                    &mut vitals,
+                    mode
+                ));
+                for _ in 0..40 {
+                    usage.tick(&mut inventory, &mut vitals, mode);
+                }
+                assert!(!usage.is_active());
+                assert!(
+                    usage
+                        .take_events()
+                        .iter()
+                        .any(|event| matches!(event, FoodRandomEvent::RemovePoison))
+                );
+                let hand = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+                if mode == GameMode::Creative {
+                    assert_eq!((hand.id(), hand.count()), ("minecraft:honey_bottle", count));
+                    assert!(inventory.slot(PlayerSlot::Storage(1)).is_none());
+                } else if count == 1 {
+                    assert_eq!((hand.id(), hand.count()), ("minecraft:glass_bottle", 1));
+                } else {
+                    assert_eq!((hand.id(), hand.count()), ("minecraft:honey_bottle", 1));
+                    let bottle = inventory.slot(PlayerSlot::Storage(1)).unwrap();
+                    assert_eq!((bottle.id(), bottle.count()), ("minecraft:glass_bottle", 1));
                 }
             }
         }

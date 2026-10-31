@@ -739,6 +739,25 @@ impl LoadedSession {
                         show_icon: true,
                     }],
                     crate::survival::FoodRandomEvent::StatusGroup { effects, .. } => effects,
+                    crate::survival::FoodRandomEvent::RemovePoison => {
+                        let tracking = self.ensure_effect_save_tracking();
+                        tracking
+                            .status_updates
+                            .push(crate::player_data::StatusUpdate {
+                                kind: crate::survival::FoodStatusKind::Poison,
+                                update: crate::player_data::HungerUpdate {
+                                    tick: tracking.ticks,
+                                    duration: 0,
+                                    amplifier: 0,
+                                    ambient: false,
+                                    visible: false,
+                                    show_icon: false,
+                                },
+                                remove: true,
+                            });
+                        self.fall.remove_poison();
+                        continue;
+                    }
                     _ => Vec::new(),
                 };
                 for effect in effects {
@@ -747,6 +766,7 @@ impl LoadedSession {
                         .status_updates
                         .push(crate::player_data::StatusUpdate {
                             kind: effect.kind,
+                            remove: false,
                             update: crate::player_data::HungerUpdate {
                                 tick: tracking.ticks,
                                 duration: effect.duration,
@@ -27785,6 +27805,7 @@ mod tests {
                 .status_updates,
             vec![crate::player_data::StatusUpdate {
                 kind: crate::survival::FoodStatusKind::Hunger,
+                remove: false,
                 update: crate::player_data::HungerUpdate {
                     tick: 32,
                     duration: 600,
@@ -27805,6 +27826,97 @@ mod tests {
             native_persistence::nbt::write(&original).unwrap(),
             original_bytes
         );
+    }
+
+    #[test]
+    fn honey_bottle_removes_poison_and_preserves_other_saved_effects() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Health".into(), Tag::Float(1.0)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:poison".into())),
+                                ("duration".into(), Tag::Int(100)),
+                                (
+                                    "hidden_effect".into(),
+                                    Tag::Compound(vec![
+                                        ("duration".into(), Tag::Int(200)),
+                                        ("amplifier".into(), Tag::Byte(0)),
+                                    ]),
+                                ),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:hunger".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        for overridden in [false, true] {
+            let mut session = session();
+            session.set_survival_rules(crate::survival::SurvivalRules {
+                natural_health_regeneration: false,
+                ..Default::default()
+            });
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::player_data::read_saved_fall_effects(&original).unwrap(),
+                Arc::new(OxygenEnchantments::default()),
+            );
+            let components = if overridden {
+                Tag::Compound(vec![("minecraft:consumable".into(), Tag::Compound(vec![]))])
+            } else {
+                Tag::Compound(vec![])
+            };
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:honey_bottle".into(), 1, 16, components),
+            );
+            session.set_player_inventory(inventory);
+            session.set_player_vitals(crate::survival::PlayerVitals {
+                health: 1.0,
+                food: 20,
+                saturation: 0.0,
+                ..Default::default()
+            });
+            session.submit_command(PlayerCommand::Place);
+            let ticks = if overridden { 32 } else { 40 };
+            for _ in 0..ticks - 1 {
+                session.update(TICK);
+            }
+            assert!(session.snapshot().poison_effect);
+            assert!(session.snapshot().first_person.item_use.is_some());
+            session.update(TICK);
+            assert_eq!(session.snapshot().poison_effect, overridden);
+            assert!(session.snapshot().hunger_effect);
+            assert_eq!(
+                session
+                    .snapshot()
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .id(),
+                "minecraft:glass_bottle"
+            );
+            assert_eq!(session.snapshot().vitals.food, 20);
+            let draft = session.draft_player_state(&original).unwrap();
+            assert_eq!(
+                crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+                *session.fall.effects()
+            );
+        }
     }
 
     #[test]

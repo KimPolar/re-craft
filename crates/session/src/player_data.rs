@@ -1326,6 +1326,7 @@ pub fn replay_saved_hunger_effects(
         .map(|update| StatusUpdate {
             kind: crate::survival::FoodStatusKind::Hunger,
             update,
+            remove: false,
         })
         .collect();
     replay_saved_status_effects(player, ticks, &updates)
@@ -1335,6 +1336,7 @@ pub fn replay_saved_hunger_effects(
 pub(crate) struct StatusUpdate {
     pub kind: crate::survival::FoodStatusKind,
     pub update: HungerUpdate,
+    pub remove: bool,
 }
 
 pub(crate) fn replay_saved_status_effects(
@@ -1444,7 +1446,12 @@ pub(crate) fn replay_saved_status_effects(
 
     let mut effects = advance_saved_effects(player, 0)?;
     let mut elapsed = 0;
-    for &StatusUpdate { kind, update } in updates {
+    for &StatusUpdate {
+        kind,
+        update,
+        remove,
+    } in updates
+    {
         let event_tick = update.tick;
         ensure!(
             event_tick >= elapsed && event_tick <= ticks,
@@ -1464,6 +1471,25 @@ pub(crate) fn replay_saved_status_effects(
             unreachable!()
         };
         *element_type = TagType::Compound;
+        if remove {
+            values.retain(|effect| {
+                !effect
+                    .get("id")
+                    .and_then(text)
+                    .and_then(|id| ResourceId::parse(&id).ok())
+                    .is_some_and(|id| {
+                        id.namespace == "minecraft"
+                            && id.path
+                                == match kind {
+                                    crate::survival::FoodStatusKind::Hunger => "hunger",
+                                    crate::survival::FoodStatusKind::Poison => "poison",
+                                }
+                    })
+            });
+            effects = Some(list);
+            elapsed = event_tick;
+            continue;
+        }
         if let Some(effect) = values.iter_mut().find(|effect| {
             effect
                 .get("id")
@@ -2355,6 +2381,7 @@ mod tests {
                     let updates = [
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
+                            remove: false,
                             update: HungerUpdate {
                                 tick: 0,
                                 duration: 10,
@@ -2366,6 +2393,7 @@ mod tests {
                         },
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Hunger,
+                            remove: false,
                             update: HungerUpdate {
                                 tick: 0,
                                 duration: 100,
@@ -2377,6 +2405,7 @@ mod tests {
                         },
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
+                            remove: false,
                             update: HungerUpdate {
                                 tick: 3,
                                 duration: 200,
@@ -2388,6 +2417,7 @@ mod tests {
                         },
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
+                            remove: false,
                             update: HungerUpdate {
                                 tick: 15,
                                 duration: -1,
@@ -2398,32 +2428,52 @@ mod tests {
                             },
                         },
                     ];
-                    let effects = replay_saved_status_effects(&original, 50, &updates).unwrap();
-                    let draft = NamedTag {
-                        name: "".into(),
-                        value: Tag::Compound(
-                            effects
-                                .map(|value| ("active_effects".into(), value))
-                                .into_iter()
-                                .collect(),
-                        ),
-                    };
-                    let index = input.len();
-                    std::fs::write(
-                        temp.path().join(format!("source{index}.nbt")),
-                        native_persistence::nbt::write(&original).unwrap(),
-                    )
-                    .unwrap();
-                    std::fs::write(
-                        temp.path().join(format!("draft{index}.nbt")),
-                        native_persistence::nbt::write(&draft).unwrap(),
-                    )
-                    .unwrap();
-                    let events: Vec<_> = updates.iter().map(|event| {
+                    for remove in [false, true] {
+                        let mut updates = updates.to_vec();
+                        if remove {
+                            updates.insert(
+                                3,
+                                StatusUpdate {
+                                    kind: crate::survival::FoodStatusKind::Poison,
+                                    remove: true,
+                                    update: HungerUpdate {
+                                        tick: 3,
+                                        duration: 0,
+                                        amplifier: 0,
+                                        ambient: false,
+                                        visible: false,
+                                        show_icon: false,
+                                    },
+                                },
+                            );
+                        }
+                        let effects = replay_saved_status_effects(&original, 50, &updates).unwrap();
+                        let draft = NamedTag {
+                            name: "".into(),
+                            value: Tag::Compound(
+                                effects
+                                    .map(|value| ("active_effects".into(), value))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        };
+                        let index = input.len();
+                        std::fs::write(
+                            temp.path().join(format!("source{index}.nbt")),
+                            native_persistence::nbt::write(&original).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            temp.path().join(format!("draft{index}.nbt")),
+                            native_persistence::nbt::write(&draft).unwrap(),
+                        )
+                        .unwrap();
+                        let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger" }, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
-                    input.push(serde_json::json!({"ticks":50,"events":events}));
+                        input.push(serde_json::json!({"ticks":50,"events":events}));
+                    }
                 }
             }
         }

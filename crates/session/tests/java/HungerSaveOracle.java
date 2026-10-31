@@ -37,6 +37,9 @@ public class HungerSaveOracle {
           var entry=updates.get(event);
           var object=entry.isJsonObject()?entry.getAsJsonObject():null;
           var kind=object!=null && object.has("kind") && object.get("kind").getAsString().equals("poison") ? MobEffects.POISON : MobEffects.HUNGER;
+          if(object!=null && object.has("remove") && object.get("remove").getAsBoolean()) {
+            effects.removeIf(e->e.getEffect()==kind); event++; continue;
+          }
           var incoming=object==null?new MobEffectInstance(kind,600,0):new MobEffectInstance(kind,object.get("duration").getAsInt(),object.get("amplifier").getAsInt(),object.get("ambient").getAsBoolean(),object.get("visible").getAsBoolean(),object.get("show_icon").getAsBoolean());
           var existing=effects.stream().filter(e->e.getEffect()==kind).findFirst();
           if(existing.isPresent()) existing.get().update(incoming);

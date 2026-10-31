@@ -2378,6 +2378,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "stripped_warped_hyphae",
     "stick",
     "bowl",
+    "glass_bottle",
     "brick",
     "clay_ball",
     "slime_ball",
@@ -2475,7 +2476,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         return Some(max);
     }
     let name = id.strip_prefix("minecraft:")?;
-    if matches!(name, "ender_pearl" | "snowball") {
+    if matches!(name, "ender_pearl" | "snowball" | "honey_bottle") {
         return Some(16);
     }
     if STACKABLE_ITEMS.contains(&name) {

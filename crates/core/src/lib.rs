@@ -1,4 +1,5 @@
 pub mod button;
+pub mod normal_noise;
 pub mod ore;
 pub mod perlin;
 pub mod random;

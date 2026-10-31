@@ -160,7 +160,7 @@ impl MenuGpuWorker {
                                 renderer.set_assets(overlay.assets.as_ref())?;
                                 renderer.update_overlay(&overlay.canvas)?;
                             }
-                            renderer.render(
+                            let _presented = renderer.render(
                                 frame.seconds,
                                 frame.speed,
                                 frame.requested_at,
@@ -168,7 +168,9 @@ impl MenuGpuWorker {
                                 frame.blur_radius,
                             )?;
                             #[cfg(test)]
-                            worker_completed.fetch_add(1, Ordering::Relaxed);
+                            if _presented {
+                                worker_completed.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Ok(())
                     }));

@@ -4,6 +4,7 @@
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 #[cfg(any(debug_assertions, test))]
 use std::time::Duration;
@@ -22,6 +23,7 @@ use crate::{menu_assets::MenuAssets, menu_draw::Canvas, menu_gpu_worker::Surface
 struct GpuFrameTimings {
     blurred: Option<bool>,
     warmup: usize,
+    startup_intervals: Vec<Duration>,
     samples: Vec<[Duration; 4]>,
     intervals: Vec<Duration>,
     previous: Option<Instant>,
@@ -44,6 +46,18 @@ impl GpuFrameTimings {
         let previous = self.previous.replace(now);
         if self.warmup < 30 {
             self.warmup += 1;
+            if let Some(previous) = previous {
+                self.startup_intervals.push(now.duration_since(previous));
+            }
+            if self.warmup == 30 && !self.startup_intervals.is_empty() {
+                self.startup_intervals.sort_unstable();
+                let n = self.startup_intervals.len();
+                eprintln!(
+                    "Menu GPU startup render intervals: blurred={blurred} samples={n} median={:?} max={:?}; excludes display scanout",
+                    self.startup_intervals[n / 2],
+                    self.startup_intervals[n - 1],
+                );
+            }
             return;
         }
         if let Some(previous) = previous {
@@ -84,9 +98,8 @@ pub struct MenuRenderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     panorama_pipeline: wgpu::RenderPipeline,
-    blur_horizontal_pipeline: wgpu::RenderPipeline,
-    blur_vertical_pipeline: wgpu::RenderPipeline,
-    composite_pipeline: wgpu::RenderPipeline,
+    blur_pipelines: Option<BlurPipelines>,
+    blur_pipeline_task: Option<mpsc::Receiver<Result<BlurPipelines>>>,
     overlay_pipeline: wgpu::RenderPipeline,
     panorama_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
@@ -115,6 +128,12 @@ pub struct MenuRenderer {
     lost_device: Arc<AtomicBool>,
     #[cfg(any(debug_assertions, test))]
     frame_timings: Option<GpuFrameTimings>,
+}
+
+struct BlurPipelines {
+    horizontal: wgpu::RenderPipeline,
+    vertical: wgpu::RenderPipeline,
+    composite: wgpu::RenderPipeline,
 }
 
 impl MenuRenderer {
@@ -149,10 +168,16 @@ impl MenuRenderer {
         vsync: bool,
         surfaces: SurfaceRequester,
     ) -> Result<Self> {
+        #[cfg(any(debug_assertions, test))]
+        let startup = std::env::var_os("NATIVE_MENU_FRAME_TIMINGS").map(|_| Instant::now());
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backend;
         let instance = wgpu::Instance::new(descriptor);
+        #[cfg(any(debug_assertions, test))]
+        let instance_ready = startup.map(|start| start.elapsed());
         let surface = surfaces.create(&instance)?;
+        #[cfg(any(debug_assertions, test))]
+        let surface_ready = startup.map(|start| start.elapsed());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -162,6 +187,8 @@ impl MenuRenderer {
             })
             .await
             .context("no compatible menu GPU adapter")?;
+        #[cfg(any(debug_assertions, test))]
+        let adapter_ready = startup.map(|start| start.elapsed());
         #[cfg(any(debug_assertions, test))]
         if std::env::var_os("NATIVE_MENU_FRAME_TIMINGS").is_some() {
             eprintln!("Menu graphics adapter: {:?}", adapter.get_info());
@@ -173,6 +200,8 @@ impl MenuRenderer {
             })
             .await
             .context("cannot create menu GPU device")?;
+        #[cfg(any(debug_assertions, test))]
+        let device_ready = startup.map(|start| start.elapsed());
         let lost_device = Arc::new(AtomicBool::new(false));
         let lost_flag = Arc::clone(&lost_device);
         device.set_device_lost_callback(move |_, _| lost_flag.store(true, Ordering::Relaxed));
@@ -201,6 +230,8 @@ impl MenuRenderer {
             );
         }
         surface.configure(&device, &config);
+        #[cfg(any(debug_assertions, test))]
+        let configured = startup.map(|start| start.elapsed());
 
         let panorama_layout = panorama_layout(&device);
         let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -239,10 +270,6 @@ impl MenuRenderer {
             label: Some("menu image shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
         });
-        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("menu blur shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("menu_blur.wgsl").into()),
-        });
         let panorama_pipeline = pipeline(
             &device,
             &panorama_layout,
@@ -250,32 +277,6 @@ impl MenuRenderer {
             config.format,
             None,
             "panorama pipeline",
-        );
-        let blur_horizontal_pipeline = pipeline_entry(
-            &device,
-            &blur_layout,
-            &blur_shader,
-            config.format,
-            None,
-            "horizontal",
-            "menu horizontal blur",
-        );
-        let blur_vertical_pipeline = pipeline_entry(
-            &device,
-            &blur_layout,
-            &blur_shader,
-            config.format,
-            None,
-            "vertical",
-            "menu vertical blur",
-        );
-        let composite_pipeline = pipeline(
-            &device,
-            &image_layout,
-            &image_shader,
-            config.format,
-            None,
-            "blurred background pipeline",
         );
         let overlay_pipeline = pipeline(
             &device,
@@ -294,9 +295,8 @@ impl MenuRenderer {
             queue,
             config,
             panorama_pipeline,
-            blur_horizontal_pipeline,
-            blur_vertical_pipeline,
-            composite_pipeline,
+            blur_pipelines: None,
+            blur_pipeline_task: None,
             overlay_pipeline,
             panorama_layout,
             image_layout,
@@ -328,6 +328,31 @@ impl MenuRenderer {
                 .map(|_| GpuFrameTimings::default()),
         };
         renderer.set_assets(None)?;
+        #[cfg(any(debug_assertions, test))]
+        if let (
+            Some(start),
+            Some(instance),
+            Some(surface),
+            Some(adapter),
+            Some(device),
+            Some(configured),
+        ) = (
+            startup,
+            instance_ready,
+            surface_ready,
+            adapter_ready,
+            device_ready,
+            configured,
+        ) {
+            eprintln!(
+                "Menu GPU initialization CPU stages: backend={backend:?} instance={instance:?} surface={:?} adapter={:?} device={:?} configure={:?} pipelines-and-placeholder={:?}; excludes display scanout",
+                surface - instance,
+                adapter - surface,
+                device - adapter,
+                configured - device,
+                start.elapsed() - configured,
+            );
+        }
         Ok(renderer)
     }
 
@@ -439,6 +464,85 @@ impl MenuRenderer {
         Ok(())
     }
 
+    fn start_blur_pipeline_task(&mut self) -> Result<()> {
+        if self.blur_pipelines.is_some() || self.blur_pipeline_task.is_some() {
+            return Ok(());
+        }
+        let device = self.device.clone();
+        let blur_layout = self.blur_layout.clone();
+        let image_layout = self.image_layout.clone();
+        let format = self.config.format;
+        let (send, receive) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("menu-blur-pipelines".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("menu blur shader"),
+                        source: wgpu::ShaderSource::Wgsl(include_str!("menu_blur.wgsl").into()),
+                    });
+                    let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("menu image shader"),
+                        source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
+                    });
+                    BlurPipelines {
+                        horizontal: pipeline_entry(
+                            &device,
+                            &blur_layout,
+                            &blur_shader,
+                            format,
+                            None,
+                            "horizontal",
+                            "menu horizontal blur",
+                        ),
+                        vertical: pipeline_entry(
+                            &device,
+                            &blur_layout,
+                            &blur_shader,
+                            format,
+                            None,
+                            "vertical",
+                            "menu vertical blur",
+                        ),
+                        composite: pipeline(
+                            &device,
+                            &image_layout,
+                            &image_shader,
+                            format,
+                            None,
+                            "blurred background pipeline",
+                        ),
+                    }
+                }))
+                .map_err(|_| anyhow!("menu blur pipeline initialization panicked"));
+                let _ = send.send(result);
+            })
+            .context("cannot start menu blur pipeline worker")?;
+        self.blur_pipeline_task = Some(receive);
+        Ok(())
+    }
+
+    fn blur_pipelines_ready(&mut self) -> Result<bool> {
+        if self.blur_pipelines.is_some() {
+            return Ok(true);
+        }
+        self.start_blur_pipeline_task()?;
+        match self
+            .blur_pipeline_task
+            .as_ref()
+            .expect("pipeline worker started")
+            .try_recv()
+        {
+            Ok(result) => {
+                self.blur_pipelines = Some(result?);
+                self.blur_pipeline_task = None;
+                Ok(true)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => bail!("menu blur pipeline worker stopped"),
+        }
+    }
+
     fn ensure_blur(&mut self) -> Result<()> {
         // Java applies the post effect in framebuffer pixels, not GUI pixels.
         let size = (self.config.width.max(1), self.config.height.max(1));
@@ -496,16 +600,19 @@ impl MenuRenderer {
         requested_at: Instant,
         blurred: bool,
         radius: u8,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.lost_device.load(Ordering::Relaxed) {
             bail!("menu graphics device was lost");
         }
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let blurred = blurred && radius > 0;
         if blurred {
+            if !self.blur_pipelines_ready()? {
+                return Ok(false);
+            }
             let radius = radius.min(10);
             if radius != self.blur_radius {
                 self.queue.write_buffer(
@@ -523,11 +630,11 @@ impl MenuRenderer {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface = self
@@ -535,7 +642,7 @@ impl MenuRenderer {
                     .create(&self.instance)
                     .context("cannot restore menu surface")?;
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Validation => bail!("menu surface validation failed"),
         };
@@ -596,7 +703,13 @@ impl MenuRenderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(&self.blur_horizontal_pipeline);
+                    pass.set_pipeline(
+                        &self
+                            .blur_pipelines
+                            .as_ref()
+                            .context("blur pipelines missing")?
+                            .horizontal,
+                    );
                     pass.set_bind_group(
                         0,
                         self.blur_binding.as_ref().context("blur binding missing")?,
@@ -616,7 +729,13 @@ impl MenuRenderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(&self.blur_vertical_pipeline);
+                    pass.set_pipeline(
+                        &self
+                            .blur_pipelines
+                            .as_ref()
+                            .context("blur pipelines missing")?
+                            .vertical,
+                    );
                     pass.set_bind_group(
                         0,
                         self.blur_temporary_binding
@@ -641,7 +760,13 @@ impl MenuRenderer {
                 multiview_mask: None,
             });
             if blurred {
-                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_pipeline(
+                    &self
+                        .blur_pipelines
+                        .as_ref()
+                        .context("blur pipelines missing")?
+                        .composite,
+                );
                 pass.set_bind_group(
                     0,
                     self.blur_composite_binding
@@ -671,6 +796,11 @@ impl MenuRenderer {
         #[cfg(any(debug_assertions, test))]
         let submitted = started.map(|start| start.elapsed());
         self.queue.present(frame);
+        // The title does not need blur. Start compilation only after its first
+        // frame is submitted so the driver cannot delay initial display.
+        if !blurred {
+            self.start_blur_pipeline_task()?;
+        }
         #[cfg(any(debug_assertions, test))]
         if let (Some(start), Some(acquired), Some(encoded), Some(submitted), Some(timings)) = (
             started,
@@ -692,7 +822,7 @@ impl MenuRenderer {
         if suboptimal {
             self.surface.configure(&self.device, &self.config);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1471,6 +1601,12 @@ mod tests {
                 label: Some("test image layout"),
                 entries: &[texture_entry(0), sampler_entry(1)],
             });
+            let blur_layout = create_blur_layout(&device);
+            let blur_radius = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test blur radius"),
+                contents: bytemuck::cast_slice(&[5_u32, 0, 0, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
             let panorama_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("test panorama shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("menu_panorama.wgsl").into()),
@@ -1549,7 +1685,7 @@ mod tests {
                 );
                 let horizontal = pipeline_entry(
                     &device,
-                    &image_layout,
+                    &blur_layout,
                     &blur_shader,
                     format,
                     None,
@@ -1558,7 +1694,7 @@ mod tests {
                 );
                 let vertical = pipeline_entry(
                     &device,
-                    &image_layout,
+                    &blur_layout,
                     &blur_shader,
                     format,
                     None,
@@ -1583,6 +1719,8 @@ mod tests {
                 .unwrap();
                 let blur_view = blur.create_view(&wgpu::TextureViewDescriptor::default());
                 let background_bind = image_binding(&device, &image_layout, &blur_view, &nearest);
+                let blur_bind =
+                    blur_binding(&device, &blur_layout, &blur_view, &nearest, &blur_radius);
                 let temporary = texture(
                     &device,
                     (16, 16),
@@ -1592,8 +1730,13 @@ mod tests {
                 )
                 .unwrap();
                 let temporary_view = temporary.create_view(&wgpu::TextureViewDescriptor::default());
-                let temporary_bind =
-                    image_binding(&device, &image_layout, &temporary_view, &nearest);
+                let temporary_bind = blur_binding(
+                    &device,
+                    &blur_layout,
+                    &temporary_view,
+                    &nearest,
+                    &blur_radius,
+                );
                 let output = texture(
                     &device,
                     (64, 64),
@@ -1640,7 +1783,7 @@ mod tests {
                         multiview_mask: None,
                     });
                     pass.set_pipeline(&horizontal);
-                    pass.set_bind_group(0, &background_bind, &[]);
+                    pass.set_bind_group(0, &blur_bind, &[]);
                     pass.draw(0..3, 0..1);
                 }
                 {

@@ -3673,6 +3673,7 @@ mod tests {
             start: Instant,
             last: Option<Instant>,
             intervals: Vec<Duration>,
+            first_rendered: Option<Duration>,
         }
         impl ApplicationHandler for Harness<'_> {
             fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -3703,6 +3704,15 @@ mod tests {
             }
             fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
                 self.menu.about_to_wait(event_loop);
+                if self.first_rendered.is_none()
+                    && self
+                        .menu
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|gpu| gpu.completed_frames() > 0)
+                {
+                    self.first_rendered = Some(self.start.elapsed());
+                }
                 if self.start.elapsed() >= Duration::from_secs(7) {
                     event_loop.exit();
                 }
@@ -3725,6 +3735,7 @@ mod tests {
             start: Instant::now(),
             last: None,
             intervals: Vec::new(),
+            first_rendered: None,
         };
         let mut builder = EventLoop::builder();
         builder.with_any_thread(true);
@@ -3735,9 +3746,19 @@ mod tests {
             "insufficient title frames: {}",
             harness.intervals.len()
         );
+        if let Some(gpu) = &harness.menu.gpu {
+            assert!(
+                gpu.completed_frames() > 100,
+                "GPU did not present enough frames"
+            );
+            assert!(
+                harness.first_rendered.is_some(),
+                "first GPU frame was not observed"
+            );
+        }
         let n = harness.intervals.len();
         println!(
-            "Menu CPU redraw intervals: screen={:?}, gpu={}, completed={}, vsync={}, refresh={:?}, count={n}, median={:?}, p95={:?}, p99={:?}, max={:?}; excludes display scanout",
+            "Menu CPU redraw intervals: screen={:?}, gpu={}, completed={}, first-render-observed={:?}, vsync={}, refresh={:?}, count={n}, median={:?}, p95={:?}, p99={:?}, max={:?}; assets were preloaded and intervals exclude display scanout",
             harness.menu.state.screen,
             harness.menu.gpu.is_some(),
             harness
@@ -3745,6 +3766,7 @@ mod tests {
                 .gpu
                 .as_ref()
                 .map_or(0, MenuGpuWorker::completed_frames),
+            harness.first_rendered,
             harness.menu.state.video.vsync,
             harness.menu.refresh_interval,
             harness.intervals[n / 2],

@@ -263,6 +263,7 @@ struct ItemEntity {
     created: Option<CreatedItemIdentity>,
     id: u32,
     section_sequence: u64,
+    random: LegacyRandom,
     _damage_state: ItemDamageState,
 }
 
@@ -513,7 +514,6 @@ pub(crate) struct ItemEntities {
     created_pickups: Vec<CreatedPickupRecord>,
     pickup_sounds: VecDeque<DVec3>,
     extinguish_sounds: VecDeque<crate::ExtinguishSound>,
-    sound_random: LegacyRandom,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -538,7 +538,6 @@ impl Default for ItemEntities {
             created_pickups: Vec::new(),
             pickup_sounds: VecDeque::new(),
             extinguish_sounds: VecDeque::new(),
-            sound_random: LegacyRandom::new(0),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1262,7 +1261,7 @@ impl ItemEntities {
 
     pub fn spawn_saved(&mut self, saved: crate::saved_item::SavedItemState) {
         let position = saved.position;
-        let (bob_offset, _) = self.item_visuals();
+        let (bob_offset, _, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1284,6 +1283,7 @@ impl ItemEntities {
             created: None,
             id: self.next_id,
             section_sequence: self.next_section_sequence,
+            random: entity_random,
             _damage_state: ItemDamageState {
                 health: i32::from(saved.health),
                 fire_ticks: i32::from(saved.fire_ticks),
@@ -1298,12 +1298,12 @@ impl ItemEntities {
     /// ItemEntity created by Entity.spawnAtLocation. The random stream is
     /// still session-local; the saved Java entity RNG is not yet reproduced.
     pub(crate) fn spawn_from_entity(&mut self, position: DVec3, stack: ItemStack) {
+        let (bob_offset, yaw, mut entity_random) = self.item_visuals();
         let velocity = DVec3::new(
-            self.random.next_double() * 0.2 - 0.1,
+            entity_random.next_double() * 0.2 - 0.1,
             0.2,
-            self.random.next_double() * 0.2 - 0.1,
+            entity_random.next_double() * 0.2 - 0.1,
         );
-        let (bob_offset, yaw) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1329,20 +1329,17 @@ impl ItemEntities {
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
+            random: entity_random,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
         self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
     }
 
-    fn item_visuals(&self) -> (f32, f32) {
+    fn item_visuals(&self) -> (f32, f32, LegacyRandom) {
         // Keep visual randomness independent of the incomplete loot/physics RNG.
         let mut seed = native_core::random::XoroshiroRandom::new(i64::from(self.next_id));
-        let mut random = LegacyRandom::new(seed.next_long());
-        (
-            random.next_float() * std::f32::consts::PI * 2.0,
-            random.next_float() * 360.0,
-        )
+        item_random_from_seed(seed.next_long())
     }
 
     pub fn snapshot(&self) -> Arc<[DroppedItem]> {
@@ -1381,7 +1378,7 @@ impl ItemEntities {
                     triangle(&mut self.random, 0.2),
                     triangle(&mut self.random, 0.0),
                 );
-                let (bob_offset, yaw) = self.item_visuals();
+                let (bob_offset, yaw, entity_random) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -1407,6 +1404,7 @@ impl ItemEntities {
                     )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
+                    random: entity_random,
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -1433,7 +1431,7 @@ impl ItemEntities {
         let position = origin.as_dvec3()
             + feet
             + DVec3::Y * (f64::from(player.pose.eye_height()) - f64::from(0.3_f32));
-        let (bob_offset, yaw) = self.item_visuals();
+        let (bob_offset, yaw, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1459,6 +1457,7 @@ impl ItemEntities {
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
+            random: entity_random,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1496,7 +1495,7 @@ impl ItemEntities {
                 f64::from(player.pose.eye_height()) - f64::from(0.3_f32),
                 0.0,
             );
-        let (bob_offset, yaw) = self.item_visuals();
+        let (bob_offset, yaw, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
                 entity_id: 0,
@@ -1529,6 +1528,7 @@ impl ItemEntities {
             )),
             id: self.next_id,
             section_sequence: self.next_section_sequence,
+            random: entity_random,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1845,7 +1845,7 @@ impl ItemEntities {
                         (location, DVec3::new(vx, vy, vz))
                     }
                 };
-                let (bob_offset, yaw) = self.item_visuals();
+                let (bob_offset, yaw, entity_random) = self.item_visuals();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -1871,6 +1871,7 @@ impl ItemEntities {
                     )),
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
+                    random: entity_random,
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -2183,7 +2184,7 @@ impl ItemEntities {
             if was_burning && entity._damage_state.fire_ticks <= 0 {
                 let event = crate::ExtinguishSound {
                     position: entity.item.position,
-                    pitch: crate::extinguish_pitch(&mut self.sound_random),
+                    pitch: crate::extinguish_pitch(&mut entity.random),
                 };
                 if self.extinguish_sounds.len() == 4096 {
                     self.extinguish_sounds.pop_front();
@@ -2559,6 +2560,17 @@ fn item_bounds(position: DVec3) -> BoundingBox {
     }
 }
 
+// Entity constructs an insecure UUID before ItemEntity initializes its visuals.
+// The actual seed and stored UUID are not available in a loaded world.
+fn item_random_from_seed(seed: i64) -> (f32, f32, LegacyRandom) {
+    let mut random = LegacyRandom::new(seed);
+    random.next_long();
+    random.next_long();
+    let bob = random.next_float() * std::f32::consts::PI * 2.0;
+    let yaw = random.next_float() * 360.0;
+    (bob, yaw, random)
+}
+
 /// Entity.isInRain checks the block containing the feet and the upper edge.
 fn item_in_rain(position: DVec3, rain_at: impl FnMut(IVec3) -> Option<bool>) -> Option<bool> {
     crate::weather::entity_in_rain(position, 0.25, rain_at)
@@ -2568,6 +2580,67 @@ fn item_in_rain(position: DVec3, rain_at: impl FnMut(IVec3) -> Option<bool>) -> 
 mod tests {
     use super::*;
     use native_resources::packs::ResourceProvider;
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn item_constructor_random_sequence_matches_java() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemRandomOracle.java");
+        let output = temp.path().join("item-random.json");
+        std::fs::write(&source, include_str!("../tests/java/ItemRandomOracle.java")).unwrap();
+        let run = |command: &mut std::process::Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "item constructor oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source));
+        run(std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ItemRandomOracle")
+            .arg(&output));
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for row in rows.as_array().unwrap() {
+            let (bob, yaw, mut random) = item_random_from_seed(row["seed"].as_i64().unwrap());
+            assert_eq!(bob.to_bits(), row["bob"].as_i64().unwrap() as i32 as u32);
+            assert_eq!(yaw.to_bits(), row["yaw"].as_i64().unwrap() as i32 as u32);
+            if row["mode"] == 0 {
+                let x = random.next_double() * 0.2 - 0.1;
+                let z = random.next_double() * 0.2 - 0.1;
+                assert_eq!(x.to_bits(), row["x"].as_i64().unwrap() as u64);
+                assert_eq!(z.to_bits(), row["z"].as_i64().unwrap() as u64);
+            }
+            assert_eq!(i64::from(random.next_int()), row["next"].as_i64().unwrap());
+        }
+    }
 
     #[test]
     fn item_rain_uses_both_positions_and_preserves_unknown() {
@@ -2614,6 +2687,8 @@ mod tests {
             entity.velocity = DVec3::ZERO;
             entity._damage_state.health = 10;
             entity._damage_state.fire_ticks = 20;
+            let mut expected_random = entity.random.clone();
+            let expected_pitch = crate::extinguish_pitch(&mut expected_random);
             items.tick_with_fluid_and_proof(
                 IVec3::ZERO,
                 DVec3::splat(100.0),
@@ -2643,9 +2718,10 @@ mod tests {
             assert_eq!(sounds.len(), usize::from(rain == Some(true)));
             if let Some(sound) = sounds.first() {
                 assert_eq!(sound.position, position);
+                assert_eq!(sound.pitch, expected_pitch);
                 assert_eq!(
-                    sound.pitch,
-                    crate::extinguish_pitch(&mut LegacyRandom::new(0))
+                    items.entities[0].random.next_int(),
+                    expected_random.next_int()
                 );
             }
             if rain.is_none() {
@@ -2711,6 +2787,23 @@ mod tests {
         second.spawn_from_entity(DVec3::ZERO, stack);
         assert_eq!(first.entities[0].velocity, second.entities[0].velocity);
         assert_eq!(first.random.next_long(), second.random.next_long());
+    }
+
+    #[test]
+    fn item_random_streams_are_independent() {
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::ZERO, stack.clone());
+        items.spawn_from_entity(DVec3::ZERO, stack);
+        let mut second_before = items.entities[1].random.clone();
+        let mut global_before = items.random.clone();
+        let first_pitch = crate::extinguish_pitch(&mut items.entities[0].random);
+        assert!(first_pitch >= 1.2 && first_pitch < 2.0);
+        assert_eq!(
+            items.entities[1].random.next_int(),
+            second_before.next_int()
+        );
+        assert_eq!(items.random.next_int(), global_before.next_int());
     }
 
     #[test]
@@ -3514,6 +3607,7 @@ mod tests {
             created: None,
             id: 0,
             section_sequence: 0,
+            random: LegacyRandom::new(0),
             _damage_state: ItemDamageState::default(),
         };
         let mut stone = make("minecraft:stone");
@@ -4286,6 +4380,7 @@ mod tests {
                             created: None,
                             id: index as u32,
                             section_sequence: 0,
+                            random: LegacyRandom::new(0),
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -4371,6 +4466,7 @@ mod tests {
                 created: None,
                 id: index as u32,
                 section_sequence: 0,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
             cells.entry(item_cell(position)).or_default().push(index);
@@ -4443,6 +4539,7 @@ mod tests {
                 created: None,
                 id: index as u32,
                 section_sequence: 0,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -4528,6 +4625,7 @@ mod tests {
                 created: None,
                 id: count,
                 section_sequence: 0,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -4585,6 +4683,7 @@ mod tests {
                 created: None,
                 id: 0,
                 section_sequence: 0,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -4645,6 +4744,7 @@ mod tests {
                 created: None,
                 id: index as u32,
                 section_sequence: index as u64,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -4693,6 +4793,7 @@ mod tests {
             created: None,
             id: 0,
             section_sequence: 4,
+            random: LegacyRandom::new(0),
             _damage_state: ItemDamageState::default(),
         });
         items.next_section_sequence = 5;
@@ -4732,6 +4833,7 @@ mod tests {
             created: None,
             id: 0,
             section_sequence: 0,
+            random: LegacyRandom::new(0),
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -4792,6 +4894,7 @@ mod tests {
             created: None,
             id: 0,
             section_sequence: 0,
+            random: LegacyRandom::new(0),
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -6147,6 +6250,7 @@ public class ItemMotionOracle {
                         created: None,
                         id: 0,
                         section_sequence: 0,
+                        random: LegacyRandom::new(0),
                         _damage_state: ItemDamageState::default(),
                     });
                 }
@@ -6213,6 +6317,7 @@ public class ItemMotionOracle {
                             created: None,
                             id: i as u32,
                             section_sequence: 0,
+                            random: LegacyRandom::new(0),
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -6361,6 +6466,7 @@ public class ItemMotionOracle {
                 }),
                 id: index as u32,
                 section_sequence: 0,
+                random: LegacyRandom::new(0),
                 _damage_state: ItemDamageState::default(),
             });
             let mut inventory = Arc::new(PlayerInventory::default());

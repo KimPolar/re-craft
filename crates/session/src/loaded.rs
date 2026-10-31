@@ -256,6 +256,7 @@ pub struct LoadedSession {
     recipes: Option<Arc<CraftingRecipes>>,
     item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     loot: Option<Arc<BlockLootTables>>,
+    mining_tags: Option<Arc<native_resources::mining_tags::MiningTags>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
     soil_deferred: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
@@ -2080,6 +2081,10 @@ impl LoadedSession {
     pub fn set_block_loot(&mut self, loot: Arc<BlockLootTables>) {
         self.loot = Some(loot);
     }
+
+    pub fn set_mining_tags(&mut self, tags: Arc<native_resources::mining_tags::MiningTags>) {
+        self.mining_tags = Some(tags);
+    }
     pub fn set_axe_transformers(&mut self, transforms: Arc<AxeTransformers>) {
         self.set_tool_transformers(ToolKind::Axe, transforms);
     }
@@ -2261,6 +2266,7 @@ impl LoadedSession {
             recipes: None,
             item_registry: None,
             loot: None,
+            mining_tags: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
             soil_deferred: BTreeMap::new(),
@@ -6351,7 +6357,25 @@ impl LoadedSession {
         Some(mining::Candidate {
             position: add(self.origin, hit.position)?,
             material: mining::Material::from_block_name(&block.name),
+            tags: self
+                .mining_tags
+                .as_ref()
+                .and_then(|tags| tags.for_block(&block.name)),
         })
+    }
+
+    fn mining_properties_for(
+        &self,
+        name: &str,
+        material: mining::Material,
+        hand: Option<&ItemStack>,
+    ) -> Option<mining::MiningProperties> {
+        match &self.mining_tags {
+            Some(tags) => {
+                mining::mining_properties_with_tags(material, hand, tags.for_block(name)?)
+            }
+            None => mining::mining_properties(material, hand),
+        }
     }
 
     fn finish_breaking(&mut self, absolute: IVec3) {
@@ -6381,7 +6405,7 @@ impl LoadedSession {
             ))
             .cloned();
         let properties = mining::Material::from_block_name(&name)
-            .and_then(|material| mining::mining_properties(material, hand.as_ref()));
+            .and_then(|material| self.mining_properties_for(&name, material, hand.as_ref()));
         let snow = matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block");
         let stair = crate::stair_items::is_stair_item(&name);
         if stair && self.stair_voxels(id).is_none() {
@@ -6460,13 +6484,15 @@ impl LoadedSession {
                     true,
                 );
             } else if !snow && !stair {
-                self.dropped_items.drop_block(
+                self.dropped_items.drop_block_with_name(
                     absolute,
                     &name,
                     hand.as_ref(),
                     self.game_mode,
                     self.block_drops,
                     self.loot.as_deref(),
+                    None,
+                    properties,
                 );
             }
             if self.game_mode != GameMode::Creative
@@ -6551,6 +6577,11 @@ impl LoadedSession {
                 self.inventory.selected(),
             ))
             .cloned();
+        let properties =
+            self.mining_properties_for(&block.name, mining::Material::Chest, hand.as_ref());
+        if self.game_mode != GameMode::Creative && properties.is_none() {
+            return;
+        }
         if !self.dropped_items.can_drop_container_block(
             absolute,
             &chest.slots,
@@ -6559,6 +6590,7 @@ impl LoadedSession {
             self.game_mode,
             self.block_drops,
             self.loot.as_deref(),
+            properties,
         ) {
             return;
         }
@@ -6601,7 +6633,6 @@ impl LoadedSession {
         }) {
             self.chest_dirty_chunks.remove(&chunk);
         }
-        let properties = mining::mining_properties(mining::Material::Chest, hand.as_ref());
         let damage = properties.map_or(0, |properties| properties.damage_per_block);
         if self.game_mode != GameMode::Creative && damage != 0 {
             Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
@@ -6614,6 +6645,7 @@ impl LoadedSession {
             self.block_drops,
             self.loot.as_deref(),
             chest.custom_name(),
+            properties,
         );
     }
 
@@ -12324,6 +12356,124 @@ mod tests {
                     .get("minecraft:damage"),
                 Some(&Tag::Int(1))
             );
+        }
+    }
+
+    #[test]
+    fn data_pack_mining_tags_control_progress_and_drops_in_session() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceProvider;
+        struct Data {
+            incorrect: bool,
+            sword: bool,
+        }
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let id = if path.ends_with("/stone_stairs.json") {
+                    "minecraft:stone_stairs"
+                } else if path.ends_with("/stone.json") {
+                    "minecraft:stone"
+                } else {
+                    return Ok(None);
+                };
+                Ok(Some(format!(r#"{{"type":"minecraft:block","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"{id}"}}]}}]}}"#).into_bytes()))
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                if !path.contains("/tags/block/") {
+                    return Ok(vec![]);
+                }
+                let selected = path.ends_with("/mineable/axe.json")
+                    || (self.incorrect && path.ends_with("/incorrect_for_iron_tool.json"))
+                    || (self.sword && path.ends_with("/sword_instantly_mines.json"));
+                Ok(vec![if selected {
+                    br#"{"replace":true,"values":["minecraft:stone","minecraft:stone_stairs"]}"#
+                        .to_vec()
+                } else {
+                    br#"{"replace":true,"values":[]}"#.to_vec()
+                }])
+            }
+        }
+        for name in ["minecraft:stone", "minecraft:stone_stairs"] {
+            for (incorrect, sword, ticks, drops, damage) in [
+                (false, false, 8, 1, 1),
+                (true, false, 25, 0, 1),
+                (false, true, 1, 0, 2),
+            ] {
+                let mut data = Data { incorrect, sword };
+                let registry = BTreeSet::from([
+                    "minecraft:air".into(),
+                    "minecraft:stone".into(),
+                    "minecraft:stone_stairs".into(),
+                ]);
+                let tags =
+                    native_resources::mining_tags::MiningTags::load(&mut data, &registry).unwrap();
+                let loot = BlockLootTables::load(&mut data).unwrap();
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(registry));
+                session.set_mining_tags(Arc::new(tags));
+                session.set_block_loot(Arc::new(loot));
+                let tool = ItemStack::new(
+                    if sword {
+                        "minecraft:iron_sword"
+                    } else {
+                        "minecraft:iron_axe"
+                    }
+                    .into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![]),
+                )
+                .unwrap();
+                Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool));
+                let pos = IVec3::new(8, 2, 6);
+                let block = if name == "minecraft:stone" {
+                    session.states[3]
+                } else {
+                    session.intern_block(state(
+                        name,
+                        &[
+                            ("facing", "south"),
+                            ("half", "top"),
+                            ("shape", "straight"),
+                            ("waterlogged", "false"),
+                        ],
+                    ))
+                };
+                session.set_with_notify(pos, block, false);
+                session.update(TICK * 3);
+                assert!(session.player.on_ground);
+                session.submit_command(PlayerCommand::Break);
+                for tick in 1..=ticks {
+                    session.update(TICK);
+                    let after = session
+                        .world
+                        .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                        .unwrap();
+                    assert_eq!(
+                        after.name,
+                        if tick == ticks { "minecraft:air" } else { name },
+                        "{name} incorrect={incorrect} sword={sword} tick={tick}"
+                    );
+                }
+                assert_eq!(
+                    session.dropped_items.snapshot().len(),
+                    drops,
+                    "{name} incorrect={incorrect} sword={sword}"
+                );
+                assert_eq!(
+                    session
+                        .inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage"),
+                    Some(&Tag::Int(damage))
+                );
+            }
         }
     }
 

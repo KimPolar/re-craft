@@ -22,6 +22,7 @@ pub mod geometry;
 pub mod heightmap_tags;
 pub mod item_registry;
 pub mod loot;
+pub mod mining_tags;
 pub mod models;
 pub mod packs;
 pub mod recipes;

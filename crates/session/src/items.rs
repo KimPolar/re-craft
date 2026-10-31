@@ -1488,7 +1488,7 @@ impl ItemEntities {
         enabled: bool,
         tables: Option<&BlockLootTables>,
     ) {
-        self.drop_block_with_name(position, name, hand, mode, enabled, tables, None);
+        self.drop_block_with_name(position, name, hand, mode, enabled, tables, None, None);
     }
 
     /// Check the active table without advancing the session RNG or dropping an item.
@@ -1499,6 +1499,7 @@ impl ItemEntities {
         mode: GameMode,
         enabled: bool,
         tables: Option<&BlockLootTables>,
+        properties: Option<mining::MiningProperties>,
     ) -> bool {
         if !enabled || mode == GameMode::Creative {
             return true;
@@ -1506,7 +1507,8 @@ impl ItemEntities {
         let Some(material) = Material::from_block_name(name) else {
             return false;
         };
-        let Some(properties) = mining::mining_properties(material, hand) else {
+        let Some(properties) = properties.or_else(|| mining::mining_properties(material, hand))
+        else {
             return false;
         };
         if !properties.correct_for_drops {
@@ -1540,6 +1542,7 @@ impl ItemEntities {
         mode: GameMode,
         enabled: bool,
         tables: Option<&BlockLootTables>,
+        properties: Option<mining::MiningProperties>,
     ) -> bool {
         if !enabled || mode == GameMode::Creative {
             return true;
@@ -1549,7 +1552,7 @@ impl ItemEntities {
             ..Default::default()
         };
         preview.drop_container_contents(position, slots);
-        preview.can_drop_block(name, hand, mode, enabled, tables)
+        preview.can_drop_block(name, hand, mode, enabled, tables, properties)
     }
 
     pub(crate) fn drop_block_with_name(
@@ -1561,13 +1564,15 @@ impl ItemEntities {
         enabled: bool,
         tables: Option<&BlockLootTables>,
         custom_name: Option<&Tag>,
+        properties: Option<mining::MiningProperties>,
     ) {
         let Some(material) = Material::from_block_name(name) else {
             return;
         };
         if !enabled
             || mode == GameMode::Creative
-            || !mining::mining_properties(material, hand)
+            || !properties
+                .or_else(|| mining::mining_properties(material, hand))
                 .is_some_and(|properties| properties.correct_for_drops)
         {
             return;

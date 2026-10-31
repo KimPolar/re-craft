@@ -672,6 +672,7 @@ impl LocalSession {
         Some(mining::Candidate {
             position: hit.position,
             material,
+            tags: None,
         })
     }
 

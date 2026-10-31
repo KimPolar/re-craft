@@ -416,6 +416,84 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
     })
 }
 
+/// Apply the default tool components to the active world's block tags.
+pub fn mining_properties_with_tags(
+    material: Material,
+    item: Option<&ItemStack>,
+    tags: u16,
+) -> Option<MiningProperties> {
+    use native_resources::mining_tags as t;
+    if basic_hand(item) {
+        return Some(MiningProperties {
+            speed: 1.0,
+            correct_for_drops: !material.needs_tool(),
+            damage_per_block: 0,
+            can_destroy_in_creative: true,
+        });
+    }
+    let item = item?;
+    if item.count() != 1 || !ordinary_return_supported(item) {
+        return None;
+    }
+    if item.id() == "minecraft:shears" {
+        let speed = if tags & t::SHEARS_EXTREME != 0 {
+            15.0
+        } else if tags & t::SHEARS_MAJOR != 0 {
+            5.0
+        } else if tags & t::SHEARS_MINOR != 0 {
+            2.0
+        } else {
+            1.0
+        };
+        return Some(MiningProperties {
+            speed,
+            correct_for_drops: !material.needs_tool(),
+            damage_per_block: 1,
+            can_destroy_in_creative: true,
+        });
+    }
+    let (tier, kind) = item.id().strip_prefix("minecraft:")?.split_once('_')?;
+    let (speed, incorrect) = match tier {
+        "wooden" => (2.0, t::WOODEN_INCORRECT),
+        "stone" => (4.0, t::STONE_INCORRECT),
+        "copper" => (5.0, t::COPPER_INCORRECT),
+        "iron" => (6.0, t::IRON_INCORRECT),
+        "golden" => (12.0, t::GOLD_INCORRECT),
+        "diamond" => (8.0, t::DIAMOND_INCORRECT),
+        "netherite" => (9.0, t::NETHERITE_INCORRECT),
+        _ => return None,
+    };
+    if kind == "sword" {
+        let speed = if tags & t::SWORD_INSTANT != 0 {
+            f32::MAX
+        } else if tags & t::SWORD_EFFICIENT != 0 {
+            1.5
+        } else {
+            1.0
+        };
+        return Some(MiningProperties {
+            speed,
+            correct_for_drops: !material.needs_tool(),
+            damage_per_block: 2,
+            can_destroy_in_creative: false,
+        });
+    }
+    let effective = match kind {
+        "pickaxe" => t::PICKAXE,
+        "axe" => t::AXE,
+        "shovel" => t::SHOVEL,
+        "hoe" => t::HOE,
+        _ => return None,
+    };
+    Some(MiningProperties {
+        speed: if tags & effective != 0 { speed } else { 1.0 },
+        correct_for_drops: !material.needs_tool()
+            || (tags & incorrect == 0 && tags & effective != 0),
+        damage_per_block: 1,
+        can_destroy_in_creative: true,
+    })
+}
+
 /// Vanilla progress with the supported default tool component and no effects.
 pub fn tool_progress(
     material: Material,
@@ -443,16 +521,22 @@ pub fn tool_progress_with_context(
         return Some(0.0);
     }
     let properties = mining_properties(material, item)?;
+    Some(progress_with_properties(material, properties, context))
+}
+
+fn progress_with_properties(
+    material: Material,
+    properties: MiningProperties,
+    context: MiningContext,
+) -> f32 {
     let speed = destroy_speed(properties.speed, context);
-    Some(
-        speed
-            / material.hardness()
-            / if properties.correct_for_drops {
-                30.0
-            } else {
-                100.0
-            },
-    )
+    speed
+        / material.hardness()
+        / if properties.correct_for_drops {
+            30.0
+        } else {
+            100.0
+        }
 }
 
 pub fn destroy_speed(base_speed: f32, context: MiningContext) -> f32 {
@@ -497,6 +581,18 @@ pub(crate) struct Candidate {
     pub position: IVec3,
     /// `None` retains the experimental instant-break behavior for unsupported blocks.
     pub material: Option<Material>,
+    pub tags: Option<u16>,
+}
+
+fn candidate_properties(
+    candidate: Candidate,
+    hand: Option<&ItemStack>,
+) -> Option<MiningProperties> {
+    let material = candidate.material?;
+    match candidate.tags {
+        Some(tags) => mining_properties_with_tags(material, hand, tags),
+        None => mining_properties(material, hand),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -578,10 +674,7 @@ impl Mining {
         if target.material == Some(Material::Unbreakable) {
             return None;
         }
-        if target
-            .material
-            .is_none_or(|material| mining_properties(material, hand).is_none())
-        {
+        if candidate_properties(target, hand).is_none() {
             // Preserve the existing experimental interaction until this block/item's
             // mining rules can be read from a complete registry and component model.
             self.cooldown = 5;
@@ -589,7 +682,8 @@ impl Mining {
         }
         if target
             .material
-            .and_then(|material| tool_progress_with_context(material, hand, context))
+            .zip(candidate_properties(target, hand))
+            .map(|(material, properties)| progress_with_properties(material, properties, context))
             .is_some_and(|progress| progress >= 1.0)
         {
             self.cooldown = 5;
@@ -669,9 +763,12 @@ impl Mining {
         }
         let active = self.active.as_mut().expect("same target has active state");
         active.candidate = target;
-        active.progress +=
-            tool_progress_with_context(target.material.expect("known material"), hand, context)
-                .expect("active tool has supported mining properties");
+        active.progress += progress_with_properties(
+            target.material.expect("known material"),
+            candidate_properties(target, hand)
+                .expect("active tool has supported mining properties"),
+            context,
+        );
         if active.progress >= 1.0 {
             let position = active.candidate.position;
             self.active = None;
@@ -700,6 +797,7 @@ mod tests {
         Candidate {
             position,
             material: Some(material),
+            tags: None,
         }
     }
 
@@ -805,6 +903,7 @@ mod tests {
             let target = Candidate {
                 position: IVec3::ZERO,
                 material,
+                tags: None,
             };
             let mut mining = Mining::default();
             assert!(mining.press(Some(target), Some(&sword), true).is_none());

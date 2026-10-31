@@ -969,6 +969,9 @@ fn prepare_existing_world(
         match resources.vanilla_block_ids() {
             Ok(registry) => {
                 session.set_vanilla_block_ids(Arc::new(registry.clone()));
+                let tags = native_resources::mining_tags::MiningTags::load(&mut resources, &registry)
+                    .context("월드의 도구 채굴 태그를 읽을 수 없습니다. 활성 데이터팩과 Minecraft 26.3 설치를 확인하세요")?;
+                session.set_mining_tags(Arc::new(tags));
                 match native_resources::respawn_tags::load_fire_tag(&mut resources, &registry) {
                     Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
@@ -999,7 +1002,11 @@ fn prepare_existing_world(
                     Err(error) => eprintln!("Snowy block tag is unavailable: {error:#}"),
                 }
             }
-            Err(error) => eprintln!("Block tags are unavailable: {error:#}"),
+            Err(error) => {
+                return Err(error.context(
+                    "월드의 블록 등록 정보를 읽을 수 없습니다. Minecraft 26.3 설치를 확인하세요",
+                ));
+            }
         }
         session.set_survival_rules(native_session::survival::SurvivalRules {
             difficulty: difficulty.difficulty,

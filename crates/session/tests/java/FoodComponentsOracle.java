@@ -25,7 +25,7 @@ public class FoodComponentsOracle {
       }
     }
     var times = new JsonArray();
-    for (float seconds : new float[]{0.05f, 0.25f, 0.81f, 1.6f, 12.75f}) {
+    for (float seconds : new float[]{0.0f, 0.01f, 0.049f, 0.05f, 0.25f, 0.81f, 1.6f, 12.75f, 12.8f, 15.0f, 1000000000.0f}) {
       var json = new JsonObject(); json.addProperty("consume_seconds", seconds);
       var consumable = Consumable.CODEC.parse(JsonOps.INSTANCE, json).getOrThrow();
       var row = new JsonObject(); row.addProperty("seconds", seconds); row.addProperty("ticks", consumable.consumeTicks()); times.add(row);

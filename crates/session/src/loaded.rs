@@ -10229,9 +10229,9 @@ impl LoadedSession {
                                 self.first_person.swing.start(swing);
                                 self.first_person.used(swing);
                             } else if self.food_use.start_hand(
-                                &self.inventory,
+                                &mut self.inventory,
                                 main_hand,
-                                self.vitals,
+                                &mut self.vitals,
                                 self.game_mode,
                             ) || (self.game_mode.allows_basic_building()
                                 && self.use_tool(hit.position, hit.face))
@@ -10304,16 +10304,16 @@ impl LoadedSession {
                     }
                     if !handled
                         && !self.food_use.start_hand(
-                            &self.inventory,
+                            &mut self.inventory,
                             main_hand,
-                            self.vitals,
+                            &mut self.vitals,
                             self.game_mode,
                         )
                     {
                         self.food_use.start_hand(
-                            &self.inventory,
+                            &mut self.inventory,
                             crate::inventory::PlayerSlot::Offhand,
-                            self.vitals,
+                            &mut self.vitals,
                             self.game_mode,
                         );
                     }
@@ -10355,7 +10355,7 @@ impl LoadedSession {
         }
         self.tick_lodestone_compasses();
         self.food_use
-            .prepare(&self.inventory, self.vitals, self.game_mode);
+            .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
         // baseTick reads the previous equipment attributes before detecting changes.
         let breathing_oxygen = self.oxygen_bonus;
         let breathing_oxygen_valid = self.oxygen_valid;

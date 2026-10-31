@@ -1203,9 +1203,9 @@ impl LocalSession {
                                 self.first_person.swing.start(animation::Hand::Main);
                             }
                         } else if self.food_use.start_hand(
-                            &self.inventory,
+                            &mut self.inventory,
                             main_hand,
-                            self.vitals,
+                            &mut self.vitals,
                             self.game_mode,
                         ) || (self.game_mode.allows_basic_building()
                             && hit.adjacent.is_some_and(|adjacent| {
@@ -1238,16 +1238,16 @@ impl LocalSession {
                     }
                     if !handled
                         && !self.food_use.start_hand(
-                            &self.inventory,
+                            &mut self.inventory,
                             main_hand,
-                            self.vitals,
+                            &mut self.vitals,
                             self.game_mode,
                         )
                     {
                         self.food_use.start_hand(
-                            &self.inventory,
+                            &mut self.inventory,
                             PlayerSlot::Offhand,
-                            self.vitals,
+                            &mut self.vitals,
                             self.game_mode,
                         );
                     }
@@ -1288,7 +1288,7 @@ impl LocalSession {
             eprintln!("player armor equipment: {error:#}");
         }
         self.food_use
-            .prepare(&self.inventory, self.vitals, self.game_mode);
+            .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);

@@ -74,9 +74,9 @@ pub struct FirstPersonInput {
 #[derive(Clone, Copy, Debug)]
 pub struct ItemUseAnimation {
     pub hand: Hand,
-    pub remaining_ticks: u8,
+    pub remaining_ticks: i32,
     /// `None` represents a held item with no implemented use animation.
-    pub duration_ticks: Option<u8>,
+    pub duration_ticks: Option<i32>,
     pub partial_tick: f32,
 }
 
@@ -194,13 +194,13 @@ fn eating_item_transform(
     left: bool,
     display: DisplayTransform,
     equip: f32,
-    remaining_ticks: u8,
-    duration_ticks: u8,
+    remaining_ticks: i32,
+    duration_ticks: i32,
     partial_tick: f32,
 ) -> Mat4 {
     let sign = if left { -1.0 } else { 1.0 };
-    let remaining = f32::from(remaining_ticks) - partial_tick.clamp(0.0, 1.0) + 1.0;
-    let fraction = remaining / f32::from(duration_ticks);
+    let remaining = remaining_ticks as f32 - partial_tick.clamp(0.0, 1.0) + 1.0;
+    let fraction = remaining / duration_ticks as f32;
     let jiggle = if fraction < 0.8 {
         (vanilla_cos(remaining / 4.0 * std::f32::consts::PI) * 0.1).abs()
     } else {
@@ -1248,8 +1248,8 @@ public class FirstPersonOracle {
     }
     for(boolean left:new boolean[]{false,true}) {
       var which=left?HumanoidArm.LEFT:HumanoidArm.RIGHT;
-      for(float equip:new float[]{0f,0.35f,1f}) for(int duration:new int[]{16,32})
-      for(int remaining=1;remaining<=duration;remaining++) for(float partial:new float[]{0f,0.25f,0.5f,0.75f,1f})
+      for(float equip:new float[]{0f,0.35f,1f}) for(int duration:new int[]{16,32,300})
+      for(int remaining:duration==300?new int[]{1,75,150,299,300}:java.util.stream.IntStream.rangeClosed(1,duration).toArray()) for(float partial:new float[]{0f,0.25f,0.5f,0.75f,1f})
       for(int i=0;i<rotations.length;i++) {
         var pose=new PoseStack();
         eat.invoke(renderer,pose,partial,which,(float)remaining,duration);
@@ -1360,8 +1360,13 @@ public class FirstPersonOracle {
         }
         for left in [false, true] {
             for equip in [0.0, 0.35, 1.0] {
-                for duration in [16, 32] {
-                    for remaining in 1..=duration {
+                for duration in [16, 32, 300] {
+                    let samples = if duration == 300 {
+                        vec![1, 75, 150, 299, 300]
+                    } else {
+                        (1..=duration).collect()
+                    };
+                    for remaining in samples {
                         for partial in [0.0, 0.25, 0.5, 0.75, 1.0] {
                             for display in displays {
                                 let transform = eating_item_transform(

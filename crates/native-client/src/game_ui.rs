@@ -2479,7 +2479,7 @@ fn displayed_item_use(
     let duration_ticks = displayed.and_then(|item| {
         let max = item.max_count()?;
         (native_session::inventory::saved_item_max(item.id(), item.components()) == Some(max))
-            .then(|| native_session::survival::ordinary_food(item.id()))
+            .then(|| native_session::survival::food_properties(item))
             .flatten()
             .map(|food| food.use_ticks)
     });
@@ -3295,6 +3295,20 @@ mod inventory_tests {
         assert_eq!(
             displayed_item_use(&hands, 0.5).unwrap().duration_ticks,
             Some(32)
+        );
+        hands.main.item = ItemStack::new(
+            "minecraft:apple".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:consumable".into(),
+                Tag::Compound(vec![("consume_seconds".into(), Tag::Float(15.0))]),
+            )]),
+        )
+        .map(Arc::new);
+        assert_eq!(
+            displayed_item_use(&hands, 0.5).unwrap().duration_ticks,
+            Some(300)
         );
         hands.item_use = Some(ItemUseState {
             hand: Hand::Off,

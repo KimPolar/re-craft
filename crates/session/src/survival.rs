@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub struct FoodProperties {
     pub nutrition: i32,
     pub saturation: f32,
-    pub use_ticks: u8,
+    pub use_ticks: i32,
     pub can_always_eat: bool,
 }
 
@@ -71,9 +71,9 @@ pub(crate) fn custom_food(value: &Tag) -> Option<(i32, f32, bool)> {
     Some((nutrition?, saturation?, always.unwrap_or(false)))
 }
 
-/// Effect-free consumables with ordinary eating animation and a representable
-/// positive duration. Unsupported effects/remainders must not be discarded.
-pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<u8> {
+/// Effect-free consumables with ordinary eating animation. Unsupported
+/// effects/remainders must not be discarded.
+pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<i32> {
     let Tag::Compound(fields) = value else {
         return None;
     };
@@ -81,7 +81,7 @@ pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<u8> {
     for (name, value) in fields {
         if name.matches("consume_seconds") && seconds.is_none() {
             let number = crate::player_data::numeric_double(value)? as f32;
-            if !number.is_finite() {
+            if !number.is_finite() || number < 0.0 {
                 return None;
             }
             seconds = Some(number);
@@ -99,11 +99,10 @@ pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<u8> {
             return None;
         }
     }
-    let ticks = (seconds.unwrap_or(1.6_f32) * 20.0) as i32;
-    u8::try_from(ticks).ok().filter(|ticks| *ticks > 0)
+    Some((seconds.unwrap_or(1.6_f32) * 20.0) as i32)
 }
 
-fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
+pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
     let components = item.components();
     if components.get("!minecraft:food").is_some()
         || components.get("!minecraft:consumable").is_some()
@@ -134,7 +133,7 @@ fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
 struct Eating {
     hand: PlayerSlot,
     item: ItemStack,
-    remaining: u8,
+    remaining: i32,
     food: FoodProperties,
 }
 
@@ -173,9 +172,9 @@ impl FoodUse {
     /// be eaten at full hunger; vanilla then stops looking at the other hand.
     pub fn start_hand(
         &mut self,
-        inventory: &PlayerInventory,
+        inventory: &mut Arc<PlayerInventory>,
         hand: PlayerSlot,
-        vitals: PlayerVitals,
+        vitals: &mut PlayerVitals,
         mode: crate::GameMode,
     ) -> bool {
         let Some(item) = inventory.slot(hand) else {
@@ -192,12 +191,16 @@ impl FoodUse {
         if mode != crate::GameMode::Spectator
             && (vitals.food < 20 || food.can_always_eat || mode == crate::GameMode::Creative)
         {
-            self.active = Some(Eating {
-                hand,
-                item: item.clone(),
-                remaining: food.use_ticks,
-                food,
-            });
+            if food.use_ticks == 0 {
+                Self::finish(inventory, vitals, mode, hand, food);
+            } else {
+                self.active = Some(Eating {
+                    hand,
+                    item: item.clone(),
+                    remaining: food.use_ticks,
+                    food,
+                });
+            }
         }
         true
     }
@@ -210,8 +213,8 @@ impl FoodUse {
 
     pub fn prepare(
         &mut self,
-        inventory: &PlayerInventory,
-        vitals: PlayerVitals,
+        inventory: &mut Arc<PlayerInventory>,
+        vitals: &mut PlayerVitals,
         mode: crate::GameMode,
     ) {
         if self.repeat {
@@ -246,7 +249,7 @@ impl FoodUse {
         vitals: &mut PlayerVitals,
         mode: crate::GameMode,
     ) {
-        self.prepare(inventory, *vitals, mode);
+        self.prepare(inventory, vitals, mode);
         let Some(active) = &mut self.active else {
             return;
         };
@@ -254,13 +257,23 @@ impl FoodUse {
         if active.remaining != 0 {
             return;
         }
-        if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(active.hand) {
-            vitals.food = vitals.food.wrapping_add(active.food.nutrition).clamp(0, 20);
-            vitals.saturation =
-                (vitals.saturation + active.food.saturation).clamp(0.0, vitals.food as f32);
-        }
+        Self::finish(inventory, vitals, mode, active.hand, active.food);
         self.active = None;
         self.repeat = self.held;
+    }
+
+    fn finish(
+        inventory: &mut Arc<PlayerInventory>,
+        vitals: &mut PlayerVitals,
+        mode: crate::GameMode,
+        hand: PlayerSlot,
+        food: FoodProperties,
+    ) {
+        if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
+            vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
+            vitals.saturation =
+                (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
+        }
     }
 }
 
@@ -823,9 +836,9 @@ mod tests {
         );
         let mut use_state = FoodUse::default();
         assert!(!use_state.start_hand(
-            &inventory,
+            &mut Arc::new(inventory),
             PlayerSlot::Storage(0),
-            PlayerVitals {
+            &mut PlayerVitals {
                 food: 1,
                 ..PlayerVitals::default()
             },
@@ -881,6 +894,110 @@ mod tests {
     }
 
     #[test]
+    fn instant_food_is_consumed_before_the_next_command() {
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.01))]),
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 2, 64, components),
+        );
+        let mut session = LocalSession::demo();
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(PlayerVitals {
+            food: 10,
+            saturation: 0.0,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.submit_command(PlayerCommand::StopUse);
+        session.update(Duration::from_millis(50));
+        let result = session.snapshot();
+        assert_eq!(result.vitals.food, 14);
+        assert_eq!(
+            result
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(result.first_person.item_use, None);
+    }
+
+    #[test]
+    fn holding_instant_food_respects_the_use_repeat_delay() {
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.0))]),
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 3, 64, components),
+        );
+        let mut session = LocalSession::demo();
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(PlayerVitals {
+            food: 1,
+            saturation: 0.0,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::UseHeld(true));
+        session.submit_command(PlayerCommand::Place);
+        session.update(Duration::from_millis(50));
+        assert_eq!(session.snapshot().vitals.food, 5);
+        for _ in 0..3 {
+            session.update(Duration::from_millis(50));
+        }
+        assert_eq!(session.snapshot().vitals.food, 5);
+        session.update(Duration::from_millis(50));
+        assert_eq!(session.snapshot().vitals.food, 9);
+    }
+
+    #[test]
+    fn long_custom_food_counts_down_without_truncation() {
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![("consume_seconds".into(), Tag::Float(15.0))]),
+        )]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, components),
+        );
+        let mut inventory = Arc::new(inventory);
+        let mut vitals = PlayerVitals {
+            food: 10,
+            ..Default::default()
+        };
+        let mut use_state = FoodUse::default();
+        assert!(use_state.start_hand(
+            &mut inventory,
+            PlayerSlot::Storage(0),
+            &mut vitals,
+            GameMode::Survival
+        ));
+        assert_eq!(use_state.visual_state().unwrap().remaining_ticks, 300);
+        for _ in 0..299 {
+            use_state.tick(&mut inventory, &mut vitals, GameMode::Survival);
+        }
+        assert_eq!(use_state.visual_state().unwrap().remaining_ticks, 1);
+        assert_eq!(vitals.food, 10);
+        use_state.tick(&mut inventory, &mut vitals, GameMode::Survival);
+        assert_eq!(vitals.food, 14);
+        assert!(inventory.slot(PlayerSlot::Storage(0)).is_none());
+    }
+
+    #[test]
+    fn negative_consume_seconds_are_rejected() {
+        let component = Tag::Compound(vec![("consume_seconds".into(), Tag::Float(-0.01))]);
+        assert_eq!(custom_consumable_ticks(&component), None);
+    }
+
+    #[test]
     fn nonfood_item_requires_both_custom_components() {
         let food = Tag::Compound(vec![
             ("nutrition".into(), Tag::Int(3)),
@@ -909,9 +1026,9 @@ mod tests {
             let mut state = FoodUse::default();
             assert_eq!(
                 state.start_hand(
-                    &inventory,
+                    &mut Arc::new(inventory),
                     PlayerSlot::Storage(0),
-                    PlayerVitals {
+                    &mut PlayerVitals {
                         food: 10,
                         ..Default::default()
                     },
@@ -946,9 +1063,9 @@ mod tests {
             inventory.set_slot(PlayerSlot::Storage(0), Some(item));
             let mut state = FoodUse::default();
             assert!(!state.start_hand(
-                &inventory,
+                &mut Arc::new(inventory),
                 PlayerSlot::Storage(0),
-                PlayerVitals {
+                &mut PlayerVitals {
                     food: 1,
                     ..Default::default()
                 },
@@ -1041,9 +1158,9 @@ mod tests {
             };
             let mut use_state = FoodUse::default();
             assert!(use_state.start_hand(
-                &inventory,
+                &mut inventory,
                 PlayerSlot::Storage(0),
-                vitals,
+                &mut vitals,
                 GameMode::Survival
             ));
             use_state.tick(&mut inventory, &mut vitals, GameMode::Survival);
@@ -1065,7 +1182,7 @@ mod tests {
             )]);
             assert_eq!(
                 custom_consumable_ticks(&component),
-                Some(row["ticks"].as_u64().unwrap() as u8),
+                Some(row["ticks"].as_i64().unwrap() as i32),
                 "{row}"
             );
         }

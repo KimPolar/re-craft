@@ -16,7 +16,7 @@ pub enum Hand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemUseState {
     pub hand: Hand,
-    pub remaining_ticks: u8,
+    pub remaining_ticks: i32,
 }
 
 #[derive(Clone, Debug, Default)]

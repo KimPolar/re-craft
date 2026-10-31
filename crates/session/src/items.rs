@@ -2515,31 +2515,8 @@ fn item_bounds(position: DVec3) -> BoundingBox {
 }
 
 /// Entity.isInRain checks the block containing the feet and the upper edge.
-fn item_in_rain(position: DVec3, mut rain_at: impl FnMut(IVec3) -> Option<bool>) -> Option<bool> {
-    fn floor_i32(value: f64) -> Option<i32> {
-        let value = value.floor();
-        (value.is_finite() && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
-            .then_some(value as i32)
-    }
-    let feet = IVec3::new(
-        floor_i32(position.x)?,
-        floor_i32(position.y)?,
-        floor_i32(position.z)?,
-    );
-    let first = rain_at(feet);
-    if first == Some(true) {
-        return Some(true);
-    }
-    let top = IVec3::new(feet.x, floor_i32(item_bounds(position).max.y)?, feet.z);
-    if top == feet {
-        return first;
-    }
-    let second = rain_at(top);
-    match (first, second) {
-        (_, Some(true)) => Some(true),
-        (Some(false), Some(false)) => Some(false),
-        _ => None,
-    }
+fn item_in_rain(position: DVec3, rain_at: impl FnMut(IVec3) -> Option<bool>) -> Option<bool> {
+    crate::weather::entity_in_rain(position, 0.25, rain_at)
 }
 
 #[cfg(test)]

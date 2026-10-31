@@ -819,6 +819,7 @@ impl Orbs {
             fast_lava,
             path,
             |_, _| false,
+            |_| Some(false),
         );
     }
 
@@ -841,6 +842,7 @@ impl Orbs {
         fast_lava: bool,
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
         mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
+        mut rain_at: impl FnMut(IVec3) -> Option<bool>,
     ) {
         self.pickup_delay = self.pickup_delay.saturating_sub(1);
         if self.entities.is_empty() {
@@ -1003,6 +1005,17 @@ impl Orbs {
             }
             if removed[index] {
                 continue;
+            }
+            if entity.damage.fire_ticks > 0 {
+                match crate::weather::entity_in_rain(
+                    entity.visual.position - origin.as_dvec3(),
+                    0.5,
+                    &mut rain_at,
+                ) {
+                    Some(true) => entity.damage.fire_ticks = 0,
+                    Some(false) => {}
+                    None => entity.save_unresolved = true,
+                }
             }
             if crate::items::item_section_order(entity.visual.previous_position)
                 != crate::items::item_section_order(entity.visual.position)
@@ -1473,6 +1486,71 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn orb_rain_follows_fire_and_fluid_effects_and_marks_unknown_saves() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut source = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let tags = Arc::new(OxygenEnchantments::load(&mut source).unwrap());
+        for (rain, lava, health, fire, unresolved) in [
+            (Some(true), false, 9, 0, false),
+            (Some(false), false, 9, 19, false),
+            (None, false, 9, 19, true),
+            (Some(true), true, 5, 0, true),
+        ] {
+            let position = DVec3::new(3.5, 5.8, 4.5);
+            let mut orb = test_orb(1, position, 7, 0, 1);
+            orb.no_gravity = true;
+            orb.damage.health = 10;
+            orb.damage.fire_ticks = 20;
+            let mut orbs = Orbs::default();
+            orbs.set_damage_tags(Arc::clone(&tags));
+            orbs.entities.push(orb);
+            orbs.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                false,
+                &mut Arc::new(PlayerInventory::default()),
+                &mut LegacyRandom::new(0),
+                &mut Experience::default(),
+                &mut 0,
+                |_| &[],
+                |_| 0.6,
+                |_| false,
+                |_, _| (Default::default(), false),
+                false,
+                |_, _, _| {
+                    Some(if lava {
+                        vec![native_world::fluid::FluidKind::Lava]
+                    } else {
+                        vec![]
+                    })
+                },
+                |_, _| true,
+                |p| if p.y == 6 { rain } else { Some(false) },
+            );
+            let result = &orbs.entities[0];
+            assert_eq!(
+                (
+                    result.damage.health,
+                    result.damage.fire_ticks,
+                    result.save_unresolved
+                ),
+                (health, fire, unresolved)
+            );
+            if unresolved {
+                let error = draft_orb(result)
+                    .err()
+                    .expect("uncertain orb must not be drafted");
+                assert!(error.to_string().contains("damage effects"));
+            }
+        }
+    }
+
+    #[test]
     fn orb_damage_uses_data_pack_bypass_and_entity_immunity_tags() {
         use native_resources::packs::{ResourceId, ResourceProvider};
         struct Data;
@@ -1604,12 +1682,14 @@ mod tests {
             .arg(&file));
         let lava = temp.path().join("lava.json");
         let fire = temp.path().join("fire.json");
+        let rain = temp.path().join("rain.json");
         run(Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg("OrbLavaOracle")
             .arg(&lava)
-            .arg(&fire));
+            .arg(&fire)
+            .arg(&rain));
         for (path, is_lava) in [(lava, true), (fire, false)] {
             let oracle: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             for mode in 0..if is_lava { 2 } else { 4 } {
@@ -1637,6 +1717,28 @@ mod tests {
                         "mode {mode}"
                     );
                 }
+            }
+        }
+        let oracle: Vec<bool> = serde_json::from_slice(&std::fs::read(rain).unwrap()).unwrap();
+        let mut index = 0;
+        for position in [
+            DVec3::new(0.5, 2.1, 0.5),
+            DVec3::new(-0.25, 2.8, -1.1),
+            DVec3::new(16.0, -0.25, -16.0),
+            DVec3::new(0.0, -1.0, 0.0),
+        ] {
+            let feet = position.floor().as_ivec3();
+            let top = IVec3::new(feet.x, (position.y + 0.5).floor() as i32, feet.z);
+            for mask in 0..4 {
+                let actual = crate::weather::entity_in_rain(position, 0.5, |at| {
+                    Some((mask & 1 != 0 && at == feet) || (mask & 2 != 0 && at == top))
+                });
+                assert_eq!(
+                    actual,
+                    Some(oracle[index]),
+                    "position {position:?}, mask {mask}"
+                );
+                index += 1;
             }
         }
     }
@@ -1963,6 +2065,7 @@ mod tests {
                     false,
                     |_, _, _| Some(Vec::new()),
                     |_, _| true,
+                    |_| Some(false),
                 )
             };
             tick(&mut orbs, DVec3::splat(100.0));
@@ -2118,6 +2221,7 @@ mod tests {
             false,
             |_, _, _| Some(Vec::new()),
             |_, _| false,
+            |_| Some(false),
         );
         assert_eq!(orbs.entities.len(), 1);
         assert!(orbs.affected_orb_chunks(&BTreeMap::new()).is_err());
@@ -2180,6 +2284,7 @@ mod tests {
             false,
             |_, _, _| Some(Vec::new()),
             |_, _| true,
+            |_| Some(false),
         );
         assert!(orbs.entities.is_empty());
         let group = BTreeSet::from([home]);
@@ -2224,6 +2329,7 @@ mod tests {
                 false,
                 |_, _, _| Some(Vec::new()),
                 |_, _| true,
+                |_| Some(false),
             );
         }
         assert_eq!(xp.total, 7);
@@ -2384,6 +2490,7 @@ mod tests {
                     false,
                     |_, _, _| Some(Vec::new()),
                     |_, _| true,
+                    |_| Some(false),
                 );
             }
             assert_eq!(xp.total as i64, row["gained"].as_i64().unwrap(), "{row}");
@@ -2432,6 +2539,7 @@ mod tests {
                 false,
                 |_, _, _| Some(Vec::new()),
                 move |_, _| safe,
+                |_| Some(false),
             )
         };
         tick(&mut orbs, true);

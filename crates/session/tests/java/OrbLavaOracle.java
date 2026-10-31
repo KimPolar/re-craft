@@ -6,6 +6,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.core.Holder;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.tags.DamageTypeTags;
 import net.minecraft.tags.TagKey;
@@ -19,15 +20,19 @@ import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.gameevent.GameEvent;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.phys.AABB;
 
 public class OrbLavaOracle {
   static class World extends ServerLevel {
     GameRules rules;
+    Set<BlockPos> raining = Set.of();
     World() { super(null,null,null,null,null,null,false,0L,null,false); }
     @Override public GameRules getGameRules() { return rules; }
+    @Override public boolean isRainingAt(BlockPos pos) { return raining.contains(pos); }
   }
   static class Orb extends ExperienceOrb {
     World world; DamageSources sources; boolean removed; boolean inLava;
+    BlockPos blockPos;
     Orb() { super(null,0,0,0,7); }
     @Override public Level level() { return world; }
     @Override public EntityType<?> getType() { return EntityTypes.EXPERIENCE_ORB; }
@@ -45,6 +50,7 @@ public class OrbLavaOracle {
     @Override public boolean isInLava() { return inLava; }
     @Override public void checkBelowWorld() { }
     @Override public void setSharedFlagOnFire(boolean value) { }
+    @Override public BlockPos blockPosition() { return blockPos; }
   }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
@@ -89,5 +95,21 @@ public class OrbLavaOracle {
       fireOut.add(rows);
     }
     Files.writeString(Path.of(args[1]),new Gson().toJson(fireOut));
+    var inRain=Entity.class.getDeclaredMethod("isInRain"); inRain.setAccessible(true);
+    var box=Entity.class.getDeclaredField("bb"); box.setAccessible(true);
+    var rainOut=new JsonArray();
+    for(double[] pos:new double[][] {{0.5,2.1,0.5},{-0.25,2.8,-1.1},{16.0,-0.25,-16.0},{0.0,-1.0,0.0}}) {
+      for(int mask=0;mask<4;mask++) {
+        var orb=(Orb)unsafe.allocateInstance(Orb.class); orb.world=world;
+        orb.blockPos=BlockPos.containing(pos[0],pos[1],pos[2]);
+        box.set(orb,new AABB(pos[0]-0.25,pos[1],pos[2]-0.25,pos[0]+0.25,pos[1]+0.5,pos[2]+0.25));
+        var top=BlockPos.containing(orb.blockPos.getX(),pos[1]+0.5,orb.blockPos.getZ());
+        world.raining=new HashSet<>();
+        if((mask&1)!=0) world.raining.add(orb.blockPos);
+        if((mask&2)!=0) world.raining.add(top);
+        rainOut.add((boolean)inRain.invoke(orb));
+      }
+    }
+    Files.writeString(Path.of(args[2]),new Gson().toJson(rainOut));
   }
 }

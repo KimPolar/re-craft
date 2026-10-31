@@ -12313,6 +12313,15 @@ impl LoadedSession {
             air,
         };
         let mut orb_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+        let rain = RainView {
+            raining: self.global_rain(),
+            origin,
+            world,
+            light_current: self.sky_lighting.is_current(),
+            heightmaps: &self.spawn_heightmaps,
+            climates: self.biome_climates.as_deref(),
+            sea_level: self.generator_sea_level,
+        };
         self.experience_orbs.tick_with_fluid_and_proof(
             origin,
             self.motion.position,
@@ -12356,6 +12365,7 @@ impl LoadedSession {
             self.fast_lava,
             |bounds, actual, requested| fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos)),
             |bounds, actual| orb_path_proof.safe(bounds, actual),
+            |pos| rain.at(pos),
         );
     }
 

@@ -7,6 +7,37 @@ use native_resources::biome_climate::BiomeClimate;
 use native_world::loaded::ChunkPos;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Java's entity rain test checks the feet and the bounding box's upper edge.
+pub(crate) fn entity_in_rain(
+    position: glam::DVec3,
+    height: f64,
+    mut rain_at: impl FnMut(glam::IVec3) -> Option<bool>,
+) -> Option<bool> {
+    fn floor_i32(value: f64) -> Option<i32> {
+        let value = value.floor();
+        (value.is_finite() && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+            .then_some(value as i32)
+    }
+    let feet = glam::IVec3::new(
+        floor_i32(position.x)?,
+        floor_i32(position.y)?,
+        floor_i32(position.z)?,
+    );
+    let first = rain_at(feet);
+    if first == Some(true) {
+        return Some(true);
+    }
+    let top = glam::IVec3::new(feet.x, floor_i32(position.y + height)?, feet.z);
+    if top == feet {
+        return first;
+    }
+    match (first, rain_at(top)) {
+        (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
 /// Immutable weather inputs; each heightmap is shared independently across ticks.
 #[derive(Clone)]
 pub struct WeatherTerrain {

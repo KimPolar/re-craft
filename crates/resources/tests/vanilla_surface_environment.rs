@@ -149,7 +149,7 @@ fn seeded_context_loads_vanilla_rules_and_evaluates_biomes() {
             classify,
             |_, _, _| ResourceId::parse("minecraft:frozen_ocean")
         )
-        .is_err()
+        .is_ok()
     );
     drop(inputs);
     let mut compiler = SurfaceRuleCompiler::new(&mut resources);

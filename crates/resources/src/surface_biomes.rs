@@ -88,6 +88,22 @@ impl SurfaceBiomes {
             .context("selected biome is not in the active registry")?;
         Ok(climate.cold_enough_to_snow(p.x, p.y, p.z, p.sea_level))
     }
+
+    /// Frozen-ocean iceberg erosion checks temperature at sea level, independent
+    /// of whether the biome has precipitation.
+    pub fn iceberg_melts(
+        &self,
+        biome: &ResourceId,
+        x: i32,
+        z: i32,
+        sea_level: i32,
+    ) -> Result<bool> {
+        let climate = self
+            .climates
+            .get(biome)
+            .context("selected biome is not in the active registry")?;
+        Ok(climate.temperature_at(x, sea_level, z, sea_level) > 0.1)
+    }
 }
 
 fn resolve_tag(

@@ -1,14 +1,14 @@
 //! Apply material rules to a noise-stage chunk. Features, carvers, structures,
-//! biome generation and frozen-ocean iceberg extensions are separate.
+//! biome generation are separate.
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 use crate::{
     noise_stage::{NoiseMaterial, NoiseStageChunk},
     packs::{ResourceId, ResourceProvider},
-    surface_rules::{SeededSurfaceInputs, SurfacePosition, SurfaceRule},
+    surface_rules::{SeededSurfaceInputs, SurfacePosition, SurfaceRandom, SurfaceRule},
 };
 
 /// Classification must use the active block registry, including fluid states.
@@ -85,6 +85,66 @@ fn extend_badlands_column(
     Ok(())
 }
 
+/// Apply the frozen-ocean extension, including random draws outside the chunk.
+fn extend_iceberg_column(
+    states: &mut [Arc<Value>],
+    kinds: &mut [SurfaceBlockKind],
+    updates: &mut [bool],
+    min_y: i32,
+    start: i32,
+    min_surface: i32,
+    sea: i32,
+    top: f64,
+    bottom: f64,
+    random: &mut SurfaceRandom,
+    snow: &(Arc<Value>, SurfaceBlockKind),
+    ice: &(Arc<Value>, SurfaceBlockKind),
+) -> Result<()> {
+    let snow_limit = 2 + random.next_int_bound(4);
+    let snow_height = sea.wrapping_add(18).wrapping_add(random.next_int_bound(10));
+    let mut snow_count = 0;
+    let top = top as i32;
+    let bottom = bottom as i32;
+    let first = start.max(top.wrapping_add(1));
+    if first < min_surface {
+        return Ok(());
+    }
+    ensure!(
+        i64::from(first) - i64::from(min_surface) <= 1_048_576,
+        "iceberg vertical range is too large"
+    );
+    let water = ResourceId::parse("minecraft:water")?;
+    for y in (min_surface..=first).rev() {
+        let index = usize::try_from(i64::from(y) - i64::from(min_y))
+            .ok()
+            .filter(|&i| i < states.len());
+        let is_air = index.is_none_or(|i| kinds[i] == SurfaceBlockKind::Air);
+        let placed = if is_air && y < top {
+            random.next_double() > 0.01
+        } else if let Some(i) = index {
+            state_id(&states[i])? == water && y > bottom && y < sea && random.next_double() > 0.15
+        } else {
+            false
+        };
+        if placed {
+            let choice = if snow_count <= snow_limit && y > snow_height {
+                snow_count += 1;
+                snow
+            } else {
+                ice
+            };
+            if let Some(i) = index {
+                states[i] = Arc::clone(&choice.0);
+                kinds[i] = choice.1;
+                if choice.1 == SurfaceBlockKind::Fluid {
+                    updates[i] = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Visits solid blocks from top to bottom with Java's depth and fluid bookkeeping.
 fn scan_column(
     kinds: &[SurfaceBlockKind],
@@ -130,8 +190,6 @@ fn scan_column(
 /// Apply a rule to noise-stage blocks using already sampled biome identities.
 /// `preliminary` is the chunk surface-level density in Z, X order; its volume
 /// sampling must match the noise generator. Unknown block classifications fail.
-/// Frozen oceans require an additional vanilla iceberg extension and are
-/// rejected until it is implemented.
 pub fn apply_surface<P: ResourceProvider>(
     chunk: &NoiseStageChunk,
     rule: &SurfaceRule,
@@ -195,18 +253,6 @@ pub fn apply_surface<P: ResourceProvider>(
             let world_z = origin_z.checked_add(z as i32).context("block Z overflow")?;
             let start = heights[column] + 1;
             let top_biome = biome_at(world_x, start, world_z)?;
-            if top_biome.namespace == "minecraft"
-                && matches!(
-                    top_biome.path.as_str(),
-                    "frozen_ocean" | "deep_frozen_ocean"
-                )
-            {
-                bail!(
-                    "surface extension for {}:{} is not implemented",
-                    top_biome.namespace,
-                    top_biome.path
-                );
-            }
             if top_biome.namespace == "minecraft" && top_biome.path == "eroded_badlands" {
                 if let Some(peak) = inputs.badlands_peak(world_x, world_z)? {
                     let range = column * h..(column + 1) * h;
@@ -286,6 +332,45 @@ pub fn apply_surface<P: ResourceProvider>(
                 }
                 Ok(())
             })?;
+            if top_biome.namespace == "minecraft"
+                && matches!(
+                    top_biome.path.as_str(),
+                    "frozen_ocean" | "deep_frozen_ocean"
+                )
+            {
+                if let Some((top, bottom)) =
+                    inputs.iceberg_bounds(&top_biome, world_x, world_z, sea_level)?
+                {
+                    let mut material = |name: &str| -> Result<(Arc<Value>, SurfaceBlockKind)> {
+                        let value = Arc::new(json!(name));
+                        let kind = if let Some(kind) = cache.get(value.as_ref()) {
+                            *kind
+                        } else {
+                            let kind = classify(&value)?;
+                            cache.insert((*value).clone(), kind);
+                            kind
+                        };
+                        Ok((value, kind))
+                    };
+                    let snow = material("minecraft:snow_block")?;
+                    let ice = material("minecraft:packed_ice")?;
+                    let mut random = inputs.iceberg_random(world_x, world_z);
+                    extend_iceberg_column(
+                        &mut states[range.clone()],
+                        &mut kinds[range.clone()],
+                        &mut fluid_updates[range.clone()],
+                        min_y,
+                        start,
+                        min_surface_level,
+                        sea_level,
+                        top,
+                        bottom,
+                        &mut random,
+                        &snow,
+                        &ice,
+                    )?;
+                }
+            }
             heights[column] = kinds[range]
                 .iter()
                 .rposition(|kind| *kind != SurfaceBlockKind::Air)
@@ -604,5 +689,193 @@ mod tests {
             "fixtures must exercise actual pillars: {changed:?}"
         );
         assert_eq!(changed[1], 0, "water must prevent pillar generation");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
+    fn frozen_ocean_icebergs_match_vanilla_columns() {
+        use crate::{
+            biome_climate::{BiomeClimate, TemperatureModifier},
+            density::WorldgenRandom,
+            packs::ResourceStack,
+            surface_rules::{FrozenOceanIcebergs, SurfaceNoise, SurfaceRandomFactory},
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut stack = ResourceStack::open(&game).unwrap();
+        let icebergs = FrozenOceanIcebergs::default();
+        let mut definitions = serde_json::Map::new();
+        for id in icebergs.noise_dependencies() {
+            let name = format!("{}:{}", id.namespace, id.path);
+            let path = format!("data/{}/worldgen/noise/{}.json", id.namespace, id.path);
+            definitions.insert(
+                name,
+                serde_json::from_slice(&stack.read_builtin_data(&path).unwrap().unwrap()).unwrap(),
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("FrozenOceanExtensionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrozenOceanExtensionOracle.java"),
+        )
+        .unwrap();
+        let cp = classpath(&game, temp.path());
+        let java = java_bin();
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let input = temp.path().join("noise.json");
+        std::fs::write(&input, serde_json::to_vec(&definitions).unwrap()).unwrap();
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("FrozenOceanExtensionOracle")
+            .arg(&input));
+        let mut noise = None;
+        let mut random = None;
+        let mut samples = 0;
+        let mut changed = 0;
+        let mut snow_count = 0;
+        let mut ice_count = 0;
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            match fields.first().copied() {
+                Some("S") => {
+                    let algorithm = if fields[1] == "0" {
+                        WorldgenRandom::Legacy
+                    } else {
+                        WorldgenRandom::Xoroshiro
+                    };
+                    let seed = fields[2].parse().unwrap();
+                    noise = Some(
+                        SurfaceNoise::load(
+                            &mut stack,
+                            seed,
+                            algorithm,
+                            icebergs.noise_dependencies(),
+                        )
+                        .unwrap(),
+                    );
+                    random = Some(SurfaceRandomFactory::new(seed, algorithm));
+                }
+                Some("P") => {
+                    let n: i32 = fields[1].parse().unwrap();
+                    let x: i32 = fields[2].parse().unwrap();
+                    let z: i32 = fields[3].parse().unwrap();
+                    let variant: i32 = fields[4].parse().unwrap();
+                    let climate = BiomeClimate {
+                        has_precipitation: false,
+                        temperature: match n % 3 {
+                            0 => 0.0,
+                            1 => 0.8,
+                            _ => 0.1,
+                        },
+                        modifier: if n & 1 != 0 {
+                            TemperatureModifier::Frozen
+                        } else {
+                            TemperatureModifier::None
+                        },
+                    };
+                    let melts = climate.temperature_at(x, 63, z, 63) > 0.1;
+                    assert_eq!(melts, fields[5] == "true", "iceberg melt condition {line}");
+                    let air = Arc::new(json!("minecraft:air"));
+                    let stone = Arc::new(json!("minecraft:stone"));
+                    let water = Arc::new(json!("minecraft:water"));
+                    let dirt = Arc::new(json!("minecraft:dirt"));
+                    let snow = (
+                        Arc::new(json!("minecraft:snow_block")),
+                        SurfaceBlockKind::Solid,
+                    );
+                    let ice = (
+                        Arc::new(json!("minecraft:packed_ice")),
+                        SurfaceBlockKind::Solid,
+                    );
+                    let floor = 45 + n % 4;
+                    let mut states: Vec<_> = (0..160)
+                        .map(|i| {
+                            let y = i - 32;
+                            Arc::clone(if y <= floor {
+                                &stone
+                            } else if y < 63 {
+                                &water
+                            } else {
+                                &air
+                            })
+                        })
+                        .collect();
+                    let mut kinds: Vec<_> = (0..160)
+                        .map(|i| {
+                            let y = i - 32;
+                            if y <= floor {
+                                SurfaceBlockKind::Solid
+                            } else if y < 63 {
+                                SurfaceBlockKind::Fluid
+                            } else {
+                                SurfaceBlockKind::Air
+                            }
+                        })
+                        .collect();
+                    if variant == 1 {
+                        states[107] = dirt;
+                        kinds[107] = SurfaceBlockKind::Solid;
+                    }
+                    if variant == 2 {
+                        for i in [87, 92] {
+                            states[i] = Arc::clone(&air);
+                            kinds[i] = SurfaceBlockKind::Air;
+                        }
+                    }
+                    let before = states.clone();
+                    let mut updates = vec![false; 160];
+                    if let Some((top, bottom)) = icebergs
+                        .bounds(noise.as_mut().unwrap(), x, z, 63, melts)
+                        .unwrap()
+                    {
+                        let mut random = random.as_ref().unwrap().root_at(x, 0, z);
+                        extend_iceberg_column(
+                            &mut states,
+                            &mut kinds,
+                            &mut updates,
+                            -32,
+                            if variant == 1 { 76 } else { 63 },
+                            28 + n % 7,
+                            63,
+                            top,
+                            bottom,
+                            &mut random,
+                            &snow,
+                            &ice,
+                        )
+                        .unwrap();
+                    }
+                    let actual: String = states
+                        .iter()
+                        .map(|state| match state.as_str().unwrap() {
+                            "minecraft:air" => 'a',
+                            "minecraft:stone" => 's',
+                            "minecraft:water" => 'w',
+                            "minecraft:dirt" => 'd',
+                            "minecraft:snow_block" => 'n',
+                            _ => 'i',
+                        })
+                        .collect();
+                    assert_eq!(actual, fields[6], "frozen ocean column {line}");
+                    changed += usize::from(states != before);
+                    snow_count += actual.matches('n').count();
+                    ice_count += actual.matches('i').count();
+                    assert!(updates.iter().all(|flag| !flag));
+                    samples += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(samples, 2 * 3 * 1000 * 3);
+        assert!(
+            changed > 0 && snow_count > 0 && ice_count > 0,
+            "fixtures must exercise ice and snow: {changed}, {snow_count}, {ice_count}"
+        );
     }
 }

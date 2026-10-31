@@ -73,7 +73,7 @@ impl SurfaceRandom {
             Self::Xoroshiro(r) => r.next_double(),
         }
     }
-    fn next_int_bound(&mut self, bound: i32) -> i32 {
+    pub(crate) fn next_int_bound(&mut self, bound: i32) -> i32 {
         match self {
             Self::Legacy(r) => r.next_int_bound(bound),
             Self::Xoroshiro(r) => r.next_int_bound(bound),
@@ -372,6 +372,57 @@ impl BadlandsPillars {
         let roof = (f64::from(noise.sample_scaled(&self.roof, x * 0.75, z * 0.75)?) * 1.5).abs();
         let peak = 64.0 + (value * value * 2.5).min((roof * 50.0).ceil() + 24.0);
         Ok(Some(peak.floor() as i32))
+    }
+}
+
+/// Seeded surface noise fields used by frozen-ocean icebergs.
+pub struct FrozenOceanIcebergs {
+    surface: ResourceId,
+    pillar: ResourceId,
+    roof: ResourceId,
+}
+impl Default for FrozenOceanIcebergs {
+    fn default() -> Self {
+        Self {
+            surface: ResourceId::parse("minecraft:iceberg_surface").unwrap(),
+            pillar: ResourceId::parse("minecraft:iceberg_pillar").unwrap(),
+            roof: ResourceId::parse("minecraft:iceberg_pillar_roof").unwrap(),
+        }
+    }
+}
+impl FrozenOceanIcebergs {
+    pub fn noise_dependencies(&self) -> [ResourceId; 3] {
+        [self.surface.clone(), self.pillar.clone(), self.roof.clone()]
+    }
+    /// Returns the top and bottom bounds before block placement.
+    pub fn bounds(
+        &self,
+        noise: &mut SurfaceNoise,
+        x: i32,
+        z: i32,
+        sea: i32,
+        melts: bool,
+    ) -> Result<Option<(f64, f64)>> {
+        let x = f64::from(x);
+        let z = f64::from(z);
+        let surface = (f64::from(noise.sample_scaled(&self.surface, x, z)?) * 8.25).abs();
+        let pillar = f64::from(noise.sample_scaled(&self.pillar, x * 1.28, z * 1.28)? * 15.0_f32);
+        let value = surface.min(pillar);
+        if value <= 1.8 {
+            return Ok(None);
+        }
+        let roof = (f64::from(noise.sample_scaled(&self.roof, x * 1.17, z * 1.17)?) * 1.5).abs();
+        let mut height = (value * value * 1.2).min((roof * 40.0).ceil() + 14.0);
+        if melts {
+            height -= 2.0;
+        }
+        if height <= 2.0 {
+            return Ok(None);
+        }
+        Ok(Some((
+            height + f64::from(sea),
+            f64::from(sea) - height - 7.0,
+        )))
     }
 }
 fn sample_surface_noise(entry: &mut SurfaceNoiseEntry, is_3d: bool, x: i32, y: i32, z: i32) -> f32 {
@@ -794,6 +845,7 @@ pub struct SeededSurfaceInputs<'a, P: ResourceProvider> {
     random: SurfaceRandomFactory,
     bands: SurfaceBands,
     badlands: BadlandsPillars,
+    icebergs: FrozenOceanIcebergs,
     density: SurfaceDensitySampler<'a, P>,
     ore: ResourceId,
 }
@@ -810,8 +862,10 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         let biomes =
             crate::surface_biomes::SurfaceBiomes::load(provider, &rule.biome_dependencies())?;
         let badlands = BadlandsPillars::default();
+        let icebergs = FrozenOceanIcebergs::default();
         let mut noises = rule.noise_dependencies();
         noises.extend(badlands.noise_dependencies());
+        noises.extend(icebergs.noise_dependencies());
         let noise = SurfaceNoise::load(provider, seed, algorithm, noises)?;
         let random = SurfaceRandomFactory::new(seed, algorithm);
         let bands = SurfaceBands::new(seed, algorithm);
@@ -825,6 +879,7 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
             random,
             bands,
             badlands,
+            icebergs,
             density,
             ore: ResourceId::parse("minecraft:ore")?,
         })
@@ -845,6 +900,19 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
     }
     pub fn badlands_peak(&mut self, x: i32, z: i32) -> Result<Option<i32>> {
         self.badlands.peak(&mut self.noise, x, z)
+    }
+    pub fn iceberg_bounds(
+        &mut self,
+        biome: &ResourceId,
+        x: i32,
+        z: i32,
+        sea: i32,
+    ) -> Result<Option<(f64, f64)>> {
+        let melts = self.biomes.iceberg_melts(biome, x, z, sea)?;
+        self.icebergs.bounds(&mut self.noise, x, z, sea, melts)
+    }
+    pub fn iceberg_random(&self, x: i32, z: i32) -> SurfaceRandom {
+        self.random.root_at(x, 0, z)
     }
 }
 impl<P: ResourceProvider> SurfaceInputs for SeededSurfaceInputs<'_, P> {

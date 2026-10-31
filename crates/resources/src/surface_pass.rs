@@ -1,5 +1,5 @@
 //! Apply material rules to a noise-stage chunk. Features, carvers, structures,
-//! biome generation and special badlands/iceberg extensions are separate.
+//! biome generation and frozen-ocean iceberg extensions are separate.
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -35,6 +35,54 @@ struct ColumnPosition {
     above: i32,
     below: i32,
     water: i32,
+}
+
+fn state_id(state: &Value) -> Result<ResourceId> {
+    let name = state
+        .as_str()
+        .or_else(|| state.get("id").and_then(Value::as_str))
+        .context("block state has no identifier")?;
+    ResourceId::parse(name)
+}
+
+/// Extend a single column after the seeded pillar height has been computed.
+fn extend_badlands_column(
+    states: &mut [Arc<Value>],
+    kinds: &mut [SurfaceBlockKind],
+    updates: &mut [bool],
+    min_y: i32,
+    start: i32,
+    peak: i32,
+    default_block: &Arc<Value>,
+    default_kind: SurfaceBlockKind,
+) -> Result<()> {
+    if peak < start || peak < min_y {
+        return Ok(());
+    }
+    let default_id = state_id(default_block)?;
+    let water = ResourceId::parse("minecraft:water")?;
+    // Above the chunk, the column is air and writes are discarded.
+    let limit = ((i64::from(peak) - i64::from(min_y)) as usize).min(states.len() - 1);
+    for state in states[..=limit].iter().rev() {
+        let id = state_id(state)?;
+        if id == default_id {
+            break;
+        }
+        if id == water {
+            return Ok(());
+        }
+    }
+    for i in (0..=limit).rev() {
+        if kinds[i] != SurfaceBlockKind::Air {
+            break;
+        }
+        states[i] = Arc::clone(default_block);
+        kinds[i] = default_kind;
+        if default_kind == SurfaceBlockKind::Fluid {
+            updates[i] = true;
+        }
+    }
+    Ok(())
 }
 
 /// Visits solid blocks from top to bottom with Java's depth and fluid bookkeeping.
@@ -82,8 +130,8 @@ fn scan_column(
 /// Apply a rule to noise-stage blocks using already sampled biome identities.
 /// `preliminary` is the chunk surface-level density in Z, X order; its volume
 /// sampling must match the noise generator. Unknown block classifications fail.
-/// Eroded badlands and frozen oceans need extra vanilla terrain extensions and
-/// are rejected until those extensions are implemented.
+/// Frozen oceans require an additional vanilla iceberg extension and are
+/// rejected until it is implemented.
 pub fn apply_surface<P: ResourceProvider>(
     chunk: &NoiseStageChunk,
     rule: &SurfaceRule,
@@ -112,6 +160,7 @@ pub fn apply_surface<P: ResourceProvider>(
     let mut cache = HashMap::<Value, SurfaceBlockKind>::new();
     let mut kinds = Vec::with_capacity(chunk.materials().len());
     let mut states = Vec::with_capacity(chunk.materials().len());
+    let mut fluid_updates = chunk.fluid_updates().to_vec();
     for material in chunk.materials() {
         let state = match material {
             NoiseMaterial::DefaultBlock => &default_block,
@@ -149,7 +198,7 @@ pub fn apply_surface<P: ResourceProvider>(
             if top_biome.namespace == "minecraft"
                 && matches!(
                     top_biome.path.as_str(),
-                    "eroded_badlands" | "frozen_ocean" | "deep_frozen_ocean"
+                    "frozen_ocean" | "deep_frozen_ocean"
                 )
             {
                 bail!(
@@ -157,6 +206,32 @@ pub fn apply_surface<P: ResourceProvider>(
                     top_biome.namespace,
                     top_biome.path
                 );
+            }
+            if top_biome.namespace == "minecraft" && top_biome.path == "eroded_badlands" {
+                if let Some(peak) = inputs.badlands_peak(world_x, world_z)? {
+                    let range = column * h..(column + 1) * h;
+                    let default_kind = if let Some(kind) = cache.get(default_block.as_ref()) {
+                        *kind
+                    } else {
+                        let kind = classify(&default_block)?;
+                        cache.insert((*default_block).clone(), kind);
+                        kind
+                    };
+                    extend_badlands_column(
+                        &mut states[range.clone()],
+                        &mut kinds[range.clone()],
+                        &mut fluid_updates[range.clone()],
+                        min_y,
+                        start,
+                        peak,
+                        &default_block,
+                        default_kind,
+                    )?;
+                    heights[column] = kinds[range]
+                        .iter()
+                        .rposition(|kind| *kind != SurfaceBlockKind::Air)
+                        .map_or(min_y - 1, |index| min_y + index as i32);
+                }
             }
             let gradient_x =
                 heights[z * 16 + (x + 1).min(15)] - heights[z * 16 + x.saturating_sub(1)];
@@ -205,6 +280,9 @@ pub fn apply_surface<P: ResourceProvider>(
                     let index = column * h + (step.y - min_y) as usize;
                     states[index] = state;
                     kinds[index] = kind;
+                    if kind == SurfaceBlockKind::Fluid {
+                        fluid_updates[index] = true;
+                    }
                 }
                 Ok(())
             })?;
@@ -220,7 +298,7 @@ pub fn apply_surface<P: ResourceProvider>(
         min_y,
         height,
         states,
-        fluid_updates: chunk.fluid_updates().to_vec(),
+        fluid_updates,
     })
 }
 
@@ -232,6 +310,35 @@ mod tests {
         path::{Path, PathBuf},
         process::Command,
     };
+    fn run(command: &mut Command) -> String {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    fn classpath(game: &Path, classes: &Path) -> OsString {
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), classes.to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        std::env::join_paths(paths).unwrap()
+    }
+    fn java_bin() -> PathBuf {
+        std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin")
+    }
     #[test]
     fn column_depths_and_water_reset_across_air_and_caves() {
         use SurfaceBlockKind::{Air as A, Fluid as F, Solid as S};
@@ -287,31 +394,6 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn column_scan_matches_vanilla_material_system() {
-        fn run(command: &mut Command) -> String {
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "Java oracle failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap()
-        }
-        fn classpath(game: &Path, classes: &Path) -> OsString {
-            let version = game.join("versions/26.3");
-            let manifest: Value =
-                serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
-            assert_eq!(manifest["id"], "26.3");
-            let mut paths = vec![version.join("26.3.jar"), classes.to_path_buf()];
-            for library in manifest["libraries"].as_array().unwrap() {
-                if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
-                    let path = game.join("libraries").join(path);
-                    if path.is_file() {
-                        paths.push(path);
-                    }
-                }
-            }
-            std::env::join_paths(paths).unwrap()
-        }
         fn kind(x: i32, y: i32, z: i32) -> SurfaceBlockKind {
             let top = 8 + (x * 3 + z * 7) % 20;
             if y > top {
@@ -331,8 +413,7 @@ mod tests {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
-        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let java = java_bin();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SurfaceColumnOracle.java");
         std::fs::write(
@@ -380,5 +461,148 @@ mod tests {
             actual.iter().map(String::as_str).collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
+    fn badlands_pillars_match_vanilla_columns() {
+        use crate::{
+            density::WorldgenRandom,
+            packs::ResourceStack,
+            surface_rules::{BadlandsPillars, SurfaceNoise},
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut stack = ResourceStack::open(&game).unwrap();
+        let pillars = BadlandsPillars::default();
+        let mut definitions = serde_json::Map::new();
+        for id in pillars.noise_dependencies() {
+            let name = format!("{}:{}", id.namespace, id.path);
+            let path = format!("data/{}/worldgen/noise/{}.json", id.namespace, id.path);
+            definitions.insert(
+                name,
+                serde_json::from_slice(&stack.read_builtin_data(&path).unwrap().unwrap()).unwrap(),
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("BadlandsExtensionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BadlandsExtensionOracle.java"),
+        )
+        .unwrap();
+        let cp = classpath(&game, temp.path());
+        let java = java_bin();
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let input = temp.path().join("noise.json");
+        std::fs::write(&input, serde_json::to_vec(&definitions).unwrap()).unwrap();
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BadlandsExtensionOracle")
+            .arg(&input));
+        let mut noise = None;
+        let mut samples = 0;
+        let mut changed = [0; 3];
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            match fields.first().copied() {
+                Some("S") => {
+                    let algorithm = if fields[1] == "0" {
+                        WorldgenRandom::Legacy
+                    } else {
+                        WorldgenRandom::Xoroshiro
+                    };
+                    let seed = fields[2].parse().unwrap();
+                    noise = Some(
+                        SurfaceNoise::load(
+                            &mut stack,
+                            seed,
+                            algorithm,
+                            pillars.noise_dependencies(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                Some("P") => {
+                    let n: i32 = fields[1].parse().unwrap();
+                    let x: i32 = fields[2].parse().unwrap();
+                    let z: i32 = fields[3].parse().unwrap();
+                    let variant: i32 = fields[4].parse().unwrap();
+                    let top = 48 + n % 14;
+                    let air = Arc::new(json!("minecraft:air"));
+                    let stone = Arc::new(json!("minecraft:stone"));
+                    let water = Arc::new(json!("minecraft:water"));
+                    let dirt = Arc::new(json!("minecraft:dirt"));
+                    let mut states: Vec<_> = (0..128)
+                        .map(|i| Arc::clone(if i - 32 <= top { &stone } else { &air }))
+                        .collect();
+                    let mut kinds: Vec<_> = (0..128)
+                        .map(|i| {
+                            if i - 32 <= top {
+                                SurfaceBlockKind::Solid
+                            } else {
+                                SurfaceBlockKind::Air
+                            }
+                        })
+                        .collect();
+                    if variant == 1 {
+                        states[(top + 33) as usize] = water;
+                        kinds[(top + 33) as usize] = SurfaceBlockKind::Fluid;
+                    }
+                    if variant == 2 {
+                        states[(top + 38) as usize] = dirt;
+                        kinds[(top + 38) as usize] = SurfaceBlockKind::Solid;
+                    }
+                    let before = states.clone();
+                    let mut updates = vec![false; 128];
+                    if let Some(peak) = pillars.peak(noise.as_mut().unwrap(), x, z).unwrap() {
+                        let start = top
+                            + if variant == 1 {
+                                2
+                            } else if variant == 2 {
+                                7
+                            } else {
+                                1
+                            };
+                        extend_badlands_column(
+                            &mut states,
+                            &mut kinds,
+                            &mut updates,
+                            -32,
+                            start,
+                            peak,
+                            &stone,
+                            SurfaceBlockKind::Solid,
+                        )
+                        .unwrap();
+                    }
+                    let actual: String = states
+                        .iter()
+                        .map(|state| match state.as_str().unwrap() {
+                            "minecraft:air" => 'a',
+                            "minecraft:stone" => 's',
+                            "minecraft:water" => 'w',
+                            _ => 'd',
+                        })
+                        .collect();
+                    assert_eq!(actual, fields[5], "badlands column {line}");
+                    changed[variant as usize] += usize::from(states != before);
+                    assert!(updates.iter().all(|flag| !flag));
+                    samples += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(samples, 2 * 3 * 300 * 3);
+        assert!(
+            changed[0] > 0 && changed[2] > 0,
+            "fixtures must exercise actual pillars: {changed:?}"
+        );
+        assert_eq!(changed[1], 0, "water must prevent pillar generation");
     }
 }

@@ -312,6 +312,16 @@ impl SurfaceNoise {
         })?;
         Ok(sample_surface_noise(entry, is_3d, x, y, z))
     }
+    /// Sample at scaled coordinates used by biome-specific surface extensions.
+    pub fn sample_scaled(&mut self, name: &ResourceId, x: f64, z: f64) -> Result<f32> {
+        let entry = self.noises.get_mut(name).with_context(|| {
+            format!(
+                "material noise not loaded: {}:{}",
+                name.namespace, name.path
+            )
+        })?;
+        Ok(entry.noise.sample(x, 0.0, z))
+    }
     pub fn surface_depth(&mut self, x: i32, z: i32) -> Result<i32> {
         let entry = self
             .noises
@@ -327,6 +337,41 @@ impl SurfaceNoise {
             .get_mut(&self.secondary_id)
             .expect("secondary surface noise is loaded");
         Ok(f64::from(sample_surface_noise(entry, false, x, 0, z)))
+    }
+}
+
+/// The three world-seeded noise fields for eroded-badlands pillars.
+pub struct BadlandsPillars {
+    surface: ResourceId,
+    pillar: ResourceId,
+    roof: ResourceId,
+}
+impl Default for BadlandsPillars {
+    fn default() -> Self {
+        Self {
+            surface: ResourceId::parse("minecraft:badlands_surface").unwrap(),
+            pillar: ResourceId::parse("minecraft:badlands_pillar").unwrap(),
+            roof: ResourceId::parse("minecraft:badlands_pillar_roof").unwrap(),
+        }
+    }
+}
+impl BadlandsPillars {
+    pub fn noise_dependencies(&self) -> [ResourceId; 3] {
+        [self.surface.clone(), self.pillar.clone(), self.roof.clone()]
+    }
+    /// Java computes the pillar product in float, then the roof and cap in double.
+    pub fn peak(&self, noise: &mut SurfaceNoise, x: i32, z: i32) -> Result<Option<i32>> {
+        let x = f64::from(x);
+        let z = f64::from(z);
+        let surface = (f64::from(noise.sample_scaled(&self.surface, x, z)?) * 8.25).abs();
+        let pillar = f64::from(noise.sample_scaled(&self.pillar, x * 0.2, z * 0.2)? * 15.0_f32);
+        let value = surface.min(pillar);
+        if value <= 0.0 {
+            return Ok(None);
+        }
+        let roof = (f64::from(noise.sample_scaled(&self.roof, x * 0.75, z * 0.75)?) * 1.5).abs();
+        let peak = 64.0 + (value * value * 2.5).min((roof * 50.0).ceil() + 24.0);
+        Ok(Some(peak.floor() as i32))
     }
 }
 fn sample_surface_noise(entry: &mut SurfaceNoiseEntry, is_3d: bool, x: i32, y: i32, z: i32) -> f32 {
@@ -748,6 +793,7 @@ pub struct SeededSurfaceInputs<'a, P: ResourceProvider> {
     noise: SurfaceNoise,
     random: SurfaceRandomFactory,
     bands: SurfaceBands,
+    badlands: BadlandsPillars,
     density: SurfaceDensitySampler<'a, P>,
     ore: ResourceId,
 }
@@ -763,7 +809,10 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
     ) -> Result<Self> {
         let biomes =
             crate::surface_biomes::SurfaceBiomes::load(provider, &rule.biome_dependencies())?;
-        let noise = SurfaceNoise::load(provider, seed, algorithm, rule.noise_dependencies())?;
+        let badlands = BadlandsPillars::default();
+        let mut noises = rule.noise_dependencies();
+        noises.extend(badlands.noise_dependencies());
+        let noise = SurfaceNoise::load(provider, seed, algorithm, noises)?;
         let random = SurfaceRandomFactory::new(seed, algorithm);
         let bands = SurfaceBands::new(seed, algorithm);
         let density = SurfaceDensitySampler::without_terrain_adjustments(
@@ -775,6 +824,7 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
             noise,
             random,
             bands,
+            badlands,
             density,
             ore: ResourceId::parse("minecraft:ore")?,
         })
@@ -792,6 +842,9 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
     }
     pub fn surface_secondary(&mut self, x: i32, z: i32) -> Result<f64> {
         self.noise.surface_secondary(x, z)
+    }
+    pub fn badlands_peak(&mut self, x: i32, z: i32) -> Result<Option<i32>> {
+        self.badlands.peak(&mut self.noise, x, z)
     }
 }
 impl<P: ResourceProvider> SurfaceInputs for SeededSurfaceInputs<'_, P> {

@@ -137,6 +137,18 @@ fn seeded_context_loads_vanilla_rules_and_evaluates_biomes() {
             classify,
             |_, _, _| ResourceId::parse("minecraft:eroded_badlands")
         )
+        .is_ok()
+    );
+    assert!(
+        apply_surface(
+            &chunk,
+            &test_rule,
+            &mut inputs,
+            &preliminary,
+            generator.sea_level(),
+            classify,
+            |_, _, _| ResourceId::parse("minecraft:frozen_ocean")
+        )
         .is_err()
     );
     drop(inputs);
@@ -170,4 +182,30 @@ fn seeded_context_loads_vanilla_rules_and_evaluates_biomes() {
         generated.states[16 * 16 + 15].as_str(),
         Some("minecraft:snow_block")
     );
+    drop(inputs);
+    let mut compiler = SurfaceRuleCompiler::new(&mut resources);
+    let fluid_rule = compiler
+        .compile(&json!({"type":"block","result_state":"minecraft:water"}))
+        .unwrap();
+    drop(compiler);
+    let mut inputs = SeededSurfaceInputs::without_terrain_adjustments(
+        &mut resources,
+        &fluid_rule,
+        42,
+        generator.random_algorithm(),
+        [0, 0, 0],
+        [16, 16, 16],
+    )
+    .unwrap();
+    let fluid = apply_surface(
+        &chunk,
+        &fluid_rule,
+        &mut inputs,
+        &preliminary,
+        generator.sea_level(),
+        classify,
+        |_, _, _| ResourceId::parse("minecraft:plains"),
+    )
+    .unwrap();
+    assert!(fluid.fluid_updates.iter().all(|flag| *flag));
 }

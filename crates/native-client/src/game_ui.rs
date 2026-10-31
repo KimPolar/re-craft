@@ -1495,7 +1495,9 @@ impl GameUi {
                 || snapshot.inventory.cursor().is_some_and(has_linked);
             self.compass_inventory_revision = Some(snapshot.inventory.revision());
         }
-        if context_changed && self.compass_visible {
+        if self.compass_visible
+            && (context_changed || self.held_models.compass_requires_frame_updates())
+        {
             self.last_draw = None;
         }
         self.sync_death(snapshot);

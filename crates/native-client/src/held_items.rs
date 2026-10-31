@@ -355,9 +355,7 @@ fn compass_range_branch<'a>(definition: &'a Value, key: &ModelKey) -> Option<&'a
             .get("property")
             .and_then(Value::as_str)
             .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
-        && branch
-            .get("wobble")
-            .is_none_or(|value| value.as_bool() == Some(true)))
+        && branch.get("wobble").is_none_or(Value::is_boolean))
     .then_some(branch)
 }
 
@@ -902,6 +900,29 @@ impl ItemModelCache {
         changed
     }
 
+    /// A non-wobbling compass with no target samples a new random value for
+    /// every model evaluation, even when the game tick has not advanced.
+    pub(crate) fn compass_requires_frame_updates(&self) -> bool {
+        self.compass.definitions.values().any(|definition| {
+            ["/model", "/model/on_true", "/model/on_false"]
+                .into_iter()
+                .filter_map(|path| definition.pointer(path))
+                .any(|branch| {
+                    branch.get("wobble").and_then(Value::as_bool) == Some(false)
+                        && branch
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| {
+                                matches!(value, "minecraft:range_dispatch" | "range_dispatch")
+                            })
+                        && branch
+                            .get("property")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| matches!(value, "minecraft:compass" | "compass"))
+                })
+        })
+    }
+
     fn compass_variant(&self, key: &ModelKey) -> Option<(ModelKey, String)> {
         let definition = self.compass.definitions.get(&key.id)?;
         let selected = selected_model(definition.get("model")?, key).ok()?;
@@ -986,6 +1007,10 @@ impl ItemModelCache {
             && let Some(branch) = compass_range_branch(definition, &key)
             && let Some(context) = self.compass.context.as_ref()
         {
+            let wobble = branch
+                .get("wobble")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let target = match branch.get("target").and_then(Value::as_str) {
                 Some("lodestone") => item
                     .components()
@@ -1047,9 +1072,10 @@ impl ItemModelCache {
                             context.yaw_degrees,
                             context.owner,
                             target,
+                            wobble,
                         )
                     })
-                    .unwrap_or_else(|| random.angle(context.tick, seed));
+                    .unwrap_or_else(|| random.angle(context.tick, seed, wobble));
                 key.compass_angle = angle.to_bits();
             }
         }
@@ -1065,6 +1091,10 @@ impl ItemModelCache {
             && let Some(branch) = compass_range_branch(definition, &key)
             && let Some(context) = self.compass.context.as_ref()
         {
+            let wobble = branch
+                .get("wobble")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let target = match branch.get("target").and_then(Value::as_str) {
                 Some("lodestone") => item
                     .stack
@@ -1101,7 +1131,7 @@ impl ItemModelCache {
                             item.bob_offset,
                         )
                     })
-                    .unwrap_or_else(|| random.angle(context.tick, item.entity_id));
+                    .unwrap_or_else(|| random.angle(context.tick, item.entity_id, wobble));
                 key.compass_angle = angle.to_bits();
             }
         }
@@ -1170,6 +1200,94 @@ mod tests {
             selected_model(&definition, &key).unwrap()["model"],
             "linked"
         );
+    }
+
+    #[test]
+    fn compass_resource_pack_can_disable_wobble() {
+        let (request, _) = mpsc::sync_channel(1);
+        let (_, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+            compass: CompassCache::default(),
+        };
+        let mut definition = serde_json::json!({"model":{
+            "type":"minecraft:condition","property":"minecraft:has_component",
+            "on_false":{"type":"minecraft:range_dispatch","property":"minecraft:compass","target":"spawn","wobble":false},
+            "on_true":{"type":"minecraft:range_dispatch","property":"minecraft:compass","target":"lodestone"}
+        }});
+        let key = ModelKey::plain("minecraft:compass");
+        assert_eq!(
+            compass_range_branch(&definition, &key).unwrap()["wobble"],
+            false
+        );
+        cache
+            .compass
+            .definitions
+            .insert(key.id.clone(), Arc::new(definition.clone()));
+        assert!(cache.compass_requires_frame_updates());
+        definition["model"]["on_false"]["wobble"] = serde_json::json!(true);
+        cache
+            .compass
+            .definitions
+            .insert(key.id, Arc::new(definition));
+        assert!(!cache.compass_requires_frame_updates());
+    }
+
+    #[test]
+    fn unwobbled_compass_changes_model_within_the_same_tick() {
+        use native_persistence::nbt::Tag;
+        let (request, requests) = mpsc::sync_channel(4);
+        let (_results, response) = mpsc::channel();
+        let mut cache = ItemModelCache {
+            request,
+            response,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            frame_started: false,
+            active: HashSet::new(),
+            previous_active: HashSet::new(),
+            compass: CompassCache::default(),
+        };
+        cache.compass.definitions.insert("minecraft:recovery_compass".into(), Arc::new(serde_json::json!({
+            "model":{"type":"minecraft:range_dispatch","property":"minecraft:compass","target":"recovery","wobble":false,
+                "entries":[{"threshold":0.0,"model":{"type":"minecraft:model","model":"first"}},
+                    {"threshold":0.5,"model":{"type":"minecraft:model","model":"second"}}]}
+        })));
+        let item = ItemStack::new(
+            "minecraft:recovery_compass".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        let mut context = CompassContext {
+            dimension: "minecraft:overworld".into(),
+            world_spawn: None,
+            last_death: native_session::LastDeathLocation::At(native_session::lodestone::Target {
+                dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+                position: glam::IVec3::new(10, 0, 0),
+            }),
+            owner: glam::DVec3::splat(0.5),
+            yaw_degrees: 0.0,
+            tick: 7,
+        };
+        cache.set_compass_context(context.clone());
+        cache.get_item(&item);
+        let first = requests.try_recv().unwrap();
+        context.yaw_degrees = 180.0;
+        cache.set_compass_context(context);
+        cache.get_item(&item);
+        let second = requests.try_recv().unwrap();
+        assert_eq!(f32::from_bits(first.compass_angle), 0.75);
+        assert_eq!(f32::from_bits(second.compass_angle), 0.25);
     }
 
     #[test]

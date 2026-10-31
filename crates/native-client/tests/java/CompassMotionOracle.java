@@ -77,5 +77,24 @@ public class CompassMotionOracle {
       }
       Files.writeString(Path.of(args[2]),new Gson().toJson(samples));
     }
+    if (args.length > 3) {
+      var direct=new CompassAngleState(false,CompassAngleState.CompassTarget.LODESTONE);
+      var randomField=CompassAngleState.class.getDeclaredField("random"); randomField.setAccessible(true);
+      unsafe.putObject(direct,unsafe.objectFieldOffset(randomField),net.minecraft.util.RandomSource.create(1234567L));
+      var spin=CompassAngleState.class.getDeclaredMethod("getRandomlySpinningRotation",int.class,long.class); spin.setAccessible(true);
+      var samples=new JsonArray(); int[] seeds={0,1,10,12345,-1,Integer.MIN_VALUE,Integer.MAX_VALUE};
+      for(int n=0;n<240;n++) {
+        long tick=n/4; player.yaw=(float)((n*47)%720-360);
+        player.point=new Vec3(16000000.25+(n%7)*0.13,65.5+(n%3),-15999999.75-(n%11)*0.17);
+        var target=new BlockPos(16000000+(n%19)-9,64,-16000000+(n%23)-11);
+        int seed=seeds[n%seeds.length];
+        var row=new JsonObject(); row.addProperty("tick",tick); row.addProperty("yaw",player.yaw); row.addProperty("seed",seed);
+        row.addProperty("x",player.point.x); row.addProperty("y",player.point.y); row.addProperty("z",player.point.z);
+        row.addProperty("tx",target.getX()); row.addProperty("ty",target.getY()); row.addProperty("tz",target.getZ());
+        row.addProperty("target_bits",Float.floatToRawIntBits((float)method.invoke(direct,player,tick,target)));
+        row.addProperty("random_bits",Float.floatToRawIntBits((float)spin.invoke(direct,seed,tick))); samples.add(row);
+      }
+      Files.writeString(Path.of(args[3]),new Gson().toJson(samples));
+    }
   }
 }

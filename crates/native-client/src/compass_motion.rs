@@ -42,8 +42,10 @@ impl RandomNeedle {
         }
     }
 
-    pub(crate) fn angle(&mut self, tick: i64, item_seed: i32) -> f32 {
-        let rotation = if self.wobbler.should_update(tick) {
+    pub(crate) fn angle(&mut self, tick: i64, item_seed: i32, wobble: bool) -> f32 {
+        let rotation = if !wobble {
+            self.random.next_float()
+        } else if self.wobbler.should_update(tick) {
             self.wobbler.update(tick, self.random.next_float())
         } else {
             self.wobbler.rotation
@@ -73,6 +75,7 @@ pub(crate) fn local_target_angle(
     yaw_degrees: f32,
     owner: DVec3,
     target: IVec3,
+    wobble: bool,
 ) -> Option<f32> {
     let center = target.as_dvec3() + DVec3::splat(0.5);
     let delta = center - owner;
@@ -85,7 +88,12 @@ pub(crate) fn local_target_angle(
     // Java divides by the double widening of the float constant 2π.
     let direction = (delta.z.atan2(delta.x) / f64::from(std::f32::consts::TAU)) as f32;
     let yaw = positive_modulo(yaw_degrees / 360.0);
-    let rotation = wobbler.update(tick, 0.5 - (yaw - 0.25));
+    let target_rotation = 0.5 - (yaw - 0.25);
+    let rotation = if wobble {
+        wobbler.update(tick, target_rotation)
+    } else {
+        target_rotation
+    };
     Some(positive_modulo(direction + rotation))
 }
 
@@ -118,11 +126,28 @@ mod tests {
     #[test]
     fn target_center_and_repeated_ticks_are_handled() {
         let mut wobbler = Wobbler::default();
-        assert!(local_target_angle(&mut wobbler, 1, 0.0, DVec3::splat(0.5), IVec3::ZERO).is_none());
-        let first =
-            local_target_angle(&mut wobbler, 1, 45.0, DVec3::ZERO, IVec3::new(1, 0, 0)).unwrap();
-        let second =
-            local_target_angle(&mut wobbler, 1, 90.0, DVec3::ZERO, IVec3::new(1, 0, 0)).unwrap();
+        assert!(
+            local_target_angle(&mut wobbler, 1, 0.0, DVec3::splat(0.5), IVec3::ZERO, true)
+                .is_none()
+        );
+        let first = local_target_angle(
+            &mut wobbler,
+            1,
+            45.0,
+            DVec3::ZERO,
+            IVec3::new(1, 0, 0),
+            true,
+        )
+        .unwrap();
+        let second = local_target_angle(
+            &mut wobbler,
+            1,
+            90.0,
+            DVec3::ZERO,
+            IVec3::new(1, 0, 0),
+            true,
+        )
+        .unwrap();
         assert_eq!(first, second);
     }
 
@@ -153,6 +178,7 @@ mod tests {
         let output = temp.path().join("motion.json");
         let random_output = temp.path().join("random.json");
         let dropped_output = temp.path().join("dropped.json");
+        let direct_output = temp.path().join("direct.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/CompassMotionOracle.java"),
@@ -169,7 +195,8 @@ mod tests {
                 .arg("CompassMotionOracle")
                 .arg(&output)
                 .arg(&random_output)
-                .arg(&dropped_output),
+                .arg(&dropped_output)
+                .arg(&direct_output),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -192,6 +219,7 @@ mod tests {
                 f("yaw") as f32,
                 DVec3::new(f("x"), f("y"), f("z")),
                 IVec3::new(i("tx"), i("ty"), i("tz")),
+                true,
             )
             .unwrap();
             let expected = f32::from_bits(row["bits"].as_i64().unwrap() as i32 as u32);
@@ -227,10 +255,40 @@ mod tests {
             let actual = random.angle(
                 row["tick"].as_i64().unwrap(),
                 row["seed"].as_i64().unwrap() as i32,
+                true,
             );
             assert_eq!(
                 actual.to_bits(),
                 row["bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(direct_output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 240);
+        let mut direct_wobbler = Wobbler::default();
+        let mut direct_random = RandomNeedle::with_seed(1_234_567);
+        for row in rows {
+            let f = |name: &str| row[name].as_f64().unwrap();
+            let i = |name: &str| row[name].as_i64().unwrap() as i32;
+            let tick = row["tick"].as_i64().unwrap();
+            let actual = local_target_angle(
+                &mut direct_wobbler,
+                tick,
+                f("yaw") as f32,
+                DVec3::new(f("x"), f("y"), f("z")),
+                IVec3::new(i("tx"), i("ty"), i("tz")),
+                false,
+            )
+            .unwrap();
+            let expected = f32::from_bits(i("target_bits") as u32);
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "{row}: {actual} != {expected}"
+            );
+            assert_eq!(
+                direct_random.angle(tick, i("seed"), false).to_bits(),
+                i("random_bits") as u32,
                 "{row}"
             );
         }

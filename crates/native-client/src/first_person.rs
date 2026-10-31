@@ -852,6 +852,7 @@ mod tests {
             let item_texture = Arc::new(RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255])));
             let make_item = |glint| {
                 Arc::new(HeldModel {
+                    particle_texture: None,
                     numeric_item_id: None,
                     glint,
                     glint_materials: if glint {

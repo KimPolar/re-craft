@@ -9,6 +9,8 @@ mod chat_hud;
 mod chest_model;
 mod chunk_stream;
 mod compass_motion;
+mod consume_particle_render;
+mod consume_particles;
 mod death_ui;
 mod equipment_visual;
 mod experience_hud;
@@ -1862,6 +1864,7 @@ impl App {
                 renderer,
                 (size.width, size.height),
                 &snapshot,
+                snapshot.origin,
                 self.session.partial_tick(),
             ) {
                 self.fail(event_loop, error);
@@ -2304,8 +2307,12 @@ impl ApplicationHandler for App {
                 self.session
                     .update(now.saturating_duration_since(self.last_update));
             }
+            let snapshot = self.session.snapshot();
+            let particles = self.session.take_consume_particles();
+            if let Some(ui) = &mut self.ui {
+                ui.update_consume_particles(&snapshot, particles);
+            }
             if let Some(audio) = &self.audio {
-                let snapshot = self.session.snapshot();
                 let eye = snapshot.camera.eye(self.session.partial_tick());
                 let (yaw, _) = self.visual_look.angles(&snapshot);
                 if self.audio_listener != Some((eye, yaw)) {

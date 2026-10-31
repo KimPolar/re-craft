@@ -496,6 +496,7 @@ mod tests {
                 std::sync::Arc::new(RgbaImage::from_pixel(16, 16, Rgba([0, 0, 255, 255])));
             let model = |glint| {
                 std::sync::Arc::new(crate::held_items::HeldModel {
+                    particle_texture: None,
                     numeric_item_id: None,
                     quads: crate::generated_item::bake(
                         std::sync::Arc::clone(&item_image),

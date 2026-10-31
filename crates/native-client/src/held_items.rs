@@ -97,6 +97,7 @@ pub struct SpriteLayer {
 
 pub struct HeldModel {
     pub quads: Vec<TexturedQuad>,
+    pub particle_texture: Option<Arc<RgbaImage>>,
     pub numeric_item_id: Option<i32>,
     pub glint: bool,
     /// Atlas coordinates per distinct texture for world and hand rendering.
@@ -650,8 +651,23 @@ impl Loader {
         } else {
             None
         };
+        let particle_texture = model
+            .texture("particle")
+            .ok()
+            .and_then(|reference| self.texture(&reference.sprite).ok())
+            .or_else(|| {
+                model
+                    .generated
+                    .then(|| {
+                        sprite_layers
+                            .first()
+                            .map(|layer| Arc::clone(&layer.texture))
+                    })
+                    .flatten()
+            });
         Ok(HeldModel {
             quads,
+            particle_texture,
             numeric_item_id,
             glint: key.glint,
             glint_materials,
@@ -1780,6 +1796,7 @@ public class PaletteOracle {
         let display = DisplayTransform::parse(None).unwrap();
         let image = Arc::new(RgbaImage::new(1, 1));
         Arc::new(HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             quads: crate::generated_item::bake(Arc::clone(&image), [1.0; 3], 0).unwrap(),
             glint: false,
@@ -2124,9 +2141,21 @@ public class PaletteOracle {
             .load("minecraft:apple")
             .unwrap();
         assert_eq!(model.sprite_layers.len(), 2);
+        assert!(Arc::ptr_eq(
+            model.particle_texture.as_ref().unwrap(),
+            &model.sprite_layers[0].texture
+        ));
         assert_eq!(model.sprite_layers[0].tint, [1.0, 0.0, 0.0]);
         assert_eq!(model.sprite_layers[1].tint, [0.0, 1.0, 0.0]);
         assert!(model.quads.iter().any(|quad| quad.layer == 0));
         assert!(model.quads.iter().any(|quad| quad.layer == 1));
+        std::fs::write(base.join("models/item/test_layered.json"),r#"{"parent":"minecraft:item/generated","textures":{"layer0":"minecraft:item/test_a","particle":"minecraft:item/test_b"}}"#).unwrap();
+        let model = open_loader(&game, &[temp.path().to_path_buf()])
+            .load("minecraft:apple")
+            .unwrap();
+        assert_eq!(
+            model.particle_texture.as_ref().unwrap().get_pixel(0, 0).0,
+            [255, 255, 255, 128]
+        );
     }
 }

@@ -138,6 +138,7 @@ pub struct GameUi {
     assets: Arc<MenuAssets>,
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
+    consume_particles: crate::consume_particles::ParticleSystem,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
     pause_page: PausePage,
@@ -191,6 +192,7 @@ impl GameUi {
             assets,
             skin,
             held_models,
+            consume_particles: crate::consume_particles::ParticleSystem::default(),
             armor_models,
             paused: false,
             pause_page: PausePage::Game,
@@ -234,6 +236,15 @@ impl GameUi {
     pub fn set_player_skin(&mut self, skin: Arc<crate::player_skin::PlayerSkin>) {
         self.skin = skin;
         self.last_draw = None;
+    }
+
+    pub fn update_consume_particles(
+        &mut self,
+        snapshot: &native_session::WorldSnapshot,
+        spawns: Vec<native_session::consume_particles::ConsumeParticleSpawn>,
+    ) {
+        self.consume_particles
+            .update(snapshot.tick, &snapshot.world, spawns);
     }
 
     pub fn set_trim_registry(&mut self, trims: Arc<crate::equipment_visual::TrimRegistry>) {
@@ -1461,6 +1472,7 @@ impl GameUi {
         renderer: &mut Renderer,
         size: (u32, u32),
         snapshot: &native_session::WorldSnapshot,
+        render_origin: glam::IVec3,
         partial: f32,
     ) -> Result<()> {
         self.held_models.begin_frame();
@@ -1533,6 +1545,29 @@ impl GameUi {
         if self.held_models.poll() {
             self.last_draw = None;
         }
+        let mut particle_draws = Vec::new();
+        for particle in self.consume_particles.particles() {
+            let Some(model) = self.held_models.get_item(&particle.item) else {
+                continue;
+            };
+            let Some(texture) = &model.particle_texture else {
+                continue;
+            };
+            let light = match &snapshot.world {
+                native_session::SessionWorld::Demo(_) => u32::MAX,
+                native_session::SessionWorld::Loaded(world) => {
+                    let cell = particle.position.floor().as_ivec3();
+                    u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                        + 16 * u32::from(world.light(cell.x, cell.y, cell.z, true).unwrap_or(15))
+                }
+            };
+            particle_draws.push(crate::consume_particle_render::RenderParticle {
+                particle: particle.clone(),
+                texture: Arc::clone(texture),
+                light,
+            });
+        }
+        renderer.set_consume_particles(particle_draws, render_origin, partial);
         let dropped_models = snapshot
             .dropped_items
             .iter()
@@ -3885,6 +3920,7 @@ mod inventory_tests {
             scale: glam::Vec3::ONE,
         };
         let mut model = HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             glint: false,
             glint_materials: Vec::new(),

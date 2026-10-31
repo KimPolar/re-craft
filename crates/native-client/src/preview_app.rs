@@ -443,6 +443,10 @@ impl Viewer {
             play.session.update(elapsed);
             play.streamer.service(&mut play.session)?;
             let snapshot = play.session.snapshot();
+            let particles = play.session.take_consume_particles();
+            if let Some(ui) = &mut self.ui {
+                ui.update_consume_particles(&snapshot, particles);
+            }
             self.camera.eye =
                 eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());
             (self.camera.yaw, self.camera.pitch) = self.visual_look.angles(&snapshot);
@@ -768,6 +772,7 @@ impl Viewer {
                 renderer,
                 (size.width, size.height),
                 &snapshot,
+                self.scene.origin,
                 play.session.partial_tick(),
             ) {
                 self.fail(event_loop, error);

@@ -674,6 +674,7 @@ mod tests {
             scale: Vec3::splat(0.5),
         };
         HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             quads: crate::generated_item::bake(texture, [1.0; 3], 0).unwrap(),
             glint: false,

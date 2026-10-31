@@ -277,6 +277,7 @@ mod tests {
             })
             .collect();
         let model = HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             quads,
             glint: false,
@@ -327,6 +328,7 @@ mod tests {
             ])
         }));
         let model = HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             quads: Vec::new(),
             glint: false,
@@ -393,6 +395,7 @@ mod tests {
             })
             .collect();
         let model = HeldModel {
+            particle_texture: None,
             numeric_item_id: None,
             quads,
             glint: false,

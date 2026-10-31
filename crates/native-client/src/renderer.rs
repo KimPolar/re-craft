@@ -19,6 +19,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     breaking_render::BreakingRenderer,
+    consume_particle_render::{ParticleRenderer, RenderParticle},
     first_person::{FirstPersonInput, FirstPersonRenderer},
     ground_items::GroundItemRenderer,
     held_items::HeldModel,
@@ -226,6 +227,10 @@ pub struct Renderer {
     ground_items: Option<GroundItemRenderer>,
     items_prepared: bool,
     orb_renderer: Option<OrbRenderer>,
+    consume_renderer: ParticleRenderer,
+    consume_draws: Vec<RenderParticle>,
+    consume_origin: glam::IVec3,
+    consume_partial: f32,
     first_person: FirstPersonRenderer,
     crosshair_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
@@ -1159,6 +1164,7 @@ impl Renderer {
             )
         });
         let screen_blur = crate::screen_blur::ScreenBlur::new(&device, config.format);
+        let consume_renderer = ParticleRenderer::new(&bind_layout, &sampler, &camera_buffer);
         Ok(Self {
             instance,
             surface,
@@ -1199,6 +1205,10 @@ impl Renderer {
             ground_items,
             items_prepared: false,
             orb_renderer,
+            consume_renderer,
+            consume_draws: Vec::new(),
+            consume_origin: glam::IVec3::ZERO,
+            consume_partial: 0.0,
             first_person,
             crosshair_pipeline,
             overlay_pipeline,
@@ -1272,6 +1282,17 @@ impl Renderer {
 
     pub fn update_first_person(&mut self, input: FirstPersonInput) {
         self.first_person.update(&self.device, &self.queue, input);
+    }
+
+    pub(crate) fn set_consume_particles(
+        &mut self,
+        particles: Vec<RenderParticle>,
+        origin: glam::IVec3,
+        partial: f32,
+    ) {
+        self.consume_draws = particles;
+        self.consume_origin = origin;
+        self.consume_partial = partial;
     }
 
     pub fn update_dropped_items(
@@ -2002,6 +2023,15 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
+        self.consume_renderer.update(
+            &self.device,
+            &self.queue,
+            &self.consume_draws,
+            self.consume_origin,
+            direction,
+            camera_up(direction, self.view_yaw),
+            self.consume_partial,
+        )?;
         self.update_fog(eye);
 
         let output_view = frame
@@ -2091,6 +2121,12 @@ impl Renderer {
             if let Some(orbs) = &self.orb_renderer {
                 orbs.draw(&mut pass);
             }
+            self.consume_renderer.draw(
+                &mut pass,
+                &self.translucent_pipeline,
+                &self.lightmap_bind_group,
+                &self.fog_bind_group,
+            );
         }
         self.first_person.draw(
             &self.queue,
@@ -2345,7 +2381,8 @@ mod tests {
                     }]);
                 let deadline = Instant::now() + Duration::from_secs(45);
                 loop {
-                    ui.draw(&mut renderer, (320, 240), &snapshot, 0.25).unwrap();
+                    ui.draw(&mut renderer, (320, 240), &snapshot, snapshot.origin, 0.25)
+                        .unwrap();
                     if renderer.ground_items.as_ref().is_some_and(|ground| {
                         ground.has_glint() && ground.resource_identities().len() == 2
                     }) {
@@ -2362,7 +2399,8 @@ mod tests {
                 renderer.render(&snapshot, 0.25, glam::Vec3::NEG_Z).unwrap();
                 snapshot.dropped_items = Arc::from([]);
                 snapshot.falling_blocks = Arc::from([]);
-                ui.draw(&mut renderer, (320, 240), &snapshot, 0.25).unwrap();
+                ui.draw(&mut renderer, (320, 240), &snapshot, snapshot.origin, 0.25)
+                    .unwrap();
                 assert!(!renderer.ground_items.as_ref().unwrap().has_glint());
                 assert_eq!(renderer.hand_glint_last.active, 0.0);
                 event_loop.exit();

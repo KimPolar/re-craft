@@ -31,6 +31,19 @@ pub trait NoiseSeedSource: NoiseRandom {
 pub trait NoiseSeedFactory {
     type Source: NoiseRandom;
     fn random_for(&self, name: &str) -> Self::Source;
+    fn at(&self, x: i32, y: i32, z: i32) -> Self::Source;
+}
+
+// Mth.getSeed uses an int multiplication for x before widening to long.
+fn coordinate_seed(x: i32, y: i32, z: i32) -> i64 {
+    let value = i64::from(x.wrapping_mul(3_129_871))
+        ^ i64::from(z).wrapping_mul(116_129_781)
+        ^ i64::from(y);
+    value
+        .wrapping_mul(value)
+        .wrapping_mul(42_317_861)
+        .wrapping_add(value.wrapping_mul(11))
+        >> 16
 }
 
 pub struct LegacyNoiseFactory(i64);
@@ -48,6 +61,9 @@ impl NoiseSeedFactory for LegacyNoiseFactory {
         });
         LegacyRandom::new(i64::from(hash) ^ self.0)
     }
+    fn at(&self, x: i32, y: i32, z: i32) -> Self::Source {
+        LegacyRandom::new(coordinate_seed(x, y, z) ^ self.0)
+    }
 }
 
 pub struct XoroshiroNoiseFactory(u64, u64);
@@ -64,6 +80,9 @@ impl NoiseSeedFactory for XoroshiroNoiseFactory {
         let low = u64::from_be_bytes(digest[..8].try_into().unwrap());
         let high = u64::from_be_bytes(digest[8..].try_into().unwrap());
         XoroshiroRandom::from_state(low ^ self.0, high ^ self.1)
+    }
+    fn at(&self, x: i32, y: i32, z: i32) -> Self::Source {
+        XoroshiroRandom::from_state(coordinate_seed(x, y, z) as u64 ^ self.0, self.1)
     }
 }
 

@@ -46,6 +46,7 @@ pub mod snow;
 mod spawn_entities;
 pub mod spawn_heightmaps;
 mod stair_items;
+mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
 pub mod world_spawn;

@@ -149,11 +149,17 @@ struct LootContext<'a> {
 
 impl Condition {
     fn fully_supported(&self) -> bool {
+        self.fully_supported_in_player_block(false)
+    }
+    fn fully_supported_in_player_block(&self, player_block: bool) -> bool {
         match self {
-            Self::Unsupported(_) | Self::ThisEntityPresent | Self::BlockState { .. } => false,
+            Self::Unsupported(_) => false,
+            Self::ThisEntityPresent | Self::BlockState { .. } => player_block,
             Self::Tool(predicate) => predicate.unsupported.is_none(),
-            Self::All(values) | Self::Any(values) => values.iter().all(Self::fully_supported),
-            Self::Not(value) => value.fully_supported(),
+            Self::All(values) | Self::Any(values) => values
+                .iter()
+                .all(|value| value.fully_supported_in_player_block(player_block)),
+            Self::Not(value) => value.fully_supported_in_player_block(player_block),
             _ => true,
         }
     }
@@ -266,6 +272,10 @@ impl Modifier {
     fn fully_supported(&self) -> bool {
         self.condition.fully_supported() && !matches!(self.kind, ModifierKind::Unsupported(_))
     }
+    fn fully_supported_in_player_block(&self) -> bool {
+        self.condition.fully_supported_in_player_block(true)
+            && !matches!(self.kind, ModifierKind::Unsupported(_))
+    }
     fn apply(
         &self,
         drop: &mut Drop,
@@ -375,6 +385,20 @@ impl Entry {
                 _ => true,
             }
     }
+    fn fully_supported_in_player_block(&self) -> bool {
+        self.condition.fully_supported_in_player_block(true)
+            && self
+                .modifiers
+                .iter()
+                .all(Modifier::fully_supported_in_player_block)
+            && match &self.kind {
+                EntryKind::Unsupported(_) => false,
+                EntryKind::Alternatives(entries) => {
+                    entries.iter().all(Self::fully_supported_in_player_block)
+                }
+                _ => true,
+            }
+    }
     /// An expanded empty entry still stops an alternatives chain.
     fn expand(
         &self,
@@ -444,6 +468,34 @@ pub struct BlockLootTables {
 }
 
 impl BlockLootTables {
+    /// Check all branches using the entity and original state supplied by a player break.
+    pub fn fully_supported_player_block(&self, block: &str) -> bool {
+        let Ok(block) = ResourceId::parse(block) else {
+            return false;
+        };
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        self.tables.get(&id).is_some_and(|table| {
+            table
+                .modifiers
+                .iter()
+                .all(Modifier::fully_supported_in_player_block)
+                && table.pools.iter().all(|pool| {
+                    pool.condition.fully_supported_in_player_block(true)
+                        && pool
+                            .modifiers
+                            .iter()
+                            .all(Modifier::fully_supported_in_player_block)
+                        && pool.entries.len() <= 1
+                        && pool
+                            .entries
+                            .iter()
+                            .all(Entry::fully_supported_in_player_block)
+                })
+        })
+    }
     /// Reject tables that could enter an unsupported branch under another RNG
     /// state before a destructive container operation is performed.
     pub fn fully_supported_block(&self, block: &str) -> bool {
@@ -469,6 +521,7 @@ impl BlockLootTables {
         let mut result = Self::default();
         let names = BASIC_BLOCKS
             .into_iter()
+            .chain(native_core::stairs::ITEMS.iter().copied())
             .chain(
                 native_core::button::Button::ALL
                     .into_iter()

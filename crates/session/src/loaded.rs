@@ -6382,17 +6382,27 @@ impl LoadedSession {
             .cloned();
         let properties = mining::Material::from_block_name(&name)
             .and_then(|material| mining::mining_properties(material, hand.as_ref()));
-        if matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block")
-            && self.game_mode != GameMode::Creative
-            && properties.is_none()
-        {
+        let snow = matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block");
+        let stair = crate::stair_items::is_stair_item(&name);
+        if stair && self.stair_voxels(id).is_none() {
             return;
         }
-        let snow_drops = if matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block")
+        if (snow || stair) && self.game_mode != GameMode::Creative && properties.is_none() {
+            return;
+        }
+        let checked_drops = if (snow || stair)
             && self.game_mode != GameMode::Creative
             && self.block_drops
             && properties.is_some_and(|properties| properties.correct_for_drops)
         {
+            if stair
+                && !self
+                    .loot
+                    .as_ref()
+                    .is_some_and(|loot| loot.fully_supported_player_block(&name))
+            {
+                return;
+            }
             let Some(state) = self.world.state(id) else {
                 return;
             };
@@ -6409,7 +6419,8 @@ impl LoadedSession {
             ) {
                 Ok(drops) => Some(drops),
                 Err(error) => {
-                    self.stream_errors.push(format!("snow loot: {error:#}"));
+                    self.stream_errors
+                        .push(format!("block loot for {name}: {error:#}"));
                     return;
                 }
             }
@@ -6418,14 +6429,29 @@ impl LoadedSession {
         };
         // Neighbor notifications may spawn drops and consume the same RNG.
         // Stage this loot first so they cannot be overwritten afterward.
-        let snow_drops = snow_drops.map(|drops| self.dropped_items.stage_player_block_drops(drops));
-        if self.set(relative, self.states[0]) {
+        let checked_drops =
+            checked_drops.map(|drops| self.dropped_items.stage_player_block_drops(drops));
+        let replacement = if stair
+            && self
+                .simulated_fluid(id)
+                .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+        {
+            self.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            })
+        } else {
+            self.states[0]
+        };
+        if self.set(relative, replacement) {
             let damage = properties.map_or(0, |properties| properties.damage_per_block);
             if self.game_mode != GameMode::Creative && damage != 0 {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
             }
-            if let Some((drops, _)) = snow_drops {
+            if let Some((drops, _)) = checked_drops {
                 self.dropped_items.drop_interaction(
                     absolute,
                     IVec3::ZERO,
@@ -6433,7 +6459,7 @@ impl LoadedSession {
                     drops,
                     true,
                 );
-            } else if !matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block") {
+            } else if !snow && !stair {
                 self.dropped_items.drop_block(
                     absolute,
                     &name,
@@ -6462,7 +6488,7 @@ impl LoadedSession {
                         .push(format!("ore experience for {name}: {error:#}")),
                 }
             }
-        } else if let Some((_, random)) = snow_drops {
+        } else if let Some((_, random)) = checked_drops {
             self.dropped_items.restore_drop_random(random);
         }
     }
@@ -12027,6 +12053,277 @@ mod tests {
                     Some(&Tag::Int(1))
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn stair_mining_preserves_water_and_drops_each_vanilla_stair() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use crate::mining::{Material, StairTool};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let mut ids: BTreeSet<String> = crate::stair_items::ITEMS
+            .iter()
+            .map(|id| format!("minecraft:{id}"))
+            .collect();
+        ids.extend([
+            "minecraft:air".into(),
+            "minecraft:water".into(),
+            "minecraft:stone".into(),
+        ]);
+        let ids = Arc::new(ids);
+        for name in crate::stair_items::ITEMS {
+            let id = format!("minecraft:{name}");
+            let Material::Stair { tool, .. } = Material::from_block_name(&id).unwrap() else {
+                panic!("missing material: {id}")
+            };
+            let tool = match tool {
+                StairTool::Axe => "minecraft:iron_axe",
+                StairTool::Pickaxe | StairTool::StonePickaxe => "minecraft:iron_pickaxe",
+                StairTool::Shears => "minecraft:shears",
+            };
+            for wet in [false, true] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::clone(&ids));
+                session.set_block_loot(Arc::clone(&loot));
+                let stack = ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![])).unwrap();
+                assert!(
+                    Arc::make_mut(&mut session.inventory)
+                        .set_slot(PlayerSlot::Storage(0), Some(stack))
+                );
+                let pos = IVec3::new(4, 2, 4);
+                let block = session.intern_block(state(
+                    &id,
+                    &[
+                        ("facing", "north"),
+                        ("half", "bottom"),
+                        ("shape", "straight"),
+                        ("waterlogged", if wet { "true" } else { "false" }),
+                    ],
+                ));
+                session.set_with_notify(pos, block, false);
+                session.finish_breaking(session.origin + pos);
+                let after = session
+                    .world
+                    .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                    .unwrap();
+                assert_eq!(
+                    after.name,
+                    if wet {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{id} wet={wet}"
+                );
+                let drops = session.dropped_items.snapshot();
+                assert_eq!(drops.len(), 1, "{id} wet={wet}");
+                assert_eq!(drops[0].stack.id(), id, "wet={wet}");
+                assert_eq!(drops[0].stack.count(), 1, "{id} wet={wet}");
+                assert_eq!(
+                    session
+                        .inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage"),
+                    Some(&Tag::Int(1)),
+                    "{id} wet={wet}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stair_breaking_with_missing_loot_or_wrong_tool_preserves_correct_state() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for (tool, creative, wet, expected) in [
+            (
+                "minecraft:iron_pickaxe",
+                false,
+                true,
+                "minecraft:stone_stairs",
+            ),
+            ("minecraft:wooden_axe", false, true, "minecraft:water"),
+            ("minecraft:iron_pickaxe", true, true, "minecraft:water"),
+        ] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:water".into(),
+                "minecraft:stone_stairs".into(),
+            ])));
+            if creative {
+                session.set_game_mode(GameMode::Creative);
+            }
+            let stack = ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![])).unwrap();
+            Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(stack));
+            let pos = IVec3::new(4, 2, 4);
+            let block = session.intern_block(state(
+                "minecraft:stone_stairs",
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("shape", "straight"),
+                    ("waterlogged", if wet { "true" } else { "false" }),
+                ],
+            ));
+            session.set_with_notify(pos, block, false);
+            session.finish_breaking(session.origin + pos);
+            assert_eq!(
+                session
+                    .world
+                    .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                    .unwrap()
+                    .name,
+                expected,
+                "{tool} creative={creative}"
+            );
+            assert!(session.dropped_items.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn stair_breaking_supplies_original_state_to_data_pack_loot() {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/oak_stairs.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond","condition":{"type":"minecraft:match_block","blocks":"minecraft:oak_stairs","state":{"shape":"inner_left"}}}]}]}"#.to_vec()))
+            }
+        }
+        for shape in ["straight", "inner_left"] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:oak_stairs".into(),
+            ])));
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+            let pos = IVec3::new(4, 2, 4);
+            let block = session.intern_block(state(
+                "minecraft:oak_stairs",
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("shape", shape),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            session.set_with_notify(pos, block, false);
+            session.finish_breaking(session.origin + pos);
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), usize::from(shape == "inner_left"));
+            if let Some(drop) = drops.first() {
+                assert_eq!(drop.stack.id(), "minecraft:diamond");
+            }
+        }
+    }
+
+    #[test]
+    fn stair_break_waits_when_another_loot_branch_is_unsupported() {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/oak_stairs.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:diamond"},{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:location_check","predicate":{}}}]}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:oak_stairs".into(),
+        ])));
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        let pos = IVec3::new(4, 2, 4);
+        let block = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        session.set_with_notify(pos, block, false);
+        session.finish_breaking(session.origin + pos);
+        assert!(
+            matches!(cell(&session.world,session.origin,session.bounds,pos,session.states[0]),Cell::State(id) if id==block)
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+    }
+
+    #[test]
+    fn held_stair_mining_uses_fixed_ticks_and_tool_progress() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for split_frames in [false, true] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:stone".into(),
+                "minecraft:oak_stairs".into(),
+            ])));
+            session.set_block_drops(false);
+            let tool =
+                ItemStack::new("minecraft:iron_axe".into(), 1, 1, Tag::Compound(vec![])).unwrap();
+            Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool));
+            let pos = IVec3::new(8, 2, 6);
+            let stair = session.intern_block(state(
+                "minecraft:oak_stairs",
+                &[
+                    ("facing", "south"),
+                    ("half", "top"),
+                    ("shape", "straight"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            session.set_with_notify(pos, stair, false);
+            session.update(TICK * 3);
+            assert!(session.player.on_ground);
+            session.submit_command(PlayerCommand::Break);
+            for tick in 1..=10 {
+                if split_frames {
+                    session.update(TICK / 2);
+                    session.update(TICK / 2);
+                } else {
+                    session.update(TICK);
+                }
+                let after = session
+                    .world
+                    .block(session.origin.x + pos.x, pos.y, session.origin.z + pos.z)
+                    .unwrap();
+                assert_eq!(
+                    after.name,
+                    if tick == 10 {
+                        "minecraft:air"
+                    } else {
+                        "minecraft:oak_stairs"
+                    },
+                    "tick={tick} split={split_frames}"
+                );
+            }
+            assert_eq!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .components()
+                    .get("minecraft:damage"),
+                Some(&Tag::Int(1))
+            );
         }
     }
 

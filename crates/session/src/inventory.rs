@@ -2385,6 +2385,9 @@ const STACKABLE_ITEMS: &[&str] = &[
 /// Vanilla defaults for ordinary items whose inventory behavior is implemented.
 /// This does not mean their use, placement, tools, or rendering are complete.
 pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
+    if id == "minecraft:shears" {
+        return Some(1);
+    }
     if crate::stair_items::is_stair_item(id) {
         return Some(64);
     }
@@ -2422,6 +2425,9 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
 
 /// Default durability for the ordinary tool families implemented above.
 pub fn ordinary_item_default_durability(id: &str) -> Option<u32> {
+    if id == "minecraft:shears" {
+        return Some(238);
+    }
     if ordinary_item_default_max(id) != Some(1) {
         return None;
     }

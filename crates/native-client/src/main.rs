@@ -874,6 +874,9 @@ fn prepare_existing_world(
         session
             .set_initial_game_time(reader.game_time()?)
             .map_err(anyhow::Error::msg)?;
+        if let Err(error) = session.capture_level_time_source(Arc::clone(&reader.level)) {
+            eprintln!("Level data is not eligible for a save draft: {error:#}");
+        }
         match native_resources::fluid_tags::load_water(&mut resources) {
             Ok(tag) => session.set_farmland_water_tag(Arc::new(tag)),
             Err(error) => eprintln!("Farmland water fluid tag is unavailable: {error:#}"),

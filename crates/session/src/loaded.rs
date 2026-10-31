@@ -141,11 +141,17 @@ pub struct PartialSessionSaveDraft {
     entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
     clocks: WorldClockDraft,
     weather: Option<WeatherSaveDraft>,
+    level_time: Option<LevelTimeSaveDraft>,
 }
 
 struct WeatherSaveDraft {
     source: Option<native_persistence::nbt::NamedTag>,
     weather: native_persistence::world::SavedWeather,
+}
+
+struct LevelTimeSaveDraft {
+    source: Arc<native_persistence::nbt::NamedTag>,
+    time: i64,
 }
 
 /// A partial same-tick snapshot including all recorded POI block transitions.
@@ -223,6 +229,9 @@ impl PartialSessionSaveDraft {
         self.clocks.add_to_save_plan(&mut plan, clock_source)?;
         if let Some(weather) = &self.weather {
             plan.add_weather(weather.source.as_ref(), weather.weather)?;
+        }
+        if let Some(level) = &self.level_time {
+            plan.add_level_time(&level.source, level.time)?;
         }
         for (position, draft) in &self.entity_chunks {
             draft.add_to_save_plan(
@@ -327,6 +336,8 @@ pub struct LoadedSession {
     can_have_weather: Option<bool>,
     advance_weather: bool,
     game_time: i64,
+    initial_game_time_set: bool,
+    level_time_source: Option<Arc<native_persistence::nbt::NamedTag>>,
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
@@ -1714,6 +1725,16 @@ impl LoadedSession {
             } else {
                 None
             },
+            level_time: if self.initial_game_time_set {
+                Some(LevelTimeSaveDraft {
+                    source: Arc::clone(self.level_time_source.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("level time source was not captured at session start")
+                    })?),
+                    time: self.game_time,
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -2930,7 +2951,31 @@ impl LoadedSession {
             return Err("game time must be restored before simulation begins");
         }
         self.game_time = value;
+        self.initial_game_time_set = true;
+        self.level_time_source = None;
         Arc::make_mut(&mut self.snapshot).game_time = value;
+        Ok(())
+    }
+
+    /// Capture the original level.dat document before advancing the session.
+    pub fn capture_level_time_source(
+        &mut self,
+        source: Arc<native_persistence::nbt::NamedTag>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "level source must be captured before simulation begins"
+        );
+        anyhow::ensure!(
+            self.initial_game_time_set && self.level_time_source.is_none(),
+            "initial level time is not ready or source was already captured"
+        );
+        let time = native_persistence::world::WorldReader::validate_level_game_time(&source)?;
+        anyhow::ensure!(
+            time == self.game_time,
+            "level source differs from the initialized time"
+        );
+        self.level_time_source = Some(source);
         Ok(())
     }
 
@@ -3231,6 +3276,8 @@ impl LoadedSession {
             can_have_weather: None,
             advance_weather: true,
             game_time: 0,
+            initial_game_time_set: false,
+            level_time_source: None,
             biome_climates: None,
             generator_sea_level: None,
             vanilla_block_ids: None,
@@ -24910,6 +24957,38 @@ mod tests {
         );
         session.capture_weather_source(None).unwrap();
         assert!(session.capture_weather_source(None).is_err());
+        let level = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Time".into(), Tag::Long(41)),
+                ]),
+            )]),
+        });
+        session.set_initial_game_time(41).unwrap();
+        assert!(
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &test_heightmap_tags(),
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
+        let wrong_level = Arc::new(WorldReader::update_level_game_time(&level, 42).unwrap());
+        assert!(session.capture_level_time_source(wrong_level).is_err());
+        session
+            .capture_level_time_source(Arc::clone(&level))
+            .unwrap();
+        assert!(
+            session
+                .capture_level_time_source(Arc::clone(&level))
+                .is_err()
+        );
         session.update(TICK);
         let state = session.weather.as_ref().unwrap().data;
         let draft = session
@@ -24924,10 +25003,14 @@ mod tests {
         let weather = draft.weather.as_ref().unwrap();
         assert_eq!(weather.weather, state);
         assert!(weather.source.is_none());
+        let level_draft = draft.level_time.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&level_draft.source, &level));
+        assert_eq!(level_draft.time, 42);
         let plan = draft
             .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
             .unwrap();
         assert!(plan.has_weather());
+        assert!(plan.has_level_time());
         assert!(session.capture_weather_source(None).is_err());
         let mut existing = self::session();
         existing.set_weather(Some(true), Some(SavedWeather::default()), false);

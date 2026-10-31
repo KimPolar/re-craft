@@ -1876,15 +1876,16 @@ fn demo_transform_state(block: Block) -> Option<TransformState> {
     Some(TransformState { name, properties })
 }
 
-/// Only fall through for items whose ordinary use-on-block and use-in-air
-/// both pass. Unknown item components may change either interaction.
+/// Called after supported tool transformations have already had an opportunity
+/// to handle the click. Unknown item components may change either interaction.
 fn placement_input_hand(inventory: &PlayerInventory) -> PlayerSlot {
     let main = PlayerSlot::Storage(inventory.selected());
     if inventory.slot(main).is_none_or(|item| {
         inventory::ordinary_return_supported(item)
             && (item.id() == "minecraft:stick"
                 || item.id().ends_with("_pickaxe")
-                || item.id().ends_with("_sword"))
+                || item.id().ends_with("_sword")
+                || ordinary_tool_kind(item).is_some())
     }) {
         PlayerSlot::Offhand
     } else {
@@ -4762,6 +4763,59 @@ mod tests {
             assert_eq!(
                 after.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
                 off_count
+            );
+        }
+    }
+
+    #[test]
+    fn demo_tools_that_pass_allow_offhand_placement() {
+        use inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+        for (item, kind) in [
+            ("minecraft:wooden_axe", ToolKind::Axe),
+            ("minecraft:stone_shovel", ToolKind::Shovel),
+            ("minecraft:iron_hoe", ToolKind::Hoe),
+        ] {
+            let mut world = World::demo();
+            world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+            let mut session = LocalSession::new(world);
+            session.set_tool_transformers(
+                kind,
+                if kind == ToolKind::Axe {
+                    test_axe_transformer()
+                } else {
+                    test_soil_transformer(kind)
+                },
+            );
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(item.into(), 1, 1, Tag::Compound(vec![]))
+            ));
+            assert!(inventory.set_slot(
+                PlayerSlot::Offhand,
+                ItemStack::new("minecraft:dirt".into(), 2, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            assert_eq!(
+                session
+                    .snapshot()
+                    .world
+                    .demo()
+                    .unwrap()
+                    .block(IVec3::new(0, 4, 4)),
+                Block::Dirt,
+                "{item}"
+            );
+            assert_eq!(
+                session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+                1
+            );
+            assert_eq!(
+                session.first_person.swing.hand(),
+                Some(animation::Hand::Off)
             );
         }
     }

@@ -6531,9 +6531,6 @@ impl LoadedSession {
             name: block.name.clone(),
             properties: block.properties.clone(),
         };
-        if supported_transform_state(&source).is_none() {
-            return false;
-        }
         let Some(face_id) = face_name(face) else {
             return false;
         };
@@ -28112,6 +28109,308 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tools_that_pass_allow_offhand_placement_but_success_takes_priority() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        for (tool, kind) in [
+            ("minecraft:wooden_axe", ToolKind::Axe),
+            ("minecraft:iron_shovel", ToolKind::Shovel),
+            ("minecraft:diamond_hoe", ToolKind::Hoe),
+        ] {
+            for offhand in [
+                "minecraft:stone_bricks",
+                "minecraft:stone_button",
+                "minecraft:snow",
+                "minecraft:snow_block",
+                "minecraft:redstone_block",
+                "minecraft:chest",
+            ] {
+                for mode in [GameMode::Survival, GameMode::Creative] {
+                    let mut session = session();
+                    session.set_game_mode(mode);
+                    session.set_snow_support_tags(fixture_snow_tags(&[], &[]));
+                    session.set_tool_transformers(
+                        kind,
+                        if kind == ToolKind::Axe {
+                            crate::tests::test_axe_transformer()
+                        } else {
+                            crate::tests::test_soil_transformer(kind)
+                        },
+                    );
+                    assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                    let absolute = session.origin + IVec3::new(8, 2, 7);
+                    let chunk = ChunkPos {
+                        x: absolute.x.div_euclid(16),
+                        z: absolute.z.div_euclid(16),
+                    };
+                    Arc::make_mut(&mut session.world)
+                        .saved_block_entities
+                        .insert(chunk, SavedBlockEntities::Empty);
+                    let mut inventory = PlayerInventory::default();
+                    assert!(inventory.set_slot(
+                        PlayerSlot::Storage(0),
+                        ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![]))
+                    ));
+                    assert!(inventory.set_slot(
+                        PlayerSlot::Offhand,
+                        ItemStack::new(offhand.into(), 2, 64, Tag::Compound(vec![]))
+                    ));
+                    session.set_player_inventory(inventory);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    assert_eq!(
+                        session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap()
+                            .name,
+                        offhand,
+                        "{tool} {offhand} {mode:?}"
+                    );
+                    assert_eq!(
+                        session.first_person.swing.hand(),
+                        Some(crate::animation::Hand::Off)
+                    );
+                    assert_eq!(
+                        session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+                        if mode == GameMode::Survival { 1 } else { 2 }
+                    );
+                    assert!(
+                        session
+                            .inventory
+                            .slot(PlayerSlot::Storage(0))
+                            .unwrap()
+                            .components()
+                            .get("minecraft:damage")
+                            .is_none()
+                    );
+                }
+            }
+        }
+        let mut session = session();
+        session.set_axe_transformers(crate::tests::test_axe_transformer());
+        let target = IVec3::new(8, 2, 6);
+        let original = session.intern_block(state("minecraft:oak_log", &[("axis", "y")]));
+        assert!(session.set(target, original));
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:wooden_axe".into(), 1, 1, Tag::Compound(vec![]))
+        ));
+        assert!(inventory.set_slot(
+            PlayerSlot::Offhand,
+            ItemStack::new(
+                "minecraft:stone_bricks".into(),
+                2,
+                64,
+                Tag::Compound(vec![])
+            )
+        ));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let absolute = session.origin + target;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:stripped_poplar_log"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+            2
+        );
+        assert_eq!(
+            session.first_person.swing.hand(),
+            Some(crate::animation::Hand::Main)
+        );
+    }
+
+    #[test]
+    fn data_pack_tool_transform_accepts_other_known_block_states() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let transforms = BlockTransformers::parse(br#"[{"item_damage_per_use":1,"update_from_neighbors":false,"block_state_provider":{"type":"minecraft:rule_based","rules":[{"if_true":{"type":"minecraft:matching_blocks","blocks":"minecraft:snow_block"},"then":{"id":"minecraft:dirt"}}]}}]"#).unwrap();
+        let mut session = session();
+        session.set_axe_transformers(Arc::new(transforms));
+        let pos = IVec3::new(8, 2, 6);
+        let id = session.intern_block(state("minecraft:snow_block", &[]));
+        assert!(session.set(pos, id));
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:wooden_axe".into(), 1, 1, Tag::Compound(vec![]))
+        ));
+        assert!(inventory.set_slot(
+            PlayerSlot::Offhand,
+            ItemStack::new(
+                "minecraft:stone_bricks".into(),
+                2,
+                64,
+                Tag::Compound(vec![])
+            )
+        ));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let absolute = session.origin + pos;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:dirt"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unresolved_tool_transform_does_not_fall_through_to_offhand() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        let transforms = BlockTransformers::parse(br#"[{"block_state_provider":{"type":"minecraft:rule_based","rules":[{"if_true":{"type":"minecraft:matching_blocks","blocks":"minecraft:stone"},"then":{"id":"example:unsupported"}}]}}]"#).unwrap();
+        let mut session = session();
+        session.set_axe_transformers(Arc::new(transforms));
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:wooden_axe".into(), 1, 1, Tag::Compound(vec![]))
+        ));
+        assert!(inventory.set_slot(
+            PlayerSlot::Offhand,
+            ItemStack::new(
+                "minecraft:stone_bricks".into(),
+                2,
+                64,
+                Tag::Compound(vec![])
+            )
+        ));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let target = session.origin + IVec3::new(8, 2, 7);
+        assert_eq!(
+            session
+                .world
+                .block(target.x, target.y, target.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Offhand).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn ordinary_tools_pass_unmatched_blocks_as_in_java() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceStack;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let mut session = session();
+        for kind in [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe] {
+            session.set_tool_transformers(
+                kind,
+                Arc::new(BlockTransformers::load_for(&mut resources, kind).unwrap()),
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ToolPassOracle.java");
+        let output = temp.path().join("passes.json");
+        std::fs::write(&source, include_str!("../tests/java/ToolPassOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ToolPassOracle")
+                .arg(&output)
+                .arg(version.join("26.3.jar")),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "tool oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 7 * 3 * 4 * 6);
+        let target = IVec3::new(4, 8, 4);
+        for row in rows {
+            let id = session.intern_block(state(
+                &format!("minecraft:{}", row["target"].as_str().unwrap()),
+                &[],
+            ));
+            session.set_with_notify(target, id, false);
+            let tool = format!("minecraft:{}", row["tool"].as_str().unwrap());
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(tool, 1, 1, Tag::Compound(vec![]))
+            ));
+            assert!(inventory.set_slot(
+                PlayerSlot::Offhand,
+                ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            let face = match row["face"].as_str().unwrap() {
+                "up" => IVec3::Y,
+                "down" => IVec3::NEG_Y,
+                "east" => IVec3::X,
+                "west" => IVec3::NEG_X,
+                "south" => IVec3::Z,
+                "north" => IVec3::NEG_Z,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                !session.use_tool(target, face),
+                row["passed"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                crate::placement_input_hand(&session.inventory),
+                PlayerSlot::Offhand
+            );
         }
     }
 

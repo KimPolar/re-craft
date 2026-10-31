@@ -62,6 +62,13 @@ public class ItemRegistryOracle {
         && !item.components().has(DataComponents.EQUIPPABLE)
         && !item.components().has(DataComponents.BLOCKS_ATTACKS)
         && !item.components().has(DataComponents.KINETIC_WEAPON));
+      v.addProperty("transformer_only_use", item.getClass().getMethod("useOn",net.minecraft.world.item.context.UseOnContext.class).getDeclaringClass()==Item.class
+        && item.getClass().getMethod("use",net.minecraft.world.level.Level.class,Player.class,net.minecraft.world.InteractionHand.class).getDeclaringClass()==Item.class
+        && item.components().has(DataComponents.BLOCK_TRANSFORMER)
+        && !item.components().has(DataComponents.CONSUMABLE)
+        && !item.components().has(DataComponents.EQUIPPABLE)
+        && !item.components().has(DataComponents.BLOCKS_ATTACKS)
+        && !item.components().has(DataComponents.KINETIC_WEAPON));
       v.addProperty("remainder",item.getCraftingRemainder()!=null);
       String id=BuiltInRegistries.ITEM.getKey(item).toString();
       var initial=new ItemStack(item,1);
@@ -182,6 +189,10 @@ fn implemented_item_defaults_and_click_assumptions_match_vanilla() {
         for kind in ["pickaxe", "sword"] {
             let id = format!("minecraft:{material}_{kind}");
             assert_eq!(result[&id]["passive_use"], true, "{id}");
+        }
+        for kind in ["axe", "shovel", "hoe"] {
+            let id = format!("minecraft:{material}_{kind}");
+            assert_eq!(result[&id]["transformer_only_use"], true, "{id}");
         }
     }
     let mut checked = 0;

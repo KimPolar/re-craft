@@ -3,10 +3,11 @@
 use crate::inventory::{ItemStack, PlayerInventory, PlayerSlot, saved_item_max};
 use native_persistence::nbt::Tag;
 use native_persistence::world::Difficulty;
+use native_resources::packs::ResourceId;
 use std::sync::Arc;
 
-/// Plain foods without effects or a container remainder. Other consumables must
-/// wait until their item components and effects are implemented.
+/// Foods without consumption effects. Known container remainders are handled
+/// separately after the food is consumed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FoodProperties {
     pub nutrition: i32,
@@ -24,7 +25,8 @@ pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
         "carrot" => (3, 0.6),
         "cod" | "salmon" | "cookie" | "sweet_berries" | "glow_berries" => (2, 0.1),
         "cooked_beef" | "cooked_porkchop" => (8, 0.8),
-        "cooked_chicken" => (6, 0.6),
+        "cooked_chicken" | "mushroom_stew" | "beetroot_soup" => (6, 0.6),
+        "rabbit_stew" => (10, 0.6),
         "cooked_mutton" | "cooked_salmon" => (6, 0.8),
         "dried_kelp" => (1, 0.3),
         "golden_carrot" => (6, 1.2),
@@ -102,6 +104,71 @@ pub(crate) fn custom_consumable_ticks(value: &Tag) -> Option<i32> {
     Some((seconds.unwrap_or(1.6_f32) * 20.0) as i32)
 }
 
+/// Decode a use-remainder item template when its stack behavior is known.
+/// Nested remainder patches are refused until component resolution is bounded.
+pub(crate) fn parse_use_remainder(value: &Tag) -> Option<ItemStack> {
+    let (raw_id, count, components) = match value {
+        Tag::String(id) => (String::from_utf16(&id.0).ok()?, 1, Tag::Compound(vec![])),
+        Tag::Compound(fields) => {
+            let (mut id, mut count, mut components) = (None, None, None);
+            for (name, value) in fields {
+                if name.matches("id") && id.is_none() {
+                    let Tag::String(value) = value else {
+                        return None;
+                    };
+                    id = Some(String::from_utf16(&value.0).ok()?);
+                } else if name.matches("count") && count.is_none() {
+                    count = value.as_java_int().filter(|value| (1..=99).contains(value));
+                    count?;
+                } else if name.matches("components") && components.is_none() {
+                    let Tag::Compound(entries) = value else {
+                        return None;
+                    };
+                    if entries.iter().any(|(name, _)| {
+                        name.matches("minecraft:use_remainder")
+                            || name.matches("!minecraft:use_remainder")
+                    }) {
+                        return None;
+                    }
+                    components = Some(value.clone());
+                } else {
+                    return None;
+                }
+            }
+            (
+                id?,
+                count.unwrap_or(1),
+                components.unwrap_or_else(|| Tag::Compound(vec![])),
+            )
+        }
+        _ => return None,
+    };
+    let id = ResourceId::parse(&raw_id).ok()?;
+    let id = format!("{}:{}", id.namespace, id.path);
+    let max = saved_item_max(&id, &components)?;
+    let count = u32::try_from(count).ok()?;
+    if count > max {
+        return None;
+    }
+    ItemStack::new(id, count, max, components)
+}
+
+fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
+    let components = item.components();
+    if components.get("!minecraft:use_remainder").is_some() {
+        return None;
+    }
+    if let Some(template) = components.get("minecraft:use_remainder") {
+        return parse_use_remainder(template);
+    }
+    matches!(
+        item.id(),
+        "minecraft:mushroom_stew" | "minecraft:rabbit_stew" | "minecraft:beetroot_soup"
+    )
+    .then(|| ItemStack::new("minecraft:bowl".into(), 1, 64, Tag::Compound(vec![])))
+    .flatten()
+}
+
 pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
     let components = item.components();
     if components.get("!minecraft:food").is_some()
@@ -142,11 +209,16 @@ pub struct FoodUse {
     active: Option<Eating>,
     held: bool,
     repeat: bool,
+    drops: Vec<ItemStack>,
 }
 
 impl FoodUse {
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(crate) fn take_drops(&mut self) -> Vec<ItemStack> {
+        std::mem::take(&mut self.drops)
     }
 
     pub fn visual_state(&self) -> Option<crate::animation::ItemUseState> {
@@ -192,7 +264,7 @@ impl FoodUse {
             && (vitals.food < 20 || food.can_always_eat || mode == crate::GameMode::Creative)
         {
             if food.use_ticks == 0 {
-                Self::finish(inventory, vitals, mode, hand, food);
+                self.finish(inventory, vitals, mode, hand, food);
             } else {
                 self.active = Some(Eating {
                     hand,
@@ -257,22 +329,38 @@ impl FoodUse {
         if active.remaining != 0 {
             return;
         }
-        Self::finish(inventory, vitals, mode, active.hand, active.food);
-        self.active = None;
+        let active = self.active.take().expect("active use exists");
+        self.finish(inventory, vitals, mode, active.hand, active.food);
         self.repeat = self.held;
     }
 
     fn finish(
+        &mut self,
         inventory: &mut Arc<PlayerInventory>,
         vitals: &mut PlayerVitals,
         mode: crate::GameMode,
         hand: PlayerSlot,
         food: FoodProperties,
     ) {
+        let remainder = inventory.slot(hand).and_then(food_remainder);
         if mode == crate::GameMode::Creative || Arc::make_mut(inventory).consume_held(hand) {
             vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
             vitals.saturation =
                 (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
+            if mode != crate::GameMode::Creative
+                && let Some(remainder) = remainder
+            {
+                let inventory = Arc::make_mut(inventory);
+                if inventory.slot(hand).is_none() {
+                    inventory.set_slot(hand, Some(remainder));
+                } else {
+                    let mut rest = Some(remainder);
+                    inventory.pickup_stack(&mut rest, false);
+                    if let Some(rest) = rest {
+                        self.drops.push(rest);
+                    }
+                }
+            }
         }
     }
 }
@@ -998,6 +1086,155 @@ mod tests {
     }
 
     #[test]
+    fn stew_returns_bowl_to_the_used_hand_unless_remainder_was_removed() {
+        for removed in [false, true] {
+            let components = if removed {
+                Tag::Compound(vec![(
+                    "!minecraft:use_remainder".into(),
+                    Tag::Compound(vec![]),
+                )])
+            } else {
+                Tag::Compound(vec![])
+            };
+            let stew = ItemStack::new("minecraft:mushroom_stew".into(), 1, 1, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Offhand, Some(stew));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                saturation: 0.0,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            assert!(usage.start_hand(
+                &mut inventory,
+                PlayerSlot::Offhand,
+                &mut vitals,
+                GameMode::Survival
+            ));
+            for _ in 0..32 {
+                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+            }
+            assert_eq!(vitals.food, 16);
+            assert_eq!(
+                inventory.slot(PlayerSlot::Offhand).map(ItemStack::id),
+                (!removed).then_some("minecraft:bowl")
+            );
+            assert!(usage.take_drops().is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_remainder_is_returned_or_dropped_when_inventory_is_full() {
+        for full in [false, true] {
+            let components = Tag::Compound(vec![
+                (
+                    "minecraft:consumable".into(),
+                    Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.0))]),
+                ),
+                (
+                    "minecraft:use_remainder".into(),
+                    Tag::String("minecraft:bowl".into()),
+                ),
+            ]);
+            let mut inventory = PlayerInventory::default();
+            if full {
+                for slot in 1..36 {
+                    inventory.set_slot(
+                        PlayerSlot::Storage(slot),
+                        ItemStack::new("minecraft:dirt".into(), 64, 64, Tag::Compound(vec![])),
+                    );
+                }
+            }
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:apple".into(), 2, 64, components),
+            );
+            let mut session = LocalSession::demo();
+            session.set_player_inventory(inventory);
+            session.set_player_vitals(PlayerVitals {
+                food: 10,
+                saturation: 0.0,
+                ..Default::default()
+            });
+            session.submit_command(PlayerCommand::Place);
+            session.update(Duration::from_millis(50));
+            let result = session.snapshot();
+            assert_eq!(
+                result
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                result
+                    .inventory
+                    .slot(PlayerSlot::Storage(1))
+                    .map(ItemStack::id),
+                Some(if full {
+                    "minecraft:dirt"
+                } else {
+                    "minecraft:bowl"
+                })
+            );
+            assert_eq!(result.dropped_items.len(), usize::from(full));
+            if full {
+                assert_eq!(result.dropped_items[0].stack.id(), "minecraft:bowl");
+            }
+        }
+    }
+
+    #[test]
+    fn remainder_merges_available_space_and_drops_only_the_rest() {
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:consumable".into(),
+                Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.0))]),
+            ),
+            (
+                "minecraft:use_remainder".into(),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:bowl".into())),
+                    ("count".into(), Tag::Int(3)),
+                ]),
+            ),
+        ]);
+        let mut inventory = PlayerInventory::default();
+        for slot in 1..36 {
+            inventory.set_slot(
+                PlayerSlot::Storage(slot),
+                ItemStack::new("minecraft:dirt".into(), 64, 64, Tag::Compound(vec![])),
+            );
+        }
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 2, 64, components),
+        );
+        inventory.set_slot(
+            PlayerSlot::Storage(1),
+            ItemStack::new("minecraft:bowl".into(), 63, 64, Tag::Compound(vec![])),
+        );
+        let mut inventory = Arc::new(inventory);
+        let mut vitals = PlayerVitals {
+            food: 10,
+            ..Default::default()
+        };
+        let mut usage = FoodUse::default();
+        assert!(usage.start_hand(
+            &mut inventory,
+            PlayerSlot::Storage(0),
+            &mut vitals,
+            GameMode::Survival
+        ));
+        assert_eq!(inventory.slot(PlayerSlot::Storage(1)).unwrap().count(), 64);
+        let drops = usage.take_drops();
+        assert_eq!(drops.len(), 1);
+        assert_eq!((drops[0].id(), drops[0].count()), ("minecraft:bowl", 2));
+    }
+
+    #[test]
     fn nonfood_item_requires_both_custom_components() {
         let food = Tag::Compound(vec![
             ("nutrition".into(), Tag::Int(3)),
@@ -1185,6 +1422,57 @@ mod tests {
                 Some(row["ticks"].as_i64().unwrap() as i32),
                 "{row}"
             );
+        }
+        for row in result["remainders"].as_array().unwrap() {
+            let template = if row["template_count"].as_i64().unwrap() == 1 {
+                Tag::String("minecraft:bowl".into())
+            } else {
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:bowl".into())),
+                    ("count".into(), Tag::Int(3)),
+                ])
+            };
+            let components = Tag::Compound(vec![
+                (
+                    "minecraft:consumable".into(),
+                    Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.0))]),
+                ),
+                ("minecraft:use_remainder".into(), template),
+            ]);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:apple".into(),
+                    row["before"].as_u64().unwrap() as u32,
+                    64,
+                    components,
+                ),
+            );
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 10,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            let mode = if row["creative"].as_bool().unwrap() {
+                GameMode::Creative
+            } else {
+                GameMode::Survival
+            };
+            assert!(usage.start_hand(&mut inventory, PlayerSlot::Storage(0), &mut vitals, mode));
+            let hand = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+            assert_eq!(hand.id(), row["hand_id"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                hand.count(),
+                row["hand_count"].as_u64().unwrap() as u32,
+                "{row}"
+            );
+            let extra = inventory
+                .slot(PlayerSlot::Storage(1))
+                .map_or(0, ItemStack::count);
+            assert_eq!(extra, row["extra_count"].as_u64().unwrap() as u32, "{row}");
+            assert!(usage.take_drops().is_empty());
         }
     }
 

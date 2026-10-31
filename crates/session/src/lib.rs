@@ -465,6 +465,18 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
+    fn spawn_food_remainders(&mut self) {
+        for stack in self.food_use.take_drops() {
+            self.dropped_items.drop_player(
+                stack,
+                IVec3::ZERO,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+    }
+
     /// Drain one-shot pickup sounds in simulated order after updating.
     pub fn take_pickup_sounds(&mut self) -> Vec<PickupSound> {
         self.pickup_sounds.drain(..).collect()
@@ -1254,6 +1266,7 @@ impl LocalSession {
                 }
                 PlayerCommand::Place => {}
             }
+            self.spawn_food_remainders();
             update_recipe_unlocks(
                 &mut self.inventory,
                 &before_inventory,
@@ -1289,6 +1302,7 @@ impl LocalSession {
         }
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
+        self.spawn_food_remainders();
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
@@ -1510,6 +1524,7 @@ impl LocalSession {
         if self.death.is_none() {
             self.food_use
                 .tick(&mut self.inventory, &mut self.vitals, self.game_mode);
+            self.spawn_food_remainders();
         }
         self.selected_block = selected_inventory_block(&self.inventory);
         self.first_person.item_use = self.food_use.visual_state();

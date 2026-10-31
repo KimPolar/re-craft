@@ -273,14 +273,21 @@ fn food_ticks_match_vanilla_with_mocked_damage() {
         );
         assert_eq!(
             food.use_ticks,
-            properties["ticks"].as_u64().unwrap() as u8,
+            properties["ticks"].as_i64().unwrap() as i32,
             "{id}"
         );
         assert_eq!(properties["always"], false, "{id}");
         assert_eq!(properties["effects"], 0, "{id}");
-        assert_eq!(properties["remainder"], false, "{id}");
+        assert_eq!(
+            properties["remainder"].as_bool().unwrap(),
+            matches!(
+                id.as_str(),
+                "minecraft:mushroom_stew" | "minecraft:rabbit_stew" | "minecraft:beetroot_soup"
+            ),
+            "{id}"
+        );
     }
-    assert_eq!(tested_foods, 27);
+    assert_eq!(tested_foods, 30);
     let results: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     for (case, ticks) in cases.iter().zip(results.as_array().unwrap()) {
         let difficulty = match case["difficulty"].as_str().unwrap() {

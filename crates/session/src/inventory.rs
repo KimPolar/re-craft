@@ -2453,7 +2453,13 @@ const STACKABLE_ITEMS: &[&str] = &[
 /// Vanilla defaults for ordinary items whose inventory behavior is implemented.
 /// This does not mean their use, placement, tools, or rendering are complete.
 pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
-    if id == "minecraft:shears" {
+    if matches!(
+        id,
+        "minecraft:shears"
+            | "minecraft:mushroom_stew"
+            | "minecraft:rabbit_stew"
+            | "minecraft:beetroot_soup"
+    ) {
         return Some(1);
     }
     if crate::stair_items::is_stair_item(id) {
@@ -2588,6 +2594,17 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             8192
+        } else if name.matches("minecraft:use_remainder") {
+            // Generic block and tool uses do not yet apply use-remainder side
+            // effects, so only resolve items whose ordinary use is handled as food.
+            crate::survival::ordinary_food(id)?;
+            crate::survival::parse_use_remainder(value)?;
+            16384
+        } else if name.matches("!minecraft:use_remainder") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            32768
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {
@@ -2630,7 +2647,7 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
     if seen & 768 == 768 {
         return None;
     }
-    if seen & 3072 == 3072 || seen & 12288 == 12288 {
+    if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

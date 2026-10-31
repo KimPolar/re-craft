@@ -705,6 +705,18 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
+    fn spawn_food_remainders(&mut self) {
+        for stack in self.food_use.take_drops() {
+            self.dropped_items.drop_player(
+                stack,
+                self.origin,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+    }
+
     /// Drain one-shot pickup sounds in simulated order after updating.
     pub fn take_pickup_sounds(&mut self) -> Vec<crate::PickupSound> {
         self.pickup_sounds.drain(..).collect()
@@ -10320,6 +10332,7 @@ impl LoadedSession {
                 }
                 PlayerCommand::Place => {}
             }
+            self.spawn_food_remainders();
             self.collect_closed_chest();
             update_recipe_unlocks(
                 &mut self.inventory,
@@ -10356,6 +10369,7 @@ impl LoadedSession {
         self.tick_lodestone_compasses();
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
+        self.spawn_food_remainders();
         // baseTick reads the previous equipment attributes before detecting changes.
         let breathing_oxygen = self.oxygen_bonus;
         let breathing_oxygen_valid = self.oxygen_valid;
@@ -11026,6 +11040,7 @@ impl LoadedSession {
         if self.death.is_none() {
             self.food_use
                 .tick(&mut self.inventory, &mut self.vitals, self.game_mode);
+            self.spawn_food_remainders();
         }
         self.selected = selected_inventory_block(&self.inventory);
         self.first_person.item_use = self.food_use.visual_state();
@@ -27227,6 +27242,52 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn saved_world_drops_food_remainder_when_inventory_is_full() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        for slot in 1..36 {
+            inventory.set_slot(
+                PlayerSlot::Storage(slot),
+                ItemStack::new("minecraft:dirt".into(), 64, 64, Tag::Compound(vec![])),
+            );
+        }
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:consumable".into(),
+                Tag::Compound(vec![("consume_seconds".into(), Tag::Float(0.0))]),
+            ),
+            (
+                "minecraft:use_remainder".into(),
+                Tag::String("minecraft:bowl".into()),
+            ),
+        ]);
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 2, 64, components),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let result = session.snapshot();
+        assert_eq!(
+            result
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(result.dropped_items.len(), 1);
+        assert_eq!(result.dropped_items[0].stack.id(), "minecraft:bowl");
     }
 
     #[test]

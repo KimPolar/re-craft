@@ -6,7 +6,9 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use native_core::{
-    normal_noise::{LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, XoroshiroNoiseFactory},
+    normal_noise::{
+        LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
+    },
     random::{LegacyRandom, XoroshiroRandom},
 };
 use serde_json::Value;
@@ -71,6 +73,12 @@ impl SurfaceRandom {
             Self::Xoroshiro(r) => r.next_float(),
         }
     }
+    pub fn next_double(&mut self) -> f64 {
+        match self {
+            Self::Legacy(r) => r.next_double(),
+            Self::Xoroshiro(r) => r.next_double(),
+        }
+    }
 }
 
 enum PositionalFactory {
@@ -116,6 +124,122 @@ impl SurfaceRandomFactory {
             PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.at(x, y, z)),
             PositionalFactory::Xoroshiro(factory) => SurfaceRandom::Xoroshiro(factory.at(x, y, z)),
         }
+    }
+    /// MaterialSystem surface depth uses the root factory directly.
+    pub fn root_at(&self, x: i32, y: i32, z: i32) -> SurfaceRandom {
+        match &self.root {
+            PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.at(x, y, z)),
+            PositionalFactory::Xoroshiro(factory) => SurfaceRandom::Xoroshiro(factory.at(x, y, z)),
+        }
+    }
+}
+
+struct SurfaceNoiseEntry {
+    noise: NormalNoise,
+    last_2d: Option<(i32, i32, f32)>,
+    last_3d: Option<(i32, i32, i32, f32)>,
+}
+
+/// Preloaded material noises and the root positional RNG for one world seed.
+pub struct SurfaceNoise {
+    noises: BTreeMap<ResourceId, SurfaceNoiseEntry>,
+    random: SurfaceRandomFactory,
+    surface_id: ResourceId,
+    secondary_id: ResourceId,
+}
+impl SurfaceNoise {
+    /// Load active data-pack definitions before borrowing the provider for density sampling.
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        names: impl IntoIterator<Item = ResourceId>,
+    ) -> Result<Self> {
+        let mut required: BTreeSet<_> = names.into_iter().collect();
+        let surface_id = ResourceId::parse("minecraft:surface")?;
+        let secondary_id = ResourceId::parse("minecraft:surface_secondary")?;
+        required.insert(surface_id.clone());
+        required.insert(secondary_id.clone());
+        let random = SurfaceRandomFactory::new(seed, algorithm);
+        let mut noises = BTreeMap::new();
+        for id in required {
+            let name = format!("{}:{}", id.namespace, id.path);
+            let parameters = crate::noise::load_normal_noise(provider, &name)?;
+            let noise = match &random.root {
+                PositionalFactory::Legacy(root) => parameters.create(&mut root.random_for(&name)),
+                PositionalFactory::Xoroshiro(root) => {
+                    parameters.create(&mut root.random_for(&name))
+                }
+            }
+            .map_err(anyhow::Error::msg)?;
+            noises.insert(
+                id,
+                SurfaceNoiseEntry {
+                    noise,
+                    last_2d: None,
+                    last_3d: None,
+                },
+            );
+        }
+        Ok(Self {
+            noises,
+            random,
+            surface_id,
+            secondary_id,
+        })
+    }
+    pub fn sample(
+        &mut self,
+        name: &ResourceId,
+        is_3d: bool,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<f32> {
+        let entry = self.noises.get_mut(name).with_context(|| {
+            format!(
+                "material noise not loaded: {}:{}",
+                name.namespace, name.path
+            )
+        })?;
+        Ok(sample_surface_noise(entry, is_3d, x, y, z))
+    }
+    pub fn surface_depth(&mut self, x: i32, z: i32) -> Result<i32> {
+        let entry = self
+            .noises
+            .get_mut(&self.surface_id)
+            .expect("surface noise is loaded");
+        let noise = f64::from(sample_surface_noise(entry, false, x, 0, z));
+        let random = self.random.root_at(x, 0, z).next_double();
+        Ok((noise * 2.75 + 3.0 + random * 0.25) as i32)
+    }
+    pub fn surface_secondary(&mut self, x: i32, z: i32) -> Result<f64> {
+        let entry = self
+            .noises
+            .get_mut(&self.secondary_id)
+            .expect("secondary surface noise is loaded");
+        Ok(f64::from(sample_surface_noise(entry, false, x, 0, z)))
+    }
+}
+fn sample_surface_noise(entry: &mut SurfaceNoiseEntry, is_3d: bool, x: i32, y: i32, z: i32) -> f32 {
+    if is_3d {
+        if let Some((cx, cy, cz, value)) = entry.last_3d {
+            if (cx, cy, cz) == (x, y, z) {
+                return value;
+            }
+        }
+        let value = entry.noise.sample(f64::from(x), f64::from(y), f64::from(z));
+        entry.last_3d = Some((x, y, z, value));
+        value
+    } else {
+        if let Some((cx, cz, value)) = entry.last_2d {
+            if (cx, cz) == (x, z) {
+                return value;
+            }
+        }
+        let value = entry.noise.sample(f64::from(x), 0.0, f64::from(z));
+        entry.last_2d = Some((x, z, value));
+        value
     }
 }
 
@@ -294,6 +418,15 @@ enum Condition {
     Not(Arc<Condition>),
 }
 impl Condition {
+    fn collect_noises(&self, out: &mut BTreeSet<ResourceId>) {
+        match self {
+            Self::Noise { name, .. } => {
+                out.insert(name.clone());
+            }
+            Self::Not(inner) => inner.collect_noises(out),
+            _ => {}
+        }
+    }
     fn test(&self, p: &SurfacePosition, inputs: &mut impl SurfaceInputs) -> Result<bool> {
         Ok(match self {
             Self::Biome(selector) => inputs.biome_matches(selector, p)?,
@@ -390,6 +523,20 @@ struct OreVein {
     gap: Value,
 }
 impl RuleNode {
+    fn collect_noises(&self, out: &mut BTreeSet<ResourceId>) {
+        match self {
+            Self::Sequence(rules) => {
+                for rule in rules {
+                    rule.collect_noises(out)
+                }
+            }
+            Self::Conditional(condition, rule) => {
+                condition.collect_noises(out);
+                rule.collect_noises(out);
+            }
+            _ => {}
+        }
+    }
     fn apply(
         &self,
         p: &SurfacePosition,
@@ -438,6 +585,12 @@ impl RuleNode {
 
 pub struct SurfaceRule(Arc<RuleNode>);
 impl SurfaceRule {
+    /// Registry noise names used by noise-threshold conditions in this rule tree.
+    pub fn noise_dependencies(&self) -> BTreeSet<ResourceId> {
+        let mut result = BTreeSet::new();
+        self.0.collect_noises(&mut result);
+        result
+    }
     pub fn evaluate(
         &self,
         position: &SurfacePosition,
@@ -754,6 +907,11 @@ mod tests {
         );
         assert!(compiler.compile(&json!("minecraft:cycle")).is_err());
         assert!(compiler.compile(&json!({"type":"other:unknown"})).is_err());
+        let noisy=compiler.compile(&json!({"type":"condition","if_true":{"type":"not","invert":{"type":"noise_threshold","noise":"example:test","min_threshold":0,"max_threshold":1}},"then_run":{"type":"block","result_state":"stone"}})).unwrap();
+        assert_eq!(
+            noisy.noise_dependencies(),
+            BTreeSet::from([ResourceId::parse("example:test").unwrap()])
+        );
     }
 
     #[test]
@@ -861,6 +1019,53 @@ mod tests {
         assert_eq!(
             outside.to_bits(),
             sampler.sample(&def, false, 20, 5, 20).unwrap().to_bits()
+        );
+    }
+
+    #[test]
+    fn surface_noise_caches_2d_and_requires_definitions() {
+        let params = br#"{"base_octave":-4}"#.to_vec();
+        let mut data = Data(BTreeMap::from([
+            (
+                "data/minecraft/worldgen/noise/surface.json".into(),
+                params.clone(),
+            ),
+            (
+                "data/minecraft/worldgen/noise/surface_secondary.json".into(),
+                params.clone(),
+            ),
+            ("data/example/worldgen/noise/test.json".into(), params),
+        ]));
+        let id = ResourceId::parse("example:test").unwrap();
+        let mut noise =
+            SurfaceNoise::load(&mut data, 42, WorldgenRandom::Xoroshiro, [id.clone()]).unwrap();
+        let first = noise.sample(&id, false, -17, 9, 23).unwrap();
+        assert_eq!(
+            first.to_bits(),
+            noise.sample(&id, false, -17, 100, 23).unwrap().to_bits()
+        );
+        assert_eq!(noise.noises[&id].last_2d, Some((-17, 23, first)));
+        noise.sample(&id, true, -17, 9, 23).unwrap();
+        assert!(noise.noises[&id].last_3d.is_some());
+        assert!(
+            noise
+                .sample(
+                    &ResourceId::parse("example:missing").unwrap(),
+                    false,
+                    0,
+                    0,
+                    0
+                )
+                .is_err()
+        );
+        assert!(
+            SurfaceNoise::load(
+                &mut data,
+                42,
+                WorldgenRandom::Legacy,
+                [ResourceId::parse("example:missing").unwrap()]
+            )
+            .is_err()
         );
     }
 }

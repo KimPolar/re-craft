@@ -34,7 +34,7 @@ public class FarmlandRandomOracle {
         Matcher(World world, BlockPos from, BlockPos to) { super(world); this.world=world; this.from=from; this.to=to; }
         @Override protected boolean anyMatched(Predicate<BlockState> p) {
             BlockPos s=world.source;
-            return s.getX()>=from.getX() && s.getX()<=to.getX() && s.getY()>=from.getY() && s.getY()<=to.getY() && s.getZ()>=from.getZ() && s.getZ()<=to.getZ() && p.test(world.fluidBlock);
+            return p.test(Blocks.AIR.defaultBlockState()) || (s.getX()>=from.getX() && s.getX()<=to.getX() && s.getY()>=from.getY() && s.getY()<=to.getY() && s.getZ()>=from.getZ() && s.getZ()<=to.getZ() && p.test(world.fluidBlock));
         }
         @Override public boolean atLeastMatched(int count) { throw new UnsupportedOperationException(); }
         @Override public void forEach(BiConsumer<BlockPos,BlockState> callback) { throw new UnsupportedOperationException(); }
@@ -49,14 +49,17 @@ public class FarmlandRandomOracle {
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class); bind.setAccessible(true);
-        bind.invoke(Fluids.WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
-        bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
         bind.invoke(Blocks.WHEAT.builtInRegistryHolder(),List.of(BlockTags.MAINTAINS_FARMLAND));
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true);
         var unsafe=(sun.misc.Unsafe)f.get(null);
         var world=(World)unsafe.allocateInstance(World.class);
         var farmland=(Farmland)unsafe.allocateInstance(Farmland.class); var rows=new JsonArray();
         int[][] offsets={{-5,0,0},{-4,0,-4},{4,1,4},{5,0,0},{0,-1,1},{0,2,1},{1,0,0}};
+        for(int tag=0;tag<6;tag++) {
+        bind.invoke(Fluids.WATER.builtInRegistryHolder(),tag==0 || tag==1 ? List.of(FluidTags.WATER) : List.of());
+        bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),tag==0 || tag==2 ? List.of(FluidTags.WATER) : List.of());
+        bind.invoke(Fluids.EMPTY.builtInRegistryHolder(),tag==3 ? List.of(FluidTags.WATER) : List.of());
+        bind.invoke(Fluids.LAVA.builtInRegistryHolder(),tag==4 ? List.of(FluidTags.WATER) : List.of());
         for(int moisture=0;moisture<=7;moisture++) for(var offset:offsets) for(int fluid=0;fluid<4;fluid++)
         for(boolean rain:new boolean[]{false,true}) for(boolean maintain:new boolean[]{false,true}) {
             world.source=new BlockPos(offset[0],offset[1],offset[2]);
@@ -71,7 +74,8 @@ public class FarmlandRandomOracle {
             var row=new JsonArray(); row.add(moisture); row.add(offset[0]); row.add(offset[1]); row.add(offset[2]);
             row.add(fluid); row.add(rain); row.add(maintain);
             row.add(farmland.dirt ? -1 : world.written == null ? moisture : world.written.getValue(FarmlandBlock.MOISTURE));
-            row.add(world.flags); rows.add(row);
+            row.add(world.flags); row.add(tag); rows.add(row);
+        }
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

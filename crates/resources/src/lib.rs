@@ -18,6 +18,7 @@ pub mod datapacks;
 pub mod enchantments;
 pub mod entity_collision;
 pub mod fluid_environment;
+pub mod fluid_tags;
 pub mod geometry;
 pub mod heightmap_tags;
 pub mod item_registry;

@@ -173,6 +173,16 @@ fn pack_selection_and_resources_match_vanilla() {
         "data/example/worldgen/biome/custom.json",
         br##"{"has_precipitation":true,"temperature":0.8,"downfall":0.4,"effects":{"water_color":"#123456","grass_color":"#abcdef"},"carvers":[],"features":[]}"##,
     );
+    write_file(
+        &packs.join("alpha"),
+        "data/minecraft/tags/fluid/water.json",
+        br##"{"replace":true,"values":["#example:hot"]}"##,
+    );
+    write_file(
+        &packs.join("alpha"),
+        "data/example/tags/fluid/hot.json",
+        br#"{"values":["minecraft:lava"]}"#,
+    );
     folder_pack(&packs, "disabled", "", &[("disabled", "disabled")]);
     folder_pack(
         &packs,
@@ -292,7 +302,11 @@ fn pack_selection_and_resources_match_vanilla() {
                     .unwrap()
                     .unwrap();
             assert_eq!(biome.water, 0x123456);
-            assert_eq!(biome.grass(), 0xabcdef);
+            assert_eq!(biome.grass_at(0, 0), 0xabcdef);
+            assert_eq!(
+                native_resources::fluid_tags::load_water(&mut stack).unwrap(),
+                std::collections::BTreeSet::from(["minecraft:lava".to_owned()])
+            );
         }
         expected.push(format!(
             "S {index} {}",

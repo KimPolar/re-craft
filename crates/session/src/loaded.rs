@@ -312,6 +312,7 @@ pub struct LoadedSession {
     soil_deferred_revision: Option<u64>,
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
+    farmland_water_tag: Option<u8>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
@@ -2801,6 +2802,22 @@ impl LoadedSession {
         self.soil_deferred_revision = None;
     }
 
+    pub fn set_farmland_water_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        let bits = [
+            "minecraft:empty",
+            "minecraft:water",
+            "minecraft:flowing_water",
+            "minecraft:lava",
+            "minecraft:flowing_lava",
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(0_u8, |bits, (index, name)| {
+            bits | (u8::from(tag.contains(name)) << index)
+        });
+        self.farmland_water_tag = Some(bits);
+    }
+
     pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
         self.vanilla_block_ids = Some(ids);
         self.soil_deferred_revision = None;
@@ -3026,6 +3043,7 @@ impl LoadedSession {
             soil_deferred_revision: None,
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
+            farmland_water_tag: None,
             vanilla_block_ids: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
@@ -7872,6 +7890,12 @@ impl LoadedSession {
     }
 
     fn farmland_near_water(&self, relative: IVec3) -> bool {
+        let Some(tag) = self.farmland_water_tag else {
+            return false;
+        };
+        if tag == 0 {
+            return false;
+        }
         for dy in 0..=1 {
             for dz in -4..=4 {
                 for dx in -4..=4 {
@@ -7891,11 +7915,8 @@ impl LoadedSession {
                         position,
                         self.states[0],
                     ) && self
-                        .fluids
-                        .get(id.0 as usize)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+                        .farmland_fluid_bit(id, tag & 1 != 0)
+                        .is_some_and(|fluid| tag & fluid != 0)
                     {
                         return true;
                     }
@@ -7903,6 +7924,53 @@ impl LoadedSession {
             }
         }
         false
+    }
+
+    fn farmland_fluid_bit(&self, id: BlockStateId, include_empty: bool) -> Option<u8> {
+        let fluid = self.fluids.get(id.0 as usize)?;
+        match fluid {
+            Some(FluidState {
+                kind: FluidKind::Water,
+                source: true,
+                ..
+            }) => Some(1 << 1),
+            Some(FluidState {
+                kind: FluidKind::Water,
+                source: false,
+                ..
+            }) => Some(1 << 2),
+            Some(FluidState {
+                kind: FluidKind::Lava,
+                source: true,
+                ..
+            }) => Some(1 << 3),
+            Some(FluidState {
+                kind: FluidKind::Lava,
+                source: false,
+                ..
+            }) => Some(1 << 4),
+            None => {
+                if !include_empty {
+                    return None;
+                }
+                let state = self.world.state(id)?;
+                if state
+                    .properties
+                    .get("waterlogged")
+                    .is_some_and(|value| value != "true" && value != "false")
+                {
+                    return None;
+                }
+                let known = matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ) || self
+                    .vanilla_block_ids
+                    .as_ref()
+                    .is_some_and(|registry| registry.contains(&state.name));
+                (known && FluidState::from_block(state).is_ok()).then_some(1)
+            }
+        }
     }
 
     fn farmland_can_hydrate_in_section(
@@ -13307,6 +13375,10 @@ mod tests {
         session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
+        session.set_farmland_water_tag(Arc::new(BTreeSet::from([
+            "minecraft:water".into(),
+            "minecraft:flowing_water".into(),
+        ])));
         session
     }
 
@@ -13364,6 +13436,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn farmland_respects_active_fluid_tag_including_flowing_lava_and_empty() {
+        for (tag, block, expected) in [
+            (
+                vec!["minecraft:water"],
+                state("minecraft:water", &[("level", "0")]),
+                true,
+            ),
+            (
+                vec!["minecraft:water"],
+                state("minecraft:water", &[("level", "1")]),
+                false,
+            ),
+            (
+                vec!["minecraft:flowing_water"],
+                state("minecraft:water", &[("level", "8")]),
+                true,
+            ),
+            (
+                vec!["minecraft:flowing_water"],
+                state("minecraft:water", &[("level", "0")]),
+                false,
+            ),
+            (
+                vec!["minecraft:lava"],
+                state("minecraft:lava", &[("level", "0")]),
+                true,
+            ),
+            (
+                vec!["minecraft:flowing_lava"],
+                state("minecraft:lava", &[("level", "3")]),
+                true,
+            ),
+            (
+                vec!["minecraft:empty"],
+                state("minecraft:lava", &[("level", "0")]),
+                true,
+            ),
+            (vec![], state("minecraft:water", &[("level", "0")]), false),
+        ] {
+            let mut session = session();
+            session.set_farmland_water_tag(Arc::new(tag.into_iter().map(str::to_owned).collect()));
+            let pos = IVec3::new(8, 3, 8);
+            let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+            let fluid = session.intern_block(block);
+            assert!(session.set(pos, farmland));
+            assert!(session.set(pos + IVec3::X, fluid));
+            assert_eq!(session.hydrate_farmland_at(pos), expected);
+        }
+        let mut session = session();
+        session.farmland_water_tag = None;
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        let pos = IVec3::new(8, 3, 8);
+        assert!(session.set(pos, farmland));
+        assert!(session.set(pos + IVec3::X, water));
+        assert!(!session.hydrate_farmland_at(pos));
     }
 
     #[test]

@@ -49,15 +49,24 @@ fn farmland_random_ticks_match_java() {
     }
     let rows: Vec<Vec<serde_json::Value>> =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(rows.len(), 896);
+    assert_eq!(rows.len(), 5376);
     for row in rows {
         let moisture = row[0].as_u64().unwrap() as u8;
         let x = row[1].as_i64().unwrap();
         let y = row[2].as_i64().unwrap();
         let z = row[3].as_i64().unwrap();
         let fluid = row[4].as_i64().unwrap();
-        let water =
-            (-4..=4).contains(&x) && (0..=1).contains(&y) && (-4..=4).contains(&z) && fluid != 3;
+        let in_range = (-4..=4).contains(&x) && (0..=1).contains(&y) && (-4..=4).contains(&z);
+        let tag = row[9].as_i64().unwrap();
+        let water = tag == 3
+            || in_range
+                && match tag {
+                    0 => fluid != 3,
+                    1 => fluid == 0 || fluid == 2,
+                    2 => fluid == 1,
+                    4 => fluid == 3,
+                    _ => false,
+                };
         let rain = row[5].as_bool().unwrap();
         let maintain = row[6].as_bool().unwrap();
         let action = random_tick(moisture, Some(water), Some(rain), Some(maintain)).unwrap();

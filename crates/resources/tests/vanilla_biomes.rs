@@ -7,7 +7,7 @@ use std::{
 };
 
 use native_resources::{
-    biomes::{BiomeColors, ColorMaps, GrassModifier},
+    biomes::{BiomeColors, ColorMaps},
     default_minecraft_dir,
     packs::ResourceStack,
 };
@@ -105,7 +105,7 @@ fn run(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
-fn builtin_biome_colors_match_vanilla_except_swamp_grass_noise() {
+fn builtin_biome_colors_match_vanilla_including_swamp() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_minecraft_dir().unwrap());
@@ -155,9 +155,7 @@ fn builtin_biome_colors_match_vanilla_except_swamp_grass_noise() {
             .iter()
             .map(|value| value.parse().unwrap())
             .collect();
-        if biome.grass_modifier != GrassModifier::Swamp {
-            assert_eq!(biome.grass(), values[0], "{} grass", parts[0]);
-        }
+        assert_eq!(biome.grass_at(12, -8), values[0], "{} grass", parts[0]);
         assert_eq!(biome.foliage, values[1], "{} foliage", parts[0]);
         assert_eq!(biome.dry_foliage, values[2], "{} dry foliage", parts[0]);
         assert_eq!(biome.water, values[3], "{} water", parts[0]);

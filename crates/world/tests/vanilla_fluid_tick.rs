@@ -31,6 +31,7 @@ import net.minecraft.world.attribute.*;
 import net.minecraft.world.level.gamerules.*;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.material.*;
@@ -79,7 +80,18 @@ public class FluidTickOracle {
       world.blocks=new HashMap<>(); world.changes=new JsonArray(); world.lava=lava;
       for(var item:s.getAsJsonArray("blocks")) { var a=item.getAsJsonArray(); int code=a.get(3).getAsInt();
         Block liquid = code >= 20 ? (lava ? Blocks.WATER : Blocks.LAVA) : (lava ? Blocks.LAVA : Blocks.WATER);
-        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
+        Block grate = switch (code) {
+          case -6 -> Blocks.COPPER_GRATE.weathering().unaffected();
+          case -7 -> Blocks.COPPER_GRATE.weathering().exposed();
+          case -8 -> Blocks.COPPER_GRATE.weathering().weathered();
+          case -9 -> Blocks.COPPER_GRATE.weathering().oxidized();
+          case -10 -> Blocks.COPPER_GRATE.waxed().unaffected();
+          case -11 -> Blocks.COPPER_GRATE.waxed().exposed();
+          case -12 -> Blocks.COPPER_GRATE.waxed().weathered();
+          case -13 -> Blocks.COPPER_GRATE.waxed().oxidized();
+          default -> null;
+        };
+        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
       }
       BlockPos p=BlockPos.ZERO; var block=world.getBlockState(p); var fluid=block.getFluidState();
@@ -235,6 +247,73 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
     ] {
         scenarios.push(json!({"blocks": blocks, "lava": lava, "fast": false, "convert": true}));
     }
+    // Wet copper grates contribute source water but retain their own block.
+    for index in 0..512 {
+        let mut blocks = vec![json!([
+            0,
+            0,
+            0,
+            if index % 2 == 0 {
+                -6
+            } else {
+                (index % 16) as i32
+            }
+        ])];
+        for x in -4..=4 {
+            for z in -4..=4 {
+                if next() % 4 != 0 {
+                    blocks.push(json!([x, -1, z, if next() % 7 == 0 { -6 } else { -2 }]));
+                }
+                if (x != 0 || z != 0) && next() % 6 == 0 {
+                    blocks.push(json!([
+                        x,
+                        0,
+                        z,
+                        if next() % 2 == 0 {
+                            -6
+                        } else {
+                            (next() % 16) as i32
+                        }
+                    ]));
+                }
+            }
+        }
+        if index % 3 == 0 {
+            blocks.push(json!([0, 1, 0, -6]));
+        }
+        scenarios.push(
+            json!({"blocks": blocks, "lava": false, "fast": false, "convert": index % 3 == 0}),
+        );
+    }
+    for level in [0, 4] {
+        for below in [-6, -2, -1] {
+            for mask in 0..16 {
+                for convert in [false, true] {
+                    let grate = -6 - (mask % 8);
+                    let mut blocks = vec![json!([0, 0, 0, level])];
+                    if below != -1 {
+                        blocks.push(json!([0, -1, 0, if below == -6 { grate } else { below }]));
+                    }
+                    for (i, (x, z)) in [(0, -1), (0, 1), (-1, 0), (1, 0)].into_iter().enumerate() {
+                        blocks.push(json!([
+                            x,
+                            0,
+                            z,
+                            if mask & (1 << i) != 0 { grate } else { 0 }
+                        ]));
+                    }
+                    scenarios.push(
+                        json!({"blocks": blocks, "lava": false, "fast": false, "convert": convert}),
+                    );
+                }
+            }
+        }
+    }
+    for grate in -13..=-6 {
+        scenarios.push(
+            json!({"blocks": [[0, 0, 0, grate]], "lava": false, "fast": false, "convert": true}),
+        );
+    }
     let input = temp.path().join("input.json");
     let output = temp.path().join("output.json");
     std::fs::write(&input, serde_json::to_vec(&scenarios).unwrap()).unwrap();
@@ -274,6 +353,13 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                 pos,
                 if level == -2 {
                     Cell::Solid
+                } else if (-13..=-6).contains(&level) {
+                    Cell::GrateWater(FluidState {
+                        kind: FluidKind::Water,
+                        amount: 8,
+                        source: true,
+                        falling: true,
+                    })
                 } else if level >= 20 {
                     Cell::Fluid(liquid(other, (level - 20) as u8))
                 } else {

@@ -1,7 +1,8 @@
 //! Scheduled fluid spread for air, full blocks and ordinary liquid blocks.
 //!
 //! Other blocks are barriers until their fluid occupancy and side shapes are
-//! available. The caller schedules resulting changes and preserves world data.
+//! available. Wet copper grates block flow but count in source checks. The
+//! caller schedules resulting changes and preserves world data.
 
 use glam::IVec3;
 
@@ -12,6 +13,8 @@ pub enum Cell {
     Air,
     Solid,
     Fluid(FluidState),
+    /// Source water inside a copper grate; its block must not be replaced.
+    GrateWater(FluidState),
     /// Unloaded or unsupported data: never replace or traverse it.
     Unknown,
 }
@@ -172,7 +175,7 @@ fn at(world: &impl Fn(IVec3) -> Cell, pos: Option<IVec3>) -> Cell {
 }
 
 fn source(cell: Cell, kind: FluidKind) -> bool {
-    matches!(cell, Cell::Fluid(state) if state.kind == kind && state.source)
+    matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) if state.kind == kind && state.source)
 }
 
 fn flowing(kind: FluidKind, amount: u8, falling: bool) -> FluidState {
@@ -218,15 +221,16 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
-        Cell::Solid | Cell::Unknown => false,
+        Cell::Solid | Cell::GrateWater(_) | Cell::Unknown => false,
     }
 }
 
 fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3) -> bool {
-    matches!(
-        at(world, offset(pos, IVec3::NEG_Y)),
-        Cell::Air | Cell::Fluid(_)
-    )
+    match at(world, offset(pos, IVec3::NEG_Y)) {
+        Cell::Air | Cell::Fluid(_) => true,
+        Cell::GrateWater(_) => false,
+        _ => false,
+    }
 }
 
 fn can_replace(

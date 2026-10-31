@@ -62,18 +62,7 @@ impl FluidState {
                 | "minecraft:tall_seagrass"
         );
         // Copper grates return source water with its falling flag set.
-        let falling_grate = waterlogged
-            && matches!(
-                block.name.as_str(),
-                "minecraft:copper_grate"
-                    | "minecraft:exposed_copper_grate"
-                    | "minecraft:weathered_copper_grate"
-                    | "minecraft:oxidized_copper_grate"
-                    | "minecraft:waxed_copper_grate"
-                    | "minecraft:waxed_exposed_copper_grate"
-                    | "minecraft:waxed_weathered_copper_grate"
-                    | "minecraft:waxed_oxidized_copper_grate"
-            );
+        let falling_grate = waterlogged && is_copper_grate(&block.name);
         Ok((waterlogged || immersed).then_some(Self {
             kind: FluidKind::Water,
             amount: 8,
@@ -85,6 +74,21 @@ impl FluidState {
     pub fn own_height(self) -> f32 {
         f32::from(self.amount) / 9.0
     }
+}
+
+/// Copper grate variants share the same water-occupancy behavior.
+pub fn is_copper_grate(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:copper_grate"
+            | "minecraft:exposed_copper_grate"
+            | "minecraft:weathered_copper_grate"
+            | "minecraft:oxidized_copper_grate"
+            | "minecraft:waxed_copper_grate"
+            | "minecraft:waxed_exposed_copper_grate"
+            | "minecraft:waxed_weathered_copper_grate"
+            | "minecraft:waxed_oxidized_copper_grate"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -8123,6 +8123,11 @@ impl LoadedSession {
         if let Some(fluid) = self.ordinary_fluid(id) {
             return fluid_sim::Cell::Fluid(fluid);
         }
+        if native_world::fluid::is_copper_grate(&state.name)
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::GrateWater(fluid);
+        }
         if self.fluids.get(id.0 as usize).copied().flatten().is_some() {
             return fluid_sim::Cell::Unknown;
         }
@@ -26229,6 +26234,79 @@ mod tests {
                 assert_eq!(fluid.source, enabled, "{kind:?}");
             }
         }
+    }
+
+    #[test]
+    fn wet_grates_count_as_sources_without_allowing_water_through_their_faces() {
+        {
+            let mut session = session();
+            let pos = IVec3::new(8, 3, 8);
+            let water = FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let water_id = session.intern_liquid(water);
+            let grate =
+                session.intern_block(state("minecraft:copper_grate", &[("waterlogged", "true")]));
+            session.set_with_notify(pos, water_id, false);
+            session.set_with_notify(pos + IVec3::NEG_Y, session.states[0], false);
+            session.set_with_notify(pos + IVec3::X, session.states[0], false);
+            for direction in [IVec3::NEG_X, IVec3::NEG_Z, IVec3::Z] {
+                assert!(session.set_with_notify(pos + direction, grate, false));
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            session.schedule_fluid(pos, water, 0);
+            session.advance_fluid_ticks();
+            assert!(
+                matches!(session.simulation_cell(pos + IVec3::NEG_Y), fluid_sim::Cell::Fluid(f) if f.falling)
+            );
+            assert!(
+                matches!(session.simulation_cell(pos + IVec3::X), fluid_sim::Cell::Fluid(f) if f.amount == 7)
+            );
+            for direction in [IVec3::NEG_X, IVec3::NEG_Z, IVec3::Z] {
+                assert!(matches!(
+                    session.simulation_cell(pos + direction),
+                    fluid_sim::Cell::GrateWater(_)
+                ));
+            }
+        }
+
+        let mut session = session();
+        let pos = IVec3::new(8, 3, 8);
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let source_id = session.intern_liquid(water);
+        let flowing = FluidState {
+            amount: 4,
+            source: false,
+            ..water
+        };
+        let flowing_id = session.intern_liquid(flowing);
+        let grate = session.intern_block(state(
+            "minecraft:waxed_oxidized_copper_grate",
+            &[("waterlogged", "true")],
+        ));
+        session.set_with_notify(pos, flowing_id, false);
+        session.set_with_notify(pos + IVec3::NEG_Y, grate, false);
+        session.set_with_notify(pos + IVec3::NEG_X, source_id, false);
+        session.set_with_notify(pos + IVec3::X, source_id, false);
+        session.set_source_conversion(true, false);
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.schedule_fluid(pos, flowing, 0);
+        session.advance_fluid_ticks();
+        assert!(matches!(session.simulation_cell(pos), fluid_sim::Cell::Fluid(f) if f.source));
+        assert!(matches!(
+            session.simulation_cell(pos + IVec3::NEG_Y),
+            fluid_sim::Cell::GrateWater(_)
+        ));
     }
 
     #[test]

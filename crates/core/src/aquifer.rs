@@ -129,7 +129,8 @@ impl<T: AquiferBlock> AquiferGenerator<T> {
         generator.skip_sampling_above_y = max
             .wrapping_add(20)
             .div_euclid(12)
-            .wrapping_sub(1)
+            // Java subtracts MIN_CELL_SAMPLE_Y, which is -1.
+            .wrapping_add(1)
             .wrapping_mul(12)
             .wrapping_add(10);
         Ok(generator)
@@ -151,9 +152,15 @@ impl<T: AquiferBlock> AquiferGenerator<T> {
         }
         let global = sampler.global(x, y, z);
         let current = global.at(y);
-        if y > self.skip_sampling_above_y || current.is_lava() {
+        if y > self.skip_sampling_above_y {
             return AquiferResult {
                 block: Some(current),
+                schedule_fluid_update: false,
+            };
+        }
+        if current.is_lava() {
+            return AquiferResult {
+                block: Some(T::lava()),
                 schedule_fluid_update: false,
             };
         }
@@ -428,8 +435,11 @@ pub fn resolve<T: AquiferBlock>(
         return solid();
     }
     let global_here = global(y).at(y);
-    if y > skip_sampling_above_y || global_here.is_lava() {
+    if y > skip_sampling_above_y {
         return fluid(global_here, false);
+    }
+    if global_here.is_lava() {
+        return fluid(T::lava(), false);
     }
     let first = local(0);
     let result = first.at(y);
@@ -713,7 +723,7 @@ mod tests {
         let values = vec![10.75; (area.size_x * area.size_z) as usize];
         let generator =
             super::AquiferGenerator::<Block>::from_surface_volume(0, false, area, &values).unwrap();
-        assert_eq!(generator.skip_sampling_above_y, 22);
+        assert_eq!(generator.skip_sampling_above_y, 46);
         assert_eq!(generator.levels.surfaces.len(), 121);
         assert_eq!(generator.levels.surfaces[&(-16, -32)], 10);
         assert!(

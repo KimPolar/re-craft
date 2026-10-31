@@ -121,6 +121,7 @@ pub struct NoiseStageGenerator {
     sea_level: i32,
     seed: i64,
     aquifer: Option<AquiferFunctions>,
+    default_aquifer_fluid: AquiferMaterial,
 }
 
 struct AquiferFunctions {
@@ -135,8 +136,11 @@ struct AquiferFunctions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AquiferMaterial {
     Air,
-    Water,
     Lava,
+    DefaultWater,
+    DefaultLava,
+    DefaultAir,
+    DefaultOther,
 }
 impl AquiferBlock for AquiferMaterial {
     fn air() -> Self {
@@ -146,19 +150,20 @@ impl AquiferBlock for AquiferMaterial {
         Self::Lava
     }
     fn is_air(self) -> bool {
-        self == Self::Air
+        matches!(self, Self::Air | Self::DefaultAir)
     }
     fn is_water(self) -> bool {
-        self == Self::Water
+        self == Self::DefaultWater
     }
     fn is_lava(self) -> bool {
-        self == Self::Lava
+        matches!(self, Self::Lava | Self::DefaultLava)
     }
 }
 struct NoiseAquiferSampler<'a> {
     functions: &'a AquiferFunctions,
     evaluator: &'a mut DensityEvaluator,
     sea: i32,
+    fluid: AquiferMaterial,
 }
 impl AquiferSampler for NoiseAquiferSampler<'_> {
     type Block = AquiferMaterial;
@@ -171,7 +176,7 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
         } else {
             FluidStatus {
                 level: self.sea,
-                block: AquiferMaterial::Water,
+                block: self.fluid,
             }
         }
     }
@@ -197,7 +202,7 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 
 impl NoiseStageGenerator {
     /// Load only if older-chunk blending and structure terrain adjustments are absent.
-    /// Local aquifers currently require the default water block state.
+    /// Block-state encodings are preserved and resolved against the registry later.
     pub fn load_without_terrain_adjustments(
         provider: &mut impl ResourceProvider,
         name: &str,
@@ -229,21 +234,50 @@ impl NoiseStageGenerator {
         validate_state_encoding(&materials.default_block).context("invalid default block")?;
         validate_state_encoding(&materials.default_fluid).context("invalid default fluid")?;
         let router = NoiseRouter::from_json_without_terrain_adjustments(provider, bytes, seed)?;
-        let aquifer = if let Some(config) = materials.aquifers {
-            let state = &materials.default_fluid;
-            let name = state
-                .as_str()
-                .or_else(|| state.get("id").and_then(Value::as_str));
-            let water = name
-                .and_then(|name| ResourceId::parse(name).ok())
-                .is_some_and(|id| id.namespace == "minecraft" && id.path == "water")
-                && state
+        let state = &materials.default_fluid;
+        let name = state
+            .as_str()
+            .or_else(|| state.get("id").and_then(Value::as_str))
+            .context("default fluid has no id")?;
+        let id = ResourceId::parse(name)?;
+        let default_aquifer_fluid = match (id.namespace.as_str(), id.path.as_str()) {
+            ("minecraft", "air") => AquiferMaterial::Air,
+            ("minecraft", "cave_air" | "void_air") => AquiferMaterial::DefaultAir,
+            ("minecraft", "water") => AquiferMaterial::DefaultWater,
+            ("minecraft", "lava") => {
+                let nondefault = state
                     .get("properties")
-                    .is_none_or(|v| v.as_object().is_some_and(|p| p.is_empty()));
-            ensure!(
-                water,
-                "local aquifers currently require the default minecraft:water state"
-            );
+                    .and_then(Value::as_object)
+                    .and_then(|p| p.get("level"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|level| {
+                        matches!(
+                            level,
+                            "1" | "2"
+                                | "3"
+                                | "4"
+                                | "5"
+                                | "6"
+                                | "7"
+                                | "8"
+                                | "9"
+                                | "10"
+                                | "11"
+                                | "12"
+                                | "13"
+                                | "14"
+                                | "15"
+                        )
+                    });
+                if nondefault {
+                    AquiferMaterial::DefaultLava
+                } else {
+                    AquiferMaterial::Lava
+                }
+            }
+            _ => AquiferMaterial::DefaultOther,
+        };
+        let aquifer = if let Some(config) = materials.aquifers {
             let object = config.as_object().context("aquifers must be an object")?;
             let mut compiler = DensityCompiler::with_world_seed(provider, seed, router.random)
                 .without_old_chunk_blending()
@@ -274,6 +308,7 @@ impl NoiseStageGenerator {
             sea_level: materials.sea_level,
             seed,
             aquifer,
+            default_aquifer_fluid,
         })
     }
 
@@ -309,6 +344,7 @@ impl NoiseStageGenerator {
                 functions,
                 evaluator,
                 sea: self.sea_level,
+                fluid: self.default_aquifer_fluid,
             };
             let origin_x = x.checked_mul(16).context("chunk X overflow")?;
             let origin_z = z.checked_mul(16).context("chunk Z overflow")?;
@@ -327,8 +363,13 @@ impl NoiseStageGenerator {
                 materials.push(match result.block {
                     None => NoiseMaterial::DefaultBlock,
                     Some(AquiferMaterial::Air) => NoiseMaterial::Air,
-                    Some(AquiferMaterial::Water) => NoiseMaterial::DefaultFluid,
                     Some(AquiferMaterial::Lava) => NoiseMaterial::Lava,
+                    Some(
+                        AquiferMaterial::DefaultWater
+                        | AquiferMaterial::DefaultLava
+                        | AquiferMaterial::DefaultAir
+                        | AquiferMaterial::DefaultOther,
+                    ) => NoiseMaterial::DefaultFluid,
                 });
                 updates.push(result.schedule_fluid_update);
             }
@@ -443,7 +484,7 @@ mod tests {
                 &serde_json::to_vec(&aquifer).unwrap(),
                 0
             )
-            .is_err()
+            .is_ok()
         );
         let mut malformed = definition();
         malformed["default_block"] = json!({"properties": {"axis":"x"}});

@@ -100,10 +100,15 @@ impl BiomeClimate {
         temperature
     }
 
+    /// Surface rules use this even in biomes without precipitation.
+    pub fn cold_enough_to_snow(self, x: i32, y: i32, z: i32, sea_level: i32) -> bool {
+        self.temperature_at(x, y, z, sea_level) < 0.15
+    }
+
     pub fn precipitation_at(self, x: i32, y: i32, z: i32, sea_level: i32) -> Precipitation {
         if !self.has_precipitation {
             Precipitation::None
-        } else if self.temperature_at(x, y, z, sea_level) < 0.15 {
+        } else if self.cold_enough_to_snow(x, y, z, sea_level) {
             Precipitation::Snow
         } else {
             Precipitation::Rain

@@ -36,6 +36,7 @@ pub mod respawn_environment;
 pub mod respawn_tags;
 pub mod sounds;
 pub mod sprites;
+pub mod surface_biomes;
 pub mod surface_rules;
 pub mod transforms;
 pub mod vanilla_atlas;

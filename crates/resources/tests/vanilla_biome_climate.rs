@@ -62,7 +62,7 @@ fn temperature_and_precipitation_match_vanilla() {
     let mut count = 0;
     for line in output.lines() {
         let values: Vec<_> = line.split_whitespace().collect();
-        assert_eq!(values.len(), 9, "unexpected output: {line}");
+        assert_eq!(values.len(), 10, "unexpected output: {line}");
         let x: i32 = values[0].parse().unwrap();
         let y: i32 = values[1].parse().unwrap();
         let z: i32 = values[2].parse().unwrap();
@@ -92,6 +92,11 @@ fn temperature_and_precipitation_match_vanilla() {
             climate.precipitation_at(x, y, z, sea),
             precipitation,
             "precipitation: {line}"
+        );
+        assert_eq!(
+            climate.cold_enough_to_snow(x, y, z, sea),
+            values[9].parse::<bool>().unwrap(),
+            "snow threshold: {line}"
         );
         count += 1;
     }

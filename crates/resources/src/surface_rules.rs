@@ -526,6 +526,13 @@ enum Condition {
     Not(Arc<Condition>),
 }
 impl Condition {
+    fn collect_biomes(&self, out: &mut Vec<Value>) {
+        match self {
+            Self::Biome(selector) if !out.contains(selector) => out.push(selector.clone()),
+            Self::Not(inner) => inner.collect_biomes(out),
+            _ => {}
+        }
+    }
     fn collect_noises(&self, out: &mut BTreeSet<ResourceId>) {
         match self {
             Self::Noise { name, .. } => {
@@ -631,6 +638,20 @@ struct OreVein {
     gap: Value,
 }
 impl RuleNode {
+    fn collect_biomes(&self, out: &mut Vec<Value>) {
+        match self {
+            Self::Sequence(rules) => {
+                for rule in rules {
+                    rule.collect_biomes(out);
+                }
+            }
+            Self::Conditional(condition, rule) => {
+                condition.collect_biomes(out);
+                rule.collect_biomes(out);
+            }
+            _ => {}
+        }
+    }
     fn collect_noises(&self, out: &mut BTreeSet<ResourceId>) {
         match self {
             Self::Sequence(rules) => {
@@ -698,6 +719,12 @@ impl RuleNode {
 
 pub struct SurfaceRule(Arc<RuleNode>);
 impl SurfaceRule {
+    /// Biome holder sets referenced by this material rule tree.
+    pub fn biome_dependencies(&self) -> Vec<Value> {
+        let mut result = Vec::new();
+        self.0.collect_biomes(&mut result);
+        result
+    }
     /// Registry noise names used by conditions and bandlands in this rule tree.
     pub fn noise_dependencies(&self) -> BTreeSet<ResourceId> {
         let mut result = BTreeSet::new();
@@ -710,6 +737,94 @@ impl SurfaceRule {
         inputs: &mut impl SurfaceInputs,
     ) -> Result<Option<Arc<Value>>> {
         self.0.apply(position, inputs)
+    }
+}
+
+/// A seeded material-rule context for a fresh volume without structure or
+/// old-chunk terrain adjustments. Biome identity is supplied by the caller.
+pub struct SeededSurfaceInputs<'a, P: ResourceProvider> {
+    biomes: crate::surface_biomes::SurfaceBiomes,
+    biome: Option<ResourceId>,
+    noise: SurfaceNoise,
+    random: SurfaceRandomFactory,
+    bands: SurfaceBands,
+    density: SurfaceDensitySampler<'a, P>,
+    ore: ResourceId,
+}
+impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
+    /// The caller must ensure this volume has no terrain adjustments.
+    pub fn without_terrain_adjustments(
+        provider: &'a mut P,
+        rule: &SurfaceRule,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Self> {
+        let biomes =
+            crate::surface_biomes::SurfaceBiomes::load(provider, &rule.biome_dependencies())?;
+        let noise = SurfaceNoise::load(provider, seed, algorithm, rule.noise_dependencies())?;
+        let random = SurfaceRandomFactory::new(seed, algorithm);
+        let bands = SurfaceBands::new(seed, algorithm);
+        let density = SurfaceDensitySampler::without_terrain_adjustments(
+            provider, seed, algorithm, min, size,
+        )?;
+        Ok(Self {
+            biomes,
+            biome: None,
+            noise,
+            random,
+            bands,
+            density,
+            ore: ResourceId::parse("minecraft:ore")?,
+        })
+    }
+    pub fn set_biome(&mut self, biome: ResourceId) -> Result<()> {
+        ensure!(
+            self.biomes.contains_biome(&biome),
+            "selected biome is not in the active registry"
+        );
+        self.biome = Some(biome);
+        Ok(())
+    }
+    pub fn surface_depth(&mut self, x: i32, z: i32) -> Result<i32> {
+        self.noise.surface_depth(x, z)
+    }
+    pub fn surface_secondary(&mut self, x: i32, z: i32) -> Result<f64> {
+        self.noise.surface_secondary(x, z)
+    }
+}
+impl<P: ResourceProvider> SurfaceInputs for SeededSurfaceInputs<'_, P> {
+    fn biome_matches(&mut self, selector: &Value, _: &SurfacePosition) -> Result<bool> {
+        self.biomes.matches(
+            selector,
+            self.biome
+                .as_ref()
+                .context("surface biome was not selected")?,
+        )
+    }
+    fn cold_enough_to_snow(&mut self, p: &SurfacePosition) -> Result<bool> {
+        self.biomes.cold_enough_to_snow(
+            self.biome
+                .as_ref()
+                .context("surface biome was not selected")?,
+            p,
+        )
+    }
+    fn noise(&mut self, name: &ResourceId, is_3d: bool, p: &SurfacePosition) -> Result<f64> {
+        Ok(f64::from(self.noise.sample(name, is_3d, p.x, p.y, p.z)?))
+    }
+    fn positional_random(&mut self, name: &ResourceId, p: &SurfacePosition) -> Result<f32> {
+        Ok(self.random.at(name, p.x, p.y, p.z).next_float())
+    }
+    fn ore_random(&mut self, p: &SurfacePosition) -> Result<SurfaceRandom> {
+        Ok(self.random.at(&self.ore, p.x, p.y, p.z))
+    }
+    fn density(&mut self, definition: &Value, in_chunk: bool, p: &SurfacePosition) -> Result<f32> {
+        self.density.sample(definition, in_chunk, p.x, p.y, p.z)
+    }
+    fn bandlands(&mut self, p: &SurfacePosition) -> Result<Arc<Value>> {
+        self.bands.at(&mut self.noise, p.x, p.y, p.z)
     }
 }
 

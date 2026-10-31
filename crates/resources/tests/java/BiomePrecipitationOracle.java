@@ -36,8 +36,9 @@ public class BiomePrecipitationOracle {
         .generationSettings(BiomeGenerationSettings.EMPTY).build();
       var pos = new BlockPos(x, y, z);
       float temp = (float) adjusted.invoke(biome, pos, sea);
-      output.printf("%d %d %d %d %s %s %d %d %s%n", x, y, z, sea, frozen, wet,
-        Float.floatToRawIntBits(base), Float.floatToRawIntBits(temp), biome.getPrecipitationAt(pos, sea));
+      output.printf("%d %d %d %d %s %s %d %d %s %s%n", x, y, z, sea, frozen, wet,
+        Float.floatToRawIntBits(base), Float.floatToRawIntBits(temp), biome.getPrecipitationAt(pos, sea),
+        biome.coldEnoughToSnow(pos, sea));
     }
   }
 }

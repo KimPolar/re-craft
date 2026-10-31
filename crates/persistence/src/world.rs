@@ -271,6 +271,13 @@ pub struct SavedPoiChunk {
     pub sections: BTreeMap<i32, SavedPoiSection>,
 }
 
+impl SavedPoiChunk {
+    /// Decode and validate a POI document for its containing chunk.
+    pub fn from_document(document: NamedTag, position: ChunkPos) -> Result<Self> {
+        decode_poi_chunk(document, position)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedPoiSection {
     pub valid: bool,

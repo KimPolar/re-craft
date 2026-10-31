@@ -90,10 +90,19 @@ pub enum SavedEntityData {
     Unavailable,
 }
 
+/// A missing POI entry, a decoded entry, and a read failure are distinct.
+#[derive(Clone)]
+pub enum SavedPoiData {
+    Missing,
+    Present(Arc<native_persistence::world::SavedPoiChunk>),
+    Unavailable,
+}
+
 struct IncomingChunk {
     pos: ChunkPos,
     world: Option<World>,
     entities: Option<SavedEntityData>,
+    poi: Option<SavedPoiData>,
     heightmaps: Option<SpawnHeightmaps>,
 }
 
@@ -369,6 +378,7 @@ pub struct LoadedSession {
     poi_edited_positions: BTreeSet<BlockPosition>,
     parked_chunks: BTreeMap<ChunkPos, Arc<native_world::loaded::Chunk>>,
     entity_chunks: BTreeMap<ChunkPos, SavedEntityData>,
+    poi_chunks: BTreeMap<ChunkPos, SavedPoiData>,
     item_chunks_seen: BTreeSet<ChunkPos>,
     saved_item_uuids: BTreeMap<[i32; 4], ChunkPos>,
     orb_chunks_seen: BTreeSet<ChunkPos>,
@@ -1639,6 +1649,20 @@ impl LoadedSession {
                 },
             "POI source belongs to another chunk"
         );
+        let captured = match self.poi_chunks.get(&position) {
+            Some(SavedPoiData::Present(chunk)) => chunk,
+            Some(SavedPoiData::Missing) => {
+                anyhow::bail!("saved POI chunk was absent and needs reconstruction")
+            }
+            Some(SavedPoiData::Unavailable) | None => {
+                anyhow::bail!("saved POI source is unavailable")
+            }
+        };
+        ensure!(
+            native_persistence::nbt::write(&captured.document)?
+                == native_persistence::nbt::write(&poi_source.document)?,
+            "POI source differs from the captured session source"
+        );
         let events = self
             .poi_edits
             .get(&position)
@@ -2615,6 +2639,7 @@ impl LoadedSession {
             poi_edited_positions: BTreeSet::new(),
             parked_chunks: BTreeMap::new(),
             entity_chunks: BTreeMap::new(),
+            poi_chunks: BTreeMap::new(),
             item_chunks_seen: BTreeSet::new(),
             saved_item_uuids: BTreeMap::new(),
             orb_chunks_seen: BTreeSet::new(),
@@ -2755,6 +2780,7 @@ impl LoadedSession {
             pos,
             world: None,
             entities: Some(entities),
+            poi: None,
             heightmaps: None,
         });
     }
@@ -2767,11 +2793,34 @@ impl LoadedSession {
         entities: SavedEntityData,
         heightmaps: Option<SpawnHeightmaps>,
     ) {
+        self.queue_loaded_chunk_with_poi(pos, chunk_world, entities, None, heightmaps);
+    }
+
+    pub fn queue_loaded_chunk_with_poi(
+        &mut self,
+        pos: ChunkPos,
+        chunk_world: World,
+        entities: SavedEntityData,
+        poi: Option<SavedPoiData>,
+        heightmaps: Option<SpawnHeightmaps>,
+    ) {
         self.incoming.push_back(IncomingChunk {
             pos,
             world: Some(chunk_world),
             entities: Some(entities),
+            poi,
             heightmaps,
+        });
+    }
+
+    /// Deliver a retried POI read at the next tick boundary.
+    pub fn queue_poi_chunk(&mut self, pos: ChunkPos, poi: SavedPoiData) {
+        self.incoming.push_back(IncomingChunk {
+            pos,
+            world: None,
+            entities: None,
+            poi: Some(poi),
+            heightmaps: None,
         });
     }
 
@@ -3023,6 +3072,51 @@ impl LoadedSession {
         validate_entity_chunk(pos, &entities)?;
         self.entity_chunks.insert(pos, entities);
         self.entity_collision_cache.insert(pos, OnceLock::new());
+        Ok(())
+    }
+
+    /// Capture POI data before the session starts editing the corresponding chunk.
+    pub fn set_initial_poi_chunk(
+        &mut self,
+        pos: ChunkPos,
+        poi: SavedPoiData,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "POI chunks must be set before the first tick"
+        );
+        anyhow::ensure!(
+            self.world.chunks.contains_key(&pos),
+            "POI chunk has no loaded block chunk"
+        );
+        anyhow::ensure!(
+            !self.poi_chunks.contains_key(&pos) && !self.block_edits.contains_key(&pos),
+            "POI source was already captured or edited"
+        );
+        validate_poi_chunk(pos, &poi)?;
+        self.poi_chunks.insert(pos, poi);
+        Ok(())
+    }
+
+    pub fn saved_poi_chunk(&self, pos: ChunkPos) -> Option<&SavedPoiData> {
+        self.poi_chunks.get(&pos)
+    }
+
+    pub fn can_retry_poi_chunk(&self, pos: ChunkPos) -> bool {
+        !self.block_edits.contains_key(&pos)
+    }
+
+    fn attach_poi_chunk(&mut self, pos: ChunkPos, poi: SavedPoiData) -> anyhow::Result<()> {
+        validate_poi_chunk(pos, &poi)?;
+        if self.block_edits.contains_key(&pos)
+            || matches!(
+                self.poi_chunks.get(&pos),
+                Some(SavedPoiData::Missing | SavedPoiData::Present(_))
+            )
+        {
+            return Ok(());
+        }
+        self.poi_chunks.insert(pos, poi);
         Ok(())
     }
 
@@ -4268,6 +4362,7 @@ impl LoadedSession {
             pos,
             world: None,
             entities: None,
+            poi: None,
             heightmaps: None,
         });
     }
@@ -5100,6 +5195,7 @@ impl LoadedSession {
                         respawn_changed = true;
                     } else {
                         world.saved_block_entities.remove(&pos);
+                        self.poi_chunks.remove(&pos);
                         if !retained_entities.contains(&pos)
                             && self.entity_chunks.remove(&pos).is_some()
                         {
@@ -5165,6 +5261,7 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
+            self.poi_chunks.remove(&pos);
             Arc::make_mut(&mut self.world)
                 .saved_block_entities
                 .remove(&pos);
@@ -5184,6 +5281,7 @@ impl LoadedSession {
             pos,
             world: source,
             entities,
+            poi,
             heightmaps,
         }) = self.incoming.pop_front()
         {
@@ -5198,6 +5296,16 @@ impl LoadedSession {
             }
             match source {
                 None => {
+                    if let Some(data) = poi {
+                        if (self.world.chunks.contains_key(&pos)
+                            || self.parked_chunks.contains_key(&pos))
+                            && let Err(error) = self.attach_poi_chunk(pos, data)
+                        {
+                            self.stream_errors
+                                .push(format!("POI chunk {}, {}: {error:#}", pos.x, pos.z));
+                        }
+                        continue;
+                    }
                     if let Some(data) = entities {
                         if (self.world.chunks.contains_key(&pos)
                             || self.parked_chunks.contains_key(&pos))
@@ -5257,6 +5365,12 @@ impl LoadedSession {
                                     .push(format!("entity chunk {}, {}: {error:#}", pos.x, pos.z)),
                             }
                         }
+                        if let Some(data) = poi
+                            && let Err(error) = self.attach_poi_chunk(pos, data)
+                        {
+                            self.stream_errors
+                                .push(format!("POI chunk {}, {}: {error:#}", pos.x, pos.z));
+                        }
                         continue;
                     }
                     let old_count = self.world.state_count();
@@ -5287,6 +5401,12 @@ impl LoadedSession {
                     });
                     match Arc::make_mut(&mut self.world).import_chunk(&source, pos) {
                         Ok(true) => {
+                            if let Some(data) = poi
+                                && let Err(error) = self.attach_poi_chunk(pos, data)
+                            {
+                                self.stream_errors
+                                    .push(format!("POI chunk {}, {}: {error:#}", pos.x, pos.z));
+                            }
                             // Preserve the original source of already-simulated
                             // entities even if a later entity read fails.
                             if !matches!(
@@ -10517,6 +10637,20 @@ fn validate_entity_chunk(pos: ChunkPos, data: &SavedEntityData) -> anyhow::Resul
             chunk.position.x == pos.x && chunk.position.z == pos.z,
             "entity chunk position mismatch"
         );
+    }
+    Ok(())
+}
+
+fn validate_poi_chunk(pos: ChunkPos, data: &SavedPoiData) -> anyhow::Result<()> {
+    if let SavedPoiData::Present(chunk) = data {
+        anyhow::ensure!(
+            chunk.position.x == pos.x && chunk.position.z == pos.z,
+            "POI chunk position mismatch"
+        );
+        native_persistence::world::SavedPoiChunk::from_document(
+            (*chunk.document).clone(),
+            chunk.position,
+        )?;
     }
     Ok(())
 }
@@ -24632,6 +24766,12 @@ mod tests {
             player,
         )
         .unwrap();
+        session
+            .set_initial_poi_chunk(
+                position,
+                SavedPoiData::Present(Arc::new(poi_source.clone())),
+            )
+            .unwrap();
         let relative = IVec3::new(4, 0, 4);
         assert!(session.set(relative, session.states[0]));
         assert!(session.set(relative, bed_id));
@@ -24660,6 +24800,13 @@ mod tests {
             panic!()
         };
         fields.push(("external".into(), Tag::Int(1)));
+        let mut altered_poi = poi_source.clone();
+        altered_poi.document = Arc::new(stale_poi.clone());
+        assert!(
+            session
+                .draft_poi_chunk(position, &terrain, &altered_poi, |_| Ok(()))
+                .is_err()
+        );
         assert!(
             draft
                 .add_to_save_plan(
@@ -24692,6 +24839,80 @@ mod tests {
                 .is_err(),
             "discontinuous history must be rejected"
         );
+    }
+
+    #[test]
+    fn poi_source_is_captured_once_and_never_replaced_after_edits() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            world::{ChunkPos as SavedChunkPos, SavedPoiChunk},
+        };
+        let mut session = session();
+        let pos = session.player_chunk().unwrap();
+        let source = || {
+            SavedPoiChunk::from_document(
+                NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        ("Sections".into(), Tag::Compound(vec![])),
+                    ]),
+                },
+                SavedChunkPos { x: pos.x, z: pos.z },
+            )
+            .unwrap()
+        };
+        session
+            .set_initial_poi_chunk(pos, SavedPoiData::Unavailable)
+            .unwrap();
+        session.queue_poi_chunk(pos, SavedPoiData::Present(Arc::new(source())));
+        session.update(TICK);
+        assert!(matches!(
+            session.saved_poi_chunk(pos),
+            Some(SavedPoiData::Present(_))
+        ));
+        session.queue_poi_chunk(pos, SavedPoiData::Missing);
+        session.update(TICK);
+        assert!(matches!(
+            session.saved_poi_chunk(pos),
+            Some(SavedPoiData::Present(_))
+        ));
+
+        let bell = session.intern_block(state("minecraft:bell", &[]));
+        assert!(session.set(IVec3::new(4, 0, 4), bell));
+        session.queue_chunk_window(
+            ChunkPos {
+                x: pos.x + 5,
+                z: pos.z,
+            },
+            0,
+        );
+        session.update(TICK);
+        assert!(session.parked_chunks.contains_key(&pos));
+        assert!(matches!(
+            session.saved_poi_chunk(pos),
+            Some(SavedPoiData::Present(_))
+        ));
+        session.queue_chunk_window(pos, 0);
+        session.update(TICK);
+        assert!(session.world.chunks.contains_key(&pos));
+        assert!(matches!(
+            session.saved_poi_chunk(pos),
+            Some(SavedPoiData::Present(_))
+        ));
+
+        let mut edited = self::session();
+        edited
+            .set_initial_poi_chunk(pos, SavedPoiData::Unavailable)
+            .unwrap();
+        let bell = edited.intern_block(state("minecraft:bell", &[]));
+        assert!(edited.set(IVec3::new(4, 0, 4), bell));
+        edited.queue_poi_chunk(pos, SavedPoiData::Missing);
+        edited.update(TICK);
+        assert!(matches!(
+            edited.saved_poi_chunk(pos),
+            Some(SavedPoiData::Unavailable)
+        ));
     }
 
     #[test]

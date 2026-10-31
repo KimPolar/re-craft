@@ -9,6 +9,12 @@ impl AquiferBlock for Block {
     fn air() -> Self {
         Self(0)
     }
+    fn lava() -> Self {
+        Self(2)
+    }
+    fn is_air(self) -> bool {
+        self.0 == 0
+    }
     fn is_water(self) -> bool {
         self.0 == 1
     }

@@ -1,6 +1,6 @@
-//! The positional random centers used by Minecraft's noise-based aquifers.
+//! Minecraft's noise-based aquifer center, fluid-level and boundary calculations.
 //!
-//! This is only the center selection step, not a fluid simulation.
+//! A caller supplies the density samplers, global picker and chunk sampling limit.
 use std::collections::HashMap;
 
 use crate::{
@@ -29,8 +29,239 @@ pub struct AquiferCenter {
 /// A block-state identity with the block checks needed by aquifers.
 pub trait AquiferBlock: Copy + Eq {
     fn air() -> Self;
+    fn lava() -> Self;
+    fn is_air(self) -> bool;
     fn is_water(self) -> bool;
     fn is_lava(self) -> bool;
+}
+
+/// Density sources and global fluid picker used while calculating a center.
+pub trait AquiferSampler {
+    type Block: AquiferBlock;
+    fn barrier(&mut self, x: i32, y: i32, z: i32) -> f32;
+    fn global(&mut self, x: i32, y: i32, z: i32) -> FluidStatus<Self::Block>;
+    fn surface(&mut self, x: i32, z: i32) -> f32;
+    fn exclusion(&mut self, x: i32, y: i32, z: i32) -> f32;
+    fn floodedness(&mut self, x: i32, y: i32, z: i32) -> f32;
+    fn spread(&mut self, x: i32, y: i32, z: i32) -> f32;
+    fn lava(&mut self, x: i32, y: i32, z: i32) -> f32;
+}
+
+/// A chunk-scoped aquifer. Keep the sampler's configuration fixed for its lifetime.
+pub struct AquiferGenerator<T> {
+    locator: AquiferLocator,
+    levels: AquiferFluidLevels,
+    statuses: HashMap<[i32; 3], FluidStatus<T>>,
+    skip_sampling_above_y: i32,
+}
+
+impl<T: AquiferBlock> AquiferGenerator<T> {
+    pub fn new(seed: i64, legacy: bool, skip_sampling_above_y: i32) -> Self {
+        Self {
+            locator: AquiferLocator::new(seed, legacy),
+            levels: AquiferFluidLevels::new(),
+            statuses: HashMap::new(),
+            skip_sampling_above_y,
+        }
+    }
+
+    pub fn sample<S: AquiferSampler<Block = T>>(
+        &mut self,
+        sampler: &mut S,
+        x: i32,
+        y: i32,
+        z: i32,
+        density: f64,
+    ) -> AquiferResult<T> {
+        if density > 0.0 {
+            return AquiferResult {
+                block: None,
+                schedule_fluid_update: false,
+            };
+        }
+        let global = sampler.global(x, y, z);
+        let current = global.at(y);
+        if y > self.skip_sampling_above_y || current.is_lava() {
+            return AquiferResult {
+                block: Some(current),
+                schedule_fluid_update: false,
+            };
+        }
+        let centers = self.locator.nearest(x, y, z);
+        let distances = centers.map(|c| c.distance_squared);
+        // resolve invokes callbacks sequentially; RefCell shares the sampler without
+        // precomputing centers or density functions that an early branch won't use.
+        let sampler = std::cell::RefCell::new(sampler);
+        resolve(
+            y,
+            density,
+            self.skip_sampling_above_y,
+            distances,
+            &mut |at| {
+                if at == y {
+                    global
+                } else {
+                    sampler.borrow_mut().global(x, at, z)
+                }
+            },
+            &mut |i| {
+                let center = centers[i];
+                *self.statuses.entry(center.grid).or_insert_with(|| {
+                    self.levels.compute(
+                        &mut **sampler.borrow_mut(),
+                        center.position[0],
+                        center.position[1],
+                        center.position[2],
+                    )
+                })
+            },
+            &mut || sampler.borrow_mut().barrier(x, y, z),
+        )
+    }
+}
+
+/// Vanilla's DimensionType.WAY_BELOW_MIN_Y for the 26.3 packed Y range.
+pub const WAY_BELOW_MIN_Y: i32 = -32_512;
+
+/// Scoped to a chunk; cached surface samples must not outlive their sampler.
+pub struct AquiferFluidLevels {
+    surfaces: HashMap<(i32, i32), i32>,
+}
+
+impl Default for AquiferFluidLevels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AquiferFluidLevels {
+    pub fn new() -> Self {
+        Self {
+            surfaces: HashMap::new(),
+        }
+    }
+
+    pub fn compute<S: AquiferSampler>(
+        &mut self,
+        sampler: &mut S,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> FluidStatus<S::Block> {
+        const OFFSETS: [(i32, i32); 13] = [
+            (0, 0),
+            (-2, -1),
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-3, 0),
+            (-2, 0),
+            (-1, 0),
+            (1, 0),
+            (-2, 1),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+        let global = sampler.global(x, y, z);
+        let mut min_surface = i32::MAX;
+        let upper = y.wrapping_add(12);
+        let lower = y.wrapping_sub(12);
+        let mut center_flooded = false;
+        for (dx, dz) in OFFSETS {
+            let sx = x.wrapping_add(dx.wrapping_mul(16));
+            let sz = z.wrapping_add(dz.wrapping_mul(16));
+            let key = (sx & !3, sz & !3);
+            let surface = *self
+                .surfaces
+                .entry(key)
+                .or_insert_with(|| java_floor(f64::from(sampler.surface(key.0, key.1))));
+            let adjusted = surface.wrapping_add(8);
+            let center = dx == 0 && dz == 0;
+            if center && lower > adjusted {
+                return global;
+            }
+            let near_surface = upper > adjusted;
+            if near_surface || center {
+                let nearby = sampler.global(sx, adjusted, sz);
+                if !nearby.at(adjusted).is_air() {
+                    if center {
+                        center_flooded = true;
+                    }
+                    if near_surface {
+                        return nearby;
+                    }
+                }
+            }
+            min_surface = min_surface.min(surface);
+        }
+        let level =
+            compute_surface_level(sampler, x, y, z, global.level, min_surface, center_flooded);
+        let mut block = global.block;
+        if level <= -10 && level != WAY_BELOW_MIN_Y && block != S::Block::lava() {
+            let noise = sampler.lava(x.div_euclid(64), y.div_euclid(40), z.div_euclid(64));
+            if f64::from(noise).abs() > 0.3 {
+                block = S::Block::lava();
+            }
+        }
+        FluidStatus { level, block }
+    }
+}
+
+fn java_floor(value: f64) -> i32 {
+    let truncated = value as i32;
+    if value < f64::from(truncated) {
+        truncated.wrapping_sub(1)
+    } else {
+        truncated
+    }
+}
+
+fn compute_surface_level<S: AquiferSampler>(
+    sampler: &mut S,
+    x: i32,
+    y: i32,
+    z: i32,
+    global_level: i32,
+    min_surface: i32,
+    center_flooded: bool,
+) -> i32 {
+    let (low, high) = if sampler.exclusion(x, y, z) > 0.0 {
+        (-1.0, -1.0)
+    } else {
+        let height = min_surface.wrapping_add(8).wrapping_sub(y);
+        let influence = if center_flooded {
+            let fraction = f64::from(height) / 64.0;
+            if fraction < 0.0 {
+                1.0
+            } else if fraction > 1.0 {
+                0.0
+            } else {
+                1.0 + fraction * (0.0 - 1.0)
+            }
+        } else {
+            0.0
+        };
+        let flooded = f64::from(sampler.floodedness(x, y, z)).clamp(-1.0, 1.0);
+        // Mth.map(value, 1, 0, from, to) performs inverse lerp then lerp.
+        let t = (influence - 1.0) / (0.0 - 1.0);
+        let high_threshold = -0.3 + t * (0.8 - (-0.3));
+        let low_threshold = -0.8 + t * (0.4 - (-0.8));
+        (flooded - low_threshold, flooded - high_threshold)
+    };
+    if high > 0.0 {
+        return global_level;
+    }
+    if low <= 0.0 || low.is_nan() {
+        return WAY_BELOW_MIN_Y;
+    }
+    let gx = x.div_euclid(16);
+    let gy = y.div_euclid(40);
+    let gz = z.div_euclid(16);
+    let base = gy.wrapping_mul(40).wrapping_add(20);
+    let value = sampler.spread(gx, gy, gz) * 10.0;
+    let quantized = java_floor(f64::from(value) / 3.0).wrapping_mul(3);
+    min_surface.min(base.wrapping_add(quantized))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,7 +500,10 @@ impl AquiferLocator {
 
 #[cfg(test)]
 mod tests {
-    use super::{AquiferBlock, AquiferLocator, FluidStatus, pressure, resolve};
+    use super::{
+        AquiferBlock, AquiferGenerator, AquiferLocator, AquiferSampler, FluidStatus, pressure,
+        resolve,
+    };
     use std::cell::Cell;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +515,12 @@ mod tests {
     impl AquiferBlock for Block {
         fn air() -> Self {
             Self::Air
+        }
+        fn lava() -> Self {
+            Self::Lava
+        }
+        fn is_air(self) -> bool {
+            self == Self::Air
         }
         fn is_water(self) -> bool {
             self == Self::Water
@@ -349,5 +589,47 @@ mod tests {
         assert_eq!(result.block, Some(Block::Water));
         assert!(result.schedule_fluid_update);
         assert_eq!(samples.get(), 1);
+    }
+
+    #[test]
+    fn repeated_samples_reuse_center_status_and_surface() {
+        struct Sampler {
+            surfaces: usize,
+        }
+        impl AquiferSampler for Sampler {
+            type Block = Block;
+            fn barrier(&mut self, _: i32, _: i32, _: i32) -> f32 {
+                0.0
+            }
+            fn global(&mut self, _: i32, _: i32, _: i32) -> FluidStatus<Block> {
+                FluidStatus {
+                    level: 63,
+                    block: Block::Water,
+                }
+            }
+            fn surface(&mut self, _: i32, _: i32) -> f32 {
+                self.surfaces += 1;
+                80.0
+            }
+            fn exclusion(&mut self, _: i32, _: i32, _: i32) -> f32 {
+                0.0
+            }
+            fn floodedness(&mut self, _: i32, _: i32, _: i32) -> f32 {
+                0.0
+            }
+            fn spread(&mut self, _: i32, _: i32, _: i32) -> f32 {
+                0.0
+            }
+            fn lava(&mut self, _: i32, _: i32, _: i32) -> f32 {
+                0.0
+            }
+        }
+        let mut sampler = Sampler { surfaces: 0 };
+        let mut generator = AquiferGenerator::new(1234, false, 200);
+        let first = generator.sample(&mut sampler, 0, 0, 0, -1.0);
+        let initial = sampler.surfaces;
+        assert!(initial > 0);
+        assert_eq!(generator.sample(&mut sampler, 0, 0, 0, -1.0), first);
+        assert_eq!(sampler.surfaces, initial);
     }
 }

@@ -58,9 +58,9 @@ public class ItemLavaOracle {
     var health=ItemEntity.class.getDeclaredField("health"); health.setAccessible(true);
     var invuln=Entity.class.getDeclaredField("permanentlyInvulnerable"); invuln.setAccessible(true);
     var out=new JsonArray();
-    for(int mode=0;mode<3;mode++) {
+    for(int mode=0;mode<4;mode++) {
       var item=(Item)unsafe.allocateInstance(Item.class); item.world=world; item.sources=sources;
-      item.stack=new ItemStack(mode==1 ? Items.NETHERITE_INGOT : Items.STONE);
+      item.stack=new ItemStack(mode==1 ? Items.NETHERITE_INGOT : mode==3 ? Items.NETHER_STAR : Items.STONE);
       health.setInt(item,5); invuln.setBoolean(item,mode==2);
       var rows=new JsonArray();
       for(int tick=0;tick<2;tick++) {
@@ -73,9 +73,9 @@ public class ItemLavaOracle {
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));
     var fireOut=new JsonArray();
-    for(int mode=0;mode<3;mode++) {
+    for(int mode=0;mode<4;mode++) {
       var item=(Item)unsafe.allocateInstance(Item.class); item.world=world; item.sources=sources;
-      item.stack=new ItemStack(mode==1 ? Items.NETHERITE_INGOT : Items.STONE);
+      item.stack=new ItemStack(mode==1 ? Items.NETHERITE_INGOT : mode==3 ? Items.NETHER_STAR : Items.STONE);
       health.setInt(item,5); invuln.setBoolean(item,mode==2); item.setRemainingFireTicks(41);
       var rows=new JsonArray();
       for(int tick=0;tick<22;tick++) {

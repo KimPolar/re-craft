@@ -127,6 +127,11 @@ public class NumericItemOracle {
     for (name, _) in actual.iter() {
         let expected = if fire[name] {
             DamageResistancePrototype::FireTag
+        } else if other
+            .get(name)
+            .is_some_and(|tag| tag == "minecraft:is_explosion")
+        {
+            DamageResistancePrototype::ExplosionTag
         } else if other.contains_key(name) {
             DamageResistancePrototype::Unknown
         } else {

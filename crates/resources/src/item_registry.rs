@@ -50,6 +50,7 @@ pub struct ItemRegistry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DamageResistancePrototype {
     FireTag,
+    ExplosionTag,
     Absent,
     Unknown,
 }
@@ -215,8 +216,16 @@ impl ItemRegistry {
     /// Recognized default component state in the verified 26.3 registry.
     /// Initializers whose resistance value is not decoded remain unknown.
     pub fn damage_resistance_prototype(&self, id: &str) -> DamageResistancePrototype {
-        if !self.ids.contains_key(id) || self.other_resistance.contains(id) {
+        if !self.ids.contains_key(id) {
             DamageResistancePrototype::Unknown
+        } else if self.other_resistance.contains(id) {
+            // In 26.3 the nether star's delayed component resolves to this tag.
+            // Other delayed initializers remain unknown until decoded.
+            if id == "minecraft:nether_star" {
+                DamageResistancePrototype::ExplosionTag
+            } else {
+                DamageResistancePrototype::Unknown
+            }
         } else if self.fire_resistant.contains(id) {
             DamageResistancePrototype::FireTag
         } else {

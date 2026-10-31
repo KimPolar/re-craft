@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use glam::{DVec3, IVec3};
@@ -222,12 +222,21 @@ pub fn damage_resistant_in_world(
     damage_type: &str,
 ) -> anyhow::Result<Option<bool>> {
     use native_resources::item_registry::DamageResistancePrototype as Builtin;
-    let fire = Tag::Compound(vec![(
-        "types".into(),
-        Tag::String("#minecraft:is_fire".into()),
-    )]);
+    static FIRE: LazyLock<Tag> = LazyLock::new(|| {
+        Tag::Compound(vec![(
+            "types".into(),
+            Tag::String("#minecraft:is_fire".into()),
+        )])
+    });
+    static EXPLOSION: LazyLock<Tag> = LazyLock::new(|| {
+        Tag::Compound(vec![(
+            "types".into(),
+            Tag::String("#minecraft:is_explosion".into()),
+        )])
+    });
     let prototype = match items.damage_resistance_prototype(stack.id()) {
-        Builtin::FireTag => DamageResistancePrototype::Component(&fire),
+        Builtin::FireTag => DamageResistancePrototype::Component(&FIRE),
+        Builtin::ExplosionTag => DamageResistancePrototype::Component(&EXPLOSION),
         Builtin::Absent => DamageResistancePrototype::Absent,
         Builtin::Unknown => DamageResistancePrototype::Unknown,
     };
@@ -3247,7 +3256,7 @@ mod tests {
         for (id, expected) in [
             ("minecraft:dirt", Some(false)),
             ("minecraft:netherite_ingot", Some(true)),
-            ("minecraft:nether_star", None),
+            ("minecraft:nether_star", Some(false)),
             ("example:unknown", None),
         ] {
             let stack = ItemStack::new(id.into(), 1, 64, Tag::Compound(vec![])).unwrap();
@@ -3257,6 +3266,55 @@ mod tests {
                 "{id}"
             );
         }
+        let star =
+            ItemStack::new("minecraft:nether_star".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        assert_eq!(
+            damage_resistant_in_world(&star, &items, &tags, "minecraft:explosion").unwrap(),
+            Some(true)
+        );
+        struct ReplacedTags;
+        impl ResourceProvider for ReplacedTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(
+                &mut self,
+                folder: &str,
+            ) -> anyhow::Result<Vec<native_resources::packs::ResourceId>> {
+                match folder {
+                    "tags/damage_type" => Ok(vec![native_resources::packs::ResourceId::parse(
+                        "minecraft:is_explosion",
+                    )?]),
+                    "damage_type" => Ok(vec![
+                        native_resources::packs::ResourceId::parse("minecraft:lava")?,
+                        native_resources::packs::ResourceId::parse("minecraft:explosion")?,
+                    ]),
+                    _ => Ok(vec![]),
+                }
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(
+                    if path == "data/minecraft/tags/damage_type/is_explosion.json" {
+                        vec![br#"{"replace":true,"values":["minecraft:lava"]}"#.to_vec()]
+                    } else {
+                        vec![]
+                    },
+                )
+            }
+        }
+        let replaced =
+            native_resources::enchantments::OxygenEnchantments::load(&mut ReplacedTags).unwrap();
+        assert_eq!(
+            damage_resistant_in_world(&star, &items, &replaced, "minecraft:lava").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            damage_resistant_in_world(&star, &items, &replaced, "minecraft:explosion").unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -3308,9 +3366,11 @@ mod tests {
         assert!(!apply_lava_contact(&mut invulnerable, &rules).unwrap());
         assert_eq!(invulnerable._damage_state.health, 5);
         assert_eq!(invulnerable._damage_state.fire_ticks, 300);
-        let mut unknown = make("minecraft:nether_star");
-        assert!(!apply_lava_contact(&mut unknown, &rules).unwrap());
-        assert_eq!(unknown._damage_state, ItemDamageState::default());
+        let mut star = make("minecraft:nether_star");
+        assert!(!apply_lava_contact(&mut star, &rules).unwrap());
+        assert_eq!(star._damage_state.health, 1);
+        assert_eq!(star._damage_state.fire_ticks, 300);
+        assert!(apply_lava_contact(&mut star, &rules).unwrap());
 
         let version = game.join("versions/26.3");
         let manifest: serde_json::Value =
@@ -3354,11 +3414,11 @@ mod tests {
             .arg(&fire_result));
         let oracle: serde_json::Value =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
-        for mode in 0..3 {
-            let mut item = make(if mode == 1 {
-                "minecraft:netherite_ingot"
-            } else {
-                "minecraft:stone"
+        for mode in 0..4 {
+            let mut item = make(match mode {
+                1 => "minecraft:netherite_ingot",
+                3 => "minecraft:nether_star",
+                _ => "minecraft:stone",
             });
             item._damage_state.invulnerable = mode == 2;
             for row in oracle[mode].as_array().unwrap() {
@@ -3378,11 +3438,11 @@ mod tests {
         }
         let fire_oracle: serde_json::Value =
             serde_json::from_slice(&std::fs::read(fire_result).unwrap()).unwrap();
-        for mode in 0..3 {
-            let mut item = make(if mode == 1 {
-                "minecraft:netherite_ingot"
-            } else {
-                "minecraft:stone"
+        for mode in 0..4 {
+            let mut item = make(match mode {
+                1 => "minecraft:netherite_ingot",
+                3 => "minecraft:nether_star",
+                _ => "minecraft:stone",
             });
             item._damage_state.invulnerable = mode == 2;
             item._damage_state.fire_ticks = 41;

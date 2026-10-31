@@ -33990,7 +33990,7 @@ mod tests {
         for (id, removed) in [
             ("minecraft:stone", true),
             ("minecraft:netherite_ingot", false),
-            ("minecraft:nether_star", false),
+            ("minecraft:nether_star", true),
         ] {
             let mut session = liquid_session("minecraft:lava");
             session.set_item_damage_rules(Arc::clone(&items), Arc::clone(&tags));

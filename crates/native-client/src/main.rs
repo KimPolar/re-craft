@@ -873,6 +873,33 @@ fn prepare_existing_world(
         session
             .set_has_skylight(profile.has_skylight)
             .map_err(anyhow::Error::msg)?;
+        let mut can_weather = preview_lighting::can_have_weather(reader.dimension(), &profile);
+        if can_weather == Some(true) && rules.advance_weather {
+            can_weather = match preview_lighting::sole_weather_dimension(
+                &mut resources,
+                reader.dimension(),
+                saved_dimensions.as_ref(),
+            ) {
+                Ok(true) => Some(true),
+                Ok(false) => None,
+                Err(error) => {
+                    eprintln!("Weather dimension topology is unavailable: {error:#}");
+                    None
+                }
+            };
+        }
+        let weather = if can_weather == Some(true) {
+            match reader.weather_data() {
+                Ok(weather) => Some(weather),
+                Err(error) => {
+                    eprintln!("Saved weather is unavailable: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        session.set_weather(can_weather, weather, rules.advance_weather);
         let clocks = reader.world_clocks_document().and_then(|source| {
             let mut clocks = source
                 .as_ref()

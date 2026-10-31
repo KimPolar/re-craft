@@ -49,6 +49,52 @@ pub struct PreviewLighting {
     pub build_bounds: Option<(i32, i32)>,
 }
 
+/// Level.canHaveWeather depends on the dimension key as well as its type.
+pub fn can_have_weather(dimension: &DimensionId, profile: &PreviewLighting) -> Option<bool> {
+    if !profile.has_skylight || (dimension.namespace == "minecraft" && dimension.path == "the_end")
+    {
+        return Some(false);
+    }
+    profile.has_ceiling.map(|ceiling| !ceiling)
+}
+
+/// Weather data is shared and Java ticks it once for every weather-capable
+/// level. This client currently simulates just one dimension.
+pub fn sole_weather_dimension(
+    source: &mut impl ResourceProvider,
+    current: &DimensionId,
+    saved: Option<&BTreeMap<DimensionId, SavedDimensionType>>,
+) -> Result<bool> {
+    let Some(saved) = saved else {
+        return Ok(false);
+    };
+    if !saved.contains_key(current) {
+        return Ok(false);
+    }
+    let mut dimensions: std::collections::BTreeSet<_> = saved.keys().cloned().collect();
+    for id in source.list_data("dimension")? {
+        dimensions.insert(DimensionId::parse(&format!(
+            "{}:{}",
+            id.namespace, id.path
+        ))?);
+    }
+    for id in dimensions {
+        if &id == current || (id.namespace == "minecraft" && id.path == "the_end") {
+            continue;
+        }
+        let resolved = resolve_dimension_type(source, &id, Some(saved))?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        let profile = match resolved {
+            Some(id) => PreviewLighting::load_type(source, &id)?,
+            None => PreviewLighting::load(source, &name)?,
+        };
+        if can_have_weather(&id, &profile) != Some(false) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl Default for PreviewLighting {
     fn default() -> Self {
         Self {
@@ -421,6 +467,89 @@ impl PreviewLighting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_topology_rejects_extra_weather_levels_and_unknown_types() {
+        struct Data {
+            extra: bool,
+            unknown: bool,
+        }
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/dimension_type/the_nether.json" => {
+                        Some(br#"{"has_skylight":false,"has_ceiling":true}"#.to_vec())
+                    }
+                    "data/example/dimension_type/sky.json" if self.unknown => {
+                        Some(br#"{"has_skylight":true}"#.to_vec())
+                    }
+                    "data/example/dimension_type/sky.json" => {
+                        Some(br#"{"has_skylight":true,"has_ceiling":false}"#.to_vec())
+                    }
+                    _ => None,
+                })
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(if folder == "dimension" && self.extra {
+                    vec![ResourceId::parse("example:sky")?]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let overworld = DimensionId::parse("minecraft:overworld").unwrap();
+        let nether = DimensionId::parse("minecraft:the_nether").unwrap();
+        let end = DimensionId::parse("minecraft:the_end").unwrap();
+        let mut saved = BTreeMap::from([
+            (
+                overworld.clone(),
+                SavedDimensionType::Named(overworld.clone()),
+            ),
+            (nether.clone(), SavedDimensionType::Named(nether.clone())),
+            (end.clone(), SavedDimensionType::Named(end.clone())),
+        ]);
+        let mut data = Data {
+            extra: false,
+            unknown: false,
+        };
+        assert!(sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
+        assert!(!sole_weather_dimension(&mut data, &overworld, None).unwrap());
+        let extra = DimensionId::parse("example:sky").unwrap();
+        saved.insert(extra.clone(), SavedDimensionType::Named(extra));
+        data.extra = true;
+        assert!(!sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
+        data.unknown = true;
+        assert!(!sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
+        let profile =
+            PreviewLighting::from_json(br#"{"has_skylight":true,"has_ceiling":false}"#).unwrap();
+        assert_eq!(can_have_weather(&overworld, &profile), Some(true));
+        assert_eq!(can_have_weather(&end, &profile), Some(false));
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3"]
+    fn vanilla_dimension_set_has_one_weather_ticking_level() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut source = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let overworld = DimensionId::parse("minecraft:overworld").unwrap();
+        let saved = [
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+        ]
+        .into_iter()
+        .map(|name| {
+            let id = DimensionId::parse(name).unwrap();
+            (id.clone(), SavedDimensionType::Named(id))
+        })
+        .collect();
+        assert!(sole_weather_dimension(&mut source, &overworld, Some(&saved)).unwrap());
+    }
 
     #[test]
     fn sky_timeline_uses_active_tracks_and_rejects_biome_overrides() {

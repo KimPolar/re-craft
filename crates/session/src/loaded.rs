@@ -313,6 +313,9 @@ pub struct LoadedSession {
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
+    weather: Option<crate::weather::Weather>,
+    can_have_weather: Option<bool>,
+    advance_weather: bool,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
@@ -2818,6 +2821,28 @@ impl LoadedSession {
         self.farmland_water_tag = Some(bits);
     }
 
+    /// Unknown dimension or weather data prevents speculative precipitation decisions.
+    pub fn set_weather(
+        &mut self,
+        can_have_weather: Option<bool>,
+        data: Option<native_persistence::world::SavedWeather>,
+        advance_weather: bool,
+    ) {
+        self.can_have_weather = can_have_weather;
+        self.weather = data.map(crate::weather::Weather::new);
+        self.advance_weather = advance_weather;
+    }
+
+    fn global_rain(&self) -> Option<bool> {
+        match self.can_have_weather? {
+            false => Some(false),
+            true => self
+                .weather
+                .as_ref()
+                .map(|weather| weather.is_raining(true)),
+        }
+    }
+
     pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
         self.vanilla_block_ids = Some(ids);
         self.soil_deferred_revision = None;
@@ -3044,6 +3069,9 @@ impl LoadedSession {
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
             farmland_water_tag: None,
+            weather: None,
+            can_have_weather: None,
+            advance_weather: true,
             vanilla_block_ids: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
@@ -7765,11 +7793,10 @@ impl LoadedSession {
                         match kinds.get(id.0 as usize) {
                             Some(1) => active.lit_ores += 1,
                             Some(2) => snow.push(index),
-                            Some(3) => {
+                            Some(3) | Some(4) => {
                                 active.has_farmland = true;
                                 farmland.push(index);
                             }
-                            Some(4) => active.has_farmland = true,
                             _ => {}
                         }
                     }
@@ -7809,11 +7836,10 @@ impl LoadedSession {
             let y = i32::from(section) * 16;
             let mut snow_active = self.snow_can_melt_in_section(chunk, section, &active.snow);
             // Large random-tick speeds must not spin billions of times when no
-            // farmland can currently hydrate. Ordinary speeds avoid a full scan.
+            // farmland can change. Ordinary speeds avoid a full scan.
             let mut farmland_active = !active.farmland.is_empty()
                 && (self.random_tick_speed <= 64
-                    || self.farmland_can_hydrate_in_section(chunk, section, &active.farmland));
-            let mut farmland_remaining = active.farmland.len();
+                    || self.farmland_can_change_in_section(chunk, section, &active.farmland));
             for index in 0..self.random_tick_speed {
                 if active.lit_ores == 0 && !snow_active && !farmland_active {
                     self.random_block_position
@@ -7834,15 +7860,13 @@ impl LoadedSession {
                         true
                     } else if self.melt_snow_at(relative, absolute) {
                         true
-                    } else if self.hydrate_farmland_at(relative) {
-                        farmland_remaining = farmland_remaining.saturating_sub(1);
-                        farmland_active = farmland_remaining > 0
-                            && (self.random_tick_speed <= 64
-                                || self.farmland_can_hydrate_in_section(
-                                    chunk,
-                                    section,
-                                    &active.farmland,
-                                ));
+                    } else if self.random_tick_farmland_at(relative) {
+                        farmland_active = self.random_tick_speed <= 64
+                            || self.farmland_can_change_in_section(
+                                chunk,
+                                section,
+                                &active.farmland,
+                            );
                         true
                     } else {
                         false
@@ -7855,9 +7879,7 @@ impl LoadedSession {
         }
     }
 
-    /// A known nearby water block is sufficient even when rain state is unknown.
-    /// Drying is deferred until weather and its progression are available.
-    fn hydrate_farmland_at(&mut self, relative: IVec3) -> bool {
+    fn farmland_action(&self, relative: IVec3) -> Option<crate::farmland::RandomTick> {
         let Cell::State(id) = cell(
             &self.world,
             self.origin,
@@ -7865,37 +7887,91 @@ impl LoadedSession {
             relative,
             self.states[0],
         ) else {
-            return false;
+            return None;
         };
         let Some(state) = self.world.state(id) else {
-            return false;
+            return None;
         };
         let Some(moisture) = farmland_moisture(state) else {
-            return false;
+            return None;
         };
-        if moisture == 7 || !self.farmland_near_water(relative) {
-            return false;
+        // A globally dry level is definitive. During rain the sky, heightmap
+        // and biome precipitation still need to be checked per block.
+        let rain = self
+            .global_rain()
+            .and_then(|raining| (!raining).then_some(false));
+        if moisture == 7 && rain.is_none() {
+            return None;
         }
-        let Some(crate::farmland::RandomTick::Moisture(next)) =
-            crate::farmland::random_tick(moisture, Some(true), None, None)
-        else {
-            return false;
+        let water = self.farmland_near_water(relative);
+        let maintained = if moisture == 0 && water == Some(false) && rain == Some(false) {
+            let above = add(relative, IVec3::Y)?;
+            let Cell::State(id) =
+                cell(&self.world, self.origin, self.bounds, above, self.states[0])
+            else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            let known = matches!(
+                state.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ) || self
+                .vanilla_block_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&state.name));
+            if !known {
+                None
+            } else {
+                self.farmland_maintainers
+                    .as_ref()
+                    .map(|tag| tag.contains(&state.name))
+            }
+        } else {
+            None
         };
-        let mut replacement = state.clone();
-        replacement
-            .properties
-            .insert("moisture".into(), next.to_string());
-        let id = self.intern_block(replacement);
-        self.set_with_notify(relative, id, false)
+        crate::farmland::random_tick(moisture, water, rain, maintained)
     }
 
-    fn farmland_near_water(&self, relative: IVec3) -> bool {
+    fn random_tick_farmland_at(&mut self, relative: IVec3) -> bool {
+        match self.farmland_action(relative) {
+            Some(crate::farmland::RandomTick::Moisture(next)) => {
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    return false;
+                };
+                let Some(mut replacement) = self.world.state(id).cloned() else {
+                    return false;
+                };
+                replacement
+                    .properties
+                    .insert("moisture".into(), next.to_string());
+                let id = self.intern_block(replacement);
+                self.set_with_notify(relative, id, false)
+            }
+            Some(crate::farmland::RandomTick::Dirt) => {
+                let Some(absolute) = add(self.origin, relative) else {
+                    return false;
+                };
+                self.push_entities_from_soil(relative, absolute);
+                self.set(relative, self.states[2])
+            }
+            _ => false,
+        }
+    }
+
+    fn farmland_near_water(&self, relative: IVec3) -> Option<bool> {
         let Some(tag) = self.farmland_water_tag else {
-            return false;
+            return None;
         };
         if tag == 0 {
-            return false;
+            return Some(false);
         }
+        let mut unknown = false;
         for dy in 0..=1 {
             for dz in -4..=4 {
                 for dx in -4..=4 {
@@ -7906,27 +7982,30 @@ impl LoadedSession {
                         .zip(relative.z.checked_add(dz))
                         .map(|((x, y), z)| IVec3::new(x, y, z))
                     else {
+                        unknown = true;
                         continue;
                     };
-                    if let Cell::State(id) = cell(
+                    match cell(
                         &self.world,
                         self.origin,
                         self.bounds,
                         position,
                         self.states[0],
-                    ) && self
-                        .farmland_fluid_bit(id, tag & 1 != 0)
-                        .is_some_and(|fluid| tag & fluid != 0)
-                    {
-                        return true;
+                    ) {
+                        Cell::Missing => unknown = true,
+                        Cell::State(id) => match self.farmland_fluid_bit(id) {
+                            Some(fluid) if tag & fluid != 0 => return Some(true),
+                            Some(_) => {}
+                            None => unknown = true,
+                        },
                     }
                 }
             }
         }
-        false
+        if unknown { None } else { Some(false) }
     }
 
-    fn farmland_fluid_bit(&self, id: BlockStateId, include_empty: bool) -> Option<u8> {
+    fn farmland_fluid_bit(&self, id: BlockStateId) -> Option<u8> {
         let fluid = self.fluids.get(id.0 as usize)?;
         match fluid {
             Some(FluidState {
@@ -7950,9 +8029,6 @@ impl LoadedSession {
                 ..
             }) => Some(1 << 4),
             None => {
-                if !include_empty {
-                    return None;
-                }
                 let state = self.world.state(id)?;
                 if state
                     .properties
@@ -7973,7 +8049,7 @@ impl LoadedSession {
         }
     }
 
-    fn farmland_can_hydrate_in_section(
+    fn farmland_can_change_in_section(
         &self,
         chunk: ChunkPos,
         section_y: i8,
@@ -8000,7 +8076,7 @@ impl LoadedSession {
             let Some(state) = blocks.get(index).and_then(|id| self.world.state(*id)) else {
                 return false;
             };
-            if !farmland_moisture(state).is_some_and(|moisture| moisture < 7) {
+            if farmland_moisture(state).is_none() {
                 return false;
             }
             let absolute = IVec3::new(
@@ -8008,8 +8084,15 @@ impl LoadedSession {
                 i32::from(section_y) * 16 + (index / 256) as i32,
                 z + ((index / 16) % 16) as i32,
             );
-            subtract(absolute, self.origin)
-                .is_some_and(|relative| self.farmland_near_water(relative))
+            subtract(absolute, self.origin).is_some_and(|relative| {
+                matches!(
+                    self.farmland_action(relative),
+                    Some(
+                        crate::farmland::RandomTick::Moisture(_)
+                            | crate::farmland::RandomTick::Dirt
+                    )
+                )
+            })
         })
     }
 
@@ -10563,6 +10646,11 @@ impl LoadedSession {
         // MinecraftServer advances shared clocks before ticking its levels.
         for clock in self.world_clocks.values_mut() {
             clock.tick(self.advance_time);
+        }
+        if self.can_have_weather == Some(true)
+            && let Some(weather) = &mut self.weather
+        {
+            weather.tick(true, self.advance_weather, &mut self.level_random);
         }
         if let Some(environment) = &self.fast_lava_environment
             && let Some(value) = environment.sample(|id| {
@@ -13422,8 +13510,11 @@ mod tests {
                 let other = session.intern_block(block.clone());
                 assert!(session.set(pos, farmland));
                 assert!(session.set(pos + IVec3::new(dx, dy, dz), other));
-                assert_eq!(session.farmland_near_water(pos), expected);
-                assert_eq!(session.hydrate_farmland_at(pos), expected && moisture < 7);
+                assert_eq!(session.farmland_near_water(pos) == Some(true), expected);
+                assert_eq!(
+                    session.random_tick_farmland_at(pos),
+                    expected && moisture < 7
+                );
                 let absolute = session.origin + pos;
                 assert_eq!(
                     farmland_moisture(
@@ -13485,7 +13576,7 @@ mod tests {
             let fluid = session.intern_block(block);
             assert!(session.set(pos, farmland));
             assert!(session.set(pos + IVec3::X, fluid));
-            assert_eq!(session.hydrate_farmland_at(pos), expected);
+            assert_eq!(session.random_tick_farmland_at(pos), expected);
         }
         let mut session = session();
         session.farmland_water_tag = None;
@@ -13494,7 +13585,7 @@ mod tests {
         let pos = IVec3::new(8, 3, 8);
         assert!(session.set(pos, farmland));
         assert!(session.set(pos + IVec3::X, water));
-        assert!(!session.hydrate_farmland_at(pos));
+        assert!(!session.random_tick_farmland_at(pos));
     }
 
     #[test]
@@ -13556,6 +13647,172 @@ mod tests {
                 expected.next_section_offset()
             );
         }
+    }
+
+    #[test]
+    fn dry_weather_decrements_moisture_and_preserves_maintained_farmland() {
+        for moisture in 0_u8..=7 {
+            for maintained in [false, true] {
+                let mut session = session();
+                session.set_weather(Some(false), None, true);
+                session.set_vanilla_block_ids(Arc::new(
+                    [
+                        "minecraft:air",
+                        "minecraft:stone",
+                        "minecraft:farmland",
+                        "minecraft:wheat",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                ));
+                session.set_farmland_maintainers(Arc::new(if maintained {
+                    BTreeSet::from(["minecraft:wheat".into()])
+                } else {
+                    BTreeSet::new()
+                }));
+                let pos = IVec3::new(8, 3, 8);
+                let farmland = session.intern_block(state(
+                    "minecraft:farmland",
+                    &[("moisture", &moisture.to_string())],
+                ));
+                assert!(session.set(pos, farmland));
+                if maintained {
+                    let wheat = session.intern_block(state("minecraft:wheat", &[("age", "0")]));
+                    assert!(session.set(pos + IVec3::Y, wheat));
+                }
+                assert_eq!(session.farmland_near_water(pos), Some(false));
+                assert_eq!(
+                    session.random_tick_farmland_at(pos),
+                    moisture > 0 || !maintained
+                );
+                let absolute = session.origin + pos;
+                let result = session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap();
+                if moisture == 0 && !maintained {
+                    assert_eq!(result.name, "minecraft:dirt");
+                } else {
+                    assert_eq!(farmland_moisture(result), Some(moisture.saturating_sub(1)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_water_rain_or_maintenance_never_speculates_on_drying() {
+        let mut session = session();
+        session.set_weather(Some(false), None, true);
+        session.set_vanilla_block_ids(Arc::new(
+            ["minecraft:air", "minecraft:stone", "minecraft:farmland"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+        let edge = IVec3::new(1, 3, 8);
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "3")]));
+        assert!(session.set(edge, farmland));
+        assert_eq!(session.farmland_near_water(edge), None);
+        assert!(!session.random_tick_farmland_at(edge));
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set(edge + IVec3::X, water));
+        assert_eq!(session.farmland_near_water(edge), Some(true));
+        assert!(session.random_tick_farmland_at(edge));
+
+        let mut session = self::session();
+        session.set_vanilla_block_ids(Arc::new(
+            ["minecraft:air", "minecraft:stone", "minecraft:farmland"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+        let pos = IVec3::new(8, 3, 8);
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "0")]));
+        assert!(session.set(pos, farmland));
+        session.set_weather(None, None, true);
+        assert!(!session.random_tick_farmland_at(pos));
+        session.set_weather(Some(false), None, true);
+        session.farmland_maintainers = None;
+        assert!(!session.random_tick_farmland_at(pos));
+        session.set_weather(
+            Some(true),
+            Some(native_persistence::world::SavedWeather {
+                raining: true,
+                ..Default::default()
+            }),
+            false,
+        );
+        assert!(!session.random_tick_farmland_at(pos));
+    }
+
+    #[test]
+    fn dry_farmland_high_random_speed_finishes_without_losing_rng_position() {
+        let mut session = session();
+        session.set_weather(Some(false), None, true);
+        session.set_vanilla_block_ids(Arc::new(
+            ["minecraft:air", "minecraft:stone", "minecraft:farmland"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+        let seed = (0..10000)
+            .find(|&seed| {
+                let [x, y, z] =
+                    native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+                (4..=11).contains(&x) && (2..=13).contains(&y) && (4..=11).contains(&z)
+            })
+            .unwrap();
+        let pos = IVec3::from_array(
+            native_core::random::BlockRandomPosition::new(seed).next_section_offset(),
+        );
+        let farmland = session.intern_block(state("minecraft:farmland", &[("moisture", "7")]));
+        assert!(session.set(pos, farmland));
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(i32::MAX as u32);
+        let mut expected = native_core::random::BlockRandomPosition::new(seed);
+        expected.skip(i32::MAX as u32);
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected.next_section_offset()
+        );
+        let absolute = session.origin + pos;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:dirt"
+        );
+    }
+
+    #[test]
+    fn loaded_weather_advances_before_block_ticks_and_honors_the_game_rule() {
+        let mut session = session();
+        let data = native_persistence::world::SavedWeather {
+            rain_time: 1,
+            thunder_time: 100,
+            ..Default::default()
+        };
+        session.set_weather(Some(true), Some(data), true);
+        session.set_random_tick_speed(0);
+        session.update(TICK);
+        let weather = session.weather.as_ref().unwrap();
+        assert!(weather.data.raining);
+        assert_eq!(weather.data.rain_time, 0);
+        assert_eq!(weather.rain_level, 0.01_f32);
+        assert_eq!(session.global_rain(), Some(false));
+        for _ in 0..20 {
+            session.update(TICK);
+        }
+        assert_eq!(session.global_rain(), Some(true));
+
+        session.set_weather(Some(true), Some(data), false);
+        session.update(TICK);
+        assert_eq!(session.weather.as_ref().unwrap().data, data);
+        assert_eq!(session.global_rain(), Some(false));
     }
 
     #[test]

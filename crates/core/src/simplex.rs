@@ -13,6 +13,11 @@ pub struct Simplex2D {
 impl Simplex2D {
     pub fn new(seed: i64, zero_offsets: bool) -> Self {
         let mut random = LegacyRandom::new(seed);
+        Self::from_random(&mut random, zero_offsets)
+    }
+
+    /// Construct consecutive noise layers from the same Java random source.
+    pub fn from_random(random: &mut LegacyRandom, zero_offsets: bool) -> Self {
         let scale = if zero_offsets { 0.0 } else { 256.0 };
         let offset_x = random.next_double() * scale;
         let offset_y = random.next_double() * scale;

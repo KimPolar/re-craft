@@ -316,6 +316,7 @@ pub struct LoadedSession {
     weather: Option<crate::weather::Weather>,
     can_have_weather: Option<bool>,
     advance_weather: bool,
+    game_time: i64,
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
@@ -2844,6 +2845,15 @@ impl LoadedSession {
         }
     }
 
+    pub fn set_initial_game_time(&mut self, value: i64) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("game time must be restored before simulation begins");
+        }
+        self.game_time = value;
+        Arc::make_mut(&mut self.snapshot).game_time = value;
+        Ok(())
+    }
+
     fn global_rain(&self) -> Option<bool> {
         match self.can_have_weather? {
             false => Some(false),
@@ -2985,6 +2995,7 @@ impl LoadedSession {
             system_messages: Arc::clone(&self.system_messages),
             locked_chest_message: self.locked_chest_message.clone(),
             weather: self.weather_visual(),
+            game_time: self.game_time,
             tick: self.tick,
             origin: self.origin,
             world_revision: self.revision,
@@ -3095,6 +3106,7 @@ impl LoadedSession {
             system_messages: Arc::from([]),
             locked_chest_message: None,
             weather: None,
+            game_time: 0,
             tick: 0,
             origin,
             world_revision: 0,
@@ -3135,6 +3147,7 @@ impl LoadedSession {
             weather: None,
             can_have_weather: None,
             advance_weather: true,
+            game_time: 0,
             biome_climates: None,
             generator_sea_level: None,
             vanilla_block_ids: None,
@@ -10704,6 +10717,7 @@ impl LoadedSession {
     }
 
     fn advance_tick(&mut self) {
+        self.game_time = self.game_time.wrapping_add(1);
         // MinecraftServer advances shared clocks before ticking its levels.
         for clock in self.world_clocks.values_mut() {
             clock.tick(self.advance_time);
@@ -12298,6 +12312,7 @@ impl GameSession for LoadedSession {
                 system_messages: Arc::clone(&self.system_messages),
                 locked_chest_message: self.locked_chest_message.clone(),
                 weather: self.weather_visual(),
+                game_time: self.game_time,
                 tick: self.tick,
                 origin: self.origin,
                 world_revision: self.revision,
@@ -13887,6 +13902,7 @@ mod tests {
             ..Default::default()
         };
         for session in [&mut fast, &mut slow] {
+            session.set_initial_game_time(i64::MAX).unwrap();
             session.set_weather(Some(true), Some(weather), true);
             session.set_random_tick_speed(0);
         }
@@ -13898,6 +13914,9 @@ mod tests {
         assert_eq!(fast.snapshot().weather, slow.snapshot().weather);
         assert_eq!(before.weather.unwrap().rain, 0.0);
         let visual = fast.snapshot().weather.unwrap();
+        assert_eq!(fast.snapshot().game_time, i64::MIN + 1);
+        assert_eq!(before.game_time, i64::MAX);
+        assert!(fast.set_initial_game_time(0).is_err());
         assert_eq!(visual.previous_rain, 0.01);
         assert_eq!(visual.rain, 0.02);
         fast.set_weather(None, None, true);

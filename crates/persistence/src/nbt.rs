@@ -90,6 +90,19 @@ pub enum Tag {
 }
 
 impl Tag {
+    /// Match `Number.longValue()` for Java dynamic numeric values.
+    pub fn as_java_long(&self) -> Option<i64> {
+        match self {
+            Self::Byte(value) => Some(i64::from(*value)),
+            Self::Short(value) => Some(i64::from(*value)),
+            Self::Int(value) => Some(i64::from(*value)),
+            Self::Long(value) => Some(*value),
+            Self::Float(value) => Some(*value as i64),
+            Self::Double(value) => Some(*value as i64),
+            _ => None,
+        }
+    }
+
     /// Match `Number.intValue()` for numeric NBT tags used by Java codecs.
     pub fn as_java_int(&self) -> Option<i32> {
         match self {

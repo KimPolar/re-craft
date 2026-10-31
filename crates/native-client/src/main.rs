@@ -868,6 +868,9 @@ fn prepare_existing_world(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        session
+            .set_initial_game_time(reader.game_time()?)
+            .map_err(anyhow::Error::msg)?;
         match native_resources::fluid_tags::load_water(&mut resources) {
             Ok(tag) => session.set_farmland_water_tag(Arc::new(tag)),
             Err(error) => eprintln!("Farmland water fluid tag is unavailable: {error:#}"),

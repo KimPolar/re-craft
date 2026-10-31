@@ -1051,6 +1051,16 @@ impl WorldReader {
         }
     }
 
+    /// Java's shared game time is independent of daylight and world clocks.
+    pub fn game_time(&self) -> Result<i64> {
+        let data = self
+            .level
+            .value
+            .get("Data")
+            .context("level.dat is missing Data")?;
+        Ok(data.get("Time").and_then(Tag::as_java_long).unwrap_or(0))
+    }
+
     fn saved_world_gen_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/world_gen_settings.dat");
         let file = match File::open(&path) {
@@ -2422,6 +2432,33 @@ mod tests {
             let reader =
                 WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
             assert_eq!(reader.default_game_type_id().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn reads_shared_game_time_like_java_dynamic() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, expected) in [
+            (None, 0),
+            (Some(Tag::Long(i64::MAX)), i64::MAX),
+            (Some(Tag::Int(-42)), -42),
+            (Some(Tag::Double(19.75)), 19),
+            (Some(Tag::String("invalid".into())), 0),
+        ] {
+            let mut document = level(TARGET_DATA_VERSION);
+            if let Some(field) = field {
+                let Tag::Compound(root) = &mut document.value else {
+                    unreachable!()
+                };
+                let Tag::Compound(data) = &mut root[0].1 else {
+                    unreachable!()
+                };
+                data.push(("Time".into(), field));
+            }
+            write_gzip(&dir.path().join("level.dat"), &document);
+            let reader =
+                WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+            assert_eq!(reader.game_time().unwrap(), expected);
         }
     }
 

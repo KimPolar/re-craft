@@ -88,4 +88,30 @@ fn catalog_compiles_installed_density_functions() {
             "missing {expected}"
         );
     }
+    drop(compiler);
+    let mut compiler = DensityCompiler::with_world_seed(&mut sources, 0, WorldgenRandom::Xoroshiro)
+        .without_old_chunk_blending()
+        .without_structure_terrain_adjustment();
+    let mut unadjusted = Vec::new();
+    for id in &ids {
+        let name = format!("{}:{}", id.namespace, id.path);
+        if compiler.compile_id(&name).is_ok() {
+            unadjusted.push(name);
+        }
+    }
+    println!(
+        "unadjusted supported: {} {:?}",
+        unadjusted.len(),
+        unadjusted
+    );
+    for expected in [
+        "minecraft:overworld/final_density",
+        "minecraft:overworld_large_biomes/final_density",
+        "minecraft:overworld_amplified/final_density",
+    ] {
+        assert!(
+            unadjusted.iter().any(|name| name == expected),
+            "missing {expected}"
+        );
+    }
 }

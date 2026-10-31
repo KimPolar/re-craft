@@ -280,6 +280,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld/sloped_cheese",
         "minecraft:overworld/preliminary_surface_level",
         "minecraft:overworld/chunk_surface_level",
+        "minecraft:overworld/final_density",
         "minecraft:overworld_large_biomes/offset",
         "minecraft:overworld_large_biomes/factor",
         "minecraft:overworld_large_biomes/jaggedness",
@@ -287,6 +288,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld_large_biomes/sloped_cheese",
         "minecraft:overworld_large_biomes/preliminary_surface_level",
         "minecraft:overworld_large_biomes/chunk_surface_level",
+        "minecraft:overworld_large_biomes/final_density",
         "minecraft:overworld_amplified/offset",
         "minecraft:overworld_amplified/factor",
         "minecraft:overworld_amplified/jaggedness",
@@ -294,6 +296,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld_amplified/sloped_cheese",
         "minecraft:overworld_amplified/preliminary_surface_level",
         "minecraft:overworld_amplified/chunk_surface_level",
+        "minecraft:overworld_amplified/final_density",
     ] {
         let mut noise_ids = std::collections::BTreeSet::new();
         let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);
@@ -308,7 +311,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
             );
         }
-        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"unblended":true,"rust_expression":id,"java_expression":java_expression}));
+        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"unblended":true,"no_structures":true,"rust_expression":id,"java_expression":java_expression}));
     }
     let mut noise_ids = std::collections::BTreeSet::new();
     let java_islands = inline_installed(
@@ -374,6 +377,9 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 let mut compiler = DensityCompiler::with_world_seed(&mut data, seed, algorithm);
                 if fixtures[index]["unblended"].as_bool() == Some(true) {
                     compiler = compiler.without_old_chunk_blending();
+                }
+                if fixtures[index]["no_structures"].as_bool() == Some(true) {
+                    compiler = compiler.without_structure_terrain_adjustment();
                 }
                 let function = compiler
                     .compile(&fixtures[index]["rust_expression"])

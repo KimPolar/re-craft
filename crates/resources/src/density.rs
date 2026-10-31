@@ -133,6 +133,8 @@ enum Node {
     Spline(Spline),
     UnblendedAlpha,
     UnblendedOffset,
+    UnblendedDensity(Arc<DensityFunction>),
+    NoStructures,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -478,6 +480,8 @@ impl DensityFunction {
             Node::Spline(spline) => spline.sample(x, y, z, volume, memo),
             Node::UnblendedAlpha => 1.0,
             Node::UnblendedOffset => 0.0,
+            Node::UnblendedDensity(input) => input.evaluate_cached(x, y, z, volume, memo),
+            Node::NoStructures => 0.0,
         }
     }
 }
@@ -536,8 +540,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         | Node::Spline(_)
         | Node::UnblendedAlpha
         | Node::UnblendedOffset => vec![],
+        Node::NoStructures => vec![],
         Node::Reference(value)
         | Node::Cache(value)
+        | Node::UnblendedDensity(value)
         | Node::Clamp { input: value, .. }
         | Node::Slice { input: value, .. }
         | Node::Unary { input: value, .. }
@@ -601,6 +607,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             }
         }
         Node::UnblendedAlpha | Node::UnblendedOffset => axes = 5,
+        Node::NoStructures => axes = 7,
         _ => {}
     }
     if let Node::Spline(spline) = &node {
@@ -616,7 +623,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     );
     let range = match &node {
         Node::Constant(value) => Interval::exact(*value),
-        Node::Reference(input) | Node::Cache(input) | Node::Interpolated { input, .. } => input.4,
+        Node::Reference(input)
+        | Node::Cache(input)
+        | Node::UnblendedDensity(input)
+        | Node::Interpolated { input, .. } => input.4,
         Node::Slice { input, .. } => input.4,
         Node::FindTopSurface { lower, upper, .. } => {
             Interval::bounds(*lower as f32, interval::max(*lower as f32, upper.4.max))
@@ -680,6 +690,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Spline(spline) => spline.range(),
         Node::UnblendedAlpha => Interval::bounds(0.0, 1.0),
         Node::UnblendedOffset => Interval::bounds(f32::NEG_INFINITY, f32::INFINITY),
+        Node::NoStructures => Interval::bounds(f32::NEG_INFINITY, f32::INFINITY),
     };
     Ok(Arc::new(DensityFunction(
         node,
@@ -703,6 +714,7 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     world_seed: Option<i64>,
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
     unblended: bool,
+    no_structure_adjustment: bool,
     end_island_noise: Option<Arc<Simplex2D>>,
     blended_noises: BTreeMap<String, Arc<BlendedNoise>>,
 }
@@ -732,6 +744,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             world_seed: None,
             noises: BTreeMap::new(),
             unblended: false,
+            no_structure_adjustment: false,
             end_island_noise: None,
             blended_noises: BTreeMap::new(),
         }
@@ -755,6 +768,12 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
     /// Use only where no older chunk data needs terrain blending.
     pub fn without_old_chunk_blending(mut self) -> Self {
         self.unblended = true;
+        self
+    }
+
+    /// Use only when no structures affect the sampled terrain.
+    pub fn without_structure_terrain_adjustment(mut self) -> Self {
+        self.no_structure_adjustment = true;
         self
     }
 
@@ -890,6 +909,17 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 } else {
                     Node::UnblendedOffset
                 }
+            }
+            "blend_density" => {
+                ensure!(self.unblended, "terrain blending context is required");
+                Node::UnblendedDensity(self.expression(field("input")?, depth + 1)?)
+            }
+            "beardifier" => {
+                ensure!(
+                    self.no_structure_adjustment,
+                    "structure terrain adjustment context is required"
+                );
+                Node::NoStructures
             }
             "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
             "old_blended_noise" => {
@@ -1522,6 +1552,21 @@ mod tests {
         assert_eq!(alpha.range(), (0.0, 1.0));
         assert_eq!(offset.sample(1, 2, 3), 0.0);
         assert_eq!(offset.range(), (f32::NEG_INFINITY, f32::INFINITY));
+        assert!(compiler.compile(&json!({"type":"beardifier"})).is_err());
+        let blended = compiler
+            .compile(&json!({"type":"blend_density","input":0.25}))
+            .unwrap();
+        assert_eq!(blended.sample(1, 2, 3), 0.25);
+        assert_eq!(blended.range(), (0.25, 0.25));
+        let mut compiler = DensityCompiler::new(&mut data).without_structure_terrain_adjustment();
+        assert!(
+            compiler
+                .compile(&json!({"type":"blend_density","input":0}))
+                .is_err()
+        );
+        let beardifier = compiler.compile(&json!({"type":"beardifier"})).unwrap();
+        assert_eq!(beardifier.sample(1, 2, 3), 0.0);
+        assert_eq!(beardifier.range(), (f32::NEG_INFINITY, f32::INFINITY));
     }
 
     #[test]

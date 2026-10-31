@@ -142,6 +142,7 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
         | "minecraft:cobblestone"
         | "minecraft:mossy_cobblestone"
         | "minecraft:stone_bricks"
+        | "minecraft:lodestone"
         | "minecraft:mossy_stone_bricks"
         | "minecraft:cracked_stone_bricks"
         | "minecraft:chiseled_stone_bricks"

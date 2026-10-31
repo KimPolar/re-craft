@@ -6372,9 +6372,21 @@ impl LoadedSession {
     }
 
     fn place_snow_block(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        self.place_plain_solid(hit, "minecraft:snow_block")
+    }
+
+    fn place_lodestone(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        self.place_plain_solid(hit, "minecraft:lodestone")
+    }
+
+    fn place_plain_solid(
+        &mut self,
+        hit: ShapeRayHit,
+        name: &str,
+    ) -> Option<crate::inventory::PlayerSlot> {
         let hand = crate::placement_input_hand(&self.inventory);
         let held = self.inventory.slot(hand)?;
-        if held.id() != "minecraft:snow_block" || held.max_count().is_none() {
+        if held.id() != name || held.max_count().is_none() {
             return None;
         }
         let Cell::State(clicked) = cell(
@@ -6409,7 +6421,7 @@ impl LoadedSession {
         {
             return None;
         }
-        let id = self.intern_block(state("minecraft:snow_block", &[]));
+        let id = self.intern_block(state(name, &[]));
         self.set(target, id).then_some(hand)
     }
 
@@ -7083,6 +7095,15 @@ impl LoadedSession {
         let snow = matches!(name.as_str(), "minecraft:snow" | "minecraft:snow_block");
         let stair = crate::stair_items::is_stair_item(&name);
         let slab = crate::slab_mining::material(&name).is_some();
+        let lodestone = name == "minecraft:lodestone";
+        if lodestone
+            && !self
+                .world
+                .state(id)
+                .is_some_and(|state| state.properties.is_empty())
+        {
+            return;
+        }
         if stair && self.stair_voxels(id).is_none() {
             return;
         }
@@ -7099,15 +7120,18 @@ impl LoadedSession {
         {
             return;
         }
-        if (snow || stair || slab) && self.game_mode != GameMode::Creative && properties.is_none() {
+        if (snow || stair || slab || lodestone)
+            && self.game_mode != GameMode::Creative
+            && properties.is_none()
+        {
             return;
         }
-        let checked_drops = if (snow || stair || slab)
+        let checked_drops = if (snow || stair || slab || lodestone)
             && self.game_mode != GameMode::Creative
             && self.block_drops
             && properties.is_some_and(|properties| properties.correct_for_drops)
         {
-            if (stair || slab)
+            if (stair || slab || lodestone)
                 && !self
                     .loot
                     .as_ref()
@@ -7178,7 +7202,7 @@ impl LoadedSession {
                     drops,
                     true,
                 );
-            } else if !snow && !stair && !slab {
+            } else if !snow && !stair && !slab && !lodestone {
                 self.dropped_items.drop_block_with_name(
                     absolute,
                     &name,
@@ -9864,6 +9888,7 @@ impl LoadedSession {
                                         | "minecraft:lever"
                                         | "minecraft:snow"
                                         | "minecraft:snow_block"
+                                        | "minecraft:lodestone"
                                         | "minecraft:chest"
                                         | "minecraft:trapped_chest"
                                 )
@@ -9917,6 +9942,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_redstone(hit))
                                     .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_snow_block(hit))
+                                    .or_else(|| self.place_lodestone(hit))
                                     .or_else(|| self.place_chest(hit))
                                     .or_else(|| self.place_slab(hit))
                                     .or_else(|| self.place_stairs(hit))
@@ -11608,7 +11634,7 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
     } else {
         matches!(
             block.name.as_str(),
-            "minecraft:redstone_block" | "minecraft:snow_block"
+            "minecraft:redstone_block" | "minecraft:snow_block" | "minecraft:lodestone"
         ) && block.properties.is_empty()
     };
     if !supported {
@@ -12394,7 +12420,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 3 * 21 * 21 * 6);
+        assert_eq!(rows.len(), 4 * 21 * 21 * 6);
         let mut session = session();
         let pos = IVec3::new(4, 8, 4);
         for row in rows {
@@ -13673,6 +13699,175 @@ mod tests {
                 assert_eq!(
                     session.inventory.slot(hand).unwrap().count(),
                     if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lodestone_use_respects_hand_mode_and_tracks_poi_changes() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                let home = session.player_chunk().unwrap();
+                session
+                    .set_initial_poi_chunk(home, SavedPoiData::Missing)
+                    .unwrap();
+                session.set_random_tick_speed(0);
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:lodestone".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let target = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                let allowed = matches!(mode, GameMode::Survival | GameMode::Creative);
+                assert_eq!(
+                    target.name,
+                    if allowed {
+                        "minecraft:lodestone"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+                assert_eq!(session.dirty_poi_chunk_positions().contains(&home), allowed);
+                if allowed {
+                    assert_eq!(
+                        picked_loaded_block_item(target).unwrap().id(),
+                        "minecraft:lodestone"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lodestone_mining_defers_unknown_tools_and_unavailable_loot() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for held in [
+            ItemStack::unresolved("example:unknown_tool".into(), 1, Tag::Compound(vec![])).unwrap(),
+            ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![])).unwrap(),
+        ] {
+            let mut session = session();
+            let relative = IVec3::new(4, 1, 4);
+            let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+            assert!(session.set(relative, lodestone));
+            Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(held));
+            session.finish_breaking(session.origin + relative);
+            assert_eq!(
+                session
+                    .world
+                    .block(session.origin.x + 4, 1, session.origin.z + 4)
+                    .unwrap()
+                    .name,
+                "minecraft:lodestone"
+            );
+            assert!(session.dropped_items.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn lodestone_mining_uses_datapack_loot() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceProvider;
+        struct LootSource;
+        impl ResourceProvider for LootSource {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/blocks/lodestone.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut LootSource).unwrap()));
+        let relative = IVec3::new(4, 1, 4);
+        let id = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(relative, id));
+        Arc::make_mut(&mut session.inventory).set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.finish_breaking(session.origin + relative);
+        assert_eq!(
+            session
+                .world
+                .block(session.origin.x + 4, 1, session.origin.z + 4)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        let drops = session.dropped_items.snapshot();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].stack.id(), "minecraft:diamond");
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn lodestone_breaking_uses_vanilla_loot_and_tool_rules() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let loot =
+            Arc::new(BlockLootTables::load(&mut ResourceStack::open(&game).unwrap()).unwrap());
+        for pickaxe in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            let relative = IVec3::new(4, 1, 4);
+            let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+            assert!(session.set(relative, lodestone));
+            if pickaxe {
+                Arc::make_mut(&mut session.inventory).set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![])),
+                );
+            }
+            session.finish_breaking(session.origin + relative);
+            assert_eq!(
+                session
+                    .world
+                    .block(session.origin.x + 4, 1, session.origin.z + 4)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(drops.len(), usize::from(pickaxe));
+            if pickaxe {
+                assert_eq!(drops[0].stack.id(), "minecraft:lodestone");
+                assert_eq!(drops[0].stack.count(), 1);
+                assert_eq!(
+                    session
+                        .inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage"),
+                    Some(&Tag::Int(1))
                 );
             }
         }

@@ -40,7 +40,7 @@ public class OrdinaryPlacementOracle {
     for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
     var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
     var world=(World)((sun.misc.Unsafe)field.get(null)).allocateInstance(World.class);
-    String[] items={"stone","dirt","oak_log"};
+    String[] items={"stone","dirt","oak_log","lodestone"};
     String[] blocks={"stone","air","snow_1","snow_2","snow_8","water","lava","short_grass","fern","dead_bush","fire","soul_fire", "torch", "wall_torch", "soul_torch", "soul_wall_torch", "oak_sapling", "spruce_sapling", "cherry_sapling", "dandelion", "poppy"};
     var result=new JsonArray();
     for(String item:items) for(String clicked:blocks) for(String adjacent:blocks) for(Direction face:Direction.values()) {

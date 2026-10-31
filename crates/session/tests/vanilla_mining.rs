@@ -2454,6 +2454,7 @@ fn supported_redstone_conductors_match_java_states() {
         "cobblestone",
         "mossy_cobblestone",
         "stone_bricks",
+        "lodestone",
         "mossy_stone_bricks",
         "cracked_stone_bricks",
         "chiseled_stone_bricks",

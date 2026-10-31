@@ -98,6 +98,7 @@ pub enum Material {
     WoodButton,
     RedstoneLamp,
     RedstoneBlock,
+    Lodestone,
     Lever,
     Cobblestone,
     /// Vanilla ore hardness and the minimum harvest tier: wood, stone or iron.
@@ -146,6 +147,7 @@ impl Material {
             "minecraft:stone_button" => Some(Self::StoneButton),
             "minecraft:redstone_lamp" => Some(Self::RedstoneLamp),
             "minecraft:redstone_block" => Some(Self::RedstoneBlock),
+            "minecraft:lodestone" => Some(Self::Lodestone),
             "minecraft:lever" => Some(Self::Lever),
             "minecraft:cobblestone" => Some(Self::Cobblestone),
             "minecraft:coal_ore" | "minecraft:nether_gold_ore" | "minecraft:nether_quartz_ore" => {
@@ -226,6 +228,7 @@ impl Material {
             Self::SnowBlock => 0.2,
             Self::RedstoneLamp => 0.3,
             Self::RedstoneBlock => 5.0,
+            Self::Lodestone => 3.5,
             Self::Stone | Self::StoneBricks => 1.5,
             Self::Planks | Self::Cobblestone | Self::Wood => 2.0,
             Self::CraftingTable | Self::Chest => 2.5,
@@ -253,6 +256,7 @@ impl Material {
                 | Self::StoneBricks
                 | Self::Cobblestone
                 | Self::RedstoneBlock
+                | Self::Lodestone
                 | Self::Ore { .. }
                 | Self::Snow
                 | Self::SnowBlock
@@ -386,6 +390,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
                 | Material::Cobblestone
                 | Material::StoneButton
                 | Material::RedstoneBlock
+                | Material::Lodestone
                 | Material::Ore { .. }
                 | Material::Stair {
                     tool: StairTool::Pickaxe | StairTool::StonePickaxe,

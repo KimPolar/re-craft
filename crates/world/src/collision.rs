@@ -270,6 +270,9 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if id == "honey_block" {
         return Some(HONEY.to_vec());
     }
+    if id == "lodestone" {
+        return state.properties.is_empty().then(|| FULL.to_vec());
+    }
     if id == "straw_bed" {
         return straw_bed(state);
     }

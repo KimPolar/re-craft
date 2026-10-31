@@ -47,6 +47,17 @@ impl PerlinStack {
     pub fn push(&mut self, noise: PerlinNoise, frequency: f64, amplitude: f32) {
         self.layers.push((noise, frequency, amplitude));
     }
+    pub fn append_scaled(&mut self, stack: PerlinStack, frequency: f64, amplitude: f32) {
+        self.layers.extend(stack.layers.into_iter().map(
+            |(noise, layer_frequency, layer_amplitude)| {
+                (
+                    noise,
+                    layer_frequency * frequency,
+                    layer_amplitude * amplitude,
+                )
+            },
+        ));
+    }
     pub fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
         let mut total = 0.0f32;
         for (noise, frequency, amplitude) in &self.layers {

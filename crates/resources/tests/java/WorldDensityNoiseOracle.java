@@ -20,7 +20,7 @@ public class WorldDensityNoiseOracle {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         var fixtures = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
-        long[] seeds = {0, -1, 2345, Long.MIN_VALUE};
+        long[] seeds = {0, -1, 2345, Long.MIN_VALUE, Long.MAX_VALUE};
         int[][] points = {{0,0,0},{1,1,1},{-1,-1,-1},{31,63,-80},{-17,-64,49},
             {12345,-20,-9832},{30000000,100,-30000000},{Integer.MIN_VALUE,12,7},
             {Integer.MAX_VALUE,-31,-17},{0,319,0},{0,320,0},{7,13,19}};
@@ -32,7 +32,11 @@ public class WorldDensityNoiseOracle {
                 RandomSource root=mode==0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
                 var factory=root.forkPositional();
                 var ctx=new DensityFunction.CompileContext() {
-                    public Noise createNoiseSampler(Holder<NormalNoise> noise) { return noise.value().create(factory.fromHashOf(Identifier.parse(id))); }
+                    public Noise createNoiseSampler(Holder<NormalNoise> noise) {
+                        if (id.equals("minecraft:nether/temperature")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed));
+                        if (id.equals("minecraft:nether/vegetation")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed + 1));
+                        return noise.value().create(factory.fromHashOf(Identifier.parse(id)));
+                    }
                     public RandomSource createRandom(Identifier name) { return factory.fromHashOf(name); }
                     public RandomSource createEndIslandRandom() { return new LegacyRandomSource(seed); }
                 };

@@ -61,6 +61,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:temperature",
         "minecraft:continentalness",
         "minecraft:offset",
+        "minecraft:nether/temperature",
+        "minecraft:nether/vegetation",
         "example:custom",
     ] {
         let (namespace, path) = id.split_once(':').unwrap();
@@ -159,6 +161,6 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             _ => {}
         }
     }
-    assert_eq!(groups, fixtures.len() * 8);
+    assert_eq!(groups, fixtures.len() * 10);
     assert_eq!(samples, groups * 12);
 }

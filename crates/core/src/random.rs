@@ -61,6 +61,32 @@ impl LegacyRandom {
         (self.seed >> (48 - count)) as u32
     }
 
+    /// Advance the 48-bit LCG as if `next_int` had been called `count` times.
+    pub fn skip_ints(&mut self, mut count: u32) {
+        const MASK: u64 = (1u64 << 48) - 1;
+        let mut multiplier = 0x5deece66d_u64;
+        let mut increment = 11_u64;
+        let mut accumulated_multiplier = 1_u64;
+        let mut accumulated_increment = 0_u64;
+        while count != 0 {
+            if count & 1 != 0 {
+                accumulated_increment = accumulated_increment
+                    .wrapping_mul(multiplier)
+                    .wrapping_add(increment)
+                    & MASK;
+                accumulated_multiplier = accumulated_multiplier.wrapping_mul(multiplier) & MASK;
+            }
+            increment = increment.wrapping_mul(multiplier.wrapping_add(1)) & MASK;
+            multiplier = multiplier.wrapping_mul(multiplier) & MASK;
+            count >>= 1;
+        }
+        self.seed = self
+            .seed
+            .wrapping_mul(accumulated_multiplier)
+            .wrapping_add(accumulated_increment)
+            & MASK;
+    }
+
     pub fn next_int(&mut self) -> i32 {
         self.bits(32) as i32
     }
@@ -217,5 +243,30 @@ mod tests {
         }
         assert_eq!(legacy.next_int_bound(0), None);
         assert_eq!(xor.next_int_bound(-1), None);
+    }
+
+    #[test]
+    fn skipped_legacy_ints_match_iteration_and_composition() {
+        for seed in [0, 1, -1, i64::MIN, i64::MAX] {
+            for count in [0, 1, 2, 262, 524, 1_000, 65_537] {
+                let mut iterated = LegacyRandom::new(seed);
+                for _ in 0..count {
+                    iterated.next_int();
+                }
+                let mut skipped = LegacyRandom::new(seed);
+                skipped.skip_ints(count);
+                assert_eq!(
+                    skipped.next_long(),
+                    iterated.next_long(),
+                    "seed {seed} count {count}"
+                );
+            }
+            let mut combined = LegacyRandom::new(seed);
+            combined.skip_ints(u32::MAX);
+            let mut split = LegacyRandom::new(seed);
+            split.skip_ints(u32::MAX - 262);
+            split.skip_ints(262);
+            assert_eq!(combined.next_long(), split.next_long());
+        }
     }
 }

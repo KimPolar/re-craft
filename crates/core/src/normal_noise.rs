@@ -104,6 +104,26 @@ impl NormalNoiseParameters {
 
     /// Initializes the same named octave sources and advances the parent RNG.
     pub fn create(&self, random: &mut impl NoiseSeedSource) -> Result<NormalNoise, &'static str> {
+        let (octaves, normalization, range) = self.prepare()?;
+        let first = random.fork_noise_factory();
+        let second = random.fork_noise_factory();
+        let mut stack = PerlinStack::new();
+        for (octave, frequency, amplitude) in octaves {
+            let name = format!("octave_{octave}");
+            let mut first_random = first.random_for(&name);
+            let mut second_random = second.random_for(&name);
+            let amplitude = (normalization * amplitude) as f32;
+            stack.push(PerlinNoise::new(&mut first_random), frequency, amplitude);
+            stack.push(
+                PerlinNoise::new(&mut second_random),
+                frequency * 1.0181268882175227,
+                amplitude,
+            );
+        }
+        Ok(NormalNoise { stack, range })
+    }
+
+    fn prepare(&self) -> Result<(Vec<(i32, f64, f64)>, f64, (f32, f32)), &'static str> {
         self.validate()?;
         let mut frequency = 2.0f64.powi(self.base_octave);
         let mut amplitude = self.base_amplitude;
@@ -157,26 +177,68 @@ impl NormalNoiseParameters {
             normalization = legacy;
         }
         let bound = (total * (1.0 / 3.0) * 6.0) as f32;
-        let first = random.fork_noise_factory();
-        let second = random.fork_noise_factory();
-        let mut stack = PerlinStack::new();
-        for (octave, frequency, amplitude) in octaves {
-            let name = format!("octave_{octave}");
-            let mut first_random = first.random_for(&name);
-            let mut second_random = second.random_for(&name);
-            let amplitude = (normalization * amplitude) as f32;
-            stack.push(PerlinNoise::new(&mut first_random), frequency, amplitude);
-            stack.push(
-                PerlinNoise::new(&mut second_random),
-                frequency * 1.0181268882175227,
-                amplitude,
-            );
-        }
-        Ok(NormalNoise {
-            stack,
-            range: (-bound, bound),
-        })
+        Ok((octaves, normalization, (-bound, bound)))
     }
+
+    /// The special sequential initializer used by Nether temperature and vegetation.
+    pub fn create_legacy_nether(
+        &self,
+        random: &mut LegacyRandom,
+    ) -> Result<NormalNoise, &'static str> {
+        let (_, normalization, range) = self.prepare()?;
+        let modifiers = if self.amplitude_modifiers.is_empty() {
+            vec![1.0; self.octave_count]
+        } else {
+            self.amplitude_modifiers.clone()
+        };
+        let first = legacy_fbm(random, self.base_octave, &modifiers)?;
+        let second = legacy_fbm(random, self.base_octave, &modifiers)?;
+        let final_amplitude = (normalization * self.base_amplitude) as f32;
+        let mut stack = PerlinStack::new();
+        stack.append_scaled(first, 1.0, final_amplitude);
+        stack.append_scaled(second, 1.0181268882175227, final_amplitude);
+        Ok(NormalNoise { stack, range })
+    }
+}
+
+fn legacy_fbm(
+    random: &mut LegacyRandom,
+    base_octave: i32,
+    modifiers: &[f64],
+) -> Result<PerlinStack, &'static str> {
+    let count = modifiers.len();
+    let zero_index = -base_octave;
+    let mut layers = vec![None; count];
+    let initial = PerlinNoise::new(random);
+    if zero_index >= 0 && (zero_index as usize) < count && modifiers[zero_index as usize] != 0.0 {
+        layers[zero_index as usize] = Some(initial);
+    }
+    for index in (0..zero_index).rev() {
+        if (index as usize) < count && modifiers[index as usize] != 0.0 {
+            layers[index as usize] = Some(PerlinNoise::new(random));
+        } else {
+            random.skip_ints(262);
+        }
+    }
+    if layers.iter().filter(|layer| layer.is_some()).count()
+        != modifiers.iter().filter(|value| **value != 0.0).count()
+    {
+        return Err("legacy octave initialization cannot construct the requested layers");
+    }
+    if zero_index < count as i32 - 1 {
+        return Err("positive legacy octaves are unsupported by Java 26.3");
+    }
+    let mut frequency = 2.0f64.powi(-zero_index);
+    let mut amplitude = 2.0f64.powi(count as i32 - 1) / (2.0f64.powi(count as i32) - 1.0);
+    let mut stack = PerlinStack::new();
+    for (layer, modifier) in layers.into_iter().zip(modifiers) {
+        if let Some(noise) = layer {
+            stack.push(noise, frequency, (amplitude * modifier) as f32);
+        }
+        frequency *= 2.0;
+        amplitude /= 2.0;
+    }
+    Ok(stack)
 }
 impl NormalNoise {
     pub fn sample_scaled_volume(&self, x: i32, y: i32, z: i32, xz_scale: f64, y_scale: f64) -> f32 {
@@ -216,5 +278,25 @@ mod tests {
         assert_eq!(noise.sample(0.0, 0.0, 0.0).to_bits(), 1033087916);
         assert_eq!(noise.sample(-1.5, 64.0, 2.75).to_bits(), 1015982720);
         assert_eq!(noise.sample_2d(-1.5, 2.75).to_bits(), 1044822740);
+    }
+
+    #[test]
+    fn sequential_nether_octaves_match_java_reference() {
+        let parameters = NormalNoiseParameters {
+            base_amplitude: 0.9494731054427981,
+            base_octave: -7,
+            octave_count: 2,
+            normalization: Normalization::Enabled,
+            amplitude_modifiers: vec![],
+        };
+        let mut random = LegacyRandom::new(0);
+        let noise = parameters.create_legacy_nether(&mut random).unwrap();
+        assert_eq!(random.next_long(), 6916802886986171058);
+        assert_eq!(noise.sample(0.0, 0.0, 0.0).to_bits(), 1039164812);
+        assert_eq!(
+            noise.sample(-1.5, 64.0, 2.75).to_bits(),
+            -1119361692i32 as u32
+        );
+        assert_eq!(noise.sample_2d(-1.5, 2.75).to_bits(), 1038596892);
     }
 }

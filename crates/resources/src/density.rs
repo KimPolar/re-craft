@@ -415,6 +415,7 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     active: BTreeSet<ResourceId>,
     nodes: usize,
     noise_factory: Option<WorldNoiseFactory>,
+    world_seed: Option<i64>,
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
 }
 
@@ -438,6 +439,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             active: BTreeSet::new(),
             nodes: 0,
             noise_factory: None,
+            world_seed: None,
             noises: BTreeMap::new(),
         }
     }
@@ -453,6 +455,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
         };
         let mut compiler = Self::new(resources);
         compiler.noise_factory = Some(noise_factory);
+        compiler.world_seed = Some(seed);
         compiler
     }
 
@@ -465,19 +468,28 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             self.noise_factory.is_some(),
             "a world seed is required for density noise"
         );
-        ensure!(
-            !(id.namespace == "minecraft"
-                && (id.path == "nether/temperature" || id.path == "nether/vegetation")),
-            "legacy Nether biome noise is not supported yet"
-        );
         let canonical = format!("{}:{}", id.namespace, id.path);
         let parameters = crate::noise::load_normal_noise(self.resources, &canonical)?;
-        let noise = match self.noise_factory.as_ref().unwrap() {
-            WorldNoiseFactory::Legacy(factory) => {
-                parameters.create(&mut factory.random_for(&canonical))
+        let nether_offset = if id.namespace == "minecraft" {
+            match id.path.as_str() {
+                "nether/temperature" => Some(0),
+                "nether/vegetation" => Some(1),
+                _ => None,
             }
-            WorldNoiseFactory::Xoroshiro(factory) => {
-                parameters.create(&mut factory.random_for(&canonical))
+        } else {
+            None
+        };
+        let noise = if let Some(offset) = nether_offset {
+            let seed = self.world_seed.unwrap().wrapping_add(offset);
+            parameters.create_legacy_nether(&mut LegacyRandom::new(seed))
+        } else {
+            match self.noise_factory.as_ref().unwrap() {
+                WorldNoiseFactory::Legacy(factory) => {
+                    parameters.create(&mut factory.random_for(&canonical))
+                }
+                WorldNoiseFactory::Xoroshiro(factory) => {
+                    parameters.create(&mut factory.random_for(&canonical))
+                }
             }
         }
         .map_err(anyhow::Error::msg)?;
@@ -869,6 +881,10 @@ mod tests {
             "data/test/worldgen/noise/sample.json".to_owned(),
             br#"{"base_octave":-3}"#.to_vec(),
         );
+        data.0.insert(
+            "data/minecraft/worldgen/noise/nether/temperature.json".to_owned(),
+            br#"{"base_octave":-7,"octave_count":2}"#.to_vec(),
+        );
         let value = json!({"type":"noise","noise":"test:sample","xz_scale":0.013,"y_scale":0.021});
         data.insert("from_pack", value.clone());
         assert!(DensityCompiler::new(&mut data).compile(&value).is_err());
@@ -893,6 +909,12 @@ mod tests {
         );
         let nether =
             json!({"type":"noise","noise":"minecraft:nether/temperature","xz_scale":1,"y_scale":1});
-        assert!(compiler.compile(&nether).is_err());
+        let nether_xor = compiler.compile(&nether).unwrap();
+        let mut legacy = DensityCompiler::with_world_seed(&mut data, 123, WorldgenRandom::Legacy);
+        let nether_legacy = legacy.compile(&nether).unwrap();
+        assert_eq!(
+            nether_xor.sample(7, 8, 9).to_bits(),
+            nether_legacy.sample(7, 8, 9).to_bits()
+        );
     }
 }

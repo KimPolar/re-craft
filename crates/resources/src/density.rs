@@ -11,13 +11,15 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
+mod interval;
+use interval::Interval;
 
 const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 100_000;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
-pub struct DensityFunction(Node, usize, usize, bool);
+pub struct DensityFunction(Node, usize, usize, bool, Interval);
 
 #[derive(Debug)]
 enum Node {
@@ -28,10 +30,17 @@ enum Node {
         from: i32,
         to: i32,
         value: f32,
+        to_value: f32,
         factor: f32,
     },
     Binary {
         op: Binary,
+        left: Arc<DensityFunction>,
+        right: Arc<DensityFunction>,
+    },
+    Extremum {
+        minimum: bool,
+        plan: ExtremumPlan,
         left: Arc<DensityFunction>,
         right: Arc<DensityFunction>,
     },
@@ -65,6 +74,14 @@ enum Binary {
     Mul,
 }
 #[derive(Clone, Copy, Debug)]
+enum ExtremumPlan {
+    Left,
+    Right,
+    LeftConstant,
+    RightConstant,
+    General(f32),
+}
+#[derive(Clone, Copy, Debug)]
 enum Unary {
     Abs,
     Square,
@@ -76,6 +93,10 @@ enum Unary {
 }
 
 impl DensityFunction {
+    /// The interval reported by Java's density function before compilation.
+    pub fn range(&self) -> (f32, f32) {
+        (self.4.min, self.4.max)
+    }
     /// Samples using the single-precision operations used by the 26.3 sampler.
     pub fn sample(&self, x: i32, y: i32, z: i32) -> f32 {
         self.evaluate(x, y, z, false)
@@ -93,6 +114,7 @@ impl DensityFunction {
                 to,
                 value,
                 factor,
+                ..
             } => {
                 let coordinate = [x, y, z][*axis].clamp((*from).min(*to), (*from).max(*to));
                 *value + (coordinate.wrapping_sub(*from) as f32) * *factor
@@ -118,6 +140,37 @@ impl DensityFunction {
                     Binary::Mul => a * b,
                 }
             }
+            Node::Extremum {
+                minimum,
+                plan,
+                left,
+                right,
+            } => {
+                let (a, b) = match plan {
+                    ExtremumPlan::Left => return left.evaluate(x, y, z, volume),
+                    ExtremumPlan::Right => return right.evaluate(x, y, z, volume),
+                    ExtremumPlan::LeftConstant => (
+                        right.evaluate(x, y, z, volume),
+                        left.evaluate(x, y, z, volume),
+                    ),
+                    ExtremumPlan::RightConstant => (
+                        left.evaluate(x, y, z, volume),
+                        right.evaluate(x, y, z, volume),
+                    ),
+                    ExtremumPlan::General(bound) => {
+                        let a = left.evaluate(x, y, z, volume);
+                        if !volume && if *minimum { a <= *bound } else { a >= *bound } {
+                            return a;
+                        }
+                        (a, right.evaluate(x, y, z, volume))
+                    }
+                };
+                if *minimum {
+                    interval::min(a, b)
+                } else {
+                    interval::max(a, b)
+                }
+            }
             Node::Unary { op, input } => {
                 let a = input.evaluate(x, y, z, volume);
                 match op {
@@ -139,16 +192,7 @@ impl DensityFunction {
                         }
                     }
                     Unary::Negate => -a,
-                    Unary::Squeeze => {
-                        let v = if a < -1.0 {
-                            -1.0
-                        } else if a > 1.0 {
-                            1.0
-                        } else {
-                            a
-                        };
-                        v / 2.0 - v * v * v / 24.0
-                    }
+                    Unary::Squeeze => squeeze(a),
                 }
             }
             Node::Range {
@@ -226,6 +270,16 @@ impl DensityFunction {
 fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
     first + alpha * (second - first)
 }
+fn squeeze(a: f32) -> f32 {
+    let v = if a < -1.0 {
+        -1.0
+    } else if a > 1.0 {
+        1.0
+    } else {
+        a
+    };
+    v / 2.0 - v * v * v / 24.0
+}
 
 fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
@@ -233,7 +287,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Reference(value)
         | Node::Unary { input: value, .. }
         | Node::Interpolated { input: value, .. } => vec![value],
-        Node::Binary { left, right, .. } => vec![left, right],
+        Node::Binary { left, right, .. } | Node::Extremum { left, right, .. } => vec![left, right],
         Node::Range {
             input,
             inside,
@@ -264,11 +318,53 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         work <= MAX_NODES,
         "density function exceeds maximum sampling work"
     );
+    let range = match &node {
+        Node::Constant(value) => Interval::exact(*value),
+        Node::Reference(input) | Node::Interpolated { input, .. } => input.4,
+        Node::Gradient {
+            value, to_value, ..
+        } => Interval::enclosing_values(*value, *to_value),
+        Node::Binary { op, left, right } => match op {
+            Binary::Add => left.4.add(right.4),
+            Binary::Sub => left.4.sub(right.4),
+            Binary::Mul => left.4.mul(right.4),
+        },
+        Node::Extremum {
+            minimum,
+            left,
+            right,
+            ..
+        } => {
+            if *minimum {
+                left.4.minimum(right.4)
+            } else {
+                left.4.maximum(right.4)
+            }
+        }
+        Node::Unary { op, input } => match op {
+            Unary::Abs => input.4.abs(),
+            Unary::Square => input.4.square(),
+            Unary::Cube => input.4.monotonic(|v| v * v * v),
+            Unary::HalfNegative => input.4.monotonic(|v| if v > 0.0 { v } else { v * 0.5 }),
+            Unary::QuarterNegative => input.4.monotonic(|v| if v > 0.0 { v } else { v * 0.25 }),
+            Unary::Negate => Interval::exact(0.0).sub(input.4),
+            Unary::Squeeze => input.4.monotonic(squeeze),
+        },
+        Node::Range {
+            inside, outside, ..
+        } => Interval::enclosing(inside.4, outside.4),
+        Node::Lerp {
+            alpha,
+            first,
+            second,
+        } => alpha.4.lerp(first.4, second.4),
+    };
     Ok(Arc::new(DensityFunction(
         node,
         depth,
         work,
         has_interpolation,
+        range,
     )))
 }
 
@@ -388,6 +484,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                     from,
                     to,
                     value: from_value,
+                    to_value,
                     factor: (to_value - from_value) / (to.wrapping_sub(from) as f32),
                 }
             }
@@ -402,6 +499,36 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                     op,
                     left: self.expression(field("left")?, depth + 1)?,
                     right: self.expression(field("right")?, depth + 1)?,
+                }
+            }
+            "min" | "max" => {
+                let left = self.expression(field("left")?, depth + 1)?;
+                let right = self.expression(field("right")?, depth + 1)?;
+                let minimum = id.path == "min";
+                let plan = if if minimum {
+                    left.4.max < right.4.min
+                } else {
+                    left.4.min > right.4.max
+                } {
+                    ExtremumPlan::Left
+                } else if if minimum {
+                    right.4.max < left.4.min
+                } else {
+                    right.4.min > left.4.max
+                } {
+                    ExtremumPlan::Right
+                } else if matches!(left.0, Node::Constant(_)) {
+                    ExtremumPlan::LeftConstant
+                } else if matches!(right.0, Node::Constant(_)) {
+                    ExtremumPlan::RightConstant
+                } else {
+                    ExtremumPlan::General(if minimum { right.4.min } else { right.4.max })
+                };
+                Node::Extremum {
+                    minimum,
+                    plan,
+                    left,
+                    right,
                 }
             }
             "abs" | "square" | "cube" | "half_negative" | "quarter_negative" | "negate"
@@ -559,10 +686,12 @@ mod tests {
             format!("{:#}", compiler.compile_id("test:node19").unwrap_err())
                 .contains("sampling work")
         );
-        assert!(
+        assert_eq!(
             compiler
                 .compile(&json!({"type":"min", "left":0, "right":1}))
-                .is_err()
+                .unwrap()
+                .sample(0, 0, 0),
+            0.0
         );
     }
 
@@ -575,5 +704,23 @@ mod tests {
         }
         let inner = json!({"type":"interpolated", "input":1, "cell_size_xz":4, "cell_size_y":8});
         assert!(compiler.compile(&json!({"type":"interpolated", "input":{"type":"add", "left":inner, "right":1}, "cell_size_xz":4, "cell_size_y":8})).is_err());
+    }
+
+    #[test]
+    fn extremum_preserves_java_single_and_volume_zero_shortcuts() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        let positive = json!({"type":"gradient", "axis":"y", "from_coordinate":0, "to_coordinate":1, "from_value":0.0, "to_value":0.0});
+        let negative = json!({"type":"negate", "input":0.0});
+        let min = compiler
+            .compile(&json!({"type":"min", "left":positive, "right":negative}))
+            .unwrap();
+        assert_eq!(min.sample(0, 0, 0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(min.evaluate(0, 0, 0, true).to_bits(), (-0.0f32).to_bits());
+        let max = compiler
+            .compile(&json!({"type":"max", "left":negative, "right":positive}))
+            .unwrap();
+        assert_eq!(max.sample(0, 0, 0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(max.evaluate(0, 0, 0, true).to_bits(), 0.0f32.to_bits());
     }
 }

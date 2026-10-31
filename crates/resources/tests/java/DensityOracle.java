@@ -26,10 +26,12 @@ public class DensityOracle {
         }
         for (int i = 0; i < expressions.size(); i++) {
             var function = DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE, expressions.get(i)).getOrThrow();
+            var range = function.range();
+            System.out.printf("R %d %d %d%n", i, Float.floatToRawIntBits(range.min()), Float.floatToRawIntBits(range.max()));
             var sampler = function.compileSampler(null);
             for (var p : points) {
                 int bits = Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED, p[0], p[1], p[2]));
-                System.out.printf("%d %d %d %d %d%n", i, p[0], p[1], p[2], bits);
+                System.out.printf("D %d %d %d %d %d%n", i, p[0], p[1], p[2], bits);
             }
         }
     }

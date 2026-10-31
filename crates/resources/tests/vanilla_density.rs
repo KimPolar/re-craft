@@ -94,6 +94,34 @@ fn pure_functions_match_java_sampler() {
             .push(json!({"type":"minecraft:lerp", "alpha":alpha, "first":gradient, "second":0.25}));
     }
     let nonlinear = json!({"type":"minecraft:mul", "left":{"type":"minecraft:square", "input":gradient}, "right":reverse});
+    let infinity = json!({"type":"square", "input":{"type":"square", "input":{"type":"square", "input":1000000.0}}});
+    let negative_infinity = json!({"type":"negate", "input":infinity});
+    expressions.push(infinity.clone());
+    for alpha in [json!(-0.5), json!(0.5), json!(1.5)] {
+        expressions.push(
+            json!({"type":"lerp", "alpha":alpha, "first":infinity, "second":negative_infinity}),
+        );
+    }
+    for kind in ["min", "max"] {
+        for (left, right) in [
+            (gradient.clone(), reverse.clone()),
+            (json!(0.25), gradient.clone()),
+            (gradient.clone(), json!(0.25)),
+            (json!(-3.0), gradient.clone()),
+            (gradient.clone(), json!(3.0)),
+            (zero.clone(), negative.clone()),
+            (json!(-0.0), json!(0.0)),
+            (nonlinear.clone(), gradient.clone()),
+            (infinity.clone(), negative_infinity.clone()),
+            (infinity.clone(), zero.clone()),
+            (zero.clone(), json!({"type":"negate", "input":0.0})),
+            (json!({"type":"negate", "input":0.0}), zero.clone()),
+        ] {
+            expressions
+                .push(json!({"type":format!("minecraft:{kind}"), "left":left, "right":right}));
+        }
+        expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":format!("minecraft:{kind}"), "left":gradient, "right":reverse}}));
+    }
     for (cell_xz, cell_y) in [(4, 8), (3, 5), (1, 1), (9, 7)] {
         expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":cell_xz, "cell_size_y":cell_y, "input":nonlinear}));
     }
@@ -113,11 +141,30 @@ fn pure_functions_match_java_sampler() {
         .map(|v| compiler.compile(v).unwrap())
         .collect();
     let mut count = 0;
+    let mut ranges = 0;
     for line in output.lines() {
-        let parts: Vec<i32> = line
+        let Some((kind, values)) = line.split_once(' ') else {
+            continue;
+        };
+        if kind != "D" && kind != "R" {
+            continue;
+        }
+        let parts: Vec<i32> = values
             .split_whitespace()
             .map(|p| p.parse().unwrap())
             .collect();
+        if kind == "R" {
+            let [index, min, max]: [i32; 3] = parts.try_into().unwrap();
+            let range = compiled[index as usize].range();
+            assert_eq!(
+                (range.0.to_bits(), range.1.to_bits()),
+                (min as u32, max as u32),
+                "range of expression {index}: {}",
+                expressions[index as usize]
+            );
+            ranges += 1;
+            continue;
+        }
         assert_eq!(parts.len(), 5, "unexpected Java output: {line}");
         let [index, x, y, z, bits]: [i32; 5] = parts.try_into().unwrap();
         assert_eq!(
@@ -129,4 +176,5 @@ fn pure_functions_match_java_sampler() {
         count += 1;
     }
     assert_eq!(count, expressions.len() * 52);
+    assert_eq!(ranges, expressions.len());
 }

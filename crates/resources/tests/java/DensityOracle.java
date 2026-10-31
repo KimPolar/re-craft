@@ -7,6 +7,7 @@ import java.util.Arrays;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.SharedConstants;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunctions;
+import net.minecraft.world.level.levelgen.densityfunction.DensityFunctionCompiler;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 
 public class DensityOracle {
@@ -28,7 +29,7 @@ public class DensityOracle {
             var function = DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE, expressions.get(i)).getOrThrow();
             var range = function.range();
             System.out.printf("R %d %d %d%n", i, Float.floatToRawIntBits(range.min()), Float.floatToRawIntBits(range.max()));
-            var sampler = function.compileSampler(null);
+            var sampler = new DensityFunctionCompiler(null).getSampler(function);
             for (var p : points) {
                 int bits = Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED, p[0], p[1], p[2]));
                 System.out.printf("D %d %d %d %d %d%n", i, p[0], p[1], p[2], bits);

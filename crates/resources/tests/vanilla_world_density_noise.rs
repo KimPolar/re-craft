@@ -1,6 +1,6 @@
 //! World-seeded density noise and cell-volume checks against Java 26.3.
 use native_resources::{
-    density::{DensityCompiler, WorldgenRandom},
+    density::{DensityCompiler, DensityEvaluator, WorldgenRandom},
     packs::{ResourceProvider, ResourceStack},
 };
 use serde_json::{Value, json};
@@ -24,6 +24,54 @@ fn run(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn inline_installed(
+    value: Value,
+    sources: &mut ResourceStack,
+    data: &mut Data,
+    noise_ids: &mut std::collections::BTreeSet<String>,
+) -> Value {
+    match value {
+        Value::String(name) if name.starts_with("minecraft:") => {
+            let path = format!(
+                "data/minecraft/worldgen/density_function/{}.json",
+                name.strip_prefix("minecraft:").unwrap()
+            );
+            let bytes = sources.read_builtin_data(&path).unwrap().unwrap();
+            let json = serde_json::from_slice(&bytes).unwrap();
+            data.0.insert(path, bytes);
+            inline_installed(json, sources, data, noise_ids)
+        }
+        Value::Object(mut object) => {
+            for (key, child) in object.iter_mut() {
+                if key == "type" {
+                    continue;
+                }
+                if key == "noise" {
+                    let name = child.as_str().unwrap().to_owned();
+                    noise_ids.insert(name.clone());
+                    let path = format!(
+                        "data/minecraft/worldgen/noise/{}.json",
+                        name.strip_prefix("minecraft:").unwrap()
+                    );
+                    let bytes = sources.read_builtin_data(&path).unwrap().unwrap();
+                    *child = serde_json::from_slice(&bytes).unwrap();
+                    data.0.insert(path, bytes);
+                } else {
+                    *child = inline_installed(child.take(), sources, data, noise_ids);
+                }
+            }
+            Value::Object(object)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| inline_installed(item, sources, data, noise_ids))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 #[test]
@@ -107,6 +155,17 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             fixtures.push(json!({"id":id,"rust_expression":rust_expression,"java_expression":java_expression}));
         }
     }
+    for id in [
+        "minecraft:overworld/ore_vein/toggle",
+        "minecraft:overworld/ore_vein/richness",
+        "minecraft:overworld/ore_vein/gap",
+        "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
+    ] {
+        let mut noise_ids = std::collections::BTreeSet::new();
+        let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);
+        assert_eq!(noise_ids.len(), 1, "fixture {id} must use one named noise");
+        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"rust_expression":id,"java_expression":java_expression}));
+    }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -115,6 +174,7 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         .arg("WorldDensityNoiseOracle")
         .arg(input));
     let mut compiled = None;
+    let mut evaluator = DensityEvaluator::default();
     let mut groups = 0;
     let mut samples = 0;
     for line in output.lines() {
@@ -155,6 +215,11 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                     expected,
                     "fixture {index} mode {mode} seed {seed} at {x} {y} {z}: {}",
                     fixtures[*index]["rust_expression"]
+                );
+                assert_eq!(
+                    evaluator.sample(function, x, y, z).to_bits(),
+                    expected,
+                    "reused evaluator fixture {index}"
                 );
                 samples += 1;
             }

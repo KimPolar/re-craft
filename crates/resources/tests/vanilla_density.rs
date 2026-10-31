@@ -127,6 +127,16 @@ fn pure_functions_match_java_sampler() {
     }
     expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"minecraft:mul", "left":zero, "right":negative}}));
     expressions.push(json!({"type":"minecraft:interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"minecraft:lerp", "alpha":gradient, "first":nonlinear, "second":reverse}}));
+    for (min, max) in [(-0.5, 0.5), (0.0, 0.0), (-3.0, -2.0), (2.0, 3.0)] {
+        expressions.push(json!({"type":"clamp", "input":gradient, "min":min, "max":max}));
+        expressions.push(json!({"type":"clamp", "input":nonlinear, "min":min, "max":max}));
+    }
+    let cached = json!({"type":"cache","input":nonlinear});
+    expressions.push(json!({"type":"add","left":cached,"right":cached}));
+    expressions.push(
+        json!({"type":"cache","input":{"type":"clamp","input":gradient,"min":-0.5,"max":0.5}}),
+    );
+    expressions.push(json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":{"type":"add","left":cached,"right":cached}}));
     let input = temp.path().join("expressions.json");
     std::fs::write(&input, serde_json::to_vec(&expressions).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))

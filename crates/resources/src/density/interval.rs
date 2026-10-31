@@ -96,6 +96,18 @@ impl Interval {
     pub fn maximum(self, rhs: Self) -> Self {
         Self::bounds(max(self.min, rhs.min), max(self.max, rhs.max))
     }
+    pub fn clamp(self, lower: f32, upper: f32) -> Self {
+        if self.min.is_nan() {
+            return Self::NAI;
+        }
+        if self.min >= upper {
+            return Self::exact(upper);
+        }
+        if self.max <= lower {
+            return Self::exact(lower);
+        }
+        Self::bounds(max(self.min, lower), min(self.max, upper))
+    }
     pub fn monotonic(self, operation: impl Fn(f32) -> f32) -> Self {
         if self.min.is_nan() {
             return Self::NAI;

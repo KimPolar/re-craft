@@ -11,6 +11,7 @@ import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunctions;
+import net.minecraft.world.level.levelgen.densityfunction.DensityFunctionCompiler;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 import net.minecraft.world.level.levelgen.synth.Noise;
 import net.minecraft.world.level.levelgen.synth.NormalNoise;
@@ -40,7 +41,7 @@ public class WorldDensityNoiseOracle {
                     public RandomSource createRandom(Identifier name) { return factory.fromHashOf(name); }
                     public RandomSource createEndIslandRandom() { return new LegacyRandomSource(seed); }
                 };
-                var sampler=function.compileSampler(ctx);
+                var sampler=new DensityFunctionCompiler(ctx).getSampler(function);
                 var range=function.range();
                 System.out.printf("S %d %d %d %d %d%n",i,mode,seed,Float.floatToRawIntBits(range.min()),Float.floatToRawIntBits(range.max()));
                 for (var p:points) {

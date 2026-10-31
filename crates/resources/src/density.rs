@@ -3,7 +3,7 @@
 //! Unsupported functions are errors rather than substitutes that silently
 //! produce a different world.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -27,10 +27,31 @@ const MAX_NODES: usize = 100_000;
 #[derive(Debug)]
 pub struct DensityFunction(Node, usize, usize, bool, Interval);
 
+type SampleMemo = HashMap<(usize, i32, i32, i32, bool), f32>;
+
+/// Reuse cache storage across samples; each sample starts with an empty cache.
+#[derive(Default)]
+pub struct DensityEvaluator {
+    memo: SampleMemo,
+}
+
+impl DensityEvaluator {
+    pub fn sample(&mut self, function: &DensityFunction, x: i32, y: i32, z: i32) -> f32 {
+        self.memo.clear();
+        function.evaluate_cached(x, y, z, false, &mut self.memo)
+    }
+}
+
 #[derive(Debug)]
 enum Node {
     Constant(f32),
     Reference(Arc<DensityFunction>),
+    Cache(Arc<DensityFunction>),
+    Clamp {
+        input: Arc<DensityFunction>,
+        min: f32,
+        max: f32,
+    },
     Gradient {
         axis: usize,
         from: i32,
@@ -118,9 +139,31 @@ impl DensityFunction {
     // Java's volume and single-point samplers differ in their multiplication
     // fast path. InterpolatedFunction samples its eight corners in a volume.
     fn evaluate(&self, x: i32, y: i32, z: i32, volume: bool) -> f32 {
+        let mut memo = HashMap::new();
+        self.evaluate_cached(x, y, z, volume, &mut memo)
+    }
+
+    fn evaluate_cached(&self, x: i32, y: i32, z: i32, volume: bool, memo: &mut SampleMemo) -> f32 {
         match &self.0 {
             Node::Constant(v) => *v,
-            Node::Reference(v) => v.evaluate(x, y, z, volume),
+            Node::Reference(v) => v.evaluate_cached(x, y, z, volume, memo),
+            Node::Cache(input) => {
+                let key = (self as *const Self as usize, x, y, z, volume);
+                if let Some(value) = memo.get(&key) {
+                    return *value;
+                }
+                let value = input.evaluate_cached(x, y, z, volume, memo);
+                memo.insert(key, value);
+                value
+            }
+            Node::Clamp { input, min, max } => {
+                let value = input.evaluate_cached(x, y, z, volume, memo);
+                if value < *min {
+                    *min
+                } else {
+                    interval::min(value, *max)
+                }
+            }
             Node::Gradient {
                 axis,
                 from,
@@ -133,7 +176,7 @@ impl DensityFunction {
                 *value + (coordinate.wrapping_sub(*from) as f32) * *factor
             }
             Node::Binary { op, left, right } => {
-                let a = left.evaluate(x, y, z, volume);
+                let a = left.evaluate_cached(x, y, z, volume, memo);
                 let left_constant = matches!(left.0, Node::Constant(_));
                 let right_constant = matches!(right.0, Node::Constant(_));
                 if !volume
@@ -144,7 +187,7 @@ impl DensityFunction {
                 {
                     return 0.0;
                 }
-                let b = right.evaluate(x, y, z, volume);
+                let b = right.evaluate_cached(x, y, z, volume, memo);
                 match op {
                     Binary::Add if left_constant => b + a,
                     Binary::Add => a + b,
@@ -160,22 +203,22 @@ impl DensityFunction {
                 right,
             } => {
                 let (a, b) = match plan {
-                    ExtremumPlan::Left => return left.evaluate(x, y, z, volume),
-                    ExtremumPlan::Right => return right.evaluate(x, y, z, volume),
+                    ExtremumPlan::Left => return left.evaluate_cached(x, y, z, volume, memo),
+                    ExtremumPlan::Right => return right.evaluate_cached(x, y, z, volume, memo),
                     ExtremumPlan::LeftConstant => (
-                        right.evaluate(x, y, z, volume),
-                        left.evaluate(x, y, z, volume),
+                        right.evaluate_cached(x, y, z, volume, memo),
+                        left.evaluate_cached(x, y, z, volume, memo),
                     ),
                     ExtremumPlan::RightConstant => (
-                        left.evaluate(x, y, z, volume),
-                        right.evaluate(x, y, z, volume),
+                        left.evaluate_cached(x, y, z, volume, memo),
+                        right.evaluate_cached(x, y, z, volume, memo),
                     ),
                     ExtremumPlan::General(bound) => {
-                        let a = left.evaluate(x, y, z, volume);
+                        let a = left.evaluate_cached(x, y, z, volume, memo);
                         if !volume && if *minimum { a <= *bound } else { a >= *bound } {
                             return a;
                         }
-                        (a, right.evaluate(x, y, z, volume))
+                        (a, right.evaluate_cached(x, y, z, volume, memo))
                     }
                 };
                 if *minimum {
@@ -185,7 +228,7 @@ impl DensityFunction {
                 }
             }
             Node::Unary { op, input } => {
-                let a = input.evaluate(x, y, z, volume);
+                let a = input.evaluate_cached(x, y, z, volume, memo);
                 match op {
                     Unary::Abs => a.abs(),
                     Unary::Square => a * a,
@@ -215,11 +258,11 @@ impl DensityFunction {
                 inside,
                 outside,
             } => {
-                let v = input.evaluate(x, y, z, volume);
+                let v = input.evaluate_cached(x, y, z, volume, memo);
                 if v >= *min && v < *max {
-                    inside.evaluate(x, y, z, volume)
+                    inside.evaluate_cached(x, y, z, volume, memo)
                 } else {
-                    outside.evaluate(x, y, z, volume)
+                    outside.evaluate_cached(x, y, z, volume, memo)
                 }
             }
             Node::Lerp {
@@ -227,17 +270,17 @@ impl DensityFunction {
                 first,
                 second,
             } => {
-                let alpha = alpha.evaluate(x, y, z, volume);
+                let alpha = alpha.evaluate_cached(x, y, z, volume, memo);
                 if alpha == 0.0 {
-                    return first.evaluate(x, y, z, volume);
+                    return first.evaluate_cached(x, y, z, volume, memo);
                 }
                 if alpha == 1.0 {
-                    return second.evaluate(x, y, z, volume);
+                    return second.evaluate_cached(x, y, z, volume, memo);
                 }
                 lerp(
                     alpha,
-                    first.evaluate(x, y, z, volume),
-                    second.evaluate(x, y, z, volume),
+                    first.evaluate_cached(x, y, z, volume, memo),
+                    second.evaluate_cached(x, y, z, volume, memo),
                 )
             }
             Node::Interpolated {
@@ -250,7 +293,7 @@ impl DensityFunction {
                 let ry = y.rem_euclid(*cell_y);
                 let rz = z.rem_euclid(*cell_xz);
                 if rx == 0 && ry == 0 && rz == 0 {
-                    return input.evaluate(x, y, z, false);
+                    return input.evaluate_cached(x, y, z, false, memo);
                 }
                 let (x0, y0, z0) = (x.wrapping_sub(rx), y.wrapping_sub(ry), z.wrapping_sub(rz));
                 let (x1, y1, z1) = (
@@ -263,7 +306,7 @@ impl DensityFunction {
                     ry as f32 / *cell_y as f32,
                     rz as f32 / *cell_xz as f32,
                 );
-                let corner = |x, y, z| input.evaluate(x, y, z, true);
+                let mut corner = |x, y, z| input.evaluate_cached(x, y, z, true, memo);
                 let z0_plane = lerp(
                     ty,
                     lerp(tx, corner(x0, y0, z0), corner(x1, y0, z0)),
@@ -290,10 +333,10 @@ impl DensityFunction {
                 let mut py = f64::from(y) * y_scale;
                 let mut pz = f64::from(z) * xz_scale;
                 if *shift_mode != 0 {
-                    px += f64::from(shifts[0].evaluate(x, y, z, volume));
-                    pz += f64::from(shifts[2].evaluate(x, y, z, volume));
+                    px += f64::from(shifts[0].evaluate_cached(x, y, z, volume, memo));
+                    pz += f64::from(shifts[2].evaluate_cached(x, y, z, volume, memo));
                     if *shift_mode == 2 {
-                        py += f64::from(shifts[1].evaluate(x, y, z, volume));
+                        py += f64::from(shifts[1].evaluate_cached(x, y, z, volume, memo));
                     }
                 }
                 noise.sample(px, py, pz)
@@ -320,6 +363,8 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
         Node::Constant(_) | Node::Gradient { .. } => vec![],
         Node::Reference(value)
+        | Node::Cache(value)
+        | Node::Clamp { input: value, .. }
         | Node::Unary { input: value, .. }
         | Node::Interpolated { input: value, .. } => vec![value],
         Node::Binary { left, right, .. } | Node::Extremum { left, right, .. } => vec![left, right],
@@ -356,7 +401,8 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     );
     let range = match &node {
         Node::Constant(value) => Interval::exact(*value),
-        Node::Reference(input) | Node::Interpolated { input, .. } => input.4,
+        Node::Reference(input) | Node::Cache(input) | Node::Interpolated { input, .. } => input.4,
+        Node::Clamp { input, min, max } => input.4.clamp(*min, *max),
         Node::Gradient {
             value, to_value, ..
         } => Interval::enclosing_values(*value, *to_value),
@@ -412,6 +458,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
 pub struct DensityCompiler<'a, P: ResourceProvider> {
     resources: &'a mut P,
     cache: BTreeMap<ResourceId, Arc<DensityFunction>>,
+    cache_nodes: BTreeMap<String, Arc<DensityFunction>>,
     active: BTreeSet<ResourceId>,
     nodes: usize,
     noise_factory: Option<WorldNoiseFactory>,
@@ -436,6 +483,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
         Self {
             resources,
             cache: BTreeMap::new(),
+            cache_nodes: BTreeMap::new(),
             active: BTreeSet::new(),
             nodes: 0,
             noise_factory: None,
@@ -571,8 +619,29 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             id.namespace == "minecraft",
             "unsupported density function type {kind}"
         );
+        if id.path == "cache" {
+            let input = field("input")?;
+            let key = serde_json::to_string(input)?;
+            if let Some(function) = self.cache_nodes.get(&key) {
+                return Ok(Arc::clone(function));
+            }
+            let child = self.expression(input, depth + 1)?;
+            let function = make(Node::Cache(child))?;
+            self.cache_nodes.insert(key, Arc::clone(&function));
+            return Ok(function);
+        }
         let node = match id.path.as_str() {
             "constant" => Node::Constant(number(field("value")?)?),
+            "clamp" => {
+                let min = number(field("min")?)?;
+                let max = number(field("max")?)?;
+                ensure!(min <= max, "clamp minimum exceeds maximum");
+                Node::Clamp {
+                    input: self.expression(field("input")?, depth + 1)?,
+                    min,
+                    max,
+                }
+            }
             "gradient" => {
                 let axis = match field("axis")?.as_str() {
                     Some("x") => 0,
@@ -915,6 +984,38 @@ mod tests {
         assert_eq!(
             nether_xor.sample(7, 8, 9).to_bits(),
             nether_legacy.sample(7, 8, 9).to_bits()
+        );
+    }
+
+    #[test]
+    fn cache_nodes_share_evaluation_and_keep_volume_keys_separate() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        let cached = json!({"type":"cache","input":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":10,"from_value":0,"to_value":1}});
+        let function = compiler
+            .compile(&json!({"type":"add","left":cached,"right":cached}))
+            .unwrap();
+        let Node::Binary { left, right, .. } = &function.0 else {
+            panic!("expected binary");
+        };
+        assert!(Arc::ptr_eq(left, right));
+        let mut memo = HashMap::new();
+        let value = function.evaluate_cached(1, 5, 3, false, &mut memo);
+        assert_eq!(value, 1.0);
+        assert_eq!(memo.len(), 1);
+        function.evaluate_cached(1, 5, 3, true, &mut memo);
+        assert_eq!(memo.len(), 2);
+        function.evaluate_cached(1, 6, 3, false, &mut memo);
+        assert_eq!(memo.len(), 3);
+        let mut evaluator = DensityEvaluator::default();
+        assert_eq!(evaluator.sample(&function, 1, 5, 3), 1.0);
+        let capacity = evaluator.memo.capacity();
+        assert_eq!(evaluator.sample(&function, 1, 6, 3), 1.2);
+        assert!(evaluator.memo.capacity() >= capacity);
+        assert!(
+            compiler
+                .compile(&json!({"type":"clamp","input":0,"min":1,"max":-1}))
+                .is_err()
         );
     }
 }

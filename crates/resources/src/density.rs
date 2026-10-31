@@ -62,6 +62,15 @@ enum Node {
         to_value: f32,
         factor: f32,
     },
+    DistanceToPoint {
+        point: [i32; 3],
+        metric: DistanceMetric,
+    },
+    Slice {
+        axis: usize,
+        coordinate: i32,
+        input: Arc<DensityFunction>,
+    },
     Binary {
         op: Binary,
         left: Arc<DensityFunction>,
@@ -127,6 +136,13 @@ enum ShiftKind {
     A,
     B,
     ThreeDimensional,
+}
+#[derive(Clone, Copy, Debug)]
+enum DistanceMetric {
+    Euclidean,
+    EuclideanSquared,
+    Manhattan,
+    Chebyshev,
 }
 #[derive(Clone, Copy, Debug)]
 enum ExtremumPlan {
@@ -195,6 +211,26 @@ impl DensityFunction {
             } => {
                 let coordinate = [x, y, z][*axis].clamp((*from).min(*to), (*from).max(*to));
                 *value + (coordinate.wrapping_sub(*from) as f32) * *factor
+            }
+            Node::DistanceToPoint { point, metric } => {
+                let dx = point[0].wrapping_sub(x) as f32;
+                let dy = point[1].wrapping_sub(y) as f32;
+                let dz = point[2].wrapping_sub(z) as f32;
+                match metric {
+                    DistanceMetric::Euclidean => (dx * dx + dy * dy + dz * dz).sqrt(),
+                    DistanceMetric::EuclideanSquared => dx * dx + dy * dy + dz * dz,
+                    DistanceMetric::Manhattan => dx.abs() + dy.abs() + dz.abs(),
+                    DistanceMetric::Chebyshev => dx.abs().max(dy.abs()).max(dz.abs()),
+                }
+            }
+            Node::Slice {
+                axis,
+                coordinate,
+                input,
+            } => {
+                let mut position = [x, y, z];
+                position[*axis] = *coordinate;
+                input.evaluate_cached(position[0], position[1], position[2], volume, memo)
             }
             Node::Binary { op, left, right } => {
                 let a = left.evaluate_cached(x, y, z, volume, memo);
@@ -428,6 +464,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
         Node::Constant(_)
         | Node::Gradient { .. }
+        | Node::DistanceToPoint { .. }
         | Node::Shift { .. }
         | Node::Spline(_)
         | Node::UnblendedAlpha
@@ -435,6 +472,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Reference(value)
         | Node::Cache(value)
         | Node::Clamp { input: value, .. }
+        | Node::Slice { input: value, .. }
         | Node::Unary { input: value, .. }
         | Node::Interpolated { input: value, .. } => vec![value],
         Node::Binary { left, right, .. } | Node::Extremum { left, right, .. } => vec![left, right],
@@ -470,6 +508,8 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let mut axes = children.iter().fold(0, |axes, child| axes | child.5);
     match &node {
         Node::Gradient { axis, .. } => axes = 1 << axis,
+        Node::DistanceToPoint { .. } => axes = 7,
+        Node::Slice { axis, .. } => axes &= !(1 << axis),
         Node::Noise {
             xz_scale, y_scale, ..
         } => {
@@ -503,10 +543,12 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let range = match &node {
         Node::Constant(value) => Interval::exact(*value),
         Node::Reference(input) | Node::Cache(input) | Node::Interpolated { input, .. } => input.4,
+        Node::Slice { input, .. } => input.4,
         Node::Clamp { input, min, max } => input.4.clamp(*min, *max),
         Node::Gradient {
             value, to_value, ..
         } => Interval::enclosing_values(*value, *to_value),
+        Node::DistanceToPoint { .. } => Interval::bounds(0.0, f32::INFINITY),
         Node::Binary { op, left, right } => match op {
             Binary::Add => left.4.add(right.4),
             Binary::Sub => left.4.sub(right.4),
@@ -764,6 +806,43 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 }
             }
             "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
+            "distance_to_point" => {
+                let point = field("point")?
+                    .as_array()
+                    .context("distance point must be an array")?;
+                ensure!(
+                    point.len() == 3,
+                    "distance point must contain three coordinates"
+                );
+                let metric = match field("metric")?.as_str() {
+                    Some("euclidean") => DistanceMetric::Euclidean,
+                    Some("euclidean_squared") => DistanceMetric::EuclideanSquared,
+                    Some("manhattan") => DistanceMetric::Manhattan,
+                    Some("chebyshev") => DistanceMetric::Chebyshev,
+                    _ => bail!("invalid distance metric"),
+                };
+                Node::DistanceToPoint {
+                    point: [
+                        integer(&point[0])?,
+                        integer(&point[1])?,
+                        integer(&point[2])?,
+                    ],
+                    metric,
+                }
+            }
+            "slice" => {
+                let axis = match field("axis")?.as_str() {
+                    Some("x") => 0,
+                    Some("y") => 1,
+                    Some("z") => 2,
+                    _ => bail!("invalid slice axis"),
+                };
+                Node::Slice {
+                    axis,
+                    coordinate: integer(field("coordinate")?)?,
+                    input: self.expression(field("input")?, depth + 1)?,
+                }
+            }
             "shift_a" | "shift_b" | "shift" => {
                 let name = field("noise")?
                     .as_str()
@@ -1291,5 +1370,19 @@ mod tests {
             .unwrap();
         assert_eq!(select.sample(0, 0, 0), 3.0);
         assert_eq!(select.range(), (1.0, 3.0));
+    }
+
+    #[test]
+    fn distance_and_slice_reject_invalid_data_pack_definitions() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        for value in [
+            json!({"type":"distance_to_point","point":[0,0],"metric":"euclidean"}),
+            json!({"type":"distance_to_point","point":[0,0,0],"metric":"unknown"}),
+            json!({"type":"slice","axis":"w","coordinate":0,"input":0}),
+            json!({"type":"slice","axis":"x","coordinate":2147483648_i64,"input":0}),
+        ] {
+            assert!(compiler.compile(&value).is_err(), "accepted {value}");
+        }
     }
 }

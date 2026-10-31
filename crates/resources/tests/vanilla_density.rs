@@ -1,5 +1,8 @@
 //! Differential checks against the locally installed 26.3 density sampler.
-use native_resources::{density::DensityCompiler, packs::ResourceProvider};
+use native_resources::{
+    density::DensityCompiler,
+    packs::{ResourceProvider, ResourceStack},
+};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -61,6 +64,30 @@ fn pure_functions_match_java_sampler() {
     let gradient = json!({"type":"minecraft:gradient","axis":"y","from_coordinate":-64,"to_coordinate":320,"from_value":1.5,"to_value":-1.5});
     let reverse = json!({"type":"minecraft:gradient","axis":"x","from_coordinate":40,"to_coordinate":-20,"from_value":-0.8,"to_value":0.7});
     let mut expressions = vec![json!(0.25), gradient.clone(), reverse.clone()];
+    for metric in ["euclidean", "euclidean_squared", "manhattan", "chebyshev"] {
+        for point in [[0, 0, 0], [17, -64, 123], [i32::MIN, i32::MAX, -1]] {
+            let distance = json!({"type":"distance_to_point", "metric":metric, "point":point});
+            expressions.push(distance.clone());
+            for axis in ["x", "y", "z"] {
+                let sliced =
+                    json!({"type":"slice", "axis":axis, "coordinate":13, "input":distance});
+                expressions.push(sliced.clone());
+                expressions.push(json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":sliced}));
+                expressions.push(json!({"type":"slice", "axis":axis, "coordinate":13, "input":{"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":distance}}));
+            }
+            expressions.push(json!({"type":"slice","axis":"x","coordinate":-2,"input":{"type":"slice","axis":"z","coordinate":11,"input":distance}}));
+            expressions.push(json!({"type":"slice","axis":"x","coordinate":-2,"input":{"type":"slice","axis":"x","coordinate":11,"input":distance}}));
+        }
+    }
+    let end_islands: Value = serde_json::from_slice(
+        &ResourceStack::open(&game)
+            .unwrap()
+            .read_builtin_data("data/minecraft/worldgen/density_function/end/islands.json")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    expressions.push(end_islands["input"]["left"].clone());
     for kind in ["add", "sub", "mul"] {
         expressions
             .push(json!({"type":format!("minecraft:{kind}"), "left":gradient, "right":reverse}));

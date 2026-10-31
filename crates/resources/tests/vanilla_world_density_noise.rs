@@ -186,6 +186,13 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             java_noise["noise"] = definition.clone();
             fixtures.push(json!({"id":id,"rust_expression":{"type":"interpolated","input":rust_noise,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":java_noise,"cell_size_xz":4,"cell_size_y":8}}));
         }
+        for axis in ["x", "y", "z"] {
+            let rust_slice = json!({"type":"slice", "axis":axis, "coordinate":13, "input":{"type":"noise","noise":id,"xz_scale":0.013,"y_scale":0.021}});
+            let java_slice = json!({"type":"slice", "axis":axis, "coordinate":13, "input":{"type":"noise","noise":definition,"xz_scale":0.013,"y_scale":0.021}});
+            fixtures
+                .push(json!({"id":id,"rust_expression":rust_slice,"java_expression":java_slice}));
+            fixtures.push(json!({"id":id,"rust_expression":{"type":"interpolated","input":rust_slice,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":java_slice,"cell_size_xz":4,"cell_size_y":8}}));
+        }
         for kind in ["shift_a", "shift_b", "shift"] {
             let rust_shift = json!({"type":kind,"noise":id});
             let java_shift = json!({"type":kind,"noise":definition});

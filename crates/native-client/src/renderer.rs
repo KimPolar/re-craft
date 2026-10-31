@@ -2389,8 +2389,15 @@ mod tests {
                     }]);
                 let deadline = Instant::now() + Duration::from_secs(45);
                 loop {
-                    ui.draw(&mut renderer, (320, 240), &snapshot, snapshot.origin, 0.25)
-                        .unwrap();
+                    ui.draw(
+                        &mut renderer,
+                        (320, 240),
+                        &snapshot,
+                        snapshot.origin,
+                        0.25,
+                        None,
+                    )
+                    .unwrap();
                     if renderer.ground_items.as_ref().is_some_and(|ground| {
                         ground.has_glint() && ground.resource_identities().len() == 2
                     }) {
@@ -2407,8 +2414,15 @@ mod tests {
                 renderer.render(&snapshot, 0.25, glam::Vec3::NEG_Z).unwrap();
                 snapshot.dropped_items = Arc::from([]);
                 snapshot.falling_blocks = Arc::from([]);
-                ui.draw(&mut renderer, (320, 240), &snapshot, snapshot.origin, 0.25)
-                    .unwrap();
+                ui.draw(
+                    &mut renderer,
+                    (320, 240),
+                    &snapshot,
+                    snapshot.origin,
+                    0.25,
+                    None,
+                )
+                .unwrap();
                 assert!(!renderer.ground_items.as_ref().unwrap().has_glint());
                 assert_eq!(renderer.hand_glint_last.active, 0.0);
                 event_loop.exit();

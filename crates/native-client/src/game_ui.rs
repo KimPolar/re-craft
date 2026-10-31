@@ -139,6 +139,21 @@ pub struct GameUi {
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
     consume_particles: crate::consume_particles::ParticleSystem,
+    plant_sprites: Option<
+        std::collections::BTreeMap<
+            native_session::loaded::PlantParticleKind,
+            (Arc<image::RgbaImage>, bool),
+        >,
+    >,
+    plant_sprite_result: std::sync::mpsc::Receiver<
+        Result<
+            std::collections::BTreeMap<
+                native_session::loaded::PlantParticleKind,
+                (Arc<image::RgbaImage>, bool),
+            >,
+            String,
+        >,
+    >,
     smoke_particles: crate::smoke_particles::SmokeSystem,
     smoke_sprites: Option<Vec<Arc<image::RgbaImage>>>,
     smoke_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
@@ -182,7 +197,22 @@ impl GameUi {
     pub fn new(assets: Arc<MenuAssets>) -> Self {
         let skin = Arc::clone(&assets.player_skin);
         let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (plant_sender, plant_sprite_result) = std::sync::mpsc::sync_channel(1);
         let smoke_loader = Arc::clone(&assets.item_models);
+        let plant_loader = Arc::clone(&assets.item_models);
+        let _ = std::thread::Builder::new()
+            .name("plant-particle-loader".into())
+            .spawn(move || {
+                let result = plant_loader
+                    .lock()
+                    .map_err(|_| "particle resource loader is unavailable".to_owned())
+                    .and_then(|mut loader| {
+                        loader
+                            .load_plant_particle_sprites()
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                let _ = plant_sender.send(result);
+            });
         let _ = std::thread::Builder::new()
             .name("particle-sprite-loader".into())
             .spawn(move || {
@@ -211,6 +241,8 @@ impl GameUi {
             skin,
             held_models,
             consume_particles: crate::consume_particles::ParticleSystem::default(),
+            plant_sprites: None,
+            plant_sprite_result,
             smoke_particles: crate::smoke_particles::SmokeSystem::default(),
             smoke_sprites: None,
             smoke_sprite_result,
@@ -266,6 +298,13 @@ impl GameUi {
     ) {
         self.consume_particles
             .update(snapshot.tick, &snapshot.world, spawns);
+    }
+
+    pub fn queue_plant_break_particles(
+        &mut self,
+        bursts: Vec<native_session::loaded::PlantBreakParticles>,
+    ) {
+        self.consume_particles.queue_plant_breaks(bursts);
     }
 
     pub fn update_evaporation_smoke(
@@ -1504,6 +1543,9 @@ impl GameUi {
         snapshot: &native_session::WorldSnapshot,
         render_origin: glam::IVec3,
         partial: f32,
+        biome_colors: Option<
+            &std::collections::BTreeMap<String, native_resources::biomes::BiomeColors>,
+        >,
     ) -> Result<()> {
         self.held_models.begin_frame();
         let dimension = match &snapshot.world {
@@ -1582,13 +1624,49 @@ impl GameUi {
                 Err(_) => {}
             }
         }
+        if self.plant_sprites.is_none() {
+            match self.plant_sprite_result.try_recv() {
+                Ok(Ok(sprites)) => self.plant_sprites = Some(sprites),
+                Ok(Err(error)) => eprintln!("Cannot load plant particle sprites: {error}"),
+                Err(_) => {}
+            }
+        }
         let mut particle_draws = Vec::new();
+        let mut plant_colors = std::collections::HashMap::new();
         for particle in self.consume_particles.particles() {
-            let Some(model) = self.held_models.get_item(&particle.item) else {
-                continue;
-            };
-            let Some(texture) = &model.particle_texture else {
-                continue;
+            let (texture, color, opaque) = match &particle.visual {
+                crate::consume_particles::ParticleVisual::Item(item) => {
+                    let Some(model) = self.held_models.get_item(item) else {
+                        continue;
+                    };
+                    let Some(texture) = &model.particle_texture else {
+                        continue;
+                    };
+                    (Arc::clone(texture), [1.0; 3], false)
+                }
+                crate::consume_particles::ParticleVisual::Plant(kind, position) => {
+                    let Some((texture, opaque)) = self
+                        .plant_sprites
+                        .as_ref()
+                        .and_then(|sprites| sprites.get(kind))
+                    else {
+                        continue;
+                    };
+                    let color = match (kind, &snapshot.world, biome_colors) {
+                        (native_session::loaded::PlantParticleKind::DeadBush, _, _) => [0.6; 3],
+                        (_, native_session::SessionWorld::Loaded(world), Some(biomes)) => {
+                            *plant_colors.entry(*position).or_insert_with(|| {
+                                crate::preview::grass_particle_tint(world, biomes, *position)
+                            })
+                        }
+                        _ => [
+                            0.6 * (145.0 / 255.0),
+                            0.6 * (189.0 / 255.0),
+                            0.6 * (90.0 / 255.0),
+                        ],
+                    };
+                    (Arc::clone(texture), color, *opaque)
+                }
             };
             let light = match &snapshot.world {
                 native_session::SessionWorld::Demo(_) => u32::MAX,
@@ -1608,9 +1686,9 @@ impl GameUi {
                     particle.uv[0] / 4.0 + 0.25,
                     particle.uv[1] / 4.0 + 0.25,
                 ],
-                color: [1.0; 3],
-                opaque: false,
-                texture: Arc::clone(texture),
+                color,
+                opaque,
+                texture,
                 light,
             });
         }

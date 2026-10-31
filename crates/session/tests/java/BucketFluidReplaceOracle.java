@@ -25,12 +25,12 @@ public class BucketFluidReplaceOracle {
   }
   static class World extends ClientLevel {
     Map<BlockPos,BlockState> blocks; EnvironmentAttributeSystem environment; RandomSource rng;
-    SoundEvent sound; SoundSource category; float volume,pitch; BlockPos soundPosition; boolean destroyed; String destroySound; float destroyVolume,destroyPitch;
+    SoundEvent sound; SoundSource category; float volume,pitch; BlockPos soundPosition; boolean destroyed; String destroySound; float destroyVolume,destroyPitch; boolean terrainParticles; JsonArray shape;
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
     @Override public BlockState getBlockState(BlockPos pos) { return blocks.getOrDefault(pos,Blocks.AIR.defaultBlockState()); }
     @Override public boolean isClientSide() { return false; }
     @Override public boolean setBlock(BlockPos pos,BlockState state,int flags,int depth) { if(getBlockState(pos)==state) return false; blocks.put(pos,state); return true; }
-    @Override public boolean destroyBlock(BlockPos pos,boolean drops,Entity entity,int depth) { var state=getBlockState(pos); if(state.isAir()) return false; destroyed=true; state.getBlock().spawnDestroyParticles(this,pos,state); blocks.put(pos,Blocks.AIR.defaultBlockState()); return true; }
+    @Override public boolean destroyBlock(BlockPos pos,boolean drops,Entity entity,int depth) { var state=getBlockState(pos); if(state.isAir()) return false; destroyed=true; terrainParticles=state.shouldSpawnTerrainParticles(); shape=new JsonArray(); for(var b:state.getShape(this,pos).toAabbs()) { var a=new JsonArray(); for(double v:new double[]{b.minX,b.minY,b.minZ,b.maxX,b.maxY,b.maxZ}) a.add(v); shape.add(a); } state.getBlock().spawnDestroyParticles(this,pos,state); blocks.put(pos,Blocks.AIR.defaultBlockState()); return true; }
     @Override public void levelEvent(Entity entity,int event,BlockPos pos,int data) { if(event!=2001) throw new AssertionError(event); var type=Block.stateById(data).getSoundType(); destroySound=type.getBreakSound().location().toString(); destroyVolume=(type.getVolume()+1.0f)/2.0f; destroyPitch=type.getPitch()*0.8f; }
     @Override public EnvironmentAttributeSystem environmentAttributes() { return environment; }
     @Override public RandomSource getRandom() { return rng; }
@@ -64,7 +64,7 @@ public class BucketFluidReplaceOracle {
     boolean success=bucket.emptyContents(player,world,target,hit);
     var row=new JsonObject(); row.addProperty("lava",lava); row.addProperty("evaporates",evaporates); row.addProperty("sneak",sneak); row.addProperty("initial",initial); row.addProperty("level",level); row.addProperty("success",success);
     row.addProperty("clicked",describe(world.getBlockState(CLICKED))); row.addProperty("adjacent",describe(world.getBlockState(ADJACENT))); row.addProperty("next_random",world.rng.nextInt());
-    row.addProperty("destroyed",world.destroyed);
+    row.addProperty("destroyed",world.destroyed); if(world.destroyed) { row.addProperty("terrain_particles",world.terrainParticles); row.add("shape",world.shape); }
     if(world.destroySound!=null) { row.addProperty("destroy_sound",world.destroySound); row.addProperty("destroy_volume_bits",Float.floatToRawIntBits(world.destroyVolume)); row.addProperty("destroy_pitch_bits",Float.floatToRawIntBits(world.destroyPitch)); }
     if(world.sound!=null) { row.addProperty("sound",world.sound.location().toString()); row.addProperty("sound_z",world.soundPosition.getZ()); row.addProperty("volume_bits",Float.floatToRawIntBits(world.volume)); row.addProperty("pitch_bits",Float.floatToRawIntBits(world.pitch)); }
     out.add(row);

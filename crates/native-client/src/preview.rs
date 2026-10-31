@@ -46,6 +46,7 @@ pub struct PreviewScene {
     pub material_generation: Option<u64>,
     pub lightmap: Arc<[[[f32; 3]; 16]; 16]>,
     pub base_lightmap: Arc<native_world::lighting::LightmapSettings>,
+    pub biome_colors: Arc<BTreeMap<String, BiomeColors>>,
 }
 
 struct BlockModel {
@@ -149,7 +150,7 @@ struct PreviewMaterials {
     fluids: BTreeMap<BlockStateId, FluidState>,
     water_textures: Option<FluidTextures>,
     lava_textures: Option<FluidTextures>,
-    biome_colors: BTreeMap<String, BiomeColors>,
+    biome_colors: Arc<BTreeMap<String, BiomeColors>>,
     lighting: PreviewLighting,
     lightmap: Arc<[[[f32; 3]; 16]; 16]>,
     base_lightmap: Arc<native_world::lighting::LightmapSettings>,
@@ -407,7 +408,7 @@ impl PreviewMaterials {
             fluids,
             water_textures,
             lava_textures,
-            biome_colors,
+            biome_colors: Arc::new(biome_colors),
             lighting,
             lightmap,
             base_lightmap,
@@ -675,6 +676,7 @@ impl PreviewScene {
             material_generation: None,
             lightmap: Arc::clone(&materials.lightmap),
             base_lightmap: Arc::clone(&materials.base_lightmap),
+            biome_colors: Arc::clone(&materials.biome_colors),
         })
     }
 
@@ -1016,6 +1018,7 @@ impl IncrementalPreview {
             material_generation: Some(self.generation),
             lightmap: Arc::clone(&materials.lightmap),
             base_lightmap: Arc::clone(&materials.base_lightmap),
+            biome_colors: Arc::clone(&materials.biome_colors),
         })
     }
 }
@@ -1190,6 +1193,14 @@ fn biome_tint(
         BiomeTint::DryFoliage => biome.map_or(0xae9d77, |b| b.dry_foliage),
         BiomeTint::Water => biome.map_or(0x3f76e4, |b| b.water),
     })
+}
+
+pub(crate) fn grass_particle_tint(
+    world: &World,
+    biomes: &BTreeMap<String, BiomeColors>,
+    position: IVec3,
+) -> [f32; 3] {
+    biome_tint(world, biomes, position, BiomeTint::Grass).map(|component| component * 0.6)
 }
 
 fn tint(

@@ -465,6 +465,7 @@ pub struct LoadedSession {
     locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
     bucket_sounds: VecDeque<BucketSoundEvent>,
     evaporation_smoke: VecDeque<EvaporationSmoke>,
+    plant_break_particles: VecDeque<PlantBreakParticles>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -600,6 +601,30 @@ pub struct BucketSoundEvent {
 pub struct EvaporationSmoke {
     pub position: IVec3,
     pub tick: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
+pub enum PlantParticleKind {
+    ShortGrass,
+    Fern,
+    DeadBush,
+}
+
+impl PlantParticleKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ShortGrass => "minecraft:short_grass",
+            Self::Fern => "minecraft:fern",
+            Self::DeadBush => "minecraft:dead_bush",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlantBreakParticles {
+    pub position: IVec3,
+    pub tick: u64,
+    pub kind: PlantParticleKind,
 }
 
 #[derive(Clone, Debug)]
@@ -3155,6 +3180,7 @@ impl LoadedSession {
             locked_chest_sounds: VecDeque::new(),
             bucket_sounds: VecDeque::new(),
             evaporation_smoke: VecDeque::new(),
+            plant_break_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -4002,6 +4028,10 @@ impl LoadedSession {
 
     pub fn take_evaporation_smoke(&mut self) -> Vec<EvaporationSmoke> {
         self.evaporation_smoke.drain(..).collect()
+    }
+
+    pub fn take_plant_break_particles(&mut self) -> Vec<PlantBreakParticles> {
+        self.plant_break_particles.drain(..).collect()
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -7455,6 +7485,19 @@ impl LoadedSession {
                     return false;
                 }
                 self.push_bucket_sound(BucketSoundKind::PlantBreak, sound_position, 1.0, 0.8);
+                if self.plant_break_particles.len() == 4096 {
+                    self.plant_break_particles.pop_front();
+                }
+                self.plant_break_particles.push_back(PlantBreakParticles {
+                    position: absolute,
+                    tick: self.tick.saturating_add(1),
+                    kind: match block.name.as_str() {
+                        "minecraft:short_grass" => PlantParticleKind::ShortGrass,
+                        "minecraft:fern" => PlantParticleKind::Fern,
+                        "minecraft:dead_bush" => PlantParticleKind::DeadBush,
+                        _ => unreachable!("plant name was checked"),
+                    },
+                });
                 if !self.set(target, self.states[0]) {
                     return false;
                 }
@@ -14256,6 +14299,11 @@ mod tests {
                             session.submit_command(PlayerCommand::Place);
                             session.update(TICK);
                             let absolute = session.origin + target;
+                            let particles = session.take_plant_break_particles();
+                            assert_eq!(particles.len(), 1);
+                            assert_eq!(particles[0].kind.id(), format!("minecraft:{plant}"));
+                            assert_eq!(particles[0].position, absolute);
+                            assert_eq!(particles[0].tick, session.tick);
                             let sounds = session.take_bucket_sounds();
                             assert_eq!(sounds.len(), 2);
                             assert_eq!(sounds[0].kind, BucketSoundKind::PlantBreak);
@@ -14317,6 +14365,7 @@ mod tests {
             );
             session.set_player_inventory(inventory);
             assert_eq!(session.try_empty_bucket(PlayerSlot::Storage(0)), evaporates);
+            assert!(session.take_plant_break_particles().is_empty());
             let sounds = session.take_bucket_sounds();
             assert_eq!(sounds.len(), usize::from(evaporates));
             if evaporates {
@@ -14693,6 +14742,15 @@ mod tests {
             session.set_player_inventory(inventory);
             let success = session.try_empty_bucket(PlayerSlot::Storage(0));
             assert_eq!(success, row["success"].as_bool().unwrap(), "{row}");
+            let particles = session.take_plant_break_particles();
+            let destroyed = row["destroyed"].as_bool().unwrap();
+            assert_eq!(particles.len(), usize::from(destroyed), "{row}");
+            if destroyed {
+                assert_eq!(row["terrain_particles"].as_bool(), Some(true));
+                assert_eq!(particles[0].position, session.origin + adjacent);
+                assert_eq!(particles[0].tick, 1);
+                assert_eq!(particles[0].kind.id(), format!("minecraft:{initial}"));
+            }
             for (pos, key) in [(clicked, "clicked"), (adjacent, "adjacent")] {
                 let p = session.origin + pos;
                 let block = session.world.block(p.x, p.y, p.z).unwrap();

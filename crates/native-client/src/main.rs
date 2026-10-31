@@ -1882,6 +1882,7 @@ impl App {
                 &snapshot,
                 snapshot.origin,
                 self.session.partial_tick(),
+                None,
             ) {
                 self.fail(event_loop, error);
                 return;

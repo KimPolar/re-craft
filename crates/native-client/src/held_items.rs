@@ -361,6 +361,51 @@ fn compass_range_branch<'a>(definition: &'a Value, key: &ModelKey) -> Option<&'a
 }
 
 impl Loader {
+    pub(crate) fn load_plant_particle_sprites(
+        &mut self,
+    ) -> Result<
+        std::collections::BTreeMap<
+            native_session::loaded::PlantParticleKind,
+            (Arc<RgbaImage>, bool),
+        >,
+    > {
+        use native_session::loaded::PlantParticleKind;
+        let mut result = std::collections::BTreeMap::new();
+        for kind in [
+            PlantParticleKind::ShortGrass,
+            PlantParticleKind::Fern,
+            PlantParticleKind::DeadBush,
+        ] {
+            let loaded: Result<_> = (|| {
+                let groups = native_resources::blockstates::resolve_blockstate(
+                    &mut self.stack,
+                    kind.id(),
+                    &std::collections::BTreeMap::new(),
+                )?;
+                let model_id = &groups
+                    .first()
+                    .and_then(|group| group.first())
+                    .context("block has no particle model")?
+                    .model;
+                let model = models::resolve_model(
+                    &mut self.stack,
+                    &format!("{}:{}", model_id.namespace, model_id.path),
+                )?;
+                let texture = model.texture("particle")?;
+                let image = self.texture(&texture.sprite)?;
+                let opaque = image.pixels().all(|pixel| pixel[3] == 0 || pixel[3] == 255);
+                Ok((image, opaque))
+            })();
+            match loaded {
+                Ok(sprite) => {
+                    result.insert(kind, sprite);
+                }
+                Err(error) => eprintln!("Cannot load {} particle sprite: {error:#}", kind.id()),
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn load_large_smoke_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
         let bytes = self
             .stack
@@ -1215,6 +1260,40 @@ impl ItemModelCache {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn plant_particle_sprites_follow_blockstate_model_and_resource_pack() {
+        use native_session::loaded::PlantParticleKind;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let vanilla = open_loader(&game, &[])
+            .load_plant_particle_sprites()
+            .unwrap();
+        assert_eq!(vanilla.len(), 3);
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("blockstates")).unwrap();
+        std::fs::create_dir_all(base.join("models/block")).unwrap();
+        std::fs::create_dir_all(base.join("textures/block")).unwrap();
+        std::fs::write(
+            base.join("blockstates/short_grass.json"),
+            br#"{"variants":{"":{"model":"minecraft:block/custom_plant"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(base.join("models/block/custom_plant.json"), br##"{"textures":{"particle":"#texture","texture":"minecraft:block/custom_particle"}}"##).unwrap();
+        RgbaImage::from_pixel(4, 4, image::Rgba([7, 11, 13, 255]))
+            .save(base.join("textures/block/custom_particle.png"))
+            .unwrap();
+        let selected = open_loader(&game, &[pack.path().to_path_buf()])
+            .load_plant_particle_sprites()
+            .unwrap();
+        let (image, opaque) = &selected[&PlantParticleKind::ShortGrass];
+        assert_eq!(image.get_pixel(0, 0).0, [7, 11, 13, 255]);
+        assert!(*opaque);
+        assert_eq!(selected.len(), 3);
+    }
 
     #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]

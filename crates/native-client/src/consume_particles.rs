@@ -7,7 +7,12 @@ use std::{
 
 use glam::{DVec3, IVec3};
 use native_core::random::LegacyRandom;
-use native_session::{SessionWorld, consume_particles::ConsumeParticleSpawn, inventory::ItemStack};
+use native_session::{
+    SessionWorld,
+    consume_particles::ConsumeParticleSpawn,
+    inventory::ItemStack,
+    loaded::{PlantBreakParticles, PlantParticleKind},
+};
 use native_world::{
     collision::Aabb,
     movement::{BoundingBox, CollisionShape, resolve_movement},
@@ -15,9 +20,30 @@ use native_world::{
 
 const MAX_PARTICLES: usize = 4096;
 
+/// 26.3 subdivides the plants' 12×13×12 voxel shape at quarter-block intervals.
+fn plant_fragments(block: IVec3) -> impl Iterator<Item = (DVec3, DVec3)> {
+    (0..3).flat_map(move |x| {
+        (0..4).flat_map(move |y| {
+            (0..3).map(move |z| {
+                let fraction = DVec3::new(
+                    (f64::from(x) + 0.5) / 3.0,
+                    (f64::from(y) + 0.5) / 4.0,
+                    (f64::from(z) + 0.5) / 3.0,
+                );
+                let local = DVec3::new(
+                    0.125 + fraction.x * 0.75,
+                    fraction.y * 0.8125,
+                    0.125 + fraction.z * 0.75,
+                );
+                (block.as_dvec3() + local, fraction - DVec3::splat(0.5))
+            })
+        })
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Particle {
-    pub item: Arc<ItemStack>,
+    pub visual: ParticleVisual,
     pub previous: DVec3,
     pub position: DVec3,
     pub velocity: DVec3,
@@ -30,12 +56,35 @@ pub(crate) struct Particle {
     on_ground: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ParticleVisual {
+    Item(Arc<ItemStack>),
+    Plant(PlantParticleKind, IVec3),
+}
+
 impl Particle {
     fn new(spawn: ConsumeParticleSpawn, random: &mut LegacyRandom) -> Self {
+        Self::new_inner(
+            spawn.position,
+            spawn.velocity,
+            ParticleVisual::Item(spawn.item),
+            false,
+            random,
+        )
+    }
+
+    fn new_inner(
+        position: DVec3,
+        velocity: DVec3,
+        visual: ParticleVisual,
+        terrain: bool,
+        random: &mut LegacyRandom,
+    ) -> Self {
         // Particle has a separate random source from the player's random stream.
         let lifetime = (4.0_f32 / (random.next_float() * 0.9 + 0.1)) as i32;
         let mut random_component = || f64::from((random.next_float() * 2.0 - 1.0) * 0.4);
-        let initial = DVec3::new(random_component(), random_component(), random_component());
+        let initial = DVec3::new(random_component(), random_component(), random_component())
+            + if terrain { velocity } else { DVec3::ZERO };
         let speed = f64::from((random.next_float() + random.next_float() + 1.0) * 0.15);
         let length = (initial.x * initial.x + initial.y * initial.y + initial.z * initial.z).sqrt();
         let initial_velocity = DVec3::new(
@@ -47,14 +96,18 @@ impl Particle {
         let uv = [random.next_float() * 3.0, random.next_float() * 3.0];
         let half = f64::from(0.1_f32);
         let bounds = BoundingBox {
-            min: spawn.position + DVec3::new(-half, 0.0, -half),
-            max: spawn.position + DVec3::new(half, f64::from(0.2_f32), half),
+            min: position + DVec3::new(-half, 0.0, -half),
+            max: position + DVec3::new(half, f64::from(0.2_f32), half),
         };
         Self {
-            item: spawn.item,
-            previous: spawn.position,
-            position: spawn.position,
-            velocity: initial_velocity * f64::from(0.1_f32) + spawn.velocity,
+            visual,
+            previous: position,
+            position,
+            velocity: if terrain {
+                initial_velocity
+            } else {
+                initial_velocity * f64::from(0.1_f32) + velocity
+            },
             size,
             uv,
             bounds,
@@ -167,6 +220,7 @@ pub(crate) fn collide(
 pub(crate) struct ParticleSystem {
     particles: VecDeque<Particle>,
     pending: BTreeMap<u64, Vec<ConsumeParticleSpawn>>,
+    pending_plants: BTreeMap<u64, Vec<PlantBreakParticles>>,
     tick: Option<u64>,
     random: LegacyRandom,
     shapes: HashMap<u32, Option<Vec<Aabb>>>,
@@ -180,6 +234,7 @@ impl Default for ParticleSystem {
         Self {
             particles: VecDeque::new(),
             pending: BTreeMap::new(),
+            pending_plants: BTreeMap::new(),
             tick: None,
             random: LegacyRandom::new(seed),
             shapes: HashMap::new(),
@@ -188,18 +243,30 @@ impl Default for ParticleSystem {
 }
 
 impl ParticleSystem {
+    pub fn queue_plant_breaks(&mut self, events: Vec<PlantBreakParticles>) {
+        for event in events {
+            self.pending_plants
+                .entry(event.tick)
+                .or_default()
+                .push(event);
+        }
+    }
     pub fn update(&mut self, target: u64, world: &SessionWorld, spawns: Vec<ConsumeParticleSpawn>) {
         for spawn in spawns {
             self.pending.entry(spawn.tick).or_default().push(spawn);
         }
         let first = self
             .pending
-            .first_key_value()
-            .map_or(target, |(&tick, _)| tick.saturating_sub(1).min(target));
+            .keys()
+            .chain(self.pending_plants.keys())
+            .copied()
+            .min()
+            .map_or(target, |tick| tick.saturating_sub(1).min(target));
         let mut tick = self.tick.unwrap_or(first);
         if target < tick {
             self.particles.clear();
             self.pending.clear();
+            self.pending_plants.clear();
             self.shapes.clear();
             tick = target;
         }
@@ -208,6 +275,8 @@ impl ParticleSystem {
             self.particles.clear();
             tick = target - 100;
             self.pending.retain(|&spawn_tick, _| spawn_tick > tick);
+            self.pending_plants
+                .retain(|&spawn_tick, _| spawn_tick > tick);
         }
         while tick < target {
             tick += 1;
@@ -221,6 +290,23 @@ impl ParticleSystem {
                 }
                 let mut random = LegacyRandom::new(self.random.next_long());
                 self.particles.push_back(Particle::new(spawn, &mut random));
+            }
+            let ready = self.pending_plants.split_off(&tick.saturating_add(1));
+            let events = std::mem::replace(&mut self.pending_plants, ready);
+            for event in events.into_values().flatten() {
+                for (position, velocity) in plant_fragments(event.position) {
+                    if self.particles.len() == MAX_PARTICLES {
+                        self.particles.pop_front();
+                    }
+                    let mut random = LegacyRandom::new(self.random.next_long());
+                    self.particles.push_back(Particle::new_inner(
+                        position,
+                        velocity,
+                        ParticleVisual::Plant(event.kind, event.position),
+                        true,
+                        &mut random,
+                    ));
+                }
             }
         }
         self.tick = Some(tick);
@@ -282,6 +368,176 @@ mod tests {
         particles.update(0, &world, vec![]);
         particles.update(1000, &world, vec![spawn(1), spawn(1000)]);
         assert_eq!(particles.particles().count(), 1);
+    }
+
+    #[test]
+    fn plant_breaks_keep_particles_across_frame_batches() {
+        let world = SessionWorld::Demo(native_world::World::demo());
+        let mut batched = ParticleSystem::default();
+        let mut individual = ParticleSystem::default();
+        batched.random = LegacyRandom::new(42);
+        individual.random = LegacyRandom::new(42);
+        let burst = |tick| PlantBreakParticles {
+            tick,
+            position: IVec3::new(2, 4, 3),
+            kind: PlantParticleKind::Fern,
+        };
+        batched.queue_plant_breaks(vec![burst(2), burst(6)]);
+        batched.update(10, &world, vec![]);
+        for tick in 1..=10 {
+            if tick == 2 || tick == 6 {
+                individual.queue_plant_breaks(vec![burst(tick)]);
+            }
+            individual.update(tick, &world, vec![]);
+        }
+        let fields = |system: &ParticleSystem| {
+            system
+                .particles()
+                .map(|p| (p.position, p.velocity, p.age, p.lifetime, p.size, p.uv))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(&batched), fields(&individual));
+        assert!(batched.particles().count() > 0);
+        let mut initial = ParticleSystem::default();
+        initial.queue_plant_breaks(vec![burst(2)]);
+        initial.update(2, &world, vec![]);
+        assert_eq!(initial.particles().count(), 36);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn plant_shapes_and_particle_physics_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let file = game.join("libraries").join(path);
+                if file.is_file() {
+                    paths.push(file);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlantParticleOracle.java");
+        let output = temp.path().join("plant_particles.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlantParticleOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("PlantParticleOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java particle oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for row in rows["shapes"].as_array().unwrap() {
+            assert_eq!(row["enabled"].as_bool(), Some(true));
+            let coordinates = row["position"].as_array().unwrap();
+            let block = IVec3::new(
+                coordinates[0].as_i64().unwrap() as i32,
+                coordinates[1].as_i64().unwrap() as i32,
+                coordinates[2].as_i64().unwrap() as i32,
+            );
+            let actual: Vec<_> = plant_fragments(block).collect();
+            let expected = row["fragments"].as_array().unwrap();
+            assert_eq!(actual.len(), expected.len(), "{row}");
+            for ((position, velocity), values) in actual.iter().zip(expected) {
+                for (actual, expected) in position
+                    .to_array()
+                    .into_iter()
+                    .chain(velocity.to_array())
+                    .zip(values.as_array().unwrap())
+                {
+                    assert_eq!(actual.to_bits(), expected.as_i64().unwrap() as u64, "{row}");
+                }
+            }
+        }
+        assert_eq!(rows["physics"].as_array().unwrap().len(), 200);
+        for row in rows["physics"].as_array().unwrap() {
+            let mut rng = LegacyRandom::new(row["seed"].as_i64().unwrap());
+            let mut particle = Particle::new_inner(
+                DVec3::new(1.25, 3.5, -2.25),
+                DVec3::new(0.1, 0.15, -0.05),
+                ParticleVisual::Plant(PlantParticleKind::Fern, IVec3::ZERO),
+                true,
+                &mut rng,
+            );
+            assert_eq!(
+                particle.lifetime,
+                row["lifetime"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+            for (actual, field) in [
+                (particle.size, "size_bits"),
+                (particle.uv[0], "u_bits"),
+                (particle.uv[1], "v_bits"),
+            ] {
+                assert_eq!(
+                    actual.to_bits(),
+                    row[field].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+            }
+            let floor = CollisionShape::new(vec![BoundingBox {
+                min: DVec3::new(-100.0, 2.0, -100.0),
+                max: DVec3::new(100.0, 3.0, 100.0),
+            }]);
+            for (index, state) in row["states"].as_array().unwrap().iter().enumerate() {
+                let alive = if index == 0 {
+                    true
+                } else {
+                    particle.tick_with(|bounds, velocity| {
+                        if row["floor"].as_bool().unwrap() {
+                            resolve_movement(
+                                bounds,
+                                velocity,
+                                false,
+                                0.0,
+                                std::slice::from_ref(&floor),
+                            )
+                        } else {
+                            velocity
+                        }
+                    })
+                };
+                for (actual, expected) in particle
+                    .position
+                    .to_array()
+                    .into_iter()
+                    .chain(particle.velocity.to_array())
+                    .zip(state.as_array().unwrap())
+                {
+                    assert_eq!(actual.to_bits(), expected.as_i64().unwrap() as u64, "{row}");
+                }
+                assert_eq!(particle.age, state[6].as_i64().unwrap() as i32, "{row}");
+                assert_eq!(!alive, state[7].as_bool().unwrap(), "{row}");
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]

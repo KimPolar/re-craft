@@ -444,8 +444,10 @@ impl Viewer {
             play.streamer.service(&mut play.session)?;
             let snapshot = play.session.snapshot();
             let particles = play.session.take_consume_particles();
+            let plant_breaks = play.session.take_plant_break_particles();
             let smoke = play.session.take_evaporation_smoke();
             if let Some(ui) = &mut self.ui {
+                ui.queue_plant_break_particles(plant_breaks);
                 ui.update_consume_particles(&snapshot, particles);
                 ui.update_evaporation_smoke(&snapshot, smoke);
             }
@@ -784,6 +786,7 @@ impl Viewer {
                 &snapshot,
                 self.scene.origin,
                 play.session.partial_tick(),
+                Some(&self.scene.biome_colors),
             ) {
                 self.fail(event_loop, error);
                 return;
@@ -1788,6 +1791,7 @@ mod tests {
                                 material_generation: self.scene.material_generation,
                                 lightmap: Arc::clone(&original_lightmap),
                                 base_lightmap: Arc::clone(&self.scene.base_lightmap),
+                                biome_colors: Arc::clone(&self.scene.biome_colors),
                             };
                             let old_path = renderer
                                 .preview_readback(&baked, eye, Vec3::NEG_Z, false)

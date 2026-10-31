@@ -215,6 +215,29 @@ impl PoiDraft {
     pub fn changed_positions(&self) -> &BTreeSet<[i32; 3]> {
         &self.changed_positions
     }
+
+    /// Add this partial draft only if the supplied source is the captured one.
+    /// Other world side effects must still be checked by the caller.
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut crate::save::WorldSavePlan,
+        dimension: crate::world::DimensionId,
+        source: &NamedTag,
+        timestamp: u32,
+    ) -> Result<()> {
+        ensure!(
+            crate::nbt::write(source)? == crate::nbt::write(&self.source)?,
+            "POI source differs from the draft source"
+        );
+        plan.add_poi_chunk(
+            dimension,
+            self.position,
+            Some(source),
+            &self.document,
+            timestamp,
+            |_, _| Ok(()),
+        )
+    }
 }
 
 /// Stage known block transitions against an existing valid POI section.
@@ -225,12 +248,31 @@ impl PoiDraft {
 pub fn draft_block_changes(
     source: &SavedPoiChunk,
     changes: &[PoiBlockChange],
+    validate_state: impl FnMut(&BlockState) -> Result<()>,
+) -> Result<PoiDraft> {
+    draft_changes(source, changes, false, validate_state)
+}
+
+/// Apply transitions in their original order, retaining intermediate POI
+/// removal and creation even when the final block equals its starting state.
+pub fn draft_ordered_block_changes(
+    source: &SavedPoiChunk,
+    changes: &[PoiBlockChange],
+    validate_state: impl FnMut(&BlockState) -> Result<()>,
+) -> Result<PoiDraft> {
+    draft_changes(source, changes, true, validate_state)
+}
+
+fn draft_changes(
+    source: &SavedPoiChunk,
+    changes: &[PoiBlockChange],
+    ordered: bool,
     mut validate_state: impl FnMut(&BlockState) -> Result<()>,
 ) -> Result<PoiDraft> {
     let original = (*source.document).clone();
     let mut decoded = decode_poi_chunk(original.clone(), source.position)?;
     let mut document = original.clone();
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeMap::<[i32; 3], &BlockState>::new();
     let mut changed_positions = BTreeSet::new();
     for change in changes {
         let [x, y, z] = change.position;
@@ -238,10 +280,13 @@ pub fn draft_block_changes(
             x.div_euclid(16) == source.position.x && z.div_euclid(16) == source.position.z,
             "POI change is outside its chunk"
         );
-        ensure!(
-            visited.insert(change.position),
-            "duplicate POI block change"
-        );
+        if let Some(previous) = visited.insert(change.position, &change.replacement) {
+            ensure!(ordered, "duplicate POI block change");
+            ensure!(
+                previous == &change.expected,
+                "POI block transition history is discontinuous"
+            );
+        }
         validate_state(&change.expected)?;
         validate_state(&change.replacement)?;
         let Some((before, after)) = poi::change(&change.expected, &change.replacement) else {
@@ -464,6 +509,37 @@ mod tests {
         assert!(draft.changed_positions().is_empty());
         assert_eq!(draft.document(), &*source.document);
         assert_eq!(source.sections[&0].records[0].free_tickets, 0);
+    }
+
+    #[test]
+    fn ordered_removal_and_recreation_resets_occupied_poi() {
+        let source = source(true);
+        let head = state("red_bed", &[("part", "head")]);
+        let air = state("air", &[]);
+        let edits = [
+            edit(0, head.clone(), air.clone()),
+            edit(0, air.clone(), head.clone()),
+        ];
+        assert!(draft_block_changes(&source, &edits, |_| Ok(())).is_err());
+        let draft = draft_ordered_block_changes(&source, &edits, |_| Ok(())).unwrap();
+        let section = decode_poi_chunk(draft.document().clone(), source.position)
+            .unwrap()
+            .sections
+            .remove(&0)
+            .unwrap();
+        let bed = section
+            .records
+            .iter()
+            .find(|record| record.position == [0, 4, 0])
+            .unwrap();
+        assert!(bed.type_id.matches("minecraft:home"));
+        assert_eq!(bed.free_tickets, 1);
+        assert!(draft.changed_positions().contains(&[0, 4, 0]));
+        let bad = [
+            edit(0, head.clone(), air),
+            edit(0, state("stone", &[]), head),
+        ];
+        assert!(draft_ordered_block_changes(&source, &bad, |_| Ok(())).is_err());
     }
 
     fn terrain(pois: &[(usize, &str)]) -> loaded::World {

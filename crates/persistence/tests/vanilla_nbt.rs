@@ -442,6 +442,13 @@ public class PoiOracle {
     runtime.refresh(add -> { add.accept(new BlockPos(-1,-1,0), meeting); add.accept(new BlockPos(-3,-3,2), meeting); });
     refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
     NbtIo.write(refreshRoot, Path.of(args[0], "refresh-expected.nbt"));
+    var occupied = new PoiSection.Packed(true, List.of(new PoiRecord.Packed(new BlockPos(-1,-1,0), home, 0)));
+    var orderedSections = new CompoundTag(); orderedSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, occupied).getOrThrow());
+    var orderedRoot = new CompoundTag(); orderedRoot.putInt("DataVersion", 5023); orderedRoot.put("Sections", orderedSections);
+    NbtIo.write(orderedRoot, Path.of(args[0], "ordered-source.nbt"));
+    var ordered = occupied.unpack(() -> {}); ordered.remove(new BlockPos(-1,-1,0)); ordered.add(new BlockPos(-1,-1,0), home);
+    orderedSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, ordered.pack()).getOrThrow());
+    NbtIo.write(orderedRoot, Path.of(args[0], "ordered-expected.nbt"));
     var data = new CompoundTag(); data.putInt("DataVersion", 5023);
     var level = new CompoundTag(); level.put("Data", data);
     NbtIo.writeCompressed(level, Path.of(args[0], "level.dat"));
@@ -604,6 +611,35 @@ public class PoiOracle {
         records(actual.document.as_ref().unwrap()),
         records(&expected)
     );
+    let ordered_source = SavedPoiChunk {
+        position: source.position,
+        document: Arc::new(
+            nbt::read(&std::fs::read(temp.path().join("ordered-source.nbt")).unwrap()).unwrap(),
+        ),
+        sections: BTreeMap::new(),
+    };
+    let bed = state("red_bed", &[("part", "head")]);
+    let air = state("air", &[]);
+    let ordered = native_persistence::poi::draft_ordered_block_changes(
+        &ordered_source,
+        &[
+            PoiBlockChange {
+                position: [-1, -1, 0],
+                expected: bed.clone(),
+                replacement: air.clone(),
+            },
+            PoiBlockChange {
+                position: [-1, -1, 0],
+                expected: air,
+                replacement: bed,
+            },
+        ],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let expected =
+        nbt::read(&std::fs::read(temp.path().join("ordered-expected.nbt")).unwrap()).unwrap();
+    assert_eq!(records(ordered.document()), records(&expected));
 }
 
 #[test]

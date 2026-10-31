@@ -141,6 +141,10 @@ impl WorldSavePlan {
         self.chunks.len()
     }
 
+    pub fn poi_chunk_count(&self) -> usize {
+        self.poi_chunks.len()
+    }
+
     /// Add a POI chunk to a coordinated partial transaction. The caller must
     /// validate every POI effect, terrain edit and villager ticket change.
     /// This API does not authorize saving an active gameplay session.

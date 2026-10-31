@@ -1,11 +1,10 @@
 //! Compare material-rule control flow and conditions with Java 26.3.
-use native_core::{
-    normal_noise::{NoiseSeedFactory, NoiseSeedSource},
-    random::XoroshiroRandom,
-};
 use native_resources::{
+    density::WorldgenRandom,
     packs::{ResourceId, ResourceProvider, ResourceStack},
-    surface_rules::{SurfaceInputs, SurfacePosition, SurfaceRuleCompiler},
+    surface_rules::{
+        SurfaceInputs, SurfacePosition, SurfaceRandom, SurfaceRandomFactory, SurfaceRuleCompiler,
+    },
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command, sync::Arc};
@@ -16,7 +15,7 @@ impl ResourceProvider for Empty {
         Ok(None)
     }
 }
-struct Inputs;
+struct Inputs(SurfaceRandomFactory);
 impl SurfaceInputs for Inputs {
     fn biome_matches(&mut self, _: &Value, _: &SurfacePosition) -> anyhow::Result<bool> {
         anyhow::bail!("unexpected biome")
@@ -28,10 +27,15 @@ impl SurfaceInputs for Inputs {
         Ok(f64::from(p.x % 5 - 2) * 0.5)
     }
     fn positional_random(&mut self, name: &ResourceId, p: &SurfacePosition) -> anyhow::Result<f32> {
-        let root = XoroshiroRandom::new(12345).fork_noise_factory();
-        let id = format!("{}:{}", name.namespace, name.path);
-        let factory = root.random_for(&id).fork_noise_factory();
-        Ok(factory.at(p.x, p.y, p.z).next_float())
+        Ok(self.0.at(name, p.x, p.y, p.z).next_float())
+    }
+    fn ore_random(&mut self, p: &SurfacePosition) -> anyhow::Result<SurfaceRandom> {
+        Ok(self
+            .0
+            .at(&ResourceId::parse("minecraft:ore")?, p.x, p.y, p.z))
+    }
+    fn density(&mut self, value: &Value, _: bool, _: &SurfacePosition) -> anyhow::Result<f32> {
+        Ok(value.as_f64().expect("synthetic density constant") as f32)
     }
     fn special_rule(
         &mut self,
@@ -100,6 +104,20 @@ fn material_conditions_and_control_flow_match_java() {
         {"type":"condition","if_true":conditions[0],"then_run":{"type":"condition","if_true":conditions[4],"then_run":{"type":"block","result_state":"minecraft:grass_block"}}},
         {"type":"condition","if_true":conditions[6],"then_run":{"type":"block","result_state":"minecraft:stone"}},
         {"type":"block","result_state":"minecraft:dirt"}]}));
+    for (density, richness, gap, raw) in [
+        (-1.0, 0.5, -0.2, 0.5),
+        (0.0, 0.5, -0.2, 0.5),
+        (0.1, 0.5, -0.2, 0.5),
+        (0.5, 0.5, -0.2, 0.5),
+        (1.0, 0.0, -0.2, 0.5),
+        (1.0, 1.0, 0.0, 0.5),
+        (1.0, 1.0, -0.2, 0.0),
+        (1.0, 1.0, -0.2, 1.0),
+        (1.0, 0.4, -0.2, 0.2),
+    ] {
+        fixtures.push(json!({"type":"ore_vein","ore_block":"minecraft:stone","raw_ore_block":"minecraft:dirt",
+            "filler_block":"minecraft:grass_block","raw_ore_chance":raw,"density":density,"richness":richness,"filler_gap":gap}));
+    }
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -136,8 +154,11 @@ fn material_conditions_and_control_flow_match_java() {
     let mut data = Empty;
     let mut compiler = SurfaceRuleCompiler::new(&mut data);
     let mut current = None;
+    let mut inputs = Inputs(SurfaceRandomFactory::new(12345, WorldgenRandom::Xoroshiro));
     let mut groups = 0;
     let mut samples = 0;
+    let mut random_samples = 0;
+    let mut random_factories = std::collections::BTreeMap::new();
     for line in output.lines() {
         let f: Vec<_> = line.split_whitespace().collect();
         match f.first().copied() {
@@ -151,7 +172,7 @@ fn material_conditions_and_control_flow_match_java() {
                 let state = current
                     .as_ref()
                     .unwrap()
-                    .evaluate(&position(n), &mut Inputs)
+                    .evaluate(&position(n), &mut inputs)
                     .unwrap();
                 let code = match state.as_deref().and_then(Value::as_str) {
                     None => 0,
@@ -168,11 +189,37 @@ fn material_conditions_and_control_flow_match_java() {
                 );
                 samples += 1;
             }
+            Some("R") => {
+                let mode: i32 = f[1].parse().unwrap();
+                let seed: i64 = f[2].parse().unwrap();
+                let name = ResourceId::parse(f[3]).unwrap();
+                let coordinate = |i: usize| f[i].parse::<i32>().unwrap();
+                let factory = random_factories.entry((mode, seed)).or_insert_with(|| {
+                    SurfaceRandomFactory::new(
+                        seed,
+                        if mode == 0 {
+                            WorldgenRandom::Legacy
+                        } else {
+                            WorldgenRandom::Xoroshiro
+                        },
+                    )
+                });
+                let mut r = factory.at(&name, coordinate(4), coordinate(5), coordinate(6));
+                for i in 0..3 {
+                    assert_eq!(
+                        r.next_float().to_bits(),
+                        coordinate(7 + i) as u32,
+                        "named random {line}"
+                    );
+                }
+                random_samples += 1;
+            }
             _ => {}
         }
     }
     assert_eq!(groups, fixtures.len());
     assert_eq!(samples, fixtures.len() * 512);
+    assert_eq!(random_samples, 2 * 5 * 2 * 7);
     let mut resources = ResourceStack::open(&game).unwrap();
     let mut compiler = SurfaceRuleCompiler::new(&mut resources);
     for name in ["minecraft:end", "minecraft:nether", "minecraft:overworld"] {

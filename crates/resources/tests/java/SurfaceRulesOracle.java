@@ -11,10 +11,16 @@ import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.levelgen.WorldGenerationContext;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
+import net.minecraft.world.level.levelgen.LegacyRandomSource;
+import net.minecraft.util.RandomSource;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
+import net.minecraft.world.level.levelgen.densityfunction.DensityFunctionCompiler;
+import net.minecraft.world.level.levelgen.densityfunction.DensitySampler;
+import net.minecraft.world.level.levelgen.densityfunction.DensitySamplerSet;
+import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 import net.minecraft.world.level.levelgen.material.MaterialRuleContext;
 import net.minecraft.world.level.levelgen.material.rule.MaterialRule;
 import net.minecraft.world.level.block.Blocks;
@@ -30,13 +36,18 @@ public class SurfaceRulesOracle {
         var worldCtor=WorldGenerationContext.class.getDeclaredConstructor(LevelAccessor.class);worldCtor.setAccessible(true);
         var world=worldCtor.newInstance(level);
         var ctor=MaterialRuleContext.class.getDeclaredConstructors()[0];ctor.setAccessible(true);
-        var ctx=(MaterialRuleContext)ctor.newInstance(null,null,new DensityVolume(16,128,16,0,-64,0),null,null,world,Set.of());
+        var densityCompiler=new DensityFunctionCompiler(null);
+        DensitySamplerSet densitySet=f -> new DensitySampler.Bound(densityCompiler.getSampler(f),SamplerContext.EMPTY_UNCACHED);
+        var ctx=(MaterialRuleContext)ctor.newInstance(null,null,new DensityVolume(16,128,16,0,-64,0),densitySet,null,world,Set.of());
         var unsafeField=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");unsafeField.setAccessible(true);
         var unsafe=(sun.misc.Unsafe)unsafeField.get(null);
         var randomState=(RandomState)unsafe.allocateInstance(RandomState.class);
         var name=Identifier.withDefaultNamespace("bedrock_floor");
         var factory=new XoroshiroRandomSource(12345).forkPositional().fromHashOf(name).forkPositional();
-        var factories=new ConcurrentHashMap<>();factories.put(name,factory);set(randomState,"positionalRandoms",factories);set(ctx,"randomState",randomState);
+        var factories=new ConcurrentHashMap<>();factories.put(name,factory);
+        var oreName=Identifier.withDefaultNamespace("ore");
+        factories.put(oreName,new XoroshiroRandomSource(12345).forkPositional().fromHashOf(oreName).forkPositional());
+        set(randomState,"positionalRandoms",factories);set(ctx,"randomState",randomState);
         int[] current={0};
         var noiseKey=ResourceKey.create(Registries.NOISE,Identifier.withDefaultNamespace("patch"));
         for(String field:new String[]{"noiseSamplers2d","noiseSamplers3d"}) {
@@ -63,6 +74,18 @@ public class SurfaceRulesOracle {
                 int code=result==null?0:result.is(Blocks.STONE)?1:result.is(Blocks.DIRT)?2:result.is(Blocks.GRASS_BLOCK)?3:-1;
                 if(code<0) throw new AssertionError(result);
                 out.printf("P %d %d%n",n,code);
+            }
+        }
+        int[][] points={{0,0,0},{-1,-1,-1},{15,-64,16},{-17,320,49},{30000000,-64,-30000000},
+            {Integer.MIN_VALUE,12,Integer.MAX_VALUE},{Integer.MAX_VALUE,-31,Integer.MIN_VALUE}};
+        for(int mode=0;mode<2;mode++) for(long seed:new long[]{0,-1,12345,Long.MIN_VALUE,Long.MAX_VALUE}) {
+            RandomSource root=mode==0?new LegacyRandomSource(seed):new XoroshiroRandomSource(seed);
+            var positional=root.forkPositional();
+            for(String id:new String[]{"minecraft:ore","minecraft:bedrock_floor"}) {
+                var named=positional.fromHashOf(Identifier.parse(id)).forkPositional();
+                for(int[] p:points) {var r=named.at(p[0],p[1],p[2]);
+                    out.printf("R %d %d %s %d %d %d %d %d %d%n",mode,seed,id,p[0],p[1],p[2],Float.floatToRawIntBits(r.nextFloat()),Float.floatToRawIntBits(r.nextFloat()),Float.floatToRawIntBits(r.nextFloat()));
+                }
             }
         }
     }

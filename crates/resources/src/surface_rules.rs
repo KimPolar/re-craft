@@ -1,7 +1,14 @@
 //! Data-driven 26.3 material rules. Evaluation requires a real surface context;
-//! this module does not create biomes, noise, ore veins or terrain by itself.
-use crate::packs::{ResourceId, ResourceProvider};
+//! callers supply biome, noise, density, and terrain information.
+use crate::{
+    density::WorldgenRandom,
+    packs::{ResourceId, ResourceProvider},
+};
 use anyhow::{Context, Result, bail, ensure};
+use native_core::{
+    normal_noise::{LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, XoroshiroNoiseFactory},
+    random::{LegacyRandom, XoroshiroRandom},
+};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,13 +42,81 @@ pub trait SurfaceInputs {
     fn cold_enough_to_snow(&mut self, position: &SurfacePosition) -> Result<bool>;
     fn noise(&mut self, name: &ResourceId, is_3d: bool, position: &SurfacePosition) -> Result<f64>;
     fn positional_random(&mut self, name: &ResourceId, position: &SurfacePosition) -> Result<f32>;
-    /// Bandlands and ore veins must be supplied by their actual implementations.
+    /// A fresh "minecraft:ore" positional generator for this block.
+    fn ore_random(&mut self, position: &SurfacePosition) -> Result<SurfaceRandom>;
+    /// `in_chunk` selects Java's volume-sampled density path when available.
+    fn density(
+        &mut self,
+        definition: &Value,
+        in_chunk: bool,
+        position: &SurfacePosition,
+    ) -> Result<f32>;
+    /// Bandlands requires its independently generated terracotta bands.
     fn special_rule(
         &mut self,
         kind: &str,
         definition: &Value,
         position: &SurfacePosition,
     ) -> Result<Option<Arc<Value>>>;
+}
+
+pub enum SurfaceRandom {
+    Legacy(LegacyRandom),
+    Xoroshiro(XoroshiroRandom),
+}
+impl SurfaceRandom {
+    pub fn next_float(&mut self) -> f32 {
+        match self {
+            Self::Legacy(r) => r.next_float(),
+            Self::Xoroshiro(r) => r.next_float(),
+        }
+    }
+}
+
+enum PositionalFactory {
+    Legacy(LegacyNoiseFactory),
+    Xoroshiro(XoroshiroNoiseFactory),
+}
+
+/// Named, seeded factories shared by material rules in a generation context.
+pub struct SurfaceRandomFactory {
+    root: PositionalFactory,
+    named: BTreeMap<ResourceId, PositionalFactory>,
+}
+impl SurfaceRandomFactory {
+    pub fn new(seed: i64, algorithm: WorldgenRandom) -> Self {
+        let root = match algorithm {
+            WorldgenRandom::Legacy => {
+                PositionalFactory::Legacy(LegacyRandom::new(seed).fork_noise_factory())
+            }
+            WorldgenRandom::Xoroshiro => {
+                PositionalFactory::Xoroshiro(XoroshiroRandom::new(seed).fork_noise_factory())
+            }
+        };
+        Self {
+            root,
+            named: BTreeMap::new(),
+        }
+    }
+    pub fn at(&mut self, name: &ResourceId, x: i32, y: i32, z: i32) -> SurfaceRandom {
+        if !self.named.contains_key(name) {
+            let id = format!("{}:{}", name.namespace, name.path);
+            let factory = match &self.root {
+                PositionalFactory::Legacy(root) => {
+                    PositionalFactory::Legacy(root.random_for(&id).fork_noise_factory())
+                }
+                PositionalFactory::Xoroshiro(root) => {
+                    PositionalFactory::Xoroshiro(root.random_for(&id).fork_noise_factory())
+                }
+            };
+            self.named.insert(name.clone(), factory);
+        }
+        let factory = self.named.get(name).expect("factory was inserted");
+        match factory {
+            PositionalFactory::Legacy(factory) => SurfaceRandom::Legacy(factory.at(x, y, z)),
+            PositionalFactory::Xoroshiro(factory) => SurfaceRandom::Xoroshiro(factory.at(x, y, z)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -201,7 +276,17 @@ enum RuleNode {
     Block(Arc<Value>),
     Sequence(Vec<Arc<RuleNode>>),
     Conditional(Arc<Condition>, Arc<RuleNode>),
+    OreVein(OreVein),
     Special(&'static str, Value),
+}
+struct OreVein {
+    ore: Arc<Value>,
+    raw: Arc<Value>,
+    filler: Arc<Value>,
+    raw_chance: f32,
+    density: Value,
+    richness: Value,
+    gap: Value,
 }
 impl RuleNode {
     fn apply(
@@ -225,6 +310,25 @@ impl RuleNode {
                 } else {
                     Ok(None)
                 }
+            }
+            Self::OreVein(rule) => {
+                let density = inputs.density(&rule.density, true, p)?;
+                if density <= 0.0 {
+                    return Ok(None);
+                }
+                let mut random = inputs.ore_random(p)?;
+                if random.next_float() > density {
+                    return Ok(None);
+                }
+                let richness = inputs.density(&rule.richness, true, p)?;
+                if random.next_float() < richness && inputs.density(&rule.gap, false, p)? < 0.0 {
+                    return Ok(Some(Arc::clone(if random.next_float() < rule.raw_chance {
+                        &rule.raw
+                    } else {
+                        &rule.ore
+                    })));
+                }
+                Ok(Some(Arc::clone(&rule.filler)))
             }
             Self::Special(kind, definition) => inputs.special_rule(kind, definition, p),
         }
@@ -318,15 +422,7 @@ impl<'a, P: ResourceProvider> SurfaceRuleCompiler<'a, P> {
             .context("material rule must be an object or identifier")?;
         let kind = kind(value)?;
         let node = match kind.path.as_str() {
-            "block" => {
-                let state = obj.get("result_state").context("missing result_state")?;
-                let name = state
-                    .as_str()
-                    .or_else(|| state.get("id").and_then(Value::as_str))
-                    .context("invalid block state")?;
-                ResourceId::parse(name)?;
-                RuleNode::Block(Arc::new(state.clone()))
-            }
+            "block" => RuleNode::Block(block_state(required(value, "result_state")?)?),
             "sequence" => {
                 let seq = obj
                     .get("sequence")
@@ -343,7 +439,19 @@ impl<'a, P: ResourceProvider> SurfaceRuleCompiler<'a, P> {
                 self.rule(required(value, "then_run")?, depth + 1)?,
             ),
             "bandlands" => RuleNode::Special("bandlands", value.clone()),
-            "ore_vein" => RuleNode::Special("ore_vein", value.clone()),
+            "ore_vein" => {
+                let raw_chance = number(value, "raw_ore_chance")? as f32;
+                ensure!((0.0..=1.0).contains(&raw_chance), "invalid raw ore chance");
+                RuleNode::OreVein(OreVein {
+                    ore: block_state(required(value, "ore_block")?)?,
+                    raw: block_state(required(value, "raw_ore_block")?)?,
+                    filler: block_state(required(value, "filler_block")?)?,
+                    raw_chance,
+                    density: required(value, "density")?.clone(),
+                    richness: required(value, "richness")?.clone(),
+                    gap: required(value, "filler_gap")?.clone(),
+                })
+            }
             _ => bail!(
                 "unsupported material rule type {}:{}",
                 kind.namespace,
@@ -421,6 +529,14 @@ impl<'a, P: ResourceProvider> SurfaceRuleCompiler<'a, P> {
 fn required<'a>(value: &'a Value, name: &str) -> Result<&'a Value> {
     value.get(name).with_context(|| format!("missing {name}"))
 }
+fn block_state(state: &Value) -> Result<Arc<Value>> {
+    let name = state
+        .as_str()
+        .or_else(|| state.get("id").and_then(Value::as_str))
+        .context("invalid block state")?;
+    ResourceId::parse(name)?;
+    Ok(Arc::new(state.clone()))
+}
 fn integer(value: &Value, name: &str) -> Result<i32> {
     i32::try_from(
         required(value, name)?
@@ -483,6 +599,12 @@ mod tests {
         fn positional_random(&mut self, _: &ResourceId, _: &SurfacePosition) -> Result<f32> {
             Ok(0.5)
         }
+        fn ore_random(&mut self, _: &SurfacePosition) -> Result<SurfaceRandom> {
+            bail!("unexpected ore random")
+        }
+        fn density(&mut self, _: &Value, _: bool, _: &SurfacePosition) -> Result<f32> {
+            bail!("unexpected density")
+        }
         fn special_rule(
             &mut self,
             _: &str,
@@ -531,5 +653,76 @@ mod tests {
         );
         assert!(compiler.compile(&json!("minecraft:cycle")).is_err());
         assert!(compiler.compile(&json!({"type":"other:unknown"})).is_err());
+    }
+
+    #[test]
+    fn ore_rule_samples_only_required_inputs_in_java_order() {
+        struct OreInputs {
+            reads: Vec<(f32, bool)>,
+            randoms: usize,
+        }
+        impl SurfaceInputs for OreInputs {
+            fn biome_matches(&mut self, _: &Value, _: &SurfacePosition) -> Result<bool> {
+                bail!("unexpected biome")
+            }
+            fn cold_enough_to_snow(&mut self, _: &SurfacePosition) -> Result<bool> {
+                bail!("unexpected temperature")
+            }
+            fn noise(&mut self, _: &ResourceId, _: bool, _: &SurfacePosition) -> Result<f64> {
+                bail!("unexpected noise")
+            }
+            fn positional_random(&mut self, _: &ResourceId, _: &SurfacePosition) -> Result<f32> {
+                bail!("unexpected gradient")
+            }
+            fn ore_random(&mut self, _: &SurfacePosition) -> Result<SurfaceRandom> {
+                self.randoms += 1;
+                Ok(SurfaceRandom::Legacy(LegacyRandom::new(10)))
+            }
+            fn density(&mut self, v: &Value, in_chunk: bool, _: &SurfacePosition) -> Result<f32> {
+                let v = v.as_f64().unwrap() as f32;
+                self.reads.push((v, in_chunk));
+                Ok(v)
+            }
+            fn special_rule(
+                &mut self,
+                _: &str,
+                _: &Value,
+                _: &SurfacePosition,
+            ) -> Result<Option<Arc<Value>>> {
+                bail!("unexpected special")
+            }
+        }
+        let mut data = Data(BTreeMap::new());
+        let mut compiler = SurfaceRuleCompiler::new(&mut data);
+        let mut def = json!({"type":"ore_vein","density":0,"richness":1,"filler_gap":-1,"raw_ore_chance":1,"ore_block":"minecraft:stone","raw_ore_block":"minecraft:dirt","filler_block":"minecraft:granite"});
+        let mut inputs = OreInputs {
+            reads: vec![],
+            randoms: 0,
+        };
+        assert!(
+            compiler
+                .compile(&def)
+                .unwrap()
+                .evaluate(&position(), &mut inputs)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inputs.reads, [(0.0, true)]);
+        assert_eq!(inputs.randoms, 0);
+        def["density"] = json!(1);
+        inputs.reads.clear();
+        assert_eq!(
+            *compiler
+                .compile(&def)
+                .unwrap()
+                .evaluate(&position(), &mut inputs)
+                .unwrap()
+                .unwrap(),
+            json!("minecraft:dirt")
+        );
+        assert_eq!(inputs.reads, [(1.0, true), (1.0, true), (-1.0, false)]);
+        assert_eq!(inputs.randoms, 1);
+        def["raw_ore_chance"] = json!(1.1);
+        assert!(compiler.compile(&def).is_err());
     }
 }

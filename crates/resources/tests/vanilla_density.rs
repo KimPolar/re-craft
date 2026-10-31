@@ -64,6 +64,26 @@ fn pure_functions_match_java_sampler() {
     let gradient = json!({"type":"minecraft:gradient","axis":"y","from_coordinate":-64,"to_coordinate":320,"from_value":1.5,"to_value":-1.5});
     let reverse = json!({"type":"minecraft:gradient","axis":"x","from_coordinate":40,"to_coordinate":-20,"from_value":-0.8,"to_value":0.7});
     let mut expressions = vec![json!(0.25), gradient.clone(), reverse.clone()];
+    for upper in [
+        json!(33.9),
+        json!(-0.1),
+        json!(-100.0),
+        gradient.clone(),
+        reverse.clone(),
+    ] {
+        for density in [
+            json!(1.0),
+            json!(-1.0),
+            gradient.clone(),
+            json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":gradient}),
+        ] {
+            let surface = json!({"type":"find_top_surface", "density":density, "upper_bound":upper, "lower_bound":-64, "cell_height":8});
+            expressions.push(surface.clone());
+            expressions.push(
+                json!({"type":"interpolated", "cell_size_xz":4,"cell_size_y":8,"input":surface}),
+            );
+        }
+    }
     for metric in ["euclidean", "euclidean_squared", "manhattan", "chebyshev"] {
         for point in [[0, 0, 0], [17, -64, 123], [i32::MIN, i32::MAX, -1]] {
             let distance = json!({"type":"distance_to_point", "metric":metric, "point":point});

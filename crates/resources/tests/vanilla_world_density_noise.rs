@@ -278,16 +278,22 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld/jaggedness",
         "minecraft:overworld/depth",
         "minecraft:overworld/sloped_cheese",
+        "minecraft:overworld/preliminary_surface_level",
+        "minecraft:overworld/chunk_surface_level",
         "minecraft:overworld_large_biomes/offset",
         "minecraft:overworld_large_biomes/factor",
         "minecraft:overworld_large_biomes/jaggedness",
         "minecraft:overworld_large_biomes/depth",
         "minecraft:overworld_large_biomes/sloped_cheese",
+        "minecraft:overworld_large_biomes/preliminary_surface_level",
+        "minecraft:overworld_large_biomes/chunk_surface_level",
         "minecraft:overworld_amplified/offset",
         "minecraft:overworld_amplified/factor",
         "minecraft:overworld_amplified/jaggedness",
         "minecraft:overworld_amplified/depth",
         "minecraft:overworld_amplified/sloped_cheese",
+        "minecraft:overworld_amplified/preliminary_surface_level",
+        "minecraft:overworld_amplified/chunk_surface_level",
     ] {
         let mut noise_ids = std::collections::BTreeSet::new();
         let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);

@@ -26,6 +26,7 @@ use spline::Spline;
 
 const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 100_000;
+const MAX_SURFACE_STEPS: f64 = 1_000_000.0;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
@@ -72,6 +73,12 @@ enum Node {
         axis: usize,
         coordinate: i32,
         input: Arc<DensityFunction>,
+    },
+    FindTopSurface {
+        density: Arc<DensityFunction>,
+        upper: Arc<DensityFunction>,
+        lower: i32,
+        cell_height: i32,
     },
     Binary {
         op: Binary,
@@ -235,6 +242,29 @@ impl DensityFunction {
                 let mut position = [x, y, z];
                 position[*axis] = *coordinate;
                 input.evaluate_cached(position[0], position[1], position[2], volume, memo)
+            }
+            Node::FindTopSurface {
+                density,
+                upper,
+                lower,
+                cell_height,
+            } => {
+                let x = if self.5 & 1 == 0 { 0 } else { x };
+                let z = if self.5 & 4 == 0 { 0 } else { z };
+                let upper = upper.evaluate_cached(x, 0, z, volume, memo);
+                let start =
+                    ((upper / *cell_height as f32).floor() as i32).wrapping_mul(*cell_height);
+                if start <= *lower {
+                    return *lower as f32;
+                }
+                let mut y = start;
+                while y >= *lower {
+                    if density.evaluate_cached(x, y, z, false, memo) > 0.0 {
+                        return y as f32;
+                    }
+                    y = y.wrapping_sub(*cell_height);
+                }
+                *lower as f32
             }
             Node::Binary { op, left, right } => {
                 let a = left.evaluate_cached(x, y, z, volume, memo);
@@ -513,6 +543,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         | Node::Unary { input: value, .. }
         | Node::Interpolated { input: value, .. } => vec![value],
         Node::Binary { left, right, .. } | Node::Extremum { left, right, .. } => vec![left, right],
+        Node::FindTopSurface { density, upper, .. } => vec![density, upper],
         Node::Range {
             input,
             inside,
@@ -549,6 +580,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::EndOuterIslands(_) => axes = 5,
         Node::OldBlendedNoise(_) => axes = 7,
         Node::Slice { axis, .. } => axes &= !(1 << axis),
+        Node::FindTopSurface { upper, .. } => {
+            axes &= !2;
+            has_interpolation = upper.3;
+        }
         Node::Noise {
             xz_scale, y_scale, ..
         } => {
@@ -583,6 +618,9 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Constant(value) => Interval::exact(*value),
         Node::Reference(input) | Node::Cache(input) | Node::Interpolated { input, .. } => input.4,
         Node::Slice { input, .. } => input.4,
+        Node::FindTopSurface { lower, upper, .. } => {
+            Interval::bounds(*lower as f32, interval::max(*lower as f32, upper.4.max))
+        }
         Node::Clamp { input, min, max } => input.4.clamp(*min, *max),
         Node::Gradient {
             value, to_value, ..
@@ -949,6 +987,32 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                     axis,
                     coordinate: integer(field("coordinate")?)?,
                     input: self.expression(field("input")?, depth + 1)?,
+                }
+            }
+            "find_top_surface" => {
+                let lower = integer(field("lower_bound")?)?;
+                ensure!(
+                    (-4064..=4062).contains(&lower),
+                    "surface lower bound is out of range"
+                );
+                let cell_height = integer(field("cell_height")?)?;
+                ensure!(cell_height > 0, "surface cell height must be positive");
+                let density = self.expression(field("density")?, depth + 1)?;
+                let upper = self.expression(field("upper_bound")?, depth + 1)?;
+                let max = f64::from(upper.4.max);
+                ensure!(
+                    upper.4.min.is_finite()
+                        && upper.4.min >= -1_000_000_000.0
+                        && max.is_finite()
+                        && max <= 1_000_000_000.0
+                        && (max - f64::from(lower)) / f64::from(cell_height) <= MAX_SURFACE_STEPS,
+                    "surface search exceeds supported sampling work"
+                );
+                Node::FindTopSurface {
+                    density,
+                    upper,
+                    lower,
+                    cell_height,
                 }
             }
             "shift_a" | "shift_b" | "shift" => {
@@ -1534,6 +1598,23 @@ mod tests {
         assert!(Arc::ptr_eq(first, second));
         let mut invalid = expression;
         invalid["y_factor"] = json!(0.0);
+        assert!(compiler.compile(&invalid).is_err());
+    }
+
+    #[test]
+    fn surface_search_scans_inclusive_cells_and_ignores_input_height() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        let surface = json!({"type":"find_top_surface", "density":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":16,"from_value":1,"to_value":-1},"upper_bound":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":16,"from_value":32,"to_value":96},"lower_bound":-16,"cell_height":8});
+        let function = compiler.compile(&surface).unwrap();
+        assert_eq!(function.sample(0, -500, 0), 0.0);
+        assert_eq!(function.sample(0, 500, 0), 0.0);
+        assert_eq!(function.range(), (-16.0, 96.0));
+        let mut invalid = surface;
+        invalid["cell_height"] = json!(0);
+        assert!(compiler.compile(&invalid).is_err());
+        invalid["cell_height"] = json!(1);
+        invalid["upper_bound"] = json!({"type":"mul","left":1000000,"right":1000000});
         assert!(compiler.compile(&invalid).is_err());
     }
 }

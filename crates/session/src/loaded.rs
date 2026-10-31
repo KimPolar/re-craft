@@ -12648,7 +12648,12 @@ fn bucket_waterloggable(block: &BlockState) -> Option<bool> {
     if !matches!(wet.as_str(), "true" | "false") {
         return None;
     }
-    if crate::stair_items::is_stair_item(&block.name) {
+    if crate::stair_items::is_stair_item(&block.name)
+        || matches!(
+            block.name.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest"
+        )
+    {
         return block_outline(block).map(|_| true);
     }
     if crate::slab_mining::material(&block.name).is_some() {
@@ -13923,6 +13928,135 @@ mod tests {
     }
 
     #[test]
+    fn water_bucket_waterlogs_saved_chest_through_adjacent_block() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+
+        for trapped in [false, true] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                let (mut session, position) = if trapped {
+                    let (session, position, _) = trapped_chest_fixture();
+                    (session, position)
+                } else {
+                    let (session, _, position, _) = saved_chest_fixture();
+                    (session, position)
+                };
+                session.set_water_evaporation_environment(bucket_environment(false));
+                let chest = position - session.origin;
+                let stone = session.intern_block(state("minecraft:stone", &[]));
+                assert!(session.set_with_notify(chest - IVec3::Z, stone, false));
+                // Look through the space above the chest at the block behind it.
+                session.player.position.y = 1.3;
+                session.motion.position.y = 1.3;
+                let hit = session.ray_hit().unwrap();
+                assert_eq!(hit.position, chest - IVec3::Z);
+                assert_eq!(hit.face, IVec3::Z);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let block = session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap();
+                assert_eq!(
+                    block.properties["waterlogged"], "true",
+                    "{trapped} {hand:?}"
+                );
+                let stack = session.saved_chest(position).unwrap().unwrap().slots[3]
+                    .clone()
+                    .unwrap();
+                assert_eq!(stack.id(), "minecraft:diamond");
+                assert_eq!(stack.count(), 5);
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().id(),
+                    "minecraft:bucket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn using_water_bucket_on_chest_opens_it_before_placing_water() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+
+        let (mut session, _, position, _) = saved_chest_fixture();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(session.inventory.is_open());
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .properties["waterlogged"],
+            "false"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:water_bucket"
+        );
+    }
+
+    #[test]
+    fn sneaking_with_water_bucket_places_water_beside_saved_chest() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+
+        let (mut session, _, position, _) = saved_chest_fixture();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Sneak(true));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let adjacent = position + IVec3::Z;
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .properties["waterlogged"],
+            "false"
+        );
+        assert_eq!(
+            session
+                .world
+                .block(adjacent.x, adjacent.y, adjacent.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert_eq!(
+            session.saved_chest(position).unwrap().unwrap().slots[3]
+                .as_ref()
+                .unwrap()
+                .count(),
+            5
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:bucket"
+        );
+    }
+
+    #[test]
     fn placed_water_schedules_fluid_ticks_and_flows_downward() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
@@ -14254,7 +14388,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 264);
+        assert_eq!(rows.len(), 312);
         for row in rows {
             let mut session = session();
             session.sneak = row["sneak"].as_bool().unwrap();
@@ -14273,6 +14407,23 @@ mod tests {
                 let id = session.intern_block(state(
                     "minecraft:stone_slab",
                     &[("type", "top"), ("waterlogged", wet)],
+                ));
+                session.set_with_notify(clicked, id, false);
+            } else if initial.starts_with("chest_") || initial.starts_with("trapped_chest_") {
+                let name = if initial.starts_with("trapped_") {
+                    "minecraft:trapped_chest"
+                } else {
+                    "minecraft:chest"
+                };
+                let kind = ["single", "left", "right"][row["level"].as_u64().unwrap() as usize];
+                let wet = if initial.ends_with("_wet") {
+                    "true"
+                } else {
+                    "false"
+                };
+                let id = session.intern_block(state(
+                    name,
+                    &[("facing", "north"), ("type", kind), ("waterlogged", wet)],
                 ));
                 session.set_with_notify(clicked, id, false);
             } else {
@@ -14304,6 +14455,12 @@ mod tests {
                     "minecraft:water" => format!("water_{}", block.properties["level"]),
                     "minecraft:lava" => format!("lava_{}", block.properties["level"]),
                     "minecraft:stone_slab" => format!("slab_{}", block.properties["waterlogged"]),
+                    "minecraft:chest" | "minecraft:trapped_chest" => format!(
+                        "{}_{}_{}",
+                        block.name.strip_prefix("minecraft:").unwrap(),
+                        block.properties["type"],
+                        block.properties["waterlogged"]
+                    ),
                     _ => panic!("unexpected {block:?}: {row}"),
                 };
                 assert_eq!(actual, row[key].as_str().unwrap(), "{row}");

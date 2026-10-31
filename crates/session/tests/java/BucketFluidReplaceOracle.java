@@ -42,14 +42,16 @@ public class BucketFluidReplaceOracle {
     if(state.is(Blocks.WATER)) return "water_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.LAVA)) return "lava_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.STONE_SLAB)) return "slab_"+state.getValue(SlabBlock.WATERLOGGED);
+    if(state.is(Blocks.CHEST) || state.is(Blocks.TRAPPED_CHEST)) return (state.is(Blocks.CHEST)?"chest_":"trapped_chest_")+state.getValue(ChestBlock.TYPE).getSerializedName()+"_"+state.getValue(ChestBlock.WATERLOGGED);
     throw new AssertionError(state);
   }
   static void run(JsonArray out,World world,Player player,boolean lava,boolean evaporates,boolean sneak,String initial,int level) {
     player.sneak=sneak; world.blocks=new HashMap<>(); world.rng=RandomSource.create(123); world.sound=null; world.soundPosition=null;
     boolean slab=initial.startsWith("slab_");
-    BlockState clicked=slab?Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(SlabBlock.WATERLOGGED,initial.equals("slab_wet")):Blocks.STONE.defaultBlockState();
+    boolean chest=initial.startsWith("chest_") || initial.startsWith("trapped_chest_");
+    BlockState clicked=slab?Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(SlabBlock.WATERLOGGED,initial.equals("slab_wet")):chest?(initial.startsWith("trapped_")?Blocks.TRAPPED_CHEST:Blocks.CHEST).defaultBlockState().setValue(ChestBlock.TYPE,new ChestType[]{ChestType.SINGLE,ChestType.LEFT,ChestType.RIGHT}[level]).setValue(ChestBlock.WATERLOGGED,initial.endsWith("_wet")):Blocks.STONE.defaultBlockState();
     world.blocks.put(CLICKED,clicked);
-    if(!slab) world.blocks.put(ADJACENT,(initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level));
+    if(!slab && !chest) world.blocks.put(ADJACENT,(initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level));
     world.environment=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributes.WATER_EVAPORATES, base -> evaporates).build();
     var bucket=(BucketItem)(lava?Items.LAVA_BUCKET:Items.WATER_BUCKET);
     var hit=new BlockHitResult(new Vec3(0.5,0.75,1.0),Direction.SOUTH,CLICKED,false);
@@ -73,6 +75,8 @@ public class BucketFluidReplaceOracle {
       for(String initial:new String[]{"water","lava"}) for(int level=0;level<16;level++) run(out,world,player,lava,evaporates,sneak,initial,level);
     for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"slab_dry","slab_wet"})
       run(out,world,player,false,evaporates,sneak,initial,0);
+    for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"chest_dry","chest_wet","trapped_chest_dry","trapped_chest_wet"}) for(int type=0;type<3;type++)
+      run(out,world,player,false,evaporates,sneak,initial,type);
     Files.writeString(Path.of(args[0]),new Gson().toJson(out));
   }
 }

@@ -969,6 +969,7 @@ mod tests {
             BucketSoundKind::EmptyWater,
             BucketSoundKind::EmptyLava,
             BucketSoundKind::Evaporate,
+            BucketSoundKind::PlantBreak,
         ] {
             let event = BucketSoundEvent {
                 kind,
@@ -988,7 +989,7 @@ mod tests {
         let pack = tempfile::tempdir().unwrap();
         let directory = pack.path().join("assets/minecraft");
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("sounds.json"), br#"{"item.bucket.fill":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"item.bucket.fill":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]},"block.grass.break":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.3,"pitch":1.25}]}}"#).unwrap();
         let mut catalog = Catalog::load(Resources {
             root,
             packs: vec![pack.path().to_path_buf()],
@@ -1008,6 +1009,24 @@ mod tests {
         assert!(voice.player_sound);
         assert_eq!(voice.volume, 0.4);
         assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
+        let event = BucketSoundEvent {
+            kind: BucketSoundKind::PlantBreak,
+            position,
+            volume: 1.0,
+            pitch: 0.8,
+            sequence: 1,
+        };
+        let voice = catalog
+            .bucket(event, &mut LegacyRandom::new(1), 48000)
+            .unwrap()
+            .unwrap();
+        assert!(!voice.player_sound);
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert_eq!(voice.volume, 0.3);
+        assert_eq!(
+            voice.step,
+            f64::from(voice.clip.rate) / 48000.0 * f64::from(0.8_f32 * 1.25)
+        );
     }
     #[test]
     fn consume_sound_command_preserves_event_and_category() {

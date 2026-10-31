@@ -567,6 +567,7 @@ pub enum BucketSoundKind {
     EmptyWater,
     EmptyLava,
     Evaporate,
+    PlantBreak,
 }
 
 impl BucketSoundKind {
@@ -577,6 +578,7 @@ impl BucketSoundKind {
             Self::EmptyWater => "item.bucket.empty",
             Self::EmptyLava => "item.bucket.empty_lava",
             Self::Evaporate => "block.fire.extinguish",
+            Self::PlantBreak => "block.grass.break",
         }
     }
 
@@ -7452,6 +7454,7 @@ impl LoadedSession {
                 {
                     return false;
                 }
+                self.push_bucket_sound(BucketSoundKind::PlantBreak, sound_position, 1.0, 0.8);
                 if !self.set(target, self.states[0]) {
                     return false;
                 }
@@ -14253,6 +14256,18 @@ mod tests {
                             session.submit_command(PlayerCommand::Place);
                             session.update(TICK);
                             let absolute = session.origin + target;
+                            let sounds = session.take_bucket_sounds();
+                            assert_eq!(sounds.len(), 2);
+                            assert_eq!(sounds[0].kind, BucketSoundKind::PlantBreak);
+                            assert_eq!(
+                                sounds[1].kind,
+                                if fluid == "minecraft:water" {
+                                    BucketSoundKind::EmptyWater
+                                } else {
+                                    BucketSoundKind::EmptyLava
+                                }
+                            );
+                            assert!(sounds[0].sequence < sounds[1].sequence);
                             assert_eq!(
                                 session
                                     .world
@@ -14302,6 +14317,11 @@ mod tests {
             );
             session.set_player_inventory(inventory);
             assert_eq!(session.try_empty_bucket(PlayerSlot::Storage(0)), evaporates);
+            let sounds = session.take_bucket_sounds();
+            assert_eq!(sounds.len(), usize::from(evaporates));
+            if evaporates {
+                assert_eq!(sounds[0].kind, BucketSoundKind::Evaporate);
+            }
             let p = session.origin + target;
             assert_eq!(
                 session.world.block(p.x, p.y, p.z).unwrap().name,
@@ -14697,8 +14717,33 @@ mod tests {
             }
             let sounds = session.take_bucket_sounds();
             if success {
-                assert_eq!(sounds.len(), 1, "{row}");
-                let sound = sounds[0];
+                let destroyed = row["destroyed"].as_bool().unwrap();
+                assert_eq!(sounds.len(), 1 + usize::from(destroyed), "{row}");
+                if destroyed {
+                    let break_sound = sounds[0];
+                    assert_eq!(
+                        format!("minecraft:{}", break_sound.kind.event()),
+                        row["destroy_sound"].as_str().unwrap(),
+                        "{row}"
+                    );
+                    assert_eq!(
+                        break_sound.volume.to_bits(),
+                        row["destroy_volume_bits"].as_i64().unwrap() as i32 as u32,
+                        "{row}"
+                    );
+                    assert_eq!(
+                        break_sound.pitch.to_bits(),
+                        row["destroy_pitch_bits"].as_i64().unwrap() as i32 as u32,
+                        "{row}"
+                    );
+                    assert_eq!(
+                        break_sound.position,
+                        (session.origin + adjacent).as_dvec3() + DVec3::splat(0.5),
+                        "{row}"
+                    );
+                    assert!(break_sound.sequence < sounds[1].sequence);
+                }
+                let sound = sounds[usize::from(destroyed)];
                 assert_eq!(
                     format!("minecraft:{}", sound.kind.event()),
                     row["sound"].as_str().unwrap(),

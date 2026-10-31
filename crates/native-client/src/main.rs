@@ -44,6 +44,7 @@ mod player_skin;
 mod preview;
 mod preview_app;
 mod preview_lighting;
+mod rain_fog;
 mod recipe_book_ui;
 mod renderer;
 mod screen_blur;

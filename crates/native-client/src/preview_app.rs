@@ -201,6 +201,8 @@ pub fn run_play(
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
             weather_frame: None,
+            rain_fog: crate::rain_fog::RainFog::default(),
+            rain_fog_millis: None,
             sky_background_tick: None,
             sky_background_revision: None,
             fog_color_previous: None,
@@ -314,6 +316,8 @@ struct PlayState {
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
     weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
+    rain_fog: crate::rain_fog::RainFog,
+    rain_fog_millis: Option<u128>,
     sky_background_tick: Option<u64>,
     sky_background_revision: Option<u64>,
     fog_color_previous: Option<[f32; 3]>,
@@ -731,6 +735,19 @@ impl Viewer {
             && let Some(background) = &play.sky_background
         {
             let snapshot = play.session.snapshot();
+            let milliseconds = now.saturating_duration_since(self.started).as_millis();
+            let delta_ticks = play
+                .rain_fog_millis
+                .map_or(0.0, |last| milliseconds.saturating_sub(last) as f32 / 50.0);
+            play.rain_fog_millis = Some(milliseconds);
+            let partial = play.session.partial_tick().clamp(0.0, 1.0);
+            let camera = self.scene.origin.as_dvec3() + self.camera.eye.as_dvec3();
+            if let Some((rain, light, precipitation)) =
+                crate::rain_fog::inputs(&snapshot, camera, partial)
+            {
+                play.rain_fog
+                    .update(rain, light, precipitation, delta_ticks);
+            }
             if play.sky_background_tick != Some(snapshot.tick)
                 || play.sky_background_revision != Some(snapshot.world_revision)
             {
@@ -827,9 +844,11 @@ impl Viewer {
                 });
                 renderer.set_fog_color(fog_color);
                 renderer.set_fog_range(match (play.sky_fog_previous, play.sky_fog_current) {
-                    (Some(previous), Some(current)) => Some(std::array::from_fn(|i| {
-                        previous[i] + partial * (current[i] - previous[i])
-                    })),
+                    (Some(previous), Some(current)) => {
+                        Some(play.rain_fog.apply(std::array::from_fn(|i| {
+                            previous[i] + partial * (current[i] - previous[i])
+                        })))
+                    }
                     _ => None,
                 });
             }

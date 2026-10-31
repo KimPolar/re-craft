@@ -1,4 +1,4 @@
-//! Scheduled fluid spread for air, full blocks, liquids and verified slabs.
+//! Scheduled fluid spread for air, full blocks, liquids, slabs and stairs.
 //!
 //! Other blocks are barriers until their fluid occupancy and side shapes are
 //! available. Wet copper grates block flow but count in source checks. The
@@ -18,6 +18,11 @@ pub enum Cell {
     /// A half slab, optionally holding source water.
     Slab {
         top: bool,
+        waterlogged: bool,
+    },
+    /// A staircase's occupied 2×2×2 cells and water occupancy.
+    Stairs {
+        voxels: u8,
         waterlogged: bool,
     },
     /// Unloaded or unsupported data: never replace or traverse it.
@@ -109,6 +114,7 @@ pub enum ChangedBlock {
     Fluid(FluidState),
     Solid(Solidified),
     WaterloggedSlab { top: bool },
+    WaterloggedStairs { voxels: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +189,7 @@ fn at(world: &impl Fn(IVec3) -> Cell, pos: Option<IVec3>) -> Cell {
 fn source(cell: Cell, kind: FluidKind) -> bool {
     matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) if state.kind == kind && state.source)
         || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
+        || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
 }
 
 fn fluid(cell: Cell) -> Option<FluidState> {
@@ -190,20 +197,23 @@ fn fluid(cell: Cell) -> Option<FluidState> {
         Cell::Fluid(state) | Cell::GrateWater(state) => Some(state),
         Cell::Slab {
             waterlogged: true, ..
+        }
+        | Cell::Stairs {
+            waterlogged: true, ..
         } => Some(flowing(FluidKind::Water, 8, false)),
         _ => None,
     }
 }
 
-// Two bits describe the occupied halves of a face; their union blocks flow
+// Four bits describe the quadrants of a face; their union blocks flow
 // only if it covers the whole face. Solid and unknown cells block all faces.
 fn face(cell: Cell, direction: IVec3) -> u8 {
     match cell {
         Cell::Air | Cell::Fluid(_) => 0,
-        Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 3,
+        Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 15,
         Cell::Slab { top, .. } if direction == IVec3::Y => {
             if top {
-                3
+                15
             } else {
                 0
             }
@@ -212,21 +222,72 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
             if top {
                 0
             } else {
-                3
+                15
             }
         }
         Cell::Slab { top, .. } => {
             if top {
-                2
+                12
             } else {
-                1
+                3
             }
+        }
+        Cell::Stairs { voxels, .. } => {
+            let indexes = if direction == IVec3::X {
+                [1, 3, 5, 7]
+            } else if direction == IVec3::NEG_X {
+                [0, 2, 4, 6]
+            } else if direction == IVec3::Y {
+                [4, 5, 6, 7]
+            } else if direction == IVec3::NEG_Y {
+                [0, 1, 2, 3]
+            } else if direction == IVec3::Z {
+                [2, 3, 6, 7]
+            } else {
+                [0, 1, 4, 5]
+            };
+            indexes
+                .into_iter()
+                .enumerate()
+                .fold(0, |face, (bit, voxel)| {
+                    face | (((voxels >> voxel) & 1) << bit)
+                })
         }
     }
 }
 
 fn can_pass(from: Cell, to: Cell, direction: IVec3) -> bool {
-    face(from, direction) | face(to, -direction) != 3
+    face(from, direction) | face(to, -direction) != 15
+}
+
+/// Encode a shape made from half-block-aligned cuboids as eight occupied cells.
+pub fn octants(boxes: &[crate::collision::Aabb]) -> Option<u8> {
+    if boxes
+        .iter()
+        .flat_map(|b| b.min.to_array().into_iter().chain(b.max.to_array()))
+        .any(|v| !matches!(v, 0.0 | 0.5 | 1.0))
+    {
+        return None;
+    }
+    let mut mask = 0;
+    for y in 0..2 {
+        for z in 0..2 {
+            for x in 0..2 {
+                let point = glam::Vec3::new(
+                    x as f32 * 0.5 + 0.25,
+                    y as f32 * 0.5 + 0.25,
+                    z as f32 * 0.5 + 0.25,
+                );
+                if boxes
+                    .iter()
+                    .any(|b| point.cmpgt(b.min).all() && point.cmplt(b.max).all())
+                {
+                    mask |= 1 << (x + 2 * z + 4 * y);
+                }
+            }
+        }
+    }
+    Some(mask)
 }
 
 fn flowing(kind: FluidKind, amount: u8, falling: bool) -> FluidState {
@@ -260,7 +321,9 @@ pub fn new_liquid(
     }
     if sources >= 2 && settings.converts_source(kind) {
         let below = at(world, offset(position, IVec3::NEG_Y));
-        if matches!(below, Cell::Solid | Cell::Slab { .. }) || source(below, kind) {
+        if matches!(below, Cell::Solid | Cell::Slab { .. } | Cell::Stairs { .. })
+            || source(below, kind)
+        {
             return Some(flowing(kind, 8, false));
         }
     }
@@ -276,7 +339,7 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
-        Cell::Slab { .. } => !source(cell, kind),
+        Cell::Slab { .. } | Cell::Stairs { .. } => !source(cell, kind),
         Cell::Solid | Cell::GrateWater(_) | Cell::Unknown => false,
     }
 }
@@ -289,6 +352,9 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
     match below {
         Cell::Air | Cell::Fluid(_) => true,
         Cell::Slab {
+            waterlogged: true, ..
+        }
+        | Cell::Stairs {
             waterlogged: true, ..
         } => kind == FluidKind::Water,
         _ => false,
@@ -304,6 +370,9 @@ fn can_replace(
     match world(position) {
         Cell::Air => true,
         Cell::Slab {
+            waterlogged: false, ..
+        }
+        | Cell::Stairs {
             waterlogged: false, ..
         } => incoming.kind == FluidKind::Water && incoming.source,
         Cell::Fluid(state)
@@ -341,7 +410,7 @@ fn slope_distance(
         // Slope search asks whether the *flowing* fluid can enter the block;
         // slabs accept only source water, even when their shape is open.
         let candidate = world(next);
-        if matches!(candidate, Cell::Slab { .. })
+        if matches!(candidate, Cell::Slab { .. } | Cell::Stairs { .. })
             || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
         {
@@ -392,7 +461,9 @@ fn side_changes(
         let Some(new) = new_liquid(world, next, state.kind, settings) else {
             continue;
         };
-        if matches!(cell, Cell::Slab { .. }) && !(new.kind == FluidKind::Water && new.source) {
+        if matches!(cell, Cell::Slab { .. } | Cell::Stairs { .. })
+            && !(new.kind == FluidKind::Water && new.source)
+        {
             continue;
         }
         let distance = if is_hole(world, next, state.kind) {
@@ -416,6 +487,7 @@ fn side_changes(
                     position: next,
                     block: match cell {
                         Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
+                        Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
                         _ => ChangedBlock::Fluid(new),
                     },
                 });
@@ -457,7 +529,7 @@ pub fn tick(
     }
     let with_self = |pos| {
         if pos == position {
-            if matches!(original, Cell::Slab { .. }) {
+            if matches!(original, Cell::Slab { .. } | Cell::Stairs { .. }) {
                 original
             } else {
                 Cell::Fluid(current)
@@ -482,6 +554,8 @@ pub fn tick(
                 ChangedBlock::Solid(Solidified::Stone)
             } else if let Cell::Slab { top, .. } = below {
                 ChangedBlock::WaterloggedSlab { top }
+            } else if let Cell::Stairs { voxels, .. } = below {
+                ChangedBlock::WaterloggedStairs { voxels }
             } else {
                 ChangedBlock::Fluid(next)
             };
@@ -502,6 +576,10 @@ pub fn tick(
                                 top,
                                 waterlogged: true,
                             },
+                            ChangedBlock::WaterloggedStairs { voxels } => Cell::Stairs {
+                                voxels,
+                                waterlogged: true,
+                            },
                             _ => Cell::Solid,
                         }
                     } else {
@@ -515,4 +593,85 @@ pub fn tick(
         changes.extend(side_changes(&with_self, position, current, settings));
     }
     changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collision::{block_shape, merged_face_occludes};
+    use crate::loaded::BlockState;
+
+    #[test]
+    fn compact_faces_match_full_collision_shapes_for_stairs_and_slabs() {
+        let mut shapes = Vec::new();
+        for facing in ["north", "south", "west", "east"] {
+            for half in ["bottom", "top"] {
+                for kind in [
+                    "straight",
+                    "inner_left",
+                    "inner_right",
+                    "outer_left",
+                    "outer_right",
+                ] {
+                    let state = BlockState {
+                        name: "minecraft:oak_stairs".into(),
+                        properties: [
+                            ("facing", facing),
+                            ("half", half),
+                            ("shape", kind),
+                            ("waterlogged", "false"),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v.into()))
+                        .collect(),
+                    };
+                    let boxes = block_shape(&state).unwrap();
+                    shapes.push((
+                        Cell::Stairs {
+                            voxels: octants(&boxes).unwrap(),
+                            waterlogged: false,
+                        },
+                        boxes,
+                    ));
+                }
+            }
+        }
+        for top in [false, true] {
+            let state = BlockState {
+                name: "minecraft:oak_slab".into(),
+                properties: [
+                    ("type", if top { "top" } else { "bottom" }),
+                    ("waterlogged", "false"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            };
+            shapes.push((
+                Cell::Slab {
+                    top,
+                    waterlogged: false,
+                },
+                block_shape(&state).unwrap(),
+            ));
+        }
+        for (from, from_boxes) in &shapes {
+            for (to, to_boxes) in &shapes {
+                for direction in [
+                    IVec3::X,
+                    IVec3::NEG_X,
+                    IVec3::Y,
+                    IVec3::NEG_Y,
+                    IVec3::Z,
+                    IVec3::NEG_Z,
+                ] {
+                    assert_eq!(
+                        can_pass(*from, *to, direction),
+                        !merged_face_occludes(from_boxes, to_boxes, direction),
+                        "{from:?} -> {to:?} {direction:?}"
+                    );
+                }
+            }
+        }
+    }
 }

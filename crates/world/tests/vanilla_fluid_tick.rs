@@ -33,11 +33,23 @@ import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.SlabType;
+import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.level.block.state.properties.StairsShape;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.material.*;
 
 public class FluidTickOracle {
+  static final Direction[] DIRS={Direction.NORTH,Direction.SOUTH,Direction.WEST,Direction.EAST};
+  static BlockState stairs(int code) {
+    int i=-100-code, wet=i%2; i/=2; int shape=i%5; i/=5; int half=i%2; i/=2;
+    return Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING,DIRS[i]).setValue(StairBlock.HALF,half==0?Half.BOTTOM:Half.TOP).setValue(StairBlock.SHAPE,StairsShape.values()[shape]).setValue(StairBlock.WATERLOGGED,wet==1);
+  }
+  static int stairsCode(BlockState s) {
+    int dir=java.util.Arrays.asList(DIRS).indexOf(s.getValue(StairBlock.FACING));
+    int half=s.getValue(StairBlock.HALF)==Half.BOTTOM?0:1;
+    return -100-(((dir*2+half)*5+s.getValue(StairBlock.SHAPE).ordinal())*2+(s.getValue(StairBlock.WATERLOGGED)?1:0));
+  }
   static class TestLevel extends ServerLevel {
     Map<BlockPos,BlockState> blocks; JsonArray changes; GameRules rules;
     EnvironmentAttributeSystem attrs; RandomSource random; boolean lava;
@@ -57,6 +69,7 @@ public class FluidTickOracle {
       else if (s.is(Blocks.COBBLESTONE)) a.add(-4);
       else if (s.is(Blocks.BASALT)) a.add(-5);
       else if (s.is(Blocks.OAK_SLAB)) a.add(s.getValue(SlabBlock.TYPE) == SlabType.TOP ? -17 : -16);
+      else if (s.is(Blocks.OAK_STAIRS)) a.add(stairsCode(s));
       else a.add(s.getValue(LiquidBlock.LEVEL) + (s.is(lava ? Blocks.WATER : Blocks.LAVA) ? 20 : 0));
       changes.add(a); return true;
     }
@@ -93,7 +106,7 @@ public class FluidTickOracle {
           case -13 -> Blocks.COPPER_GRATE.waxed().oxidized();
           default -> null;
         };
-        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
+        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
       }
       BlockPos p=BlockPos.ZERO; var block=world.getBlockState(p); var fluid=block.getFluidState();
@@ -152,6 +165,40 @@ fn liquid(kind: FluidKind, level: u8) -> FluidState {
         },
         source: level == 0,
         falling: level >= 8,
+    }
+}
+
+fn stair_cell(code: i64) -> Cell {
+    let mut index = -100 - code;
+    let waterlogged = index % 2 != 0;
+    index /= 2;
+    let shape = [
+        "straight",
+        "inner_left",
+        "inner_right",
+        "outer_left",
+        "outer_right",
+    ][(index % 5) as usize];
+    index /= 5;
+    let half = ["bottom", "top"][(index % 2) as usize];
+    index /= 2;
+    let facing = ["north", "south", "west", "east"][index as usize];
+    let block = native_world::loaded::BlockState {
+        name: "minecraft:oak_stairs".into(),
+        properties: [
+            ("facing", facing),
+            ("half", half),
+            ("shape", shape),
+            ("waterlogged", if waterlogged { "true" } else { "false" }),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect(),
+    };
+    let shape = native_world::collision::block_shape(&block).unwrap();
+    Cell::Stairs {
+        voxels: fluid_sim::octants(&shape).unwrap(),
+        waterlogged,
     }
 }
 
@@ -378,6 +425,68 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             scenarios.push(json!({"blocks": [[0,0,0,0], [0,-1,0,-2], [0,0,-1,-2], [0,0,1,-2], [-1,0,0,-2], [1,0,0,slab], [1,-1,0,-2], [2,0,0,0]], "lava": false, "fast": false, "convert": convert}));
         }
     }
+    // Every stair orientation, half and corner shape as a source and as a
+    // dry container, with all four horizontal approach directions.
+    let directions = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+    for stair in 0..40 {
+        for (x, z) in directions {
+            let wet = -101 - stair * 2;
+            scenarios.push(json!({"blocks": [[0,0,0,wet],[0,-1,0,-2],[x,0,z,0]], "lava": false, "fast": false, "convert": false}));
+            let dry = -100 - stair * 2;
+            let mut blocks = vec![
+                json!([0, 0, 0, 0]),
+                json!([0, -1, 0, -2]),
+                json!([x, 0, z, dry]),
+                json!([x, -1, z, -2]),
+            ];
+            for (dx, dz) in directions {
+                if (dx, dz) != (x, z) {
+                    blocks.push(json!([dx, 0, dz, -2]));
+                }
+                if (x + dx, z + dz) != (0, 0) {
+                    blocks.push(json!([x + dx, 0, z + dz, 0]));
+                }
+            }
+            scenarios
+                .push(json!({"blocks": blocks, "lava": false, "fast": false, "convert": true}));
+        }
+    }
+    for index in 0..800 {
+        let lava = index >= 600;
+        let center = if !lava && index % 2 == 0 {
+            -101 - ((next() >> 16) % 40) as i32 * 2
+        } else if index % 3 == 0 {
+            0
+        } else {
+            4
+        };
+        let mut blocks = vec![json!([0, 0, 0, center])];
+        for x in -4..=4 {
+            for z in -4..=4 {
+                let n = (next() >> 16) % 8;
+                if n < 6 {
+                    let code = if n < 4 {
+                        -100 - ((next() >> 16) % 80) as i32
+                    } else {
+                        -2
+                    };
+                    blocks.push(json!([x, -1, z, code]));
+                }
+                if x != 0 || z != 0 {
+                    let n = (next() >> 16) % 12;
+                    if n < 4 {
+                        let code = if n < 3 {
+                            -100 - ((next() >> 16) % 80) as i32
+                        } else {
+                            0
+                        };
+                        blocks.push(json!([x, 0, z, code]));
+                    }
+                }
+            }
+        }
+        scenarios.push(json!({"blocks": blocks, "lava": lava, "fast": lava && index % 3 == 0, "convert": index % 2 == 0}));
+    }
     let input = temp.path().join("input.json");
     let output = temp.path().join("output.json");
     std::fs::write(&input, serde_json::to_vec(&scenarios).unwrap()).unwrap();
@@ -399,7 +508,23 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             "Java did not waterlog slab code {code}"
         );
     }
+    let waterlogged_stairs: std::collections::BTreeSet<_> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap())
+        .filter_map(|change| change[3].as_i64())
+        .filter(|code| (-179..=-100).contains(code))
+        .collect();
+    for stair in 0..40 {
+        let expected = -101 - stair * 2;
+        assert!(
+            waterlogged_stairs.contains(&expected),
+            "Java did not waterlog stair {expected}"
+        );
+    }
     let mut differences = Vec::new();
+    let stair_cells: Vec<_> = (-179..=-100).map(stair_cell).collect();
     for (index, (scenario, java)) in scenarios
         .iter()
         .zip(expected.as_array().unwrap())
@@ -411,6 +536,7 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             FluidKind::Water
         };
         let mut blocks = HashMap::new();
+        let mut block_codes = HashMap::new();
         for block in scenario["blocks"].as_array().unwrap() {
             let pos = IVec3::new(
                 block[0].as_i64().unwrap() as i32,
@@ -418,6 +544,7 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                 block[2].as_i64().unwrap() as i32,
             );
             let level = block[3].as_i64().unwrap();
+            block_codes.insert(pos, level);
             let other = if kind == FluidKind::Water {
                 FluidKind::Lava
             } else {
@@ -427,6 +554,8 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                 pos,
                 if level == -2 {
                     Cell::Solid
+                } else if (-179..=-100).contains(&level) {
+                    stair_cells[(level + 179) as usize]
                 } else if (-13..=-6).contains(&level) {
                     Cell::GrateWater(FluidState {
                         kind: FluidKind::Water,
@@ -471,6 +600,9 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                         } else {
                             -16
                         }
+                    }
+                    ChangedBlock::WaterloggedStairs { .. } => {
+                        block_codes[&change.position] as i32 - 1
                     }
                     ChangedBlock::Fluid(s) => {
                         let offset = if s.kind == kind { 0 } else { 20 };

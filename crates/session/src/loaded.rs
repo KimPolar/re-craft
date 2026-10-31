@@ -241,6 +241,7 @@ fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> 
 pub struct LoadedSession {
     world: Arc<World>,
     shapes: Vec<Option<Vec<Aabb>>>,
+    stair_octants: Vec<Option<u8>>,
     outlines: Vec<Option<Vec<Aabb>>>,
     fluids: Vec<Option<FluidState>>,
     origin: IVec3,
@@ -604,6 +605,15 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect(),
     }
+}
+
+fn stair_octants(state: &BlockState, shape: Option<&[Aabb]>) -> Option<u8> {
+    if !state.name.ends_with("_stairs")
+        || native_world::collision::slab_stair_solid(state) != Some(true)
+    {
+        return None;
+    }
+    fluid_sim::octants(shape?)
 }
 
 /// Vanilla chooses the first (right) half's custom name before the second.
@@ -2180,6 +2190,11 @@ impl LoadedSession {
             .states()
             .map(|(_, state)| block_shape(state))
             .collect();
+        let stair_octants: Vec<_> = world
+            .states()
+            .zip(shapes.iter())
+            .map(|((_, state), shape)| stair_octants(state, shape.as_deref()))
+            .collect();
         let outlines: Vec<_> = world
             .states()
             .map(|(_, state)| block_outline(state))
@@ -2225,6 +2240,7 @@ impl LoadedSession {
         let mut session = Self {
             world,
             shapes,
+            stair_octants,
             outlines,
             fluids,
             origin,
@@ -5044,6 +5060,8 @@ impl LoadedSession {
                             for (_, state) in self.world.states().skip(old_count) {
                                 let shape = block_shape(state);
                                 self.unsupported_states += usize::from(shape.is_none());
+                                self.stair_octants
+                                    .push(stair_octants(state, shape.as_deref()));
                                 self.shapes.push(shape);
                                 self.outlines.push(block_outline(state));
                                 self.fluids
@@ -6927,13 +6945,25 @@ impl LoadedSession {
         }
     }
 
+    fn stair_voxels(&self, id: BlockStateId) -> Option<u8> {
+        let voxels = self.stair_octants.get(id.0 as usize).copied().flatten()?;
+        let state = self.world.state(id)?;
+        if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
+            return None;
+        }
+        Some(voxels)
+    }
+
     fn simulated_fluid(&self, id: BlockStateId) -> Option<FluidState> {
         if let Some(fluid) = self.ordinary_fluid(id) {
             return Some(fluid);
         }
+        let fluid = self.fluids.get(id.0 as usize).copied().flatten()?;
         let state = self.world.state(id)?;
-        self.slab_top(state)?;
-        self.fluids.get(id.0 as usize).copied().flatten()
+        if self.slab_top(state).is_none() && self.stair_voxels(id).is_none() {
+            return None;
+        }
+        Some(fluid)
     }
 
     fn schedule_fluid(&mut self, relative: IVec3, state: FluidState, delay: u64) {
@@ -8160,6 +8190,15 @@ impl LoadedSession {
                     .is_some_and(|v| v == "true"),
             };
         }
+        if let Some(voxels) = self.stair_voxels(id) {
+            return fluid_sim::Cell::Stairs {
+                voxels,
+                waterlogged: state
+                    .properties
+                    .get("waterlogged")
+                    .is_some_and(|v| v == "true"),
+            };
+        }
         if self.fluids.get(id.0 as usize).copied().flatten().is_some() {
             return fluid_sim::Cell::Unknown;
         }
@@ -8186,6 +8225,8 @@ impl LoadedSession {
             let state = self.world.state(id).expect("new state is interned");
             let shape = block_shape(state);
             self.unsupported_states += usize::from(shape.is_none());
+            self.stair_octants
+                .push(stair_octants(state, shape.as_deref()));
             self.shapes.push(shape);
             self.outlines.push(block_outline(state));
             self.fluids
@@ -8303,13 +8344,24 @@ impl LoadedSession {
                     fluid_sim::ChangedBlock::Air => self.states[0],
                     fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
                     fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
-                    fluid_sim::ChangedBlock::WaterloggedSlab { top } => {
-                        if self.simulation_cell(change.position)
-                            != (fluid_sim::Cell::Slab {
-                                top,
-                                waterlogged: false,
-                            })
-                        {
+                    fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+                    | fluid_sim::ChangedBlock::WaterloggedStairs { .. } => {
+                        let expected = match change.block {
+                            fluid_sim::ChangedBlock::WaterloggedSlab { top } => {
+                                fluid_sim::Cell::Slab {
+                                    top,
+                                    waterlogged: false,
+                                }
+                            }
+                            fluid_sim::ChangedBlock::WaterloggedStairs { voxels } => {
+                                fluid_sim::Cell::Stairs {
+                                    voxels,
+                                    waterlogged: false,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        if self.simulation_cell(change.position) != expected {
                             continue;
                         }
                         let Cell::State(previous) = cell(
@@ -8337,6 +8389,7 @@ impl LoadedSession {
                     if matches!(
                         change.block,
                         fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+                            | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
                     ) && let Some(water) = self.simulated_fluid(id)
                     {
                         self.schedule_fluid(change.position, water, settings.delay(water.kind));
@@ -26481,6 +26534,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn waterlogged_stairs_keep_their_shape_and_schedule_source_water() {
+        for half in ["bottom", "top"] {
+            let mut session = session();
+            session
+                .set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_stairs".into()])));
+            let pos = IVec3::new(8, 3, 8);
+            let stair = session.intern_block(state(
+                "minecraft:oak_stairs",
+                &[
+                    ("facing", "north"),
+                    ("half", half),
+                    ("shape", "straight"),
+                    ("waterlogged", "true"),
+                ],
+            ));
+            session.set_with_notify(pos, stair, false);
+            session.set_with_notify(pos + IVec3::NEG_Y, session.states[0], false);
+            session.set_with_notify(pos + IVec3::X, session.states[0], false);
+            session.set_with_notify(pos + IVec3::X + IVec3::NEG_Y, session.states[3], false);
+            for direction in [IVec3::NEG_X, IVec3::NEG_Z, IVec3::Z] {
+                session.set_with_notify(pos + direction, session.states[3], false);
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            let initial = session.simulation_cell(pos);
+            let water = session.simulated_fluid(stair).unwrap();
+            session.schedule_fluid(pos, water, 0);
+            session.advance_fluid_ticks();
+            assert_eq!(session.simulation_cell(pos), initial);
+            if half == "top" {
+                assert!(
+                    matches!(session.simulation_cell(pos + IVec3::NEG_Y), fluid_sim::Cell::Fluid(f) if f.falling)
+                );
+            } else {
+                assert_eq!(
+                    session.simulation_cell(pos + IVec3::NEG_Y),
+                    fluid_sim::Cell::Air
+                );
+                assert!(
+                    matches!(session.simulation_cell(pos + IVec3::X), fluid_sim::Cell::Fluid(f) if f.amount == 7)
+                );
+            }
+        }
+
+        let mut session = session();
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_stairs".into()])));
+        session.set_source_conversion(true, false);
+        let pos = IVec3::new(8, 3, 8);
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let water_id = session.intern_liquid(water);
+        let stair = session.intern_block(state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        session.set_with_notify(pos, water_id, false);
+        session.set_with_notify(pos + IVec3::X, stair, false);
+        session.set_with_notify(pos + IVec3::X * 2, water_id, false);
+        for offset in [
+            IVec3::NEG_Y,
+            IVec3::X + IVec3::NEG_Y,
+            IVec3::NEG_X,
+            IVec3::NEG_Z,
+            IVec3::Z,
+        ] {
+            session.set_with_notify(pos + offset, session.states[3], false);
+        }
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.schedule_fluid(pos, water, 0);
+        session.advance_fluid_ticks();
+        let stair_pos = pos + IVec3::X;
+        let fluid_sim::Cell::Stairs {
+            voxels,
+            waterlogged: true,
+        } = session.simulation_cell(stair_pos)
+        else {
+            panic!("stair not waterlogged")
+        };
+        assert_eq!(Some(voxels), session.stair_voxels(stair));
+        let absolute = session.origin + stair_pos;
+        assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+            && key.y == absolute.y
+            && key.z == absolute.z
+            && key.kind == FluidKind::Water
+            && key.source));
     }
 
     #[test]

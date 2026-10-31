@@ -293,10 +293,7 @@ fn edited_session_chunk_round_trips_through_vanilla_palette() {
 #[cfg(windows)]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn session_lighting_and_block_changes_survive_java_region_round_trip() {
-    use native_persistence::{
-        save::{WorldSavePlan, WorldWriteGuard},
-        world::WorldReader,
-    };
+    use native_persistence::{save::WorldWriteGuard, world::WorldReader};
     use native_session::SessionWorld;
     let (game, java) = game_and_java();
     let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
@@ -338,6 +335,12 @@ public class LightRegionOracle {
       NbtIo.writeCompressed(player,playerDir.resolve("00000000-0000-0000-0000-000000000001.dat"));
       var clockDir=world.resolve("data/minecraft"); Files.createDirectories(clockDir);
       var clock=new CompoundTag(); clock.putInt("DataVersion",5023); var clocks=new CompoundTag(); var overworld=new CompoundTag(); overworld.putLong("total_ticks",10); overworld.putInt("future_clock",17); clocks.put("minecraft:overworld",overworld); clock.put("data",clocks); NbtIo.writeCompressed(clock,clockDir.resolve("world_clocks.dat"));
+      var entityDir=world.resolve("dimensions/minecraft/overworld/entities"); Files.createDirectories(entityDir);
+      var entityChunk=new CompoundTag(); entityChunk.putInt("DataVersion",5023); entityChunk.putIntArray("Position",new int[]{1,1}); entityChunk.putString("future_entity_chunk","keep");
+      var orb=new CompoundTag(); orb.putString("id","minecraft:experience_orb"); orb.putIntArray("UUID",new int[]{1,2,3,4});
+      var orbPos=new ListTag(); orbPos.add(DoubleTag.valueOf(24.5)); orbPos.add(DoubleTag.valueOf(1.0)); orbPos.add(DoubleTag.valueOf(24.5)); orb.put("Pos",orbPos); orb.putBoolean("NoGravity",true); orb.putShort("Value",(short)7); orb.putInt("Count",2);
+      var entities=new ListTag(); entities.add(orb); entityChunk.put("Entities",entities);
+      try(var region=open(entityDir); var out=region.getChunkDataOutputStream(new ChunkPos(1,1))) { NbtIo.write(entityChunk,(DataOutput)out); }
       try(var region=open(dir)) { for(int x=0;x<3;x++) for(int z=0;z<3;z++) {
         var chunk=new CompoundTag(); chunk.putInt("DataVersion",5023); chunk.putInt("xPos",x); chunk.putInt("zPos",z); chunk.putString("Status","minecraft:full"); chunk.putBoolean("isLightOn",true); chunk.putLong("future_data",42+x*3+z);
         var palette=new ListTag(); var air=new CompoundTag(); air.putString("id","minecraft:air"); palette.add(air);
@@ -351,6 +354,13 @@ public class LightRegionOracle {
       try(var region=open(dir)) { CompoundTag chunk;
         try(var in=region.getChunkDataInputStream(new ChunkPos(1,1))) { chunk=NbtIo.read((DataInput)in); }
         chunk.putLong("future_data",999);
+        try(var out=region.getChunkDataOutputStream(new ChunkPos(1,1))) { NbtIo.write(chunk,(DataOutput)out); }
+      }
+    } else if(args[0].equals("alter_entity")) {
+      var entityDir=world.resolve("dimensions/minecraft/overworld/entities");
+      try(var region=open(entityDir)) { CompoundTag chunk;
+        try(var in=region.getChunkDataInputStream(new ChunkPos(1,1))) { chunk=NbtIo.read((DataInput)in); }
+        chunk.putString("future_entity_chunk","changed");
         try(var out=region.getChunkDataOutputStream(new ChunkPos(1,1))) { NbtIo.write(chunk,(DataOutput)out); }
       }
     } else {
@@ -371,6 +381,12 @@ public class LightRegionOracle {
       if(at!=expected.length) throw new AssertionError("sample count");
       var player=NbtIo.readCompressed(world.resolve("players/data/00000000-0000-0000-0000-000000000001.dat"),NbtAccounter.unlimitedHeap());
       if(!Arrays.equals(player.getIntArray("UUID").orElseThrow(),new int[]{0,0,0,1}) || player.getLongOr("future_player",0)!=83 || player.getListOrEmpty("Pos").getDouble(0).orElseThrow()!=24.5) throw new AssertionError("player data");
+      if(player.getIntOr("XpTotal",0)!=7) throw new AssertionError("orb pickup was not saved");
+      var entityDir=world.resolve("dimensions/minecraft/overworld/entities");
+      try(var region=open(entityDir); var in=region.getChunkDataInputStream(new ChunkPos(1,1))) {
+        var entityChunk=NbtIo.read((DataInput)in); var entities=entityChunk.getListOrEmpty("Entities");
+        if(!entityChunk.getStringOr("future_entity_chunk","").equals("keep") || entities.size()!=1 || ((CompoundTag)entities.get(0)).getIntOr("Count",0)!=1) throw new AssertionError("entity data");
+      }
       var clock=NbtIo.readCompressed(world.resolve("data/minecraft/world_clocks.dat"),NbtAccounter.unlimitedHeap()); var overworld=clock.getCompoundOrEmpty("data").getCompoundOrEmpty("minecraft:overworld");
       if(overworld.getLongOr("total_ticks",0)!=11 || overworld.getIntOr("future_clock",0)!=17) throw new AssertionError("clock data");
     }
@@ -397,6 +413,7 @@ public class LightRegionOracle {
     let clock_source = nbt::read_gzip(std::fs::File::open(&clock_path).unwrap()).unwrap();
     let mut reader = WorldReader::open(&world_path, dimension.clone()).unwrap();
     let area = reader.read_area(ChunkPos { x: 1, z: 1 }, 1).unwrap();
+    let entity_source = reader.read_entity_chunk(1, 1).unwrap().unwrap();
     assert_eq!(area.chunks.len(), 9);
     let world = area.materialize(&dimension).unwrap();
     drop(reader);
@@ -420,6 +437,12 @@ public class LightRegionOracle {
     .unwrap();
     session
         .restore_saved_player_inventory(&player_source)
+        .unwrap();
+    session
+        .set_initial_entity_chunk(
+            native_world::loaded::ChunkPos { x: 1, z: 1 },
+            native_session::loaded::SavedEntityData::Present(Arc::new(entity_source.clone())),
+        )
         .unwrap();
     session
         .restore_saved_world_clocks(
@@ -494,7 +517,6 @@ public class LightRegionOracle {
             .is_err()
     );
     let make_plan = || {
-        let mut plan = WorldSavePlan::new();
         let combined = session
             .draft_player_terrain_entities_and_clocks(
                 &player_source,
@@ -504,24 +526,26 @@ public class LightRegionOracle {
                 |state| Ok((state.name.matches("minecraft:air"), false)),
             )
             .unwrap();
-        assert!(combined.entity_chunks.is_empty());
-        assert_eq!(combined.player_and_terrain.chunks().len(), dirty.len());
-        let (player, chunks) = combined.player_and_terrain.into_parts();
-        for (_, draft) in chunks {
-            plan.add_chunk(dimension.clone(), draft, 1_777_777).unwrap();
-        }
-        player
-            .add_to_save_plan(&mut plan, [0, 0, 0, 1], &player_source)
-            .unwrap();
+        assert_eq!(combined.entity_chunks().len(), 1);
+        assert_eq!(combined.player_and_terrain().chunks().len(), dirty.len());
         combined
-            .clocks
-            .add_to_save_plan(&mut plan, &clock_source)
-            .unwrap();
-        plan
+            .into_save_plan(
+                [0, 0, 0, 1],
+                &player_source,
+                &BTreeMap::from([(
+                    native_world::loaded::ChunkPos { x: 1, z: 1 },
+                    Some(entity_source.document.as_ref()),
+                )]),
+                &clock_source,
+                1_777_777,
+            )
+            .unwrap()
     };
     let stale_plan = make_plan();
     let region_path = world_path.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let entity_path = world_path.join("dimensions/minecraft/overworld/entities/r.0.0.mca");
     let original_region = std::fs::read(&region_path).unwrap();
+    let original_entities = std::fs::read(&entity_path).unwrap();
     run(Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&cp)
@@ -537,8 +561,25 @@ public class LightRegionOracle {
     assert_eq!(std::fs::read(&region_path).unwrap(), changed_region);
     assert_eq!(std::fs::read(&player_path).unwrap(), unchanged_player);
     assert_eq!(std::fs::read(&clock_path).unwrap(), unchanged_clock);
+    assert_eq!(std::fs::read(&entity_path).unwrap(), original_entities);
     assert!(!world_path.join(".minecraft-native-pending").exists());
     std::fs::write(&region_path, &original_region).unwrap();
+    let stale_entity_plan = make_plan();
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("LightRegionOracle")
+        .arg("alter_entity")
+        .arg(&world_path));
+    let changed_entities = std::fs::read(&entity_path).unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world_path).unwrap();
+    assert!(writer.write_plan(stale_entity_plan, |_, _| Ok(())).is_err());
+    drop(writer);
+    assert_eq!(std::fs::read(&entity_path).unwrap(), changed_entities);
+    assert_eq!(std::fs::read(&region_path).unwrap(), original_region);
+    assert_eq!(std::fs::read(&player_path).unwrap(), unchanged_player);
+    assert_eq!(std::fs::read(&clock_path).unwrap(), unchanged_clock);
+    std::fs::write(&entity_path, &original_entities).unwrap();
     let plan = make_plan();
     let mut writer = WorldWriteGuard::acquire(&world_path).unwrap();
     let result = writer

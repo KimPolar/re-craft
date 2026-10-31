@@ -127,9 +127,63 @@ pub struct WorldClockDraft {
 /// Partial session snapshot; other entity kinds and world effects still need
 /// inclusion before this can authorize an actual gameplay save.
 pub struct PartialSessionSaveDraft {
-    pub player_and_terrain: PlayerWorldDraft,
-    pub entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
-    pub clocks: WorldClockDraft,
+    dimension: native_persistence::world::DimensionId,
+    player_and_terrain: PlayerWorldDraft,
+    entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
+    clocks: WorldClockDraft,
+}
+
+impl PartialSessionSaveDraft {
+    pub fn player_and_terrain(&self) -> &PlayerWorldDraft {
+        &self.player_and_terrain
+    }
+
+    pub fn entity_chunks(
+        &self,
+    ) -> &BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft> {
+        &self.entity_chunks
+    }
+
+    /// Assemble all tracked pieces into a fresh partial transaction. This does
+    /// not establish that every gameplay effect is supported or authorize a
+    /// playable-world write; the caller still needs complete coverage checks.
+    pub fn into_save_plan(
+        self,
+        uuid: [i32; 4],
+        player_source: &native_persistence::nbt::NamedTag,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        clock_source: &native_persistence::nbt::NamedTag,
+        region_timestamp_seconds: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        anyhow::ensure!(
+            self.entity_chunks.len() == entity_sources.len()
+                && self
+                    .entity_chunks
+                    .keys()
+                    .all(|pos| entity_sources.contains_key(pos)),
+            "all tracked entity chunk sources must be supplied exactly once"
+        );
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        let (player, chunks) = self.player_and_terrain.into_parts();
+        player.add_to_save_plan(&mut plan, uuid, player_source)?;
+        self.clocks.add_to_save_plan(&mut plan, clock_source)?;
+        for (position, draft) in &self.entity_chunks {
+            draft.add_to_save_plan(
+                &mut plan,
+                self.dimension.clone(),
+                native_persistence::world::ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                },
+                entity_sources[position],
+                region_timestamp_seconds,
+            )?;
+        }
+        for (_, chunk) in chunks {
+            plan.add_chunk(self.dimension.clone(), chunk, region_timestamp_seconds)?;
+        }
+        Ok(plan)
+    }
 }
 
 impl WorldClockDraft {
@@ -1298,6 +1352,7 @@ impl LoadedSession {
         let entity_chunks = self.draft_tracked_entity_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
         Ok(PartialSessionSaveDraft {
+            dimension: native_persistence::world::DimensionId::parse(&self.world.dimension)?,
             player_and_terrain,
             entity_chunks,
             clocks,
@@ -17412,7 +17467,10 @@ mod tests {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let player = NamedTag {
             name: "".into(),
-            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+            ]),
         };
         let clock = NamedTag {
             name: "".into(),
@@ -17464,12 +17522,96 @@ mod tests {
                         x: home.x,
                         z: home.z,
                     },
-                    document,
+                    document: Arc::clone(&document),
                 })),
             )
             .unwrap();
         let tags = test_heightmap_tags();
         session.update(TICK);
+        let make_draft = || {
+            session
+                .draft_player_terrain_entities_and_clocks(
+                    &player,
+                    &BTreeMap::new(),
+                    &clock,
+                    &tags,
+                    |_| unreachable!(),
+                )
+                .unwrap()
+        };
+        let valid_sources = BTreeMap::from([(home, Some(document.as_ref()))]);
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
+                .is_err()
+        );
+        assert!(
+            make_draft()
+                .into_save_plan(
+                    [0, 0, 0, 1],
+                    &player,
+                    &BTreeMap::from([(home, None)]),
+                    &clock,
+                    1
+                )
+                .is_err()
+        );
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 2], &player, &valid_sources, &clock, 1)
+                .is_err()
+        );
+        let mut changed_player = player.clone();
+        let Tag::Compound(fields) = &mut changed_player.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &changed_player, &valid_sources, &clock, 1)
+                .is_err()
+        );
+        let mut changed_entity = document.as_ref().clone();
+        let Tag::Compound(fields) = &mut changed_entity.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        let changed_sources = BTreeMap::from([(home, Some(&changed_entity))]);
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &player, &changed_sources, &clock, 1)
+                .is_err()
+        );
+        let extra_sources = BTreeMap::from([
+            (home, Some(document.as_ref())),
+            (
+                ChunkPos {
+                    x: home.x + 1,
+                    z: home.z,
+                },
+                None,
+            ),
+        ]);
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &player, &extra_sources, &clock, 1)
+                .is_err()
+        );
+        let mut changed_clock = clock.clone();
+        let Tag::Compound(fields) = &mut changed_clock.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &player, &valid_sources, &changed_clock, 1)
+                .is_err()
+        );
+        assert!(
+            make_draft()
+                .into_save_plan([0, 0, 0, 1], &player, &valid_sources, &clock, 1)
+                .is_ok()
+        );
         let partial = session
             .draft_player_terrain_entities_and_clocks(
                 &player,

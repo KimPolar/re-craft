@@ -61,6 +61,19 @@ impl PerlinStack {
         }
         total
     }
+
+    /// Matches `NoiseStack.addToVolume`: each layer combines its frequency
+    /// with the coordinate scale before multiplying by the block coordinate.
+    pub fn sample_scaled_volume(&self, x: i32, y: i32, z: i32, xz_scale: f64, y_scale: f64) -> f32 {
+        let mut total = 0.0f32;
+        for (noise, frequency, amplitude) in &self.layers {
+            let xz = xz_scale * frequency;
+            let y_scale = y_scale * frequency;
+            total += *amplitude
+                * noise.sample(f64::from(x) * xz, f64::from(y) * y_scale, f64::from(z) * xz);
+        }
+        total
+    }
 }
 
 impl PerlinNoise {

@@ -1,13 +1,19 @@
-//! The context-independent subset of 26.3 density functions.
+//! A subset of 26.3 density functions, optionally bound to a world seed.
 //!
-//! Unsupported functions are errors: treating noise as a constant would
-//! silently produce a different world.
+//! Unsupported functions are errors rather than substitutes that silently
+//! produce a different world.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use native_core::{
+    normal_noise::{
+        LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
+    },
+    random::{LegacyRandom, XoroshiroRandom},
+};
 use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
@@ -64,6 +70,13 @@ enum Node {
         input: Arc<DensityFunction>,
         cell_xz: i32,
         cell_y: i32,
+    },
+    Noise {
+        noise: Arc<NormalNoise>,
+        xz_scale: f64,
+        y_scale: f64,
+        shifts: [Arc<DensityFunction>; 3],
+        shift_mode: u8,
     },
 }
 
@@ -263,6 +276,28 @@ impl DensityFunction {
                 );
                 lerp(tz, z0_plane, z1_plane)
             }
+            Node::Noise {
+                noise,
+                xz_scale,
+                y_scale,
+                shifts,
+                shift_mode,
+            } => {
+                if *shift_mode == 0 && volume {
+                    return noise.sample_scaled_volume(x, y, z, *xz_scale, *y_scale);
+                }
+                let mut px = f64::from(x) * xz_scale;
+                let mut py = f64::from(y) * y_scale;
+                let mut pz = f64::from(z) * xz_scale;
+                if *shift_mode != 0 {
+                    px += f64::from(shifts[0].evaluate(x, y, z, volume));
+                    pz += f64::from(shifts[2].evaluate(x, y, z, volume));
+                    if *shift_mode == 2 {
+                        py += f64::from(shifts[1].evaluate(x, y, z, volume));
+                    }
+                }
+                noise.sample(px, py, pz)
+            }
         }
     }
 }
@@ -299,6 +334,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             first,
             second,
         } => vec![alpha, first, second],
+        Node::Noise { shifts, .. } => shifts.iter().collect(),
     };
     let depth = 1 + children.iter().map(|child| child.1).max().unwrap_or(0);
     let mut work = children
@@ -358,6 +394,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             first,
             second,
         } => alpha.4.lerp(first.4, second.4),
+        Node::Noise { noise, .. } => {
+            let (min, max) = noise.range();
+            Interval::bounds(min, max)
+        }
     };
     Ok(Arc::new(DensityFunction(
         node,
@@ -374,6 +414,20 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     cache: BTreeMap<ResourceId, Arc<DensityFunction>>,
     active: BTreeSet<ResourceId>,
     nodes: usize,
+    noise_factory: Option<WorldNoiseFactory>,
+    noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
+}
+
+enum WorldNoiseFactory {
+    Legacy(LegacyNoiseFactory),
+    Xoroshiro(XoroshiroNoiseFactory),
+}
+
+/// Random source selected by the world's 26.3 generator settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldgenRandom {
+    Legacy,
+    Xoroshiro,
 }
 
 impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
@@ -383,7 +437,53 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             cache: BTreeMap::new(),
             active: BTreeSet::new(),
             nodes: 0,
+            noise_factory: None,
+            noises: BTreeMap::new(),
         }
+    }
+
+    pub fn with_world_seed(resources: &'a mut P, seed: i64, algorithm: WorldgenRandom) -> Self {
+        let noise_factory = match algorithm {
+            WorldgenRandom::Legacy => {
+                WorldNoiseFactory::Legacy(LegacyRandom::new(seed).fork_noise_factory())
+            }
+            WorldgenRandom::Xoroshiro => {
+                WorldNoiseFactory::Xoroshiro(XoroshiroRandom::new(seed).fork_noise_factory())
+            }
+        };
+        let mut compiler = Self::new(resources);
+        compiler.noise_factory = Some(noise_factory);
+        compiler
+    }
+
+    fn noise(&mut self, name: &str) -> Result<Arc<NormalNoise>> {
+        let id = ResourceId::parse(name)?;
+        if let Some(noise) = self.noises.get(&id) {
+            return Ok(Arc::clone(noise));
+        }
+        ensure!(
+            self.noise_factory.is_some(),
+            "a world seed is required for density noise"
+        );
+        ensure!(
+            !(id.namespace == "minecraft"
+                && (id.path == "nether/temperature" || id.path == "nether/vegetation")),
+            "legacy Nether biome noise is not supported yet"
+        );
+        let canonical = format!("{}:{}", id.namespace, id.path);
+        let parameters = crate::noise::load_normal_noise(self.resources, &canonical)?;
+        let noise = match self.noise_factory.as_ref().unwrap() {
+            WorldNoiseFactory::Legacy(factory) => {
+                parameters.create(&mut factory.random_for(&canonical))
+            }
+            WorldNoiseFactory::Xoroshiro(factory) => {
+                parameters.create(&mut factory.random_for(&canonical))
+            }
+        }
+        .map_err(anyhow::Error::msg)?;
+        let noise = Arc::new(noise);
+        self.noises.insert(id, Arc::clone(&noise));
+        Ok(noise)
     }
 
     pub fn compile_id(&mut self, id: &str) -> Result<Arc<DensityFunction>> {
@@ -572,6 +672,44 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                     cell_y,
                 }
             }
+            "noise" => {
+                let name = field("noise")?
+                    .as_str()
+                    .context("noise must reference a registered noise definition")?;
+                let noise = self.noise(name)?;
+                let xz_scale = field("xz_scale")?
+                    .as_f64()
+                    .context("xz_scale must be a number")?;
+                let y_scale = field("y_scale")?
+                    .as_f64()
+                    .context("y_scale must be a number")?;
+                ensure!(
+                    xz_scale.is_finite() && y_scale.is_finite(),
+                    "noise scale must be finite"
+                );
+                let mut shifts = Vec::with_capacity(3);
+                for key in ["shift_x", "shift_y", "shift_z"] {
+                    shifts.push(match object.get(key) {
+                        Some(value) => self.expression(value, depth + 1)?,
+                        None => make(Node::Constant(0.0))?,
+                    });
+                }
+                let zero = |function: &Arc<DensityFunction>| matches!(&function.0, Node::Constant(value) if value.to_bits() == 0);
+                let shift_mode = if shifts.iter().all(zero) {
+                    0
+                } else if zero(&shifts[1]) {
+                    1
+                } else {
+                    2
+                };
+                Node::Noise {
+                    noise,
+                    xz_scale,
+                    y_scale,
+                    shifts: shifts.try_into().unwrap(),
+                    shift_mode,
+                }
+            }
             _ => bail!("unsupported density function type {kind}"),
         };
         make(node)
@@ -645,7 +783,7 @@ mod tests {
         let mut data = Data::default();
         data.insert("a", json!("test:b"));
         data.insert("b", json!("test:a"));
-        data.insert("noise", json!({"type":"minecraft:noise"}));
+        data.insert("noise", json!({"type":"minecraft:old_blended_noise"}));
         let mut compiler = DensityCompiler::new(&mut data);
         assert!(format!("{:#}", compiler.compile_id("test:a").unwrap_err()).contains("cyclic"));
         assert!(
@@ -722,5 +860,39 @@ mod tests {
             .unwrap();
         assert_eq!(max.sample(0, 0, 0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(max.evaluate(0, 0, 0, true).to_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn seeded_noise_reuses_registered_sampler_and_requires_seed() {
+        let mut data = Data::default();
+        data.0.insert(
+            "data/test/worldgen/noise/sample.json".to_owned(),
+            br#"{"base_octave":-3}"#.to_vec(),
+        );
+        let value = json!({"type":"noise","noise":"test:sample","xz_scale":0.013,"y_scale":0.021});
+        data.insert("from_pack", value.clone());
+        assert!(DensityCompiler::new(&mut data).compile(&value).is_err());
+        let mut compiler =
+            DensityCompiler::with_world_seed(&mut data, 123, WorldgenRandom::Xoroshiro);
+        let first = compiler.compile(&value).unwrap();
+        let second = compiler.compile(&value).unwrap();
+        if let (Node::Noise { noise: a, .. }, Node::Noise { noise: b, .. }) = (&first.0, &second.0)
+        {
+            assert!(Arc::ptr_eq(a, b));
+        } else {
+            panic!("expected noise functions");
+        }
+        assert_eq!(
+            first.sample(10, 20, 30).to_bits(),
+            second.sample(10, 20, 30).to_bits()
+        );
+        let referenced = compiler.compile_id("test:from_pack").unwrap();
+        assert_eq!(
+            first.sample(10, 20, 30).to_bits(),
+            referenced.sample(10, 20, 30).to_bits()
+        );
+        let nether =
+            json!({"type":"noise","noise":"minecraft:nether/temperature","xz_scale":1,"y_scale":1});
+        assert!(compiler.compile(&nether).is_err());
     }
 }

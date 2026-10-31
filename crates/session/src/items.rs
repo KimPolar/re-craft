@@ -516,6 +516,9 @@ pub(crate) struct ItemEntities {
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
     uncoordinated_saved_merge: bool,
+    // Unknown rain can affect a later merge, pickup, or removal, so retain it
+    // until the session is restarted instead of accepting partial save drafts.
+    unresolved_rain_effect: bool,
     random: LegacyRandom,
     next_id: u32,
     next_section_sequence: u64,
@@ -536,6 +539,7 @@ impl Default for ItemEntities {
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
             uncoordinated_saved_merge: false,
+            unresolved_rain_effect: false,
             random: LegacyRandom::new(0),
             next_id: 0,
             next_section_sequence: 0,
@@ -547,6 +551,13 @@ impl Default for ItemEntities {
 }
 
 impl ItemEntities {
+    fn ensure_rain_resolved(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.unresolved_rain_effect,
+            "item rain effects could not be resolved"
+        );
+        Ok(())
+    }
     /// Conservative closure of all known item sources, destinations, movement
     /// paths and merge/removal effects. Other entity kinds are not covered.
     pub(crate) fn affected_item_chunks(
@@ -554,6 +565,7 @@ impl ItemEntities {
         saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<BTreeSet<native_world::loaded::ChunkPos>> {
         use anyhow::Context;
+        self.ensure_rain_resolved()?;
         let mut chunks: BTreeSet<_> = saved_uuids.values().copied().collect();
         for entity in self
             .entities
@@ -696,6 +708,7 @@ impl ItemEntities {
         saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
+        self.ensure_rain_resolved()?;
         ensure!(
             !self.uncoordinated_saved_merge,
             "saved item merge effects need coordinated saving"
@@ -797,6 +810,7 @@ impl ItemEntities {
         saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
+        self.ensure_rain_resolved()?;
         ensure!(
             !self.uncoordinated_saved_merge,
             "saved item merge effects need coordinated saving"
@@ -844,6 +858,7 @@ impl ItemEntities {
         &self,
         uuid: [i32; 4],
     ) -> anyhow::Result<Option<crate::saved_item::ItemDraft>> {
+        self.ensure_rain_resolved()?;
         for entity in &self.entities {
             let Some(source) = &entity._saved_source else {
                 continue;
@@ -871,6 +886,7 @@ impl ItemEntities {
         positions: &BTreeSet<native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<Vec<crate::saved_item::CreatedItemDraft>> {
         use anyhow::{Context, ensure};
+        self.ensure_rain_resolved()?;
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
         for entity in &self.entities {
@@ -993,6 +1009,7 @@ impl ItemEntities {
         uuid: [i32; 4],
     ) -> anyhow::Result<Option<crate::saved_item::ItemDraft>> {
         use anyhow::ensure;
+        self.ensure_rain_resolved()?;
         let mut found = None;
         for removed in &self.removed_saved {
             let entity = &removed.entity;
@@ -1013,6 +1030,7 @@ impl ItemEntities {
         saved_uuids: &std::collections::BTreeMap<[i32; 4], native_world::loaded::ChunkPos>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
+        self.ensure_rain_resolved()?;
         ensure!(
             !self.uncoordinated_saved_merge,
             "saved item merge effects need coordinated saving"
@@ -2135,12 +2153,12 @@ impl ItemEntities {
                     }
                 }
             }
-            if !removed[index]
-                && entity._damage_state.fire_ticks > 0
-                && item_in_rain(entity.item.position - origin.as_dvec3(), &mut rain_at)
-                    == Some(true)
-            {
-                entity._damage_state.fire_ticks = 0;
+            if !removed[index] && entity._damage_state.fire_ticks > 0 {
+                match item_in_rain(entity.item.position - origin.as_dvec3(), &mut rain_at) {
+                    Some(true) => entity._damage_state.fire_ticks = 0,
+                    Some(false) => {}
+                    None => self.unresolved_rain_effect = true,
+                }
             }
             if removed[index] {
                 continue;
@@ -2593,6 +2611,19 @@ mod tests {
             );
             assert_eq!(items.entities[0]._damage_state.health, expected_health);
             assert_eq!(items.entities[0]._damage_state.fire_ticks, expected_fire);
+            assert_eq!(items.unresolved_rain_effect, rain.is_none());
+            if rain.is_none() {
+                assert!(items.affected_item_chunks(&Default::default()).is_err());
+                assert!(items.draft_saved_item([0; 4]).is_err());
+                assert!(items.draft_removed_item([0; 4]).is_err());
+                assert!(
+                    items
+                        .draft_created_items_in_chunks(&BTreeSet::new())
+                        .is_err()
+                );
+                items.entities.clear();
+                assert!(items.affected_item_chunks(&Default::default()).is_err());
+            }
         }
     }
 

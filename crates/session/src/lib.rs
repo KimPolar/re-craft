@@ -28,6 +28,7 @@ pub mod equippable;
 pub mod experience;
 pub mod fall;
 pub mod falling_block;
+pub mod farmland;
 mod interaction;
 pub mod inventory;
 pub mod items;

@@ -2394,6 +2394,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "lapis_lazuli",
     "redstone",
     "compass",
+    "recovery_compass",
     "quartz",
     "raw_iron",
     "raw_gold",

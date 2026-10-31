@@ -36,6 +36,15 @@ pub struct PlayerSaveState {
     pub score: i32,
 }
 
+/// Read the last-death GlobalPos without discarding unrecognized saved data.
+pub fn read_last_death_location(player: &NamedTag) -> Result<Option<crate::lodestone::Target>> {
+    unique_field(&player.value, "LastDeathLocation")?
+        .map(|value| {
+            crate::lodestone::Target::parse(value).context("unsupported last-death location")
+        })
+        .transpose()
+}
+
 pub(crate) fn numeric_double(tag: &Tag) -> Option<f64> {
     Some(match tag {
         Tag::Byte(value) => f64::from(*value),
@@ -801,6 +810,23 @@ pub struct PlayerStateDraft(PlayerInventoryDraft);
 impl PlayerStateDraft {
     pub fn document(&self) -> &NamedTag {
         self.0.document()
+    }
+
+    pub(crate) fn set_last_death_location(
+        &mut self,
+        original: &NamedTag,
+        target: &crate::lodestone::Target,
+    ) -> Result<()> {
+        // Refuse to overwrite a saved value whose extra data cannot be preserved.
+        read_last_death_location(original)?;
+        set_field(
+            &mut self.0.document.value,
+            "LastDeathLocation",
+            Some(target.to_nbt()),
+        )?;
+        native_persistence::nbt::write(&self.0.document)
+            .context("last-death draft cannot be encoded")?;
+        Ok(())
     }
 
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
@@ -2049,6 +2075,44 @@ mod tests {
         )
         .unwrap();
         assert!(draft.set_flying(&invalid, true).is_err());
+    }
+
+    #[test]
+    fn last_death_draft_preserves_unrelated_fields_and_rejects_unknown_target_data() {
+        let original = player_with_inventory();
+        let inventory = read_saved_player(&original).unwrap();
+        let mut draft = PlayerStateDraft(draft_player_inventory(&original, &inventory).unwrap());
+        let target = crate::lodestone::Target {
+            dimension: ResourceId::parse("example:dimension").unwrap(),
+            position: glam::IVec3::new(-30, -64, 42),
+        };
+        assert_eq!(read_last_death_location(&original).unwrap(), None);
+        draft.set_last_death_location(&original, &target).unwrap();
+        assert_eq!(
+            read_last_death_location(draft.document()).unwrap(),
+            Some(target.clone())
+        );
+        assert_eq!(
+            draft.document().value.get("custom_world_data"),
+            original.value.get("custom_world_data")
+        );
+        assert!(draft.matches_source(&original).unwrap());
+        let mut unknown = original.clone();
+        set_field(
+            &mut unknown.value,
+            "LastDeathLocation",
+            Some(Tag::Compound(vec![
+                (
+                    "dimension".into(),
+                    Tag::String("minecraft:overworld".into()),
+                ),
+                ("pos".into(), Tag::IntArray(vec![0, 0, 0])),
+                ("future".into(), Tag::Int(1)),
+            ])),
+        )
+        .unwrap();
+        assert!(read_last_death_location(&unknown).is_err());
+        assert!(draft.set_last_death_location(&unknown, &target).is_err());
     }
 
     #[test]

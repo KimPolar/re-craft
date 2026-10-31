@@ -1470,13 +1470,19 @@ impl GameUi {
         let context = crate::held_items::CompassContext {
             dimension: dimension.to_owned(),
             world_spawn: snapshot.world_spawn.clone(),
+            last_death: snapshot.last_death.clone(),
             owner: snapshot.origin.as_dvec3() + snapshot.player.position.as_dvec3(),
             yaw_degrees: snapshot.player.yaw.to_degrees() - 180.0,
             tick: snapshot.tick.min(i64::MAX as u64) as i64,
         };
         let context_changed = self.held_models.set_compass_context(context);
         if self.compass_inventory_revision != Some(snapshot.inventory.revision()) {
-            let has_linked = |item: &ItemStack| item.id() == "minecraft:compass";
+            let has_linked = |item: &ItemStack| {
+                matches!(
+                    item.id(),
+                    "minecraft:compass" | "minecraft:recovery_compass"
+                )
+            };
             let slots = (0..36)
                 .map(PlayerSlot::Storage)
                 .chain((0..4).map(PlayerSlot::Armor))
@@ -4889,6 +4895,7 @@ mod inventory_tests {
         let context = |x| crate::held_items::CompassContext {
             dimension: "minecraft:overworld".into(),
             world_spawn: None,
+            last_death: native_session::LastDeathLocation::Unknown,
             owner: glam::DVec3::new(x, 64.0, 0.5),
             yaw_degrees: -180.0,
             tick: 10,
@@ -4955,6 +4962,7 @@ mod inventory_tests {
         let context = |x| crate::held_items::CompassContext {
             dimension: "minecraft:overworld".into(),
             world_spawn: Some(Arc::new(spawn.clone())),
+            last_death: native_session::LastDeathLocation::Unknown,
             owner: glam::DVec3::new(x, 64.0, 0.5),
             yaw_degrees: -180.0,
             tick: 10,
@@ -5004,6 +5012,82 @@ mod inventory_tests {
         assert_ne!(
             slot_one.gui_icon.as_ref().unwrap().as_raw(),
             slot_two.gui_icon.as_ref().unwrap().as_raw()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn recovery_compass_models_follow_last_death() {
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceId;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&directory, &[]).unwrap()));
+        let compass = ItemStack::new(
+            "minecraft:recovery_compass".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        let death = native_session::lodestone::Target {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            position: glam::IVec3::new(100, 64, 0),
+        };
+        let context = |x| crate::held_items::CompassContext {
+            dimension: "minecraft:overworld".into(),
+            world_spawn: None,
+            last_death: native_session::LastDeathLocation::At(death.clone()),
+            owner: glam::DVec3::new(x, 64.0, 0.5),
+            yaw_degrees: -180.0,
+            tick: 10,
+        };
+        let load = |ui: &mut GameUi, x| {
+            ui.held_models.set_compass_context(context(x));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_item(&compass) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "recovery compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        load(&mut ui, 0.5);
+        let east = load(&mut ui, 0.5);
+        let west = load(&mut ui, 200.5);
+        assert_ne!(
+            east.gui_icon.as_ref().unwrap().as_raw(),
+            west.gui_icon.as_ref().unwrap().as_raw()
+        );
+        let mut absent = context(0.5);
+        absent.last_death = native_session::LastDeathLocation::Absent;
+        absent.tick = 11;
+        ui.held_models.set_compass_context(absent);
+        let mut load_seed = |seed| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                ui.held_models.poll();
+                if let Some(model) = ui.held_models.get_item_seeded(&compass, seed) {
+                    break model;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "random recovery compass did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let one = load_seed(1);
+        let two = load_seed(2);
+        assert_ne!(
+            one.gui_icon.as_ref().unwrap().as_raw(),
+            two.gui_icon.as_ref().unwrap().as_raw()
         );
     }
 

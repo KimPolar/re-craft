@@ -301,6 +301,7 @@ pub struct LoadedSession {
     selected: Block,
     inventory: Arc<PlayerInventory>,
     saved_player_inventory_source: Option<Vec<u8>>,
+    last_death_dirty: bool,
     recipes: Option<Arc<CraftingRecipes>>,
     item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     loot: Option<Arc<BlockLootTables>>,
@@ -823,6 +824,31 @@ impl LoadedSession {
             "world spawn must be set before the first tick"
         );
         Arc::make_mut(&mut self.snapshot).world_spawn = Some(Arc::new(spawn));
+        Ok(())
+    }
+
+    fn record_last_death(&mut self) {
+        self.last_death_dirty = true;
+        let location = native_resources::packs::ResourceId::parse(&self.world.dimension)
+            .map(|dimension| {
+                crate::LastDeathLocation::At(crate::lodestone::Target {
+                    dimension,
+                    position: (self.origin.as_dvec3() + self.motion.position)
+                        .floor()
+                        .as_ivec3(),
+                })
+            })
+            .unwrap_or(crate::LastDeathLocation::Unknown);
+        Arc::make_mut(&mut self.snapshot).last_death = location;
+    }
+
+    /// A newly created player has no last-death location.
+    pub fn set_new_player_last_death(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.saved_player_inventory_source.is_none(),
+            "new player state must be set before loading or ticking"
+        );
+        Arc::make_mut(&mut self.snapshot).last_death = crate::LastDeathLocation::Absent;
         Ok(())
     }
 
@@ -1629,6 +1655,12 @@ impl LoadedSession {
             score: self.score,
         };
         let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
+        if self.last_death_dirty {
+            let crate::LastDeathLocation::At(target) = &self.snapshot.last_death else {
+                anyhow::bail!("last-death position is unavailable");
+            };
+            draft.set_last_death_location(original, target)?;
+        }
         draft.set_flying(original, self.flight.flying)?;
         if let Some(effects) = effect_draft {
             draft.set_effects(effects)?;
@@ -2604,6 +2636,7 @@ impl LoadedSession {
         self.snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Loaded(Arc::clone(&self.world)),
             world_spawn: self.snapshot.world_spawn.clone(),
+            last_death: self.snapshot.last_death.clone(),
             player: self.player,
             camera: self.camera,
             game_mode: self.game_mode,
@@ -2645,8 +2678,18 @@ impl LoadedSession {
             "saved player inventory source was already captured"
         );
         let inventory = crate::player_data::read_saved_player(source)?;
+        let last_death = match crate::player_data::read_last_death_location(source) {
+            Ok(Some(target)) => crate::LastDeathLocation::At(target),
+            Ok(None) => crate::LastDeathLocation::Absent,
+            Err(error) => {
+                self.stream_errors
+                    .push(format!("last-death location is unavailable: {error:#}"));
+                crate::LastDeathLocation::Unknown
+            }
+        };
         let encoded = native_persistence::nbt::write(source)?;
         self.set_player_inventory(inventory);
+        Arc::make_mut(&mut self.snapshot).last_death = last_death;
         self.saved_player_inventory_source = Some(encoded);
         Ok(())
     }
@@ -2700,6 +2743,7 @@ impl LoadedSession {
         let snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Loaded(Arc::clone(&world)),
             world_spawn: None,
+            last_death: crate::LastDeathLocation::Unknown,
             player,
             camera,
             game_mode: GameMode::default(),
@@ -2744,6 +2788,7 @@ impl LoadedSession {
             selected: Block::Grass,
             inventory,
             saved_player_inventory_source: None,
+            last_death_dirty: false,
             recipes: None,
             item_registry: None,
             loot: None,
@@ -10375,6 +10420,7 @@ impl LoadedSession {
                     respawn_pending: false,
                     can_respawn: false,
                 });
+                self.record_last_death();
                 self.movement = (0.0, 0.0, false);
                 self.sprint = crate::physics::SprintState::default();
             }
@@ -10818,6 +10864,7 @@ impl LoadedSession {
                     respawn_pending: false,
                     can_respawn: false,
                 });
+                self.record_last_death();
             }
             if self.game_mode != GameMode::Spectator && !self.sneak {
                 self.set_redstone_ore_lit(legacy, true);
@@ -10996,6 +11043,7 @@ impl LoadedSession {
                     respawn_pending: false,
                     can_respawn: false,
                 });
+                self.record_last_death();
             }
         }
         if self.death.is_some() {
@@ -11180,6 +11228,7 @@ impl GameSession for LoadedSession {
             self.snapshot = Arc::new(WorldSnapshot {
                 world: SessionWorld::Loaded(Arc::clone(&self.world)),
                 world_spawn: self.snapshot.world_spawn.clone(),
+                last_death: self.snapshot.last_death.clone(),
                 player: self.player,
                 camera: self.camera,
                 game_mode: self.game_mode,
@@ -14394,6 +14443,53 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.snapshot().world_spawn.as_deref(), Some(&spawn));
         assert!(session.set_world_spawn(spawn).is_err());
+    }
+
+    #[test]
+    fn new_last_death_is_reflected_in_player_draft_without_changing_source() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        session.set_player_inventory(PlayerInventory::default());
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "Dimension".into(),
+                    Tag::String("minecraft:overworld".into()),
+                ),
+                (
+                    "Rotation".into(),
+                    Tag::List {
+                        element_type: TagType::Float,
+                        values: vec![Tag::Float(-180.0), Tag::Float(0.0)],
+                    },
+                ),
+                ("future".into(), Tag::Int(7)),
+            ]),
+        };
+        let old = session.snapshot();
+        session.record_last_death();
+        let target = match &session.snapshot().last_death {
+            crate::LastDeathLocation::At(target) => target.clone(),
+            _ => panic!("death position not recorded"),
+        };
+        assert!(matches!(&old.last_death, crate::LastDeathLocation::Unknown));
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_last_death_location(draft.document()).unwrap(),
+            Some(target)
+        );
+        assert!(original.value.get("LastDeathLocation").is_none());
+        assert_eq!(draft.document().value.get("future"), Some(&Tag::Int(7)));
+        let mut unsupported = original.clone();
+        if let Tag::Compound(fields) = &mut unsupported.value {
+            fields.push((
+                "LastDeathLocation".into(),
+                Tag::Compound(vec![("future".into(), Tag::Int(1))]),
+            ));
+        }
+        assert!(session.draft_player_state(&unsupported).is_err());
     }
 
     #[test]
@@ -25035,8 +25131,14 @@ mod tests {
             air: -19,
             ..Default::default()
         });
+        let drowning_position = (drowning.origin.as_dvec3() + drowning.motion.position)
+            .floor()
+            .as_ivec3();
         drowning.update(TICK);
         assert_eq!(drowning.snapshot().death.unwrap().cause, DeathCause::Drown);
+        assert!(
+            matches!(&drowning.snapshot().last_death, crate::LastDeathLocation::At(target) if target.position == drowning_position && target.dimension.namespace == "minecraft" && target.dimension.path == "overworld")
+        );
 
         let mut starving = session();
         starving.set_survival_rules(crate::survival::SurvivalRules {
@@ -25052,6 +25154,9 @@ mod tests {
         });
         starving.update(TICK);
         assert_eq!(starving.snapshot().death.unwrap().cause, DeathCause::Starve);
+        assert!(
+            matches!(&starving.snapshot().last_death, crate::LastDeathLocation::At(target) if target.position == (starving.origin.as_dvec3() + starving.motion.position).floor().as_ivec3())
+        );
     }
 
     #[test]

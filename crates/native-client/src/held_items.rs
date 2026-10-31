@@ -785,6 +785,7 @@ pub struct ItemModelCache {
 pub(crate) struct CompassContext {
     pub dimension: String,
     pub world_spawn: Option<Arc<native_persistence::world::RespawnData>>,
+    pub last_death: native_session::LastDeathLocation,
     pub owner: glam::DVec3,
     pub yaw_degrees: f32,
     pub tick: i64,
@@ -798,8 +799,10 @@ struct CompassCache {
     context: Option<CompassContext>,
     wobbler: crate::compass_motion::Wobbler,
     spawn_wobbler: crate::compass_motion::Wobbler,
+    recovery_wobbler: crate::compass_motion::Wobbler,
     random_lodestone: crate::compass_motion::RandomNeedle,
     random_spawn: crate::compass_motion::RandomNeedle,
+    random_recovery: crate::compass_motion::RandomNeedle,
 }
 
 impl ItemModelCache {
@@ -948,17 +951,25 @@ impl ItemModelCache {
         seed: i32,
     ) -> Option<Arc<HeldModel>> {
         let mut key = ModelKey::from_item(item);
-        if key.id == "minecraft:compass"
-            && let Some(definition) = self.compass.definitions.get(&key.id)
-            && definition
+        if matches!(
+            key.id.as_str(),
+            "minecraft:compass" | "minecraft:recovery_compass"
+        ) && let Some(definition) = self.compass.definitions.get(&key.id)
+            && let Some(branch) = if key.id == "minecraft:recovery_compass" {
+                definition.get("model")
+            } else if definition
                 .pointer("/model/property")
                 .and_then(Value::as_str)
                 .is_some_and(|value| matches!(value, "minecraft:has_component" | "has_component"))
-            && let Some(branch) = definition.pointer(if key.lodestone_tracker {
-                "/model/on_true"
+            {
+                definition.pointer(if key.lodestone_tracker {
+                    "/model/on_true"
+                } else {
+                    "/model/on_false"
+                })
             } else {
-                "/model/on_false"
-            })
+                None
+            }
             && branch
                 .get("type")
                 .and_then(Value::as_str)
@@ -1002,6 +1013,26 @@ impl ItemModelCache {
                         &mut self.compass.random_spawn,
                     )
                 }),
+                Some("recovery") => match &context.last_death {
+                    native_session::LastDeathLocation::Unknown => None,
+                    native_session::LastDeathLocation::Absent => Some((
+                        None,
+                        &mut self.compass.recovery_wobbler,
+                        &mut self.compass.random_recovery,
+                    )),
+                    native_session::LastDeathLocation::At(location) => {
+                        let target = (format!(
+                            "{}:{}",
+                            location.dimension.namespace, location.dimension.path
+                        ) == context.dimension)
+                            .then_some(location.position);
+                        Some((
+                            target,
+                            &mut self.compass.recovery_wobbler,
+                            &mut self.compass.random_recovery,
+                        ))
+                    }
+                },
                 _ => None,
             };
             if let Some((target, wobbler, random)) = target {

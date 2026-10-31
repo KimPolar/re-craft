@@ -61,6 +61,61 @@ fn tracker_components_match_java_codec() {
             .and_then(|v| v.as_java_int())
             .map(|v| v as u32)
     );
+    assert_eq!(
+        native_session::inventory::ordinary_item_default_max("minecraft:recovery_compass"),
+        java.get("recovery_max")
+            .and_then(|v| v.as_java_int())
+            .map(|v| v as u32)
+    );
+    let death =
+        native_session::player_data::read_last_death_location(&native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: java.clone(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        death.dimension,
+        ResourceId::parse("example:deep/cave").unwrap()
+    );
+    assert_eq!(death.position, IVec3::new(-123, -64, 456));
+    let java_death = java.get("LastDeathLocation").unwrap();
+    for field in ["dimension", "pos"] {
+        assert_eq!(death.to_nbt().get(field), java_death.get(field));
+    }
+    let native_persistence::nbt::Tag::List {
+        values: java_positions,
+        ..
+    } = java.get("death_positions").unwrap()
+    else {
+        panic!("missing death positions")
+    };
+    let positions = [
+        glam::DVec3::new(-0.01, -64.5, 0.99),
+        glam::DVec3::new(16000000.75, 71.1, -16000000.99),
+        glam::DVec3::new(-30000000.0, 319.99, 29999999.99),
+        glam::DVec3::ZERO,
+    ];
+    for (position, expected) in positions.into_iter().zip(java_positions) {
+        assert_eq!(
+            &native_persistence::nbt::Tag::IntArray(
+                position.floor().as_ivec3().to_array().to_vec()
+            ),
+            expected
+        );
+    }
+    let variations = java.get("variations").unwrap();
+    let expected = java.get("variation_results").unwrap();
+    for index in 0..4 {
+        let name = format!("v{index}");
+        let actual =
+            native_session::lodestone::Target::parse(variations.get(&name).unwrap()).is_some();
+        assert_eq!(
+            actual,
+            expected.get(&name).and_then(|v| v.as_java_int()).unwrap() != 0,
+            "{name}"
+        );
+    }
     let mut second = Tracker::linked(
         ResourceId::parse("minecraft:the_nether").unwrap(),
         IVec3::new(0, -64, 0),

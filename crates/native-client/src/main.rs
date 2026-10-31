@@ -1184,6 +1184,7 @@ fn prepare_existing_world(
                 Err(error) => eprintln!("World respawn is unavailable: {error:#}"),
             }
         } else {
+            session.set_new_player_last_death()?;
             session.set_player_vitals(native_session::survival::PlayerVitals {
                 hardcore: difficulty.hardcore,
                 ..Default::default()

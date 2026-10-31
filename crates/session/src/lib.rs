@@ -263,6 +263,15 @@ pub struct PlayerState {
     pub pose: PlayerPose,
 }
 
+/// Whether a player's last death is known independently of their respawn point.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum LastDeathLocation {
+    #[default]
+    Unknown,
+    Absent,
+    At(lodestone::Target),
+}
+
 /// The damage event that caused the player's death. A saved player whose
 /// health is already zero has no reliable cause in the available NBT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,6 +364,7 @@ pub struct WorldSnapshot {
     pub world: SessionWorld,
     /// Saved world-wide spawn, independent of the player's respawn point.
     pub world_spawn: Option<Arc<native_persistence::world::RespawnData>>,
+    pub last_death: LastDeathLocation,
     pub player: PlayerState,
     /// Camera endpoints are visual-only and never used for simulation.
     pub camera: camera::CameraMotion,
@@ -478,6 +488,7 @@ impl LocalSession {
         let snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Demo(world.clone()),
             world_spawn: None,
+            last_death: LastDeathLocation::Absent,
             player,
             camera,
             game_mode: GameMode::default(),
@@ -637,6 +648,7 @@ impl LocalSession {
         self.snapshot = Arc::new(WorldSnapshot {
             world: SessionWorld::Demo(self.world.clone()),
             world_spawn: self.snapshot.world_spawn.clone(),
+            last_death: self.snapshot.last_death.clone(),
             player: self.player,
             camera: self.camera,
             game_mode: self.game_mode,
@@ -1544,6 +1556,11 @@ impl LocalSession {
             return;
         }
         self.death_processed = true;
+        Arc::make_mut(&mut self.snapshot).last_death = LastDeathLocation::At(lodestone::Target {
+            dimension: native_resources::packs::ResourceId::parse("minecraft:overworld")
+                .expect("valid dimension"),
+            position: self.motion.position.floor().as_ivec3(),
+        });
         self.experience_orbs.drop_player_experience(
             self.motion.position,
             self.experience,
@@ -1648,6 +1665,7 @@ impl GameSession for LocalSession {
             self.snapshot = Arc::new(WorldSnapshot {
                 world: SessionWorld::Demo(self.world.clone()),
                 world_spawn: self.snapshot.world_spawn.clone(),
+                last_death: self.snapshot.last_death.clone(),
                 player: self.player,
                 camera: self.camera,
                 game_mode: self.game_mode,
@@ -1784,6 +1802,7 @@ fn tool_hands(inventory: &PlayerInventory, sneaking: bool) -> [Option<(PlayerSlo
         inventory::ordinary_return_supported(item)
             && (item.id() == "minecraft:stick"
                 || item.id() == "minecraft:compass"
+                || item.id() == "minecraft:recovery_compass"
                 || item.id().ends_with("_pickaxe")
                 || item.id().ends_with("_sword"))
     });
@@ -1903,6 +1922,7 @@ fn placement_input_hand(inventory: &PlayerInventory) -> PlayerSlot {
         inventory::ordinary_return_supported(item)
             && (item.id() == "minecraft:stick"
                 || item.id() == "minecraft:compass"
+                || item.id() == "minecraft:recovery_compass"
                 || item.id().ends_with("_pickaxe")
                 || item.id().ends_with("_sword")
                 || ordinary_tool_kind(item).is_some())
@@ -2306,6 +2326,10 @@ mod tests {
         assert_eq!(a.vitals.food, 20);
         assert_eq!(a.player.position, steady.spawn.position);
         assert_eq!(a.player.position, b.player.position);
+        assert!(
+            matches!(&a.last_death, LastDeathLocation::At(target) if target.position == steady.spawn.position.floor().as_ivec3())
+        );
+        assert_eq!(a.last_death, b.last_death);
         assert!(!a.inventory.is_open());
         assert!(a.inventory.slot(PlayerSlot::Storage(0)).is_none());
         assert_eq!(a.dropped_items.len(), 3);

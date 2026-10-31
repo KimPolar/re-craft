@@ -2205,6 +2205,7 @@ mod tests {
         let snapshot = WorldSnapshot {
             world: previous.world.clone(),
             world_spawn: previous.world_spawn.clone(),
+            last_death: previous.last_death.clone(),
             player,
             camera: native_session::camera::CameraMotion::new(
                 player.position.as_dvec3(),

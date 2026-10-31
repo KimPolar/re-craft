@@ -4,13 +4,37 @@
 //! invalidate a target merely because its chunk has not been read yet.
 
 use glam::IVec3;
-use native_persistence::nbt::{Tag, TagType};
+use native_persistence::nbt::Tag;
 use native_resources::packs::ResourceId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub dimension: ResourceId,
     pub position: IVec3,
+}
+
+impl Target {
+    /// Decode the GlobalPos representation used by player and item data.
+    pub fn parse(tag: &Tag) -> Option<Self> {
+        parse_target(tag)
+    }
+
+    pub fn to_nbt(&self) -> Tag {
+        Tag::Compound(vec![
+            (
+                "dimension".into(),
+                Tag::String(
+                    format!("{}:{}", self.dimension.namespace, self.dimension.path)
+                        .as_str()
+                        .into(),
+                ),
+            ),
+            (
+                "pos".into(),
+                Tag::IntArray(self.position.to_array().to_vec()),
+            ),
+        ])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,27 +83,7 @@ impl Tracker {
     pub fn to_nbt(&self) -> Tag {
         let mut fields = Vec::new();
         if let Some(target) = &self.target {
-            fields.push((
-                "target".into(),
-                Tag::Compound(vec![
-                    (
-                        "dimension".into(),
-                        Tag::String(
-                            format!("{}:{}", target.dimension.namespace, target.dimension.path)
-                                .as_str()
-                                .into(),
-                        ),
-                    ),
-                    (
-                        "pos".into(),
-                        Tag::IntArray(vec![
-                            target.position.x,
-                            target.position.y,
-                            target.position.z,
-                        ]),
-                    ),
-                ]),
-            ));
+            fields.push(("target".into(), target.to_nbt()));
         }
         if !self.tracked {
             fields.push(("tracked".into(), Tag::Byte(0)));
@@ -122,16 +126,13 @@ fn parse_target(tag: &Tag) -> Option<Target> {
         } else if name.matches("pos") && position.is_none() {
             let coords: Vec<i32> = match value {
                 Tag::IntArray(values) => values.clone(),
-                Tag::List {
-                    element_type: TagType::Int,
-                    values,
-                } => values
-                    .iter()
-                    .map(|value| match value {
-                        Tag::Int(n) => Some(*n),
-                        _ => None,
-                    })
-                    .collect::<Option<_>>()?,
+                Tag::ByteArray(values) => {
+                    values.iter().map(|value| i32::from(*value as i8)).collect()
+                }
+                Tag::LongArray(values) => values.iter().map(|value| *value as i32).collect(),
+                Tag::List { values, .. } => {
+                    values.iter().map(Tag::as_java_int).collect::<Option<_>>()?
+                }
                 _ => return None,
             };
             let [x, y, z] = coords.as_slice() else {

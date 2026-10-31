@@ -1401,6 +1401,48 @@ impl PlayerInventory {
         Some(remainder)
     }
 
+    /// Apply the inventory portion of filling an empty bucket. An overflow is
+    /// returned for the caller to drop after the world mutation succeeds.
+    pub(crate) fn fill_bucket(
+        &mut self,
+        hand: PlayerSlot,
+        result: &str,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if source.id != "minecraft:bucket" || !ordinary_return_supported(source) {
+            return None;
+        }
+        let filled = ItemStack::new(result.to_owned(), 1, 1, Tag::Compound(vec![]))?;
+        if creative {
+            let already_owned = self
+                .storage
+                .iter()
+                .chain(self.armor.iter())
+                .chain(std::iter::once(&self.offhand))
+                .flatten()
+                .any(|item| item.same_item_and_components(&filled));
+            if !already_owned {
+                let mut remainder = Some(filled);
+                self.pickup_stack(&mut remainder, true);
+            }
+            return Some(None);
+        }
+        if source.count == 1 {
+            self.set_slot(hand, Some(filled));
+            return Some(None);
+        }
+        if !self.consume_held(hand) {
+            return None;
+        }
+        let mut remainder = Some(filled);
+        self.pickup_stack(&mut remainder, false);
+        Some(remainder)
+    }
+
     /// Add a supported dropped stack using Java's selected-slot, offhand,
     /// other-stack, then empty-slot order. The remainder stays in `source`.
     pub fn pickup_stack(&mut self, source: &mut Option<ItemStack>, creative: bool) -> bool {
@@ -2457,6 +2499,8 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
     if matches!(
         id,
         "minecraft:shears"
+            | "minecraft:water_bucket"
+            | "minecraft:lava_bucket"
             | "minecraft:mushroom_stew"
             | "minecraft:rabbit_stew"
             | "minecraft:beetroot_soup"
@@ -2476,7 +2520,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         return Some(max);
     }
     let name = id.strip_prefix("minecraft:")?;
-    if matches!(name, "ender_pearl" | "snowball" | "honey_bottle") {
+    if matches!(name, "ender_pearl" | "snowball" | "honey_bottle" | "bucket") {
         return Some(16);
     }
     if STACKABLE_ITEMS.contains(&name) {
@@ -2837,6 +2881,166 @@ pub(crate) fn equal_tag(a: &Tag, b: &Tag) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filling_bucket_handles_stacks_overflow_and_creative_duplicates() {
+        let bucket =
+            |count| ItemStack::new("minecraft:bucket".into(), count, 16, Tag::Compound(vec![]));
+        let water = || ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![]));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Offhand, bucket(2));
+        for index in 0..36 {
+            inventory.set_slot(PlayerSlot::Storage(index), stack("minecraft:stone", 64));
+        }
+        let overflow = inventory
+            .fill_bucket(PlayerSlot::Offhand, "minecraft:water_bucket", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (overflow.id(), overflow.count()),
+            ("minecraft:water_bucket", 1)
+        );
+        assert_eq!(inventory.slot(PlayerSlot::Offhand).unwrap().count(), 1);
+        inventory.set_slot(PlayerSlot::Storage(10), water());
+        assert!(
+            inventory
+                .fill_bucket(PlayerSlot::Offhand, "minecraft:water_bucket", true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.slot(PlayerSlot::Offhand).unwrap().count(), 1);
+        assert_eq!(
+            inventory
+                .storage
+                .iter()
+                .flatten()
+                .filter(|item| item.id() == "minecraft:water_bucket")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn filling_bucket_inventory_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BucketInventoryOracle.java");
+        let output = temp.path().join("buckets.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BucketInventoryOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BucketInventoryOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 64);
+        let describe = |item: Option<&ItemStack>| match item {
+            None => "-".to_string(),
+            Some(item) => format!(
+                "{}{}",
+                match item.id() {
+                    "minecraft:stone" => "s",
+                    "minecraft:bucket" => "b",
+                    "minecraft:water_bucket" => "w",
+                    "minecraft:lava_bucket" => "l",
+                    id => panic!("unexpected {id}"),
+                },
+                item.count()
+            ),
+        };
+        for row in rows {
+            let flag = |name: &str| row[name].as_bool().unwrap();
+            let mut inventory = PlayerInventory::default();
+            if flag("full") {
+                for i in 0..36 {
+                    inventory.set_slot(PlayerSlot::Storage(i), stack("minecraft:stone", 64));
+                }
+            }
+            let result = if flag("lava") {
+                "minecraft:lava_bucket"
+            } else {
+                "minecraft:water_bucket"
+            };
+            if flag("existing") {
+                inventory.set_slot(
+                    PlayerSlot::Storage(5),
+                    ItemStack::new(result.into(), 1, 1, Tag::Compound(vec![])),
+                );
+            }
+            let hand = if flag("offhand") {
+                PlayerSlot::Offhand
+            } else {
+                PlayerSlot::Storage(0)
+            };
+            inventory.set_slot(
+                hand,
+                ItemStack::new(
+                    "minecraft:bucket".into(),
+                    row["count"].as_u64().unwrap() as u32,
+                    16,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            let dropped = inventory
+                .fill_bucket(hand, result, flag("creative"))
+                .unwrap();
+            assert_eq!(
+                describe(dropped.as_ref()),
+                row["drop"].as_str().unwrap(),
+                "{row}"
+            );
+            for i in 0..36 {
+                assert_eq!(
+                    describe(inventory.slot(PlayerSlot::Storage(i))),
+                    row["slots"][i as usize].as_str().unwrap(),
+                    "slot {i}: {row}"
+                );
+            }
+            assert_eq!(
+                describe(inventory.slot(PlayerSlot::Offhand)),
+                row["off"].as_str().unwrap(),
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     fn efficiency_tool_retains_enchantment_when_damaged() {

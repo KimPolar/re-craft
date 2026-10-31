@@ -214,6 +214,36 @@ impl NoiseRouter {
         evaluator.sample_refs(fields.map(|field| self.function(field).as_ref()), x, y, z)
     }
 
+    /// Precompute Java's four-block-spaced climate buffers in Z, X, Y order.
+    pub fn sample_climate_volume(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        min_quart: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Vec<[f32; 6]>> {
+        let min = min_quart.map(|v| v.wrapping_mul(4));
+        let fields = [
+            RouterField::Temperature,
+            RouterField::Vegetation,
+            RouterField::Continents,
+            RouterField::Erosion,
+            RouterField::Depth,
+            RouterField::Ridges,
+        ];
+        let mut result = Vec::new();
+        for (index, field) in fields.into_iter().enumerate() {
+            let values =
+                evaluator.sample_stepped_volume(self.function(field), min, size, [4, 4, 4])?;
+            if index == 0 {
+                result.resize(values.len(), [0.0; 6]);
+            }
+            for (entry, value) in result.iter_mut().zip(values) {
+                entry[index] = value;
+            }
+        }
+        Ok(result)
+    }
+
     /// Sample a unit-step block volume in Z, X, Y order.
     pub fn sample_block_volume(
         &self,

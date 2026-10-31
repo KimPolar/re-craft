@@ -226,6 +226,52 @@ pub struct BiomeSource {
     kind: SourceKind,
     previous: Option<usize>,
 }
+
+/// Precomputed climate values; resolve in the caller's original iteration
+/// order, because Java's search cache makes equal-distance ties order-sensitive.
+pub struct ClimateVolume {
+    min: [i32; 3],
+    size: [u32; 3],
+    values: Vec<[f32; 6]>,
+}
+impl ClimateVolume {
+    pub fn sample(
+        router: &NoiseRouter,
+        evaluator: &mut DensityEvaluator,
+        min: [i32; 3],
+        size: [u32; 3],
+    ) -> Result<Self> {
+        for axis in 0..3 {
+            ensure!(
+                size[axis] > 0
+                    && i64::from(min[axis]) + i64::from(size[axis] - 1) <= i64::from(i32::MAX),
+                "climate quart coordinates overflow"
+            );
+        }
+        let values = router.sample_climate_volume(evaluator, min, size)?;
+        Ok(Self { min, size, values })
+    }
+    pub fn get(&self, quart: [i32; 3]) -> Option<[f32; 6]> {
+        let mut local = [0usize; 3];
+        for axis in 0..3 {
+            let delta = i64::from(quart[axis]) - i64::from(self.min[axis]);
+            if delta < 0 || delta >= i64::from(self.size[axis]) {
+                return None;
+            }
+            local[axis] = delta as usize;
+        }
+        let index =
+            (local[2] * self.size[0] as usize + local[0]) * self.size[1] as usize + local[1];
+        self.values.get(index).copied()
+    }
+    pub fn select<'a>(
+        &self,
+        source: &'a mut BiomeSource,
+        quart: [i32; 3],
+    ) -> Option<&'a ResourceId> {
+        Some(source.select(self.get(quart)?))
+    }
+}
 enum SourceKind {
     Fixed(ResourceId),
     Multi(ClimateTree),
@@ -322,7 +368,7 @@ impl BiomeSource {
         }
     }
     /// Sample the noise router at a noise-biome (quart) coordinate. Chunk-volume
-    /// interpolation uses a separate Java path and is not implemented here.
+    /// interpolation uses a separate Java path; use `ClimateVolume` for that.
     pub fn sample_quart(
         &mut self,
         router: &NoiseRouter,
@@ -500,6 +546,11 @@ mod tests {
             source.sample_quart(&router, &mut evaluator, [0, 4, 0]).path,
             "b"
         );
+        let climate =
+            ClimateVolume::sample(&router, &mut evaluator, [0, -4, 0], [1, 9, 1]).unwrap();
+        assert_eq!(climate.select(&mut source, [0, -4, 0]).unwrap().path, "a");
+        assert_eq!(climate.select(&mut source, [0, 4, 0]).unwrap().path, "b");
+        assert!(climate.get([0, 5, 0]).is_none());
         assert!(BiomeSource::load(&mut data, &json!({"type":"fixed","biome":"missing"})).is_err());
         assert!(
             BiomeSource::load(

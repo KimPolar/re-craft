@@ -37,6 +37,7 @@ pub struct DensityFunction(Node, usize, usize, bool, Interval, u8, bool);
 struct BlockVolume {
     min: [i32; 3],
     max: [i32; 3],
+    step: [i32; 3],
 }
 
 #[derive(Default)]
@@ -117,7 +118,7 @@ impl DensityEvaluator {
     }
 
     /// Java's 4-block-spaced, Y=0 surface volume in Z/X order.
-    /// Interpolated graphs need general stepped-volume interpolation and are rejected.
+    /// Uses the same stepped-volume path as biome sampling.
     pub fn sample_quart_surface(
         &mut self,
         function: &DensityFunction,
@@ -126,40 +127,7 @@ impl DensityEvaluator {
         size_x: u32,
         size_z: u32,
     ) -> Result<Vec<f32>> {
-        ensure!(
-            !function.3 && function.6,
-            "interpolated stepped surface volumes are not supported"
-        );
-        ensure!(
-            size_x > 0 && size_z > 0,
-            "surface dimensions must be positive"
-        );
-        let count = (size_x as usize)
-            .checked_mul(size_z as usize)
-            .context("surface size overflow")?;
-        ensure!(count <= 1_048_576, "surface exceeds maximum sample count");
-        let max_x = i64::from(min_x) + i64::from(size_x - 1) * 4;
-        let max_z = i64::from(min_z) + i64::from(size_z - 1) * 4;
-        let max = [
-            i32::try_from(max_x).context("surface X overflow")?,
-            0,
-            i32::try_from(max_z).context("surface Z overflow")?,
-        ];
-        self.memo.volume = Some(BlockVolume {
-            min: [min_x, 0, min_z],
-            max,
-        });
-        let mut output = Vec::with_capacity(count);
-        for z in 0..size_z {
-            for x in 0..size_x {
-                self.memo.clear();
-                let px = (i64::from(min_x) + i64::from(x) * 4) as i32;
-                let pz = (i64::from(min_z) + i64::from(z) * 4) as i32;
-                output.push(function.evaluate_cached(px, 0, pz, true, &mut self.memo));
-            }
-        }
-        self.memo.volume = None;
-        Ok(output)
+        self.sample_stepped_volume(function, [min_x, 0, min_z], [size_x, 1, size_z], [4, 1, 4])
     }
 
     /// Evaluate a unit-step block volume in Java's Z, X, Y buffer order.
@@ -170,6 +138,17 @@ impl DensityEvaluator {
         min: [i32; 3],
         size: [u32; 3],
     ) -> Result<Vec<f32>> {
+        self.sample_stepped_volume(function, min, size, [1, 1, 1])
+    }
+
+    /// Evaluate a positive-step volume in Java's Z, X, Y buffer order.
+    pub fn sample_stepped_volume(
+        &mut self,
+        function: &DensityFunction,
+        min: [i32; 3],
+        size: [u32; 3],
+        step: [i32; 3],
+    ) -> Result<Vec<f32>> {
         ensure!(
             function.6,
             "bulk sampling of a slice enclosing interpolation is not supported"
@@ -178,6 +157,7 @@ impl DensityEvaluator {
             size.iter().all(|n| *n > 0),
             "volume dimensions must be positive"
         );
+        ensure!(step.iter().all(|n| *n > 0), "volume steps must be positive");
         let count = size
             .iter()
             .try_fold(1usize, |total, n| total.checked_mul(*n as usize))
@@ -186,16 +166,23 @@ impl DensityEvaluator {
         let mut max = [0; 3];
         for axis in 0..3 {
             max[axis] = i64::from(min[axis])
-                .checked_add(i64::from(size[axis]) - 1)
+                .checked_add(i64::from(size[axis] - 1) * i64::from(step[axis]))
                 .and_then(|v| i32::try_from(v).ok())
                 .context("volume coordinates overflow")?;
+            if function.3 && step != [1, 1, 1] {
+                i32::try_from(i64::from(max[axis]) + i64::from(step[axis]) - 1)
+                    .context("expanded interpolation volume coordinates overflow")?;
+            }
         }
-        self.memo.volume = Some(BlockVolume { min, max });
+        self.memo.volume = Some(BlockVolume { min, max, step });
         let mut output = Vec::with_capacity(count);
-        for z in min[2]..=max[2] {
-            for x in min[0]..=max[0] {
+        for iz in 0..size[2] {
+            let z = (i64::from(min[2]) + i64::from(iz) * i64::from(step[2])) as i32;
+            for ix in 0..size[0] {
+                let x = (i64::from(min[0]) + i64::from(ix) * i64::from(step[0])) as i32;
                 self.memo.clear();
-                for y in min[1]..=max[1] {
+                for iy in 0..size[1] {
+                    let y = (i64::from(min[1]) + i64::from(iy) * i64::from(step[1])) as i32;
                     output.push(function.evaluate_cached(x, y, z, true, &mut self.memo));
                 }
             }
@@ -670,15 +657,23 @@ fn interpolate_block_volume(
         if axes & (1 << axis) == 0 {
             bounds.min[axis] = 0;
             bounds.max[axis] = 0;
+            bounds.step[axis] = 1;
         }
     }
     let cell = [cell_xz, cell_y, cell_xz];
     let aligned = (0..3).all(|axis| {
         bounds.min[axis].rem_euclid(cell[axis]) == 0
-            && (bounds.min[axis] == bounds.max[axis] || cell[axis] == 1)
+            && (bounds.min[axis] == bounds.max[axis] || cell[axis] == bounds.step[axis])
     });
     if aligned {
         return input.evaluate_cached(position[0], position[1], position[2], true, memo);
+    }
+    // Non-unit volumes are first expanded to a unit-step volume with
+    // size*step samples on each axis, then Java reads the requested positions.
+    if bounds.step != [1, 1, 1] {
+        for axis in 0..3 {
+            bounds.max[axis] = bounds.max[axis].wrapping_add(bounds.step[axis] - 1);
+        }
     }
     let mut base = [0; 3];
     let mut next = [0; 3];
@@ -1934,6 +1929,16 @@ mod tests {
                 .sample_block_volume(&constant, [0, 0, 0], [2, 2, 2])
                 .unwrap(),
             vec![1.0; 8]
+        );
+        assert!(
+            evaluator
+                .sample_stepped_volume(&constant, [0, 0, 0], [1, 1, 1], [4, 0, 4])
+                .is_err()
+        );
+        assert!(
+            evaluator
+                .sample_stepped_volume(&constant, [i32::MAX - 2, 0, 0], [2, 1, 1], [4, 1, 1])
+                .is_err()
         );
     }
 }

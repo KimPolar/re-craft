@@ -31,7 +31,7 @@ use native_world::{
         SavedFluidTick, Section, World,
     },
     movement::BoundingBox,
-    raycast::{ShapeRayHit, raycast_shapes},
+    raycast::{ShapeRayHit, raycast_shapes, raycast_shapes_with_fluid},
 };
 
 use crate::{
@@ -7351,7 +7351,6 @@ impl LoadedSession {
     }
 
     /// Empty buckets target fluid sources as well as ordinary block outlines.
-    /// Waterlogged blocks require their own pickup rules and are not handled here.
     fn try_fill_bucket(&mut self, hand: crate::inventory::PlayerSlot) -> bool {
         use crate::inventory::ordinary_return_supported;
         let Some(item) = self.inventory.slot(hand) else {
@@ -7368,7 +7367,7 @@ impl LoadedSession {
             min: Vec3::ZERO,
             max: Vec3::ONE,
         }];
-        let hit = raycast_shapes(
+        let hit = raycast_shapes_with_fluid(
             self.player.eye(),
             self.player.direction(),
             if self.game_mode == GameMode::Creative {
@@ -7386,28 +7385,29 @@ impl LoadedSession {
                 ) else {
                     return None;
                 };
-                let block = self.world.state(id)?;
-                if matches!(block.name.as_str(), "minecraft:water" | "minecraft:lava")
-                    && block.properties.get("level").map(String::as_str) == Some("0")
-                {
+                let outline = self
+                    .outlines
+                    .get(id.0 as usize)
+                    .and_then(Option::as_deref)
+                    .unwrap_or_else(|| unknown_barrier());
+                let fluid = self.fluids.get(id.0 as usize).copied().flatten();
+                if let Some(fluid) = fluid.filter(|fluid| fluid.source) {
                     let above = add(relative, IVec3::Y).and_then(|p| {
                         match cell(&self.world, self.origin, self.bounds, p, self.states[0]) {
-                            Cell::State(id) => self.world.state(id),
+                            Cell::State(id) => self.fluids.get(id.0 as usize).copied().flatten(),
                             Cell::Missing => None,
                         }
                     });
-                    return Some(if above.is_some_and(|above| above.name == block.name) {
-                        FULL
-                    } else {
-                        SOURCE
-                    });
+                    return Some((
+                        outline,
+                        if above.is_some_and(|above| above.kind == fluid.kind) {
+                            FULL
+                        } else {
+                            SOURCE
+                        },
+                    ));
                 }
-                Some(
-                    self.outlines
-                        .get(id.0 as usize)
-                        .and_then(Option::as_deref)
-                        .unwrap_or_else(|| unknown_barrier()),
-                )
+                Some((outline, &[]))
             },
         );
         let Some(hit) = hit else { return false };
@@ -7423,12 +7423,24 @@ impl LoadedSession {
         let Some(block) = self.world.state(id) else {
             return false;
         };
-        let result = match (
+        let (result, replacement) = match (
             block.name.as_str(),
             block.properties.get("level").map(String::as_str),
         ) {
-            ("minecraft:water", Some("0")) => "minecraft:water_bucket",
-            ("minecraft:lava", Some("0")) => "minecraft:lava_bucket",
+            ("minecraft:water", Some("0")) => ("minecraft:water_bucket", None),
+            ("minecraft:lava", Some("0")) => ("minecraft:lava_bucket", None),
+            _ if block.properties.get("waterlogged").map(String::as_str) == Some("true")
+                && (crate::stair_items::is_stair_item(&block.name)
+                    || crate::slab_mining::material(&block.name).is_some()
+                    || matches!(
+                        block.name.as_str(),
+                        "minecraft:chest" | "minecraft:trapped_chest"
+                    )) =>
+            {
+                let mut dry = block.clone();
+                dry.properties.insert("waterlogged".into(), "false".into());
+                ("minecraft:water_bucket", Some(dry))
+            }
             _ => return false,
         };
         let mut inventory = (*self.inventory).clone();
@@ -7437,7 +7449,8 @@ impl LoadedSession {
         else {
             return false;
         };
-        if !self.set(hit.position, self.states[0]) {
+        let replacement = replacement.map_or(self.states[0], |state| self.intern_block(state));
+        if !self.set(hit.position, replacement) {
             return false;
         }
         self.inventory = Arc::new(inventory);
@@ -13392,6 +13405,203 @@ mod tests {
         );
         session.set_player_inventory(inventory);
         assert!(!session.try_fill_bucket(PlayerSlot::Storage(0)));
+    }
+
+    #[test]
+    fn empty_bucket_drains_waterlogged_slabs_stairs_and_chests() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let cases = [
+            state(
+                "minecraft:stone_slab",
+                &[("type", "bottom"), ("waterlogged", "true")],
+            ),
+            state(
+                "minecraft:stone_slab",
+                &[("type", "top"), ("waterlogged", "true")],
+            ),
+            state(
+                "minecraft:oak_stairs",
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("shape", "straight"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            state(
+                "minecraft:chest",
+                &[
+                    ("type", "single"),
+                    ("facing", "north"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+        ];
+        for block in cases {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                let mut session = session();
+                let pos = IVec3::new(8, 2, 7);
+                let id = session.intern_block(block.clone());
+                session.set_with_notify(pos, id, false);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                assert!(session.try_fill_bucket(hand), "{}", block.name);
+                let p = session.origin + pos;
+                let drained = session.world.block(p.x, p.y, p.z).unwrap();
+                assert_eq!(drained.name, block.name);
+                assert_eq!(drained.properties["waterlogged"], "false");
+                for (key, value) in block
+                    .properties
+                    .iter()
+                    .filter(|(key, _)| *key != "waterlogged")
+                {
+                    assert_eq!(&drained.properties[key], value);
+                }
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().id(),
+                    "minecraft:water_bucket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn use_command_drains_exposed_water_in_a_bottom_slab() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let pos = IVec3::new(8, 2, 7);
+        let wet = session.intern_block(state(
+            "minecraft:stone_slab",
+            &[("type", "bottom"), ("waterlogged", "true")],
+        ));
+        session.set_with_notify(pos, wet, false);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let p = session.origin + pos;
+        assert_eq!(
+            session.world.block(p.x, p.y, p.z).unwrap().properties["waterlogged"],
+            "false"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:water_bucket"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn waterlogged_pickup_rays_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("WaterloggedPickupOracle.java");
+        let output = temp.path().join("pickup.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WaterloggedPickupOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("WaterloggedPickupOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 18);
+        const FLUID: &[Aabb] = &[Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::new(1.0, 8.0 / 9.0, 1.0),
+        }];
+        let stone = block_outline(&state("minecraft:stone", &[])).unwrap();
+        for row in rows {
+            let shape = row["shape"].as_str().unwrap();
+            let block = if shape == "stairs" {
+                state(
+                    "minecraft:oak_stairs",
+                    &[
+                        ("facing", "north"),
+                        ("half", "bottom"),
+                        ("shape", "straight"),
+                        ("waterlogged", "true"),
+                    ],
+                )
+            } else {
+                state(
+                    "minecraft:stone_slab",
+                    &[("type", shape), ("waterlogged", "true")],
+                )
+            };
+            let outline = block_outline(&block).unwrap();
+            let hit = raycast_shapes_with_fluid(
+                Vec3::new(0.5, row["height"].as_f64().unwrap() as f32, 2.5),
+                Vec3::NEG_Z,
+                5.0,
+                |pos| {
+                    if pos == IVec3::ZERO {
+                        Some((&outline, FLUID))
+                    } else if pos == IVec3::NEG_Z {
+                        Some((&stone, &[]))
+                    } else {
+                        Some((&[], &[]))
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(hit.position.z, row["z"].as_i64().unwrap() as i32, "{row}");
+            assert_eq!(face_name(hit.face), row["face"].as_str(), "{row}");
+            assert!(
+                (hit.location.z - row["hit_z"].as_f64().unwrap()).abs() < 1e-9,
+                "{row}"
+            );
+            if hit.position == IVec3::ZERO {
+                assert_eq!(row["item"], true);
+                assert_eq!(row["wet"], false);
+            }
+        }
     }
 
     #[test]

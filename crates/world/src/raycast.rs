@@ -98,6 +98,19 @@ pub fn raycast_shapes<'a>(
     max_distance: f32,
     mut shape: impl FnMut(IVec3) -> Option<&'a [Aabb]>,
 ) -> Option<ShapeRayHit> {
+    raycast_shapes_with_fluid(origin, direction, max_distance, |cell| {
+        shape(cell).map(|block| (block, &[] as &[Aabb]))
+    })
+}
+
+/// Clip block and fluid shapes independently in each cell. Java chooses the
+/// closest hit and prefers the block when both hits are equally distant.
+pub fn raycast_shapes_with_fluid<'a>(
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+    mut shapes: impl FnMut(IVec3) -> Option<(&'a [Aabb], &'a [Aabb])>,
+) -> Option<ShapeRayHit> {
     if !origin.is_finite()
         || !direction.is_finite()
         || direction.length_squared() <= f32::EPSILON
@@ -147,8 +160,25 @@ pub fn raycast_shapes<'a>(
             };
     }
     loop {
-        let boxes = shape(cell)?;
-        if let Some(hit) = clip_shape(boxes, cell, start, end) {
+        let (block, fluid) = shapes(cell)?;
+        let block_hit = clip_shape(block, cell, start, end);
+        let fluid_hit = if fluid.is_empty() {
+            None
+        } else {
+            clip_shape(fluid, cell, start, end)
+        };
+        let hit = match (block_hit, fluid_hit) {
+            (Some(block), Some(fluid)) => {
+                if start.distance_squared(block.location) <= start.distance_squared(fluid.location)
+                {
+                    Some(block)
+                } else {
+                    Some(fluid)
+                }
+            }
+            (block, fluid) => block.or(fluid),
+        };
+        if let Some(hit) = hit {
             return Some(hit);
         }
         if next.x > 1.0 && next.y > 1.0 && next.z > 1.0 {
@@ -249,6 +279,42 @@ mod tests {
                 IVec3::new(-1, 0, 0),
                 IVec3::ZERO,
             ]
+        );
+    }
+
+    #[test]
+    fn block_and_fluid_shapes_are_clipped_independently() {
+        const FLUID: [Aabb; 1] = [Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::new(1.0, 8.0 / 9.0, 1.0),
+        }];
+        let trace = |height| {
+            raycast_shapes_with_fluid(Vec3::new(0.5, height, 1.5), Vec3::NEG_Z, 3.0, |cell| {
+                Some(if cell == IVec3::ZERO {
+                    (&SLAB, &FLUID)
+                } else {
+                    (&[], &[])
+                })
+            })
+            .unwrap()
+        };
+        let upper = trace(0.75);
+        assert_eq!(upper.position, IVec3::ZERO);
+        assert_eq!(upper.face, IVec3::Z);
+        let tied = trace(0.25);
+        assert_eq!(tied.face, IVec3::Z);
+        assert_eq!(tied.location, DVec3::new(0.5, 0.25, 1.0));
+        assert!(
+            raycast_shapes_with_fluid(Vec3::new(0.5, 0.75, 2.5), Vec3::NEG_Z, 3.0, |cell| {
+                if cell == IVec3::Z {
+                    None
+                } else if cell == IVec3::ZERO {
+                    Some((&FULL, &FLUID))
+                } else {
+                    Some((&[], &[]))
+                }
+            })
+            .is_none()
         );
     }
 }

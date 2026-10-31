@@ -269,6 +269,20 @@ public class RegionWriteOracle {
             } catch (Exception exception) {
                 System.out.println("LOCKED");
             }
+        } else if (args[0].equals("verifyPoi")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            var ops = net.minecraft.core.RegistryAccess.fromRegistryOfRegistries(net.minecraft.core.registries.BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
+            Path poi = world.resolve("dimensions/minecraft/overworld/poi");
+            try (var region = open(poi); var in = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
+                if (in == null) throw new AssertionError("missing POI chunk");
+                var root = NbtIo.read((DataInput)in);
+                if (root.getIntOr("DataVersion", 0) != 5023) throw new AssertionError("POI version");
+                var section = net.minecraft.world.entity.ai.village.poi.PoiSection.Packed.CODEC.parse(ops, root.getCompoundOrEmpty("Sections").get("0")).getOrThrow();
+                if (!section.isValid() || section.records().size() != 1) throw new AssertionError("POI section");
+                var record = section.records().getFirst();
+                if (!record.pos().equals(new net.minecraft.core.BlockPos(1,1,1)) || !record.poiType().getRegisteredName().equals("minecraft:meeting") || record.freeTickets() != 32) throw new AssertionError("POI record");
+            }
+            System.out.println("OK");
         } else if (args[0].equals("hold")) {
             try (var lock = DirectoryLock.create(world)) {
                 System.out.println("LOCKED");
@@ -322,6 +336,112 @@ fn state(name: &str) -> BlockState {
         name: name.into(),
         properties: Vec::new(),
     }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_reads_poi_region_created_in_coordinated_save() {
+    use native_persistence::nbt::{NamedTag, Tag, TagType};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-poi-save-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seed").lines().any(|line| line == "OK"));
+    let path = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let original = RegionReader::open(&path)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let change = BlockChange {
+        x: 0,
+        y: 0,
+        z: 0,
+        expected: state("minecraft:stone"),
+        replacement: state("minecraft:dirt"),
+    };
+    let mut draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[change]).unwrap();
+    draft
+        .rebuild_heightmaps(
+            HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            |block| {
+                let air = block.name.matches("minecraft:air");
+                Ok(BlockHeightFlags {
+                    is_air: air,
+                    blocks_motion: !air,
+                    blocks_motion_no_leaves: !air,
+                    has_fluid: false,
+                })
+            },
+        )
+        .unwrap();
+    let poi = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            (
+                "Sections".into(),
+                Tag::Compound(vec![(
+                    "0".into(),
+                    Tag::Compound(vec![
+                        ("Valid".into(), Tag::Byte(1)),
+                        (
+                            "Records".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("pos".into(), Tag::IntArray(vec![1, 1, 1])),
+                                    ("type".into(), Tag::String("minecraft:meeting".into())),
+                                    ("free_tickets".into(), Tag::Int(32)),
+                                ])],
+                            },
+                        ),
+                    ]),
+                )]),
+            ),
+        ]),
+    };
+    let dimension = DimensionId::parse("overworld").unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_chunk(dimension.clone(), draft, 2).unwrap();
+    plan.add_poi_chunk(dimension, ChunkPos { x: 0, z: 0 }, None, &poi, 3, |_, _| {
+        Ok(())
+    })
+    .unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+    let result = writer.write_plan(plan, |_, _| Ok(())).unwrap();
+    assert_eq!(result.poi_region_paths.len(), 1);
+    drop(writer);
+    let output = invoke("verifyPoi");
+    assert!(output.contains("OK"), "{output}");
 }
 
 #[test]
@@ -906,6 +1026,7 @@ fn exercise_entity_chunk_drafts(new_region: bool) {
         FallingSaveState {
             position: DVec3::new(if new_region { 513.5 } else { 17.5 }, 2.0, 3.0),
             velocity: DVec3::ZERO,
+            fall_distance: 0.0,
             on_ground: false,
             no_gravity: false,
             time: 1,

@@ -61,12 +61,13 @@ pub struct RewriteResult {
 }
 
 /// A partial world save. Regions and optional player data are replaced in
-/// one recoverable transaction; level, POI, and other files are not
+/// one recoverable transaction; level, POI effects, and other files are not
 /// implied by this type.
 #[derive(Default)]
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
     entity_chunks: Vec<PlannedEntityChunk>,
+    poi_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedWorldClocks>,
 }
@@ -89,6 +90,7 @@ struct PlannedEntityChunk {
 enum RegionKind {
     Blocks,
     Entities,
+    Poi,
 }
 
 struct RegionChange {
@@ -137,6 +139,37 @@ impl WorldSavePlan {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Add a POI chunk to a coordinated partial transaction. The caller must
+    /// validate every POI effect, terrain edit and villager ticket change.
+    /// This API does not authorize saving an active gameplay session.
+    pub fn add_poi_chunk(
+        &mut self,
+        dimension: DimensionId,
+        position: crate::world::ChunkPos,
+        source: Option<&nbt::NamedTag>,
+        document: &nbt::NamedTag,
+        region_timestamp_seconds: u32,
+        mut validate: impl FnMut(Option<&nbt::NamedTag>, &nbt::NamedTag) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .poi_chunks
+                .iter()
+                .any(|chunk| chunk.dimension == dimension && chunk.position == position),
+            "world save plan contains a duplicate POI chunk"
+        );
+        validate(source, document)?;
+        validate_poi_preservation(source, document, position)?;
+        self.poi_chunks.push(PlannedEntityChunk {
+            dimension,
+            position,
+            source_nbt: source.map(nbt::write).transpose()?,
+            replacement: Some(nbt::write(document)?),
+            region_timestamp_seconds,
+        });
+        Ok(())
     }
 
     /// Add an entity chunk to a coordinated partial save. The caller must
@@ -272,9 +305,95 @@ impl WorldSavePlan {
 pub struct WorldSaveResult {
     pub region_paths: Vec<PathBuf>,
     pub entity_region_paths: Vec<PathBuf>,
+    pub poi_region_paths: Vec<PathBuf>,
     pub player_paths: Vec<PathBuf>,
     pub world_clocks_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
+}
+
+fn validate_poi_preservation(
+    source: Option<&nbt::NamedTag>,
+    document: &nbt::NamedTag,
+    position: crate::world::ChunkPos,
+) -> Result<()> {
+    let after = crate::world::decode_poi_chunk(document.clone(), position)?;
+    let Some(source) = source else { return Ok(()) };
+    let before = crate::world::decode_poi_chunk(source.clone(), position)?;
+    ensure!(source.name == document.name, "POI chunk root name changed");
+    fn extras(tag: &Tag, known: &[&str]) -> Result<Vec<u8>> {
+        let Tag::Compound(fields) = tag else {
+            anyhow::bail!("POI value must be a compound")
+        };
+        nbt::write(&nbt::NamedTag {
+            name: "".into(),
+            value: Tag::Compound(
+                fields
+                    .iter()
+                    .filter(|(name, _)| !known.iter().any(|key| name.matches(key)))
+                    .cloned()
+                    .collect(),
+            ),
+        })
+    }
+    let empty = extras(&Tag::Compound(vec![]), &[])?;
+    ensure!(
+        extras(&source.value, &["DataVersion", "Sections"])?
+            == extras(&document.value, &["DataVersion", "Sections"])?,
+        "unrecognized POI chunk fields changed"
+    );
+    let before_sections = source.value.get("Sections").unwrap();
+    let after_sections = document.value.get("Sections").unwrap();
+    for (y, section) in &before.sections {
+        let key = y.to_string();
+        let raw_before = before_sections.get(&key).unwrap();
+        let raw_after = after_sections.get(&key);
+        let section_extra = extras(raw_before, &["Valid", "Records"])?;
+        match raw_after {
+            Some(raw) => ensure!(
+                section_extra == extras(raw, &["Valid", "Records"])?,
+                "unrecognized POI section fields changed"
+            ),
+            None => ensure!(
+                section_extra == empty,
+                "removing POI section would discard unrecognized fields"
+            ),
+        }
+        let Some(Tag::List {
+            values: old_records,
+            ..
+        }) = raw_before.get("Records")
+        else {
+            unreachable!()
+        };
+        let new_records = raw_after
+            .and_then(|raw| raw.get("Records"))
+            .and_then(|value| match value {
+                Tag::List { values, .. } => Some(values.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[]);
+        let decoded_after = after.sections.get(y);
+        for (record, old_raw) in section.records.iter().zip(old_records) {
+            let old_extra = extras(old_raw, &["pos", "type", "free_tickets"])?;
+            let new_index = decoded_after.and_then(|section| {
+                section
+                    .records
+                    .iter()
+                    .position(|entry| entry.position == record.position)
+            });
+            match new_index {
+                Some(index) => ensure!(
+                    old_extra == extras(&new_records[index], &["pos", "type", "free_tickets"])?,
+                    "unrecognized POI record fields changed"
+                ),
+                None => ensure!(
+                    old_extra == empty,
+                    "removing POI record would discard unrecognized fields"
+                ),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_entity_document(
@@ -488,8 +607,8 @@ impl WorldWriteGuard {
     /// Write validated chunk drafts and optional player data as one recoverable
     /// transaction.
     ///
-    /// Level, POI, entity creation/removal and other world data are not implied, so a gameplay
-    /// session must not enable saving from this partial plan.
+    /// Level data and complete POI, entity, and other side effects are not
+    /// implied, so a gameplay session must not enable saving from this plan.
     pub fn write_plan(
         &mut self,
         plan: WorldSavePlan,
@@ -498,6 +617,7 @@ impl WorldWriteGuard {
         ensure!(
             !plan.chunks.is_empty()
                 || !plan.entity_chunks.is_empty()
+                || !plan.poi_chunks.is_empty()
                 || !plan.players.is_empty()
                 || plan.world_clocks.is_some(),
             "world save plan is empty"
@@ -541,6 +661,23 @@ impl WorldWriteGuard {
                     timestamp: chunk.region_timestamp_seconds,
                 });
         }
+        for chunk in &plan.poi_chunks {
+            let position = chunk.position;
+            groups
+                .entry((
+                    RegionKind::Poi,
+                    chunk.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default()
+                .push(RegionChange {
+                    position,
+                    source_nbt: chunk.source_nbt.clone(),
+                    replacement: chunk.replacement.clone(),
+                    timestamp: chunk.region_timestamp_seconds,
+                });
+        }
 
         let backup_root = self.root.join(".minecraft-native-backups");
         match fs::symlink_metadata(&backup_root) {
@@ -566,35 +703,36 @@ impl WorldWriteGuard {
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut absent_dependencies = Vec::new();
-        let mut entity_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
+        let mut extra_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
         for ((kind, dimension, _, _), chunks) in &groups {
-            if *kind != RegionKind::Entities {
-                continue;
-            }
-            let directory = dimension.entity_region_dir(&self.root);
+            let directory = match kind {
+                RegionKind::Blocks => continue,
+                RegionKind::Entities => dimension.entity_region_dir(&self.root),
+                RegionKind::Poi => dimension.poi_region_dir(&self.root),
+            };
             let (_, exists) = crate::save_transaction::checked_directory(&self.root, &directory)?;
             if !exists {
                 ensure!(
                     chunks.iter().all(|chunk| chunk.source_nbt.is_none()),
-                    "entity directory changed after its draft was created"
+                    "region directory changed after its draft was created"
                 );
             }
-            let entry = entity_directories
+            let entry = extra_directories
                 .entry(directory)
                 .or_insert((exists, false));
-            ensure!(entry.0 == exists, "entity directory changed during staging");
+            ensure!(entry.0 == exists, "region directory changed during staging");
             entry.1 |= chunks.iter().any(|chunk| chunk.replacement.is_some());
         }
-        for (directory, (exists, needed)) in &entity_directories {
+        for (directory, (exists, needed)) in &extra_directories {
             if !exists && *needed {
                 // Only a single, verified final component is created. A failed
                 // save can leave this directory empty, never remove outside data.
                 fs::create_dir(directory).with_context(|| {
-                    format!("cannot create entity directory {}", directory.display())
+                    format!("cannot create region directory {}", directory.display())
                 })?;
                 ensure!(
                     crate::save_transaction::checked_directory(&self.root, directory)?.1,
-                    "entity directory disappeared"
+                    "region directory disappeared"
                 );
             } else if !exists {
                 absent_dependencies.push(crate::save_transaction::Dependency::AbsentDirectory {
@@ -604,24 +742,26 @@ impl WorldWriteGuard {
         }
         let mut region_paths = Vec::with_capacity(groups.len());
         let mut entity_region_paths = Vec::new();
+        let mut poi_region_paths = Vec::new();
         let mut player_paths = Vec::with_capacity(plan.players.len());
         let mut world_clocks_path = None;
 
         for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
             groups.into_iter().enumerate()
         {
-            if kind == RegionKind::Entities
-                && entity_directories.get(&dimension.entity_region_dir(&self.root))
-                    == Some(&(false, false))
+            let directory = match kind {
+                RegionKind::Blocks => dimension.region_dir(&self.root),
+                RegionKind::Entities => dimension.entity_region_dir(&self.root),
+                RegionKind::Poi => dimension.poi_region_dir(&self.root),
+            };
+            if kind != RegionKind::Blocks
+                && extra_directories.get(&directory) == Some(&(false, false))
             {
                 continue;
             }
-            let region_dir = match kind {
-                RegionKind::Blocks => dimension.region_dir(&self.root),
-                RegionKind::Entities => dimension.entity_region_dir(&self.root),
-            }
-            .canonicalize()
-            .context("cannot open dimension region directory")?;
+            let region_dir = directory
+                .canonicalize()
+                .context("cannot open dimension region directory")?;
             ensure!(
                 region_dir.starts_with(&self.root),
                 "region directory is outside the world"
@@ -643,7 +783,7 @@ impl WorldWriteGuard {
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
-                        && kind == RegionKind::Entities =>
+                        && kind != RegionKind::Blocks =>
                 {
                     None
                 }
@@ -656,7 +796,7 @@ impl WorldWriteGuard {
             if existing.is_none() && chunks.iter().all(|chunk| chunk.replacement.is_none()) {
                 ensure!(
                     chunks.iter().all(|chunk| chunk.source_nbt.is_none()),
-                    "entity region changed after its draft was created"
+                    "region changed after its draft was created"
                 );
                 absent_dependencies.push(crate::save_transaction::Dependency::Absent {
                     target: region_path,
@@ -720,6 +860,9 @@ impl WorldWriteGuard {
                         RegionKind::Entities => {
                             validate_entity_document(&source, position)?;
                         }
+                        RegionKind::Poi => {
+                            crate::world::decode_poi_chunk(source, position)?;
+                        }
                     }
                 }
                 if let Some(replacement) = &planned.replacement {
@@ -728,6 +871,9 @@ impl WorldWriteGuard {
                         RegionKind::Blocks => validate_chunk(&draft.value, position.x, position.z)?,
                         RegionKind::Entities => {
                             validate_entity_document(&draft, position)?;
+                        }
+                        RegionKind::Poi => {
+                            crate::world::decode_poi_chunk(draft.clone(), position)?;
                         }
                     }
                     ensure!(
@@ -779,6 +925,7 @@ impl WorldWriteGuard {
             match kind {
                 RegionKind::Blocks => region_paths.push(target),
                 RegionKind::Entities => entity_region_paths.push(target),
+                RegionKind::Poi => poi_region_paths.push(target),
             }
         }
 
@@ -928,11 +1075,13 @@ impl WorldWriteGuard {
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\nabsent_entity_regions={}\nplayers={}\nworld_clocks={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}",
             region_paths.len(),
             plan.chunks.len(),
             entity_region_paths.len(),
             plan.entity_chunks.len(),
+            poi_region_paths.len(),
+            plan.poi_chunks.len(),
             absent_dependencies.len(),
             plan.players.len(),
             plan.world_clocks.is_some() as usize
@@ -955,6 +1104,7 @@ impl WorldWriteGuard {
         Ok(WorldSaveResult {
             region_paths,
             entity_region_paths,
+            poi_region_paths,
             player_paths,
             world_clocks_path,
             backup_directory,
@@ -1720,6 +1870,219 @@ mod tests {
             102
         );
         assert_ne!(fs::read(&block_path).unwrap(), block_bytes);
+    }
+
+    fn poi_document() -> NamedTag {
+        NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("future_root".into(), Tag::Int(1)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            ("future_section".into(), Tag::Int(2)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("pos".into(), Tag::IntArray(vec![0, 0, 0])),
+                                        ("type".into(), Tag::String("minecraft:farmer".into())),
+                                        ("free_tickets".into(), Tag::Int(1)),
+                                        ("future_record".into(), Tag::Int(3)),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        }
+    }
+
+    fn poi_records_mut(document: &mut NamedTag) -> &mut Vec<Tag> {
+        let Tag::Compound(root) = &mut document.value else {
+            panic!()
+        };
+        let Tag::Compound(sections) = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("Sections"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        let Tag::Compound(section) = &mut sections[0].1 else {
+            panic!()
+        };
+        let Tag::List { values, .. } = &mut section
+            .iter_mut()
+            .find(|(name, _)| name.matches("Records"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        values
+    }
+
+    #[test]
+    fn coordinated_poi_creation_saves_with_terrain_and_backups() {
+        let world = test_world();
+        let (terrain_path, mut terrain_bytes, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut terrain_bytes, 0, 2, &terrain, 1);
+        fs::write(&terrain_path, &terrain_bytes).unwrap();
+        let mut plan = WorldSavePlan::new();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        plan.add_chunk(
+            dimension.clone(),
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            2,
+        )
+        .unwrap();
+        let poi = poi_document();
+        plan.add_poi_chunk(dimension, ChunkPos { x: 0, z: 0 }, None, &poi, 3, |_, _| {
+            Ok(())
+        })
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let path = world
+            .path()
+            .join("dimensions/minecraft/overworld/poi/r.0.0.mca");
+        assert_eq!(result.poi_region_paths, vec![path.canonicalize().unwrap()]);
+        assert_eq!(
+            RegionReader::open(&path).unwrap().read_chunk(0, 0).unwrap(),
+            Some(poi)
+        );
+        assert_ne!(fs::read(&terrain_path).unwrap(), terrain_bytes);
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            terrain_bytes
+        );
+        let manifest =
+            fs::read_to_string(result.backup_directory.join("transaction.json")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&manifest).unwrap()["version"],
+            4
+        );
+    }
+
+    #[test]
+    fn poi_preservation_and_stale_sources_stop_coordinated_writes() {
+        let world = test_world();
+        let (terrain_path, mut terrain_bytes, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut terrain_bytes, 0, 2, &terrain, 1);
+        fs::write(&terrain_path, &terrain_bytes).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/poi");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let source = poi_document();
+        let mut poi_bytes = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut poi_bytes, 0, 2, &source, 1);
+        fs::write(&path, &poi_bytes).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut deleted = source.clone();
+        poi_records_mut(&mut deleted).clear();
+        let mut plan = WorldSavePlan::new();
+        assert!(
+            plan.add_poi_chunk(
+                dimension.clone(),
+                ChunkPos { x: 0, z: 0 },
+                Some(&source),
+                &deleted,
+                2,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        let mut edited = source.clone();
+        poi_records_mut(&mut edited).push(Tag::Compound(vec![
+            ("pos".into(), Tag::IntArray(vec![1, 0, 0])),
+            ("type".into(), Tag::String("minecraft:meeting".into())),
+            ("free_tickets".into(), Tag::Int(32)),
+        ]));
+        plan.add_poi_chunk(
+            dimension.clone(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &edited,
+            2,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        plan.add_chunk(
+            dimension,
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            2,
+        )
+        .unwrap();
+        let mut outside = source.clone();
+        let Tag::Compound(root) = &mut outside.value else {
+            panic!()
+        };
+        root[1].1 = Tag::Int(99);
+        store_record(&mut poi_bytes, 0, 2, &outside, 1);
+        fs::write(&path, &poi_bytes).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&terrain_path).unwrap(), terrain_bytes);
+        assert_eq!(fs::read(&path).unwrap(), poi_bytes);
+    }
+
+    #[test]
+    fn existing_poi_region_is_backed_up_and_preserves_unknown_fields() {
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("dimensions/minecraft/overworld/poi");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("r.0.0.mca");
+        let source = poi_document();
+        let mut bytes = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut bytes, 0, 2, &source, 1);
+        fs::write(&path, &bytes).unwrap();
+        let mut edited = source.clone();
+        poi_records_mut(&mut edited).push(Tag::Compound(vec![
+            ("pos".into(), Tag::IntArray(vec![1, 0, 0])),
+            ("type".into(), Tag::String("minecraft:meeting".into())),
+            ("free_tickets".into(), Tag::Int(32)),
+        ]));
+        let mut plan = WorldSavePlan::new();
+        plan.add_poi_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            ChunkPos { x: 0, z: 0 },
+            Some(&source),
+            &edited,
+            2,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            RegionReader::open(&path).unwrap().read_chunk(0, 0).unwrap(),
+            Some(edited)
+        );
     }
 
     #[test]

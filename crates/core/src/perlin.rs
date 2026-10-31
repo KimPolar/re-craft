@@ -129,6 +129,16 @@ impl PerlinNoise {
 
     /// Samples the underlying octave; this is not yet the complete normal noise stack.
     pub fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
+        self.sample_inner(x, y, z, None, false)
+    }
+
+    /// Java's height-smeared octave, including its distinct volume gradient order.
+    pub fn sample_smeared(&self, x: f64, y: f64, z: f64, smear: f64, volume: bool) -> f32 {
+        self.sample_inner(x, y, z, Some(smear), volume)
+    }
+
+    fn sample_inner(&self, x: f64, y: f64, z: f64, smear: Option<f64>, volume: bool) -> f32 {
+        let original_y = y;
         let x = wrap(x) + self.offsets[0];
         let y = wrap(y) + self.offsets[1];
         let z = wrap(z) + self.offsets[2];
@@ -136,7 +146,19 @@ impl PerlinNoise {
         let iy = java_floor(y);
         let iz = java_floor(z);
         let fx = (x - f64::from(ix)) as f32;
-        let fy = (y - f64::from(iy)) as f32;
+        let fractional_y = y - f64::from(iy);
+        let fy = match smear {
+            Some(scale) => {
+                let limited = if original_y >= 0.0 && original_y < fractional_y {
+                    original_y
+                } else {
+                    fractional_y
+                };
+                let fudge = f64::from(java_floor(limited / scale + f64::from(1.0e-7_f32))) * scale;
+                (fractional_y - fudge) as f32
+            }
+            None => fractional_y as f32,
+        };
         let fz = (z - f64::from(iz)) as f32;
         let px0 = self.permute(ix);
         let px1 = self.permute(ix.wrapping_add(1));
@@ -145,7 +167,12 @@ impl PerlinNoise {
         let p10 = self.permute(px1.wrapping_add(iy));
         let p11 = self.permute(px1.wrapping_add(iy).wrapping_add(1));
         let grad = |p: i32, dz: i32, x: f32, y: f32, z: f32| {
-            gradient(self.permute(p.wrapping_add(iz).wrapping_add(dz)), x, y, z)
+            let hash = self.permute(p.wrapping_add(iz).wrapping_add(dz));
+            if volume && smear.is_some() {
+                gradient_volume(hash, x, y, z)
+            } else {
+                gradient(hash, x, y, z)
+            }
         };
         let x0 = fx;
         let x1 = fx - 1.0;
@@ -153,7 +180,11 @@ impl PerlinNoise {
         let y1 = fy - 1.0;
         let z0 = fz;
         let z1 = fz - 1.0;
-        let (sx, sy, sz) = (smoothstep(fx), smoothstep(fy), smoothstep(fz));
+        let (sx, sy, sz) = (
+            smoothstep(fx),
+            smoothstep(fractional_y as f32),
+            smoothstep(fz),
+        );
         let plane0 = lerp(
             sy,
             lerp(sx, grad(p00, 0, x0, y0, z0), grad(p10, 0, x1, y0, z0)),
@@ -195,6 +226,16 @@ fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
 }
 
 fn gradient(hash: i32, x: f32, y: f32, z: f32) -> f32 {
+    let (gx, gy, gz) = gradient_components(hash);
+    gx * x + gy * y + gz * z
+}
+
+fn gradient_volume(hash: i32, x: f32, y: f32, z: f32) -> f32 {
+    let (gx, gy, gz) = gradient_components(hash);
+    (gx * x + gz * z) + gy * y
+}
+
+fn gradient_components(hash: i32) -> (f32, f32, f32) {
     const GRADIENTS: [(f32, f32, f32); 16] = [
         (1.0, 1.0, 0.0),
         (-1.0, 1.0, 0.0),
@@ -213,8 +254,7 @@ fn gradient(hash: i32, x: f32, y: f32, z: f32) -> f32 {
         (-1.0, 1.0, 0.0),
         (0.0, -1.0, -1.0),
     ];
-    let (gx, gy, gz) = GRADIENTS[(hash & 15) as usize];
-    gx * x + gy * y + gz * z
+    GRADIENTS[(hash & 15) as usize]
 }
 
 #[cfg(test)]

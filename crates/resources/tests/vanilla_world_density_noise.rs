@@ -277,14 +277,17 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld/factor",
         "minecraft:overworld/jaggedness",
         "minecraft:overworld/depth",
+        "minecraft:overworld/sloped_cheese",
         "minecraft:overworld_large_biomes/offset",
         "minecraft:overworld_large_biomes/factor",
         "minecraft:overworld_large_biomes/jaggedness",
         "minecraft:overworld_large_biomes/depth",
+        "minecraft:overworld_large_biomes/sloped_cheese",
         "minecraft:overworld_amplified/offset",
         "minecraft:overworld_amplified/factor",
         "minecraft:overworld_amplified/jaggedness",
         "minecraft:overworld_amplified/depth",
+        "minecraft:overworld_amplified/sloped_cheese",
     ] {
         let mut noise_ids = std::collections::BTreeSet::new();
         let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);
@@ -313,6 +316,29 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":outer,"java_expression":outer}));
     fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":"minecraft:end/islands","java_expression":java_islands}));
     fixtures.push(json!({"id":"minecraft:offset","end_fixture":true,"rust_expression":{"type":"interpolated","input":outer,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":outer,"cell_size_xz":4,"cell_size_y":8}}));
+    for id in [
+        "minecraft:overworld/base_3d_noise",
+        "minecraft:nether/base_3d_noise",
+        "minecraft:end/base_3d_noise",
+        "minecraft:end/sloped_cheese",
+    ] {
+        let mut names = std::collections::BTreeSet::new();
+        let java = inline_installed(json!(id), &mut sources, &mut data, &mut names);
+        assert!(names.is_empty());
+        fixtures
+            .push(json!({"id":"minecraft:terrain","rust_expression":id,"java_expression":java}));
+        fixtures.push(json!({"id":"minecraft:terrain","rust_expression":{"type":"interpolated","input":id,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":java,"cell_size_xz":4,"cell_size_y":8}}));
+    }
+    for params in [
+        [0.001, 0.001, 1000.0, 1000.0, 1.0],
+        [1.3, 0.7, 2.5, 3.0, 4.0],
+        [1000.0, 1000.0, 0.001, 0.001, 8.0],
+    ] {
+        let value = json!({"type":"old_blended_noise","xz_scale":params[0],"y_scale":params[1],"xz_factor":params[2],"y_factor":params[3],"smear_scale_multiplier":params[4]});
+        fixtures.push(
+            json!({"id":"minecraft:terrain","rust_expression":value,"java_expression":value}),
+        );
+    }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))

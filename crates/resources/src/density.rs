@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use native_core::{
+    blended_noise::BlendedNoise,
     normal_noise::{
         LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
     },
@@ -121,6 +122,7 @@ enum Node {
         kind: ShiftKind,
     },
     EndOuterIslands(Arc<Simplex2D>),
+    OldBlendedNoise(Arc<BlendedNoise>),
     Spline(Spline),
     UnblendedAlpha,
     UnblendedOffset,
@@ -430,6 +432,7 @@ impl DensityFunction {
                 }
             },
             Node::EndOuterIslands(noise) => end_outer_island_density(noise, x, z),
+            Node::OldBlendedNoise(noise) => noise.sample(x, y, z, volume),
             Node::IntervalSelect {
                 input,
                 thresholds,
@@ -498,6 +501,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         | Node::Gradient { .. }
         | Node::DistanceToPoint { .. }
         | Node::EndOuterIslands(_)
+        | Node::OldBlendedNoise(_)
         | Node::Shift { .. }
         | Node::Spline(_)
         | Node::UnblendedAlpha
@@ -543,6 +547,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Gradient { axis, .. } => axes = 1 << axis,
         Node::DistanceToPoint { .. } => axes = 7,
         Node::EndOuterIslands(_) => axes = 5,
+        Node::OldBlendedNoise(_) => axes = 7,
         Node::Slice { axis, .. } => axes &= !(1 << axis),
         Node::Noise {
             xz_scale, y_scale, ..
@@ -584,6 +589,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         } => Interval::enclosing_values(*value, *to_value),
         Node::DistanceToPoint { .. } => Interval::bounds(0.0, f32::INFINITY),
         Node::EndOuterIslands(_) => Interval::bounds(-0.84375, 0.5625),
+        Node::OldBlendedNoise(noise) => {
+            let (min, max) = noise.range();
+            Interval::bounds(min, max)
+        }
         Node::Binary { op, left, right } => match op {
             Binary::Add => left.4.add(right.4),
             Binary::Sub => left.4.sub(right.4),
@@ -657,6 +666,7 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
     unblended: bool,
     end_island_noise: Option<Arc<Simplex2D>>,
+    blended_noises: BTreeMap<String, Arc<BlendedNoise>>,
 }
 
 enum WorldNoiseFactory {
@@ -685,6 +695,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             noises: BTreeMap::new(),
             unblended: false,
             end_island_noise: None,
+            blended_noises: BTreeMap::new(),
         }
     }
 
@@ -843,6 +854,55 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 }
             }
             "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
+            "old_blended_noise" => {
+                let parse = |name: &str, min: f64, max: f64| -> Result<f64> {
+                    let value = field(name)?
+                        .as_f64()
+                        .with_context(|| format!("{name} must be a number"))?;
+                    ensure!(
+                        value.is_finite() && (min..=max).contains(&value),
+                        "{name} is out of range"
+                    );
+                    Ok(value)
+                };
+                let params = [
+                    parse("xz_scale", 0.001, 1000.0)?,
+                    parse("y_scale", 0.001, 1000.0)?,
+                    parse("xz_factor", 0.001, 1000.0)?,
+                    parse("y_factor", 0.001, 1000.0)?,
+                    parse("smear_scale_multiplier", 1.0, 8.0)?,
+                ];
+                let key = serde_json::to_string(&params)?;
+                let noise = if let Some(noise) = self.blended_noises.get(&key) {
+                    Arc::clone(noise)
+                } else {
+                    let factory = self
+                        .noise_factory
+                        .as_ref()
+                        .context("a world seed is required for blended terrain noise")?;
+                    let make_noise = |rng: &mut _| {
+                        BlendedNoise::new(
+                            rng, params[0], params[1], params[2], params[3], params[4],
+                        )
+                    };
+                    let noise = Arc::new(match factory {
+                        WorldNoiseFactory::Legacy(factory) => {
+                            make_noise(&mut factory.random_for("minecraft:terrain"))
+                        }
+                        WorldNoiseFactory::Xoroshiro(factory) => BlendedNoise::new(
+                            &mut factory.random_for("minecraft:terrain"),
+                            params[0],
+                            params[1],
+                            params[2],
+                            params[3],
+                            params[4],
+                        ),
+                    });
+                    self.blended_noises.insert(key, Arc::clone(&noise));
+                    noise
+                };
+                Node::OldBlendedNoise(noise)
+            }
             "end_outer_islands" => {
                 let seed = self
                     .world_seed
@@ -1167,7 +1227,7 @@ mod tests {
         let mut data = Data::default();
         data.insert("a", json!("test:b"));
         data.insert("b", json!("test:a"));
-        data.insert("noise", json!({"type":"minecraft:old_blended_noise"}));
+        data.insert("noise", json!({"type":"minecraft:unknown_noise"}));
         let mut compiler = DensityCompiler::new(&mut data);
         assert!(format!("{:#}", compiler.compile_id("test:a").unwrap_err()).contains("cyclic"));
         assert!(
@@ -1452,5 +1512,28 @@ mod tests {
             panic!("expected end island samplers");
         };
         assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn blended_noise_checks_parameters_and_shares_identical_graphs() {
+        let mut data = Data::default();
+        let expression = json!({"type":"old_blended_noise","xz_scale":0.25,"y_scale":0.125,"xz_factor":80.0,"y_factor":160.0,"smear_scale_multiplier":8.0});
+        assert!(
+            DensityCompiler::new(&mut data)
+                .compile(&expression)
+                .is_err()
+        );
+        let mut compiler =
+            DensityCompiler::with_world_seed(&mut data, 123, WorldgenRandom::Xoroshiro);
+        let first = compiler.compile(&expression).unwrap();
+        let second = compiler.compile(&expression).unwrap();
+        let (Node::OldBlendedNoise(first), Node::OldBlendedNoise(second)) = (&first.0, &second.0)
+        else {
+            panic!("expected blended noise");
+        };
+        assert!(Arc::ptr_eq(first, second));
+        let mut invalid = expression;
+        invalid["y_factor"] = json!(0.0);
+        assert!(compiler.compile(&invalid).is_err());
     }
 }

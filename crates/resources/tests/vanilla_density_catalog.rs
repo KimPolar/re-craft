@@ -26,6 +26,8 @@ fn catalog_compiles_installed_density_functions() {
         "minecraft:overworld/ore_vein/toggle",
         "minecraft:overworld/ore_vein/richness",
         "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
+        "minecraft:overworld/caves/spaghetti_2d",
+        "minecraft:overworld/caves/entrances",
         "minecraft:shift_x",
         "minecraft:shift_z",
         "minecraft:overworld/temperature",

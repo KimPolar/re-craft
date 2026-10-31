@@ -19,8 +19,7 @@ fn run(command: &mut Command) -> String {
     let output = command.output().expect("cannot run Java 25");
     assert!(
         output.status.success(),
-        "world density oracle failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        "world density oracle failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
@@ -44,12 +43,14 @@ fn inline_installed(
             inline_installed(json, sources, data, noise_ids)
         }
         Value::Object(mut object) => {
+            let mut noise_name = None;
             for (key, child) in object.iter_mut() {
                 if key == "type" {
                     continue;
                 }
                 if key == "noise" {
                     let name = child.as_str().unwrap().to_owned();
+                    noise_name = Some(name.clone());
                     noise_ids.insert(name.clone());
                     let path = format!(
                         "data/minecraft/worldgen/noise/{}.json",
@@ -61,6 +62,9 @@ fn inline_installed(
                 } else {
                     *child = inline_installed(child.take(), sources, data, noise_ids);
                 }
+            }
+            if let Some(name) = noise_name {
+                object.insert("_oracle_noise_id".into(), Value::String(name));
             }
             Value::Object(object)
         }
@@ -180,6 +184,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         "minecraft:overworld/ore_vein/richness",
         "minecraft:overworld/ore_vein/gap",
         "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
+        "minecraft:overworld/caves/spaghetti_2d",
+        "minecraft:overworld/caves/entrances",
         "minecraft:shift_x",
         "minecraft:shift_z",
         "minecraft:overworld/temperature",

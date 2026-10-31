@@ -92,6 +92,20 @@ impl Interval {
         let d = mul_bound(self.max, rhs.max);
         Self::bounds(min(min(a, b), min(c, d)), max(max(a, b), max(c, d)))
     }
+    pub fn div(self, rhs: Self) -> Self {
+        let reciprocal = if rhs.min.is_nan() || (rhs.min == 0.0 && rhs.max == 0.0) {
+            Self::NAI
+        } else if rhs.min > 0.0 || rhs.max < 0.0 {
+            Self::bounds(1.0 / rhs.max, 1.0 / rhs.min)
+        } else if rhs.max == 0.0 {
+            Self::bounds(f32::NEG_INFINITY, 1.0 / rhs.min)
+        } else if rhs.min == 0.0 {
+            Self::bounds(1.0 / rhs.max, f32::INFINITY)
+        } else {
+            Self::bounds(f32::NEG_INFINITY, f32::INFINITY)
+        };
+        self.mul(reciprocal)
+    }
     pub fn minimum(self, rhs: Self) -> Self {
         Self::bounds(min(self.min, rhs.min), min(self.max, rhs.max))
     }

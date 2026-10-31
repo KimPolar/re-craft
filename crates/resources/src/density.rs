@@ -84,6 +84,11 @@ enum Node {
         inside: Arc<DensityFunction>,
         outside: Arc<DensityFunction>,
     },
+    IntervalSelect {
+        input: Arc<DensityFunction>,
+        thresholds: Vec<f32>,
+        functions: Vec<Arc<DensityFunction>>,
+    },
     Lerp {
         alpha: Arc<DensityFunction>,
         first: Arc<DensityFunction>,
@@ -115,6 +120,7 @@ enum Binary {
     Add,
     Sub,
     Mul,
+    Div,
 }
 #[derive(Clone, Copy, Debug)]
 enum ShiftKind {
@@ -195,7 +201,7 @@ impl DensityFunction {
                 let left_constant = matches!(left.0, Node::Constant(_));
                 let right_constant = matches!(right.0, Node::Constant(_));
                 if !volume
-                    && matches!(op, Binary::Mul)
+                    && matches!(op, Binary::Mul | Binary::Div)
                     && !left_constant
                     && !right_constant
                     && a == 0.0
@@ -209,6 +215,8 @@ impl DensityFunction {
                     Binary::Sub if !left_constant && right_constant => a + -b,
                     Binary::Sub => a - b,
                     Binary::Mul => a * b,
+                    Binary::Div if !left_constant && right_constant => a * (1.0 / b),
+                    Binary::Div => a / b,
                 }
             }
             Node::Extremum {
@@ -378,6 +386,18 @@ impl DensityFunction {
                     noise.sample_scaled_volume(x, y, z, 0.25, 0.25) * 4.0
                 }
             },
+            Node::IntervalSelect {
+                input,
+                thresholds,
+                functions,
+            } => {
+                let value = input.evaluate_cached(x, y, z, volume, memo);
+                let index = thresholds
+                    .iter()
+                    .position(|threshold| value < *threshold)
+                    .unwrap_or(thresholds.len());
+                functions[index].evaluate_cached(x, y, z, volume, memo)
+            }
             Node::Spline(spline) => spline.sample(x, y, z, volume, memo),
             Node::UnblendedAlpha => 1.0,
             Node::UnblendedOffset => 0.0,
@@ -419,6 +439,9 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             outside,
             ..
         } => vec![input, inside, outside],
+        Node::IntervalSelect {
+            input, functions, ..
+        } => std::iter::once(input).chain(functions.iter()).collect(),
         Node::Lerp {
             alpha,
             first,
@@ -460,6 +483,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             Binary::Add => left.4.add(right.4),
             Binary::Sub => left.4.sub(right.4),
             Binary::Mul => left.4.mul(right.4),
+            Binary::Div => left.4.div(right.4),
         },
         Node::Extremum {
             minimum,
@@ -485,6 +509,9 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Range {
             inside, outside, ..
         } => Interval::enclosing(inside.4, outside.4),
+        Node::IntervalSelect { functions, .. } => functions
+            .iter()
+            .fold(Interval::NAI, |range, f| Interval::enclosing(range, f.4)),
         Node::Lerp {
             alpha,
             first,
@@ -757,11 +784,12 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                     factor: (to_value - from_value) / (to.wrapping_sub(from) as f32),
                 }
             }
-            "add" | "sub" | "mul" => {
+            "add" | "sub" | "mul" | "div" => {
                 let op = match id.path.as_str() {
                     "add" => Binary::Add,
                     "sub" => Binary::Sub,
                     "mul" => Binary::Mul,
+                    "div" => Binary::Div,
                     _ => Binary::Mul,
                 };
                 Node::Binary {
@@ -823,6 +851,37 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
                 inside: self.expression(field("when_in_range")?, depth + 1)?,
                 outside: self.expression(field("when_out_of_range")?, depth + 1)?,
             },
+            "interval_select" => {
+                let thresholds: Vec<f32> = field("thresholds")?
+                    .as_array()
+                    .context("thresholds must be an array")?
+                    .iter()
+                    .map(number)
+                    .collect::<Result<_>>()?;
+                ensure!(
+                    thresholds
+                        .windows(2)
+                        .all(|pair| pair[0].total_cmp(&pair[1]).is_le()),
+                    "thresholds must be ordered"
+                );
+                let values = field("functions")?
+                    .as_array()
+                    .context("functions must be an array")?;
+                ensure!(
+                    values.len() >= 2 && values.len() == thresholds.len() + 1,
+                    "interval selection requires one more function than thresholds"
+                );
+                let input = self.expression(field("input")?, depth + 1)?;
+                let functions = values
+                    .iter()
+                    .map(|value| self.expression(value, depth + 1))
+                    .collect::<Result<_>>()?;
+                Node::IntervalSelect {
+                    input,
+                    thresholds,
+                    functions,
+                }
+            }
             "lerp" => Node::Lerp {
                 alpha: self.expression(field("alpha")?, depth + 1)?,
                 first: self.expression(field("first")?, depth + 1)?,
@@ -1183,5 +1242,25 @@ mod tests {
         assert_eq!(alpha.range(), (0.0, 1.0));
         assert_eq!(offset.sample(1, 2, 3), 0.0);
         assert_eq!(offset.range(), (f32::NEG_INFINITY, f32::INFINITY));
+    }
+
+    #[test]
+    fn interval_selection_validates_thresholds_and_selects_equal_upper_interval() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        for value in [
+            json!({"type":"interval_select","input":0,"thresholds":[1,0],"functions":[0,1,2]}),
+            json!({"type":"interval_select","input":0,"thresholds":[0],"functions":[0]}),
+            json!({"type":"interval_select","input":0,"thresholds":[],"functions":[0]}),
+        ] {
+            assert!(compiler.compile(&value).is_err());
+        }
+        let select = compiler
+            .compile(
+                &json!({"type":"interval_select","input":0,"thresholds":[0,0],"functions":[1,2,3]}),
+            )
+            .unwrap();
+        assert_eq!(select.sample(0, 0, 0), 3.0);
+        assert_eq!(select.range(), (1.0, 3.0));
     }
 }

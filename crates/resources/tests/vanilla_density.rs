@@ -81,6 +81,32 @@ fn pure_functions_match_java_sampler() {
     expressions.push(json!({"type":"minecraft:range_choice", "input":gradient, "min_inclusive":-0.5, "max_exclusive":0.5, "when_in_range":reverse, "when_out_of_range":0.125}));
     let zero = json!({"type":"minecraft:gradient", "axis":"y", "from_coordinate":0, "to_coordinate":1, "from_value":0.0, "to_value":0.0});
     let negative = json!({"type":"minecraft:negate", "input":1.0});
+    for (index, (left, right)) in [
+        (gradient.clone(), reverse.clone()),
+        (json!(1.0), gradient.clone()),
+        (gradient.clone(), json!(3.0)),
+        (json!(-2.0), json!(0.0)),
+        (zero.clone(), reverse.clone()),
+        (gradient.clone(), json!(-0.0)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        expressions.push(json!({"type":"div", "left":left, "right":right}));
+        if index < 3 {
+            expressions.push(json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"div", "left":left, "right":right}}));
+        }
+    }
+    for thresholds in [vec![0.0], vec![-0.5, 0.0, 0.0, 0.5]] {
+        let functions = (0..=thresholds.len())
+            .map(|i| json!(i as f32 * 0.5 - 1.0))
+            .collect::<Vec<_>>();
+        let select = json!({"type":"interval_select", "input":gradient, "thresholds":thresholds, "functions":functions});
+        expressions.push(select.clone());
+        expressions.push(
+            json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":select}),
+        );
+    }
     expressions.push(json!({"type":"minecraft:mul", "left":zero, "right":negative}));
     expressions.push(json!({"type":"minecraft:mul", "left":zero, "right":-1.0}));
     expressions.push(json!({"type":"minecraft:sub", "left":zero, "right":0.0}));

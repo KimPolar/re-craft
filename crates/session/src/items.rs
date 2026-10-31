@@ -1224,11 +1224,19 @@ impl ItemEntities {
                 .collect();
             restored.sort_unstable();
             for (_, index) in restored {
+                // A reloaded Java entity runs the base ItemEntity constructor,
+                // then restores its saved fields without rerolling velocity.
+                let (bob_offset, _, random) = self.item_visuals();
+                let new_id = self.next_id;
+                self.next_id = self.next_id.wrapping_add(1);
                 let entity = &mut self.entities[index];
                 // Java creates a fresh entity from NBT on chunk reload. Its
                 // lifetime is saved, but Entity.tickCount is not.
                 entity.item.age = 0;
                 entity.item.previous_position = entity.item.position;
+                entity.item.bob_offset = bob_offset;
+                entity.id = new_id;
+                entity.random = random;
                 entity.ground_without_support = false;
                 entity.section_sequence = self.next_section_sequence;
                 self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
@@ -2804,6 +2812,35 @@ mod tests {
             second_before.next_int()
         );
         assert_eq!(items.random.next_int(), global_before.next_int());
+    }
+
+    #[test]
+    fn reloaded_items_get_a_fresh_constructor_stream_and_keep_saved_state() {
+        use native_world::loaded::ChunkPos;
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(1.5, 5.0, 1.5), stack);
+        let original = items.entities[0].clone();
+        items.entities[0].item.age = 12;
+        items.entities[0].random.next_int();
+        let home = ChunkPos { x: 0, z: 0 };
+        items.set_active_chunks(BTreeSet::from([home]));
+        items.set_active_chunks(BTreeSet::new());
+        let mut seed = native_core::random::XoroshiroRandom::new(1);
+        let (bob, _, mut expected_random) = item_random_from_seed(seed.next_long());
+        items.set_active_chunks(BTreeSet::from([home]));
+        let restored = &mut items.entities[0];
+        assert_eq!(restored.id, 1);
+        assert_eq!(restored.item.age, 0);
+        assert_eq!(restored.item.bob_offset, bob);
+        assert_eq!(restored.random.next_int(), expected_random.next_int());
+        assert_eq!(restored.item.position, original.item.position);
+        assert_eq!(restored.item.previous_position, original.item.position);
+        assert_eq!(restored.velocity, original.velocity);
+        assert_eq!(restored.lifetime, original.lifetime);
+        assert_eq!(restored.pickup_delay, original.pickup_delay);
+        assert_eq!(restored.created, original.created);
+        assert_eq!(items.next_id, 2);
     }
 
     #[test]

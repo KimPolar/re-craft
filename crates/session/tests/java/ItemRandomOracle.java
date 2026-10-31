@@ -6,6 +6,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
@@ -25,10 +26,11 @@ public class ItemRandomOracle {
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true);
     var world=(World)((sun.misc.Unsafe)f.get(null)).allocateInstance(World.class);
     var out = new JsonArray();
-    for (int mode=0; mode<2; mode++) for (int i=0; i<32; i++) {
+    for (int mode=0; mode<3; mode++) for (int i=0; i<32; i++) {
       var item = mode==0
         ? new ItemEntity(world,3.5,5.8,4.5,new ItemStack(Items.STONE))
-        : new ItemEntity(world,3.5,5.8,4.5,new ItemStack(Items.STONE),0.1,0.2,0.3);
+        : mode==1 ? new ItemEntity(world,3.5,5.8,4.5,new ItemStack(Items.STONE),0.1,0.2,0.3)
+        : new ItemEntity(EntityTypes.ITEM,world);
       var random=item.getRandom();
       long state=((AtomicLong)seedField.get(random)).get();
       for(int step=0;step<(mode==0?10:6);step++)

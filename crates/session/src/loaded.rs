@@ -7331,23 +7331,15 @@ impl LoadedSession {
         let Some(clicked) = self.world.state(clicked) else {
             return false;
         };
-        let waterloggable = fluid == "minecraft:water"
-            && matches!(
-                clicked.properties.get("waterlogged").map(String::as_str),
-                Some("true" | "false")
-            )
-            && (crate::stair_items::is_stair_item(&clicked.name)
-                || (crate::slab_mining::material(&clicked.name).is_some()
-                    && clicked.properties.get("type").map(String::as_str) != Some("double")));
+        let clicked_waterloggable =
+            fluid == "minecraft:water" && bucket_waterloggable(clicked) == Some(true);
         if fluid == "minecraft:water"
             && clicked.properties.contains_key("waterlogged")
-            && !waterloggable
-            && !(crate::slab_mining::material(&clicked.name).is_some()
-                && clicked.properties.get("type").map(String::as_str) == Some("double"))
+            && bucket_waterloggable(clicked).is_none()
         {
             return false;
         }
-        let Some(target) = (if waterloggable {
+        let Some(target) = (if clicked_waterloggable && !self.sneak {
             Some(hit.position)
         } else {
             add(hit.position, hit.face)
@@ -7366,11 +7358,13 @@ impl LoadedSession {
         let Some(block) = self.world.state(existing) else {
             return false;
         };
+        let waterloggable = fluid == "minecraft:water" && bucket_waterloggable(block) == Some(true);
         if !waterloggable
             && !matches!(
                 block.name.as_str(),
                 "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
             )
+            && self.ordinary_fluid(existing).is_none()
         {
             return false;
         }
@@ -12645,6 +12639,28 @@ fn ordinary_can_replace(block: &BlockState) -> Option<bool> {
     button_can_replace(block).or_else(|| crate::falling_block::known_landing_replaceable(block))
 }
 
+/// Water buckets can enter these supported SimpleWaterloggedBlock states.
+/// `None` leaves unrecognized waterlogged implementations unresolved.
+fn bucket_waterloggable(block: &BlockState) -> Option<bool> {
+    let Some(wet) = block.properties.get("waterlogged") else {
+        return Some(false);
+    };
+    if !matches!(wet.as_str(), "true" | "false") {
+        return None;
+    }
+    if crate::stair_items::is_stair_item(&block.name) {
+        return block_outline(block).map(|_| true);
+    }
+    if crate::slab_mining::material(&block.name).is_some() {
+        return match block.properties.get("type").map(String::as_str) {
+            Some("top" | "bottom") => Some(true),
+            Some("double") => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// Java's Direction.orderedByNearest with the clicked face's opposite moved
 /// to the front by BlockPlaceContext when placing in the adjacent cell.
 fn button_placement_directions(
@@ -13929,6 +13945,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bucket_replaces_sources_and_flowing_fluids_in_both_hands() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for (item, target) in [
+            ("minecraft:water_bucket", "minecraft:water"),
+            ("minecraft:lava_bucket", "minecraft:lava"),
+        ] {
+            for existing in ["minecraft:water", "minecraft:lava"] {
+                for level in ["0", "1", "7", "8", "15"] {
+                    for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                        let mut session = session();
+                        session.set_water_evaporation_environment(bucket_environment(false));
+                        let pos = IVec3::new(8, 2, 7);
+                        let id = session.intern_block(state(existing, &[("level", level)]));
+                        session.set_with_notify(pos, id, false);
+                        let mut inventory = PlayerInventory::default();
+                        inventory.set_slot(
+                            hand,
+                            ItemStack::new(item.into(), 1, 1, Tag::Compound(vec![])),
+                        );
+                        session.set_player_inventory(inventory);
+                        session.submit_command(PlayerCommand::Place);
+                        session.update(TICK);
+                        let pos = session.origin + pos;
+                        let block = session.world.block(pos.x, pos.y, pos.z).unwrap();
+                        assert_eq!(block.name, target, "{item} {existing} {level} {hand:?}");
+                        assert_eq!(block.properties["level"], "0");
+                        assert_eq!(
+                            session.inventory.slot(hand).unwrap().id(),
+                            "minecraft:bucket"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sneaking_places_water_next_to_a_waterloggable_block() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        let clicked = IVec3::new(8, 2, 6);
+        let id = session.intern_block(state(
+            "minecraft:stone_slab",
+            &[("type", "top"), ("waterlogged", "false")],
+        ));
+        session.set_with_notify(clicked, id, false);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Sneak(true));
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let pos = session.origin + clicked;
+        assert_eq!(
+            session.world.block(pos.x, pos.y, pos.z).unwrap().properties["waterlogged"],
+            "false"
+        );
+        let adjacent = pos + IVec3::Z;
+        assert_eq!(
+            session
+                .world
+                .block(adjacent.x, adjacent.y, adjacent.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+    }
+
+    #[test]
+    fn lava_bucket_in_flowing_water_reacts_to_an_adjacent_water_source() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let target = IVec3::new(8, 2, 7);
+        let flowing = session.intern_block(state("minecraft:water", &[("level", "3")]));
+        let source = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        session.set_with_notify(target, flowing, false);
+        session.set_with_notify(target + IVec3::X, source, false);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:lava_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        assert!(session.try_empty_bucket(PlayerSlot::Storage(0)));
+        let p = session.origin + target;
+        assert_eq!(
+            session.world.block(p.x, p.y, p.z).unwrap().name,
+            "minecraft:obsidian"
+        );
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:bucket"
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -14074,6 +14193,158 @@ mod tests {
                     + DVec3::splat(0.5),
                 "{row}"
             );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next_random"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn bucket_fluid_replacement_and_sneaking_match_java() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BucketFluidReplaceOracle.java");
+        let output = temp.path().join("bucket_fluid.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BucketFluidReplaceOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BucketFluidReplaceOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 264);
+        for row in rows {
+            let mut session = session();
+            session.sneak = row["sneak"].as_bool().unwrap();
+            session.set_water_evaporation_environment(bucket_environment(
+                row["evaporates"].as_bool().unwrap(),
+            ));
+            let clicked = IVec3::new(8, 2, 6);
+            let adjacent = clicked + IVec3::Z;
+            let initial = row["initial"].as_str().unwrap();
+            if initial.starts_with("slab_") {
+                let wet = if initial == "slab_wet" {
+                    "true"
+                } else {
+                    "false"
+                };
+                let id = session.intern_block(state(
+                    "minecraft:stone_slab",
+                    &[("type", "top"), ("waterlogged", wet)],
+                ));
+                session.set_with_notify(clicked, id, false);
+            } else {
+                let name = format!("minecraft:{initial}");
+                let level = row["level"].as_i64().unwrap().to_string();
+                let id = session.intern_block(state(&name, &[("level", &level)]));
+                session.set_with_notify(adjacent, id, false);
+            }
+            session.level_random = native_core::random::LegacyRandom::new(123);
+            let item = if row["lava"].as_bool().unwrap() {
+                "minecraft:lava_bucket"
+            } else {
+                "minecraft:water_bucket"
+            };
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(item.into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            let success = session.try_empty_bucket(PlayerSlot::Storage(0));
+            assert_eq!(success, row["success"].as_bool().unwrap(), "{row}");
+            for (pos, key) in [(clicked, "clicked"), (adjacent, "adjacent")] {
+                let p = session.origin + pos;
+                let block = session.world.block(p.x, p.y, p.z).unwrap();
+                let actual = match block.name.as_str() {
+                    "minecraft:air" => "air".into(),
+                    "minecraft:stone" => "stone".into(),
+                    "minecraft:water" => format!("water_{}", block.properties["level"]),
+                    "minecraft:lava" => format!("lava_{}", block.properties["level"]),
+                    "minecraft:stone_slab" => format!("slab_{}", block.properties["waterlogged"]),
+                    _ => panic!("unexpected {block:?}: {row}"),
+                };
+                assert_eq!(actual, row[key].as_str().unwrap(), "{row}");
+            }
+            let sounds = session.take_bucket_sounds();
+            if success {
+                assert_eq!(sounds.len(), 1, "{row}");
+                let sound = sounds[0];
+                assert_eq!(
+                    format!("minecraft:{}", sound.kind.event()),
+                    row["sound"].as_str().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    sound.volume.to_bits(),
+                    row["volume_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    sound.pitch.to_bits(),
+                    row["pitch_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    sound.position,
+                    (session.origin + clicked + IVec3::Z * row["sound_z"].as_i64().unwrap() as i32)
+                        .as_dvec3()
+                        + DVec3::splat(0.5),
+                    "{row}"
+                );
+                assert_eq!(
+                    session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                    "minecraft:bucket"
+                );
+            } else {
+                assert!(sounds.is_empty());
+                assert_eq!(
+                    session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                    item
+                );
+            }
             assert_eq!(
                 session.level_random.next_int(),
                 row["next_random"].as_i64().unwrap() as i32,

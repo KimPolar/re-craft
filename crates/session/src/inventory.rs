@@ -2485,6 +2485,11 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             16
+        } else if name.matches("!minecraft:tool") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            64
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {

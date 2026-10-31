@@ -563,8 +563,9 @@ pub fn destroy_speed(base_speed: f32, context: MiningContext) -> f32 {
 /// Items with unresolved components may have tool, enchantment or mining overrides.
 pub(crate) fn basic_hand(item: Option<&ItemStack>) -> bool {
     item.is_none_or(|item| {
-        matches!(ordinary_item_default_max(item.id()), Some(16 | 64))
-            && ordinary_return_supported(item)
+        ordinary_return_supported(item)
+            && (matches!(ordinary_item_default_max(item.id()), Some(16 | 64))
+                || item.components().get("!minecraft:tool").is_some())
     })
 }
 
@@ -662,6 +663,11 @@ impl Mining {
     ) -> Option<IVec3> {
         self.active = None;
         let target = target?;
+        // An unresolved component patch may change whether, how fast, or with
+        // what effects a block can be broken. Do not assume instant breaking.
+        if hand.is_some_and(|item| !ordinary_return_supported(item)) {
+            return None;
+        }
         if creative {
             if mining_properties(Material::Dirt, hand)
                 .is_some_and(|properties| !properties.can_destroy_in_creative)
@@ -914,6 +920,63 @@ mod tests {
                         .is_none()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unresolved_tool_component_never_breaks_blocks_speculatively() {
+        let item = ItemStack::new(
+            "minecraft:diamond_pickaxe".into(),
+            1,
+            1,
+            Tag::Compound(vec![("minecraft:tool".into(), Tag::Compound(vec![]))]),
+        )
+        .unwrap();
+        for material in [Some(Material::Stone), None] {
+            for creative in [false, true] {
+                let target = Candidate {
+                    position: IVec3::ZERO,
+                    material,
+                    tags: None,
+                };
+                let mut mining = Mining::default();
+                assert_eq!(mining.press(Some(target), Some(&item), creative), None);
+                for _ in 0..20 {
+                    assert_eq!(
+                        mining.tick(Some(target), Some(&item), creative, true, false),
+                        None
+                    );
+                    assert!(mining.progress().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removed_tool_component_uses_hand_rules_including_creative() {
+        let item = ItemStack::new(
+            "minecraft:diamond_sword".into(),
+            1,
+            1,
+            Tag::Compound(vec![("!minecraft:tool".into(), Tag::Compound(vec![]))]),
+        )
+        .unwrap();
+        for tags in [None, Some(0), Some(u16::MAX)] {
+            let target = Candidate {
+                position: IVec3::ZERO,
+                material: Some(Material::Stone),
+                tags,
+            };
+            let properties = candidate_properties(target, Some(&item)).unwrap();
+            assert_eq!(properties.speed, 1.0);
+            assert!(!properties.correct_for_drops);
+            assert_eq!(properties.damage_per_block, 0);
+            assert!(properties.can_destroy_in_creative);
+            let mut mining = Mining::default();
+            assert_eq!(
+                mining.press(Some(target), Some(&item), true),
+                Some(IVec3::ZERO)
+            );
         }
     }
 

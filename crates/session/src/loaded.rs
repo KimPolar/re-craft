@@ -5390,6 +5390,35 @@ impl LoadedSession {
         )))
     }
 
+    /// Resolve a normal full-block placement using the clicked block's
+    /// replaceability before considering the adjacent cell.
+    fn ordinary_placement_target(&self, hit: ShapeRayHit) -> Option<IVec3> {
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let target = if ordinary_can_replace(self.world.state(clicked)?)? {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        (ordinary_can_replace(self.world.state(existing)?) == Some(true)).then_some(target)
+    }
+
     fn snowy_setting(&self, name: &str) -> Option<bool> {
         if !self.vanilla_block_ids.as_ref()?.contains(name) {
             return None;
@@ -8723,8 +8752,7 @@ impl LoadedSession {
                                 }
                             } else if self.game_mode.allows_basic_building()
                                 && let Some((hand, block)) = placement_hand(&self.inventory)
-                                && let Some(target) = add(hit.position, hit.face)
-                                && matches!(cell(&self.world, self.origin, self.bounds, target, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| matches!(state.name.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")))
+                                && let Some(target) = self.ordinary_placement_target(hit)
                                 && let Some(block) = self.placement_block(target, block)
                                 && !player_intersects_block(self.player, target, block)
                                 && {
@@ -10477,6 +10505,10 @@ fn button_can_replace(block: &BlockState) -> Option<bool> {
     None
 }
 
+fn ordinary_can_replace(block: &BlockState) -> Option<bool> {
+    button_can_replace(block).or_else(|| crate::falling_block::known_landing_replaceable(block))
+}
+
 /// Java's Direction.orderedByNearest with the clicked face's opposite moved
 /// to the front by BlockPlaceContext when placing in the adjacent cell.
 fn button_placement_directions(
@@ -10855,6 +10887,196 @@ mod tests {
         session.set_bounce_suppression_tag(Arc::new(BTreeSet::new()));
         session.set_farmland_maintainers(Arc::new(BTreeSet::new()));
         session
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn ordinary_placement_targets_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("OrdinaryPlacementOracle.java");
+        let output = temp.path().join("placement.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/OrdinaryPlacementOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("OrdinaryPlacementOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "placement oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 3 * 21 * 21 * 6);
+        let mut session = session();
+        let pos = IVec3::new(4, 8, 4);
+        for row in rows {
+            let face = match row["face"].as_str().unwrap() {
+                "up" => IVec3::Y,
+                "down" => IVec3::NEG_Y,
+                "east" => IVec3::X,
+                "west" => IVec3::NEG_X,
+                "south" => IVec3::Z,
+                "north" => IVec3::NEG_Z,
+                _ => unreachable!(),
+            };
+            let make_state = |name: &str| {
+                if let Some(layers) = name.strip_prefix("snow_") {
+                    state("minecraft:snow", &[("layers", layers)])
+                } else if name == "water" || name == "lava" {
+                    state(&format!("minecraft:{name}"), &[("level", "0")])
+                } else {
+                    state(&format!("minecraft:{name}"), &[])
+                }
+            };
+            let clicked = session.intern_block(make_state(row["clicked"].as_str().unwrap()));
+            let adjacent = session.intern_block(make_state(row["adjacent"].as_str().unwrap()));
+            session.set_with_notify(pos, clicked, false);
+            session.set_with_notify(pos + face, adjacent, false);
+            let hit = ShapeRayHit {
+                position: pos,
+                face,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            let actual = session.ordinary_placement_target(hit);
+            assert_eq!(
+                actual.is_some(),
+                row["can_place"].as_bool().unwrap(),
+                "{row}"
+            );
+            if let Some(actual) = actual {
+                let expected = IVec3::new(
+                    row["x"].as_i64().unwrap() as i32,
+                    row["y"].as_i64().unwrap() as i32,
+                    row["z"].as_i64().unwrap() as i32,
+                );
+                assert_eq!(actual - pos, expected, "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_block_placement_replaces_water_and_consumes_held_stack() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let pos = IVec3::new(8, 2, 7);
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set_with_notify(pos, water, false));
+                let mut inventory = PlayerInventory::default();
+                assert!(inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![]))
+                ));
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let Cell::State(id) = cell(
+                    &session.world,
+                    session.origin,
+                    session.bounds,
+                    pos,
+                    session.states[0],
+                ) else {
+                    panic!("missing target")
+                };
+                assert_eq!(
+                    session.world.state(id).unwrap().name,
+                    if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                        "minecraft:stone"
+                    } else {
+                        "minecraft:water"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_block_use_replaces_clicked_thin_snow() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let position = IVec3::new(8, 1, 7);
+        let snow = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+        assert!(session.set_with_notify(position, snow, false));
+        session.player.pitch = -0.9;
+        assert_eq!(session.ray_hit().unwrap().position, position);
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![]))
+        ));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let Cell::State(id) = cell(
+            &session.world,
+            session.origin,
+            session.bounds,
+            position,
+            session.states[0],
+        ) else {
+            panic!("missing target")
+        };
+        assert_eq!(session.world.state(id).unwrap().name, "minecraft:stone");
+        assert_eq!(
+            session
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]

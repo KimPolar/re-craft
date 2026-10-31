@@ -29,6 +29,7 @@ pub mod mining_tags;
 pub mod models;
 pub mod noise;
 pub mod noise_router;
+pub mod noise_stage;
 pub mod packs;
 pub mod recipes;
 pub mod respawn_environment;

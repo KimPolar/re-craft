@@ -2,6 +2,7 @@
 use native_resources::{
     density::{DensityCompiler, DensityEvaluator, WorldgenRandom},
     noise_router::{NoiseRouter, RouterField},
+    noise_stage::{NoiseMaterial, NoiseStageGenerator, select_without_aquifer},
     packs::{ResourceProvider, ResourceStack},
 };
 use serde_json::{Value, json};
@@ -397,6 +398,9 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 fixture["volume_size"] = json!([5, 9, 5]);
                 fixture["chunk_min_y"] = settings["noise"]["min_y"].clone();
                 fixture["chunk_height"] = settings["noise"]["height"].clone();
+                if name != "overworld" {
+                    fixture["simple_noise"] = json!(name);
+                }
             }
             fixtures.push(fixture);
         }
@@ -418,6 +422,10 @@ fn seeded_noise_functions_and_interpolation_match_java() {
     let mut chunk_values = None;
     let mut chunk_index = 0;
     let mut chunk_samples = 0;
+    let mut material_chunk = None;
+    let mut material_index = 0;
+    let mut material_samples = 0;
+    let mut fluid_cases = 0;
     for line in output.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         match fields.first().copied() {
@@ -473,6 +481,8 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 volume_values = None;
                 chunk_values = None;
                 chunk_index = 0;
+                material_chunk = None;
+                material_index = 0;
                 groups += 1;
             }
             Some("P") | Some("Q") => {
@@ -537,6 +547,50 @@ fn seeded_noise_functions_and_interpolation_match_java() {
                 chunk_index += 1;
                 chunk_samples += 1;
             }
+            Some("F") => {
+                let sea: i32 = fields[1].parse().unwrap();
+                let y: i32 = fields[2].parse().unwrap();
+                let density = f32::from_bits(fields[3].parse::<i32>().unwrap() as u32);
+                let expected: i32 = fields[4].parse().unwrap();
+                let actual = match select_without_aquifer(density, y, sea) {
+                    NoiseMaterial::DefaultBlock => 0,
+                    NoiseMaterial::DefaultFluid => 1,
+                    NoiseMaterial::Lava => 2,
+                    NoiseMaterial::Air => 3,
+                };
+                assert_eq!(actual, expected, "sea {sea} y {y} density {density}");
+                fluid_cases += 1;
+            }
+            Some("M") => {
+                let (index, mode, seed, _) = compiled.as_ref().unwrap();
+                let name = fixtures[*index]["router_settings"].as_str().unwrap();
+                let chunk = material_chunk.get_or_insert_with(|| {
+                    let generator = NoiseStageGenerator::load_without_terrain_adjustments(
+                        &mut data, name, *seed,
+                    )
+                    .unwrap();
+                    generator.generate(&mut evaluator, 90, -60).unwrap()
+                });
+                let actual = match chunk.materials()[material_index] {
+                    NoiseMaterial::DefaultBlock => 0,
+                    NoiseMaterial::DefaultFluid => {
+                        if name == "minecraft:the_end" || name == "minecraft:end" {
+                            3
+                        } else {
+                            2
+                        }
+                    }
+                    NoiseMaterial::Lava => 2,
+                    NoiseMaterial::Air => 3,
+                };
+                assert_eq!(
+                    actual,
+                    fields[1].parse::<i32>().unwrap(),
+                    "material {name} mode {mode} seed {seed} index {material_index}"
+                );
+                material_index += 1;
+                material_samples += 1;
+            }
             _ => {}
         }
     }
@@ -573,4 +627,6 @@ fn seeded_noise_functions_and_interpolation_match_java() {
         .sum();
     assert_eq!(volume_samples, expected_volume_samples);
     assert_eq!(chunk_samples, 16 * 16 * (384 + 128 + 128));
+    assert_eq!(fluid_cases, 7 * 16 * 7);
+    assert_eq!(material_samples, 2 * 16 * 16 * 128);
 }

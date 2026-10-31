@@ -21,6 +21,10 @@ import net.minecraft.world.level.levelgen.densityfunction.DensityBuffer;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.synth.Noise;
 import net.minecraft.world.level.levelgen.synth.NormalNoise;
+import net.minecraft.world.level.levelgen.Aquifer;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
+import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
+import net.minecraft.world.level.block.Blocks;
 
 public class WorldDensityNoiseOracle {
     // Codec-decoded noise values may compare equal even when their registry names
@@ -110,11 +114,41 @@ public class WorldDensityNoiseOracle {
                     var buffer=DensityBuffer.createUnpooled(volume.size());
                     sampler.sampleVolume(SamplerContext.EMPTY_UNCACHED,buffer,volume);
                     for (int j=0;j<buffer.size();j++) System.out.printf("C %d%n",Float.floatToRawIntBits(buffer.get(j)));
+                    if (fixture.has("simple_noise")) {
+                        boolean nether=fixture.get("simple_noise").getAsString().equals("nether");
+                        var fluid=nether?Blocks.LAVA.defaultBlockState():Blocks.AIR.defaultBlockState();
+                        int sea=nether?32:0;
+                        var setting=new NoiseGeneratorSettings(null,Blocks.STONE.defaultBlockState(),fluid,null,null,java.util.List.of(),sea,false,java.util.Optional.empty(),true,null);
+                        var method=NoiseBasedChunkGenerator.class.getDeclaredMethod("createFluidPicker", NoiseGeneratorSettings.class);
+                        method.setAccessible(true);
+                        var aquifer=Aquifer.createDisabled((Aquifer.FluidPicker)method.invoke(null,setting));
+                        for (int j=0;j<buffer.size();j++) {
+                            int y=minY+j%height;
+                            var state=aquifer.computeSubstance(0,y,0,buffer.get(j));
+                            int code=state==null?0:state.is(Blocks.WATER)?1:state.is(Blocks.LAVA)?2:state.is(Blocks.AIR)?3:-1;
+                            System.out.printf("M %d%n",code);
+                        }
+                    }
                 }
                 if (fixture.has("end_fixture")) for (int j=0;j<80;j++) {
                     int x=(j*7919)%90000-45000, z=(j*3571)%90000-45000, y=j-40;
                     System.out.printf("Q %d %d %d %d%n",x,y,z,Float.floatToRawIntBits(sampler.sampleValue(SamplerContext.EMPTY_UNCACHED,x,y,z)));
                 }
+            }
+        }
+        var pickerMethod=NoiseBasedChunkGenerator.class.getDeclaredMethod("createFluidPicker", NoiseGeneratorSettings.class);
+        pickerMethod.setAccessible(true);
+        int[] levels={-100,-54,-53,0,32,63,320};
+        int[] ys={-110,-101,-100,-99,-55,-54,-53,-1,0,31,32,62,63,319,320,321};
+        float[] densities={Float.NEGATIVE_INFINITY,-1.0f,-0.0f,0.0f,1.0f,Float.POSITIVE_INFINITY,Float.NaN};
+        for (int sea:levels) {
+            var settings=new NoiseGeneratorSettings(null,Blocks.STONE.defaultBlockState(),Blocks.WATER.defaultBlockState(),null,null,java.util.List.of(),sea,false,java.util.Optional.empty(),true,null);
+            var picker=(Aquifer.FluidPicker)pickerMethod.invoke(null,settings);
+            var aquifer=Aquifer.createDisabled(picker);
+            for (int y:ys) for (float density:densities) {
+                var state=aquifer.computeSubstance(0,y,0,density);
+                int code=state==null?0:state.is(Blocks.WATER)?1:state.is(Blocks.LAVA)?2:state.is(Blocks.AIR)?3:-1;
+                System.out.printf("F %d %d %d %d%n",sea,y,Float.floatToRawIntBits(density),code);
             }
         }
     }

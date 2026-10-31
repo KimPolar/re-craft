@@ -32,6 +32,7 @@ import net.minecraft.world.level.gamerules.*;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.material.*;
@@ -55,6 +56,7 @@ public class FluidTickOracle {
       else if (s.is(Blocks.OBSIDIAN)) a.add(-3);
       else if (s.is(Blocks.COBBLESTONE)) a.add(-4);
       else if (s.is(Blocks.BASALT)) a.add(-5);
+      else if (s.is(Blocks.OAK_SLAB)) a.add(s.getValue(SlabBlock.TYPE) == SlabType.TOP ? -17 : -16);
       else a.add(s.getValue(LiquidBlock.LEVEL) + (s.is(lava ? Blocks.WATER : Blocks.LAVA) ? 20 : 0));
       changes.add(a); return true;
     }
@@ -91,7 +93,7 @@ public class FluidTickOracle {
           case -13 -> Blocks.COPPER_GRATE.waxed().oxidized();
           default -> null;
         };
-        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
+        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
       }
       BlockPos p=BlockPos.ZERO; var block=world.getBlockState(p); var fluid=block.getFluidState();
@@ -314,6 +316,68 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             json!({"blocks": [[0, 0, 0, grate]], "lava": false, "fast": false, "convert": true}),
         );
     }
+    for index in 0..1600 {
+        let lava = index >= 1200;
+        let mut blocks = vec![json!([
+            0,
+            0,
+            0,
+            match (lava, index % 4) {
+                (false, 0) => -16,
+                (false, 1) => -17,
+                (_, 2) => 0,
+                _ => 4,
+            }
+        ])];
+        for x in -4..=4 {
+            for z in -4..=4 {
+                let n = (next() >> 16) % 8;
+                if n < 6 {
+                    blocks.push(json!([
+                        x,
+                        -1,
+                        z,
+                        match n {
+                            0 => -14,
+                            1 => -15,
+                            2 => -16,
+                            3 => -17,
+                            _ => -2,
+                        }
+                    ]));
+                }
+                if x != 0 || z != 0 {
+                    let n = (next() >> 16) % 16;
+                    if n < 6 {
+                        blocks.push(json!([
+                            x,
+                            0,
+                            z,
+                            match n {
+                                0 => -14,
+                                1 => -15,
+                                2 => -16,
+                                3 => -17,
+                                4 => 0,
+                                _ => 4,
+                            }
+                        ]));
+                    }
+                }
+            }
+        }
+        if index % 4 == 0 {
+            blocks.push(json!([0, 1, 0, if index % 8 == 0 { -16 } else { -17 }]));
+        }
+        scenarios.push(
+            json!({"blocks": blocks, "lava": lava, "fast": lava && index % 3 == 0, "convert": index % 2 == 0}),
+        );
+    }
+    for slab in [-14, -15] {
+        for convert in [false, true] {
+            scenarios.push(json!({"blocks": [[0,0,0,0], [0,-1,0,-2], [0,0,-1,-2], [0,0,1,-2], [-1,0,0,-2], [1,0,0,slab], [1,-1,0,-2], [2,0,0,0]], "lava": false, "fast": false, "convert": convert}));
+        }
+    }
     let input = temp.path().join("input.json");
     let output = temp.path().join("output.json");
     std::fs::write(&input, serde_json::to_vec(&scenarios).unwrap()).unwrap();
@@ -325,6 +389,16 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
         .arg(&input)
         .arg(&output));
     let expected: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    for code in [-16, -17] {
+        assert!(
+            expected.as_array().unwrap().iter().any(|row| row
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change[3].as_i64() == Some(code))),
+            "Java did not waterlog slab code {code}"
+        );
+    }
     let mut differences = Vec::new();
     for (index, (scenario, java)) in scenarios
         .iter()
@@ -360,6 +434,11 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                         source: true,
                         falling: true,
                     })
+                } else if (-17..=-14).contains(&level) {
+                    Cell::Slab {
+                        top: level == -15 || level == -17,
+                        waterlogged: level <= -16,
+                    }
                 } else if level >= 20 {
                     Cell::Fluid(liquid(other, (level - 20) as u8))
                 } else {
@@ -386,6 +465,13 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                     ChangedBlock::Air => -1,
                     ChangedBlock::Solid(Solidified::Stone) => -2,
                     ChangedBlock::Solid(other) => panic!("unexpected solid: {other:?}"),
+                    ChangedBlock::WaterloggedSlab { top } => {
+                        if top {
+                            -17
+                        } else {
+                            -16
+                        }
+                    }
                     ChangedBlock::Fluid(s) => {
                         let offset = if s.kind == kind { 0 } else { 20 };
                         offset

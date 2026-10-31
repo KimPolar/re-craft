@@ -1,4 +1,4 @@
-//! Scheduled fluid spread for air, full blocks and ordinary liquid blocks.
+//! Scheduled fluid spread for air, full blocks, liquids and verified slabs.
 //!
 //! Other blocks are barriers until their fluid occupancy and side shapes are
 //! available. Wet copper grates block flow but count in source checks. The
@@ -15,6 +15,11 @@ pub enum Cell {
     Fluid(FluidState),
     /// Source water inside a copper grate; its block must not be replaced.
     GrateWater(FluidState),
+    /// A half slab, optionally holding source water.
+    Slab {
+        top: bool,
+        waterlogged: bool,
+    },
     /// Unloaded or unsupported data: never replace or traverse it.
     Unknown,
 }
@@ -103,6 +108,7 @@ pub enum ChangedBlock {
     Air,
     Fluid(FluidState),
     Solid(Solidified),
+    WaterloggedSlab { top: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +182,51 @@ fn at(world: &impl Fn(IVec3) -> Cell, pos: Option<IVec3>) -> Cell {
 
 fn source(cell: Cell, kind: FluidKind) -> bool {
     matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) if state.kind == kind && state.source)
+        || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
+}
+
+fn fluid(cell: Cell) -> Option<FluidState> {
+    match cell {
+        Cell::Fluid(state) | Cell::GrateWater(state) => Some(state),
+        Cell::Slab {
+            waterlogged: true, ..
+        } => Some(flowing(FluidKind::Water, 8, false)),
+        _ => None,
+    }
+}
+
+// Two bits describe the occupied halves of a face; their union blocks flow
+// only if it covers the whole face. Solid and unknown cells block all faces.
+fn face(cell: Cell, direction: IVec3) -> u8 {
+    match cell {
+        Cell::Air | Cell::Fluid(_) => 0,
+        Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 3,
+        Cell::Slab { top, .. } if direction == IVec3::Y => {
+            if top {
+                3
+            } else {
+                0
+            }
+        }
+        Cell::Slab { top, .. } if direction == IVec3::NEG_Y => {
+            if top {
+                0
+            } else {
+                3
+            }
+        }
+        Cell::Slab { top, .. } => {
+            if top {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn can_pass(from: Cell, to: Cell, direction: IVec3) -> bool {
+    face(from, direction) | face(to, -direction) != 3
 }
 
 fn flowing(kind: FluidKind, amount: u8, falling: bool) -> FluidState {
@@ -194,11 +245,14 @@ pub fn new_liquid(
     kind: FluidKind,
     settings: Settings,
 ) -> Option<FluidState> {
+    let current = world(position);
     let mut most = 0;
     let mut sources = 0;
     for direction in SIDES {
-        if let Cell::Fluid(state) = at(world, offset(position, direction))
+        let neighbor = at(world, offset(position, direction));
+        if let Some(state) = fluid(neighbor)
             && state.kind == kind
+            && can_pass(current, neighbor, direction)
         {
             most = most.max(state.amount);
             sources += u8::from(state.source);
@@ -206,11 +260,12 @@ pub fn new_liquid(
     }
     if sources >= 2 && settings.converts_source(kind) {
         let below = at(world, offset(position, IVec3::NEG_Y));
-        if below == Cell::Solid || source(below, kind) {
+        if matches!(below, Cell::Solid | Cell::Slab { .. }) || source(below, kind) {
             return Some(flowing(kind, 8, false));
         }
     }
-    if matches!(at(world, offset(position, IVec3::Y)), Cell::Fluid(state) if state.kind == kind) {
+    let above = at(world, offset(position, IVec3::Y));
+    if fluid(above).is_some_and(|state| state.kind == kind) && can_pass(current, above, IVec3::Y) {
         return Some(flowing(kind, 8, true));
     }
     let amount = most.saturating_sub(settings.drop_off(kind));
@@ -221,14 +276,21 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
+        Cell::Slab { .. } => !source(cell, kind),
         Cell::Solid | Cell::GrateWater(_) | Cell::Unknown => false,
     }
 }
 
-fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3) -> bool {
-    match at(world, offset(pos, IVec3::NEG_Y)) {
+fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool {
+    let below = at(world, offset(pos, IVec3::NEG_Y));
+    if !can_pass(world(pos), below, IVec3::NEG_Y) {
+        return false;
+    }
+    match below {
         Cell::Air | Cell::Fluid(_) => true,
-        Cell::GrateWater(_) => false,
+        Cell::Slab {
+            waterlogged: true, ..
+        } => kind == FluidKind::Water,
         _ => false,
     }
 }
@@ -236,13 +298,22 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3) -> bool {
 fn can_replace(
     world: &impl Fn(IVec3) -> Cell,
     position: IVec3,
-    kind: FluidKind,
+    incoming: FluidState,
     down: bool,
 ) -> bool {
     match world(position) {
         Cell::Air => true,
-        Cell::Fluid(state) if state.kind == FluidKind::Water && kind == FluidKind::Lava => down,
-        Cell::Fluid(state) if state.kind == FluidKind::Lava && kind == FluidKind::Water => {
+        Cell::Slab {
+            waterlogged: false, ..
+        } => incoming.kind == FluidKind::Water && incoming.source,
+        Cell::Fluid(state)
+            if state.kind == FluidKind::Water && incoming.kind == FluidKind::Lava =>
+        {
+            down
+        }
+        Cell::Fluid(state)
+            if state.kind == FluidKind::Lava && incoming.kind == FluidKind::Water =>
+        {
             state.amount >= 4
                 || matches!(at(world, offset(position, IVec3::Y)), Cell::Fluid(above) if above.kind == FluidKind::Lava)
         }
@@ -259,6 +330,7 @@ fn slope_distance(
     limit: u8,
 ) -> u16 {
     let mut best = 1000;
+    let current = world(pos);
     for direction in SIDES {
         if direction == -previous {
             continue;
@@ -266,10 +338,16 @@ fn slope_distance(
         let Some(next) = offset(pos, direction) else {
             continue;
         };
-        if !can_search(world(next), kind) {
+        // Slope search asks whether the *flowing* fluid can enter the block;
+        // slabs accept only source water, even when their shape is open.
+        let candidate = world(next);
+        if matches!(candidate, Cell::Slab { .. })
+            || !can_search(candidate, kind)
+            || !can_pass(current, candidate, direction)
+        {
             continue;
         }
-        if is_hole(world, next) {
+        if is_hole(world, next, kind) {
             return u16::from(depth);
         }
         if depth < limit {
@@ -302,18 +380,22 @@ fn side_changes(
     }
     let mut best = 1000;
     let mut changes = Vec::new();
+    let current = world(pos);
     for direction in SIDES {
         let Some(next) = offset(pos, direction) else {
             continue;
         };
         let cell = world(next);
-        if !can_search(cell, state.kind) {
+        if !can_search(cell, state.kind) || !can_pass(current, cell, direction) {
             continue;
         }
         let Some(new) = new_liquid(world, next, state.kind, settings) else {
             continue;
         };
-        let distance = if is_hole(world, next) {
+        if matches!(cell, Cell::Slab { .. }) && !(new.kind == FluidKind::Water && new.source) {
+            continue;
+        }
+        let distance = if is_hole(world, next, state.kind) {
             0
         } else {
             slope_distance(
@@ -329,10 +411,13 @@ fn side_changes(
             changes.clear();
         }
         if distance <= best {
-            if can_replace(world, next, state.kind, false) {
+            if can_replace(world, next, new, false) {
                 changes.push(Change {
                     position: next,
-                    block: ChangedBlock::Fluid(new),
+                    block: match cell {
+                        Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
+                        _ => ChangedBlock::Fluid(new),
+                    },
                 });
             }
             best = distance;
@@ -341,16 +426,20 @@ fn side_changes(
     changes
 }
 
-/// Plan one scheduled tick in air, full blocks and ordinary liquids.
+/// Plan one scheduled tick in air, full blocks, ordinary liquids and slabs.
 pub fn tick(
     world: &impl Fn(IVec3) -> Cell,
     position: IVec3,
     kind: FluidKind,
     settings: Settings,
 ) -> Vec<Change> {
-    let Cell::Fluid(mut current) = world(position) else {
+    let original = world(position);
+    let Some(mut current) = fluid(original) else {
         return Vec::new();
     };
+    if matches!(original, Cell::GrateWater(_)) {
+        return Vec::new();
+    }
     if current.kind != kind {
         return Vec::new();
     }
@@ -368,23 +457,31 @@ pub fn tick(
     }
     let with_self = |pos| {
         if pos == position {
-            Cell::Fluid(current)
+            if matches!(original, Cell::Slab { .. }) {
+                original
+            } else {
+                Cell::Fluid(current)
+            }
         } else {
             world(pos)
         }
     };
     let below_pos = offset(position, IVec3::NEG_Y);
     let below = at(&with_self, below_pos);
-    if below_pos
-        .is_some_and(|pos| can_search(below, kind) && can_replace(&with_self, pos, kind, true))
-    {
+    let next_below = below_pos.and_then(|pos| {
+        (can_search(below, kind) && can_pass(with_self(position), below, IVec3::NEG_Y))
+            .then(|| new_liquid(&with_self, pos, kind, settings))
+            .flatten()
+            .filter(|next| can_replace(&with_self, pos, *next, true))
+    });
+    if let Some(next) = next_below {
         if let Some(below_pos) = below_pos {
-            let next = new_liquid(&with_self, below_pos, kind, settings)
-                .expect("same fluid above produces a falling or source state");
             let block = if kind == FluidKind::Lava
                 && matches!(below, Cell::Fluid(state) if state.kind == FluidKind::Water)
             {
                 ChangedBlock::Solid(Solidified::Stone)
+            } else if let Cell::Slab { top, .. } = below {
+                ChangedBlock::WaterloggedSlab { top }
             } else {
                 ChangedBlock::Fluid(next)
             };
@@ -401,6 +498,10 @@ pub fn tick(
                     if pos == below_pos {
                         match block {
                             ChangedBlock::Fluid(state) => Cell::Fluid(state),
+                            ChangedBlock::WaterloggedSlab { top } => Cell::Slab {
+                                top,
+                                waterlogged: true,
+                            },
                             _ => Cell::Solid,
                         }
                     } else {
@@ -410,7 +511,7 @@ pub fn tick(
                 changes.extend(side_changes(&down, position, current, settings));
             }
         }
-    } else if source(Cell::Fluid(current), kind) || !is_hole(&with_self, position) {
+    } else if source(Cell::Fluid(current), kind) || !is_hole(&with_self, position, kind) {
         changes.extend(side_changes(&with_self, position, current, settings));
     }
     changes

@@ -6913,6 +6913,29 @@ impl LoadedSession {
         self.fluids.get(id.0 as usize).copied().flatten()
     }
 
+    fn slab_top(&self, state: &BlockState) -> Option<bool> {
+        if !state.name.ends_with("_slab")
+            || !self.vanilla_block_ids.as_ref()?.contains(&state.name)
+            || native_world::collision::slab_stair_solid(state) != Some(true)
+        {
+            return None;
+        }
+        match state.properties.get("type")?.as_str() {
+            "top" => Some(true),
+            "bottom" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn simulated_fluid(&self, id: BlockStateId) -> Option<FluidState> {
+        if let Some(fluid) = self.ordinary_fluid(id) {
+            return Some(fluid);
+        }
+        let state = self.world.state(id)?;
+        self.slab_top(state)?;
+        self.fluids.get(id.0 as usize).copied().flatten()
+    }
+
     fn schedule_fluid(&mut self, relative: IVec3, state: FluidState, delay: u64) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -7922,7 +7945,7 @@ impl LoadedSession {
         let new_support = self.world.state(new).and_then(button_support_direction);
         if changed_kind
             && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
-            && let Some(fluid) = self.ordinary_fluid(new)
+            && let Some(fluid) = self.simulated_fluid(new)
             && !(fluid.kind == FluidKind::Lava && self.react_lava(position))
         {
             self.schedule_fluid(position, fluid, settings.delay(fluid.kind));
@@ -7997,7 +8020,7 @@ impl LoadedSession {
             if let Some(kind) = sand {
                 self.schedule_sand(neighbor, kind);
             }
-            if let Some(fluid) = self.ordinary_fluid(id)
+            if let Some(fluid) = self.simulated_fluid(id)
                 && !(fluid.kind == FluidKind::Lava && self.react_lava(neighbor))
             {
                 self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
@@ -8128,6 +8151,15 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::GrateWater(fluid);
         }
+        if let Some(top) = self.slab_top(state) {
+            return fluid_sim::Cell::Slab {
+                top,
+                waterlogged: state
+                    .properties
+                    .get("waterlogged")
+                    .is_some_and(|v| v == "true"),
+            };
+        }
         if self.fluids.get(id.0 as usize).copied().flatten().is_some() {
             return fluid_sim::Cell::Unknown;
         }
@@ -8235,7 +8267,7 @@ impl LoadedSession {
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             self.fluid_pending.remove(&scheduled.key);
             executed += 1;
-            let Some(fluid) = self.ordinary_fluid(id) else {
+            let Some(fluid) = self.simulated_fluid(id) else {
                 continue;
             };
             if fluid.kind != scheduled.key.kind || fluid.source != scheduled.key.source {
@@ -8271,12 +8303,44 @@ impl LoadedSession {
                     fluid_sim::ChangedBlock::Air => self.states[0],
                     fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
                     fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
+                    fluid_sim::ChangedBlock::WaterloggedSlab { top } => {
+                        if self.simulation_cell(change.position)
+                            != (fluid_sim::Cell::Slab {
+                                top,
+                                waterlogged: false,
+                            })
+                        {
+                            continue;
+                        }
+                        let Cell::State(previous) = cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            change.position,
+                            self.states[0],
+                        ) else {
+                            continue;
+                        };
+                        let Some(mut state) = self.world.state(previous).cloned() else {
+                            continue;
+                        };
+                        state.properties.insert("waterlogged".into(), "true".into());
+                        self.intern_block(state)
+                    }
                 };
-                if self.set(change.position, id)
-                    && change.position == relative
-                    && let fluid_sim::ChangedBlock::Fluid(next) = change.block
-                {
-                    self.schedule_fluid(relative, next, delay);
+                if self.set(change.position, id) {
+                    if change.position == relative
+                        && let fluid_sim::ChangedBlock::Fluid(next) = change.block
+                    {
+                        self.schedule_fluid(relative, next, delay);
+                    }
+                    if matches!(
+                        change.block,
+                        fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+                    ) && let Some(water) = self.simulated_fluid(id)
+                    {
+                        self.schedule_fluid(change.position, water, settings.delay(water.kind));
+                    }
                 }
             }
         }
@@ -26307,6 +26371,116 @@ mod tests {
             session.simulation_cell(pos + IVec3::NEG_Y),
             fluid_sim::Cell::GrateWater(_)
         ));
+    }
+
+    #[test]
+    fn waterlogged_slabs_respect_their_collision_faces_and_keep_their_block() {
+        for top in [false, true] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_slab".into()])));
+            let pos = IVec3::new(8, 3, 8);
+            let slab = session.intern_block(state(
+                "minecraft:oak_slab",
+                &[
+                    ("type", if top { "top" } else { "bottom" }),
+                    ("waterlogged", "true"),
+                ],
+            ));
+            session.set_with_notify(pos, slab, false);
+            session.set_with_notify(pos + IVec3::NEG_Y, session.states[0], false);
+            session.set_with_notify(pos + IVec3::X, session.states[0], false);
+            session.set_with_notify(pos + IVec3::X + IVec3::NEG_Y, session.states[3], false);
+            for direction in [IVec3::NEG_X, IVec3::NEG_Z, IVec3::Z] {
+                session.set_with_notify(pos + direction, session.states[3], false);
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            let water = session.simulated_fluid(slab).unwrap();
+            session.schedule_fluid(pos, water, 0);
+            session.advance_fluid_ticks();
+            assert_eq!(
+                session.simulation_cell(pos),
+                fluid_sim::Cell::Slab {
+                    top,
+                    waterlogged: true
+                }
+            );
+            if top {
+                assert!(
+                    matches!(session.simulation_cell(pos + IVec3::NEG_Y), fluid_sim::Cell::Fluid(f) if f.falling)
+                );
+                assert_eq!(
+                    session.simulation_cell(pos + IVec3::X),
+                    fluid_sim::Cell::Air
+                );
+            } else {
+                assert_eq!(
+                    session.simulation_cell(pos + IVec3::NEG_Y),
+                    fluid_sim::Cell::Air
+                );
+                assert!(
+                    matches!(session.simulation_cell(pos + IVec3::X), fluid_sim::Cell::Fluid(f) if f.amount == 7)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_conversion_waterlogs_dry_slabs_and_schedules_water() {
+        for top in [false, true] {
+            for conversion in [false, true] {
+                let mut session = session();
+                session
+                    .set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_slab".into()])));
+                session.set_source_conversion(conversion, false);
+                let pos = IVec3::new(8, 3, 8);
+                let water = FluidState {
+                    kind: FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                };
+                let water_id = session.intern_liquid(water);
+                let slab = session.intern_block(state(
+                    "minecraft:oak_slab",
+                    &[
+                        ("type", if top { "top" } else { "bottom" }),
+                        ("waterlogged", "false"),
+                    ],
+                ));
+                session.set_with_notify(pos, water_id, false);
+                session.set_with_notify(pos + IVec3::X, slab, false);
+                session.set_with_notify(pos + IVec3::X * 2, water_id, false);
+                for offset in [
+                    IVec3::NEG_Y,
+                    IVec3::X + IVec3::NEG_Y,
+                    IVec3::NEG_X,
+                    IVec3::NEG_Z,
+                    IVec3::Z,
+                ] {
+                    session.set_with_notify(pos + offset, session.states[3], false);
+                }
+                session.fluid_ticks.clear();
+                session.fluid_pending.clear();
+                session.schedule_fluid(pos, water, 0);
+                session.advance_fluid_ticks();
+                assert_eq!(
+                    session.simulation_cell(pos + IVec3::X),
+                    fluid_sim::Cell::Slab {
+                        top,
+                        waterlogged: conversion
+                    }
+                );
+                if conversion {
+                    let absolute = session.origin + pos + IVec3::X;
+                    assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                        && key.y == absolute.y
+                        && key.z == absolute.z
+                        && key.kind == FluidKind::Water
+                        && key.source));
+                }
+            }
+        }
     }
 
     #[test]

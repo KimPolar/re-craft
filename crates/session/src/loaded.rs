@@ -142,6 +142,45 @@ pub struct PartialSessionSaveDraft {
     clocks: WorldClockDraft,
 }
 
+/// A partial same-tick snapshot including all recorded POI block transitions.
+/// Untracked entities, villager tickets and other effects still prevent a
+/// playable-world save.
+pub struct PartialSessionPoiSaveDraft {
+    session: PartialSessionSaveDraft,
+    poi: BTreeMap<ChunkPos, native_persistence::poi::ReconciledPoiDraft>,
+}
+
+impl PartialSessionPoiSaveDraft {
+    pub fn session(&self) -> &PartialSessionSaveDraft {
+        &self.session
+    }
+    pub fn poi_chunks(&self) -> &BTreeMap<ChunkPos, native_persistence::poi::ReconciledPoiDraft> {
+        &self.poi
+    }
+
+    pub fn into_save_plan(
+        self,
+        uuid: [i32; 4],
+        player_source: &native_persistence::nbt::NamedTag,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        clock_source: &native_persistence::nbt::NamedTag,
+        timestamp: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        let dimension = self.session.dimension.clone();
+        let mut plan = self.session.into_save_plan(
+            uuid,
+            player_source,
+            entity_sources,
+            clock_source,
+            timestamp,
+        )?;
+        for draft in self.poi.values() {
+            draft.add_to_save_plan(&mut plan, dimension.clone(), draft.source(), timestamp)?;
+        }
+        Ok(plan)
+    }
+}
+
 impl PartialSessionSaveDraft {
     pub fn player_and_terrain(&self) -> &PlayerWorldDraft {
         &self.player_and_terrain
@@ -1388,6 +1427,49 @@ impl LoadedSession {
             entity_chunks,
             clocks,
         })
+    }
+
+    /// Include POI transitions in the same immutable tick-boundary draft as
+    /// the player, terrain, tracked entities and clocks. Registry callbacks
+    /// must validate all supplied data. This is not a complete gameplay save.
+    pub fn draft_player_terrain_entities_clocks_and_poi(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        clock: &native_persistence::nbt::NamedTag,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+        mut resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        mut validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
+        use anyhow::Context;
+        let session = self.draft_player_terrain_entities_and_clocks(
+            player,
+            terrain,
+            clock,
+            tags,
+            air_and_fluid,
+        )?;
+        let mut poi = BTreeMap::new();
+        for position in self.dirty_poi_chunk_positions() {
+            let source = terrain
+                .get(&position)
+                .context("POI terrain source is missing from the session snapshot")?;
+            let draft = self.draft_reconciled_poi_chunk(
+                position,
+                source,
+                &mut resolve_saved_state,
+                &mut validate_state,
+                &mut validate_poi_type,
+            )?;
+            poi.insert(position, draft);
+        }
+        Ok(PartialSessionPoiSaveDraft { session, poi })
     }
 
     fn validate_player_draft_source(
@@ -20456,6 +20538,178 @@ mod tests {
             .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
             .unwrap();
         assert_eq!(plan.chunk_count(), 1);
+    }
+
+    #[test]
+    fn combined_draft_includes_reconciled_poi_and_same_tick_terrain() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            palette::BlockState as SavedState,
+        };
+        struct HeightTags;
+        impl native_resources::packs::ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:lodestone"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:lodestone".into(),
+        ]);
+        let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let source = fixture_chunk_document(home);
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+            ]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Missing)
+            .unwrap();
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        let relative = IVec3::new(4, 0, 4);
+        let absolute = session.origin + relative;
+        assert!(session.set(relative, lodestone));
+        let resolve = |saved: &SavedState| -> anyhow::Result<BlockState> {
+            Ok(BlockState {
+                name: String::from_utf16(&saved.name.0)?,
+                properties: saved
+                    .properties
+                    .iter()
+                    .map(|(k, v)| Ok((String::from_utf16(&k.0)?, String::from_utf16(&v.0)?)))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        };
+        let validate = |block: &BlockState| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                block.properties.is_empty()
+                    && matches!(
+                        block.name.as_str(),
+                        "minecraft:air" | "minecraft:stone" | "minecraft:lodestone"
+                    )
+            );
+            Ok(())
+        };
+        assert!(
+            session
+                .draft_player_terrain_entities_clocks_and_poi(
+                    &player,
+                    &BTreeMap::from([(home, &source)]),
+                    &clock,
+                    &tags,
+                    |state| Ok((state.name.matches("minecraft:air"), false)),
+                    resolve,
+                    |_| anyhow::bail!("unknown block state"),
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        session.poi_chunks.remove(&home);
+        assert!(
+            session
+                .draft_player_terrain_entities_clocks_and_poi(
+                    &player,
+                    &BTreeMap::from([(home, &source)]),
+                    &clock,
+                    &tags,
+                    |state| Ok((state.name.matches("minecraft:air"), false)),
+                    resolve,
+                    validate,
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        session.poi_chunks.insert(home, SavedPoiData::Missing);
+        let snapshot = session
+            .draft_player_terrain_entities_clocks_and_poi(
+                &player,
+                &BTreeMap::from([(home, &source)]),
+                &clock,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+                resolve,
+                validate,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(snapshot.poi_chunks().len(), 1);
+        let poi = &snapshot.poi_chunks()[&home];
+        assert!(poi.source().is_none());
+        let section = poi
+            .document()
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("0")
+            .unwrap();
+        let Some(Tag::List { values, .. }) = section.get("Records") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("pos"),
+            Some(&Tag::IntArray(vec![absolute.x, absolute.y, absolute.z]))
+        );
+        assert_eq!(
+            values[0].get("type"),
+            Some(&Tag::String("minecraft:lodestone".into()))
+        );
+        assert_eq!(values[0].get("free_tickets"), Some(&Tag::Int(0)));
+        let terrain = snapshot.session().player_and_terrain().chunks()[&home].document();
+        let sections = native_persistence::palette::decode_sections(&terrain.value).unwrap();
+        assert!(
+            sections[0]
+                .blocks
+                .as_ref()
+                .unwrap()
+                .block(4, 0, 4)
+                .unwrap()
+                .name
+                .matches("minecraft:lodestone")
+        );
+        assert!(snapshot.session().entity_chunks().is_empty());
+        assert!(session.set(relative, session.states[3]));
+        let section = snapshot.poi_chunks()[&home]
+            .document()
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("0")
+            .unwrap();
+        let Some(Tag::List { values, .. }) = section.get("Records") else {
+            panic!()
+        };
+        assert_eq!(
+            values[0].get("type"),
+            Some(&Tag::String("minecraft:lodestone".into())),
+            "later session edits must not mutate the captured draft"
+        );
+        let plan = snapshot
+            .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
+            .unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+        assert_eq!(plan.poi_chunk_count(), 1);
     }
 
     #[test]

@@ -36,10 +36,11 @@ public class BucketInventoryOracle {
       player.creative=creative; player.dropped=null; player.inventory=new Inventory(player,new EntityEquipment());
       if(full) for(int i=0;i<36;i++) player.inventory.setItem(i,new ItemStack(Items.STONE,64));
       var result=lava?Items.LAVA_BUCKET:Items.WATER_BUCKET;
+      var emptied=BucketItem.getEmptySuccessItem(new ItemStack(result),player);
       if(existing) player.inventory.setItem(5,new ItemStack(result));
       int slot=offhand?40:0; var held=new ItemStack(Items.BUCKET,count); player.inventory.setItem(slot,held);
       player.inventory.setItem(slot,ItemUtils.createFilledResult(held,player,new ItemStack(result)));
-      var row=new JsonObject(); row.addProperty("creative",creative); row.addProperty("offhand",offhand); row.addProperty("full",full); row.addProperty("existing",existing); row.addProperty("lava",lava); row.addProperty("count",count); row.addProperty("drop",describe(player.dropped));
+      var row=new JsonObject(); row.addProperty("creative",creative); row.addProperty("offhand",offhand); row.addProperty("full",full); row.addProperty("existing",existing); row.addProperty("lava",lava); row.addProperty("count",count); row.addProperty("drop",describe(player.dropped)); row.addProperty("empty",describe(emptied));
       var slots=new JsonArray(); for(int i=0;i<36;i++) slots.add(describe(player.inventory.getItem(i))); row.add("slots",slots); row.addProperty("off",describe(player.inventory.getItem(40))); output.add(row);
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(output));

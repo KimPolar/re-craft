@@ -12,16 +12,23 @@ use crate::{
 
 /// Apply one constant layer to the Java default (`false`).
 pub fn fast_lava_from_attributes(attributes: &Value) -> Result<bool> {
+    boolean_from_attributes(attributes, "gameplay/fast_lava")
+}
+
+fn boolean_from_attributes(attributes: &Value, attribute: &str) -> Result<bool> {
     let attributes = attributes
         .as_object()
         .context("environment attributes must be an object")?;
     let mut fast = None;
     for (name, value) in attributes {
         let id = ResourceId::parse(name)?;
-        if id.namespace != "minecraft" || id.path != "gameplay/fast_lava" {
+        if id.namespace != "minecraft" || id.path != attribute {
             continue;
         }
-        ensure!(fast.is_none(), "duplicate fast lava attribute");
+        ensure!(
+            fast.is_none(),
+            "duplicate environment attribute {attribute}"
+        );
         let (modifier, argument) = if let Some(value) = value.as_bool() {
             (BooleanModifier::Override, value)
         } else {
@@ -45,6 +52,9 @@ pub struct FastLavaEnvironment {
     base: bool,
     tracks: Vec<FastLavaTrack>,
 }
+
+/// The same boolean timeline sampler is shared by both fluid attributes.
+pub type WaterEvaporationEnvironment = FastLavaEnvironment;
 
 #[derive(Clone, Debug)]
 struct FastLavaTrack {
@@ -112,6 +122,46 @@ pub fn load_fast_lava_environment(
     provider: &mut impl ResourceProvider,
     dimension_type: &str,
 ) -> Result<FastLavaEnvironment> {
+    load_boolean_environment(provider, dimension_type, "gameplay/fast_lava")
+}
+
+/// Water evaporation can also vary by biome. Reject such packs until biome
+/// boundary sampling can reproduce the server's positional lookup.
+pub fn load_water_evaporation_environment(
+    provider: &mut impl ResourceProvider,
+    dimension_type: &str,
+) -> Result<WaterEvaporationEnvironment> {
+    let biomes = provider.list_data("worldgen/biome")?;
+    ensure!(!biomes.is_empty(), "biome registry is empty");
+    for id in biomes {
+        let path = format!("data/{}/worldgen/biome/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing biome {path}"))?;
+        let biome: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("invalid biome {path}"))?;
+        if let Some(attributes) = biome.get("attributes") {
+            for name in attributes
+                .as_object()
+                .context("invalid biome attributes")?
+                .keys()
+            {
+                let name = ResourceId::parse(name)?;
+                ensure!(
+                    name.namespace != "minecraft" || name.path != "gameplay/water_evaporates",
+                    "water evaporation varies by biome"
+                );
+            }
+        }
+    }
+    load_boolean_environment(provider, dimension_type, "gameplay/water_evaporates")
+}
+
+fn load_boolean_environment(
+    provider: &mut impl ResourceProvider,
+    dimension_type: &str,
+    attribute: &str,
+) -> Result<FastLavaEnvironment> {
     let id = ResourceId::parse(dimension_type)?;
     let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
     let bytes = provider
@@ -124,7 +174,7 @@ pub fn load_fast_lava_environment(
         "dimension type {path} is not an object"
     );
     let base = match definition.get("attributes") {
-        Some(attributes) => fast_lava_from_attributes(attributes)
+        Some(attributes) => boolean_from_attributes(attributes, attribute)
             .with_context(|| format!("invalid attributes in {path}"))?,
         None => false,
     };
@@ -140,8 +190,8 @@ pub fn load_fast_lava_environment(
         let mut found = false;
         for (name, track) in tracks {
             let attr = ResourceId::parse(name)?;
-            if attr.namespace == "minecraft" && attr.path == "gameplay/fast_lava" {
-                ensure!(!found, "duplicate fast lava attribute");
+            if attr.namespace == "minecraft" && attr.path == attribute {
+                ensure!(!found, "duplicate environment attribute {attribute}");
                 found = true;
                 result.tracks.push(parse_fast_lava_track(&timeline, track)?);
             }
@@ -366,11 +416,59 @@ mod tests {
             Ok(self.0.get(path).map(|v| serde_json::to_vec(v).unwrap()))
         }
         fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+            if folder == "worldgen/biome"
+                && self.0.contains_key("data/example/worldgen/biome/test.json")
+            {
+                return Ok(vec![ResourceId::parse("example:test")?]);
+            }
             if folder == "timeline" && self.0.contains_key("data/example/timeline/test.json") {
                 Ok(vec![ResourceId::parse("example:test")?])
             } else {
                 Ok(Vec::new())
             }
+        }
+    }
+
+    #[test]
+    fn water_evaporation_uses_dimension_and_active_timeline_and_refuses_biome_overrides() {
+        let mut source = Memory(BTreeMap::from([
+            (
+                "data/example/dimension_type/test.json".into(),
+                json!({"attributes":{"gameplay/water_evaporates":true}, "timelines":["example:test"]}),
+            ),
+            ("data/example/worldgen/biome/test.json".into(), json!({})),
+            (
+                "data/example/timeline/test.json".into(),
+                json!({"clock":"example:clock", "tracks":{"gameplay/water_evaporates":{"modifier":"xor", "keyframes":[{"ticks":0,"value":false},{"ticks":2,"value":true}]}}}),
+            ),
+        ]));
+        let environment = load_water_evaporation_environment(&mut source, "example:test").unwrap();
+        assert_eq!(environment.sample(|_| Some(0)), Some(true));
+        assert_eq!(environment.sample(|_| Some(2)), Some(false));
+        assert_eq!(environment.sample(|_| None), None);
+        source.0.insert(
+            "data/example/worldgen/biome/test.json".into(),
+            json!({"attributes":{"gameplay/water_evaporates":false}}),
+        );
+        assert!(load_water_evaporation_environment(&mut source, "example:test").is_err());
+        source.0.remove("data/example/worldgen/biome/test.json");
+        assert!(load_water_evaporation_environment(&mut source, "example:test").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn installed_dimensions_supply_water_evaporation_rules() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        for (dimension, expected) in [
+            ("minecraft:overworld", false),
+            ("minecraft:the_nether", true),
+            ("minecraft:the_end", false),
+        ] {
+            let environment = load_water_evaporation_environment(&mut source, dimension).unwrap();
+            assert_eq!(environment.sample(|_| Some(0)), Some(expected));
         }
     }
 

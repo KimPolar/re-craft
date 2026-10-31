@@ -826,6 +826,18 @@ fn prepare_existing_world(
                 }
             }
         });
+        let water_evaporation = world.dimension_type.as_deref().and_then(|dimension_type| {
+            match native_resources::fluid_environment::load_water_evaporation_environment(
+                &mut resources,
+                dimension_type,
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("Water evaporation rules are unavailable: {error:#}");
+                    None
+                }
+            }
+        });
         let sky_timeline = world.dimension_type.as_deref().and_then(|dimension_type| {
             match preview_lighting::SkyTimeline::load(&mut resources, dimension_type) {
                 Ok(timeline) if timeline.is_animated() => Some(timeline),
@@ -882,6 +894,9 @@ fn prepare_existing_world(
             && let Err(error) = session.set_fast_lava_environment(Arc::new(environment))
         {
             eprintln!("Fast lava environment is unavailable; using dimension fallback: {error}");
+        }
+        if let Some(environment) = water_evaporation {
+            session.set_water_evaporation_environment(Arc::new(environment));
         }
         session.set_player_uuid(reader.singleplayer_uuid_words()?);
         match reader.world_spawn() {

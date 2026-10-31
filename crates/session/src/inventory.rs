@@ -1443,6 +1443,30 @@ impl PlayerInventory {
         Some(remainder)
     }
 
+    /// Java replaces the whole held stack with a fresh bucket after emptying.
+    pub(crate) fn empty_bucket(&mut self, hand: PlayerSlot, creative: bool) -> bool {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return false;
+        }
+        let Some(item) = self.slot(hand) else {
+            return false;
+        };
+        if !matches!(
+            item.id(),
+            "minecraft:water_bucket" | "minecraft:lava_bucket"
+        ) || !ordinary_return_supported(item)
+        {
+            return false;
+        }
+        if !creative {
+            self.set_slot(
+                hand,
+                ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![])),
+            );
+        }
+        true
+    }
+
     /// Add a supported dropped stack using Java's selected-slot, offhand,
     /// other-stack, then empty-slot order. The remainder stays in `source`.
     pub fn pickup_stack(&mut self, source: &mut Option<ItemStack>, creative: bool) -> bool {
@@ -3037,6 +3061,16 @@ mod tests {
             assert_eq!(
                 describe(inventory.slot(PlayerSlot::Offhand)),
                 row["off"].as_str().unwrap(),
+                "{row}"
+            );
+            inventory.set_slot(
+                hand,
+                ItemStack::new(result.into(), 1, 1, Tag::Compound(vec![])),
+            );
+            assert!(inventory.empty_bucket(hand, flag("creative")));
+            assert_eq!(
+                describe(inventory.slot(hand)),
+                row["empty"].as_str().unwrap(),
                 "{row}"
             );
         }

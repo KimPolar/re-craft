@@ -133,6 +133,16 @@ impl Spline {
             Self::Multipoint { interpolation, .. } => *interpolation,
         }
     }
+    pub fn domain_axes(&self) -> u8 {
+        match self {
+            Self::Constant(_) => 0,
+            Self::Multipoint {
+                coordinate, points, ..
+            } => points
+                .iter()
+                .fold(coordinate.5, |axes, point| axes | point.value.domain_axes()),
+        }
+    }
     pub fn range(&self) -> Interval {
         match self {
             Self::Constant(value) => Interval::exact(*value),

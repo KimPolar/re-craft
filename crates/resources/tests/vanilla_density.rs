@@ -81,21 +81,16 @@ fn pure_functions_match_java_sampler() {
     expressions.push(json!({"type":"minecraft:range_choice", "input":gradient, "min_inclusive":-0.5, "max_exclusive":0.5, "when_in_range":reverse, "when_out_of_range":0.125}));
     let zero = json!({"type":"minecraft:gradient", "axis":"y", "from_coordinate":0, "to_coordinate":1, "from_value":0.0, "to_value":0.0});
     let negative = json!({"type":"minecraft:negate", "input":1.0});
-    for (index, (left, right)) in [
+    for (left, right) in [
         (gradient.clone(), reverse.clone()),
         (json!(1.0), gradient.clone()),
         (gradient.clone(), json!(3.0)),
         (json!(-2.0), json!(0.0)),
         (zero.clone(), reverse.clone()),
         (gradient.clone(), json!(-0.0)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         expressions.push(json!({"type":"div", "left":left, "right":right}));
-        if index < 3 {
-            expressions.push(json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"div", "left":left, "right":right}}));
-        }
+        expressions.push(json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"div", "left":left, "right":right}}));
     }
     for thresholds in [vec![0.0], vec![-0.5, 0.0, 0.0, 0.5]] {
         let functions = (0..=thresholds.len())
@@ -122,6 +117,20 @@ fn pure_functions_match_java_sampler() {
     let nonlinear = json!({"type":"minecraft:mul", "left":{"type":"minecraft:square", "input":gradient}, "right":reverse});
     let infinity = json!({"type":"square", "input":{"type":"square", "input":{"type":"square", "input":1000000.0}}});
     let negative_infinity = json!({"type":"negate", "input":infinity});
+    let z_gradient = json!({"type":"gradient","axis":"z","from_coordinate":-20,"to_coordinate":40,"from_value":-1,"to_value":1});
+    for varying in [
+        json!(0),
+        gradient.clone(),
+        reverse.clone(),
+        z_gradient.clone(),
+        json!({"type":"add","left":gradient,"right":reverse}),
+        json!({"type":"add","left":reverse,"right":z_gradient}),
+        json!({"type":"add","left":gradient,"right":z_gradient}),
+    ] {
+        let interpolated = json!({"type":"interpolated", "cell_size_xz":4,"cell_size_y":8,"input":{"type":"add","left":infinity,"right":varying}});
+        expressions.push(interpolated.clone());
+        expressions.push(json!({"type":"add", "left":interpolated, "right":z_gradient}));
+    }
     expressions.push(infinity.clone());
     for alpha in [json!(-0.5), json!(0.5), json!(1.5)] {
         expressions.push(

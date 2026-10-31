@@ -27,7 +27,7 @@ const MAX_NODES: usize = 100_000;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
-pub struct DensityFunction(Node, usize, usize, bool, Interval);
+pub struct DensityFunction(Node, usize, usize, bool, Interval, u8);
 
 type SampleMemo = HashMap<(usize, i32, i32, i32, bool), f32>;
 
@@ -312,6 +312,11 @@ impl DensityFunction {
                 cell_y,
             } => {
                 debug_assert!(!volume, "nested interpolation is not supported");
+                // The Java compiler slices axes outside this function's domain
+                // to zero before sampling, even when the result is non-finite.
+                let x = if self.5 & 1 == 0 { 0 } else { x };
+                let y = if self.5 & 2 == 0 { 0 } else { y };
+                let z = if self.5 & 4 == 0 { 0 } else { z };
                 let rx = x.rem_euclid(*cell_xz);
                 let ry = y.rem_euclid(*cell_y);
                 let rz = z.rem_euclid(*cell_xz);
@@ -462,10 +467,33 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     }
     let mut has_interpolation =
         matches!(node, Node::Interpolated { .. }) || children.iter().any(|child| child.3);
+    let mut axes = children.iter().fold(0, |axes, child| axes | child.5);
+    match &node {
+        Node::Gradient { axis, .. } => axes = 1 << axis,
+        Node::Noise {
+            xz_scale, y_scale, ..
+        } => {
+            if *xz_scale != 0.0 {
+                axes |= 5;
+            }
+            if *y_scale != 0.0 {
+                axes |= 2;
+            }
+        }
+        Node::Shift { kind, .. } => {
+            axes = match kind {
+                ShiftKind::A | ShiftKind::B => 5,
+                ShiftKind::ThreeDimensional => 7,
+            }
+        }
+        Node::UnblendedAlpha | Node::UnblendedOffset => axes = 5,
+        _ => {}
+    }
     if let Node::Spline(spline) = &node {
         depth = 1 + spline.depth();
         work = 1usize.saturating_add(spline.work());
         has_interpolation = spline.has_interpolation();
+        axes = spline.domain_axes();
     }
     ensure!(depth <= MAX_DEPTH, "density function exceeds maximum depth");
     ensure!(
@@ -535,6 +563,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         work,
         has_interpolation,
         range,
+        axes,
     )))
 }
 

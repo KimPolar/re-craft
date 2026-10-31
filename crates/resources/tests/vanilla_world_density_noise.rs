@@ -171,6 +171,21 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             };
             fixtures.push(json!({"id":id,"rust_expression":rust_expression,"java_expression":java_expression}));
         }
+        for (xz_scale, y_scale, shifted) in [
+            (0.0, 0.0, false),
+            (0.0, 0.021, false),
+            (0.013, 0.0, false),
+            (0.0, 0.0, true),
+        ] {
+            let mut rust_noise =
+                json!({"type":"noise","noise":id,"xz_scale":xz_scale,"y_scale":y_scale});
+            if shifted {
+                rust_noise["shift_x"] = gradient.clone();
+            }
+            let mut java_noise = rust_noise.clone();
+            java_noise["noise"] = definition.clone();
+            fixtures.push(json!({"id":id,"rust_expression":{"type":"interpolated","input":rust_noise,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":java_noise,"cell_size_xz":4,"cell_size_y":8}}));
+        }
         for kind in ["shift_a", "shift_b", "shift"] {
             let rust_shift = json!({"type":kind,"noise":id});
             let java_shift = json!({"type":kind,"noise":definition});

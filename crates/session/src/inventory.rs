@@ -2328,6 +2328,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "emerald",
     "lapis_lazuli",
     "redstone",
+    "compass",
     "quartz",
     "raw_iron",
     "raw_gold",
@@ -2461,7 +2462,7 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     };
     let mut max = default;
-    let mut seen = 0_u8;
+    let mut seen = 0_u16;
     for (name, value) in entries {
         let flag = if name.matches("minecraft:max_stack_size") {
             max = value
@@ -2497,6 +2498,14 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         } else if name.matches("minecraft:tool") {
             crate::custom_tool::Tool::parse(value)?;
             128
+        } else if id == "minecraft:compass" && name.matches("minecraft:lodestone_tracker") {
+            crate::lodestone::Tracker::parse(value)?;
+            256
+        } else if id == "minecraft:compass" && name.matches("!minecraft:lodestone_tracker") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            512
         } else if name.matches("minecraft:enchantments")
             && ordinary_item_default_durability(id).is_some()
         {
@@ -2534,6 +2543,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & 192 == 192 {
+        return None;
+    }
+    if seen & 768 == 768 {
         return None;
     }
     // Durable item prototypes require special stackability rules when their

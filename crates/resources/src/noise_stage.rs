@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::{
     density::{DensityCompiler, DensityEvaluator, DensityFunction, WorldgenRandom},
-    noise_router::NoiseRouter,
+    noise_router::{NoiseRouter, RouterField},
     packs::{ResourceId, ResourceProvider},
 };
 
@@ -201,6 +201,34 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 }
 
 impl NoiseStageGenerator {
+    pub fn sea_level(&self) -> i32 {
+        self.sea_level
+    }
+
+    pub fn random_algorithm(&self) -> WorldgenRandom {
+        self.router.random
+    }
+
+    /// Preliminary surface values in Z, X order, for the material pass.
+    pub fn preliminary_surface(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Result<Vec<f32>> {
+        let x = chunk_x
+            .checked_mul(16)
+            .context("chunk X exceeds block-coordinate range")?;
+        let z = chunk_z
+            .checked_mul(16)
+            .context("chunk Z exceeds block-coordinate range")?;
+        self.router.sample_block_volume(
+            evaluator,
+            RouterField::ChunkSurfaceLevel,
+            [x, 0, z],
+            [16, 1, 16],
+        )
+    }
     /// Load only if older-chunk blending and structure terrain adjustments are absent.
     /// Block-state encodings are preserved and resolved against the registry later.
     pub fn load_without_terrain_adjustments(

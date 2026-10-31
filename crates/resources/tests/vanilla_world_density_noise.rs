@@ -154,17 +154,47 @@ fn seeded_noise_functions_and_interpolation_match_java() {
             };
             fixtures.push(json!({"id":id,"rust_expression":rust_expression,"java_expression":java_expression}));
         }
+        for kind in ["shift_a", "shift_b", "shift"] {
+            let rust_shift = json!({"type":kind,"noise":id});
+            let java_shift = json!({"type":kind,"noise":definition});
+            fixtures
+                .push(json!({"id":id,"rust_expression":rust_shift,"java_expression":java_shift}));
+            fixtures.push(json!({"id":id,"rust_expression":{"type":"interpolated","input":rust_shift,"cell_size_xz":4,"cell_size_y":8},"java_expression":{"type":"interpolated","input":java_shift,"cell_size_xz":4,"cell_size_y":8}}));
+        }
     }
     for id in [
         "minecraft:overworld/ore_vein/toggle",
         "minecraft:overworld/ore_vein/richness",
         "minecraft:overworld/ore_vein/gap",
         "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
+        "minecraft:shift_x",
+        "minecraft:shift_z",
+        "minecraft:overworld/temperature",
+        "minecraft:overworld/vegetation",
+        "minecraft:overworld/continents",
+        "minecraft:overworld/erosion",
+        "minecraft:overworld/ridges",
+        "minecraft:overworld/ridges_folded",
+        "minecraft:overworld_large_biomes/temperature",
+        "minecraft:overworld_large_biomes/vegetation",
+        "minecraft:overworld_large_biomes/continents",
+        "minecraft:overworld_large_biomes/erosion",
     ] {
         let mut noise_ids = std::collections::BTreeSet::new();
         let java_expression = inline_installed(json!(id), &mut sources, &mut data, &mut noise_ids);
-        assert_eq!(noise_ids.len(), 1, "fixture {id} must use one named noise");
-        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"rust_expression":id,"java_expression":java_expression}));
+        assert!(!noise_ids.is_empty(), "fixture {id} must use a named noise");
+        let mut noises = serde_json::Map::new();
+        for name in &noise_ids {
+            let path = format!(
+                "data/minecraft/worldgen/noise/{}.json",
+                name.strip_prefix("minecraft:").unwrap()
+            );
+            noises.insert(
+                name.clone(),
+                serde_json::from_slice(data.0.get(&path).unwrap()).unwrap(),
+            );
+        }
+        fixtures.push(json!({"id":noise_ids.into_iter().next().unwrap(),"noises":noises,"rust_expression":id,"java_expression":java_expression}));
     }
     let input = temp.path().join("fixtures.json");
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();

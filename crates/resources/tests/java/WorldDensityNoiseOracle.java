@@ -2,6 +2,7 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.JsonOps;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.Holder;
 import net.minecraft.resources.Identifier;
@@ -28,15 +29,24 @@ public class WorldDensityNoiseOracle {
         for (int i=0;i<fixtures.size();i++) {
             var fixture=fixtures.get(i).getAsJsonObject();
             String id=fixture.get("id").getAsString();
+            var noiseNames = new HashMap<NormalNoise,String>();
+            if (fixture.has("noises")) {
+                for (var entry:fixture.getAsJsonObject("noises").entrySet()) {
+                    var definition=NormalNoise.DIRECT_CODEC.parse(JsonOps.INSTANCE,entry.getValue()).getOrThrow();
+                    String previous=noiseNames.put(definition,entry.getKey());
+                    if (previous != null && !previous.equals(entry.getKey())) throw new IllegalStateException("ambiguous noise definitions");
+                }
+            }
             var function=DensityFunctions.DIRECT_CODEC.parse(JsonOps.INSTANCE,fixture.get("java_expression")).getOrThrow();
             for (int mode=0;mode<2;mode++) for (long seed:seeds) {
                 RandomSource root=mode==0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
                 var factory=root.forkPositional();
                 var ctx=new DensityFunction.CompileContext() {
                     public Noise createNoiseSampler(Holder<NormalNoise> noise) {
-                        if (id.equals("minecraft:nether/temperature")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed));
-                        if (id.equals("minecraft:nether/vegetation")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed + 1));
-                        return noise.value().create(factory.fromHashOf(Identifier.parse(id)));
+                        String name=noiseNames.getOrDefault(noise.value(),id);
+                        if (name.equals("minecraft:nether/temperature")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed));
+                        if (name.equals("minecraft:nether/vegetation")) return noise.value().createForLegacyNetherBiome(new LegacyRandomSource(seed + 1));
+                        return noise.value().create(factory.fromHashOf(Identifier.parse(name)));
                     }
                     public RandomSource createRandom(Identifier name) { return factory.fromHashOf(name); }
                     public RandomSource createEndIslandRandom() { return new LegacyRandomSource(seed); }

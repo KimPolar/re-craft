@@ -99,6 +99,10 @@ enum Node {
         shifts: [Arc<DensityFunction>; 3],
         shift_mode: u8,
     },
+    Shift {
+        noise: Arc<NormalNoise>,
+        kind: ShiftKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +110,12 @@ enum Binary {
     Add,
     Sub,
     Mul,
+}
+#[derive(Clone, Copy, Debug)]
+enum ShiftKind {
+    A,
+    B,
+    ThreeDimensional,
 }
 #[derive(Clone, Copy, Debug)]
 enum ExtremumPlan {
@@ -341,6 +351,28 @@ impl DensityFunction {
                 }
                 noise.sample(px, py, pz)
             }
+            Node::Shift { noise, kind } => match (kind, volume) {
+                (ShiftKind::A, false) => {
+                    noise.sample(f64::from(x) * 0.25, 0.0, f64::from(z) * 0.25) * 4.0
+                }
+                (ShiftKind::A, true) => noise.sample_scaled_volume(x, 0, z, 0.25, 0.0) * 4.0,
+                (ShiftKind::B, false) => {
+                    noise.sample(f64::from(z) * 0.25, f64::from(x) * 0.25, 0.0) * 4.0
+                }
+                (ShiftKind::B, true) => {
+                    noise.sample_scaled_volume_weighted(z, x, 0, 0.25, 0.25, 4.0)
+                }
+                (ShiftKind::ThreeDimensional, false) => {
+                    noise.sample(
+                        f64::from(x) * 0.25,
+                        f64::from(y) * 0.25,
+                        f64::from(z) * 0.25,
+                    ) * 4.0
+                }
+                (ShiftKind::ThreeDimensional, true) => {
+                    noise.sample_scaled_volume(x, y, z, 0.25, 0.25) * 4.0
+                }
+            },
         }
     }
 }
@@ -361,7 +393,7 @@ fn squeeze(a: f32) -> f32 {
 
 fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let children: Vec<&Arc<DensityFunction>> = match &node {
-        Node::Constant(_) | Node::Gradient { .. } => vec![],
+        Node::Constant(_) | Node::Gradient { .. } | Node::Shift { .. } => vec![],
         Node::Reference(value)
         | Node::Cache(value)
         | Node::Clamp { input: value, .. }
@@ -443,6 +475,10 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Noise { noise, .. } => {
             let (min, max) = noise.range();
             Interval::bounds(min, max)
+        }
+        Node::Shift { noise, .. } => {
+            let (min, max) = noise.range();
+            Interval::bounds(min, max).mul(Interval::exact(4.0))
         }
     };
     Ok(Arc::new(DensityFunction(
@@ -632,6 +668,18 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
         }
         let node = match id.path.as_str() {
             "constant" => Node::Constant(number(field("value")?)?),
+            "shift_a" | "shift_b" | "shift" => {
+                let name = field("noise")?
+                    .as_str()
+                    .context("shift noise must reference a registered noise definition")?;
+                let noise = self.noise(name)?;
+                let kind = match id.path.as_str() {
+                    "shift_a" => ShiftKind::A,
+                    "shift_b" => ShiftKind::B,
+                    _ => ShiftKind::ThreeDimensional,
+                };
+                Node::Shift { noise, kind }
+            }
             "clamp" => {
                 let min = number(field("min")?)?;
                 let max = number(field("max")?)?;
@@ -1016,6 +1064,43 @@ mod tests {
             compiler
                 .compile(&json!({"type":"clamp","input":0,"min":1,"max":-1}))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn shift_functions_share_noise_and_horizontal_shifts_ignore_height() {
+        let mut data = Data::default();
+        data.0.insert(
+            "data/test/worldgen/noise/offset.json".to_owned(),
+            br#"{"base_octave":-3}"#.to_vec(),
+        );
+        let mut compiler =
+            DensityCompiler::with_world_seed(&mut data, 47, WorldgenRandom::Xoroshiro);
+        let a = compiler
+            .compile(&json!({"type":"shift_a","noise":"test:offset"}))
+            .unwrap();
+        let b = compiler
+            .compile(&json!({"type":"shift_b","noise":"test:offset"}))
+            .unwrap();
+        let c = compiler
+            .compile(&json!({"type":"shift","noise":"test:offset"}))
+            .unwrap();
+        let (
+            Node::Shift { noise: first, .. },
+            Node::Shift { noise: second, .. },
+            Node::Shift { noise: third, .. },
+        ) = (&a.0, &b.0, &c.0)
+        else {
+            panic!("expected shift functions");
+        };
+        assert!(Arc::ptr_eq(first, second) && Arc::ptr_eq(first, third));
+        assert_eq!(
+            a.sample(12, -100, 23).to_bits(),
+            a.sample(12, 100, 23).to_bits()
+        );
+        assert_eq!(
+            b.sample(12, -100, 23).to_bits(),
+            b.sample(12, 100, 23).to_bits()
         );
     }
 }

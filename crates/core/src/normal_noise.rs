@@ -241,6 +241,18 @@ fn legacy_fbm(
     Ok(stack)
 }
 impl NormalNoise {
+    pub fn sample_scaled_volume_weighted(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        xz_scale: f64,
+        y_scale: f64,
+        weight: f32,
+    ) -> f32 {
+        self.stack
+            .sample_scaled_volume_weighted(x, y, z, xz_scale, y_scale, weight)
+    }
     pub fn sample_scaled_volume(&self, x: i32, y: i32, z: i32, xz_scale: f64, y_scale: f64) -> f32 {
         self.stack.sample_scaled_volume(x, y, z, xz_scale, y_scale)
     }

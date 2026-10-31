@@ -26,6 +26,16 @@ fn catalog_compiles_installed_density_functions() {
         "minecraft:overworld/ore_vein/toggle",
         "minecraft:overworld/ore_vein/richness",
         "minecraft:overworld/caves/spaghetti_2d_thickness_modulator",
+        "minecraft:shift_x",
+        "minecraft:shift_z",
+        "minecraft:overworld/temperature",
+        "minecraft:overworld/vegetation",
+        "minecraft:overworld/continents",
+        "minecraft:overworld/erosion",
+        "minecraft:overworld_large_biomes/temperature",
+        "minecraft:overworld_large_biomes/vegetation",
+        "minecraft:overworld_large_biomes/continents",
+        "minecraft:overworld_large_biomes/erosion",
     ] {
         assert!(
             supported.iter().any(|name| name == expected),

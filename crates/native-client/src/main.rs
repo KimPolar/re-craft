@@ -913,6 +913,8 @@ fn prepare_existing_world(
             let pos = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
             let entities = chunk_stream::read_entity_data(&mut reader, pos);
             session.set_initial_entity_chunk(pos, entities)?;
+            let poi = chunk_stream::read_poi_data(&mut reader, pos);
+            session.set_initial_poi_chunk(pos, poi)?;
             if heightmap_tags.is_some()
                 && let Err(error) = session.prepare_initial_spawn_heightmaps(saved)
             {

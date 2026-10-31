@@ -19,7 +19,7 @@ use native_persistence::{
 use native_resources::heightmap_tags::HeightmapTags;
 use native_session::{
     GameSession,
-    loaded::{LoadedSession, SavedEntityData},
+    loaded::{LoadedSession, SavedEntityData, SavedPoiData},
 };
 use native_world::loaded::{ChunkPos, World};
 
@@ -53,6 +53,7 @@ struct Request {
 struct ChunkPayload {
     world: Option<World>,
     entities: SavedEntityData,
+    poi: SavedPoiData,
     heightmaps: Option<SpawnHeightmaps>,
 }
 
@@ -103,6 +104,7 @@ impl ChunkStreamer {
                 return Ok(Some(ChunkPayload {
                     world: None,
                     entities: read_entity_data(&mut reader, pos),
+                    poi: read_poi_data(&mut reader, pos),
                     heightmaps: None,
                 }));
             }
@@ -119,6 +121,7 @@ impl ChunkStreamer {
             };
             let world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
             let entities = read_entity_data(&mut reader, pos);
+            let poi = read_poi_data(&mut reader, pos);
             let heightmaps = heightmap_context.as_ref().and_then(|(bounds, tags)| {
                 match native_session::spawn_heightmaps::prepare(&chunk, &world, *bounds, tags) {
                     Ok(maps) => Some(maps),
@@ -134,6 +137,7 @@ impl ChunkStreamer {
             Ok(Some(ChunkPayload {
                 world: Some(world),
                 entities,
+                poi,
                 heightmaps,
             }))
         })?;
@@ -151,6 +155,7 @@ impl ChunkStreamer {
             Ok(read(pos)?.map(|world| ChunkPayload {
                 world: Some(world),
                 entities: SavedEntityData::Unavailable,
+                poi: SavedPoiData::Unavailable,
                 heightmaps: None,
             }))
         })
@@ -241,7 +246,12 @@ impl ChunkStreamer {
                 if matches!(
                     session.saved_entity_chunk(pos),
                     Some(SavedEntityData::Unavailable)
-                ) {
+                ) || (session.can_retry_poi_chunk(pos)
+                    && matches!(
+                        session.saved_poi_chunk(pos),
+                        Some(SavedPoiData::Unavailable)
+                    ))
+                {
                     self.entity_retry
                         .entry(pos)
                         .or_insert((Instant::now() + Duration::from_secs(5), 0));
@@ -282,9 +292,13 @@ impl ChunkStreamer {
                         Ok(Some(ChunkPayload {
                             world,
                             entities,
+                            poi,
                             heightmaps,
                         })) => {
-                            if matches!(entities, SavedEntityData::Unavailable) {
+                            if matches!(entities, SavedEntityData::Unavailable)
+                                || (session.can_retry_poi_chunk(response.pos)
+                                    && matches!(poi, SavedPoiData::Unavailable))
+                            {
                                 let attempts = self
                                     .entity_retry
                                     .get(&response.pos)
@@ -298,14 +312,16 @@ impl ChunkStreamer {
                                 self.entity_retry.remove(&response.pos);
                             }
                             if let Some(world) = world {
-                                session.queue_loaded_chunk_with_data(
+                                session.queue_loaded_chunk_with_poi(
                                     response.pos,
                                     world,
                                     entities,
+                                    Some(poi),
                                     heightmaps,
                                 );
                             } else {
                                 session.queue_entity_chunk(response.pos, entities);
+                                session.queue_poi_chunk(response.pos, poi);
                             }
                         }
                         Ok(None) => {
@@ -399,6 +415,17 @@ pub(crate) fn read_entity_data(reader: &mut WorldReader, pos: ChunkPos) -> Saved
                 pos.x, pos.z
             );
             SavedEntityData::Unavailable
+        }
+    }
+}
+
+pub(crate) fn read_poi_data(reader: &mut WorldReader, pos: ChunkPos) -> SavedPoiData {
+    match reader.read_poi_chunk(pos.x, pos.z) {
+        Ok(None) => SavedPoiData::Missing,
+        Ok(Some(chunk)) => SavedPoiData::Present(Arc::new(chunk)),
+        Err(error) => {
+            eprintln!("Could not read POI chunk {}, {}: {error:#}", pos.x, pos.z);
+            SavedPoiData::Unavailable
         }
     }
 }
@@ -590,58 +617,79 @@ mod tests {
     }
 
     #[test]
-    fn retries_unavailable_entities_for_a_resident_chunk() {
-        let home = ChunkPos { x: 0, z: 0 };
-        let player = PlayerState {
-            position: Vec3::new(8.5, 1.0, 8.5),
-            yaw: 0.0,
-            pitch: 0.0,
-            vertical_velocity: 0.0,
-            on_ground: false,
-            pose: native_session::PlayerPose::Standing,
-        };
-        let mut session = LoadedSession::new(
-            chunk_world(home),
-            IVec3::ZERO,
-            BuildBounds {
-                min_y: 0,
-                max_y: 32,
-            },
-            player,
-        )
-        .unwrap();
-        session
-            .set_initial_entity_chunk(home, SavedEntityData::Unavailable)
+    fn retries_unavailable_entities_or_poi_for_a_resident_chunk() {
+        for retry_poi in [false, true] {
+            let home = ChunkPos { x: 0, z: 0 };
+            let player = PlayerState {
+                position: Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut session = LoadedSession::new(
+                chunk_world(home),
+                IVec3::ZERO,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
             .unwrap();
-        let mut streamer =
-            ChunkStreamer::with_entity_source(1, BTreeSet::new(), move |pos, entities_only| {
-                if pos == home {
-                    assert!(entities_only);
-                }
-                Ok((pos == home).then_some(ChunkPayload {
-                    world: None,
-                    entities: SavedEntityData::Empty,
-                    heightmaps: None,
-                }))
-            })
-            .unwrap();
-        streamer.service(&mut session).unwrap();
-        assert!(streamer.entity_retry.contains_key(&home));
-        streamer.entity_retry.get_mut(&home).unwrap().0 = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
+            session
+                .set_initial_entity_chunk(
+                    home,
+                    if retry_poi {
+                        SavedEntityData::Empty
+                    } else {
+                        SavedEntityData::Unavailable
+                    },
+                )
+                .unwrap();
+            session
+                .set_initial_poi_chunk(
+                    home,
+                    if retry_poi {
+                        SavedPoiData::Unavailable
+                    } else {
+                        SavedPoiData::Missing
+                    },
+                )
+                .unwrap();
+            let mut streamer =
+                ChunkStreamer::with_entity_source(1, BTreeSet::new(), move |pos, entities_only| {
+                    if pos == home {
+                        assert!(entities_only);
+                    }
+                    Ok((pos == home).then_some(ChunkPayload {
+                        world: None,
+                        entities: SavedEntityData::Empty,
+                        poi: SavedPoiData::Missing,
+                        heightmaps: None,
+                    }))
+                })
+                .unwrap();
             streamer.service(&mut session).unwrap();
-            session.update(Duration::from_millis(50));
-            if matches!(
-                session.saved_entity_chunk(home),
-                Some(SavedEntityData::Empty)
-            ) {
-                break;
+            assert!(streamer.entity_retry.contains_key(&home));
+            streamer.entity_retry.get_mut(&home).unwrap().0 = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                streamer.service(&mut session).unwrap();
+                session.update(Duration::from_millis(50));
+                if matches!(
+                    session.saved_entity_chunk(home),
+                    Some(SavedEntityData::Empty)
+                ) && matches!(session.saved_poi_chunk(home), Some(SavedPoiData::Missing))
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "entity retry did not complete");
+                thread::sleep(Duration::from_millis(2));
             }
-            assert!(Instant::now() < deadline, "entity retry did not complete");
-            thread::sleep(Duration::from_millis(2));
+            assert!(!streamer.entity_retry.contains_key(&home));
         }
-        assert!(!streamer.entity_retry.contains_key(&home));
     }
 
     #[test]
@@ -847,6 +895,7 @@ mod tests {
                 Ok(Some(ChunkPayload {
                     world: Some(chunk_world(pos)),
                     entities: SavedEntityData::Empty,
+                    poi: SavedPoiData::Missing,
                     heightmaps: None,
                 }))
             })
@@ -1295,6 +1344,7 @@ mod tests {
                     Ok(Some(ChunkPayload {
                         world: Some(world),
                         entities: SavedEntityData::Empty,
+                        poi: SavedPoiData::Missing,
                         heightmaps: Some(maps),
                     }))
                 })
@@ -1512,6 +1562,44 @@ mod tests {
         std::fs::create_dir_all(&entity_dir).unwrap();
         let entity_path = entity_dir.join("r.0.0.mca");
         std::fs::write(&entity_path, &entity_region).unwrap();
+        let poi_document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("pos".into(), Tag::IntArray(vec![16, 1, 0])),
+                                        ("type".into(), Tag::String("minecraft:home".into())),
+                                        ("free_tickets".into(), Tag::Int(0)),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib.write_all(&nbt::write(&poi_document).unwrap()).unwrap();
+        let compressed_poi = zlib.finish().unwrap();
+        let mut poi_region = vec![0u8; 3 * 4096];
+        poi_region[4..8].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+        poi_region[8192..8196].copy_from_slice(&((compressed_poi.len() + 1) as u32).to_be_bytes());
+        poi_region[8196] = 2;
+        poi_region[8197..8197 + compressed_poi.len()].copy_from_slice(&compressed_poi);
+        let poi_dir = temp.path().join("dimensions/minecraft/overworld/poi");
+        std::fs::create_dir_all(&poi_dir).unwrap();
+        let poi_path = poi_dir.join("r.0.0.mca");
+        std::fs::write(&poi_path, &poi_region).unwrap();
         let dimension = DimensionId::parse("minecraft:overworld").unwrap();
         let mut reader = WorldReader::open(temp.path(), dimension).unwrap();
         let area = reader.read_area(SavedChunkPos { x: 0, z: 0 }, 0).unwrap();
@@ -1590,6 +1678,11 @@ mod tests {
             panic!("streamed entity data was not preserved");
         };
         assert_eq!(*entities.document, entity_document);
+        let Some(SavedPoiData::Present(poi)) = session.saved_poi_chunk(ChunkPos { x: 1, z: 0 })
+        else {
+            panic!("streamed POI data was not preserved")
+        };
+        assert_eq!(*poi.document, poi_document);
         assert_eq!(
             session.spawn_column_heights(16, 0).unwrap(),
             native_session::world_spawn::SpawnColumnHeights {
@@ -1604,6 +1697,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(region_path).unwrap(), region);
         assert_eq!(std::fs::read(entity_path).unwrap(), entity_region);
+        assert_eq!(std::fs::read(poi_path).unwrap(), poi_region);
 
         // A missing region really is empty, but a truncated region must not
         // become a false negative for future entity collision checks.
@@ -1624,5 +1718,16 @@ mod tests {
         ));
         assert!(reader.read_chunk(1, 0).unwrap().is_some());
         assert_eq!(std::fs::read(bad_path).unwrap(), [1, 2, 3]);
+        let bad_poi = poi_dir.join("r.1.0.mca");
+        std::fs::write(&bad_poi, [1, 2, 3]).unwrap();
+        assert!(matches!(
+            read_poi_data(&mut reader, ChunkPos { x: 64, z: 0 }),
+            SavedPoiData::Missing
+        ));
+        assert!(matches!(
+            read_poi_data(&mut reader, ChunkPos { x: 32, z: 0 }),
+            SavedPoiData::Unavailable
+        ));
+        assert_eq!(std::fs::read(bad_poi).unwrap(), [1, 2, 3]);
     }
 }

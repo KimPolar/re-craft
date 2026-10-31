@@ -465,11 +465,13 @@ impl Viewer {
                 .take_locked_chest_sounds()
                 .into_iter()
                 .peekable();
+            let mut buckets = play.session.take_bucket_sounds().into_iter().peekable();
             while let Some((_, kind)) = [
                 buttons.peek().map(|event| (event.sequence, 0)),
                 levers.peek().map(|event| (event.sequence, 1)),
                 chests.peek().map(|event| (event.sequence, 2)),
                 locked_chests.peek().map(|event| (event.sequence, 3)),
+                buckets.peek().map(|event| (event.sequence, 4)),
             ]
             .into_iter()
             .flatten()
@@ -494,10 +496,16 @@ impl Viewer {
                             audio.chest(event);
                         }
                     }
-                    _ => {
+                    3 => {
                         let event = locked_chests.next().unwrap();
                         if let Some(audio) = &self.audio {
                             audio.locked_chest(event);
+                        }
+                    }
+                    _ => {
+                        let event = buckets.next().unwrap();
+                        if let Some(audio) = &self.audio {
+                            audio.bucket(event);
                         }
                     }
                 }

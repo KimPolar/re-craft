@@ -167,6 +167,15 @@ impl UiAudio {
             event,
         ));
     }
+    pub fn bucket(&self, event: native_session::loaded::BucketSoundEvent) {
+        let _ = self.audio.commands.try_send(Command::Bucket(
+            Resources {
+                root: self.root.clone(),
+                packs: self.packs.clone(),
+            },
+            event,
+        ));
+    }
     pub fn item_pickup(&self, position: glam::DVec3) {
         self.pickup(position, PickupSound::Item);
     }
@@ -213,6 +222,7 @@ enum Command {
     Lever(Resources, native_session::loaded::LeverSoundEvent),
     Chest(Resources, native_session::loaded::ChestSoundEvent),
     LockedChest(Resources, native_session::loaded::LockedChestSoundEvent),
+    Bucket(Resources, native_session::loaded::BucketSoundEvent),
     Pickup(Resources, glam::DVec3, PickupSound),
     Consume(Resources, native_session::ConsumeSound),
 }
@@ -623,6 +633,28 @@ impl Catalog {
         })
     }
 
+    fn bucket(
+        &mut self,
+        event: native_session::loaded::BucketSoundEvent,
+        random: &mut LegacyRandom,
+        output_rate: u32,
+    ) -> Result<Option<Voice>> {
+        self.resolve(
+            event.kind.event(),
+            event.volume,
+            event.pitch,
+            Some(event.position),
+            random,
+            output_rate,
+        )
+        .map(|voice| {
+            voice.map(|mut voice| {
+                voice.player_sound = event.kind.is_player_sound();
+                voice
+            })
+        })
+    }
+
     fn resolve(
         &mut self,
         event: &str,
@@ -741,21 +773,69 @@ fn run(
     let mut random = LegacyRandom::new(seed);
     let mut catalog: Option<Catalog> = None;
     while let Ok(command) = receiver.recv() {
-        let (resources, play, button, lever, chest, locked, pickup, consume) = match command {
-            Command::Prepare(resources) => (resources, false, None, None, None, None, None, None),
-            Command::Click(resources) => (resources, true, None, None, None, None, None, None),
-            Command::Button(resources, event) => {
-                (resources, true, Some(event), None, None, None, None, None)
+        let (resources, play, button, lever, chest, locked, pickup, consume, bucket) = match command
+        {
+            Command::Prepare(resources) => {
+                (resources, false, None, None, None, None, None, None, None)
             }
-            Command::Lever(resources, event) => {
-                (resources, true, None, Some(event), None, None, None, None)
+            Command::Click(resources) => {
+                (resources, true, None, None, None, None, None, None, None)
             }
-            Command::Chest(resources, event) => {
-                (resources, true, None, None, Some(event), None, None, None)
-            }
-            Command::LockedChest(resources, event) => {
-                (resources, true, None, None, None, Some(event), None, None)
-            }
+            Command::Button(resources, event) => (
+                resources,
+                true,
+                Some(event),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Command::Lever(resources, event) => (
+                resources,
+                true,
+                None,
+                Some(event),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Command::Chest(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                Some(event),
+                None,
+                None,
+                None,
+                None,
+            ),
+            Command::LockedChest(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                Some(event),
+                None,
+                None,
+                None,
+            ),
+            Command::Bucket(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(event),
+            ),
             Command::Pickup(resources, position, kind) => (
                 resources,
                 true,
@@ -765,10 +845,19 @@ fn run(
                 None,
                 Some((position, kind)),
                 None,
+                None,
             ),
-            Command::Consume(resources, event) => {
-                (resources, true, None, None, None, None, None, Some(event))
-            }
+            Command::Consume(resources, event) => (
+                resources,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(event),
+                None,
+            ),
         };
         if catalog
             .as_ref()
@@ -789,7 +878,9 @@ fn run(
             } else {
                 &mut preload_random
             };
-            let resolved = if let Some(event) = consume {
+            let resolved = if let Some(event) = bucket {
+                catalog.bucket(event, chosen_random, config.sample_rate.0)
+            } else if let Some(event) = consume {
                 catalog.consume(event, chosen_random, config.sample_rate.0, &neutral_gain)
             } else if let Some((position, kind)) = pickup {
                 catalog.pickup(position, kind, chosen_random, config.sample_rate.0)
@@ -843,6 +934,81 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bucket_sound_command_keeps_event_and_order() {
+        use native_session::loaded::{BucketSoundEvent, BucketSoundKind};
+        let (audio, probe) = Audio::test_channel();
+        let ui = UiAudio::new(audio, PathBuf::from("minecraft"), Vec::new());
+        let event = BucketSoundEvent {
+            kind: BucketSoundKind::FillWater,
+            position: glam::DVec3::new(1.0, 2.0, 3.0),
+            volume: 1.0,
+            pitch: 1.0,
+            sequence: 2,
+        };
+        ui.bucket(event);
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Bucket(_, actual)) if actual == event)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn bucket_sounds_use_correct_categories_and_resource_pack() {
+        use native_session::loaded::{BucketSoundEvent, BucketSoundKind};
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let mut vanilla = Catalog::load(Resources {
+            root: root.clone(),
+            packs: vec![],
+        })
+        .unwrap();
+        let position = glam::DVec3::new(17.5, 64.5, -3.5);
+        for kind in [
+            BucketSoundKind::FillWater,
+            BucketSoundKind::FillLava,
+            BucketSoundKind::EmptyWater,
+            BucketSoundKind::EmptyLava,
+            BucketSoundKind::Evaporate,
+        ] {
+            let event = BucketSoundEvent {
+                kind,
+                position,
+                volume: 1.0,
+                pitch: 1.0,
+                sequence: 0,
+            };
+            let voice = vanilla
+                .bucket(event, &mut LegacyRandom::new(1), 48000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(voice.player_sound, kind.is_player_sound());
+            assert_eq!(voice.spatial.unwrap().position, position);
+            assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+        }
+        let pack = tempfile::tempdir().unwrap();
+        let directory = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("sounds.json"), br#"{"item.bucket.fill":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: vec![pack.path().to_path_buf()],
+        })
+        .unwrap();
+        let event = BucketSoundEvent {
+            kind: BucketSoundKind::FillWater,
+            position,
+            volume: 1.0,
+            pitch: 1.0,
+            sequence: 0,
+        };
+        let voice = catalog
+            .bucket(event, &mut LegacyRandom::new(1), 48000)
+            .unwrap()
+            .unwrap();
+        assert!(voice.player_sound);
+        assert_eq!(voice.volume, 0.4);
+        assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
+    }
     #[test]
     fn consume_sound_command_preserves_event_and_category() {
         let (audio, probe) = Audio::test_channel();

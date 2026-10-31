@@ -19,13 +19,14 @@ public class BucketPlacementOracle {
   static final BlockPos CLICKED=new BlockPos(0,0,0), ADJACENT=CLICKED.south();
   static class World extends ClientLevel {
     Map<BlockPos,BlockState> blocks; EnvironmentAttributeSystem environment; RandomSource rng;
+    SoundEvent sound; SoundSource soundSource; float volume, pitch; BlockPos soundPosition;
     World() { super(null,null,null,null,0,0,null,false,0L,0); }
     @Override public BlockState getBlockState(BlockPos pos) { return blocks.getOrDefault(pos, Blocks.AIR.defaultBlockState()); }
     @Override public boolean isClientSide() { return false; }
     @Override public boolean setBlock(BlockPos pos, BlockState value, int flags, int depth) { blocks.put(pos,value); return true; }
     @Override public EnvironmentAttributeSystem environmentAttributes() { return environment; }
     @Override public RandomSource getRandom() { return rng; }
-    @Override public void playSound(Entity entity, BlockPos pos, SoundEvent sound, SoundSource source, float volume, float pitch) {}
+    @Override public void playSound(Entity entity, BlockPos pos, SoundEvent sound, SoundSource source, float volume, float pitch) { this.sound=sound; this.soundSource=source; this.volume=volume; this.pitch=pitch; this.soundPosition=pos; }
     @Override public void scheduleTick(BlockPos pos, Fluid fluid, int delay) {}
     @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) {}
   }
@@ -52,13 +53,13 @@ public class BucketPlacementOracle {
       // to a waterlogged slab into obsidian.
       if(lava && shape.equals("slab_wet")) continue;
       BlockState clicked=shape.equals("stone")?Blocks.STONE.defaultBlockState():Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,shape.equals("slab_double")?SlabType.DOUBLE:SlabType.TOP).setValue(SlabBlock.WATERLOGGED,shape.equals("slab_wet"));
-      world.blocks=new HashMap<>(); world.blocks.put(CLICKED,clicked); world.rng=RandomSource.create(123);
+      world.blocks=new HashMap<>(); world.blocks.put(CLICKED,clicked); world.rng=RandomSource.create(123); world.sound=null; world.soundPosition=null;
       world.environment=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributes.WATER_EVAPORATES, base -> evaporates).build();
       var bucket=(BucketItem)(lava?Items.LAVA_BUCKET:Items.WATER_BUCKET);
       var hit=new BlockHitResult(new Vec3(0.5,0.75,1.0), Direction.SOUTH, CLICKED, false);
       var target=!lava && clicked.getBlock() instanceof LiquidBlockContainer?CLICKED:ADJACENT;
       boolean success=bucket.emptyContents(null,world,target,hit);
-      var row=new JsonObject(); row.addProperty("lava",lava); row.addProperty("evaporates",evaporates); row.addProperty("shape",shape); row.addProperty("success",success); row.addProperty("clicked",describe(world.getBlockState(CLICKED))); row.addProperty("adjacent",describe(world.getBlockState(ADJACENT))); row.addProperty("next_random",world.rng.nextInt()); output.add(row);
+      var row=new JsonObject(); row.addProperty("lava",lava); row.addProperty("evaporates",evaporates); row.addProperty("shape",shape); row.addProperty("success",success); row.addProperty("clicked",describe(world.getBlockState(CLICKED))); row.addProperty("adjacent",describe(world.getBlockState(ADJACENT))); row.addProperty("next_random",world.rng.nextInt()); row.addProperty("sound",world.sound.location().toString()); row.addProperty("category",world.soundSource.getName()); row.addProperty("volume_bits",Float.floatToRawIntBits(world.volume)); row.addProperty("pitch_bits",Float.floatToRawIntBits(world.pitch)); row.addProperty("sound_z",world.soundPosition.getZ()); output.add(row);
     }
     Files.writeString(Path.of(args[0]),new Gson().toJson(output));
   }

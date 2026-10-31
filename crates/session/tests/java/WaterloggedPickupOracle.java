@@ -34,9 +34,10 @@ public class WaterloggedPickupOracle {
       Vec3 from=new Vec3(0.5,(double)height,2.5), to=new Vec3(0.5,(double)height,-2.5);
       var hit=world.clip(new ClipContext(from,to,ClipContext.Block.OUTLINE,ClipContext.Fluid.SOURCE_ONLY,CollisionContext.empty()));
       var row=new JsonObject(); row.addProperty("shape",shape); row.addProperty("height",height); row.addProperty("z",hit.getBlockPos().getZ()); row.addProperty("face",hit.getDirection().getName()); row.addProperty("hit_z",hit.getLocation().z);
+      row.addProperty("water_sound",((BucketPickup)Blocks.WATER).getPickupSound().orElseThrow().location().toString()); row.addProperty("lava_sound",((BucketPickup)Blocks.LAVA).getPickupSound().orElseThrow().location().toString());
       if(hit.getBlockPos().equals(TARGET)) {
         var item=((BucketPickup)block.getBlock()).pickupBlock(null,world,TARGET,block);
-        row.addProperty("item",item.is(Items.WATER_BUCKET)); row.addProperty("wet",world.getBlockState(TARGET).getValue(BlockStateProperties.WATERLOGGED));
+        row.addProperty("item",item.is(Items.WATER_BUCKET)); row.addProperty("wet",world.getBlockState(TARGET).getValue(BlockStateProperties.WATERLOGGED)); row.addProperty("pickup_sound",((BucketPickup)block.getBlock()).getPickupSound().orElseThrow().location().toString());
       }
       output.add(row);
     }

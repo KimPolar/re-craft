@@ -463,6 +463,7 @@ pub struct LoadedSession {
     lever_sounds: VecDeque<LeverSoundEvent>,
     chest_sounds: VecDeque<ChestSoundEvent>,
     locked_chest_sounds: VecDeque<LockedChestSoundEvent>,
+    bucket_sounds: VecDeque<BucketSoundEvent>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -555,6 +556,40 @@ pub struct ChestSoundEvent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LockedChestSoundEvent {
     pub position: DVec3,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketSoundKind {
+    FillWater,
+    FillLava,
+    EmptyWater,
+    EmptyLava,
+    Evaporate,
+}
+
+impl BucketSoundKind {
+    pub fn event(self) -> &'static str {
+        match self {
+            Self::FillWater => "item.bucket.fill",
+            Self::FillLava => "item.bucket.fill_lava",
+            Self::EmptyWater => "item.bucket.empty",
+            Self::EmptyLava => "item.bucket.empty_lava",
+            Self::Evaporate => "block.fire.extinguish",
+        }
+    }
+
+    pub fn is_player_sound(self) -> bool {
+        matches!(self, Self::FillWater | Self::FillLava)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BucketSoundEvent {
+    pub kind: BucketSoundKind,
+    pub position: DVec3,
+    pub volume: f32,
+    pub pitch: f32,
     pub sequence: u64,
 }
 
@@ -3109,6 +3144,7 @@ impl LoadedSession {
             lever_sounds: VecDeque::new(),
             chest_sounds: VecDeque::new(),
             locked_chest_sounds: VecDeque::new(),
+            bucket_sounds: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -3928,6 +3964,30 @@ impl LoadedSession {
 
     pub fn take_locked_chest_sounds(&mut self) -> Vec<LockedChestSoundEvent> {
         self.locked_chest_sounds.drain(..).collect()
+    }
+
+    fn push_bucket_sound(
+        &mut self,
+        kind: BucketSoundKind,
+        position: DVec3,
+        volume: f32,
+        pitch: f32,
+    ) {
+        let sequence = self.next_sound_sequence();
+        if self.bucket_sounds.len() == 4096 {
+            self.bucket_sounds.pop_front();
+        }
+        self.bucket_sounds.push_back(BucketSoundEvent {
+            kind,
+            position,
+            volume,
+            pitch,
+            sequence,
+        });
+    }
+
+    pub fn take_bucket_sounds(&mut self) -> Vec<BucketSoundEvent> {
+        self.bucket_sounds.drain(..).collect()
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -7329,15 +7389,30 @@ impl LoadedSession {
         if !inventory.empty_bucket(hand, self.game_mode == GameMode::Creative) {
             return false;
         }
+        let Some(sound_position) =
+            add(self.origin, target).map(|p| p.as_dvec3() + DVec3::splat(0.5))
+        else {
+            return false;
+        };
         if evaporates {
-            // Level's extinguish sound pitch consumes two floats in Java.
-            self.level_random.next_float();
-            self.level_random.next_float();
+            let pitch = 2.6_f32
+                + (self.level_random.next_float() - self.level_random.next_float()) * 0.8_f32;
+            self.push_bucket_sound(BucketSoundKind::Evaporate, sound_position, 0.5, pitch);
         } else {
             let id = self.intern_block(replacement);
             if id != existing && !self.set(target, id) {
                 return false;
             }
+            self.push_bucket_sound(
+                if fluid == "minecraft:water" {
+                    BucketSoundKind::EmptyWater
+                } else {
+                    BucketSoundKind::EmptyLava
+                },
+                sound_position,
+                1.0,
+                1.0,
+            );
         }
         self.inventory = Arc::new(inventory);
         let swing = if hand == crate::inventory::PlayerSlot::Offhand {
@@ -7453,6 +7528,16 @@ impl LoadedSession {
         if !self.set(hit.position, replacement) {
             return false;
         }
+        self.push_bucket_sound(
+            if result == "minecraft:water_bucket" {
+                BucketSoundKind::FillWater
+            } else {
+                BucketSoundKind::FillLava
+            },
+            self.origin.as_dvec3() + self.motion.position,
+            1.0,
+            1.0,
+        );
         self.inventory = Arc::new(inventory);
         if let Some(stack) = overflow {
             self.dropped_items.drop_player(
@@ -13341,8 +13426,22 @@ mod tests {
                         ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![]))
                     ));
                     session.set_player_inventory(inventory);
+                    let sound_position = session.origin.as_dvec3() + session.motion.position;
                     session.submit_command(PlayerCommand::Place);
                     session.update(TICK);
+                    let sounds = session.take_bucket_sounds();
+                    assert_eq!(sounds.len(), 1);
+                    assert_eq!(
+                        sounds[0].kind,
+                        if fluid == "water" {
+                            BucketSoundKind::FillWater
+                        } else {
+                            BucketSoundKind::FillLava
+                        }
+                    );
+                    assert_eq!(sounds[0].position, sound_position);
+                    assert_eq!((sounds[0].volume, sounds[0].pitch), (1.0, 1.0));
+                    assert!(sounds[0].kind.is_player_sound());
                     let absolute = session.origin + pos;
                     assert_ne!(
                         session
@@ -13387,6 +13486,7 @@ mod tests {
             );
             session.set_player_inventory(inventory);
             assert!(!session.try_fill_bucket(PlayerSlot::Storage(0)));
+            assert!(session.take_bucket_sounds().is_empty());
             assert_eq!(
                 session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
                 "minecraft:bucket"
@@ -13451,6 +13551,10 @@ mod tests {
                 );
                 session.set_player_inventory(inventory);
                 assert!(session.try_fill_bucket(hand), "{}", block.name);
+                assert_eq!(
+                    session.take_bucket_sounds()[0].kind,
+                    BucketSoundKind::FillWater
+                );
                 let p = session.origin + pos;
                 let drained = session.world.block(p.x, p.y, p.z).unwrap();
                 assert_eq!(drained.name, block.name);
@@ -13591,6 +13695,14 @@ mod tests {
                 },
             )
             .unwrap();
+            assert_eq!(
+                format!("minecraft:{}", BucketSoundKind::FillWater.event()),
+                row["water_sound"].as_str().unwrap()
+            );
+            assert_eq!(
+                format!("minecraft:{}", BucketSoundKind::FillLava.event()),
+                row["lava_sound"].as_str().unwrap()
+            );
             assert_eq!(hit.position.z, row["z"].as_i64().unwrap() as i32, "{row}");
             assert_eq!(face_name(hit.face), row["face"].as_str(), "{row}");
             assert!(
@@ -13600,6 +13712,10 @@ mod tests {
             if hit.position == IVec3::ZERO {
                 assert_eq!(row["item"], true);
                 assert_eq!(row["wet"], false);
+                assert_eq!(
+                    format!("minecraft:{}", BucketSoundKind::FillWater.event()),
+                    row["pickup_sound"].as_str().unwrap()
+                );
             }
         }
     }
@@ -13900,6 +14016,33 @@ mod tests {
                 };
                 assert_eq!(actual, row[key].as_str().unwrap(), "{row}");
             }
+            let sounds = session.take_bucket_sounds();
+            assert_eq!(sounds.len(), 1, "{row}");
+            let sound = sounds[0];
+            assert_eq!(
+                format!("minecraft:{}", sound.kind.event()),
+                row["sound"].as_str().unwrap(),
+                "{row}"
+            );
+            assert_eq!(row["category"], "block");
+            assert!(!sound.kind.is_player_sound());
+            assert_eq!(
+                sound.volume.to_bits(),
+                row["volume_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+            assert_eq!(
+                sound.pitch.to_bits(),
+                row["pitch_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+            assert_eq!(
+                sound.position,
+                (session.origin + clicked + IVec3::Z * row["sound_z"].as_i64().unwrap() as i32)
+                    .as_dvec3()
+                    + DVec3::splat(0.5),
+                "{row}"
+            );
             assert_eq!(
                 session.level_random.next_int(),
                 row["next_random"].as_i64().unwrap() as i32,
@@ -20968,6 +21111,7 @@ mod tests {
         assert!(session.set(relative_lever, lever));
         session.push_chest_sound(position, None, true);
         assert!(session.use_lever(relative_lever));
+        session.push_bucket_sound(BucketSoundKind::EmptyWater, DVec3::ZERO, 1.0, 1.0);
         session.push_button_sound(
             IVec3::new(8, 2, 7),
             native_core::button::Button::from_id("minecraft:stone_button").unwrap(),
@@ -20975,7 +21119,8 @@ mod tests {
         );
         assert_eq!(session.take_chest_sounds()[0].sequence, 0);
         assert_eq!(session.take_lever_sounds()[0].sequence, 1);
-        assert_eq!(session.take_button_sounds()[0].sequence, 2);
+        assert_eq!(session.take_bucket_sounds()[0].sequence, 2);
+        assert_eq!(session.take_button_sounds()[0].sequence, 3);
     }
 
     #[test]

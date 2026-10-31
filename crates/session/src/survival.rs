@@ -466,7 +466,7 @@ pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
 #[derive(Clone, Debug)]
 struct Eating {
     hand: PlayerSlot,
-    item: ItemStack,
+    item: Arc<ItemStack>,
     remaining: i32,
     food: FoodProperties,
 }
@@ -485,11 +485,13 @@ pub(crate) enum FoodRandomEvent {
     ParticlePulse {
         count: u8,
         sound: FoodSound,
+        item: Option<Arc<ItemStack>>,
     },
     Finish {
         causes_hunger: bool,
         particles: bool,
         sound: FoodSound,
+        item: Option<Arc<ItemStack>>,
     },
     StatusGroup {
         probability: f32,
@@ -499,14 +501,30 @@ pub(crate) enum FoodRandomEvent {
 }
 
 impl FoodRandomEvent {
+    pub(crate) fn particle_item(&self) -> Option<&Arc<ItemStack>> {
+        match self {
+            Self::ParticlePulse { item, .. } | Self::Finish { item, .. } => item.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Advance the player's stream for the sound and particle calculations
     /// Java performs even when their visual output is not yet rendered.
+    #[cfg(test)]
     pub(crate) fn apply_with_sounds(
         &self,
         random: &mut native_core::random::LegacyRandom,
     ) -> (bool, [Option<crate::ConsumeSoundInfo>; 3]) {
+        self.apply_with_particles(random, &mut |_| {})
+    }
+
+    pub(crate) fn apply_with_particles(
+        &self,
+        random: &mut native_core::random::LegacyRandom,
+        emit: &mut impl FnMut([f32; 4]),
+    ) -> (bool, [Option<crate::ConsumeSoundInfo>; 3]) {
         let (particles, sound) = match self {
-            Self::ParticlePulse { count, sound } => (*count, *sound),
+            Self::ParticlePulse { count, sound, .. } => (*count, *sound),
             Self::Finish {
                 particles, sound, ..
             } => {
@@ -524,8 +542,13 @@ impl FoodRandomEvent {
         let volume = if random.next_bool() { 0.5 } else { 1.0 };
         let eat_pitch = 1.0_f32 + 0.2_f32 * (random.next_float() - random.next_float());
         let drink_pitch = 0.9_f32 + random.next_float() * (1.0_f32 - 0.9_f32);
-        for _ in 0..u32::from(particles) * 4 {
-            random.next_float();
+        for _ in 0..particles {
+            emit([
+                random.next_float(),
+                random.next_float(),
+                random.next_float(),
+                random.next_float(),
+            ]);
         }
         let (event, volume, pitch) = match sound {
             FoodSound::Eat => ("entity.generic.eat", volume, eat_pitch),
@@ -627,7 +650,7 @@ impl FoodUse {
             } else {
                 self.active = Some(Eating {
                     hand,
-                    item: item.clone(),
+                    item: Arc::new(item.clone()),
                     remaining: food.use_ticks,
                     food,
                 });
@@ -672,6 +695,12 @@ impl FoodUse {
         }) {
             self.active = None;
         }
+        if let Some(active) = &mut self.active
+            && let Some(held) = inventory.slot(active.hand)
+            && active.item.as_ref() != held
+        {
+            active.item = Arc::new(held.clone());
+        }
     }
 
     pub fn tick(
@@ -690,6 +719,10 @@ impl FoodUse {
             self.events.push(FoodRandomEvent::ParticlePulse {
                 count: if active.food.consume_particles { 5 } else { 0 },
                 sound: active.food.sound,
+                item: active
+                    .food
+                    .consume_particles
+                    .then(|| Arc::clone(&active.item)),
             });
         }
         active.remaining = active.remaining.saturating_sub(1);
@@ -710,6 +743,10 @@ impl FoodUse {
         food: FoodProperties,
     ) {
         let remainder = inventory.slot(hand).and_then(food_remainder);
+        let particle_item = food
+            .consume_particles
+            .then(|| inventory.slot(hand).cloned().map(Arc::new))
+            .flatten();
         let remove_poison = inventory.slot(hand).is_some_and(|item| {
             item.id() == "minecraft:honey_bottle"
                 && item.components().get("minecraft:consumable").is_none()
@@ -750,6 +787,7 @@ impl FoodUse {
                 causes_hunger,
                 particles: food.consume_particles,
                 sound: food.sound,
+                item: particle_item,
             });
             self.events
                 .extend(custom_groups.into_iter().map(|action| match action {
@@ -1550,6 +1588,7 @@ mod tests {
                     FoodRandomEvent::ParticlePulse {
                         count: 5,
                         sound: FoodSound::Eat,
+                        item: None,
                     }
                     .apply(&mut random);
                 }
@@ -1557,6 +1596,7 @@ mod tests {
                     causes_hunger: !overridden,
                     particles: true,
                     sound: FoodSound::Eat,
+                    item: None,
                 }
                 .apply(&mut random);
                 assert_eq!(
@@ -1632,14 +1672,14 @@ mod tests {
     }
 
     #[test]
-    fn consume_sounds_keep_tick_order_across_frame_rates() {
+    fn consume_effects_keep_tick_order_across_frame_rates() {
         let run = |id: &str, max: u32, frame_ms: u64| {
             let mut session = LocalSession::demo();
             session.player_random = native_core::random::LegacyRandom::new(99);
             let mut inventory = PlayerInventory::default();
             inventory.set_slot(
                 PlayerSlot::Storage(0),
-                ItemStack::new(id.into(), 1, max, Tag::Compound(vec![])),
+                ItemStack::new(id.into(), 2, max, Tag::Compound(vec![])),
             );
             session.set_player_inventory(inventory);
             session.set_player_vitals(PlayerVitals {
@@ -1648,20 +1688,43 @@ mod tests {
             });
             session.submit_command(PlayerCommand::Place);
             let mut sounds = Vec::new();
+            let mut particles = Vec::new();
             for _ in 0..(4_000 / frame_ms) {
                 session.update(Duration::from_millis(frame_ms));
                 sounds.extend(session.take_consume_sounds());
+                particles.extend(session.take_consume_particles());
             }
             assert!(session.take_consume_sounds().is_empty());
-            sounds
+            assert!(session.take_consume_particles().is_empty());
+            (sounds, particles)
         };
         for (id, max, sound) in [
             ("minecraft:apple", 64, "entity.generic.eat"),
             ("minecraft:honey_bottle", 16, "item.honey_bottle.drink"),
         ] {
-            let slow = run(id, max, 100);
-            let fast = run(id, max, 5);
+            let (slow, slow_particles) = run(id, max, 100);
+            let (fast, fast_particles) = run(id, max, 5);
             assert_eq!(slow, fast);
+            assert_eq!(slow_particles, fast_particles);
+            assert_eq!(
+                slow_particles.len(),
+                if id == "minecraft:apple" { 46 } else { 0 }
+            );
+            assert!(
+                slow_particles
+                    .iter()
+                    .all(|particle| particle.item.id() == id && particle.item.count() == 2)
+            );
+            if id == "minecraft:apple" {
+                assert!(Arc::ptr_eq(
+                    &slow_particles[0].item,
+                    &slow_particles[29].item
+                ));
+                assert!(Arc::ptr_eq(
+                    &slow_particles[30].item,
+                    &slow_particles[45].item
+                ));
+            }
             assert!(slow.len() >= 3);
             assert_eq!(slow[slow.len() - 3].info.event, sound);
             assert_eq!(

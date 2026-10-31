@@ -317,6 +317,7 @@ pub struct LoadedSession {
     experience_orbs: crate::orbs::Orbs,
     pickup_sounds: VecDeque<crate::PickupSound>,
     consume_sounds: VecDeque<crate::ConsumeSound>,
+    consume_particles: VecDeque<crate::consume_particles::ConsumeParticleSpawn>,
     block_drops: bool,
     entity_drops: bool,
     game_mode: GameMode,
@@ -726,7 +727,26 @@ impl LoadedSession {
 
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
-            let (applied, sounds) = event.apply_with_sounds(&mut self.player_random);
+            let item = event.particle_item().cloned();
+            let eye = self.origin.as_dvec3()
+                + self.motion.position
+                + DVec3::Y * f64::from(self.player.pose.eye_height());
+            let yaw = self.player.yaw.to_degrees() - 180.0;
+            let pitch = -self.player.pitch.to_degrees();
+            let (applied, sounds) =
+                event.apply_with_particles(&mut self.player_random, &mut |samples| {
+                    if let Some(item) = &item {
+                        crate::push_consume_particle(
+                            &mut self.consume_particles,
+                            item,
+                            samples,
+                            eye,
+                            yaw,
+                            pitch,
+                            self.tick.saturating_add(1),
+                        );
+                    }
+                });
             crate::collect_consume_sounds(
                 &mut self.consume_sounds,
                 self.origin.as_dvec3() + self.motion.position,
@@ -819,6 +839,12 @@ impl LoadedSession {
 
     pub fn take_consume_sounds(&mut self) -> Vec<crate::ConsumeSound> {
         self.consume_sounds.drain(..).collect()
+    }
+
+    pub fn take_consume_particles(
+        &mut self,
+    ) -> Vec<crate::consume_particles::ConsumeParticleSpawn> {
+        self.consume_particles.drain(..).collect()
     }
     /// Restore health and food before play begins. World files remain untouched.
     pub fn set_player_vitals(&mut self, vitals: crate::survival::PlayerVitals) {
@@ -2932,6 +2958,7 @@ impl LoadedSession {
             experience_orbs: crate::orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
+            consume_particles: VecDeque::new(),
             block_drops: true,
             entity_drops: true,
             game_mode: GameMode::default(),
@@ -27684,6 +27711,7 @@ mod tests {
                         crate::survival::FoodRandomEvent::ParticlePulse {
                             count: 5,
                             sound: crate::survival::FoodSound::Eat,
+                            item: None,
                         }
                         .apply(&mut random);
                     }
@@ -27691,6 +27719,7 @@ mod tests {
                         causes_hunger: false,
                         particles: true,
                         sound: crate::survival::FoodSound::Eat,
+                        item: None,
                     }
                     .apply(&mut random);
                     crate::survival::FoodRandomEvent::StatusGroup {
@@ -27782,6 +27811,7 @@ mod tests {
                     crate::survival::FoodRandomEvent::ParticlePulse {
                         count: 5,
                         sound: crate::survival::FoodSound::Eat,
+                        item: None,
                     }
                     .apply(&mut random);
                 }
@@ -27789,6 +27819,7 @@ mod tests {
                     causes_hunger: true,
                     particles: true,
                     sound: crate::survival::FoodSound::Eat,
+                    item: None,
                 }
                 .apply(&mut random)
             })
@@ -28059,6 +28090,13 @@ mod tests {
                 "minecraft:glass_bottle"
             );
             assert_eq!(session.snapshot().vitals.food, 20);
+            let particles = session.take_consume_particles();
+            assert_eq!(particles.len(), if overridden { 46 } else { 0 });
+            assert!(
+                particles
+                    .iter()
+                    .all(|particle| particle.item.id() == "minecraft:honey_bottle")
+            );
             let sounds = session.take_consume_sounds();
             assert!(sounds.len() >= 3);
             assert_eq!(

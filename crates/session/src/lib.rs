@@ -20,6 +20,7 @@ pub mod animation;
 pub mod camera;
 pub mod chest_lid;
 pub mod chest_placement;
+pub mod consume_particles;
 mod custom_tool;
 mod equipment_attributes;
 pub use equipment_attributes::ArmorValues;
@@ -114,6 +115,27 @@ fn collect_consume_sounds(
         }
         queue.push_back(ConsumeSound { position, info });
     }
+}
+
+fn push_consume_particle(
+    queue: &mut VecDeque<consume_particles::ConsumeParticleSpawn>,
+    item: &Arc<inventory::ItemStack>,
+    samples: [f32; 4],
+    eye: DVec3,
+    yaw: f32,
+    pitch: f32,
+    tick: u64,
+) {
+    let (position, velocity) = consume_particles::particle_vectors(samples, eye, yaw, pitch);
+    if queue.len() == 4096 {
+        queue.pop_front();
+    }
+    queue.push_back(consume_particles::ConsumeParticleSpawn {
+        item: Arc::clone(item),
+        tick,
+        position,
+        velocity,
+    });
 }
 
 fn collect_pickup_sounds(
@@ -469,6 +491,7 @@ pub struct LocalSession {
     experience_orbs: orbs::Orbs,
     pickup_sounds: VecDeque<PickupSound>,
     consume_sounds: VecDeque<ConsumeSound>,
+    consume_particles: VecDeque<consume_particles::ConsumeParticleSpawn>,
     player_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
@@ -505,7 +528,24 @@ pub struct LocalSession {
 impl LocalSession {
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
-            let (applied, sounds) = event.apply_with_sounds(&mut self.player_random);
+            let item = event.particle_item().cloned();
+            let eye = self.motion.position + DVec3::Y * f64::from(self.player.pose.eye_height());
+            let yaw = self.player.yaw.to_degrees() - 180.0;
+            let pitch = -self.player.pitch.to_degrees();
+            let (applied, sounds) =
+                event.apply_with_particles(&mut self.player_random, &mut |samples| {
+                    if let Some(item) = &item {
+                        push_consume_particle(
+                            &mut self.consume_particles,
+                            item,
+                            samples,
+                            eye,
+                            yaw,
+                            pitch,
+                            self.tick.saturating_add(1),
+                        );
+                    }
+                });
             collect_consume_sounds(&mut self.consume_sounds, self.motion.position, sounds);
             if applied {
                 match event {
@@ -546,6 +586,10 @@ impl LocalSession {
 
     pub fn take_consume_sounds(&mut self) -> Vec<ConsumeSound> {
         self.consume_sounds.drain(..).collect()
+    }
+
+    pub fn take_consume_particles(&mut self) -> Vec<consume_particles::ConsumeParticleSpawn> {
+        self.consume_particles.drain(..).collect()
     }
     pub fn demo() -> Self {
         Self::new(World::demo())
@@ -614,6 +658,7 @@ impl LocalSession {
             experience_orbs: orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
+            consume_particles: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,

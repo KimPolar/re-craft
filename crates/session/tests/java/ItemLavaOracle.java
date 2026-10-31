@@ -7,6 +7,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.core.Holder;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.tags.DamageTypeTags;
@@ -20,15 +21,19 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.gameevent.GameEvent;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.phys.AABB;
 
 public class ItemLavaOracle {
   static class World extends ServerLevel {
     GameRules rules;
+    Set<BlockPos> raining = Set.of();
     World() { super(null,null,null,null,null,null,false,0L,null,false); }
     @Override public GameRules getGameRules() { return rules; }
+    @Override public boolean isRainingAt(BlockPos pos) { return raining.contains(pos); }
   }
   static class Item extends ItemEntity {
     World world; ItemStack stack; DamageSources sources; boolean removed;
+    BlockPos blockPos;
     Item() { super(null,0,0,0,ItemStack.EMPTY); }
     @Override public Level level() { return world; }
     @Override public EntityType<?> getType() { return EntityTypes.ITEM; }
@@ -38,6 +43,7 @@ public class ItemLavaOracle {
     @Override public void clearFreeze() { }
     @Override public void remove(Entity.RemovalReason reason) { removed=true; }
     @Override public boolean isSilent() { return true; }
+    @Override public BlockPos blockPosition() { return blockPos; }
   }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
@@ -92,5 +98,21 @@ public class ItemLavaOracle {
       fireOut.add(rows);
     }
     Files.writeString(Path.of(args[1]),new Gson().toJson(fireOut));
+    var inRain=Entity.class.getDeclaredMethod("isInRain"); inRain.setAccessible(true);
+    var box=Entity.class.getDeclaredField("bb"); box.setAccessible(true);
+    var rainOut=new JsonArray();
+    for(double[] pos:new double[][] {{0.5,2.1,0.5},{-0.25,2.8,-1.1},{16.0,-0.25,-16.0},{0.0,-1.0,0.0}}) {
+      for(int mask=0;mask<4;mask++) {
+        var item=(Item)unsafe.allocateInstance(Item.class); item.world=world;
+        item.blockPos=BlockPos.containing(pos[0],pos[1],pos[2]);
+        box.set(item,new AABB(pos[0]-0.125,pos[1],pos[2]-0.125,pos[0]+0.125,pos[1]+0.25,pos[2]+0.125));
+        var top=BlockPos.containing(item.blockPos.getX(),pos[1]+0.25,item.blockPos.getZ());
+        world.raining=new HashSet<>();
+        if((mask&1)!=0) world.raining.add(item.blockPos);
+        if((mask&2)!=0) world.raining.add(top);
+        rainOut.add((boolean)inRain.invoke(item));
+      }
+    }
+    Files.writeString(Path.of(args[2]),new Gson().toJson(rainOut));
   }
 }

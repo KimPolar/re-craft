@@ -1878,6 +1878,7 @@ impl ItemEntities {
             false,
             |_, _, _| None,
             |_, _| false,
+            |_| Some(false),
         );
     }
 
@@ -1899,6 +1900,7 @@ impl ItemEntities {
         fast_lava: bool,
         path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
         safe: impl FnMut(BoundingBox, DVec3) -> bool,
+        rain_at: impl FnMut(IVec3) -> Option<bool>,
     ) {
         self.tick_with_threshold(
             origin,
@@ -1915,6 +1917,7 @@ impl ItemEntities {
             fast_lava,
             path,
             safe,
+            rain_at,
         );
     }
 
@@ -1935,6 +1938,7 @@ impl ItemEntities {
         fast_lava: bool,
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
         mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
+        mut rain_at: impl FnMut(IVec3) -> Option<bool>,
     ) {
         let player_box = movement::player_bounds(player, pose.height());
         let pickup = BoundingBox {
@@ -2130,6 +2134,13 @@ impl ItemEntities {
                         entity._damage_state.fire_ticks = entity._damage_state.fire_ticks.min(0)
                     }
                 }
+            }
+            if !removed[index]
+                && entity._damage_state.fire_ticks > 0
+                && item_in_rain(entity.item.position - origin.as_dvec3(), &mut rain_at)
+                    == Some(true)
+            {
+                entity._damage_state.fire_ticks = 0;
             }
             if removed[index] {
                 continue;
@@ -2503,10 +2514,110 @@ fn item_bounds(position: DVec3) -> BoundingBox {
     }
 }
 
+/// Entity.isInRain checks the block containing the feet and the upper edge.
+fn item_in_rain(position: DVec3, mut rain_at: impl FnMut(IVec3) -> Option<bool>) -> Option<bool> {
+    fn floor_i32(value: f64) -> Option<i32> {
+        let value = value.floor();
+        (value.is_finite() && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+            .then_some(value as i32)
+    }
+    let feet = IVec3::new(
+        floor_i32(position.x)?,
+        floor_i32(position.y)?,
+        floor_i32(position.z)?,
+    );
+    let first = rain_at(feet);
+    if first == Some(true) {
+        return Some(true);
+    }
+    let top = IVec3::new(feet.x, floor_i32(item_bounds(position).max.y)?, feet.z);
+    if top == feet {
+        return first;
+    }
+    let second = rain_at(top);
+    match (first, second) {
+        (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use native_resources::packs::ResourceProvider;
+
+    #[test]
+    fn item_rain_uses_both_positions_and_preserves_unknown() {
+        let position = DVec3::new(-0.25, 2.8, -1.1);
+        let feet = IVec3::new(-1, 2, -2);
+        let top = IVec3::new(-1, 3, -2);
+        assert_eq!(
+            item_in_rain(position, |p| if p == feet { None } else { Some(p == top) }),
+            Some(true)
+        );
+        assert_eq!(
+            item_in_rain(position, |p| if p == feet { None } else { Some(false) }),
+            None
+        );
+        assert_eq!(item_in_rain(position, |_| Some(false)), Some(false));
+        assert_eq!(item_in_rain(DVec3::splat(f64::NAN), |_| Some(true)), None);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn item_rain_follows_fire_damage_and_lava_effects() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut source = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(source.vanilla_item_registry().unwrap());
+        let tags = Arc::new(
+            native_resources::enchantments::OxygenEnchantments::load(&mut source).unwrap(),
+        );
+        for (rain, lava, expected_health, expected_fire) in [
+            (Some(true), false, 9, 0),
+            (None, false, 9, 19),
+            (Some(true), true, 5, 0),
+        ] {
+            let mut items = ItemEntities::default();
+            items.set_damage_rules(Arc::clone(&registry), Arc::clone(&tags));
+            let position = DVec3::new(3.5, 5.8, 4.5);
+            items.spawn_from_entity(
+                position,
+                ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap(),
+            );
+            let entity = &mut items.entities[0];
+            entity.no_gravity = true;
+            entity.velocity = DVec3::ZERO;
+            entity._damage_state.health = 10;
+            entity._damage_state.fire_ticks = 20;
+            items.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                &mut Arc::new(PlayerInventory::default()),
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| {
+                    Some(if lava {
+                        vec![native_world::fluid::FluidKind::Lava]
+                    } else {
+                        vec![]
+                    })
+                },
+                |_, _| true,
+                |p| if p.y == 6 { rain } else { Some(false) },
+            );
+            assert_eq!(items.entities[0]._damage_state.health, expected_health);
+            assert_eq!(items.entities[0]._damage_state.fire_ticks, expected_fire);
+        }
+    }
 
     #[test]
     fn created_items_keep_random_uuid_and_original_chunk_when_streamed() {
@@ -2686,6 +2797,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         assert!(
             items
@@ -2724,6 +2836,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         assert!(items.entities[0].item.position.x < 16.0);
         assert!(
@@ -2880,6 +2993,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         let player = items.entities[0].item.position;
         items.tick_with_fluid_and_proof(
@@ -2896,6 +3010,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         assert!(items.entities.is_empty());
         assert_eq!(
@@ -2977,6 +3092,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         assert!(expired.entities.is_empty());
         assert_eq!(
@@ -3036,6 +3152,7 @@ mod tests {
                 false,
                 |_, _, _| None,
                 |_, _| true,
+                |_| Some(false),
             );
         };
         tick(&mut items, &mut inventory);
@@ -3143,6 +3260,7 @@ mod tests {
                 false,
                 |_, _, _| None,
                 |_, _| true,
+                |_| Some(false),
             );
             let group = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
             assert!(items.entities.is_empty());
@@ -3194,6 +3312,7 @@ mod tests {
             false,
             |_, _, _| None,
             |_, _| true,
+            |_| Some(false),
         );
         assert!(items.entities.is_empty());
         assert!(items.take_pickup_sounds().is_empty());
@@ -3406,12 +3525,14 @@ mod tests {
             .arg(&file));
         let result = temp.path().join("lava.json");
         let fire_result = temp.path().join("fire.json");
+        let rain_result = temp.path().join("rain.json");
         run(std::process::Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&classpath)
             .arg("ItemLavaOracle")
             .arg(&result)
-            .arg(&fire_result));
+            .arg(&fire_result)
+            .arg(&rain_result));
         let oracle: serde_json::Value =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
         for mode in 0..4 {
@@ -3434,6 +3555,29 @@ mod tests {
                     row["fire"].as_i64().unwrap(),
                     "mode {mode}"
                 );
+            }
+        }
+        let rain_oracle: Vec<bool> =
+            serde_json::from_slice(&std::fs::read(rain_result).unwrap()).unwrap();
+        let mut index = 0;
+        for position in [
+            DVec3::new(0.5, 2.1, 0.5),
+            DVec3::new(-0.25, 2.8, -1.1),
+            DVec3::new(16.0, -0.25, -16.0),
+            DVec3::new(0.0, -1.0, 0.0),
+        ] {
+            let feet = position.floor().as_ivec3();
+            let top = IVec3::new(feet.x, (position.y + 0.25).floor() as i32, feet.z);
+            for mask in 0..4 {
+                let actual = item_in_rain(position, |at| {
+                    Some((mask & 1 != 0 && at == feet) || (mask & 2 != 0 && at == top))
+                });
+                assert_eq!(
+                    actual,
+                    Some(rain_oracle[index]),
+                    "position {position:?}, mask {mask}"
+                );
+                index += 1;
             }
         }
         let fire_oracle: serde_json::Value =
@@ -3962,6 +4106,7 @@ mod tests {
                 false,
                 |_, _, _| None,
                 |_, _| true,
+                |_| Some(false),
             );
         }
         assert_eq!(items.entities.len(), 2, "partial merge keeps both entities");
@@ -4125,6 +4270,7 @@ mod tests {
                                 false,
                                 |_, _, _| None,
                                 |_, _| false,
+                                |_| Some(false),
                             );
                         }
                         timings[i].push(start.elapsed().as_secs_f64() * 1000.0);
@@ -6230,6 +6376,7 @@ public class ItemMotionOracle {
                     false,
                     |_, _, _| None,
                     |_, _| true,
+                    |_| Some(false),
                 );
                 if oracle["removed"].as_bool() == Some(true) {
                     assert!(

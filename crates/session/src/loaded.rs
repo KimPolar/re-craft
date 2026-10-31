@@ -304,6 +304,54 @@ fn light_regions_touch(a: BlockPosition, ar: i32, b: BlockPosition, br: i32) -> 
         <= i64::from(ar + br + 1)
 }
 
+struct RainView<'a> {
+    raining: Option<bool>,
+    origin: IVec3,
+    world: &'a World,
+    light_current: bool,
+    heightmaps: &'a BTreeMap<ChunkPos, Arc<SpawnHeightmaps>>,
+    climates: Option<&'a BTreeMap<String, native_resources::biome_climate::BiomeClimate>>,
+    sea_level: Option<i32>,
+}
+
+impl RainView<'_> {
+    fn at(&self, relative: IVec3) -> Option<bool> {
+        if !self.raining? {
+            return Some(false);
+        }
+        let pos = add(self.origin, relative)?;
+        let chunk_pos = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        let chunk = self.world.chunks.get(&chunk_pos)?;
+        if !chunk.block_light_correct || !self.light_current {
+            return None;
+        }
+        if self.world.light(pos.x, pos.y, pos.z, true)? < 15 {
+            return Some(false);
+        }
+        let highest = self.heightmaps.get(&chunk_pos)?.highest(
+            SpawnHeightmapKind::MotionBlocking,
+            pos.x,
+            pos.z,
+        )?;
+        if highest.checked_add(1)? > pos.y {
+            return Some(false);
+        }
+        self.world.biome_zoom_seed()?;
+        let biome = self.world.biome_at_block(pos.x, pos.y, pos.z)?;
+        let climate = self.climates?.get(biome)?;
+        if !climate.has_precipitation {
+            return Some(false);
+        }
+        Some(
+            climate.precipitation_at(pos.x, pos.y, pos.z, self.sea_level?)
+                == native_resources::biome_climate::Precipitation::Rain,
+        )
+    }
+}
+
 pub struct LoadedSession {
     world: Arc<World>,
     shapes: Vec<Option<Vec<Aabb>>>,
@@ -3001,42 +3049,16 @@ impl LoadedSession {
     /// Level.isRainingAt checks the sky, motion-blocking height and biome.
     /// Unknown or pending light and missing biome data are never guessed.
     fn rain_at(&self, relative: IVec3) -> Option<bool> {
-        if !self.global_rain()? {
-            return Some(false);
+        RainView {
+            raining: self.global_rain(),
+            origin: self.origin,
+            world: &self.world,
+            light_current: self.sky_lighting.is_current(),
+            heightmaps: &self.spawn_heightmaps,
+            climates: self.biome_climates.as_deref(),
+            sea_level: self.generator_sea_level,
         }
-        let pos = add(self.origin, relative)?;
-        let chunk_pos = ChunkPos {
-            x: pos.x.div_euclid(16),
-            z: pos.z.div_euclid(16),
-        };
-        let chunk = self.world.chunks.get(&chunk_pos)?;
-        if !chunk.block_light_correct || !self.sky_lighting.is_current() {
-            return None;
-        }
-        if self.world.light(pos.x, pos.y, pos.z, true)? < 15 {
-            return Some(false);
-        }
-        let highest = self.spawn_heightmaps.get(&chunk_pos)?.highest(
-            SpawnHeightmapKind::MotionBlocking,
-            pos.x,
-            pos.z,
-        )?;
-        if highest.checked_add(1)? > pos.y {
-            return Some(false);
-        }
-        // biome_at_block intentionally falls back to quart lookup without a seed;
-        // gameplay must instead wait for the exact zoomed biome.
-        self.world.biome_zoom_seed()?;
-        let biome = self.world.biome_at_block(pos.x, pos.y, pos.z)?;
-        let climate = self.biome_climates.as_ref()?.get(biome)?;
-        if !climate.has_precipitation {
-            return Some(false);
-        }
-        let sea = self.generator_sea_level?;
-        Some(
-            climate.precipitation_at(pos.x, pos.y, pos.z, sea)
-                == native_resources::biome_climate::Precipitation::Rain,
-        )
+        .at(relative)
     }
 
     pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
@@ -10959,6 +10981,15 @@ impl LoadedSession {
                 air,
             };
             let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+            let rain = RainView {
+                raining: self.global_rain(),
+                origin,
+                world,
+                light_current: self.sky_lighting.is_current(),
+                heightmaps: &self.spawn_heightmaps,
+                climates: self.biome_climates.as_deref(),
+                sea_level: self.generator_sea_level,
+            };
             self.dropped_items.tick_with_fluid_and_proof(
                 origin,
                 self.motion.position,
@@ -11010,6 +11041,7 @@ impl LoadedSession {
                     fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
                 },
                 |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
+                |pos| rain.at(pos),
             );
             self.tick_experience_orbs(false);
             self.tick += 1;
@@ -12149,6 +12181,15 @@ impl LoadedSession {
             air,
         };
         let mut item_path_proof = CreatedItemPathProof::new(world, origin, bounds);
+        let rain = RainView {
+            raining: self.global_rain(),
+            origin,
+            world,
+            light_current: self.sky_lighting.is_current(),
+            heightmaps: &self.spawn_heightmaps,
+            climates: self.biome_climates.as_deref(),
+            sea_level: self.generator_sea_level,
+        };
         self.dropped_items.tick_with_fluid_and_proof(
             origin,
             self.motion.position,
@@ -12204,6 +12245,7 @@ impl LoadedSession {
                 fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos))
             },
             |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
+            |pos| rain.at(pos),
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
         self.tick_experience_orbs(self.death.is_none());

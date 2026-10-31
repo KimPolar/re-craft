@@ -1640,7 +1640,7 @@ impl LoadedSession {
         poi_source: &native_persistence::world::SavedPoiChunk,
         mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
     ) -> anyhow::Result<native_persistence::poi::PoiDraft> {
-        use anyhow::{Context, ensure};
+        use anyhow::ensure;
         ensure!(
             poi_source.position
                 == native_persistence::world::ChunkPos {
@@ -1663,6 +1663,17 @@ impl LoadedSession {
                 == native_persistence::nbt::write(&poi_source.document)?,
             "POI source differs from the captured session source"
         );
+        let changes = self.recorded_poi_changes(position, terrain_source, &mut validate_state)?;
+        native_persistence::poi::draft_ordered_block_changes(poi_source, &changes, validate_state)
+    }
+
+    fn recorded_poi_changes(
+        &self,
+        position: ChunkPos,
+        terrain_source: &native_persistence::nbt::NamedTag,
+        mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Vec<native_persistence::poi::PoiBlockChange>> {
+        use anyhow::{Context, ensure};
         let events = self
             .poi_edits
             .get(&position)
@@ -1719,7 +1730,123 @@ impl LoadedSession {
                 "POI history does not match current terrain"
             );
         }
-        native_persistence::poi::draft_ordered_block_changes(poi_source, &changes, validate_state)
+        Ok(changes)
+    }
+
+    /// Reconcile missing or invalid POI sections against source-verified
+    /// terrain before replaying the session's ordered block transitions.
+    /// The saved-state resolver must apply registry defaults and reject unknown
+    /// or noncanonical states. Other world effects still prohibit gameplay save.
+    pub fn draft_reconciled_poi_chunk(
+        &self,
+        position: ChunkPos,
+        terrain_source: &native_persistence::nbt::NamedTag,
+        mut resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        mut validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        mut validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<native_persistence::poi::ReconciledPoiDraft> {
+        use anyhow::{Context, ensure};
+        let captured = match self.poi_chunks.get(&position) {
+            Some(SavedPoiData::Present(chunk)) => {
+                Some(native_persistence::world::SavedPoiChunk::from_document(
+                    (*chunk.document).clone(),
+                    chunk.position,
+                )?)
+            }
+            Some(SavedPoiData::Missing) => None,
+            Some(SavedPoiData::Unavailable) | None => {
+                anyhow::bail!("saved POI source is unavailable")
+            }
+        };
+        let changes = self.recorded_poi_changes(position, terrain_source, &mut validate_state)?;
+        let edits = self
+            .block_edits
+            .get(&position)
+            .context("POI terrain history is unavailable")?;
+        let mut original_world = (*self.world).clone();
+        if !original_world.chunks.contains_key(&position) {
+            original_world.chunks.insert(
+                position,
+                Arc::clone(
+                    self.parked_chunks
+                        .get(&position)
+                        .context("POI terrain chunk is unavailable")?,
+                ),
+            );
+        }
+        for (&(x, y, z), edit) in edits {
+            let old = edit
+                .original
+                .context("POI terrain source state is unavailable")?;
+            original_world
+                .set_block_id(x, y, z, old)
+                .map_err(|error| anyhow::anyhow!("cannot reconstruct POI terrain: {error}"))?;
+        }
+        let sections: BTreeSet<i8> = changes
+            .iter()
+            .filter(|change| {
+                native_world::poi::change(&change.expected, &change.replacement).is_some()
+            })
+            .map(|change| {
+                i8::try_from(change.position[1].div_euclid(16))
+                    .context("POI section is out of range")
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let source_sections = native_persistence::palette::decode_sections(&terrain_source.value)?;
+        let chunk = original_world
+            .chunks
+            .get(&position)
+            .context("POI terrain chunk is unavailable")?;
+        for y in sections {
+            if captured
+                .as_ref()
+                .and_then(|chunk| chunk.sections.get(&i32::from(y)))
+                .is_some_and(|section| section.valid)
+            {
+                continue;
+            }
+            let palette = source_sections
+                .iter()
+                .find(|section| section.y == y)
+                .and_then(|section| section.blocks.as_ref())
+                .context("POI source terrain section is incomplete")?;
+            let mut resolved = Vec::with_capacity(palette.states.len());
+            for state in &palette.states {
+                let state = resolve_saved_state(state)?;
+                validate_state(&state)?;
+                resolved.push(state);
+            }
+            let blocks = chunk
+                .sections
+                .get(&y)
+                .and_then(|section| section.blocks.as_ref())
+                .context("POI runtime terrain section is incomplete")?;
+            for (index, id) in blocks.iter().enumerate() {
+                let runtime = original_world
+                    .state(*id)
+                    .context("POI runtime terrain state is unavailable")?;
+                let saved = resolved
+                    .get(palette.indices[index] as usize)
+                    .context("POI terrain palette index is invalid")?;
+                ensure!(
+                    runtime == saved,
+                    "POI source terrain section differs from the session source"
+                );
+            }
+        }
+        native_persistence::poi::reconcile_and_draft_block_changes(
+            captured.as_ref(),
+            native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            &original_world,
+            &changes,
+            &mut validate_state,
+            &mut validate_poi_type,
+        )
     }
 
     /// Combine block edits and supported block ticks in memory only.
@@ -24913,6 +25040,181 @@ mod tests {
             edited.saved_poi_chunk(pos),
             Some(SavedPoiData::Unavailable)
         ));
+    }
+
+    #[test]
+    fn missing_poi_is_rebuilt_from_verified_original_terrain() {
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::Tag,
+            palette::BlockState as SavedState,
+        };
+        let mut session = session();
+        let position = session.player_chunk().unwrap();
+        let source = fixture_chunk_document(position);
+        session
+            .set_initial_poi_chunk(position, SavedPoiData::Missing)
+            .unwrap();
+        let bell = session.intern_block(state("minecraft:bell", &[]));
+        let relative = IVec3::new(4, 1, 4);
+        let absolute = session.origin + relative;
+        assert!(session.set(relative, bell));
+        let resolve = |saved: &SavedState| -> anyhow::Result<BlockState> {
+            Ok(BlockState {
+                name: String::from_utf16(&saved.name.0)?,
+                properties: saved
+                    .properties
+                    .iter()
+                    .map(|(k, v)| Ok((String::from_utf16(&k.0)?, String::from_utf16(&v.0)?)))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        };
+        let draft = session
+            .draft_reconciled_poi_chunk(position, &source, resolve, |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert!(draft.source().is_none());
+        let section = draft
+            .document()
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("0")
+            .unwrap();
+        let Some(Tag::List { values, .. }) = section.get("Records") else {
+            panic!()
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("pos"),
+            Some(&Tag::IntArray(vec![absolute.x, absolute.y, absolute.z]))
+        );
+        assert_eq!(values[0].get("free_tickets"), Some(&Tag::Int(32)));
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        draft
+            .add_to_save_plan(
+                &mut plan,
+                native_persistence::world::DimensionId::parse("overworld").unwrap(),
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(plan.poi_chunk_count(), 1);
+
+        let stale = draft_chunk_blocks(
+            &source,
+            native_persistence::world::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            &[BlockChange {
+                x: session.origin.x + 5,
+                y: 0,
+                z: session.origin.z + 4,
+                expected: SavedState {
+                    name: "minecraft:stone".into(),
+                    properties: vec![],
+                },
+                replacement: SavedState {
+                    name: "minecraft:dirt".into(),
+                    properties: vec![],
+                },
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        assert!(
+            session
+                .draft_reconciled_poi_chunk(position, &stale, resolve, |_| Ok(()), |_| Ok(()))
+                .is_err(),
+            "an unrelated stale terrain block must prevent reconstruction"
+        );
+    }
+
+    #[test]
+    fn invalid_poi_rebuild_preserves_source_and_blocks_unknown_data_loss() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag, TagType},
+            palette::BlockState as SavedState,
+            world::{ChunkPos as SavedChunkPos, SavedPoiChunk},
+        };
+        let mut session = session();
+        let pos = session.player_chunk().unwrap();
+        let source = fixture_chunk_document(pos);
+        let stale_position = [session.origin.x + 5, 0, session.origin.z + 4];
+        let poi = SavedPoiChunk::from_document(
+            NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "Sections".into(),
+                        Tag::Compound(vec![(
+                            "0".into(),
+                            Tag::Compound(vec![
+                                ("Valid".into(), Tag::Byte(0)),
+                                (
+                                    "Records".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![
+                                            ("pos".into(), Tag::IntArray(stale_position.to_vec())),
+                                            ("type".into(), Tag::String("minecraft:home".into())),
+                                            ("free_tickets".into(), Tag::Int(0)),
+                                            ("future".into(), Tag::Int(17)),
+                                        ])],
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            },
+            SavedChunkPos { x: pos.x, z: pos.z },
+        )
+        .unwrap();
+        session
+            .set_initial_poi_chunk(pos, SavedPoiData::Present(Arc::new(poi.clone())))
+            .unwrap();
+        let bell = session.intern_block(state("minecraft:bell", &[]));
+        assert!(session.set(IVec3::new(4, 1, 4), bell));
+        let resolve = |saved: &SavedState| -> anyhow::Result<BlockState> {
+            Ok(BlockState {
+                name: String::from_utf16(&saved.name.0)?,
+                properties: saved
+                    .properties
+                    .iter()
+                    .map(|(k, v)| Ok((String::from_utf16(&k.0)?, String::from_utf16(&v.0)?)))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        };
+        let draft = session
+            .draft_reconciled_poi_chunk(pos, &source, resolve, |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert_eq!(draft.source(), Some(&*poi.document));
+        assert_eq!(
+            draft.discarded_positions(),
+            &BTreeSet::from([stale_position])
+        );
+        let section = draft
+            .document()
+            .value
+            .get("Sections")
+            .unwrap()
+            .get("0")
+            .unwrap();
+        assert_eq!(section.get("Valid"), Some(&Tag::Byte(1)));
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        assert!(
+            draft
+                .add_to_save_plan(
+                    &mut plan,
+                    native_persistence::world::DimensionId::parse("overworld").unwrap(),
+                    Some(&poi.document),
+                    1
+                )
+                .is_err()
+        );
     }
 
     #[test]

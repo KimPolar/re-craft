@@ -33,6 +33,7 @@ fn weather_timer_and_intensities_match_java() {
     let rust_data = temp.path().join("rust-weather.dat");
     let rust_level = temp.path().join("rust-level.dat");
     let command_output = temp.path().join("weather-commands.json");
+    let shared_output = temp.path().join("weather-shared.json");
     let state = SavedWeather {
         clear_weather_time: 37,
         rain_time: 239,
@@ -86,7 +87,8 @@ fn weather_timer_and_intensities_match_java() {
             .arg(&saved_data)
             .arg(&rust_data)
             .arg(&rust_level)
-            .arg(&command_output),
+            .arg(&command_output)
+            .arg(&shared_output),
     ] {
         let result = command.output().unwrap();
         assert!(
@@ -100,6 +102,75 @@ fn weather_timer_and_intensities_match_java() {
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     let commands: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(command_output).unwrap()).unwrap();
+    let shared: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(shared_output).unwrap()).unwrap();
+    assert_eq!(shared.len(), 120);
+    for case in &shared {
+        let data = SavedWeather {
+            clear_weather_time: case["clear"].as_i64().unwrap() as i32,
+            rain_time: case["rain"].as_i64().unwrap() as i32,
+            thunder_time: case["thunder"].as_i64().unwrap() as i32,
+            raining: case["raining"].as_bool().unwrap(),
+            thundering: case["thundering"].as_bool().unwrap(),
+        };
+        let current = case["current"].as_i64().unwrap();
+        let advance = case["advance"].as_bool().unwrap();
+        let mut weather = Weather::new(data);
+        let mut randoms = [
+            LegacyRandom::new(case["seedA"].as_i64().unwrap()),
+            LegacyRandom::new(case["seedB"].as_i64().unwrap()),
+            LegacyRandom::new(case["seedC"].as_i64().unwrap()),
+        ];
+        let level_count = case["levelCount"].as_u64().unwrap() as usize;
+        for expected in case["trace"].as_array().unwrap() {
+            for (index, random) in randoms.iter_mut().take(level_count).enumerate() {
+                if current == index as i64 {
+                    weather.tick(true, advance, random);
+                } else if advance {
+                    Weather::advance_data(&mut weather.data, random);
+                }
+            }
+            let expected = expected.as_array().unwrap();
+            assert_eq!(
+                weather.data,
+                SavedWeather {
+                    clear_weather_time: expected[0].as_i64().unwrap() as i32,
+                    rain_time: expected[1].as_i64().unwrap() as i32,
+                    thunder_time: expected[2].as_i64().unwrap() as i32,
+                    raining: expected[3].as_bool().unwrap(),
+                    thundering: expected[4].as_bool().unwrap()
+                },
+                "{case}"
+            );
+            if current >= 0 {
+                assert_eq!(
+                    weather.rain_level.to_bits(),
+                    expected[5].as_i64().unwrap() as i32 as u32,
+                    "{case}"
+                );
+                assert_eq!(
+                    weather.thunder_level.to_bits(),
+                    expected[6].as_i64().unwrap() as i32 as u32,
+                    "{case}"
+                );
+            }
+        }
+        assert_eq!(
+            randoms[0].next_int(),
+            case["nextA"].as_i64().unwrap() as i32,
+            "{case}"
+        );
+        assert_eq!(
+            randoms[1].next_int(),
+            case["nextB"].as_i64().unwrap() as i32,
+            "{case}"
+        );
+        assert_eq!(
+            randoms[2].next_int(),
+            case["nextC"].as_i64().unwrap() as i32,
+            "{case}"
+        );
+    }
     assert_eq!(commands.len(), 72);
     for row in &commands {
         use native_session::weather_command::{WeatherCommand, WeatherKind, apply};

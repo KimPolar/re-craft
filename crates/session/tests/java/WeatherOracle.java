@@ -119,6 +119,38 @@ public class WeatherOracle {
             }
         }
         Files.writeString(Path.of(args[4]),commands.toString());
+        var other=(World)u.allocateInstance(World.class);
+        field(ServerLevel.class,"server").set(other,server); other.rules=rules;
+        var third=(World)u.allocateInstance(World.class);
+        field(ServerLevel.class,"server").set(third,server); third.rules=rules;
+        var sharedCases=new JsonArray();
+        for(int n=0;n<120;n++) {
+            long seedA=random.nextLong(), seedB=random.nextLong(), seedC=random.nextLong();
+            int levelCount=2+n%2;
+            int clear=random.nextInt(4), rt=random.nextInt(4), tt=random.nextInt(4), current=(n/2)%(levelCount+1)-1;
+            boolean raining=random.nextBoolean(), thundering=random.nextBoolean(), advance=random.nextBoolean();
+            var data=new WeatherData(clear,rt,tt,raining,thundering);
+            var levels=new World[]{world,other,third};
+            var randoms=new RandomSource[]{RandomSource.create(seedA),RandomSource.create(seedB),RandomSource.create(seedC)};
+            rules.enabled=advance;
+            for(int j=0;j<levelCount;j++) {
+                var level=levels[j]; level.weather=data; level.canWeather=true; randomField.set(level,randoms[j]);
+                rain.setFloat(level,raining?1f:0f); thunder.setFloat(level,raining&&thundering?1f:0f);
+                oldRain.setFloat(level,0f); oldThunder.setFloat(level,0f);
+            }
+            var trace=new JsonArray();
+            for(int i=0;i<30;i++) {
+                for(int j=0;j<levelCount;j++) tick.invoke(levels[j]);
+                var row=new JsonArray(); row.add(data.getClearWeatherTime()); row.add(data.getRainTime()); row.add(data.getThunderTime());
+                row.add(data.isRaining()); row.add(data.isThundering());
+                if(current>=0) { row.add(Float.floatToIntBits(rain.getFloat(levels[current]))); row.add(Float.floatToIntBits(thunder.getFloat(levels[current]))); }
+                trace.add(row);
+            }
+            var row=new JsonObject(); row.addProperty("seedA",seedA); row.addProperty("seedB",seedB); row.addProperty("seedC",seedC); row.addProperty("levelCount",levelCount); row.addProperty("current",current);
+            row.addProperty("clear",clear); row.addProperty("rain",rt); row.addProperty("thunder",tt); row.addProperty("raining",raining); row.addProperty("thundering",thundering);
+            row.addProperty("advance",advance); row.addProperty("nextA",randoms[0].nextInt()); row.addProperty("nextB",randoms[1].nextInt()); row.addProperty("nextC",randoms[2].nextInt()); row.add("trace",trace); sharedCases.add(row);
+        }
+        Files.writeString(Path.of(args[5]),sharedCases.toString());
         var saved=new WeatherData(37,239,919,true,false);
         var document=new CompoundTag();
         document.putInt("DataVersion",5023);

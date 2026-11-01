@@ -926,19 +926,26 @@ fn prepare_existing_world(
             .set_has_skylight(profile.has_skylight)
             .map_err(anyhow::Error::msg)?;
         let mut can_weather = preview_lighting::can_have_weather(reader.dimension(), &profile);
-        if can_weather == Some(true) && rules.advance_weather {
-            can_weather = match preview_lighting::sole_weather_dimension(
+        let weather_order = if rules.advance_weather {
+            match preview_lighting::weather_tick_order(
                 &mut resources,
                 reader.dimension(),
                 saved_dimensions.as_ref(),
             ) {
-                Ok(true) => Some(true),
-                Ok(false) => None,
+                Ok(Some(order)) if can_weather == Some(order.contains(reader.dimension())) => {
+                    Some(order)
+                }
+                Ok(_) => None,
                 Err(error) => {
                     eprintln!("Weather dimension topology is unavailable: {error:#}");
                     None
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if rules.advance_weather && weather_order.is_none() && can_weather == Some(true) {
+            can_weather = None;
         }
         // WeatherData is server-wide, so commands may change it from any dimension.
         let weather = {
@@ -962,6 +969,12 @@ fn prepare_existing_world(
             weather.as_ref().map(|(data, _)| *data),
             rules.advance_weather,
         );
+        if let Some(order) = weather_order {
+            let current_levels: Vec<_> = order.iter().map(|id| id == reader.dimension()).collect();
+            session
+                .set_weather_tick_order(&current_levels)
+                .map_err(anyhow::Error::msg)?;
+        }
         if let Some((_, source)) = &weather {
             session.capture_weather_source(source.as_ref())?;
         }

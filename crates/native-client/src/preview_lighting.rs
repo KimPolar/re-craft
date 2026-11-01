@@ -151,18 +151,20 @@ pub fn can_have_weather(dimension: &DimensionId, profile: &PreviewLighting) -> O
     profile.has_ceiling.map(|ceiling| !ceiling)
 }
 
-/// Weather data is shared and Java ticks it once for every weather-capable
-/// level. This client currently simulates just one dimension.
-pub fn sole_weather_dimension(
+/// Java ticks the overworld first. Other levels come from a HashMap whose
+/// iteration order cannot be reconstructed from saved data alone; use a
+/// stable identifier order for those levels until their registry is modeled.
+pub fn weather_tick_order(
     source: &mut impl ResourceProvider,
     current: &DimensionId,
     saved: Option<&BTreeMap<DimensionId, SavedDimensionType>>,
-) -> Result<bool> {
+) -> Result<Option<Vec<DimensionId>>> {
     let Some(saved) = saved else {
-        return Ok(false);
+        return Ok(None);
     };
-    if !saved.contains_key(current) {
-        return Ok(false);
+    let overworld = DimensionId::parse("minecraft:overworld")?;
+    if !saved.contains_key(current) || !saved.contains_key(&overworld) {
+        return Ok(None);
     }
     let mut dimensions: std::collections::BTreeSet<_> = saved.keys().cloned().collect();
     for id in source.list_data("dimension")? {
@@ -171,8 +173,9 @@ pub fn sole_weather_dimension(
             id.namespace, id.path
         ))?);
     }
+    let mut result = Vec::new();
     for id in dimensions {
-        if &id == current || (id.namespace == "minecraft" && id.path == "the_end") {
+        if id.namespace == "minecraft" && id.path == "the_end" {
             continue;
         }
         let resolved = resolve_dimension_type(source, &id, Some(saved))?;
@@ -181,11 +184,17 @@ pub fn sole_weather_dimension(
             Some(id) => PreviewLighting::load_type(source, &id)?,
             None => PreviewLighting::load(source, &name)?,
         };
-        if can_have_weather(&id, &profile) != Some(false) {
-            return Ok(false);
+        match can_have_weather(&id, &profile) {
+            Some(true) => result.push(id),
+            Some(false) => {}
+            None => return Ok(None),
         }
     }
-    Ok(true)
+    if let Some(index) = result.iter().position(|id| *id == overworld) {
+        let overworld = result.remove(index);
+        result.insert(0, overworld);
+    }
+    Ok(Some(result))
 }
 
 impl Default for PreviewLighting {
@@ -690,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn weather_topology_rejects_extra_weather_levels_and_unknown_types() {
+    fn weather_topology_orders_extra_levels_and_rejects_unknown_types() {
         struct Data {
             extra: bool,
             unknown: bool,
@@ -701,6 +710,9 @@ mod tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 Ok(match path {
+                    "data/minecraft/dimension_type/overworld.json" => {
+                        Some(br#"{"has_skylight":true,"has_ceiling":false}"#.to_vec())
+                    }
                     "data/minecraft/dimension_type/the_nether.json" => {
                         Some(br#"{"has_skylight":false,"has_ceiling":true}"#.to_vec())
                     }
@@ -736,14 +748,47 @@ mod tests {
             extra: false,
             unknown: false,
         };
-        assert!(sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
-        assert!(!sole_weather_dimension(&mut data, &overworld, None).unwrap());
+        assert_eq!(
+            weather_tick_order(&mut data, &overworld, Some(&saved)).unwrap(),
+            Some(vec![overworld.clone()])
+        );
+        assert_eq!(
+            weather_tick_order(&mut data, &nether, Some(&saved)).unwrap(),
+            Some(vec![overworld.clone()])
+        );
+        assert_eq!(
+            weather_tick_order(&mut data, &overworld, None).unwrap(),
+            None
+        );
         let extra = DimensionId::parse("example:sky").unwrap();
         saved.insert(extra.clone(), SavedDimensionType::Named(extra));
         data.extra = true;
-        assert!(!sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
+        assert_eq!(
+            weather_tick_order(&mut data, &overworld, Some(&saved)).unwrap(),
+            Some(vec![
+                overworld.clone(),
+                DimensionId::parse("example:sky").unwrap()
+            ])
+        );
+        let other = DimensionId::parse("example:other").unwrap();
+        saved.insert(
+            other.clone(),
+            SavedDimensionType::Named(DimensionId::parse("example:sky").unwrap()),
+        );
+        assert_eq!(
+            weather_tick_order(&mut data, &overworld, Some(&saved)).unwrap(),
+            Some(vec![
+                overworld.clone(),
+                other.clone(),
+                DimensionId::parse("example:sky").unwrap()
+            ])
+        );
+        saved.remove(&other);
         data.unknown = true;
-        assert!(!sole_weather_dimension(&mut data, &overworld, Some(&saved)).unwrap());
+        assert_eq!(
+            weather_tick_order(&mut data, &overworld, Some(&saved)).unwrap(),
+            None
+        );
         let profile =
             PreviewLighting::from_json(br#"{"has_skylight":true,"has_ceiling":false}"#).unwrap();
         assert_eq!(can_have_weather(&overworld, &profile), Some(true));
@@ -769,7 +814,15 @@ mod tests {
             (id.clone(), SavedDimensionType::Named(id))
         })
         .collect();
-        assert!(sole_weather_dimension(&mut source, &overworld, Some(&saved)).unwrap());
+        assert_eq!(
+            weather_tick_order(&mut source, &overworld, Some(&saved)).unwrap(),
+            Some(vec![overworld.clone()])
+        );
+        let nether = DimensionId::parse("minecraft:the_nether").unwrap();
+        assert_eq!(
+            weather_tick_order(&mut source, &nether, Some(&saved)).unwrap(),
+            Some(vec![overworld])
+        );
     }
 
     #[test]

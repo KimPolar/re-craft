@@ -361,6 +361,11 @@ impl RainView<'_> {
     }
 }
 
+enum WeatherTickLevel {
+    Current,
+    Background(native_core::random::LegacyRandom),
+}
+
 pub struct LoadedSession {
     world: Arc<World>,
     shapes: Vec<Option<Vec<Aabb>>>,
@@ -392,6 +397,7 @@ pub struct LoadedSession {
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
     weather: Option<crate::weather::Weather>,
+    weather_tick_order: Vec<WeatherTickLevel>,
     weather_source: Option<Option<native_persistence::nbt::NamedTag>>,
     can_have_weather: Option<bool>,
     advance_weather: bool,
@@ -3459,11 +3465,40 @@ impl LoadedSession {
         advance_weather: bool,
     ) {
         self.can_have_weather = can_have_weather;
+        self.weather_tick_order.clear();
+        if can_have_weather == Some(true) {
+            self.weather_tick_order.push(WeatherTickLevel::Current);
+        }
         self.weather = data.map(crate::weather::Weather::new);
         self.weather_source = None;
         self.advance_weather = advance_weather;
         let visual = self.weather_visual();
         Arc::make_mut(&mut self.snapshot).weather = visual;
+    }
+
+    /// Install the server's weather-capable level order; each other level has
+    /// its own random source, independent of the player's current level.
+    pub fn set_weather_tick_order(&mut self, current_levels: &[bool]) -> Result<(), &'static str> {
+        if self.tick != 0 || self.accumulated != Duration::ZERO {
+            return Err("weather tick order must be set before simulation begins");
+        }
+        let current_count = current_levels.iter().filter(|&&current| current).count();
+        if current_count != usize::from(self.can_have_weather == Some(true)) {
+            return Err("weather tick order does not match the current dimension");
+        }
+        self.weather_tick_order = current_levels
+            .iter()
+            .map(|&current| {
+                if current {
+                    WeatherTickLevel::Current
+                } else {
+                    WeatherTickLevel::Background(native_core::random::LegacyRandom::new(
+                        fresh_breathing_seed(),
+                    ))
+                }
+            })
+            .collect();
+        Ok(())
     }
 
     /// Capture the exact document (or its absence) before any weather ticks.
@@ -3826,6 +3861,7 @@ impl LoadedSession {
             farmland_water_tag: None,
             weather: None,
             weather_source: None,
+            weather_tick_order: Vec::new(),
             can_have_weather: None,
             advance_weather: true,
             game_time: 0,
@@ -11609,10 +11645,18 @@ impl LoadedSession {
         for clock in self.world_clocks.values_mut() {
             clock.tick(self.advance_time);
         }
-        if self.can_have_weather == Some(true)
-            && let Some(weather) = &mut self.weather
-        {
-            weather.tick(true, self.advance_weather, &mut self.level_random);
+        if let Some(weather) = &mut self.weather {
+            for level in &mut self.weather_tick_order {
+                match level {
+                    WeatherTickLevel::Current => {
+                        weather.tick(true, self.advance_weather, &mut self.level_random)
+                    }
+                    WeatherTickLevel::Background(random) if self.advance_weather => {
+                        crate::weather::Weather::advance_data(&mut weather.data, random)
+                    }
+                    WeatherTickLevel::Background(_) => {}
+                }
+            }
         }
         if let Some(environment) = &self.fast_lava_environment
             && let Some(value) = environment.sample(|id| {
@@ -15376,6 +15420,44 @@ mod tests {
         session.update(TICK);
         assert_eq!(session.weather.as_ref().unwrap().data, data);
         assert_eq!(session.global_rain(), Some(false));
+    }
+
+    #[test]
+    fn shared_weather_follows_level_order_without_changing_other_visuals() {
+        use native_persistence::world::SavedWeather;
+        let data = SavedWeather {
+            rain_time: 2,
+            thunder_time: 100,
+            ..Default::default()
+        };
+        let mut nether = session();
+        nether.set_weather(Some(false), Some(data), true);
+        assert!(nether.set_weather_tick_order(&[false]).is_ok());
+        nether.set_random_tick_speed(0);
+        nether.update(TICK);
+        assert_eq!(nether.weather.as_ref().unwrap().data.rain_time, 1);
+        assert_eq!(
+            nether.weather_visual(),
+            Some(crate::weather::WeatherVisual::default())
+        );
+        assert!(nether.set_weather_tick_order(&[false]).is_err());
+
+        let mut before = session();
+        before.set_weather(Some(true), Some(data), true);
+        assert!(before.set_weather_tick_order(&[false, true]).is_ok());
+        before.set_random_tick_speed(0);
+        before.update(TICK);
+        assert!(before.weather.as_ref().unwrap().data.raining);
+        assert_eq!(before.weather_visual().unwrap().rain, 0.01);
+
+        let mut after = session();
+        after.set_weather(Some(true), Some(data), true);
+        assert!(after.set_weather_tick_order(&[true, false]).is_ok());
+        after.set_random_tick_speed(0);
+        after.update(TICK);
+        assert!(after.weather.as_ref().unwrap().data.raining);
+        assert_eq!(after.weather_visual().unwrap().rain, 0.0);
+        assert!(self::session().set_weather_tick_order(&[true]).is_err());
     }
 
     #[test]

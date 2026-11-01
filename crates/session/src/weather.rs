@@ -118,47 +118,7 @@ impl Weather {
         self.previous_rain_level = self.rain_level;
         self.previous_thunder_level = self.thunder_level;
         if advance_weather {
-            let data = &mut self.data;
-            if data.clear_weather_time > 0 {
-                data.clear_weather_time -= 1;
-                data.thunder_time = if data.thundering { 0 } else { 1 };
-                data.rain_time = if data.raining { 0 } else { 1 };
-                data.thundering = false;
-                data.raining = false;
-            } else {
-                if data.thunder_time > 0 {
-                    data.thunder_time -= 1;
-                    if data.thunder_time == 0 {
-                        data.thundering = !data.thundering;
-                    }
-                } else {
-                    let (min, max) = if data.thundering {
-                        (3600, 15600)
-                    } else {
-                        (12000, 180000)
-                    };
-                    data.thunder_time = min
-                        + random
-                            .next_int_bound(max - min + 1)
-                            .expect("valid weather range");
-                }
-                if data.rain_time > 0 {
-                    data.rain_time -= 1;
-                    if data.rain_time == 0 {
-                        data.raining = !data.raining;
-                    }
-                } else {
-                    let (min, max) = if data.raining {
-                        (12000, 24000)
-                    } else {
-                        (12000, 180000)
-                    };
-                    data.rain_time = min
-                        + random
-                            .next_int_bound(max - min + 1)
-                            .expect("valid weather range");
-                }
-            }
+            Self::advance_data(&mut self.data, random);
         }
         self.thunder_level = (self.thunder_level
             + if self.data.thundering {
@@ -174,6 +134,50 @@ impl Weather {
                 -0.01_f32
             })
         .clamp(0.0, 1.0);
+    }
+
+    /// Tick shared timers for a background level without changing this level's visuals.
+    pub fn advance_data(data: &mut SavedWeather, random: &mut LegacyRandom) {
+        if data.clear_weather_time > 0 {
+            data.clear_weather_time -= 1;
+            data.thunder_time = if data.thundering { 0 } else { 1 };
+            data.rain_time = if data.raining { 0 } else { 1 };
+            data.thundering = false;
+            data.raining = false;
+        } else {
+            if data.thunder_time > 0 {
+                data.thunder_time -= 1;
+                if data.thunder_time == 0 {
+                    data.thundering = !data.thundering;
+                }
+            } else {
+                let (min, max) = if data.thundering {
+                    (3600, 15600)
+                } else {
+                    (12000, 180000)
+                };
+                data.thunder_time = min
+                    + random
+                        .next_int_bound(max - min + 1)
+                        .expect("valid weather range");
+            }
+            if data.rain_time > 0 {
+                data.rain_time -= 1;
+                if data.rain_time == 0 {
+                    data.raining = !data.raining;
+                }
+            } else {
+                let (min, max) = if data.raining {
+                    (12000, 24000)
+                } else {
+                    (12000, 180000)
+                };
+                data.rain_time = min
+                    + random
+                        .next_int_bound(max - min + 1)
+                        .expect("valid weather range");
+            }
+        }
     }
 
     pub fn is_raining(&self, can_have_weather: bool) -> bool {

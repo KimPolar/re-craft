@@ -12679,6 +12679,40 @@ impl LoadedSession {
         );
     }
 
+    /// LiquidBlock checks source water on placement and neighbor changes.
+    fn schedule_water_bubble_check(&mut self, position: IVec3, id: BlockStateId) {
+        if !self
+            .ordinary_fluid(id)
+            .is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source)
+        {
+            return;
+        }
+        let Some(tags) = self.bubble_column_tags.as_ref() else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        if !tags.water_can_occupy() {
+            return;
+        }
+        let Some(below) = add(position, IVec3::NEG_Y) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let Cell::State(support) =
+            cell(&self.world, self.origin, self.bounds, below, self.states[0])
+        else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let Some(support) = self.world.state(support) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        if tags.enables(&support.name) {
+            self.schedule_bubble(position, BubbleTickKind::Water, 20);
+        }
+    }
+
     fn enqueue_saved_ice(&mut self, ticks: &[SavedBlockTick]) {
         for (index, tick) in ticks.iter().enumerate() {
             if !matches!(tick.block.as_str(), "minecraft:frosted_ice" | "frosted_ice") {
@@ -14098,12 +14132,16 @@ impl LoadedSession {
         let new_sand = new_name.and_then(FallingKind::from_id);
         let old_support = self.world.state(old).and_then(button_support_direction);
         let new_support = self.world.state(new).and_then(button_support_direction);
-        if changed_kind
+        if (changed_kind || new_name == Some("minecraft:water"))
             && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
             && let Some(fluid) = self.simulated_fluid(new)
             && !(fluid.kind == FluidKind::Lava && self.react_lava(position))
         {
             self.schedule_fluid(position, fluid, settings.delay(fluid.kind));
+        }
+        if matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
+        {
+            self.schedule_water_bubble_check(position, new);
         }
         if changed_kind
             && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
@@ -14123,6 +14161,15 @@ impl LoadedSession {
             let Some(neighbor) = add(position, direction) else {
                 continue;
             };
+            if let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) {
+                self.schedule_water_bubble_check(neighbor, id);
+            }
             if let Cell::State(id) = cell(
                 &self.world,
                 self.origin,
@@ -18206,20 +18253,13 @@ impl DiskWorld<'_> {
                     let below = add(IVec3::from_array(neighbor), IVec3::NEG_Y)
                         .ok_or_else(|| anyhow::anyhow!("water support position overflow"))?
                         .to_array();
-                    let support = if below == position || self.frozen.contains(&below) {
-                        "minecraft:frosted_ice"
-                    } else {
-                        &self.state(below)?.name
-                    };
-                    let tags = self
-                        .session
+                    if below != position && !self.frozen.contains(&below) {
+                        self.state(below)?;
+                    }
+                    self.session
                         .bubble_column_tags
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("bubble-column tags are unavailable"))?;
-                    anyhow::ensure!(
-                        !tags.water_can_occupy() || !tags.enables(support),
-                        "bubble column scheduling is unsupported"
-                    );
                 }
                 "minecraft:frosted_ice" => {
                     anyhow::ensure!(
@@ -22369,6 +22409,41 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn water_bucket_above_magma_schedules_and_creates_bubble_column() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        let support = session.intern_block(state("minecraft:magma_block", &[]));
+        assert!(session.set_with_notify(IVec3::new(8, 1, 7), support, false));
+        assert!(session.try_empty_bucket(PlayerSlot::Storage(0)));
+        let absolute = session.origin + IVec3::new(8, 2, 7);
+        assert!(session.bubble_pending.contains(&BubbleTickKey {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+            kind: BubbleTickKind::Water
+        }));
+        session.tick = 20;
+        session.advance_block_ticks();
+        let block = session
+            .world
+            .block(absolute.x, absolute.y, absolute.z)
+            .unwrap();
+        assert_eq!(block.name, "minecraft:bubble_column");
+        assert_eq!(
+            block.properties.get("drag").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -28863,15 +28938,9 @@ pub(crate) mod tests {
                 BTreeSet::new(),
             ),
         ));
-        let random_before = tagged_floor.level_random.clone().next_int();
-        tagged_floor.run_location_effects(true);
-        assert!(tagged_floor.ice_ticks.is_empty());
-        assert_eq!(tagged_floor.level_random.clone().next_int(), random_before);
-        tagged_floor.set_bubble_column_tags(Arc::new(
-            native_resources::fluid_tags::BubbleColumnTags::new(BTreeSet::new(), BTreeSet::new()),
-        ));
         tagged_floor.run_location_effects(true);
         assert_eq!(tagged_floor.ice_ticks.len(), 24);
+        assert!(!tagged_floor.bubble_ticks.is_empty());
 
         let mut excluded_water = setup(true);
         excluded_water.set_bubble_column_tags(Arc::new(
@@ -28901,8 +28970,17 @@ pub(crate) mod tests {
         assert!(
             stage
                 .validate_freeze((tagged_ice.origin + IVec3::new(8, 1, 8)).to_array())
-                .is_err()
+                .is_ok()
         );
+        let ice = tagged_ice.intern_block(state("minecraft:frosted_ice", &[("age", "0")]));
+        assert!(tagged_ice.set(IVec3::new(8, 1, 8), ice));
+        let above = tagged_ice.origin + IVec3::new(8, 2, 8);
+        assert!(tagged_ice.bubble_pending.contains(&BubbleTickKey {
+            x: above.x,
+            y: above.y,
+            z: above.z,
+            kind: BubbleTickKind::Water
+        }));
 
         let mut missing = setup(false);
         let before_random = missing.level_random.clone().next_int();
@@ -28986,6 +29064,193 @@ pub(crate) mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn frost_walker_bubble_scheduling_matches_java_effect() {
+        use native_resources::enchantments::{
+            EquipmentSlot,
+            location::{LocationAction, LocationContext},
+        };
+        use native_resources::packs::ResourceId;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FrostWalkerBubbleOracle.java");
+        let dependency = temp.path().join("IceBubbleTagOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrostWalkerBubbleOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            include_str!("../tests/java/IceBubbleTagOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&dependency),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FrostWalkerBubbleOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut resources).unwrap();
+        let definition = registry
+            .location_effects(&ResourceId::parse("minecraft:frost_walker").unwrap())
+            .unwrap();
+        let context = LocationContext {
+            active: false,
+            flying: false,
+            on_ground: true,
+            vehicle: false,
+            movement_block: "minecraft:water",
+            level: 1,
+            tick_count: 0,
+            known_movement: [0.0; 3],
+        };
+        let (_, actions) = definition
+            .evaluate(0, EquipmentSlot::Feet, &context, &mut || {
+                panic!("unexpected random condition")
+            })
+            .unwrap();
+        let [LocationAction::ReplaceDisk(action)] = actions.as_slice() else {
+            panic!("unexpected frost walker effect")
+        };
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32);
+        for row in rows {
+            let mut session = session();
+            session
+                .entity_chunks
+                .insert(session.player_chunk().unwrap(), SavedEntityData::Empty);
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            for x in 4..=12 {
+                for z in 4..=12 {
+                    assert!(session.set_with_notify(IVec3::new(x, 1, z), water, false));
+                }
+            }
+            let tags = row["tags"].as_u64().unwrap();
+            let down = if tags & 1 != 0 {
+                BTreeSet::from(["minecraft:stone".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let up = if tags & 2 != 0 {
+                BTreeSet::from(["minecraft:stone".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let fluids = if row["water"].as_bool().unwrap() {
+                BTreeSet::from(["minecraft:water".into()])
+            } else {
+                BTreeSet::new()
+            };
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(down, up, fluids),
+            ));
+            session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            session.player.position = session.motion.position.as_vec3();
+            session.level_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            session.apply_location_disk(action).unwrap();
+            let mut blocks: Vec<_> = session
+                .ice_ticks
+                .iter()
+                .map(|(order, &(x, y, z))| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            "ice",
+                            x - session.origin.x,
+                            y - session.origin.y,
+                            z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            blocks.extend(session.bubble_ticks.iter().map(|(order, key)| {
+                (
+                    order.3,
+                    serde_json::json!([
+                        "water",
+                        key.x - session.origin.x,
+                        key.y - session.origin.y,
+                        key.z - session.origin.z,
+                        order.0
+                    ]),
+                )
+            }));
+            blocks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(blocks.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["blockTicks"],
+                "{row}"
+            );
+            let mut fluid: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluid.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(fluid.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["fluidTicks"],
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -29454,6 +29719,176 @@ pub(crate) mod tests {
             assert_eq!(
                 session.level_random.next_int(),
                 row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn water_placement_and_neighbor_bubble_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("WaterBubblePlacementOracle.java");
+        let dependency = temp.path().join("IceBubbleTagOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WaterBubblePlacementOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            include_str!("../tests/java/IceBubbleTagOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&dependency),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("WaterBubblePlacementOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 48);
+        let center = IVec3::new(8, 10, 8);
+        for row in rows {
+            let mut session = session();
+            let tag = row["tags"].as_u64().unwrap();
+            let down = if tag & 1 != 0 {
+                BTreeSet::from(["minecraft:stone".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let up = if tag & 2 != 0 {
+                BTreeSet::from(["minecraft:stone".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let fluids = if row["water"].as_bool().unwrap() {
+                BTreeSet::from(["minecraft:water".into()])
+            } else {
+                BTreeSet::new()
+            };
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(down, up, fluids),
+            ));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            let flowing = session.intern_block(state("minecraft:water", &[("level", "1")]));
+            let scenario = row["scenario"].as_u64().unwrap();
+            let target = match scenario {
+                0 | 4 => {
+                    assert!(session.set_with_notify(center - IVec3::Y, stone, false));
+                    if scenario == 4 {
+                        assert!(session.set_with_notify(center, flowing, false));
+                    }
+                    center
+                }
+                1 => {
+                    assert!(session.set_with_notify(center, water, false));
+                    center - IVec3::Y
+                }
+                5 => {
+                    for side in [IVec3::NEG_X, IVec3::X] {
+                        assert!(session.set_with_notify(center + side, water, false));
+                        assert!(session.set_with_notify(center + side - IVec3::Y, stone, false));
+                    }
+                    center
+                }
+                _ => {
+                    assert!(session.set_with_notify(center - IVec3::Y, stone, false));
+                    assert!(session.set_with_notify(
+                        center,
+                        if scenario == 3 { flowing } else { water },
+                        false
+                    ));
+                    center + IVec3::X
+                }
+            };
+            assert!(session.set(
+                target,
+                if scenario == 0 || scenario == 4 {
+                    water
+                } else {
+                    stone
+                }
+            ));
+            let mut blocks: Vec<_> = session
+                .bubble_ticks
+                .iter()
+                .map(|(order, key)| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            "water",
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            blocks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(blocks.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["blockTicks"],
+                "{row}"
+            );
+            let mut fluids: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluids.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(fluids.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["fluidTicks"],
                 "{row}"
             );
         }

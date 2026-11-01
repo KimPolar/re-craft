@@ -634,6 +634,225 @@ fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_and_rust_round_trip_named_loot_and_random_sequence() {
+    use native_persistence::{
+        chest_loot::VerifiedChestLoot,
+        nbt::{Tag, TagType},
+    };
+    use native_resources::{
+        chest_loot::{ChestLootItem, ChestLootTable},
+        packs::{ResourceId, ResourceProvider, ResourceStack},
+    };
+    use native_session::{
+        equippable::saved_inventory_max,
+        inventory::{ItemStack, PlayerSlot},
+        player_data,
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-named-loot-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let region_source = temp.path().join("RegionWriteOracle.java");
+    let loot_source = temp.path().join("NamedLootTransactionOracle.java");
+    std::fs::write(&region_source, ORACLE).unwrap();
+    std::fs::write(
+        &loot_source,
+        include_str!("java/NamedLootTransactionOracle.java"),
+    )
+    .unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&region_source)
+        .arg(&loot_source));
+    let mut resources = ResourceStack::open(&game).unwrap();
+    let bytes = resources
+        .read_builtin_data("data/minecraft/loot_table/chests/buried_treasure.json")
+        .unwrap()
+        .unwrap();
+    let loot_file = temp.path().join("loot.json");
+    std::fs::write(&loot_file, &bytes).unwrap();
+    let table = ChestLootTable::decode(&serde_json::from_slice(&bytes).unwrap()).unwrap();
+    let registry = resources.vanilla_item_registry().unwrap();
+    let table_id = ResourceId::parse("minecraft:chests/buried_treasure").unwrap();
+    let seed = 987654321;
+    let components = |item: &ChestLootItem| {
+        if let Some(potion) = &item.potion {
+            let potion = format!("{}:{}", potion.namespace, potion.path);
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![("potion".into(), Tag::String(potion.as_str().into()))]),
+            )])
+        } else {
+            Tag::Compound(vec![])
+        }
+    };
+    let maximum = |item: &ChestLootItem| -> anyhow::Result<u32> {
+        let id = format!("{}:{}", item.id.namespace, item.id.path);
+        anyhow::ensure!(
+            registry.id(&id).is_some(),
+            "loot item is missing from the registry"
+        );
+        saved_inventory_max(&id, &components(item))
+            .ok_or_else(|| anyhow::anyhow!("unsupported loot prototype {id}"))
+    };
+    for existing in [false, true] {
+        let world = temp.path().join(if existing { "existing" } else { "new" });
+        std::fs::create_dir(&world).unwrap();
+        let invoke = |action: &str| {
+            run(Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("NamedLootTransactionOracle")
+                .arg(action)
+                .arg(&world)
+                .arg(&loot_file)
+                .arg(existing.to_string()))
+        };
+        assert!(invoke("prepare").contains("PREPARED"));
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let reader = WorldReader::open(&world, dimension.clone()).unwrap();
+        assert_eq!(reader.saved_world_seed().unwrap(), Some(seed));
+        let mut sequences = reader.random_sequences().unwrap();
+        assert_eq!(sequences.source().is_some(), existing);
+        drop(reader);
+        let region = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        let source_chunk = RegionReader::open(&region)
+            .unwrap()
+            .read_chunk(0, 0)
+            .unwrap()
+            .unwrap();
+        let Tag::List { values, .. } = source_chunk.value.get("block_entities").unwrap() else {
+            panic!()
+        };
+        let source_chest = values[0].clone();
+        let mut random = sequences
+            .get("minecraft:chests/buried_treasure", seed)
+            .unwrap();
+        let proof = VerifiedChestLoot::replay_named(
+            &source_chest,
+            &table_id,
+            &table,
+            seed,
+            random.state(),
+            &maximum,
+        )
+        .unwrap();
+        let generated = table
+            .fill_with_random(&[false; 27], &mut random, &maximum)
+            .unwrap();
+        sequences
+            .set("minecraft:chests/buried_treasure", &random)
+            .unwrap();
+        let moved = generated.iter().position(Option::is_some).unwrap();
+        let stack = generated[moved].as_ref().unwrap();
+        let id = format!("{}:{}", stack.id.namespace, stack.id.path);
+        let mut replacement = source_chest.clone();
+        let Tag::Compound(fields) = &mut replacement else {
+            panic!()
+        };
+        fields.retain(|(key, _)| !key.matches("LootTable") && !key.matches("LootTableSeed"));
+        let items = generated
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, item)| {
+                if slot == moved {
+                    return None;
+                }
+                let item = item.as_ref()?;
+                let name = format!("{}:{}", item.id.namespace, item.id.path);
+                let mut fields = vec![
+                    ("Slot".into(), Tag::Byte(slot as i8)),
+                    ("id".into(), Tag::String(name.as_str().into())),
+                    ("count".into(), Tag::Int(item.count as i32)),
+                ];
+                let component = components(item);
+                if component != Tag::Compound(vec![]) {
+                    fields.push(("components".into(), component));
+                }
+                Some(Tag::Compound(fields))
+            })
+            .collect();
+        fields.push((
+            "Items".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: items,
+            },
+        ));
+        let mut chunk = draft_chunk_blocks(&source_chunk, ChunkPos { x: 0, z: 0 }, &[]).unwrap();
+        chunk
+            .stage_checked_chest_inventories_with_loot(
+                &[BlockEntityChange {
+                    expected: source_chest,
+                    replacement,
+                }],
+                &[proof],
+            )
+            .unwrap();
+        let player_path = world.join("players/data/00000000-0000-0000-0000-000000000001.dat");
+        let player = nbt::read_gzip(std::fs::File::open(&player_path).unwrap()).unwrap();
+        let mut inventory = player_data::read_saved_player(&player).unwrap();
+        inventory.set_slot(
+            PlayerSlot::Storage(8),
+            ItemStack::new(id, stack.count, maximum(stack).unwrap(), components(stack)),
+        );
+        let player_draft = player_data::draft_player_inventory(&player, &inventory).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(dimension, chunk, 2).unwrap();
+        plan.add_player_data(
+            [0, 0, 0, 1],
+            &player,
+            player_draft.document(),
+            |source, _| {
+                anyhow::ensure!(player_draft.matches_source(source)?);
+                Ok(())
+            },
+        )
+        .unwrap();
+        plan.add_random_sequences(&sequences).unwrap();
+        let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+        let result = writer.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert!(result.backup_directory.exists());
+        drop(writer);
+        assert!(invoke("verify").contains(&format!("VERIFIED {moved}")));
+        let restored = RegionReader::open(&region)
+            .unwrap()
+            .read_chunk(0, 0)
+            .unwrap()
+            .unwrap();
+        let Tag::List { values, .. } = restored.value.get("block_entities").unwrap() else {
+            panic!()
+        };
+        let Tag::List { values: items, .. } = values[0].get("Items").unwrap() else {
+            panic!()
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| item.get("Slot") == Some(&Tag::Byte(moved as i8)))
+        );
+        let restored_player = nbt::read_gzip(std::fs::File::open(player_path).unwrap()).unwrap();
+        assert!(
+            player_data::read_saved_player(&restored_player)
+                .unwrap()
+                .slot(PlayerSlot::Storage(8))
+                .is_none()
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_and_rust_round_trip_chest_and_player_transfer() {
     use native_session::{
         inventory::{PlayerInventory, PlayerSlot},

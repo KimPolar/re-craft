@@ -222,6 +222,7 @@ pub struct Renderer {
     end_sky: Option<crate::end_sky::EndSky>,
     sun: Option<crate::sun_render::Sun>,
     moon: Option<crate::sun_render::Sun>,
+    celestial_sky: Option<crate::star_render::Sky>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -357,7 +358,7 @@ impl Renderer {
         self.sun = Some(crate::sun_render::Sun::new(
             &self.device,
             &self.queue,
-            self.config.format,
+            crate::star_render::FORMAT,
             DEPTH_FORMAT,
             texture,
             None,
@@ -375,12 +376,26 @@ impl Renderer {
         self.moon = Some(crate::sun_render::Sun::new(
             &self.device,
             &self.queue,
-            self.config.format,
+            crate::star_render::FORMAT,
             DEPTH_FORMAT,
             texture,
             self.sun.as_ref(),
         )?);
         Ok(())
+    }
+
+    pub fn enable_celestial_sky(&mut self) {
+        self.celestial_sky = Some(crate::star_render::Sky::new(
+            &self.device,
+            self.config.format,
+            DEPTH_FORMAT,
+        ));
+    }
+
+    pub fn set_star_frame(&mut self, frame: Option<crate::star_render::Frame>) {
+        if let Some(sky) = &mut self.celestial_sky {
+            sky.set_frame(frame);
+        }
     }
 
     pub fn set_moon_frame(
@@ -1342,6 +1357,7 @@ impl Renderer {
             end_sky: None,
             sun: None,
             moon: None,
+            celestial_sky: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2251,6 +2267,14 @@ impl Renderer {
         if let Some(moon) = &mut self.moon {
             moon.update(&self.queue, sky_matrix, sky_background, self.sun.as_ref());
         }
+        if let Some(sky) = &mut self.celestial_sky {
+            sky.prepare(
+                &self.device,
+                &self.queue,
+                (self.config.width, self.config.height),
+                sky_matrix,
+            );
+        }
         self.consume_renderer.update(
             &self.device,
             &self.queue,
@@ -2312,6 +2336,15 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+        if let Some(sky) = &self.celestial_sky {
+            sky.render(
+                &mut encoder,
+                &self.depth,
+                sky_background,
+                self.sun.as_ref(),
+                self.moon.as_ref(),
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain pass"),
@@ -2339,11 +2372,8 @@ impl Renderer {
             if let Some(sky) = &self.end_sky {
                 sky.draw(&mut pass);
             }
-            if let Some(sun) = &self.sun {
-                sun.draw(&mut pass);
-            }
-            if let Some(moon) = &self.moon {
-                moon.draw(&mut pass);
+            if let Some(sky) = &self.celestial_sky {
+                sky.composite(&mut pass);
             }
             pass.set_pipeline(&self.terrain_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);

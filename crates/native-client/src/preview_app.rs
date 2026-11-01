@@ -131,6 +131,17 @@ fn interpolate_sun_angle(previous: f32, current: f32, partial: f32) -> f32 {
     }
 }
 
+pub(crate) fn star_brightness_weather(mut brightness: f32, rain: f32, thunder: f32) -> f32 {
+    let rain_only = rain - thunder;
+    if rain_only > 0.0 {
+        brightness += rain_only * (0.0 - brightness);
+    }
+    if thunder > 0.0 {
+        brightness += thunder * (0.0 - brightness);
+    }
+    brightness.clamp(0.0, 1.0)
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub yaw: f32,
@@ -287,8 +298,8 @@ pub fn run_play(
             fog_is_background: false,
             sunset_previous: None,
             sunset_current: None,
-            celestial_angles_previous: [None; 2],
-            celestial_angles_current: [None; 2],
+            celestial_values_previous: [None; 4],
+            celestial_values_current: [None; 4],
             moon_phase: None,
             sky_background_previous: None,
             sky_background_current: None,
@@ -423,8 +434,8 @@ struct PlayState {
     fog_is_background: bool,
     sunset_previous: Option<(f32, [f32; 4])>,
     sunset_current: Option<(f32, [f32; 4])>,
-    celestial_angles_previous: [Option<f32>; 2],
-    celestial_angles_current: [Option<f32>; 2],
+    celestial_values_previous: [Option<f32>; 4],
+    celestial_values_current: [Option<f32>; 4],
     moon_phase: Option<crate::moon_phase::Phase>,
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
@@ -938,7 +949,7 @@ impl Viewer {
                     fog_range,
                     sky_mix,
                     sunset,
-                    celestial_angles,
+                    mut celestial_values,
                     moon_phase,
                     water,
                 }) = value
@@ -966,15 +977,24 @@ impl Viewer {
                     }
                     play.sunset_current = sunset;
                     play.moon_phase = moon_phase;
-                    for (index, angle) in celestial_angles.into_iter().enumerate() {
+                    celestial_values[3] = celestial_values[3].and_then(|value| {
+                        snapshot.weather.map(|weather| {
+                            star_brightness_weather(
+                                value,
+                                weather.rain_at(1.0),
+                                weather.thunder_at(1.0),
+                            )
+                        })
+                    });
+                    for (index, angle) in celestial_values.into_iter().enumerate() {
                         if play.sky_background_tick != Some(snapshot.tick)
-                            || play.celestial_angles_previous[index].is_none()
-                            || play.celestial_angles_current[index].is_none()
+                            || play.celestial_values_previous[index].is_none()
+                            || play.celestial_values_current[index].is_none()
                         {
-                            play.celestial_angles_previous[index] =
-                                play.celestial_angles_current[index].or(angle);
+                            play.celestial_values_previous[index] =
+                                play.celestial_values_current[index].or(angle);
                         }
-                        play.celestial_angles_current[index] = angle;
+                        play.celestial_values_current[index] = angle;
                     }
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_fog_previous.is_none()
@@ -1006,8 +1026,8 @@ impl Viewer {
             {
                 let partial = play.session.partial_tick().clamp(0.0, 1.0);
                 let sun_frame = match (
-                    play.celestial_angles_previous[0],
-                    play.celestial_angles_current[0],
+                    play.celestial_values_previous[0],
+                    play.celestial_values_current[0],
                 ) {
                     (Some(previous), Some(current)) if background.has_overworld_sky() => {
                         Some(crate::sun_render::Frame {
@@ -1023,8 +1043,8 @@ impl Viewer {
                 };
                 renderer.set_sun_frame(sun_frame);
                 let moon_frame = match (
-                    play.celestial_angles_previous[1],
-                    play.celestial_angles_current[1],
+                    play.celestial_values_previous[1],
+                    play.celestial_values_current[1],
                     play.moon_phase,
                 ) {
                     (Some(previous), Some(current), Some(phase))
@@ -1045,6 +1065,24 @@ impl Viewer {
                     _ => None,
                 };
                 renderer.set_moon_frame(moon_frame);
+                let star_frame = match (
+                    play.celestial_values_previous[2],
+                    play.celestial_values_current[2],
+                    play.celestial_values_previous[3],
+                    play.celestial_values_current[3],
+                ) {
+                    (
+                        Some(old_angle),
+                        Some(new_angle),
+                        Some(old_brightness),
+                        Some(new_brightness),
+                    ) if background.has_overworld_sky() => Some(crate::star_render::Frame {
+                        angle_degrees: interpolate_sun_angle(old_angle, new_angle, partial),
+                        brightness: old_brightness + partial * (new_brightness - old_brightness),
+                    }),
+                    _ => None,
+                };
+                renderer.set_star_frame(star_frame);
                 let color =
                     std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
                 let mut fog_color = match (play.fog_color_previous, play.fog_color_current) {
@@ -1392,6 +1430,14 @@ impl ApplicationHandler for Viewer {
         };
         renderer.set_fov(self.video.fov);
         renderer.set_view_bobbing(self.video.view_bobbing);
+        if self
+            .play
+            .as_ref()
+            .and_then(|play| play.sky_background.as_ref())
+            .is_some_and(crate::sky_background::SkyBackground::has_overworld_sky)
+        {
+            renderer.enable_celestial_sky();
+        }
         if let Some(texture) = self.play.as_ref().and_then(|play| play.end_sky.as_ref())
             && let Err(error) = renderer.set_end_sky(texture)
         {

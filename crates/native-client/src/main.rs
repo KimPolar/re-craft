@@ -63,6 +63,8 @@ mod screenshot;
 mod sky_background;
 mod smoke_particles;
 mod sound_ui;
+mod star_geometry;
+mod star_render;
 mod status_effect_ui;
 mod sun_render;
 mod survival_hud;

@@ -102,6 +102,27 @@ public class SkyBackgroundOracle {
             clock.loadFrom(new ClockState(tick, 0, 1, false));
             var row = new JsonArray(); row.add(moonSampler.applyTimeBased(0f, ++tickId)); output.add(row);
         }
+        for (var item : List.of(
+                Map.entry(EnvironmentAttributes.STAR_ANGLE, "starAngleTrack"),
+                Map.entry(EnvironmentAttributes.STAR_BRIGHTNESS, "starBrightnessTrack"))) {
+            var starTrack = AttributeTrack.createCodec(item.getKey()).parse(JsonOps.INSTANCE, input.get(item.getValue())).getOrThrow();
+            var starSampler = starTrack.bakeSampler(item.getKey(), Holder.direct(new WorldClock()), Optional.of(24000), manager);
+            for (int tick = -100; tick <= 24100; tick += 37) {
+                clock.loadFrom(new ClockState(tick, 0, 1, false));
+                var row = new JsonArray(); row.add(starSampler.applyTimeBased(0f, ++tickId)); output.add(row);
+            }
+        }
+        var starWeatherRain = WeatherAttributes.RAIN.get(EnvironmentAttributes.STAR_BRIGHTNESS);
+        var starWeatherThunder = WeatherAttributes.THUNDER.get(EnvironmentAttributes.STAR_BRIGHTNESS);
+        var starWeatherLerp = EnvironmentAttributes.STAR_BRIGHTNESS.type().stateChangeLerp();
+        for (var item : input.getAsJsonArray("weatherCases")) {
+            var c = item.getAsJsonObject();
+            float rain = c.get("rain").getAsFloat(), thunder = c.get("thunder").getAsFloat();
+            float value = 0.5f, rainOnly = rain - thunder;
+            if (rainOnly > 0f) value = starWeatherLerp.apply(rainOnly, value, starWeatherRain.applyModifier(value));
+            if (thunder > 0f) value = starWeatherLerp.apply(thunder, value, starWeatherThunder.applyModifier(value));
+            var row = new JsonArray(); row.add(value); output.add(row);
+        }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }
 }

@@ -539,6 +539,8 @@ pub struct WorldSnapshot {
     pub armor: Option<ArmorValues>,
     /// Whether the most recent fluid-contact tick placed the player's eyes in water.
     pub eyes_in_water: bool,
+    /// Previous eye-fluid state combined with current body-water contact.
+    pub under_water: bool,
     /// Visual water adaptation from the most recent fixed tick.
     pub water_vision: f32,
     /// Whether normal sprint movement was active on this tick.
@@ -787,6 +789,7 @@ impl LocalSession {
             death: None,
             armor: Some(ArmorValues::default()),
             eyes_in_water: false,
+            under_water: false,
             water_vision: 0.0,
             sprinting: false,
             selected_block: Block::Grass,
@@ -968,6 +971,7 @@ impl LocalSession {
             death: self.death,
             armor: self.armor.value(),
             eyes_in_water: false,
+            under_water: false,
             water_vision: 0.0,
             sprinting: self.sprint.active,
             selected_block: self.selected_block,
@@ -2097,6 +2101,7 @@ impl GameSession for LocalSession {
                 death: self.death,
                 armor: self.armor.value(),
                 eyes_in_water: false,
+                under_water: false,
                 water_vision: 0.0,
                 sprinting: self.sprint.active,
                 selected_block: self.selected_block,

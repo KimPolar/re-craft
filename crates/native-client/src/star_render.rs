@@ -4,6 +4,20 @@ use wgpu::util::DeviceExt;
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+fn dark_disc_vertices() -> [[f32; 3]; 24] {
+    let edge = |i: usize| {
+        let radians = ((i as i32 * 45 - 180) as f32) * 0.017_453_292_f32;
+        let cos = native_session::physics::java_sin(f64::from(radians), true);
+        let sin = native_session::physics::java_sin(f64::from(radians), false);
+        [-512.0 * cos, -4.0, 512.0 * sin]
+    };
+    std::array::from_fn(|index| match index % 3 {
+        0 => [0.0, -4.0, 0.0],
+        1 => edge(index / 3),
+        _ => edge(index / 3 + 1),
+    })
+}
+
 #[derive(Clone, Copy)]
 pub struct Frame {
     pub angle_degrees: f32,
@@ -19,6 +33,12 @@ struct Target {
 
 pub struct Sky {
     sunrise: crate::sunrise_render::Sunrise,
+    dark_pipeline: wgpu::RenderPipeline,
+    dark_binding: wgpu::BindGroup,
+    dark_uniform: wgpu::Buffer,
+    dark_vertices: wgpu::Buffer,
+    dark_disc: bool,
+    dark_last_matrix: Option<[[f32; 4]; 4]>,
     star_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
@@ -75,6 +95,20 @@ impl Sky {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform.as_entire_binding(),
+            }],
+        });
+        let dark_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dark sky transform"),
+            size: 80,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dark_binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dark sky uniforms"),
+            layout: &star_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: dark_uniform.as_entire_binding(),
             }],
         });
         let star_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -177,6 +211,43 @@ impl Sky {
             multiview_mask: None,
             cache: None,
         });
+        let dark_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("dark sky disc"),
+            layout: Some(&star_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &star_shader,
+                entry_point: Some("star_vertex"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &star_shader,
+                entry_point: Some("star_fragment"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let dark_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dark sky disc vertices"),
+            contents: bytemuck::cast_slice(&dark_disc_vertices()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let mut triangles = Vec::new();
         for quad in crate::star_geometry::vertices().chunks_exact(4) {
             triangles.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
@@ -189,6 +260,12 @@ impl Sky {
         });
         Self {
             sunrise: crate::sunrise_render::Sunrise::new(device),
+            dark_pipeline,
+            dark_binding,
+            dark_uniform,
+            dark_vertices,
+            dark_disc: false,
+            dark_last_matrix: None,
             star_pipeline,
             composite_pipeline,
             composite_layout,
@@ -210,6 +287,10 @@ impl Sky {
         self.sunrise.set_frame(frame);
     }
 
+    pub fn set_dark_disc(&mut self, visible: bool) {
+        self.dark_disc = visible;
+    }
+
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -218,6 +299,18 @@ impl Sky {
         view_projection: Mat4,
     ) {
         self.sunrise.prepare(queue, view_projection);
+        let matrix = view_projection.to_cols_array_2d();
+        if self.dark_disc && self.dark_last_matrix != Some(matrix) {
+            let state = [
+                matrix[0],
+                matrix[1],
+                matrix[2],
+                matrix[3],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            queue.write_buffer(&self.dark_uniform, 0, bytemuck::cast_slice(&state));
+            self.dark_last_matrix = Some(matrix);
+        }
         if self
             .target
             .as_ref()
@@ -314,6 +407,12 @@ impl Sky {
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
         }
+        if self.dark_disc {
+            pass.set_pipeline(&self.dark_pipeline);
+            pass.set_bind_group(0, &self.dark_binding, &[]);
+            pass.set_vertex_buffer(0, self.dark_vertices.slice(..));
+            pass.draw(0..24, 0..1);
+        }
     }
 
     pub fn composite<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
@@ -329,6 +428,99 @@ mod tests {
     use glam::Vec3;
     use sha1::{Digest, Sha1};
     use std::{io::Cursor, sync::mpsc, time::Duration};
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn dark_disc_geometry_and_horizon_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("DarkSkyOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/DarkSkyOracle.java")).unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("DarkSkyOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut lines = text.lines();
+        let java: Vec<[f32; 3]> = (0..10)
+            .map(|_| {
+                let values: Vec<_> = lines
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|v| f32::from_bits(v.parse::<i32>().unwrap() as u32))
+                    .collect();
+                values.try_into().unwrap()
+            })
+            .collect();
+        let vertices = dark_disc_vertices();
+        for triangle in 0..8 {
+            for (actual, expected) in vertices[triangle * 3..triangle * 3 + 3].iter().zip([
+                java[0],
+                java[triangle + 1],
+                java[triangle + 2],
+            ]) {
+                for axis in 0..3 {
+                    assert_eq!(
+                        actual[axis].to_bits(),
+                        expected[axis].to_bits(),
+                        "triangle {triangle}, axis {axis}"
+                    );
+                }
+            }
+        }
+        for flat in [false, true] {
+            for min_y in [-128, -64, 0, 32] {
+                let horizon: f64 = lines.next().unwrap().parse().unwrap();
+                for eye in [horizon - 0.001, horizon, horizon + 0.001] {
+                    for underwater in [false, true] {
+                        assert_eq!(
+                            crate::sky_background::dark_disc_visible_at(
+                                min_y, flat, eye, underwater
+                            ),
+                            eye < horizon && !underwater
+                        );
+                    }
+                }
+            }
+        }
+        assert!(lines.next().is_none());
+    }
 
     struct Assets(Vec<u8>);
     impl native_resources::packs::ResourceProvider for Assets {
@@ -706,6 +898,184 @@ mod tests {
                         readback.unmap();
                     }
                 }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod dark_gpu_tests {
+    use super::*;
+    use glam::Vec3;
+    use std::{io::Cursor, sync::mpsc, time::Duration};
+
+    struct Assets(Vec<u8>);
+    impl native_resources::packs::ResourceProvider for Assets {
+        fn read_asset(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(path.ends_with(".png").then(|| self.0.clone()))
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU; renders offscreen without opening a window"]
+    fn dark_disc_covers_celestial_layers_only_below_horizon() {
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = match std::env::var("NATIVE_TEST_GPU_BACKEND").ok().as_deref() {
+                Some("dx12") => wgpu::Backends::DX12,
+                Some("vulkan") => wgpu::Backends::VULKAN,
+                _ => wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            };
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("GPU adapter unavailable");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let mut sky = Sky::new(&device, FORMAT, wgpu::TextureFormat::Depth32Float);
+            let mut png = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 255, 255, 255]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let texture = crate::sun_render::Texture::load(&mut Assets(png.into_inner())).unwrap();
+            let mut sun =
+                crate::sun_render::Sun::new(&device, &queue, FORMAT, None, texture).unwrap();
+            sun.set_frame(Some(crate::sun_render::Frame {
+                angle_degrees: 180.0,
+                rain_brightness: 1.0,
+                tick: 0,
+            }));
+            let size = wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            };
+            let texture = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            let output = texture(
+                FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let depth = texture(
+                wgpu::TextureFormat::Depth32Float,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            );
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 64 * 64 * 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            for (direction, visible, black) in [
+                (Vec3::NEG_Y, false, false),
+                (Vec3::NEG_Y, true, true),
+                (Vec3::Y, true, false),
+            ] {
+                let matrix = Mat4::perspective_rh(30.0_f32.to_radians(), 1.0, 0.05, 1024.0)
+                    * Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Z);
+                sky.set_dark_disc(visible);
+                sky.prepare(&device, &queue, (64, 64), matrix);
+                sun.update(&queue, matrix);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                sky.render(&mut encoder, [0.2, 0.4, 0.6], Some(&sun), None);
+                {
+                    let view = output.create_view(&Default::default());
+                    let depth_view = depth.create_view(&Default::default());
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    sky.composite(&mut pass);
+                }
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &output,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(64),
+                        },
+                    },
+                    size,
+                );
+                queue.submit([encoder.finish()]);
+                let (sender, receiver) = mpsc::channel();
+                readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = sender.send(result);
+                    });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(Duration::from_secs(15)),
+                    })
+                    .unwrap();
+                receiver
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+                    .unwrap();
+                let pixels = readback.slice(..).get_mapped_range().unwrap();
+                let center = &pixels[(32 * 64 + 32) * 4..][..4];
+                assert_eq!(
+                    center,
+                    if black {
+                        &[0, 0, 0, 255]
+                    } else if direction == Vec3::NEG_Y {
+                        &[255, 255, 255, 255]
+                    } else {
+                        &[51, 102, 153, 255]
+                    }
+                );
+                drop(pixels);
+                readback.unmap();
             }
         });
     }

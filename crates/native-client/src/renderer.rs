@@ -402,6 +402,12 @@ impl Renderer {
         }
     }
 
+    pub fn set_dark_sky_disc(&mut self, visible: bool) {
+        if let Some(sky) = &mut self.celestial_sky {
+            sky.set_dark_disc(visible);
+        }
+    }
+
     pub fn set_moon_frame(
         &mut self,
         frame: Option<(crate::sun_render::Frame, crate::moon_phase::Phase)>,

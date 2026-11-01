@@ -1127,6 +1127,10 @@ impl Viewer {
                     ));
                 }
                 let camera_y = f64::from(snapshot.origin.y) + snapshot.camera.eye(partial).y;
+                let underwater = play.session.camera_in_water(snapshot.camera.eye(partial));
+                renderer.set_dark_sky_disc(
+                    background.dark_disc_visible(camera_y, snapshot.under_water),
+                );
                 let void_darkness = background.void_darkness(camera_y);
                 let night_vision = crate::preview_lighting::night_vision_scale(
                     snapshot.night_vision_duration,
@@ -1142,7 +1146,7 @@ impl Viewer {
                     }
                     _ => None,
                 };
-                let water = if play.session.camera_in_water(snapshot.camera.eye(partial)) {
+                let water = if underwater {
                     match (play.water_fog_previous, play.water_fog_current) {
                         (Some(previous), Some(current)) => {
                             let color = std::array::from_fn(|i| {
@@ -2926,6 +2930,7 @@ mod tests {
             death: previous.death,
             armor: previous.armor,
             eyes_in_water: previous.eyes_in_water,
+            under_water: previous.under_water,
             water_vision: previous.water_vision,
             sprinting: previous.sprinting,
             selected_block: previous.selected_block,

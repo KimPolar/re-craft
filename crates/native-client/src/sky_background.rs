@@ -674,6 +674,11 @@ pub(crate) fn void_darkness_at(min_y: i32, flat: bool, camera_y: f64) -> f32 {
     ((range + min_y as f32 - camera_y as f32) / range).clamp(0.0, 1.0)
 }
 
+pub(crate) fn dark_disc_visible_at(min_y: i32, flat: bool, eye_y: f64, underwater: bool) -> bool {
+    let horizon = if flat { f64::from(min_y) } else { 63.0 };
+    !underwater && eye_y < horizon
+}
+
 impl SkyBackground {
     pub fn load(
         source: &mut impl ResourceProvider,
@@ -1027,6 +1032,11 @@ impl SkyBackground {
         void_darkness_at(self.min_y, flat, camera_y)
     }
 
+    pub fn dark_disc_visible(&self, eye_y: f64, underwater: bool) -> bool {
+        self.flat_world
+            .is_some_and(|flat| dark_disc_visible_at(self.min_y, flat, eye_y, underwater))
+    }
+
     pub fn sample(
         &self,
         world: &World,
@@ -1279,6 +1289,15 @@ fn gaussian_biomes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_disc_visibility_tracks_horizon_and_underwater_state() {
+        for (min_y, flat, horizon) in [(-64, false, 63.0), (-64, true, -64.0), (32, true, 32.0)] {
+            assert!(dark_disc_visible_at(min_y, flat, horizon - 0.01, false));
+            assert!(!dark_disc_visible_at(min_y, flat, horizon, false));
+            assert!(!dark_disc_visible_at(min_y, flat, horizon - 0.01, true));
+        }
+    }
 
     #[test]
     fn weather_uses_fog_layer_for_skyless_background_and_preserves_water() {

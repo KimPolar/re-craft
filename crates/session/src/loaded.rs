@@ -4054,6 +4054,7 @@ impl LoadedSession {
             death: self.death,
             armor: self.armor.value(),
             eyes_in_water: self.previous_eye_in_water,
+            under_water: self.sprint.under_water,
             water_vision: self.water_vision.factor(self.previous_eye_in_water),
             sprinting: self.sprint.active,
             selected_block: self.selected,
@@ -4172,6 +4173,7 @@ impl LoadedSession {
             death: None,
             armor: Some(crate::ArmorValues::default()),
             eyes_in_water: false,
+            under_water: false,
             water_vision: 0.0,
             sprinting: false,
             selected_block: Block::Grass,
@@ -14921,6 +14923,7 @@ impl GameSession for LoadedSession {
                 death: self.death,
                 armor: self.armor.value(),
                 eyes_in_water: self.previous_eye_in_water,
+                under_water: self.sprint.under_water,
                 water_vision: self.water_vision.factor(self.previous_eye_in_water),
                 sprinting: self.sprint.active,
                 selected_block: self.selected,
@@ -37619,7 +37622,7 @@ mod tests {
         assert!(camera.camera_in_water(DVec3::new(8.5, 3.99, 8.5)));
         assert!(!camera.camera_in_water(DVec3::new(8.5, 4.0, 8.5)));
         let original = a.snapshot();
-        for _ in 0..40 {
+        for tick in 0..40 {
             for session in [&mut a, &mut b] {
                 session.motion.position = DVec3::new(8.5, 1.0, 8.5);
                 session.motion.velocity = DVec3::ZERO;
@@ -37628,6 +37631,8 @@ mod tests {
                 a.update(Duration::from_millis(10));
             }
             b.update(TICK);
+            assert_eq!(a.snapshot().under_water, tick > 0);
+            assert_eq!(a.snapshot().under_water, b.snapshot().under_water);
             assert_eq!(a.snapshot().vitals.air, b.snapshot().vitals.air);
             assert_eq!(
                 a.snapshot().water_vision.to_bits(),
@@ -37635,6 +37640,7 @@ mod tests {
             );
         }
         assert_eq!(original.vitals.air, 300);
+        assert!(!original.under_water);
         assert_eq!(a.snapshot().vitals.air, 260);
         assert!(a.snapshot().eyes_in_water);
         assert_eq!(

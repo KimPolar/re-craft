@@ -6,6 +6,7 @@ pub mod apply;
 pub mod canyon;
 pub mod cave;
 pub mod schedule;
+pub mod tags;
 
 fn source_random(
     seed: i64,

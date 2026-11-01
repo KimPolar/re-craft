@@ -1,4 +1,5 @@
 pub mod aquifer;
+pub mod beardifier;
 pub mod blended_noise;
 pub mod button;
 pub mod normal_noise;

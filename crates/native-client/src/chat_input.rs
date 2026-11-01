@@ -638,7 +638,34 @@ mod tests {
         let mut identifier_cases = 0;
         let mut syntax_cases = 0;
         let mut clock_definitions = 0;
+        let mut timeline_cases = 0;
+        let mut rate_strings = 0;
         for row in rows {
+            if let Some(value) = row["rateValue"].as_str() {
+                rate_strings += 1;
+                assert_eq!(
+                    crate::chat_hud::format_clock_rate(value.parse().unwrap()),
+                    row["rateString"].as_str().unwrap(),
+                    "{row}"
+                );
+                continue;
+            }
+            if let Some(period) = row["timelinePeriod"].as_i64() {
+                timeline_cases += 1;
+                let ticks = row["timelineTicks"].as_i64().unwrap();
+                let period = (period != 0).then_some(period as i32);
+                assert_eq!(
+                    native_session::time_command::timeline_value(ticks, period, false),
+                    row["timelineCurrent"].as_i64().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    native_session::time_command::timeline_value(ticks, period, true),
+                    row["timelineRepetitions"].as_i64().unwrap(),
+                    "{row}"
+                );
+                continue;
+            }
             if let Some(json) = row["worldClockJson"].as_str() {
                 clock_definitions += 1;
                 assert_eq!(
@@ -651,8 +678,24 @@ mod tests {
             }
             if let Some(input) = row["timeSyntax"].as_str() {
                 syntax_cases += 1;
+                let parsed = native_session::time_command::parse(input);
+                // The Java parser also resolves resource arguments against its
+                // registry; this fixture registers two timelines.
+                let accepted = parsed
+                    .as_ref()
+                    .is_some_and(|command| match &command.action {
+                        native_session::time_command::TimeAction::QueryTimeline {
+                            timeline,
+                            ..
+                        } => {
+                            (timeline.namespace == "example" && timeline.path == "timeline")
+                                || (timeline.namespace == "minecraft"
+                                    && timeline.path == "gametime")
+                        }
+                        _ => true,
+                    });
                 assert_eq!(
-                    native_session::time_command::parse(input).is_some(),
+                    accepted,
                     row["timeSyntaxAccepted"].as_bool().unwrap(),
                     "{row}"
                 );
@@ -767,7 +810,9 @@ mod tests {
         assert_eq!(marker_cases, 420);
         assert_eq!(clock_cases, 72);
         assert_eq!(identifier_cases, 48);
-        assert_eq!(syntax_cases, 14);
+        assert_eq!(syntax_cases, 27);
+        assert_eq!(timeline_cases, 55);
+        assert_eq!(rate_strings, 511);
         assert_eq!(clock_definitions, 7);
     }
 }

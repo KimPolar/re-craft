@@ -319,6 +319,21 @@ fn format_translation(template: &str, arguments: &[&str]) -> String {
     result
 }
 
+pub(crate) fn format_clock_rate(rate: f32) -> String {
+    if rate < 0.001 {
+        let value = format!("{rate:e}");
+        let (mantissa, exponent) = value.split_once('e').expect("scientific format");
+        let mantissa = if mantissa.contains('.') {
+            mantissa.to_owned()
+        } else {
+            format!("{mantissa}.0")
+        };
+        format!("{mantissa}E{exponent}")
+    } else {
+        format!("{rate:?}")
+    }
+}
+
 fn prepare_lines(
     canvas: &Canvas,
     assets: &MenuAssets,
@@ -347,6 +362,10 @@ fn prepare_lines(
                 | SystemMessageKind::TimeSaveUnavailable
                 | SystemMessageKind::TimeUnknownClock(_)
                 | SystemMessageKind::TimeMarkerDataUnavailable
+                | SystemMessageKind::TimeTimelineDataUnavailable
+                | SystemMessageKind::TimeUnknownTimeline(_)
+                | SystemMessageKind::TimeWrongTimeline { .. }
+                | SystemMessageKind::TimeRate { already: true, .. }
                 | SystemMessageKind::TimePaused { already: true, .. }
                 | SystemMessageKind::TimeMarker { already: true, .. }
                 | SystemMessageKind::TimeMarker { missing: true, .. }
@@ -425,6 +444,84 @@ fn prepare_lines(
                     assets.translate("commands.time.query.absolute", "Clock %s is at %s tick(s)"),
                     &[name, &ticks.to_string()],
                 ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeRate {
+                name,
+                rate_bits,
+                already,
+            } => {
+                let (key, fallback) = if *already {
+                    (
+                        "commands.time.rate.already_same",
+                        "Clock %s is already running at rate %s",
+                    )
+                } else {
+                    ("commands.time.rate", "Set clock %s rate to %s")
+                };
+                let rate = format_clock_rate(f32::from_bits(*rate_bits));
+                (
+                    format_translation(assets.translate(key, fallback), &[name, &rate]),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::TimeTimeline {
+                name,
+                ticks,
+                repetitions,
+            } => {
+                let (key, fallback) = if *repetitions {
+                    (
+                        "commands.time.query.timeline.repetitions",
+                        "Timeline %s has repeated %s time(s)",
+                    )
+                } else {
+                    (
+                        "commands.time.query.timeline",
+                        "Timeline %s is at %s tick(s)",
+                    )
+                };
+                (
+                    format_translation(
+                        assets.translate(key, fallback),
+                        &[name, &ticks.to_string()],
+                    ),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::TimeUnknownTimeline(name) => (
+                format_translation(
+                    assets.translate(
+                        "argument.resource.not_found",
+                        "Can't find element '%s' of type '%s'",
+                    ),
+                    &[name, "minecraft:timeline"],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeWrongTimeline { clock, timeline } => (
+                format_translation(
+                    assets.translate(
+                        "commands.time.wrong_timeline_for_clock",
+                        "Timeline %s does not use clock %s",
+                    ),
+                    &[timeline, clock],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeTimelineDataUnavailable => (
+                "Cannot query timelines because the active timeline data could not be verified."
+                    .to_owned(),
                 None,
                 Vec::new(),
                 None,

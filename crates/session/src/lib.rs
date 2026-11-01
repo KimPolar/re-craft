@@ -437,6 +437,22 @@ pub enum SystemMessageKind {
     TimeSaveUnavailable,
     TimeUnknownClock(Arc<str>),
     TimeMarkerDataUnavailable,
+    TimeRate {
+        name: Arc<str>,
+        rate_bits: u32,
+        already: bool,
+    },
+    TimeTimeline {
+        name: Arc<str>,
+        ticks: i64,
+        repetitions: bool,
+    },
+    TimeUnknownTimeline(Arc<str>),
+    TimeWrongTimeline {
+        clock: Arc<str>,
+        timeline: Arc<str>,
+    },
+    TimeTimelineDataUnavailable,
     TimeMarker {
         name: Arc<str>,
         marker: Arc<str>,

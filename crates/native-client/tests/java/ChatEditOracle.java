@@ -201,17 +201,53 @@ public final class ChatEditOracle {
         Registry.register(clocks, "example:clock", new WorldClock());
         clocks.freeze();
         var timelines = new MappedRegistry<Timeline>(Registries.TIMELINE, Lifecycle.stable());
+        var timelineConstructor = Timeline.class.getDeclaredConstructor(net.minecraft.core.Holder.class, Optional.class, java.util.Map.class, java.util.Map.class);
+        timelineConstructor.setAccessible(true);
+        var clockHolder = clocks.getOrThrow(net.minecraft.resources.ResourceKey.create(Registries.WORLD_CLOCK, net.minecraft.resources.Identifier.parse("example:clock")));
+        Registry.register(timelines, "example:timeline", timelineConstructor.newInstance(clockHolder, Optional.of(48), java.util.Map.of(), java.util.Map.of()));
+        Registry.register(timelines, "minecraft:gametime", timelineConstructor.newInstance(clockHolder, Optional.empty(), java.util.Map.of(), java.util.Map.of()));
         timelines.freeze();
         var lookup = HolderLookup.Provider.create(java.util.stream.Stream.of(clocks, timelines));
         var commandContext = CommandBuildContext.simple(lookup, FeatureFlags.DEFAULT_FLAGS);
         var commands = new CommandDispatcher<CommandSourceStack>();
         TimeCommand.register(commands, commandContext);
         set(source, CommandSourceStack.class, "permissions", PermissionSet.ALL_PERMISSIONS);
-        for (String command : new String[]{"time of example:clock set example:wake", "time of example:clock set 1d", "time of example:clock set -1", "time of example:clock query time", "time of example:clock query gametime", "time of example:clock add -1.5s", "time of example:clock add nope", "time of example:clock pause", "time of example:clock resume", "time of example:clock query time extra", "time set example:wake", "time query gametime", "time set +1", "time set example:"}) {
+        for (String command : new String[]{"time of example:clock set example:wake", "time of example:clock set 1d", "time of example:clock set -1", "time of example:clock query time", "time of example:clock query gametime", "time of example:clock query example:missing", "time of example:clock add -1.5s", "time of example:clock add nope", "time of example:clock pause", "time of example:clock resume", "time of example:clock query time extra", "time set example:wake", "time query gametime", "time set +1", "time set example:", "time rate 0.00001", "time rate 1000", "time rate 1000.1", "time rate 0", "time rate -1", "time rate 1e2", "time rate +1", "time rate 1.5", "time of example:clock rate .5", "time query example:timeline", "time of example:clock query example:timeline repetition", "time query example:timeline repetitions"}) {
             var parsed = commands.parse(command, source);
             JsonObject row = new JsonObject();
             row.addProperty("timeSyntax", "/" + command);
             row.addProperty("timeSyntaxAccepted", !parsed.getReader().canRead() && parsed.getContext().getCommand() != null);
+            rows.add(row);
+        }
+        for (int period : new int[]{0, 1, 48, 24000, Integer.MAX_VALUE})
+        for (long ticks : new long[]{Long.MIN_VALUE, -2147483649L, -49, -1, 0, 1, 47, 48, 49, 2147483648L, Long.MAX_VALUE}) {
+            var timeline = timelineConstructor.newInstance(clockHolder, period == 0 ? Optional.empty() : Optional.of(period), java.util.Map.of(), java.util.Map.of());
+            net.minecraft.world.clock.ClockInstance instance = new net.minecraft.world.clock.ClockInstance() {
+                public long totalTicks() { return ticks; }
+                public float partialTick() { return 0; }
+                public float rate() { return 1; }
+                public boolean isPaused() { return false; }
+            };
+            net.minecraft.world.clock.ClockManager manager = holder -> instance;
+            JsonObject row = new JsonObject();
+            row.addProperty("timelinePeriod", period);
+            row.addProperty("timelineTicks", ticks);
+            row.addProperty("timelineCurrent", timeline.getCurrentTicks(manager));
+            row.addProperty("timelineRepetitions", timeline.getPeriodCount(manager));
+            rows.add(row);
+        }
+        for (String rate : new String[]{"0.00001", "0.00002", "0.0001", "0.000999", "0.001", "0.1", "1", "1.5", "10", "1000", "1.2345678"}) {
+            JsonObject row = new JsonObject();
+            row.addProperty("rateValue", rate);
+            row.addProperty("rateString", Float.toString(Float.parseFloat(rate)));
+            rows.add(row);
+        }
+        java.util.Random rateRandom = new java.util.Random(263);
+        for (int i = 0; i < 500; i++) {
+            float rate = (float)Math.pow(10, -5 + rateRandom.nextDouble() * 8);
+            JsonObject row = new JsonObject();
+            row.addProperty("rateValue", Float.toString(rate));
+            row.addProperty("rateString", Float.toString(rate));
             rows.add(row);
         }
         var missingClock = commands.parse("time of example:missing query time", source);

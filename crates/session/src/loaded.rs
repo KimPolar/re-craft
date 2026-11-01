@@ -413,6 +413,14 @@ pub struct LoadedSession {
     game_master_permission: bool,
     world_seed: Option<i64>,
     registered_clocks: Option<Arc<BTreeSet<native_persistence::world::DimensionId>>>,
+    timelines: Option<
+        Arc<
+            BTreeMap<
+                native_resources::packs::ResourceId,
+                native_resources::world_clock::TimelineDefinition,
+            >,
+        >,
+    >,
     default_clock: Option<Option<native_persistence::world::DimensionId>>,
     clock_dimension_type: Option<Arc<str>>,
     time_markers: Option<
@@ -3215,6 +3223,29 @@ impl LoadedSession {
             return Message::CommandUnavailable;
         }
         let can_save_clock = self.saved_clock_source.is_some();
+        let selected_timeline = if let TimeAction::QueryTimeline { timeline, .. } = &command.action
+        {
+            let Some(timelines) = &self.timelines else {
+                return Message::TimeTimelineDataUnavailable;
+            };
+            let timeline_name: Arc<str> =
+                format!("{}:{}", timeline.namespace, timeline.path).into();
+            let Some(definition) = timelines.get(timeline) else {
+                return Message::TimeUnknownTimeline(timeline_name);
+            };
+            if definition.period.is_some_and(|period| period <= 0) {
+                return Message::TimeTimelineDataUnavailable;
+            }
+            if definition.clock.namespace != id.namespace || definition.clock.path != id.path {
+                return Message::TimeWrongTimeline {
+                    clock: name,
+                    timeline: timeline_name,
+                };
+            }
+            Some((timeline_name, definition.period))
+        } else {
+            None
+        };
         let selected_marker = if let TimeAction::SetMarker(marker) = &command.action {
             let Some(markers) = &self.time_markers else {
                 return Message::TimeMarkerDataUnavailable;
@@ -3247,6 +3278,34 @@ impl LoadedSession {
                 name,
                 ticks: clock.total_ticks,
             },
+            TimeAction::QueryTimeline { repetitions, .. } => {
+                let (timeline, period) = selected_timeline.expect("timeline was resolved");
+                Message::TimeTimeline {
+                    name: timeline,
+                    ticks: crate::time_command::timeline_value(
+                        clock.total_ticks,
+                        period,
+                        *repetitions,
+                    ),
+                    repetitions: *repetitions,
+                }
+            }
+            TimeAction::SetRate(bits) => {
+                let rate = f32::from_bits(*bits);
+                if !(0.00001..=1000.0).contains(&rate) {
+                    return Message::CommandUnavailable;
+                }
+                let already = clock.rate == rate;
+                if !already && !can_save_clock {
+                    return Message::TimeSaveUnavailable;
+                }
+                clock.rate = rate;
+                Message::TimeRate {
+                    name,
+                    rate_bits: *bits,
+                    already,
+                }
+            }
             TimeAction::Set(ticks) if *ticks < 0 => Message::CommandUnavailable,
             TimeAction::Set(ticks) if clock.total_ticks == i64::from(*ticks) => {
                 Message::TimeAlreadySet {
@@ -3322,6 +3381,18 @@ impl LoadedSession {
         clocks: Arc<BTreeSet<native_persistence::world::DimensionId>>,
     ) {
         self.registered_clocks = Some(clocks);
+    }
+
+    pub fn set_timelines(
+        &mut self,
+        timelines: Arc<
+            BTreeMap<
+                native_resources::packs::ResourceId,
+                native_resources::world_clock::TimelineDefinition,
+            >,
+        >,
+    ) {
+        self.timelines = Some(timelines);
     }
 
     pub fn set_time_markers(
@@ -3775,6 +3846,7 @@ impl LoadedSession {
             game_master_permission: false,
             world_seed: None,
             registered_clocks: None,
+            timelines: None,
             default_clock: None,
             clock_dimension_type: None,
             time_markers: None,
@@ -14347,6 +14419,123 @@ fn move_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_rate_and_timeline_queries_use_registered_data_and_safe_clock_source() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            world::DimensionId,
+        };
+        use native_resources::{packs::ResourceId, world_clock::TimelineDefinition};
+        let id = DimensionId::parse("example:clock").unwrap();
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "example:clock".into(),
+                        Tag::Compound(vec![
+                            ("total_ticks".into(), Tag::Long(98)),
+                            ("partial_tick".into(), Tag::Float(0.5)),
+                            ("future".into(), Tag::Int(42)),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let mut session = session();
+        session
+            .restore_saved_world_clocks(
+                &source,
+                native_persistence::world::parse_world_clocks(&source).unwrap(),
+                false,
+            )
+            .unwrap();
+        session.set_default_clock("example:dimension".into(), Some(id.clone()));
+        session.set_registered_clocks(Arc::new(BTreeSet::from([id.clone()])));
+        let timeline = ResourceId::parse("example:timeline").unwrap();
+        session.set_timelines(Arc::new(BTreeMap::from([(
+            timeline.clone(),
+            TimelineDefinition {
+                clock: ResourceId::parse("example:clock").unwrap(),
+                period: Some(48),
+            },
+        )])));
+        let command = |text| crate::time_command::parse(text).unwrap();
+        assert!(matches!(
+            session.execute_time_command(&command("/time rate 2.5")),
+            crate::SystemMessageKind::TimePermissionDenied
+        ));
+        session.set_game_master_permission(true);
+        assert!(matches!(
+            session.execute_time_command(&command("/time query example:timeline")),
+            crate::SystemMessageKind::TimeTimeline {
+                ticks: 2,
+                repetitions: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.execute_time_command(&command("/time query example:timeline repetition")),
+            crate::SystemMessageKind::TimeTimeline {
+                ticks: 2,
+                repetitions: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.execute_time_command(&command("/time query example:missing")),
+            crate::SystemMessageKind::TimeUnknownTimeline(_)
+        ));
+        assert!(matches!(
+            session.execute_time_command(&command("/time rate 2.5")),
+            crate::SystemMessageKind::TimeRate { already: false, .. }
+        ));
+        assert_eq!(session.world_clock(&id).unwrap().rate, 2.5);
+        assert_eq!(session.world_clock(&id).unwrap().partial_tick, 0.5);
+        assert!(matches!(
+            session.execute_time_command(&command("/time rate 2.5")),
+            crate::SystemMessageKind::TimeRate { already: true, .. }
+        ));
+        let updated = native_persistence::world::WorldReader::update_world_clock_document(
+            &source,
+            &session.world_clocks,
+        )
+        .unwrap();
+        assert_eq!(
+            updated
+                .value
+                .get("data")
+                .unwrap()
+                .get("example:clock")
+                .unwrap()
+                .get("future"),
+            Some(&Tag::Int(42))
+        );
+        assert_eq!(
+            native_persistence::world::parse_world_clocks(&updated).unwrap()[&id].rate,
+            2.5
+        );
+        session.set_timelines(Arc::new(BTreeMap::from([(
+            timeline,
+            TimelineDefinition {
+                clock: ResourceId::parse("example:other").unwrap(),
+                period: None,
+            },
+        )])));
+        assert!(matches!(
+            session.execute_time_command(&command("/time query example:timeline")),
+            crate::SystemMessageKind::TimeWrongTimeline { .. }
+        ));
+        session.saved_clock_source = None;
+        assert!(matches!(
+            session.execute_time_command(&command("/time rate 1")),
+            crate::SystemMessageKind::TimeSaveUnavailable
+        ));
+        assert_eq!(session.world_clock(&id).unwrap().rate, 2.5);
+    }
 
     #[test]
     fn explicit_registered_clock_accepts_custom_marker_and_preserves_other_clocks() {

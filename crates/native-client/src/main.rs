@@ -1023,6 +1023,10 @@ fn prepare_existing_world(
             Ok(markers) => session.set_time_markers(Arc::new(markers)),
             Err(error) => eprintln!("Time markers are unavailable: {error:#}"),
         }
+        match native_resources::world_clock::timelines(&mut resources) {
+            Ok(timelines) => session.set_timelines(Arc::new(timelines)),
+            Err(error) => eprintln!("Timelines are unavailable: {error:#}"),
+        }
         if let Some(environment) = fast_lava
             && let Err(error) = session.set_fast_lava_environment(Arc::new(environment))
         {

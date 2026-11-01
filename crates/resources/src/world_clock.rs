@@ -30,6 +30,43 @@ pub struct TimeMarker {
     pub period: Option<i32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineDefinition {
+    pub clock: ResourceId,
+    pub period: Option<i32>,
+}
+
+/// Load clock and period information, including timelines without markers.
+pub fn timelines(
+    provider: &mut impl ResourceProvider,
+) -> Result<BTreeMap<ResourceId, TimelineDefinition>> {
+    let mut result = BTreeMap::new();
+    for id in provider.list_data("timeline")? {
+        let path = format!("data/{}/timeline/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing timeline {path}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("invalid timeline {path}"))?;
+        let clock = ResourceId::parse(
+            value
+                .get("clock")
+                .and_then(serde_json::Value::as_str)
+                .context("timeline clock is missing")?,
+        )?;
+        let period = value
+            .get("period_ticks")
+            .map(|value| {
+                let n = i32::try_from(value.as_i64().context("period_ticks must be an integer")?)?;
+                ensure!(n > 0, "period_ticks must be positive");
+                Ok::<_, anyhow::Error>(n)
+            })
+            .transpose()?;
+        result.insert(id, TimelineDefinition { clock, period });
+    }
+    Ok(result)
+}
+
 /// Resolve time markers from the active timeline registry. Ambiguous duplicate
 /// markers are rejected rather than guessing registry load order.
 pub fn time_markers(
@@ -240,6 +277,31 @@ mod tests {
     }
 
     #[test]
+    fn loads_timelines_without_markers_and_rejects_invalid_periods() {
+        let path = "data/example/timeline/custom.json";
+        let mut provider = Data(BTreeMap::from([(
+            path.into(),
+            br#"{"clock":"example:clock","period_ticks":48}"#.to_vec(),
+        )]));
+        let result = timelines(&mut provider).unwrap();
+        assert_eq!(
+            result[&ResourceId::parse("example:custom").unwrap()],
+            TimelineDefinition {
+                clock: ResourceId::parse("example:clock").unwrap(),
+                period: Some(48),
+            }
+        );
+        for json in [
+            r#"{}"#,
+            r#"{"clock":"example:clock","period_ticks":0}"#,
+            r#"{"clock":"example:clock","period_ticks":1.5}"#,
+        ] {
+            provider.0.insert(path.into(), json.as_bytes().to_vec());
+            assert!(timelines(&mut provider).is_err());
+        }
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn installed_dimensions_use_registered_defaults() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -259,6 +321,8 @@ mod tests {
             );
         }
         let markers = time_markers(&mut provider).unwrap();
+        let timeline_definitions = timelines(&mut provider).unwrap();
+        assert!(!timeline_definitions.is_empty());
         let clocks = registered_clocks(&mut provider).unwrap();
         assert!(clocks.contains(&ResourceId::parse("minecraft:overworld").unwrap()));
         assert!(clocks.contains(&ResourceId::parse("minecraft:the_end").unwrap()));

@@ -12,7 +12,9 @@ use std::{
 use anyhow::bail;
 use anyhow::{Context, Result};
 use native_persistence::{anvil, nbt::Tag};
-use native_resources::{default_minecraft_dir, load_atlas_with_packs};
+#[cfg(test)]
+use native_resources::default_minecraft_dir;
+use native_resources::load_atlas_with_packs;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
@@ -358,6 +360,14 @@ fn java_folder_name(path: &Path) -> impl Iterator<Item = u16> {
 }
 
 impl State {
+    fn from_settings(settings: Settings, options: crate::launch_options::LaunchOptions) -> Self {
+        let (directory, packs) = options.resolve(&settings);
+        let mut state = Self::new(directory, packs);
+        state.video = settings.video;
+        state.sound = settings.sound;
+        state
+    }
+
     fn new(minecraft_dir: PathBuf, packs: Vec<PathBuf>) -> Self {
         let mut state = Self {
             minecraft_dir,
@@ -684,14 +694,9 @@ impl State {
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(options: crate::launch_options::LaunchOptions) -> Result<()> {
     let settings = menu_settings::load();
-    let dir = settings
-        .minecraft_dir
-        .unwrap_or_else(|| default_minecraft_dir().unwrap_or_default());
-    let mut state = State::new(dir, settings.resource_packs);
-    state.video = settings.video;
-    state.sound = settings.sound;
+    let mut state = State::from_settings(settings, options);
     let mut event_loop = EventLoop::new().context("Cannot create the Minecraft window")?;
     loop {
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -5599,6 +5604,28 @@ public class GuiScaleOracle {
                 .unwrap_or_default()
                 .contains("saved resource packs")
         );
+    }
+
+    #[test]
+    fn launch_options_reach_menu_asset_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old");
+        let new = temp.path().join("new");
+        let pack = temp.path().join("pack.zip");
+        let settings = Settings {
+            minecraft_dir: Some(old.clone()),
+            resource_packs: vec![temp.path().join("old.zip")],
+            ..Default::default()
+        };
+        let options = crate::launch_options::LaunchOptions {
+            minecraft_dir: Some(new.clone()),
+            resource_packs: Some(vec![pack.clone()]),
+        };
+        let state = State::from_settings(settings, options);
+        let pending = state.asset_load.as_ref().unwrap();
+        assert_eq!(pending.directory, new);
+        assert_eq!(pending.packs, [pack]);
+        assert!(matches!(state.screen, Screen::Loading));
     }
 
     #[test]

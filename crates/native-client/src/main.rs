@@ -36,6 +36,7 @@ mod held_items;
 mod item_gui;
 mod item_render;
 mod item_tooltip;
+mod launch_options;
 mod menu;
 mod menu_assets;
 mod menu_draw;
@@ -144,7 +145,11 @@ fn run() -> Result<()> {
     if std::env::args_os().nth(1).is_some() {
         return run_cli();
     }
-    menu::run()
+    #[cfg(not(debug_assertions))]
+    let options = launch_options::LaunchOptions::parse(std::env::args_os().skip(1))?;
+    #[cfg(debug_assertions)]
+    let options = launch_options::LaunchOptions::default();
+    menu::run(options)
 }
 
 #[cfg(debug_assertions)]

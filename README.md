@@ -12,6 +12,8 @@ Windows x64와 로컬에 설치된 Minecraft Java Edition 26.3이 필요합니�
 cargo build --release -p native-client
 ```
 
+릴리스 EXE는 선택적으로 `--minecraft-dir "경로"`와 `--resource-pack "경로"`를 받을 수 있습니다. 리소스팩 옵션은 여러 번 지정할 수 있으며 순서대로 적용합니다. 같은 설정은 메뉴의 Minecraft 폴더 선택과 리소스팩 화면에서도 할 수 있습니다. 실행 옵션을 지정하지 않으면 저장된 설정을 사용하고, 설치 폴더만 바꾸면 기존 폴더의 리소스팩 선택은 적용하지 않습니다. 실행 옵션 자체는 즉시 저장되지 않습니다. 개발 전용 검사·스모크 테스트 옵션은 릴리스 EXE에서 사용할 수 없습니다.
+
 Re-Craft의 자체 버전은 Minecraft 기준 버전 26.3과 별도로 관리하며 메인 화면 왼쪽 아래에 함께 표시합니다. 로컬 빌드의 기본 버전은 워크스페이스 `Cargo.toml`의 `0.1.0`이고, GitHub Actions 릴리스 빌드는 해당 릴리스 버전을 실행 파일에 반영합니다.
 
 커밋 제목은 `type(scope): subject` 형식을 사용합니다. 예를 들면 `feat(world): add chunk generation`, `fix(camera): correct vertical view`입니다. 범위는 영문 소문자·숫자와 `-`, `_`, `.`, `/`를 사용합니다. 호환성을 깨는 변경은 `feat(world)!: ...` 또는 본문의 `BREAKING CHANGE: ...`로 표시합니다. 허용되는 유형은 `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`, `style`, `revert`입니다. Actions는 새로 push된 일반 커밋을 검사하고 병합 커밋은 제외합니다. 기존 이력은 재작성하지 않습니다.

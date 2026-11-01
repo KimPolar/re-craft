@@ -430,9 +430,23 @@ struct Entry {
     weight: u32,
 }
 
+struct ExpandedEntry<'a> {
+    weight: u32,
+    item: Option<&'a ResourceId>,
+    modifiers: Vec<&'a [Modifier]>,
+}
+
 impl Entry {
+    fn maximum_weight(&self) -> Option<i32> {
+        match &self.kind {
+            EntryKind::Alternatives(children) => children.iter().try_fold(0, |maximum, child| {
+                Some(maximum.max(child.maximum_weight()?))
+            }),
+            _ => i32::try_from(self.weight).ok(),
+        }
+    }
     fn potential_component_drops(&self) -> Result<Vec<Drop>> {
-        if self.weight == 0 {
+        if self.weight == 0 && !matches!(self.kind, EntryKind::Alternatives(_)) {
             return Ok(Vec::new());
         }
         let mut drops = match &self.kind {
@@ -480,26 +494,26 @@ impl Entry {
             }
     }
     /// An expanded empty entry still stops an alternatives chain.
-    fn expand(
-        &self,
+    fn expand<'a>(
+        &'a self,
         tool: BasicTool<'_>,
         random: &mut Option<&mut dyn LootRandom>,
         context: LootContext<'_>,
-    ) -> Result<Option<(u32, Option<Drop>)>> {
+    ) -> Result<Option<ExpandedEntry<'a>>> {
         if !self.condition.test(tool, random, context)? {
             return Ok(None);
         }
-        let (weight, mut value) = match &self.kind {
-            EntryKind::Item(id) => (
-                self.weight,
-                Some(Drop {
-                    item: id.clone(),
-                    count: 1,
-                    copy_block_entity_custom_name: false,
-                    copy_block_entity_components: Vec::new(),
-                }),
-            ),
-            EntryKind::Empty => (self.weight, None),
+        let mut value = match &self.kind {
+            EntryKind::Item(id) => ExpandedEntry {
+                weight: self.weight,
+                item: Some(id),
+                modifiers: Vec::new(),
+            },
+            EntryKind::Empty => ExpandedEntry {
+                weight: self.weight,
+                item: None,
+                modifiers: Vec::new(),
+            },
             EntryKind::Alternatives(children) => {
                 let mut selected = None;
                 for child in children {
@@ -515,15 +529,10 @@ impl Entry {
             }
             EntryKind::Unsupported(reason) => bail!("unsupported loot entry: {reason}"),
         };
-        if let Some(drop) = &mut value {
-            for modifier in &self.modifiers {
-                modifier.apply(drop, tool, random, context)?;
-            }
-            if drop.count == 0 {
-                value = None;
-            }
+        if !self.modifiers.is_empty() {
+            value.modifiers.push(&self.modifiers);
         }
-        Ok(Some((weight, value)))
+        Ok(Some(value))
     }
 }
 
@@ -554,6 +563,17 @@ struct Pool {
     entries: Vec<Entry>,
     modifiers: Vec<Modifier>,
     rolls: u32,
+}
+
+impl Pool {
+    fn weights_fit(&self) -> bool {
+        self.entries
+            .iter()
+            .try_fold(0i32, |total, entry| {
+                total.checked_add(entry.maximum_weight()?)
+            })
+            .is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -725,7 +745,7 @@ impl BlockLootTables {
                     && pool.modifiers.iter().all(|modifier| {
                         modifier.fully_supported_in_player_block_with_components(components)
                     })
-                    && pool.entries.len() <= 1
+                    && pool.weights_fit()
                     && pool.entries.iter().all(|entry| {
                         entry.fully_supported_in_player_block_with_components(components)
                     })
@@ -747,7 +767,7 @@ impl BlockLootTables {
                 && table.pools.iter().all(|pool| {
                     pool.condition.fully_supported()
                         && pool.modifiers.iter().all(Modifier::fully_supported)
-                        && pool.entries.len() <= 1
+                        && pool.weights_fit()
                         && pool.entries.iter().all(Entry::fully_supported)
                 })
         })
@@ -937,7 +957,7 @@ impl BlockLootTables {
                 && table.pools.iter().all(|pool| {
                     pool.condition.fully_supported_in_interaction()
                         && pool.modifiers.iter().all(|m| modifier_valid(m, tool))
-                        && pool.entries.len() <= 1
+                        && pool.weights_fit()
                         && pool.entries.iter().all(|entry| entry_valid(entry, tool))
                 })
         })
@@ -1107,22 +1127,56 @@ impl BlockLootTables {
             if !pool.condition.test(tool, &mut random, context)? {
                 continue;
             }
+            let mut candidates = Vec::with_capacity(pool.entries.len());
             for _ in 0..pool.rolls {
-                let mut selected = None;
-                let mut expanded = 0;
+                candidates.clear();
+                let mut total = 0i32;
                 for entry in &pool.entries {
-                    if let Some((weight, value)) = entry.expand(tool, &mut random, context)?
-                        && weight > 0
+                    if let Some(value) = entry.expand(tool, &mut random, context)?
+                        && value.weight > 0
                     {
-                        expanded += 1;
-                        selected = value;
+                        total = total
+                            .checked_add(
+                                i32::try_from(value.weight).context("loot weight too large")?,
+                            )
+                            .context("loot weight overflow")?;
+                        candidates.push(value);
                     }
                 }
-                ensure!(
-                    expanded <= 1,
-                    "random selection among multiple loot entries is not implemented"
-                );
-                if let Some(mut drop) = selected {
+                let selected = match candidates.len() {
+                    0 => continue,
+                    1 => &candidates[0],
+                    _ => {
+                        let mut value = random
+                            .as_deref_mut()
+                            .context("random loot requires a random source")?
+                            .next_int(total)
+                            .context("loot random source does not support bounded integers")?;
+                        ensure!(
+                            (0..total).contains(&value),
+                            "loot random source returned an invalid value"
+                        );
+                        candidates
+                            .iter()
+                            .find(|entry| {
+                                value -= entry.weight as i32;
+                                value < 0
+                            })
+                            .context("loot selection exceeded its weights")?
+                    }
+                };
+                if let Some(item) = selected.item {
+                    let mut drop = Drop {
+                        item: item.clone(),
+                        count: 1,
+                        copy_block_entity_custom_name: false,
+                        copy_block_entity_components: Vec::new(),
+                    };
+                    for modifiers in &selected.modifiers {
+                        for modifier in *modifiers {
+                            modifier.apply(&mut drop, tool, &mut random, context)?;
+                        }
+                    }
                     for modifier in &pool.modifiers {
                         modifier.apply(&mut drop, tool, &mut random, context)?;
                     }
@@ -1232,8 +1286,18 @@ fn parse_entry(
         .get("weight")
         .map(|value| value.as_i64().context("invalid loot weight"))
         .transpose()?
-        .unwrap_or(1)
-        .clamp(0, i64::from(u32::MAX)) as u32;
+        .unwrap_or(1);
+    let weight = i32::try_from(weight)
+        .context("loot weight out of range")?
+        .max(0) as u32;
+    let kind = if json
+        .get("quality")
+        .is_some_and(|value| value.as_i64() != Some(0))
+    {
+        EntryKind::Unsupported("loot quality requires the player's luck".into())
+    } else {
+        kind
+    };
     Ok(Entry {
         condition,
         kind,
@@ -1754,6 +1818,198 @@ mod tests {
             tables
                 .drops_without_entity("minecraft:short_grass", Some(&mut || 0.0))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn weighted_entries_choose_before_applying_selected_modifiers() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/stone.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:set_count","count":{"type":"minecraft:uniform","min":1,"max":3}}},{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":1.0}},{"type":"minecraft:empty","weight":2}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        assert!(tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
+        for seed in 0..128 {
+            let mut actual = native_core::random::LegacyRandom::new(seed);
+            let mut expected = actual.clone();
+            expected.next_float();
+            let selected = expected.next_int_bound(4).unwrap();
+            let count = if selected == 0 {
+                expected.next_int_bound(3).unwrap() + 1
+            } else {
+                1
+            };
+            let drops = tables
+                .drops_with_random("minecraft:stone", tool, Some(&mut actual))
+                .unwrap();
+            if selected >= 2 {
+                assert!(drops.is_empty());
+            } else {
+                assert_eq!(drops.len(), 1);
+                assert_eq!(
+                    drops[0].item,
+                    ResourceId::parse(if selected == 0 {
+                        "minecraft:stone"
+                    } else {
+                        "minecraft:stick"
+                    })
+                    .unwrap()
+                );
+                assert_eq!(drops[0].count, count as u32);
+            }
+            assert_eq!(actual.next_int(), expected.next_int(), "seed {seed}");
+        }
+        assert!(
+            tables
+                .drops_with_random("minecraft:stone", tool, None)
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn weighted_block_loot_matches_java_26_3() {
+        use std::{path::PathBuf, process::Command};
+        const TABLES: [&str; 4] = [
+            r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:set_count","count":{"type":"minecraft:uniform","min":1,"max":3}}},{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":0.5}},{"type":"minecraft:empty","weight":2}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:stone","weight":4,"condition":{"type":"minecraft:random_chance","chance":0.3}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]},{"type":"minecraft:item","name":"minecraft:diamond","weight":3},{"type":"minecraft:empty","weight":2}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":5,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0},{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":3,"condition":{"type":"minecraft:random_chance","chance":0.5},"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":3,"modifier":{"type":"minecraft:set_count","count":2,"condition":{"type":"minecraft:random_chance","chance":0.5}}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]}]}"#,
+        ];
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("WeightedLootOracle.java");
+        let input = temp.path().join("tables.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WeightedLootOracle.java"),
+        )
+        .unwrap();
+        let definitions: Vec<Value> = TABLES
+            .iter()
+            .map(|table| serde_json::from_str(table).unwrap())
+            .collect();
+        std::fs::write(&input, serde_json::to_vec(&definitions).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("WeightedLootOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), TABLES.len() * 2 * 64);
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        let mut index = 0;
+        for (table_index, table) in TABLES.iter().enumerate() {
+            let mut source = Memory::default();
+            source.put("data/minecraft/loot_table/blocks/stone.json", table);
+            let tables = BlockLootTables::load(&mut source).unwrap();
+            assert!(tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
+            for mode in 0..2 {
+                for seed in -32..32 {
+                    let (drops, next) = if mode == 0 {
+                        let mut random = native_core::random::LegacyRandom::new(seed);
+                        let drops = tables
+                            .drops_with_random("minecraft:stone", tool, Some(&mut random))
+                            .unwrap();
+                        (drops, random.next_long())
+                    } else {
+                        let mut random = native_core::random::XoroshiroRandom::new(seed);
+                        let drops = tables
+                            .drops_with_random("minecraft:stone", tool, Some(&mut random))
+                            .unwrap();
+                        (drops, random.next_long())
+                    };
+                    let actual: Vec<_> = drops
+                        .iter()
+                        .map(|drop| {
+                            serde_json::json!([
+                                format!("{}:{}", drop.item.namespace, drop.item.path),
+                                drop.count
+                            ])
+                        })
+                        .collect();
+                    assert_eq!(
+                        actual,
+                        *rows[index]["drops"].as_array().unwrap(),
+                        "table={table_index} mode={mode} seed={seed}"
+                    );
+                    assert_eq!(
+                        next,
+                        rows[index]["next"].as_i64().unwrap(),
+                        "table={table_index} mode={mode} seed={seed}"
+                    );
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_preflight_rejects_overflow_and_checks_alternative_weights() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/stone.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":2147483647},{"type":"minecraft:item","name":"minecraft:stick","weight":1}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        assert!(!tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
+        let mut random = native_core::random::LegacyRandom::new(1);
+        assert!(
+            tables
+                .drops_with_random("minecraft:stone", tool, Some(&mut random))
+                .is_err()
+        );
+        source.put("data/minecraft/loot_table/blocks/stone.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","weight":0,"children":[{"type":"minecraft:item","name":"minecraft:stone","weight":2}]},{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        assert!(tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
+        assert_eq!(
+            tables
+                .potential_block_entity_drops("minecraft:stone")
+                .unwrap()
+                .len(),
+            2
         );
     }
 

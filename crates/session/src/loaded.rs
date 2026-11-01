@@ -39499,7 +39499,7 @@ mod tests {
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Ok(match path {
                     "data/minecraft/block_transformer/hoe.json" => Some(br#"[{"item_damage_per_use":1,"drop_strategy":"clicked_face","loot":"example:test","block_state_provider":{"type":"minecraft:rule_based","rules":[{"if_true":{"type":"minecraft:matching_blocks","blocks":"minecraft:rooted_dirt"},"then":{"id":"minecraft:dirt"}}]}}]"#.to_vec()),
-                    "data/example/loot_table/test.json" => Some(br#"{"type":"minecraft:block_interact","random_sequence":"example:tool","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:hanging_roots","condition":{"type":"minecraft:all_of","terms":[{"type":"minecraft:match_block","blocks":"minecraft:rooted_dirt"},{"type":"minecraft:random_chance","chance":1.0}]}}]}]}"#.to_vec()),
+                    "data/example/loot_table/test.json" => Some(br#"{"type":"minecraft:block_interact","random_sequence":"example:tool","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:hanging_roots","condition":{"type":"minecraft:all_of","terms":[{"type":"minecraft:match_block","blocks":"minecraft:rooted_dirt"},{"type":"minecraft:random_chance","chance":1.0}]}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]}]}"#.to_vec()),
                     _ => None,
                 })
             }
@@ -39557,6 +39557,7 @@ mod tests {
                         .get("example:tool", 42)
                         .unwrap();
                 expected_sequence.next_float();
+                let selected = expected_sequence.next_int_bound(3).unwrap();
                 assert!(session.use_tool(relative, IVec3::Z));
                 assert_eq!(
                     session
@@ -39567,6 +39568,16 @@ mod tests {
                     "minecraft:dirt"
                 );
                 assert_eq!(session.dropped_items.snapshot().len(), usize::from(enabled));
+                if enabled {
+                    assert_eq!(
+                        session.dropped_items.snapshot()[0].stack.id(),
+                        if selected == 0 {
+                            "minecraft:hanging_roots"
+                        } else {
+                            "minecraft:stick"
+                        }
+                    );
+                }
                 for _ in 0..4 {
                     expected_level.next_double();
                 }

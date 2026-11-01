@@ -4141,16 +4141,28 @@ impl LoadedSession {
             .as_ref()
             .context("item registry is unavailable")?;
         chest.unpack_seeded_loot(&id, table, |item| {
-            ensure!(
-                item.potion.is_none(),
-                "potion loot requires its active registry"
-            );
             let id = format!("{}:{}", item.id.namespace, item.id.path);
             ensure!(
                 registry.id(&id).is_some() && id != "minecraft:air",
                 "unknown loot item"
             );
-            let components = native_persistence::nbt::Tag::Compound(vec![]);
+            let components = if let Some(potion) = &item.potion {
+                ensure!(
+                    id == "minecraft:potion"
+                        && potion.namespace == "minecraft"
+                        && potion.path == "water_breathing",
+                    "unsupported potion loot prototype"
+                );
+                native_persistence::nbt::Tag::Compound(vec![(
+                    "minecraft:potion_contents".into(),
+                    native_persistence::nbt::Tag::Compound(vec![(
+                        "potion".into(),
+                        native_persistence::nbt::Tag::String("minecraft:water_breathing".into()),
+                    )]),
+                )])
+            } else {
+                native_persistence::nbt::Tag::Compound(vec![])
+            };
             let maximum = crate::equippable::saved_inventory_max(&id, &components)
                 .context("loot item prototype is unsupported")?;
             crate::inventory::ItemStack::new(id, 1, maximum, components)
@@ -22302,6 +22314,172 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn buried_treasure_open_and_saved_items_match_java() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceProvider, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChestLootOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../resources/tests/java/ChestLootOracle.java"),
+        )
+        .unwrap();
+        let result = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let input = temp.path().join("loot.json");
+        std::fs::write(
+            &input,
+            resources
+                .read_builtin_data("data/minecraft/loot_table/chests/buried_treasure.json")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("ChestLootOracle")
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let tables = Arc::new(ChestLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let mut lines = output
+            .lines()
+            .filter(|line| {
+                line.starts_with("S ") || line.starts_with("P ") || line.starts_with("R ")
+            })
+            .peekable();
+        let mut cases = 0;
+        while let Some(header) = lines.next() {
+            let parts: Vec<_> = header.split_whitespace().collect();
+            assert_eq!(parts[0], "S");
+            let mode: i32 = parts[1].parse().unwrap();
+            let seed: i64 = parts[2].parse().unwrap();
+            let mut expected = Vec::new();
+            while lines.peek().is_some_and(|line| line.starts_with("P ")) {
+                expected.push(lines.next().unwrap().to_owned());
+            }
+            assert!(lines.next().unwrap().starts_with("R "));
+            if mode != 0 {
+                continue;
+            }
+            let (mut session, _, position, chunk) = saved_chest_fixture();
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!()
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                panic!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String("minecraft:chests/buried_treasure".into()),
+            ));
+            fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_chest_loot(Arc::clone(&tables));
+            session.set_item_registry(Arc::clone(&registry));
+            assert!(
+                session.try_open_saved_chest(position - session.origin),
+                "seed {seed}"
+            );
+            let actual: Vec<_> = (0..27)
+                .filter_map(|slot| {
+                    session
+                        .inventory
+                        .slot(crate::inventory::PlayerSlot::Chest(slot))
+                        .map(|item| {
+                            let potion = match item
+                                .components()
+                                .get("minecraft:potion_contents")
+                                .and_then(|contents| contents.get("potion"))
+                            {
+                                Some(Tag::String(id)) => String::from_utf16(&id.0).unwrap(),
+                                _ => "-".to_owned(),
+                            };
+                            format!("P {slot} {} {} {potion}", item.id(), item.count())
+                        })
+                })
+                .collect();
+            assert_eq!(actual, expected, "seed {seed}");
+            assert!(Arc::make_mut(&mut session.inventory).toggle());
+            session.collect_closed_chest();
+            let chest = session.saved_chest(position).unwrap().unwrap();
+            let draft = chest.draft_inventory(&chest.slots).unwrap();
+            let encoded = nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![draft],
+                },
+            })
+            .unwrap();
+            let restored = crate::saved_chest::read(
+                &SavedBlockEntities::Encoded(encoded.into()),
+                chunk,
+                position,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(restored.slots, chest.slots);
+            cases += 1;
+        }
+        assert_eq!(cases, 10);
     }
 
     #[test]

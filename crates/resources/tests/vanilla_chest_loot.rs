@@ -73,6 +73,30 @@ fn buried_treasure_chest_loot_matches_java() {
         .arg(&cp)
         .arg("ChestLootOracle")
         .arg(&input));
+    let prototypes: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("V "))
+        .collect();
+    assert_eq!(
+        prototypes,
+        [
+            "V minecraft:heart_of_the_sea 64 0 net.minecraft.world.item.Item",
+            "V minecraft:tnt 64 0 net.minecraft.world.item.BlockItem",
+            "V minecraft:prismarine_crystals 64 0 net.minecraft.world.item.Item",
+            "V minecraft:potion 1 0 net.minecraft.world.item.PotionItem",
+            "V minecraft:iron_spear 1 250 net.minecraft.world.item.Item",
+            "V minecraft:copper_nautilus_armor 1 0 net.minecraft.world.item.Item",
+            "V minecraft:iron_nautilus_armor 1 0 net.minecraft.world.item.Item",
+            "V minecraft:golden_nautilus_armor 1 0 net.minecraft.world.item.Item",
+            "V minecraft:diamond_nautilus_armor 1 0 net.minecraft.world.item.Item",
+        ]
+    );
+    let potions: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("N "))
+        .collect();
+    assert!(!potions.is_empty());
+    assert!(potions.iter().all(|line| *line == "N {components:{\"minecraft:potion_contents\":{potion:\"minecraft:water_breathing\"}},count:1,id:\"minecraft:potion\"}"));
     let mut lines = output
         .lines()
         .filter(|l| l.starts_with("S ") || l.starts_with("P ") || l.starts_with("R "))

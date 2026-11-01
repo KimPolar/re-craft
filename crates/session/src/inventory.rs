@@ -2418,6 +2418,9 @@ const WOODS: &[&str] = &[
 ];
 const STACKABLE_ITEMS: &[&str] = &[
     "cobblestone",
+    "tnt",
+    "heart_of_the_sea",
+    "prismarine_crystals",
     "sand",
     "red_sand",
     "gravel",
@@ -2523,6 +2526,12 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
     if matches!(
         id,
         "minecraft:shears"
+            | "minecraft:potion"
+            | "minecraft:iron_spear"
+            | "minecraft:copper_nautilus_armor"
+            | "minecraft:iron_nautilus_armor"
+            | "minecraft:golden_nautilus_armor"
+            | "minecraft:diamond_nautilus_armor"
             | "minecraft:water_bucket"
             | "minecraft:lava_bucket"
             | "minecraft:mushroom_stew"
@@ -2577,7 +2586,10 @@ pub fn ordinary_item_default_durability(id: &str) -> Option<u32> {
     if ordinary_item_default_max(id) != Some(1) {
         return None;
     }
-    let (material, _) = id.strip_prefix("minecraft:")?.split_once('_')?;
+    let (material, kind) = id.strip_prefix("minecraft:")?.split_once('_')?;
+    if !TOOL_KINDS.contains(&kind) && id != "minecraft:iron_spear" {
+        return None;
+    }
     Some(match material {
         "wooden" => 59,
         "stone" => 131,
@@ -2603,7 +2615,7 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     };
     let mut max = default;
-    let mut seen = 0_u16;
+    let mut seen = 0_u32;
     for (name, value) in entries {
         let flag = if name.matches("minecraft:max_stack_size") {
             max = value
@@ -2611,11 +2623,22 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 .and_then(|value| u32::try_from(value).ok())
                 .filter(|value| (1..=99).contains(value))?;
             1
-        } else if name.matches("minecraft:damage") && default == 1 {
+        } else if name.matches("minecraft:damage") && ordinary_item_default_durability(id).is_some()
+        {
             if !matches!(value, Tag::Int(damage) if *damage >= 0) {
                 return None;
             }
             2
+        } else if id == "minecraft:potion" && name.matches("minecraft:potion_contents") {
+            let Tag::Compound(fields) = value else {
+                return None;
+            };
+            if !matches!(fields.as_slice(), [(key, Tag::String(potion))]
+                if key.matches("potion") && potion.matches("minecraft:water_breathing"))
+            {
+                return None;
+            }
+            65536
         } else if name.matches("minecraft:custom_data") {
             if !matches!(value, Tag::Compound(_)) {
                 return None;
@@ -4120,5 +4143,48 @@ mod tests {
             None
         );
         assert_eq!(ordinary_item_default_max("other:diamond_sword"), None);
+    }
+
+    #[test]
+    fn buried_treasure_item_defaults_and_water_breathing_potion_patch() {
+        for id in [
+            "minecraft:heart_of_the_sea",
+            "minecraft:tnt",
+            "minecraft:prismarine_crystals",
+        ] {
+            assert_eq!(ordinary_item_default_max(id), Some(64));
+        }
+        for id in [
+            "minecraft:potion",
+            "minecraft:copper_nautilus_armor",
+            "minecraft:iron_nautilus_armor",
+            "minecraft:golden_nautilus_armor",
+            "minecraft:diamond_nautilus_armor",
+        ] {
+            assert_eq!(ordinary_item_default_max(id), Some(1));
+            assert_eq!(ordinary_item_default_durability(id), None);
+        }
+        assert_eq!(ordinary_item_default_max("minecraft:iron_spear"), Some(1));
+        assert_eq!(
+            ordinary_item_default_durability("minecraft:iron_spear"),
+            Some(250)
+        );
+        let potion = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![(
+                "potion".into(),
+                Tag::String("minecraft:water_breathing".into()),
+            )]),
+        )]);
+        assert_eq!(saved_item_max("minecraft:potion", &potion), Some(1));
+        assert_eq!(saved_item_max("minecraft:stone", &potion), None);
+        let unknown = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![(
+                "potion".into(),
+                Tag::String("example:unknown".into()),
+            )]),
+        )]);
+        assert_eq!(saved_item_max("minecraft:potion", &unknown), None);
     }
 }

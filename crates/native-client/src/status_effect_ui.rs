@@ -12,10 +12,15 @@ pub struct EffectInfo {
 }
 
 // Values are the built-in 26.3 MobEffect colors and categories, not potion colors.
-pub const EFFECTS: [EffectInfo; 18] = [
+pub const EFFECTS: [EffectInfo; 19] = [
     EffectInfo {
         id: "night_vision",
         color: 12779366,
+        beneficial: true,
+    },
+    EffectInfo {
+        id: "fire_resistance",
+        color: 16750848,
         beneficial: true,
     },
     EffectInfo {
@@ -148,7 +153,7 @@ pub struct Entry {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Frame {
-    entries: [Option<Entry>; 18],
+    entries: [Option<Entry>; EFFECTS.len()],
 }
 
 impl Frame {
@@ -609,11 +614,11 @@ mod tests {
                 show_icon: true,
             }]);
         }
-        for offset in 0..18 {
+        for offset in 0..EFFECTS.len() {
             cases.push(
                 (0..8)
                     .map(|n| DisplayEffect {
-                        id: EFFECTS[(offset + n * 5) % 18].id,
+                        id: EFFECTS[(offset + n * 5) % EFFECTS.len()].id,
                         duration: [-1, 10, 199, 200, 1000, 32148, 40000, 600][n],
                         amplifier: n as u8,
                         ambient: n % 3 == 0,

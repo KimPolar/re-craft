@@ -635,6 +635,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
         let id = ResourceId::parse(&name)?;
         let slot = match (id.namespace.as_str(), id.path.as_str()) {
             ("minecraft", "night_vision") => &mut effects.night_vision,
+            ("minecraft", "fire_resistance") => &mut effects.fire_resistance,
             ("minecraft", "jump_boost") => &mut effects.jump_boost,
             ("minecraft", "resistance") => &mut effects.resistance,
             ("minecraft", "slow_falling") => &mut effects.slow_falling,
@@ -1534,6 +1535,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                     resource.path.as_str(),
                     "jump_boost"
                         | "night_vision"
+                        | "fire_resistance"
                         | "resistance"
                         | "slow_falling"
                         | "levitation"
@@ -1705,6 +1707,9 @@ pub(crate) fn replay_saved_status_effects(
                             crate::survival::FoodStatusKind::NightVision => {
                                 "minecraft:night_vision"
                             }
+                            crate::survival::FoodStatusKind::FireResistance => {
+                                "minecraft:fire_resistance"
+                            }
                             crate::survival::FoodStatusKind::WaterBreathing => {
                                 "minecraft:water_breathing"
                             }
@@ -1843,6 +1848,9 @@ pub(crate) fn replay_saved_status_effects(
                                         "breath_of_the_nautilus"
                                     }
                                     crate::survival::FoodStatusKind::NightVision => "night_vision",
+                                    crate::survival::FoodStatusKind::FireResistance => {
+                                        "fire_resistance"
+                                    }
                                     crate::survival::FoodStatusKind::WaterBreathing => {
                                         "water_breathing"
                                     }
@@ -1877,6 +1885,9 @@ pub(crate) fn replay_saved_status_effects(
                                     "breath_of_the_nautilus"
                                 }
                                 crate::survival::FoodStatusKind::NightVision => "night_vision",
+                                crate::survival::FoodStatusKind::FireResistance => {
+                                    "fire_resistance"
+                                }
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     "water_breathing"
                                 }
@@ -2964,7 +2975,7 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness", crate::survival::FoodStatusKind::JumpBoost => "jump_boost", crate::survival::FoodStatusKind::SlowFalling => "slow_falling", crate::survival::FoodStatusKind::Resistance => "resistance", crate::survival::FoodStatusKind::Levitation => "levitation", crate::survival::FoodStatusKind::DolphinsGrace => "dolphins_grace", crate::survival::FoodStatusKind::ConduitPower => "conduit_power", crate::survival::FoodStatusKind::BreathOfTheNautilus => "breath_of_the_nautilus" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::FireResistance => "fire_resistance", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness", crate::survival::FoodStatusKind::JumpBoost => "jump_boost", crate::survival::FoodStatusKind::SlowFalling => "slow_falling", crate::survival::FoodStatusKind::Resistance => "resistance", crate::survival::FoodStatusKind::Levitation => "levitation", crate::survival::FoodStatusKind::DolphinsGrace => "dolphins_grace", crate::survival::FoodStatusKind::ConduitPower => "conduit_power", crate::survival::FoodStatusKind::BreathOfTheNautilus => "breath_of_the_nautilus" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }
@@ -2972,6 +2983,10 @@ mod tests {
             }
         }
         for (effect_name, effect_kind) in [
+            (
+                "fire_resistance",
+                crate::survival::FoodStatusKind::FireResistance,
+            ),
             (
                 "regeneration",
                 crate::survival::FoodStatusKind::Regeneration,

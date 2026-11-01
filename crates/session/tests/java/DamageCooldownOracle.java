@@ -12,17 +12,18 @@ import net.minecraft.world.level.GameType;
 public class DamageCooldownOracle {
   static final class Captured extends RuntimeException { }
   static final class Source extends DamageSource {
-    boolean bypass;
+    boolean bypass; boolean fire;
     Source() { super(Holder.direct(new DamageType("test",0.0f))); }
-    @Override public boolean is(TagKey<DamageType> tag) { return bypass && tag == DamageTypeTags.BYPASSES_COOLDOWN; }
+    @Override public boolean is(TagKey<DamageType> tag) { return (bypass && tag == DamageTypeTags.BYPASSES_COOLDOWN) || (fire && tag == DamageTypeTags.IS_FIRE); }
   }
   static final class TestPlayer extends Player {
-    float captured; boolean called;
+    float captured; boolean called; boolean fireResistance;
     TestPlayer() { super(null,null); }
     @Override public GameType gameMode() { return GameType.SURVIVAL; }
     @Override public boolean isInvulnerableTo(ServerLevel world,DamageSource source) { return false; }
     @Override public boolean isDeadOrDying() { return false; }
     @Override public boolean isSleeping() { return false; }
+    @Override public boolean hasEffect(Holder<net.minecraft.world.effect.MobEffect> effect) { return fireResistance && effect == net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE; }
     @Override public ItemStack getUseItem() { return ItemStack.EMPTY; }
     @Override public float applyItemBlocking(ServerLevel world,DamageSource source,float amount) { return 0.0f; }
     @Override protected void actuallyHurt(ServerLevel world,DamageSource source,float amount) { captured=amount; called=true; throw new Captured(); }

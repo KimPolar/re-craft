@@ -1143,6 +1143,9 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::NightVision => {
                                     self.fall.effects().night_vision.is_some()
                                 }
+                                crate::survival::FoodStatusKind::FireResistance => {
+                                    self.fall.effects().fire_resistance.is_some()
+                                }
                                 crate::survival::FoodStatusKind::Regeneration => {
                                     self.fall.effects().regeneration.is_some()
                                 }
@@ -39869,6 +39872,8 @@ mod tests {
         use native_persistence::nbt::{NamedTag, Tag};
         for potion in [
             "night_vision",
+            "fire_resistance",
+            "long_fire_resistance",
             "water_breathing",
             "poison",
             "regeneration",
@@ -39918,6 +39923,24 @@ mod tests {
             }
             match potion {
                 "night_vision" => assert_eq!(session.snapshot().night_vision_duration, Some(3600)),
+                "fire_resistance" | "long_fire_resistance" => {
+                    let effect = session.fall.effects().fire_resistance.as_ref().unwrap();
+                    assert_eq!(
+                        effect.duration,
+                        if potion == "fire_resistance" {
+                            3600
+                        } else {
+                            9600
+                        }
+                    );
+                    assert!(
+                        session
+                            .snapshot()
+                            .active_effects
+                            .iter()
+                            .any(|effect| effect.id == "fire_resistance")
+                    );
+                }
                 "water_breathing" => assert_eq!(
                     session
                         .breathing_effects

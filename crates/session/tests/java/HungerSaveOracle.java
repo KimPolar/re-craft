@@ -43,6 +43,7 @@ public class HungerSaveOracle {
             case "jump_boost" -> MobEffects.JUMP_BOOST;
             case "slow_falling" -> MobEffects.SLOW_FALLING;
             case "resistance" -> MobEffects.RESISTANCE;
+            case "fire_resistance" -> MobEffects.FIRE_RESISTANCE;
             case "levitation" -> MobEffects.LEVITATION;
             case "dolphins_grace" -> MobEffects.DOLPHINS_GRACE;
             case "conduit_power" -> MobEffects.CONDUIT_POWER;

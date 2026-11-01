@@ -101,6 +101,7 @@ pub(crate) enum FoodStatusKind {
     Hunger,
     Poison,
     NightVision,
+    FireResistance,
     WaterBreathing,
     Regeneration,
     JumpBoost,
@@ -160,6 +161,8 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::Poison)
     } else if value.matches("minecraft:night_vision") || value.matches("night_vision") {
         Some(FoodStatusKind::NightVision)
+    } else if value.matches("minecraft:fire_resistance") || value.matches("fire_resistance") {
+        Some(FoodStatusKind::FireResistance)
     } else if value.matches("minecraft:water_breathing") || value.matches("water_breathing") {
         Some(FoodStatusKind::WaterBreathing)
     } else if value.matches("minecraft:regeneration") || value.matches("regeneration") {
@@ -219,6 +222,8 @@ fn supported_potion(id: &ResourceId) -> bool {
                 | "awkward"
                 | "night_vision"
                 | "long_night_vision"
+                | "fire_resistance"
+                | "long_fire_resistance"
                 | "water_breathing"
                 | "long_water_breathing"
                 | "poison"
@@ -355,6 +360,8 @@ fn base_potion_effects(id: Option<&ResourceId>) -> Option<Vec<StatusApplication>
     let (kind, duration, amplifier) = match id.path.as_str() {
         "night_vision" => (FoodStatusKind::NightVision, 3600, 0),
         "long_night_vision" => (FoodStatusKind::NightVision, 9600, 0),
+        "fire_resistance" => (FoodStatusKind::FireResistance, 3600, 0),
+        "long_fire_resistance" => (FoodStatusKind::FireResistance, 9600, 0),
         "water_breathing" => (FoodStatusKind::WaterBreathing, 3600, 0),
         "long_water_breathing" => (FoodStatusKind::WaterBreathing, 9600, 0),
         "poison" => (FoodStatusKind::Poison, 900, 0),
@@ -454,6 +461,7 @@ fn status_color(kind: FoodStatusKind) -> u32 {
         FoodStatusKind::Hunger => 0x587653,
         FoodStatusKind::Poison => 0x87a363,
         FoodStatusKind::NightVision => 0xc2ff66,
+        FoodStatusKind::FireResistance => 0xff9900,
         FoodStatusKind::WaterBreathing => 0x98dac0,
         FoodStatusKind::Regeneration => 0xcd5cab,
         FoodStatusKind::JumpBoost => 0xfdff84,
@@ -1359,6 +1367,7 @@ impl EffectDuration {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FallEffects {
     pub night_vision: Option<EffectDuration>,
+    pub fire_resistance: Option<EffectDuration>,
     pub jump_boost: Option<EffectDuration>,
     pub resistance: Option<EffectDuration>,
     pub slow_falling: Option<EffectDuration>,
@@ -1420,6 +1429,7 @@ impl FallEffects {
 
     pub fn tick(&mut self) {
         EffectDuration::tick(&mut self.night_vision);
+        EffectDuration::tick(&mut self.fire_resistance);
         EffectDuration::tick(&mut self.jump_boost);
         EffectDuration::tick(&mut self.resistance);
         EffectDuration::tick(&mut self.slow_falling);
@@ -1502,6 +1512,7 @@ pub(crate) fn display_effects(
 ) -> std::sync::Arc<[DisplayEffect]> {
     [
         ("night_vision", &fall.night_vision),
+        ("fire_resistance", &fall.fire_resistance),
         ("jump_boost", &fall.jump_boost),
         ("resistance", &fall.resistance),
         ("slow_falling", &fall.slow_falling),
@@ -2004,6 +2015,7 @@ mod tests {
             "hunger",
             "poison",
             "night_vision",
+            "fire_resistance",
             "water_breathing",
             "regeneration",
             "jump_boost",
@@ -2190,6 +2202,7 @@ mod tests {
                     FoodStatusKind::Hunger => "hunger",
                     FoodStatusKind::Poison => "poison",
                     FoodStatusKind::NightVision => "night_vision",
+                    FoodStatusKind::FireResistance => "fire_resistance",
                     FoodStatusKind::WaterBreathing => "water_breathing",
                     FoodStatusKind::Regeneration => "regeneration",
                     FoodStatusKind::JumpBoost => "jump_boost",
@@ -2306,7 +2319,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 500);
+        assert_eq!(rows.len(), 540);
         for row in rows {
             for variant in 0..4 {
                 let name = row["potion"].as_str().unwrap();
@@ -2399,6 +2412,7 @@ mod tests {
                 for (actual, expected) in effects.iter().zip(expected) {
                     let name = match actual.kind {
                         FoodStatusKind::NightVision => "minecraft:night_vision",
+                        FoodStatusKind::FireResistance => "minecraft:fire_resistance",
                         FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
                         FoodStatusKind::Poison => "minecraft:poison",
                         FoodStatusKind::Regeneration => "minecraft:regeneration",
@@ -3419,6 +3433,7 @@ mod tests {
                                 FoodStatusKind::Hunger => &mut active,
                                 FoodStatusKind::Poison => &mut active_poison,
                                 FoodStatusKind::NightVision
+                                | FoodStatusKind::FireResistance
                                 | FoodStatusKind::WaterBreathing
                                 | FoodStatusKind::Regeneration
                                 | FoodStatusKind::JumpBoost
@@ -3446,6 +3461,7 @@ mod tests {
                                 FoodStatusKind::Hunger => active = None,
                                 FoodStatusKind::Poison => active_poison = None,
                                 FoodStatusKind::NightVision
+                                | FoodStatusKind::FireResistance
                                 | FoodStatusKind::WaterBreathing
                                 | FoodStatusKind::Regeneration
                                 | FoodStatusKind::JumpBoost
@@ -3861,6 +3877,72 @@ mod tests {
             ItemStack::new("minecraft:apple".into(), 2, 64, Tag::Compound(vec![])),
         );
         inventory
+    }
+
+    #[test]
+    fn drinking_fire_resistance_updates_snapshot_and_keeps_old_snapshot_unchanged() {
+        for (potion, duration) in [
+            ("minecraft:fire_resistance", 3600),
+            ("minecraft:long_fire_resistance", 9600),
+        ] {
+            let mut session = LocalSession::demo();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:potion".into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:potion_contents".into(),
+                        Tag::String(potion.into()),
+                    )]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            let before = session.snapshot();
+            session.submit_command(PlayerCommand::Place);
+            for _ in 0..32 {
+                session.update(Duration::from_millis(50));
+            }
+            let after = session.snapshot();
+            assert!(
+                before
+                    .active_effects
+                    .iter()
+                    .all(|effect| effect.id != "fire_resistance")
+            );
+            let effect = after
+                .active_effects
+                .iter()
+                .find(|effect| effect.id == "fire_resistance")
+                .unwrap();
+            assert_eq!(effect.duration, duration);
+            assert_eq!(
+                after.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                "minecraft:glass_bottle"
+            );
+            session.update(Duration::from_millis(50));
+            assert_eq!(
+                session
+                    .snapshot()
+                    .active_effects
+                    .iter()
+                    .find(|effect| effect.id == "fire_resistance")
+                    .unwrap()
+                    .duration,
+                duration - 1
+            );
+            assert_eq!(
+                after
+                    .active_effects
+                    .iter()
+                    .find(|effect| effect.id == "fire_resistance")
+                    .unwrap()
+                    .duration,
+                duration
+            );
+        }
     }
 
     #[test]

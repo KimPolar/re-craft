@@ -187,6 +187,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Hunger => self.effects.hunger = None,
             crate::survival::FoodStatusKind::Poison => self.effects.poison = None,
             crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
+            crate::survival::FoodStatusKind::FireResistance => self.effects.fire_resistance = None,
             crate::survival::FoodStatusKind::Regeneration => self.effects.regeneration = None,
             crate::survival::FoodStatusKind::JumpBoost => self.effects.jump_boost = None,
             crate::survival::FoodStatusKind::SlowFalling => self.effects.slow_falling = None,
@@ -223,6 +224,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Hunger => &mut self.effects.hunger,
             crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
             crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
+            crate::survival::FoodStatusKind::FireResistance => &mut self.effects.fire_resistance,
             crate::survival::FoodStatusKind::Regeneration => &mut self.effects.regeneration,
             crate::survival::FoodStatusKind::JumpBoost => &mut self.effects.jump_boost,
             crate::survival::FoodStatusKind::SlowFalling => &mut self.effects.slow_falling,
@@ -296,6 +298,17 @@ impl FallTracker {
                         | "minecraft:magic"
                 ),
                 "minecraft:bypasses_effects" => damage == "minecraft:starve",
+                "minecraft:is_fire" => matches!(
+                    damage,
+                    "minecraft:in_fire"
+                        | "minecraft:campfire"
+                        | "minecraft:on_fire"
+                        | "minecraft:lava"
+                        | "minecraft:hot_floor"
+                        | "minecraft:sulfur_cube_hot"
+                        | "minecraft:unattributed_fireball"
+                        | "minecraft:fireball"
+                ),
                 _ => false,
             })
         }
@@ -449,6 +462,9 @@ impl FallTracker {
         cooldown: Option<&mut DamageCooldown>,
     ) -> Result<()> {
         if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
+            return Ok(());
+        }
+        if self.effects.fire_resistance.is_some() && self.damage_tag("minecraft:is_fire", damage)? {
             return Ok(());
         }
         let mut next_cooldown = cooldown.as_deref().copied();
@@ -759,6 +775,250 @@ mod tests {
         );
         assert_eq!(cooldown, before);
         assert_eq!(vitals.health, 13.0);
+    }
+
+    #[test]
+    fn fire_resistance_blocks_fire_before_cooldown_and_preserves_other_damage() {
+        let mut tracker = FallTracker::default();
+        tracker.add_status(crate::survival::StatusApplication {
+            kind: crate::survival::FoodStatusKind::FireResistance,
+            duration: 20,
+            amplifier: 0,
+            ambient: false,
+            visible: true,
+            show_icon: true,
+        });
+        let inventory = PlayerInventory::default();
+        let mut vitals = PlayerVitals::default();
+        let mut cooldown = DamageCooldown::default();
+        let before = cooldown;
+        for id in [
+            "minecraft:in_fire",
+            "minecraft:campfire",
+            "minecraft:on_fire",
+            "minecraft:lava",
+            "minecraft:hot_floor",
+            "minecraft:sulfur_cube_hot",
+            "minecraft:unattributed_fireball",
+            "minecraft:fireball",
+        ] {
+            tracker
+                .damage(
+                    4.0,
+                    id,
+                    &inventory,
+                    Some(ArmorValues::default()),
+                    &mut vitals,
+                    GameMode::Survival,
+                    Some(&mut cooldown),
+                )
+                .unwrap();
+            assert_eq!(vitals.health, 20.0, "{id}");
+            assert_eq!(cooldown, before, "{id}");
+        }
+        tracker
+            .damage(
+                4.0,
+                "minecraft:fall",
+                &inventory,
+                Some(ArmorValues::default()),
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            )
+            .unwrap();
+        assert_eq!(vitals.health, 16.0);
+        assert_ne!(cooldown, before);
+    }
+
+    #[test]
+    fn fire_resistance_uses_active_damage_tags_and_rejects_invalid_tags() {
+        use native_resources::packs::ResourceProvider;
+        struct Data(bool);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(if folder == "tags/damage_type" {
+                    [
+                        "is_fire",
+                        "bypasses_cooldown",
+                        "bypasses_armor",
+                        "bypasses_effects",
+                        "bypasses_resistance",
+                        "bypasses_enchantments",
+                    ]
+                    .into_iter()
+                    .map(|name| ResourceId::parse(name).unwrap())
+                    .collect()
+                } else {
+                    Vec::new()
+                })
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.ends_with("/is_fire.json") {
+                    return Ok(Some(if self.0 {
+                        b"invalid".to_vec()
+                    } else {
+                        br#"{"replace":true,"values":["minecraft:fall"]}"#.to_vec()
+                    }));
+                }
+                if path.contains("/tags/damage_type/") {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Ok(None)
+            }
+        }
+        for invalid in [false, true] {
+            let mut tracker = FallTracker::default();
+            tracker.add_status(crate::survival::StatusApplication {
+                kind: crate::survival::FoodStatusKind::FireResistance,
+                duration: 20,
+                amplifier: 0,
+                ambient: false,
+                visible: true,
+                show_icon: true,
+            });
+            tracker.enchantments = Some(Arc::new(
+                OxygenEnchantments::load(&mut Data(invalid)).unwrap(),
+            ));
+            let mut vitals = PlayerVitals::default();
+            let mut cooldown = DamageCooldown::default();
+            let result = tracker.damage(
+                4.0,
+                "minecraft:fall",
+                &PlayerInventory::default(),
+                Some(ArmorValues::default()),
+                &mut vitals,
+                GameMode::Survival,
+                Some(&mut cooldown),
+            );
+            assert_eq!(result.is_err(), invalid);
+            assert_eq!(vitals.health, 20.0);
+            assert_eq!(cooldown, DamageCooldown::default());
+            if !invalid {
+                tracker
+                    .damage(
+                        4.0,
+                        "minecraft:lava",
+                        &PlayerInventory::default(),
+                        Some(ArmorValues::default()),
+                        &mut vitals,
+                        GameMode::Survival,
+                        Some(&mut cooldown),
+                    )
+                    .unwrap();
+                assert_eq!(vitals.health, 16.0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn fire_resistance_damage_order_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FireResistanceOracle.java");
+        let helper = temp.path().join("DamageCooldownOracle.java");
+        let result = temp.path().join("fire.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FireResistanceOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &helper,
+            include_str!("../tests/java/DamageCooldownOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .arg(&helper)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("FireResistanceOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 12);
+        for row in rows {
+            let mut tracker = FallTracker::default();
+            if row["resistant"].as_bool().unwrap() {
+                tracker.add_status(crate::survival::StatusApplication {
+                    kind: crate::survival::FoodStatusKind::FireResistance,
+                    duration: 20,
+                    amplifier: 0,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                });
+            }
+            let mut vitals = PlayerVitals::default();
+            let mut cooldown = DamageCooldown {
+                ticks: row["timer"].as_i64().unwrap() as i32,
+                last_damage: 2.0,
+            };
+            let before = cooldown;
+            tracker
+                .damage(
+                    4.0,
+                    if row["fire"].as_bool().unwrap() {
+                        "minecraft:lava"
+                    } else {
+                        "minecraft:fall"
+                    },
+                    &PlayerInventory::default(),
+                    Some(ArmorValues::default()),
+                    &mut vitals,
+                    GameMode::Survival,
+                    Some(&mut cooldown),
+                )
+                .unwrap();
+            let accepted = row["accepted"].as_bool().unwrap();
+            assert_eq!(vitals.health < 20.0, accepted, "{row}");
+            if accepted {
+                assert_eq!(vitals.health, 20.0 - row["damage"].as_f64().unwrap() as f32);
+            } else {
+                assert_eq!(cooldown, before, "{row}");
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]

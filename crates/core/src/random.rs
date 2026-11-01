@@ -192,6 +192,77 @@ impl XoroshiroRandom {
     }
 }
 
+/// Java 26.3's `WorldgenRandom` over a xoroshiro source, used during decoration.
+/// Its inherited legacy methods consume the high bits of separate xoroshiro
+/// draws; they differ from calling methods on `XoroshiroRandom` directly.
+#[derive(Clone, Debug)]
+pub struct DecorationRandom {
+    source: XoroshiroRandom,
+}
+impl DecorationRandom {
+    pub fn new(seed: i64) -> Self {
+        Self {
+            source: XoroshiroRandom::new(seed),
+        }
+    }
+    pub fn set_seed(&mut self, seed: i64) {
+        self.source = XoroshiroRandom::new(seed);
+    }
+    fn bits(&mut self, bits: u32) -> u32 {
+        ((self.source.next_long() as u64) >> (64 - bits)) as u32
+    }
+    pub fn next_long(&mut self) -> i64 {
+        let high = i64::from(self.bits(32) as i32) << 32;
+        high.wrapping_add(i64::from(self.bits(32) as i32))
+    }
+    pub fn next_int(&mut self) -> i32 {
+        self.bits(32) as i32
+    }
+    pub fn next_int_bound(&mut self, bound: i32) -> Option<i32> {
+        if bound <= 0 {
+            return None;
+        }
+        if (bound & -bound) == bound {
+            return Some(((i64::from(bound) * i64::from(self.bits(31))) >> 31) as i32);
+        }
+        loop {
+            let bits = self.bits(31) as i32;
+            let value = bits % bound;
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+                return Some(value);
+            }
+        }
+    }
+    pub fn next_bool(&mut self) -> bool {
+        self.bits(1) != 0
+    }
+    pub fn next_float(&mut self) -> f32 {
+        self.bits(24) as f32 * (1.0 / 16_777_216.0)
+    }
+    pub fn next_double(&mut self) -> f64 {
+        let value = (u64::from(self.bits(26)) << 27) | u64::from(self.bits(27));
+        value as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+    pub fn set_decoration_seed(&mut self, seed: i64, block_x: i32, block_z: i32) -> i64 {
+        self.set_seed(seed);
+        let x_scale = self.next_long() | 1;
+        let z_scale = self.next_long() | 1;
+        let result = i64::from(block_x)
+            .wrapping_mul(x_scale)
+            .wrapping_add(i64::from(block_z).wrapping_mul(z_scale))
+            ^ seed;
+        self.set_seed(result);
+        result
+    }
+    pub fn set_feature_seed(&mut self, decoration_seed: i64, index: i32, step: i32) {
+        self.set_seed(
+            decoration_seed
+                .wrapping_add(i64::from(index))
+                .wrapping_add(i64::from(10_000i32.wrapping_mul(step))),
+        );
+    }
+}
+
 fn mix_stafford13(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

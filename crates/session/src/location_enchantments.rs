@@ -69,6 +69,16 @@ fn slots(inventory: &PlayerInventory) -> [(EquipmentSlot, PlayerSlot); 6] {
     ]
 }
 
+fn same_stack(left: Option<&ItemStack>, right: Option<&ItemStack>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.count() == right.count() && (left == right || left.same_item_and_components(right))
+        }
+        _ => false,
+    }
+}
+
 /// Java removes an existing modifier with the same id before applying a
 /// transient one. Until those replacements are persisted, reject such saves.
 pub(crate) fn validate_save_modifiers(
@@ -128,7 +138,9 @@ impl LocationTracker {
         slots(inventory)
             .into_iter()
             .enumerate()
-            .any(|(index, (_, slot))| self.equipment[index].as_ref() != inventory.slot(slot))
+            .any(|(index, (_, slot))| {
+                !same_stack(self.equipment[index].as_ref(), inventory.slot(slot))
+            })
     }
     pub fn needs_processing(&self, inventory: &PlayerInventory) -> bool {
         !self.active.is_empty()
@@ -327,7 +339,9 @@ impl LocationTracker {
         let current = slots(inventory).map(|(_, slot)| inventory.slot(slot).cloned());
         self.transaction(inventory, random, |tracker, inventory, random, outcome| {
             let changed: Vec<_> = (0..6)
-                .filter(|&index| tracker.equipment[index] != current[index])
+                .filter(|&index| {
+                    !same_stack(tracker.equipment[index].as_ref(), current[index].as_ref())
+                })
                 .collect();
             for &index in &changed {
                 tracker.stop_slot(index, outcome);
@@ -442,6 +456,50 @@ mod tests {
                 &efficiency
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn reordered_component_fields_do_not_reactivate_equipment_effects() {
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack).unwrap());
+        let enchantments = (
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("example:location".into(), Tag::Int(1))]),
+        );
+        let damage = ("minecraft:damage".into(), Tag::Int(1));
+        let item =
+            |entries| ItemStack::new("minecraft:iron_boots".into(), 1, 1, Tag::Compound(entries));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_enchantments(Arc::clone(&registry));
+        inventory.set_slot(
+            PlayerSlot::Armor(3),
+            item(vec![enchantments.clone(), damage.clone()]),
+        );
+        let mut tracker = LocationTracker::default();
+        let mut random = LegacyRandom::new(3);
+        assert!(
+            tracker
+                .sync_equipment(
+                    &mut inventory,
+                    &registry,
+                    env("minecraft:soul_sand"),
+                    &mut random
+                )
+                .unwrap()
+                .attributes_changed
+        );
+        inventory.set_slot(PlayerSlot::Armor(3), item(vec![damage, enchantments]));
+        assert!(!tracker.equipment_changed(&inventory));
+        assert!(
+            !tracker
+                .sync_equipment(
+                    &mut inventory,
+                    &registry,
+                    env("minecraft:soul_sand"),
+                    &mut random
+                )
+                .unwrap()
+                .attributes_changed
         );
     }
 

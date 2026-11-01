@@ -28338,10 +28338,57 @@ mod tests {
     #[test]
     #[ignore = "requires the installed Minecraft 26.3 assets"]
     fn soul_speed_drafts_damaged_and_broken_boots_with_conserved_items() {
+        use flate2::{Compression, write::GzEncoder};
         use native_persistence::nbt::{NamedTag, Tag};
+        use native_persistence::save::{WorldSavePlan, WorldWriteGuard};
+        use std::{io::Write, path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/location-save-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir_in(root).unwrap();
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let java_source = temp.path().join("LocationPlayerSaveOracle.java");
+        std::fs::write(
+            &java_source,
+            include_str!("../tests/java/LocationPlayerSaveOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&java_source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let write = |path: &std::path::Path, value: &NamedTag| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&native_persistence::nbt::write(value).unwrap())
+                .unwrap();
+            std::fs::write(path, encoder.finish().unwrap()).unwrap();
+        };
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
         for initial_damage in [0, 194] {
@@ -28349,6 +28396,12 @@ mod tests {
                 name: "".into(),
                 value: Tag::Compound(vec![
                     ("DataVersion".into(), Tag::Int(5023)),
+                    ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+                    (
+                        "Dimension".into(),
+                        Tag::String("minecraft:overworld".into()),
+                    ),
+                    ("future_data".into(), Tag::Long(42)),
                     (
                         "equipment".into(),
                         Tag::Compound(vec![(
@@ -28417,6 +28470,61 @@ mod tests {
                 crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap(),
                 crate::player_data::read_saved_movement_speed_attribute(&original).unwrap()
             );
+            let world = temp.path().join(format!("world-{initial_damage}"));
+            let player_path = world.join("players/data/00000000-0000-0000-0000-000000000001.dat");
+            write(
+                &world.join("level.dat"),
+                &NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![(
+                        "Data".into(),
+                        Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+                    )]),
+                },
+            );
+            write(&player_path, &original);
+            let mut plan = WorldSavePlan::new();
+            draft
+                .add_to_save_plan(&mut plan, [0, 0, 0, 1], &original)
+                .unwrap();
+            let result = WorldWriteGuard::acquire(&world)
+                .unwrap()
+                .write_plan(plan, |_, _| anyhow::bail!("unexpected block edit"))
+                .unwrap();
+            let backup = result
+                .backup_directory
+                .join("players/00000000-0000-0000-0000-000000000001.dat");
+            assert_eq!(
+                native_persistence::nbt::read_gzip(std::fs::File::open(backup).unwrap()).unwrap(),
+                original
+            );
+            let verified = Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("LocationPlayerSaveOracle")
+                .arg(&player_path)
+                .arg(if initial_damage == 194 { "-1" } else { "1" })
+                .output()
+                .unwrap();
+            assert!(
+                verified.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&verified.stdout),
+                String::from_utf8_lossy(&verified.stderr)
+            );
+            let roundtrip =
+                native_persistence::nbt::read_gzip(std::fs::File::open(&player_path).unwrap())
+                    .unwrap();
+            assert_eq!(roundtrip.value.get("java_roundtrip"), Some(&Tag::Long(73)));
+            let reloaded = crate::player_data::read_saved_player(&roundtrip).unwrap();
+            match (reloaded.slot(crate::inventory::PlayerSlot::Armor(3)), boots) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.count(), expected.count());
+                    assert!(actual.same_item_and_components(expected));
+                }
+                (None, None) => {}
+                _ => panic!("boot presence changed after Java roundtrip"),
+            }
             let mut altered_source = original.clone();
             let Tag::Compound(fields) = &mut altered_source.value else {
                 unreachable!()

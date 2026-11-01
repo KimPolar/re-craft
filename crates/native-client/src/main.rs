@@ -68,6 +68,7 @@ mod weather_gpu;
 mod weather_render;
 #[cfg(all(test, target_os = "windows"))]
 mod window_test;
+mod world_banner;
 
 use std::{
     collections::BTreeMap,

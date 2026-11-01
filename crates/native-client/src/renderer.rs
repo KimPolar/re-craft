@@ -89,6 +89,8 @@ struct PreviewChunkGpu {
     capacity: usize,
     count: u32,
     chest_lids: Arc<[crate::preview::ChestLidMesh]>,
+    banner_flags: Arc<[crate::preview::BannerFlagMesh]>,
+    banner_frame: Option<(i64, u32)>,
     animated_lids: BTreeMap<(i32, i32, i32), u32>,
 }
 
@@ -101,6 +103,8 @@ impl Default for PreviewChunkGpu {
             capacity: 0,
             count: 0,
             chest_lids: Arc::from([]),
+            banner_flags: Arc::from([]),
+            banner_frame: None,
             animated_lids: BTreeMap::new(),
         }
     }
@@ -139,6 +143,7 @@ impl PreviewChunkGpu {
         let mut uploaded = false;
         let mut draw_changed = false;
         if opaque_changed {
+            self.banner_frame = None;
             self.animated_lids.clear();
             let previous_count = self.count;
             self.count = u32::try_from(mesh.opaque.len()).context("too many chunk vertices")?;
@@ -179,6 +184,7 @@ impl PreviewChunkGpu {
             self.translucent = Arc::clone(&mesh.translucent);
         }
         self.chest_lids = Arc::clone(&mesh.chest_lids);
+        self.banner_flags = Arc::clone(&mesh.banner_flags);
         Ok((uploaded, transparent_changed, draw_changed))
     }
 }
@@ -275,6 +281,8 @@ pub struct Renderer {
     preview_chunks: BTreeMap<ChunkPos, PreviewChunkGpu>,
     chest_visuals: Arc<[native_session::chest_lid::ChestLidVisual]>,
     chest_partial: f32,
+    banner_time: i64,
+    banner_partial: f32,
     animated_chest_chunks: BTreeSet<ChunkPos>,
     preview_bundle: Option<wgpu::RenderBundle>,
     preview_bundle_dirty: bool,
@@ -1335,6 +1343,8 @@ impl Renderer {
             preview_chunks: BTreeMap::new(),
             chest_visuals: Arc::from([]),
             chest_partial: 0.0,
+            banner_time: 0,
+            banner_partial: 0.0,
             animated_chest_chunks: BTreeSet::new(),
             preview_bundle: None,
             preview_bundle_dirty: true,
@@ -1728,6 +1738,7 @@ impl Renderer {
             self.preview_uploaded = true;
         }
         self.update_chest_lids()?;
+        self.update_banner_flags()?;
         if scene.atlas.needs_update(tick) {
             Arc::make_mut(&mut scene.atlas).update(tick);
             let atlas = &scene.atlas.texture;
@@ -1819,6 +1830,35 @@ impl Renderer {
     ) {
         self.chest_visuals = lids;
         self.chest_partial = partial;
+    }
+
+    pub fn set_banner_time(&mut self, game_time: i64, partial: f32) {
+        self.banner_time = game_time;
+        self.banner_partial = partial;
+    }
+
+    fn update_banner_flags(&mut self) -> Result<()> {
+        for chunk in self.preview_chunks.values_mut() {
+            let frame = (self.banner_time, self.banner_partial.to_bits());
+            if chunk.banner_frame == Some(frame) || chunk.banner_flags.is_empty() {
+                continue;
+            }
+            let Some(buffer) = &chunk.buffer else {
+                continue;
+            };
+            for flag in chunk.banner_flags.iter() {
+                let vertices =
+                    flag.animated_vertices(&chunk.opaque, self.banner_time, self.banner_partial);
+                let offset = flag
+                    .start
+                    .checked_mul(std::mem::size_of::<Vertex>())
+                    .context("banner vertex offset overflow")?;
+                self.queue
+                    .write_buffer(buffer, offset as u64, bytemuck::cast_slice(&vertices));
+            }
+            chunk.banner_frame = Some(frame);
+        }
+        Ok(())
     }
 
     fn update_chest_lids(&mut self) -> Result<()> {
@@ -2435,6 +2475,92 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a GPU; does not open a window"]
+    fn gpu_banner_animation_updates_chunk_vertex_buffer() {
+        use glam::{IVec3, Quat, Vec3};
+        use std::{collections::BTreeMap, sync::Arc, time::Duration};
+        let state = native_world::loaded::BlockState {
+            name: "minecraft:white_banner".into(),
+            properties: BTreeMap::from([("rotation".into(), "0".into())]),
+        };
+        let position = IVec3::new(1, 2, 3);
+        let phase = crate::banner_item::world_phase(position, 0, 0.0);
+        let (_, flag) = crate::banner_item::world_geometry(&state, phase).unwrap();
+        let vertices: Vec<_> = flag
+            .iter()
+            .flat_map(|quad| {
+                [0, 1, 2, 0, 2, 3].map(|i| {
+                    let vertex = quad.vertices[i];
+                    crate::mesh::Vertex {
+                        position: (position.as_vec3() + Vec3::from_array(vertex.position))
+                            .to_array(),
+                        uv: vertex.uv,
+                        shade: 1.0,
+                        tint: [1.0; 3],
+                        light: 240,
+                    }
+                })
+            })
+            .collect();
+        let motion = crate::preview::BannerFlagMesh {
+            position,
+            pivot: position.as_vec3() + Vec3::new(0.5, 44.0 / 24.0, 0.5),
+            orientation: Quat::IDENTITY,
+            initial_angle: crate::banner_item::flag_angle(phase),
+            start: 0,
+            end: 36,
+        };
+        let mesh = crate::preview::ChunkMesh {
+            opaque: vertices.into(),
+            banner_flags: Arc::from([motion]),
+            ..Default::default()
+        };
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .unwrap();
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let mut chunk = super::PreviewChunkGpu::default();
+            chunk.update(&device, &queue, &mesh).unwrap();
+            let animated = chunk.banner_flags[0].animated_vertices(&chunk.opaque, 47, 0.25);
+            assert!(
+                animated
+                    .iter()
+                    .zip(chunk.opaque.iter())
+                    .any(|(a, b)| a.position != b.position)
+            );
+            queue.write_buffer(
+                chunk.buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&animated),
+            );
+            queue.submit([]);
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(15)),
+                })
+                .unwrap();
+            if let Some(error) = errors.pop().await {
+                panic!("GPU validation failed: {error}");
+            }
+        });
+    }
+
     #[test]
     fn vertical_view_keeps_a_finite_yaw_aligned_camera_basis() {
         use glam::{Mat4, Vec3};

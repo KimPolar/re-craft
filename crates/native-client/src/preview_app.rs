@@ -1092,6 +1092,7 @@ impl Viewer {
                 Arc::clone(&snapshot.chest_lids),
                 play.session.partial_tick(),
             );
+            renderer.set_banner_time(snapshot.game_time, play.session.partial_tick());
             renderer.set_fov_modifier(snapshot.camera.fov_modifier(play.session.partial_tick()));
             renderer.set_camera_bob(&snapshot.camera, play.session.partial_tick());
             if let Err(error) = renderer.update_experience_orbs(
@@ -2233,6 +2234,7 @@ mod tests {
                                             opaque: opaque.into(),
                                             translucent: translucent.into(),
                                             chest_lids: Arc::from([]),
+                                            banner_flags: Arc::from([]),
                                         }),
                                     )
                                 })

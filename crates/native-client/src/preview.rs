@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Quat, Vec3};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use native_resources::{
     biomes::{BiomeColors, ColorMaps},
@@ -100,10 +100,14 @@ struct PreviewSource<'a, T> {
     inner: &'a mut T,
     missing_png: Vec<u8>,
     missing: BTreeSet<String>,
+    generated: BTreeMap<String, Vec<u8>>,
 }
 
 impl<T: ResourceProvider> ResourceProvider for PreviewSource<'_, T> {
     fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.generated.get(path) {
+            return Ok(Some(bytes.clone()));
+        }
         if path == MISSING_TEXTURE {
             return Ok(Some(self.missing_png.clone()));
         }
@@ -121,6 +125,12 @@ impl<T: ResourceProvider> ResourceProvider for PreviewSource<'_, T> {
     }
 
     fn read_asset_with_metadata(&mut self, path: &str) -> Result<Option<ResourceAsset>> {
+        if let Some(bytes) = self.generated.get(path) {
+            return Ok(Some(ResourceAsset {
+                bytes: bytes.clone(),
+                metadata: None,
+            }));
+        }
         if path == MISSING_TEXTURE {
             return Ok(Some(ResourceAsset {
                 bytes: self.missing_png.clone(),
@@ -155,6 +165,7 @@ struct PreviewMaterials {
     lightmap: Arc<[[[f32; 3]; 16]; 16]>,
     base_lightmap: Arc<native_world::lighting::LightmapSettings>,
     warnings: Vec<String>,
+    banner_sprites: BTreeMap<crate::world_banner::Appearance, ResourceId>,
 }
 
 #[derive(Default)]
@@ -162,6 +173,34 @@ pub struct ChunkMesh {
     pub opaque: Arc<[Vertex]>,
     pub translucent: Arc<[TransparentQuad]>,
     pub chest_lids: Arc<[ChestLidMesh]>,
+    pub banner_flags: Arc<[BannerFlagMesh]>,
+}
+
+#[derive(Clone)]
+pub struct BannerFlagMesh {
+    pub position: IVec3,
+    pub pivot: Vec3,
+    pub orientation: Quat,
+    pub initial_angle: f32,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl BannerFlagMesh {
+    pub fn animated_vertices(&self, base: &[Vertex], time: i64, partial: f32) -> [Vertex; 36] {
+        let phase = crate::banner_item::world_phase(self.position, time, partial);
+        let angle = crate::banner_item::flag_angle(phase) - self.initial_angle;
+        let rotation = self.orientation * Quat::from_rotation_x(angle) * self.orientation.inverse();
+        let mut vertices: [Vertex; 36] = base[self.start..self.end]
+            .try_into()
+            .expect("banner flag contains six quads");
+        for vertex in &mut vertices {
+            vertex.position = (self.pivot
+                + rotation * (Vec3::from_array(vertex.position) - self.pivot))
+                .to_array();
+        }
+        vertices
+    }
 }
 
 #[derive(Clone)]
@@ -248,16 +287,37 @@ impl PreviewMaterials {
         max_atlas_side: u32,
         state_ids: BTreeSet<BlockStateId>,
         biome_ids: BTreeSet<BiomeId>,
+        banners: &BTreeSet<crate::world_banner::Appearance>,
     ) -> Result<Self> {
         let mut provider = PreviewSource {
             inner: source,
             missing_png: missing_png()?,
             missing: BTreeSet::new(),
+            generated: BTreeMap::new(),
         };
         let fallback = missing_model()?;
         let mut models: BTreeMap<BlockStateId, BlockModel> = BTreeMap::new();
         let mut fluids: BTreeMap<BlockStateId, FluidState> = BTreeMap::new();
         let mut warnings = Vec::new();
+        let mut banner_sprites = BTreeMap::new();
+        for (index, appearance) in banners.iter().enumerate() {
+            let id = ResourceId::parse(&format!("native:entity/banner/composite_{index}"))?;
+            let bytes = match crate::world_banner::compose(provider.inner, appearance) {
+                Ok(image) => {
+                    let mut bytes = Cursor::new(Vec::new());
+                    DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png)?;
+                    bytes.into_inner()
+                }
+                Err(error) => {
+                    warnings.push(format!("banner texture: {error:#}"));
+                    provider.missing_png.clone()
+                }
+            };
+            provider
+                .generated
+                .insert(id.asset_path("textures", "png"), bytes);
+            banner_sprites.insert(appearance.clone(), id);
+        }
         let lighting_result = match &world.dimension_type {
             Some(id) => PreviewLighting::load_type(provider.inner, id),
             None => PreviewLighting::load(provider.inner, &world.dimension),
@@ -356,6 +416,10 @@ impl PreviewMaterials {
             .map(|quad| quad.texture.sprite.clone())
             .chain(std::iter::once(ResourceId::parse("native:block/missing")?))
             .collect();
+        if !banner_sprites.is_empty() {
+            textures.push(ResourceId::parse("minecraft:entity/banner/banner_base")?);
+            textures.extend(banner_sprites.values().cloned());
+        }
         let has_water = fluids.values().any(|fluid| fluid.kind == FluidKind::Water);
         let has_lava = fluids.values().any(|fluid| fluid.kind == FluidKind::Lava);
         if has_water {
@@ -408,6 +472,7 @@ impl PreviewMaterials {
             lightmap,
             base_lightmap,
             warnings,
+            banner_sprites,
         })
     }
 
@@ -417,6 +482,7 @@ impl PreviewMaterials {
         chunk: &Chunk,
         origin: IVec3,
         blend: u8,
+        banners: &BTreeMap<[i32; 3], crate::world_banner::Appearance>,
     ) -> Result<ChunkMesh> {
         let Self {
             atlas,
@@ -431,6 +497,7 @@ impl PreviewMaterials {
         let mut opaque = Vec::new();
         let mut translucent = Vec::new();
         let mut chest_lids = Vec::new();
+        let mut banner_flags = Vec::new();
         let mut colors = TintCache::new(world, biome_colors, blend);
         let base_x = chunk
             .position
@@ -462,6 +529,89 @@ impl PreviewMaterials {
                     base_z.checked_add(local_z).context("block Z overflow")?,
                 );
                 let state = world.state(*id).context("invalid block state ID")?;
+                if let Some(appearance) = banners.get(&position.to_array())
+                    && let Some((body, flag)) = crate::banner_item::world_geometry(
+                        state,
+                        crate::banner_item::world_phase(position, 0, 0.0),
+                    )
+                {
+                    let body_id = ResourceId::parse("minecraft:entity/banner/banner_base")?;
+                    let flag_id = self
+                        .banner_sprites
+                        .get(appearance)
+                        .context("banner sprite missing")?;
+                    let light = u32::from(stored_light(world, position, false).unwrap_or(0))
+                        + 16 * u32::from(if lighting.has_skylight {
+                            stored_light(world, position, true).unwrap_or(15)
+                        } else {
+                            0
+                        });
+                    for (is_flag, quads, sprite) in [(false, body, &body_id), (true, flag, flag_id)]
+                    {
+                        let rect = atlas
+                            .rectangle(sprite)
+                            .context("banner sprite was not put in atlas")?;
+                        let start = opaque.len();
+                        let transparent =
+                            atlas.transparency(sprite) == Some(Transparency::Translucent);
+                        for quad in quads {
+                            let vertices = std::array::from_fn(|i| {
+                                let vertex = quad.vertices[[0, 1, 2, 0, 2, 3][i]];
+                                Vertex {
+                                    position: (relative_position(position, origin)
+                                        + Vec3::from_array(vertex.position))
+                                    .to_array(),
+                                    uv: [
+                                        (rect.x as f32 + vertex.uv[0] * rect.width as f32)
+                                            / atlas.texture.width as f32,
+                                        (rect.y as f32 + vertex.uv[1] * rect.height as f32)
+                                            / atlas.texture.height as f32,
+                                    ],
+                                    shade: 1.0,
+                                    tint: [1.0; 3],
+                                    light,
+                                }
+                            });
+                            if transparent {
+                                let center = vertices
+                                    .iter()
+                                    .fold(Vec3::ZERO, |sum, v| sum + Vec3::from_array(v.position))
+                                    / 6.0;
+                                translucent.push(TransparentQuad { center, vertices });
+                            } else {
+                                opaque.extend_from_slice(&vertices);
+                            }
+                            ensure!(
+                                opaque.len() + translucent.len() * 6 <= MAX_VERTICES_PER_CHUNK,
+                                "chunk exceeds the vertex rendering limit"
+                            );
+                        }
+                        if is_flag && !transparent {
+                            let orientation = crate::banner_item::world_orientation(state)
+                                .context("invalid banner orientation")?;
+                            let pivot_model = if state.name.ends_with("_wall_banner") {
+                                Vec3::new(0.0, -20.5, 10.5)
+                            } else {
+                                Vec3::new(0.0, -44.0, 0.0)
+                            };
+                            let pivot = relative_position(position, origin)
+                                + Vec3::new(0.5, 0.0, 0.5)
+                                + orientation
+                                    * (Vec3::new(2.0 / 3.0, -2.0 / 3.0, -2.0 / 3.0) * pivot_model
+                                        / 16.0);
+                            banner_flags.push(BannerFlagMesh {
+                                position,
+                                pivot,
+                                orientation,
+                                initial_angle: crate::banner_item::flag_angle(
+                                    crate::banner_item::world_phase(position, 0, 0.0),
+                                ),
+                                start,
+                                end: opaque.len(),
+                            });
+                        }
+                    }
+                }
                 if let Some(liquid) = liquid {
                     let cell = |pos: IVec3| {
                         let Some(id) = world.block_id(pos.x, pos.y, pos.z) else {
@@ -662,6 +812,7 @@ impl PreviewMaterials {
             opaque: opaque.into(),
             translucent: translucent.into(),
             chest_lids: chest_lids.into(),
+            banner_flags: banner_flags.into(),
         })
     }
 }
@@ -686,15 +837,22 @@ impl PreviewScene {
     ) -> Result<Self> {
         let mut states = BTreeSet::new();
         let mut biomes = BTreeSet::new();
+        let mut chunk_banners = BTreeMap::new();
+        let mut appearances = BTreeSet::new();
         for chunk in world.chunks.values() {
             let (chunk_states, chunk_biomes) = chunk_usage(chunk);
             states.extend(chunk_states);
             biomes.extend(chunk_biomes);
+            let banners = crate::world_banner::scan(world, chunk.position).unwrap_or_default();
+            appearances.extend(banners.values().cloned());
+            chunk_banners.insert(chunk.position, banners);
         }
-        let materials = PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes)?;
+        let materials =
+            PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes, &appearances)?;
         let mut chunks = BTreeMap::new();
         for (&position, chunk) in &world.chunks {
-            let mesh = materials.mesh_chunk(world, chunk, origin, blend)?;
+            let mesh =
+                materials.mesh_chunk(world, chunk, origin, blend, &chunk_banners[&position])?;
             chunks.insert(position, Arc::new(mesh));
         }
         Ok(Self {
@@ -759,12 +917,27 @@ struct MaterialsKey {
     max_atlas_side: u32,
     states: Vec<(BlockStateId, BlockState)>,
     biomes: Vec<(BiomeId, String)>,
+    banners: BTreeSet<crate::world_banner::Appearance>,
 }
 
 struct CachedUsage {
     chunk: Arc<Chunk>,
     states: BTreeSet<BlockStateId>,
     biomes: BTreeSet<BiomeId>,
+    entity_data: Option<native_world::loaded::SavedBlockEntities>,
+    banners: BTreeMap<[i32; 3], crate::world_banner::Appearance>,
+}
+
+fn same_entity_data(
+    a: Option<&native_world::loaded::SavedBlockEntities>,
+    b: Option<&native_world::loaded::SavedBlockEntities>,
+) -> bool {
+    use native_world::loaded::SavedBlockEntities::*;
+    match (a, b) {
+        (Some(Encoded(a)), Some(Encoded(b))) => Arc::ptr_eq(a, b),
+        (Some(Empty), Some(Empty)) | (Some(Unavailable), Some(Unavailable)) | (None, None) => true,
+        _ => false,
+    }
 }
 
 struct CachedChunkMesh {
@@ -901,18 +1074,30 @@ impl IncrementalPreview {
                 chunk.position == pos,
                 "chunk position does not match its key"
             );
-            if self
-                .usage
-                .get(&pos)
-                .is_none_or(|old| !Arc::ptr_eq(&old.chunk, chunk))
-            {
+            if self.usage.get(&pos).is_none_or(|old| {
+                !Arc::ptr_eq(&old.chunk, chunk)
+                    || !same_entity_data(
+                        old.entity_data.as_ref(),
+                        world.saved_block_entities.get(&pos),
+                    )
+            }) {
                 let (states, biomes) = chunk_usage(chunk);
+                let banners = crate::world_banner::scan(world, pos).unwrap_or_default();
+                if self
+                    .usage
+                    .get(&pos)
+                    .is_some_and(|old| old.banners != banners)
+                {
+                    self.chunks.remove(&pos);
+                }
                 self.usage.insert(
                     pos,
                     CachedUsage {
                         chunk: Arc::clone(chunk),
                         states,
                         biomes,
+                        entity_data: world.saved_block_entities.get(&pos).cloned(),
+                        banners,
                     },
                 );
             }
@@ -927,8 +1112,14 @@ impl IncrementalPreview {
             .values()
             .flat_map(|usage| usage.biomes.iter().copied())
             .collect();
+        let current_banners: BTreeSet<_> = self
+            .usage
+            .values()
+            .flat_map(|usage| usage.banners.values().cloned())
+            .collect();
         let mut states = current_states.clone();
         let mut biomes = current_biomes.clone();
+        let mut banners = current_banners.clone();
         if let Some((old, _)) = &self.materials
             && old.dimension == world.dimension
             && old.dimension_type == world.dimension_type
@@ -944,66 +1135,81 @@ impl IncrementalPreview {
         {
             states.extend(old.states.iter().map(|(id, _)| *id));
             biomes.extend(old.biomes.iter().map(|(id, _)| *id));
+            banners.extend(old.banners.iter().cloned());
             // Bound historical registry retention; the current world can still
             // contain more states or biomes than these cache thresholds.
             if states.len() > 8192 || biomes.len() > 1024 {
                 states = current_states.clone();
                 biomes = current_biomes.clone();
             }
+            if banners.len() > 512 {
+                banners = current_banners.clone();
+            }
         }
-        let make_key =
-            |states: &BTreeSet<BlockStateId>, biomes: &BTreeSet<BiomeId>| -> Result<MaterialsKey> {
-                Ok(MaterialsKey {
-                    dimension: world.dimension.clone(),
-                    dimension_type: world.dimension_type.clone(),
-                    max_atlas_side,
-                    states: states
-                        .iter()
-                        .map(|id| {
-                            Ok((
-                                *id,
-                                world.state(*id).context("invalid block state ID")?.clone(),
-                            ))
-                        })
-                        .collect::<Result<_>>()?,
-                    biomes: biomes
-                        .iter()
-                        .map(|id| {
-                            Ok((
-                                *id,
-                                world
-                                    .biome_by_id(*id)
-                                    .context("invalid biome ID")?
-                                    .to_owned(),
-                            ))
-                        })
-                        .collect::<Result<_>>()?,
-                })
-            };
-        let mut key = make_key(&states, &biomes)?;
+        let make_key = |states: &BTreeSet<BlockStateId>,
+                        biomes: &BTreeSet<BiomeId>,
+                        banners: &BTreeSet<crate::world_banner::Appearance>|
+         -> Result<MaterialsKey> {
+            Ok(MaterialsKey {
+                dimension: world.dimension.clone(),
+                dimension_type: world.dimension_type.clone(),
+                max_atlas_side,
+                banners: banners.clone(),
+                states: states
+                    .iter()
+                    .map(|id| {
+                        Ok((
+                            *id,
+                            world.state(*id).context("invalid block state ID")?.clone(),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+                biomes: biomes
+                    .iter()
+                    .map(|id| {
+                        Ok((
+                            *id,
+                            world
+                                .biome_by_id(*id)
+                                .context("invalid biome ID")?
+                                .to_owned(),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            })
+        };
+        let mut key = make_key(&states, &biomes, &banners)?;
         if self.materials.as_ref().is_none_or(|(old, _)| *old != key) {
-            let materials =
-                match PreviewMaterials::prepare(world, source, max_atlas_side, states, biomes) {
-                    Ok(materials) => materials,
-                    Err(error)
-                        if key.states.len() != current_states.len()
-                            || key.biomes.len() != current_biomes.len() =>
-                    {
-                        // Retained textures may no longer fit. Retry with only
-                        // resources used by the currently loaded chunks.
-                        let materials = PreviewMaterials::prepare(
-                            world,
-                            source,
-                            max_atlas_side,
-                            current_states.clone(),
-                            current_biomes.clone(),
-                        )
-                        .with_context(|| format!("material cache fallback after: {error:#}"))?;
-                        key = make_key(&current_states, &current_biomes)?;
-                        materials
-                    }
-                    Err(error) => return Err(error),
-                };
+            let materials = match PreviewMaterials::prepare(
+                world,
+                source,
+                max_atlas_side,
+                states,
+                biomes,
+                &banners,
+            ) {
+                Ok(materials) => materials,
+                Err(error)
+                    if key.states.len() != current_states.len()
+                        || key.biomes.len() != current_biomes.len()
+                        || key.banners.len() != current_banners.len() =>
+                {
+                    // Retained textures may no longer fit. Retry with only
+                    // resources used by the currently loaded chunks.
+                    let materials = PreviewMaterials::prepare(
+                        world,
+                        source,
+                        max_atlas_side,
+                        current_states.clone(),
+                        current_biomes.clone(),
+                        &current_banners,
+                    )
+                    .with_context(|| format!("material cache fallback after: {error:#}"))?;
+                    key = make_key(&current_states, &current_biomes, &current_banners)?;
+                    materials
+                }
+                Err(error) => return Err(error),
+            };
             self.materials = Some((key, materials));
             self.chunks.clear();
             self.generation = self.generation.wrapping_add(1);
@@ -1041,7 +1247,8 @@ impl IncrementalPreview {
                 .get(&pos)
                 .is_none_or(|old| !same_neighborhood(&old.neighbors, &neighbors))
             {
-                let mut mesh = materials.mesh_chunk(world, chunk, origin, blend)?;
+                let mut mesh =
+                    materials.mesh_chunk(world, chunk, origin, blend, &self.usage[&pos].banners)?;
                 if let Some(previous) = self.chunks.get(&pos) {
                     mesh.reuse_unchanged_layers(&previous.mesh);
                 }
@@ -1541,6 +1748,137 @@ mod tests {
 
     #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn saved_banner_mesh_uses_patterns_and_invalidates_when_entity_changes() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let standing = world.intern_state(BlockState {
+            name: "minecraft:red_banner".into(),
+            properties: BTreeMap::from([("rotation".into(), "3".into())]),
+        });
+        let wall = world.intern_state(BlockState {
+            name: "minecraft:blue_wall_banner".into(),
+            properties: BTreeMap::from([("facing".into(), "north".into())]),
+        });
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[3 + 2 * 16 + 2 * 256] = standing;
+        blocks[6 + 2 * 16 + 2 * 256] = wall;
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                block_light_correct: false,
+                status: Some("minecraft:full".into()),
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let payload = |pattern: &str| {
+            let entity = |x: i32, color: &str| {
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:banner".into())),
+                    ("x".into(), Tag::Int(x)),
+                    ("y".into(), Tag::Int(2)),
+                    ("z".into(), Tag::Int(2)),
+                    (
+                        "patterns".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![Tag::Compound(vec![
+                                ("pattern".into(), Tag::String(pattern.into())),
+                                ("color".into(), Tag::String(color.into())),
+                            ])],
+                        },
+                    ),
+                ])
+            };
+            SavedBlockEntities::Encoded(
+                nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![entity(3, "blue"), entity(6, "red")],
+                    },
+                })
+                .unwrap()
+                .into(),
+            )
+        };
+        world
+            .saved_block_entities
+            .insert(pos, payload("minecraft:cross"));
+        let mut incremental = IncrementalPreview::default();
+        let first = incremental
+            .prepare(&world, &mut resources, IVec3::ZERO, 1024)
+            .unwrap();
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        assert_eq!(first.opaque_len() + first.translucent_len() * 6, 30 * 6);
+        let mesh = &first.chunks[&pos];
+        assert_eq!(mesh.banner_flags.len(), 2);
+        for flag in mesh.banner_flags.iter() {
+            let state = world
+                .block(flag.position.x, flag.position.y, flag.position.z)
+                .unwrap();
+            let phase = crate::banner_item::world_phase(flag.position, 47, 0.25);
+            let (_, expected) = crate::banner_item::world_geometry(state, phase).unwrap();
+            let actual = flag.animated_vertices(&mesh.opaque, 47, 0.25);
+            assert_eq!(actual.len(), 36);
+            for (actual, expected) in actual.iter().zip(
+                expected
+                    .iter()
+                    .flat_map(|quad| [0, 1, 2, 0, 2, 3].map(|i| quad.vertices[i])),
+            ) {
+                let want = flag.position.as_vec3() + Vec3::from_array(expected.position);
+                assert!((Vec3::from_array(actual.position) - want).length() < 0.00001);
+            }
+        }
+        let repeated = incremental
+            .prepare(&world, &mut resources, IVec3::ZERO, 1024)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.chunks[&pos], &repeated.chunks[&pos]));
+        assert_eq!(first.material_generation, repeated.material_generation);
+        world
+            .saved_block_entities
+            .insert(pos, payload("minecraft:cross"));
+        let unchanged = incremental
+            .prepare(&world, &mut resources, IVec3::ZERO, 1024)
+            .unwrap();
+        assert!(Arc::ptr_eq(&repeated.chunks[&pos], &unchanged.chunks[&pos]));
+        assert_eq!(repeated.material_generation, unchanged.material_generation);
+        world
+            .saved_block_entities
+            .insert(pos, payload("minecraft:stripe_bottom"));
+        let changed = incremental
+            .prepare(&world, &mut resources, IVec3::ZERO, 1024)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first.chunks[&pos], &changed.chunks[&pos]));
+        assert_ne!(first.material_generation, changed.material_generation);
+        assert_ne!(first.atlas.texture.rgba, changed.atlas.texture.rgba);
+        let full = PreviewScene::prepare(&world, &mut resources, IVec3::ZERO, 1024).unwrap();
+        assert_eq!(
+            changed.opaque_len() + changed.translucent_len() * 6,
+            full.opaque_len() + full.translucent_len() * 6
+        );
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn chest_mesh_uses_vanilla_entity_textures() {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
@@ -2006,6 +2344,7 @@ mod tests {
             opaque: vec![vertex; 10_000].into(),
             translucent: Arc::from([]),
             chest_lids: Arc::from([]),
+            banner_flags: Arc::from([]),
         });
         for cached in cache.chunks.values_mut() {
             cached.mesh = Arc::clone(&mesh);

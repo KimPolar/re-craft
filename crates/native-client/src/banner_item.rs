@@ -10,13 +10,13 @@ use native_resources::{
 };
 use serde_json::Value;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Pattern {
     Registry(String),
     Direct(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Layer {
     pub pattern: Pattern,
     pub color: u32,
@@ -329,11 +329,211 @@ pub fn geometry(transformation: Option<&Value>) -> Result<(Vec<Quad>, Vec<Quad>)
     Ok((body, flag))
 }
 
+/// Java's block entity renderer uses a different model for wall banners and
+/// computes the cloth angle from the block position and world time.
+pub fn world_geometry(
+    state: &native_world::loaded::BlockState,
+    phase: f32,
+) -> Option<(Vec<Quad>, Vec<Quad>)> {
+    native_world::collision::banner_item_id(state)?;
+    if !phase.is_finite() {
+        return None;
+    }
+    let wall = state.name.ends_with("_wall_banner");
+    let orientation = world_orientation(state)?;
+    let transform = Transform {
+        translation: Vec3::new(0.5, 0.0, 0.5),
+        left: orientation,
+        scale: Vec3::new(2.0 / 3.0, -2.0 / 3.0, -2.0 / 3.0),
+        right: Quat::IDENTITY,
+    };
+    let (bar_y, bar_z, pivot_z) = if wall {
+        (-20.5, 9.5, 10.5)
+    } else {
+        (-44.0, -1.0, 0.0)
+    };
+    let mut body = cube(
+        Vec3::new(-10., bar_y, bar_z),
+        Vec3::new(20., 2., 2.),
+        [0., 42.],
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        &transform,
+    );
+    if !wall {
+        body.extend(cube(
+            Vec3::new(-1., -42., -1.),
+            Vec3::new(2., 42., 2.),
+            [44., 0.],
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &transform,
+        ));
+    }
+    let flag = cube(
+        Vec3::new(-10., 0., -2.),
+        Vec3::new(20., 40., 1.),
+        [0., 0.],
+        Vec3::new(0., bar_y, pivot_z),
+        Quat::from_rotation_x(flag_angle(phase)),
+        &transform,
+    );
+    Some((body, flag))
+}
+
+pub fn world_orientation(state: &native_world::loaded::BlockState) -> Option<Quat> {
+    native_world::collision::banner_item_id(state)?;
+    let degrees = if state.name.ends_with("_wall_banner") {
+        match state.properties.get("facing")?.as_str() {
+            "south" => 0.0,
+            "west" => 90.0,
+            "north" => 180.0,
+            "east" => 270.0,
+            _ => return None,
+        }
+    } else {
+        state.properties.get("rotation")?.parse::<f32>().ok()? * 22.5
+    };
+    Some(Quat::from_rotation_y(
+        -degrees * std::f32::consts::PI / 180.0,
+    ))
+}
+
+pub fn flag_angle(phase: f32) -> f32 {
+    // Mth.cos indexes a 65536-entry sine table rather than calling cos directly.
+    let radians = std::f32::consts::TAU * phase;
+    let index = ((f64::from(radians) * 10430.378350470453 + 16384.0) as i64) & 65535;
+    let cosine = ((index as f64) * std::f64::consts::TAU / 65536.0).sin() as f32;
+    (-0.0125 + 0.01 * cosine) * std::f32::consts::PI
+}
+
+pub fn world_phase(position: glam::IVec3, game_time: i64, partial_tick: f32) -> f32 {
+    let offset = position
+        .x
+        .wrapping_mul(7)
+        .wrapping_add(position.y.wrapping_mul(9))
+        .wrapping_add(position.z.wrapping_mul(13));
+    ((i64::from(offset).wrapping_add(game_time)).rem_euclid(100) as f32 + partial_tick) / 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(target_os = "windows")]
     use std::{path::PathBuf, process::Command};
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn world_geometry_matches_java_for_rotations_and_animation() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let base = temp.path().join("BannerGeometryOracle.java");
+        let source = temp.path().join("WorldBannerGeometryOracle.java");
+        let output = temp.path().join("world-banners.json");
+        std::fs::write(
+            &base,
+            include_str!("../tests/java/BannerGeometryOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WorldBannerGeometryOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&base)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("WorldBannerGeometryOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 100);
+        for row in rows.as_array().unwrap() {
+            let index = row["index"].as_u64().unwrap() as usize;
+            let state = native_world::loaded::BlockState {
+                name: if index < 16 {
+                    "minecraft:white_banner"
+                } else {
+                    "minecraft:white_wall_banner"
+                }
+                .into(),
+                properties: if index < 16 {
+                    [("rotation".into(), index.to_string())].into()
+                } else {
+                    [(
+                        "facing".into(),
+                        ["south", "west", "north", "east"][index - 16].into(),
+                    )]
+                    .into()
+                },
+            };
+            let (body, flag) =
+                world_geometry(&state, row["phase"].as_f64().unwrap() as f32).unwrap();
+            for (name, quads) in [("body", body), ("flag", flag)] {
+                let expected = row[name].as_array().unwrap();
+                assert_eq!(expected.len(), quads.len() * 4, "{row}");
+                for (quad, expected) in quads.iter().zip(expected.chunks_exact(4)) {
+                    for (vertex, want) in quad.vertices.iter().zip(expected) {
+                        for (actual, want) in vertex
+                            .position
+                            .iter()
+                            .zip(want["position"].as_array().unwrap())
+                        {
+                            assert!(
+                                (f64::from(*actual) - want.as_f64().unwrap()).abs() < 0.000002,
+                                "{row}"
+                            );
+                        }
+                        for (actual, want) in vertex.uv.iter().zip(want["uv"].as_array().unwrap()) {
+                            assert!(
+                                (f64::from(*actual) - want.as_f64().unwrap()).abs() < 0.000002,
+                                "{row}"
+                            );
+                        }
+                        for (actual, want) in
+                            quad.normal.iter().zip(want["normal"].as_array().unwrap())
+                        {
+                            assert!(
+                                (f64::from(*actual) - want.as_f64().unwrap()).abs() < 0.000002,
+                                "{row}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn pattern_resolution_and_overlay_preserve_order_and_alpha() {

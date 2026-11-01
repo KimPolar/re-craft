@@ -66,10 +66,19 @@ pub struct AquiferSurfaceArea {
 
 impl AquiferSurfaceArea {
     pub fn for_chunk(chunk_x: i32, chunk_z: i32) -> Option<Self> {
-        fn axis(chunk: i32) -> Option<(i32, u32)> {
-            let origin = chunk.checked_mul(16)?;
-            let min_grid = origin.checked_sub(5)?.div_euclid(16);
-            let max_grid = origin.checked_add(10)?.div_euclid(16).checked_add(1)?;
+        let x = chunk_x.checked_mul(16)?;
+        let z = chunk_z.checked_mul(16)?;
+        Self::for_block_rectangle([x, z], [x.checked_add(15)?, z.checked_add(15)?])
+    }
+
+    /// Surface sampling rectangle used by an arbitrary unit-step density volume.
+    pub fn for_block_rectangle(min_block: [i32; 2], max_block: [i32; 2]) -> Option<Self> {
+        fn axis(first: i32, last: i32) -> Option<(i32, u32)> {
+            if first > last {
+                return None;
+            }
+            let min_grid = first.checked_sub(5)?.div_euclid(16);
+            let max_grid = last.checked_sub(5)?.div_euclid(16).checked_add(1)?;
             let min = min_grid.checked_mul(16)?;
             let max = max_grid.checked_mul(16)?.checked_add(9)? & !3;
             Some((
@@ -77,8 +86,8 @@ impl AquiferSurfaceArea {
                 u32::try_from((i64::from(max) - i64::from(min)) / 4 + 1).ok()?,
             ))
         }
-        let (min_x, size_x) = axis(chunk_x)?;
-        let (min_z, size_z) = axis(chunk_z)?;
+        let (min_x, size_x) = axis(min_block[0], max_block[0])?;
+        let (min_z, size_z) = axis(min_block[1], max_block[1])?;
         Some(Self {
             min_x,
             min_z,
@@ -730,5 +739,11 @@ mod tests {
             super::AquiferGenerator::<Block>::from_surface_volume(0, false, area, &values[..120])
                 .is_err()
         );
+        let column = super::AquiferSurfaceArea::for_block_rectangle([0, -1], [0, -1]).unwrap();
+        assert_eq!(
+            (column.min_x, column.min_z, column.size_x, column.size_z),
+            (-16, -16, 7, 7)
+        );
+        assert!(super::AquiferSurfaceArea::for_block_rectangle([1, 0], [0, 0]).is_none());
     }
 }

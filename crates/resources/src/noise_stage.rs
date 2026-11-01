@@ -24,6 +24,38 @@ pub enum NoiseMaterial {
     Air,
 }
 
+/// Base-noise column, ordered bottom to top before surface rules and carvers.
+pub struct BaseNoiseColumn {
+    min_y: i32,
+    materials: Vec<NoiseMaterial>,
+}
+impl BaseNoiseColumn {
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+    pub fn materials(&self) -> &[NoiseMaterial] {
+        &self.materials
+    }
+    /// Java's first occupied height; `dimension_min_y` is the fallback when no state matches.
+    pub fn first_occupied_height(
+        &self,
+        dimension_min_y: i32,
+        mut accepts: impl FnMut(NoiseMaterial) -> Result<bool>,
+    ) -> Result<i32> {
+        for (index, &state) in self.materials.iter().enumerate().rev() {
+            if accepts(state)? {
+                return self
+                    .min_y
+                    .checked_add(i32::try_from(index)?)
+                    .context("column height overflow");
+            }
+        }
+        dimension_min_y
+            .checked_sub(1)
+            .context("dimension minimum overflow")
+    }
+}
+
 /// Selects vanilla's global fluid status when no local aquifer is configured.
 pub fn select_without_aquifer(density: f32, y: i32, sea_level: i32) -> NoiseMaterial {
     if density > 0.0 {
@@ -310,6 +342,9 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 }
 
 impl NoiseStageGenerator {
+    pub fn default_block(&self) -> &Value {
+        &self.default_block
+    }
     pub fn default_fluid(&self) -> &Value {
         &self.default_fluid
     }
@@ -362,6 +397,88 @@ impl NoiseStageGenerator {
 
     pub fn random_algorithm(&self) -> WorldgenRandom {
         self.router.random
+    }
+
+    /// Sample the same 1×height×1 volume used by Java's base-column queries.
+    /// It deliberately excludes structure and old-chunk terrain adjustments.
+    pub fn base_column(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        x: i32,
+        z: i32,
+    ) -> Result<BaseNoiseColumn> {
+        let previous = evaluator.replace_structure_terrain_context(None);
+        let result = self.base_column_unadjusted(evaluator, x, z);
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
+
+    fn base_column_unadjusted(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        x: i32,
+        z: i32,
+    ) -> Result<BaseNoiseColumn> {
+        let min_y = self.router.min_y;
+        let height = self.router.height;
+        if height == 0 {
+            return Ok(BaseNoiseColumn {
+                min_y,
+                materials: Vec::new(),
+            });
+        }
+        let density = self.router.sample_block_volume(
+            evaluator,
+            RouterField::FinalDensity,
+            [x, min_y, z],
+            [1, height as u32, 1],
+        )?;
+        let mut materials = vec![NoiseMaterial::Air; height as usize];
+        if let Some(functions) = &self.aquifer {
+            let area = AquiferSurfaceArea::for_block_rectangle([x, z], [x, z])
+                .context("column aquifer surface coordinates overflow")?;
+            let surface = evaluator.sample_quart_surface(
+                &functions.surface,
+                area.min_x,
+                area.min_z,
+                area.size_x,
+                area.size_z,
+            )?;
+            let mut aquifer = AquiferGenerator::from_surface_volume(
+                self.seed,
+                self.router.random == WorldgenRandom::Legacy,
+                area,
+                &surface,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let mut sampler = NoiseAquiferSampler {
+                functions,
+                evaluator,
+                sea: self.sea_level,
+                fluid: self.default_aquifer_fluid,
+            };
+            for index in (0..height as usize).rev() {
+                let y = min_y + index as i32;
+                let sample = aquifer.sample(&mut sampler, x, y, z, f64::from(density[index]));
+                materials[index] = match sample.block {
+                    None => NoiseMaterial::DefaultBlock,
+                    Some(AquiferMaterial::Air) => NoiseMaterial::Air,
+                    Some(AquiferMaterial::Lava) => NoiseMaterial::Lava,
+                    Some(
+                        AquiferMaterial::DefaultWater
+                        | AquiferMaterial::DefaultLava
+                        | AquiferMaterial::DefaultAir
+                        | AquiferMaterial::DefaultOther,
+                    ) => NoiseMaterial::DefaultFluid,
+                };
+            }
+        } else {
+            for index in (0..height as usize).rev() {
+                materials[index] =
+                    select_without_aquifer(density[index], min_y + index as i32, self.sea_level);
+            }
+        }
+        Ok(BaseNoiseColumn { min_y, materials })
     }
 
     /// Preliminary surface values in Z, X order, for the material pass.
@@ -718,6 +835,57 @@ mod tests {
             &previous,
             &evaluator.replace_structure_terrain_context(None).unwrap()
         ));
+    }
+
+    #[test]
+    fn base_column_ignores_structure_and_preserves_context() {
+        let mut data = Data;
+        let mut settings = definition();
+        settings["noise_router"]["final_density"] =
+            json!({"type":"add","left":-0.25,"right":{"type":"beardifier"}});
+        let generator = NoiseStageGenerator::from_json_with_structure_context(
+            &mut data,
+            &serde_json::to_vec(&settings).unwrap(),
+            0,
+        )
+        .unwrap();
+        let bounds = BoundingBox::new([0, 5, 0], [2, 7, 2]).unwrap();
+        let structure = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([-24, -19, -24], [26, 31, 26]).unwrap()),
+        ));
+        let mut evaluator = DensityEvaluator::default();
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&structure)));
+        let column = generator.base_column(&mut evaluator, 1, 1).unwrap();
+        assert_eq!(column.materials()[5], NoiseMaterial::DefaultFluid);
+        assert_eq!(
+            column
+                .first_occupied_height(0, |m| Ok(m != NoiseMaterial::Air))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            column
+                .first_occupied_height(0, |m| Ok(m == NoiseMaterial::DefaultBlock))
+                .unwrap(),
+            -1
+        );
+        assert!(Arc::ptr_eq(
+            &structure,
+            evaluator.structure_terrain_context().unwrap()
+        ));
+        assert_eq!(
+            generator
+                .generate(&mut evaluator, 0, 0)
+                .unwrap()
+                .get(1, 5, 1),
+            Some(NoiseMaterial::DefaultBlock)
+        );
     }
     #[test]
     fn global_fluid_edges_and_aquifer_config_validation() {

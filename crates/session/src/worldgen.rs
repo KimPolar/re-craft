@@ -17,6 +17,9 @@ use native_resources::{
 use native_world::biome_zoom::{obfuscate_seed, quart_position};
 use serde_json::Value;
 
+mod carving;
+pub use carving::CarverBlockState;
+
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
     chunk: [i32; 2],
@@ -390,6 +393,76 @@ impl TerrainGenerator {
                 .clone())
         })
     }
+
+    /// Produce fresh terrain after surface rules and carvers. This is still an
+    /// intermediate chunk: structures, features and lighting remain. Block
+    /// classification must be stable for the active registry and pack stack.
+    pub fn generate_carved_surface<P: ResourceProvider>(
+        &mut self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut CarverCache,
+        chunk: [i32; 2],
+        neighborhood: &BiomeNeighborhood,
+        tags: &native_resources::carver::tags::CarverBlockTags,
+        mut classify: impl FnMut(&Value) -> Result<CarverBlockState>,
+    ) -> Result<SurfaceStageChunk> {
+        let mut result =
+            self.generate_surface(provider, evaluator, chunk, neighborhood, |state| {
+                let facts = classify(state)?;
+                Ok(if facts.is_air {
+                    SurfaceBlockKind::Air
+                } else if facts.has_fluid {
+                    SurfaceBlockKind::Fluid
+                } else {
+                    SurfaceBlockKind::Solid
+                })
+            })?;
+        let mask = self.generate_carving_mask(provider, evaluator, cache, chunk)?;
+        self.apply_carving_to_surface(
+            provider,
+            evaluator,
+            &mut result,
+            &mask,
+            tags,
+            &mut classify,
+        )?;
+        Ok(result)
+    }
+
+    /// Apply a mask to a fresh surface-stage chunk from this generator. On
+    /// error the partially modified chunk must be discarded.
+    pub fn apply_carving_to_surface<P: ResourceProvider>(
+        &mut self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        chunk: &mut SurfaceStageChunk,
+        mask: &CarvingMask,
+        tags: &native_resources::carver::tags::CarverBlockTags,
+        mut classify: impl FnMut(&Value) -> Result<CarverBlockState>,
+    ) -> Result<()> {
+        ensure!(
+            chunk.min_y == self.min_y && chunk.height == self.height,
+            "surface chunk height does not match generator"
+        );
+        if !mask.is_empty() {
+            let aquifer = self
+                .noise
+                .carving_aquifer(evaluator, chunk.chunk_position)?;
+            let mut inputs = carving::FreshCarvingInputs::new(
+                provider,
+                tags,
+                aquifer,
+                &self.noise,
+                &self.surface,
+                &mut self.source,
+                self.seed,
+                &mut classify,
+            );
+            native_resources::carver::apply::apply_mask(chunk, mask, &mut inputs)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -546,5 +619,95 @@ mod tests {
             .unwrap();
         assert!(mask.is_empty());
         assert_eq!((mask.min_y(), mask.max_y()), (1, 8));
+    }
+
+    #[test]
+    fn fresh_terrain_connects_biome_carvers_aquifer_and_block_tag() {
+        use native_resources::carver::tags::CarverBlockTags;
+        use std::collections::BTreeSet;
+        struct CarvingData;
+        impl ResourceProvider for CarvingData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/worldgen/biome/plains.json" {
+                    Some(br#"{"has_precipitation":true,"temperature":0.8,"carvers":["minecraft:test"]}"#.to_vec())
+                } else if path == "data/minecraft/worldgen/carver/test.json" {
+                    Some(br#"{"type":"minecraft:cave","probability":1,"y":{"absolute":4},"count":1,"thickness":2,"room_vertical_radius_multiplier":1,"horizontal_radius_multiplier":1,"vertical_radius_multiplier":1,"floor_level":-1}"#.to_vec())
+                } else if path == "data/minecraft/tags/block/uncarvable.json" {
+                    Some(br#"{"values":["minecraft:bedrock"]}"#.to_vec())
+                } else if path.starts_with("data/minecraft/worldgen/noise/") {
+                    Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            }
+        }
+        let mut data = CarvingData;
+        let registry: BTreeSet<_> = ["air", "bedrock", "stone", "dirt", "water", "lava"]
+            .into_iter()
+            .map(|v| format!("minecraft:{v}"))
+            .collect();
+        let tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut neighborhood = generator.biome_neighborhood().unwrap();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                neighborhood
+                    .insert(Arc::new(
+                        generator.generate_biomes([x, z], &mut evaluator).unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let mut cache = CarverCache::default();
+        let expected = generator
+            .generate_carving_mask(&mut data, &mut evaluator, &mut cache, [0, 0])
+            .unwrap();
+        assert!(!expected.is_empty());
+        let generated = generator
+            .generate_carved_surface(
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                [0, 0],
+                &neighborhood,
+                &tags,
+                |state| {
+                    let id = state.as_str().unwrap_or("");
+                    Ok(CarverBlockState {
+                        is_air: id == "minecraft:air",
+                        has_fluid: id == "minecraft:water" || id == "minecraft:lava",
+                    })
+                },
+            )
+            .unwrap();
+        for x in 0..16u8 {
+            for z in 0..16u8 {
+                for y in 0..16i32 {
+                    let index = (usize::from(z) * 16 + usize::from(x)) * 16 + y as usize;
+                    let block = generated.states[index].as_str().unwrap();
+                    let wanted = if expected.contains(x, y, z) {
+                        if y < 8 {
+                            "minecraft:water"
+                        } else {
+                            "minecraft:air"
+                        }
+                    } else {
+                        "minecraft:dirt"
+                    };
+                    assert_eq!(block, wanted, "({x},{y},{z})");
+                    assert!(!generated.fluid_updates[index]);
+                }
+            }
+        }
     }
 }

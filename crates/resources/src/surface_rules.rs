@@ -546,6 +546,23 @@ impl<'a, P: ResourceProvider> SurfaceDensitySampler<'a, P> {
             Ok(self.evaluator.sample(&entry.function, x, y, z))
         }
     }
+
+    /// Reuse compiled functions while moving a one-block rule context. Each
+    /// move invalidates volume samples, which depend on the volume origin.
+    pub fn set_single_position(&mut self, position: [i32; 3]) -> Result<()> {
+        ensure!(
+            self.size == [1, 1, 1],
+            "surface density context is not a single block"
+        );
+        if self.min != position {
+            self.min = position;
+            self.max = position;
+            for entry in self.entries.values_mut() {
+                entry.volume = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -859,13 +876,36 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         min: [i32; 3],
         size: [u32; 3],
     ) -> Result<Self> {
+        Self::build(provider, rule, seed, algorithm, min, size, true)
+    }
+    /// Build the single-block context used to repair surface material after
+    /// carving. Biome pillar and iceberg extensions do not run in this pass.
+    pub fn for_carver_top_material(
+        provider: &'a mut P,
+        rule: &SurfaceRule,
+        seed: i64,
+        algorithm: WorldgenRandom,
+    ) -> Result<Self> {
+        Self::build(provider, rule, seed, algorithm, [0, 0, 0], [1, 1, 1], false)
+    }
+    fn build(
+        provider: &'a mut P,
+        rule: &SurfaceRule,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+        extensions: bool,
+    ) -> Result<Self> {
         let biomes =
             crate::surface_biomes::SurfaceBiomes::load(provider, &rule.biome_dependencies())?;
         let badlands = BadlandsPillars::default();
         let icebergs = FrozenOceanIcebergs::default();
         let mut noises = rule.noise_dependencies();
-        noises.extend(badlands.noise_dependencies());
-        noises.extend(icebergs.noise_dependencies());
+        if extensions {
+            noises.extend(badlands.noise_dependencies());
+            noises.extend(icebergs.noise_dependencies());
+        }
         let noise = SurfaceNoise::load(provider, seed, algorithm, noises)?;
         let random = SurfaceRandomFactory::new(seed, algorithm);
         let bands = SurfaceBands::new(seed, algorithm);
@@ -891,6 +931,9 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         );
         self.biome = Some(biome);
         Ok(())
+    }
+    pub fn set_single_position(&mut self, position: [i32; 3]) -> Result<()> {
+        self.density.set_single_position(position)
     }
     pub fn surface_depth(&mut self, x: i32, z: i32) -> Result<i32> {
         self.noise.surface_depth(x, z)
@@ -1359,6 +1402,21 @@ mod tests {
             outside.to_bits(),
             sampler.sample(&def, false, 20, 5, 20).unwrap().to_bits()
         );
+        assert!(sampler.set_single_position([0, 0, 0]).is_err());
+        drop(sampler);
+        let mut single = SurfaceDensitySampler::without_terrain_adjustments(
+            &mut data,
+            0,
+            WorldgenRandom::Legacy,
+            [0, 0, 0],
+            [1, 1, 1],
+        )
+        .unwrap();
+        let first = single.sample(&def, true, 0, 0, 0).unwrap();
+        single.set_single_position([0, 8, 0]).unwrap();
+        let second = single.sample(&def, true, 0, 8, 0).unwrap();
+        assert_ne!(first.to_bits(), second.to_bits());
+        assert_eq!(single.entries.len(), 1);
     }
 
     #[test]

@@ -296,6 +296,9 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 }
 
 impl NoiseStageGenerator {
+    pub fn default_fluid(&self) -> &Value {
+        &self.default_fluid
+    }
     pub fn carving_aquifer<'a>(
         &'a self,
         evaluator: &'a mut DensityEvaluator,

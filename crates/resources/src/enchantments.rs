@@ -9,6 +9,7 @@ use crate::packs::{ResourceId, ResourceProvider};
 use crate::recipes::{TagEntry, parse_tag, resolve_tag};
 
 pub mod location;
+pub mod tick;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttributeOperation {
@@ -994,6 +995,7 @@ fn damage_type_info(bytes: &[u8]) -> Result<DamageTypeInfo> {
 pub struct OxygenEnchantments {
     definitions: BTreeMap<ResourceId, std::result::Result<Definition, String>>,
     location: BTreeMap<ResourceId, std::result::Result<location::LocationEnchantment, String>>,
+    tick: BTreeMap<ResourceId, std::result::Result<tick::TickEnchantment, String>>,
     protection: BTreeMap<ResourceId, std::result::Result<Vec<ProtectionEffect>, String>>,
     damage_immunity: BTreeMap<ResourceId, std::result::Result<Vec<DamagePredicate>, String>>,
     repair: BTreeMap<ResourceId, std::result::Result<Option<Vec<RepairValueEffect>>, String>>,
@@ -1010,6 +1012,7 @@ impl OxygenEnchantments {
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut definitions = BTreeMap::new();
         let mut location = BTreeMap::new();
+        let mut tick = BTreeMap::new();
         let mut protection = BTreeMap::new();
         let mut damage_immunity = BTreeMap::new();
         let mut repair = BTreeMap::new();
@@ -1031,6 +1034,11 @@ impl OxygenEnchantments {
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
                 .and_then(|value| location::LocationEnchantment::load(provider, value))
+                .map_err(|error| format!("{error:#}"));
+            let tick_effect = value
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                .and_then(|value| tick::TickEnchantment::load(provider, value))
                 .map_err(|error| format!("{error:#}"));
             let protection_effect = value
                 .as_ref()
@@ -1073,6 +1081,7 @@ impl OxygenEnchantments {
             item_damage.insert(id.clone(), damage_effect);
             block_experience.insert(id.clone(), experience_effect);
             location.insert(id.clone(), location_effect);
+            tick.insert(id.clone(), tick_effect);
             definitions.insert(id, parsed);
         }
         let damage_types: BTreeSet<_> = provider.list_data("damage_type")?.into_iter().collect();
@@ -1138,6 +1147,7 @@ impl OxygenEnchantments {
         Ok(Self {
             definitions,
             location,
+            tick,
             protection,
             damage_immunity,
             repair,
@@ -1167,6 +1177,14 @@ impl OxygenEnchantments {
             .context("enchantment is absent from the active registry")?
             .as_ref()
             .map_err(|error| anyhow::anyhow!("unsupported location enchantment: {error}"))
+    }
+
+    pub fn tick_effects(&self, id: &ResourceId) -> Result<&tick::TickEnchantment> {
+        self.tick
+            .get(id)
+            .context("enchantment is absent from the active registry")?
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("unsupported enchantment tick effect: {error}"))
     }
 
     /// Apply the active definition's attribute effects for one equipment slot.

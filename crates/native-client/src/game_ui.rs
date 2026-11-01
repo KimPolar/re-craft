@@ -179,6 +179,11 @@ pub struct GameUi {
     bubble_sprite_result:
         std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     bubble_load_failed: bool,
+    soul_particles: crate::soul_particles::SoulSystem,
+    soul_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    soul_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
+    soul_load_failed: bool,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
     hud_hidden: bool,
@@ -227,6 +232,7 @@ impl GameUi {
         let skin = Arc::clone(&assets.player_skin);
         let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (bubble_sender, bubble_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (soul_sender, soul_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (plant_sender, plant_sprite_result) = std::sync::mpsc::sync_channel(1);
         let smoke_loader = Arc::clone(&assets.item_models);
         let plant_loader = Arc::clone(&assets.item_models);
@@ -257,12 +263,19 @@ impl GameUi {
                             .load_bubble_sprites()
                             .map_err(|error| format!("{error:#}")),
                     );
+                    let _ = soul_sender.send(
+                        loader
+                            .load_soul_sprites()
+                            .map_err(|error| format!("{error:#}")),
+                    );
                 }
                 Err(_) => {
                     let _ = smoke_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
                     let _ = bubble_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
+                    let _ =
+                        soul_sender.send(Err("particle resource loader is unavailable".to_owned()));
                 }
             });
         let mut held_models = ItemModelCache::new(Arc::clone(&assets.item_models));
@@ -291,6 +304,10 @@ impl GameUi {
             bubble_sprites: None,
             bubble_sprite_result,
             bubble_load_failed: false,
+            soul_particles: crate::soul_particles::SoulSystem::default(),
+            soul_sprites: None,
+            soul_sprite_result,
+            soul_load_failed: false,
             armor_models,
             paused: false,
             hud_hidden: false,
@@ -400,6 +417,28 @@ impl GameUi {
     ) -> Vec<native_session::ConsumeSound> {
         self.smoke_particles
             .update(snapshot.tick, &snapshot.world, bursts, fizz)
+    }
+
+    pub fn update_soul_particles(
+        &mut self,
+        snapshot: &native_session::WorldSnapshot,
+        spawns: Vec<native_session::loaded::SoulParticleSpawn>,
+    ) {
+        self.soul_particles.enqueue(spawns);
+        if self.soul_sprites.is_none() && !self.soul_load_failed {
+            match self.soul_sprite_result.try_recv() {
+                Ok(Ok(sprites)) => self.soul_sprites = Some(sprites),
+                Ok(Err(error)) => {
+                    eprintln!("Cannot load soul sprites: {error}");
+                    self.soul_load_failed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.soul_load_failed = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.soul_sprites.is_some() || self.soul_load_failed {
+            self.soul_particles.update(snapshot.tick, &snapshot.world);
+        }
     }
 
     pub fn set_trim_registry(&mut self, trims: Arc<crate::equipment_visual::TrimRegistry>) {
@@ -2188,6 +2227,36 @@ impl GameUi {
                     uv,
                     color: [1.0; 3],
                     opaque: true,
+                    texture: Arc::clone(texture),
+                    light,
+                });
+            }
+        }
+        if let Some(sprites) = &mut self.soul_sprites {
+            if self.soul_particles.particles().next().is_some() {
+                sprites.advance(snapshot.tick);
+            }
+            for particle in self.soul_particles.particles() {
+                let Some((texture, uv)) = sprites.get(particle.frame(sprites.len())) else {
+                    continue;
+                };
+                let light = match &snapshot.world {
+                    native_session::SessionWorld::Demo(_) => u32::MAX,
+                    native_session::SessionWorld::Loaded(world) => {
+                        let cell = particle.position.floor().as_ivec3();
+                        u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                            + 16 * u32::from(
+                                world.light(cell.x, cell.y, cell.z, true).unwrap_or(15),
+                            )
+                    }
+                };
+                particle_draws.push(crate::consume_particle_render::RenderParticle {
+                    previous: particle.previous,
+                    position: particle.position,
+                    size: particle.size,
+                    uv,
+                    color: [1.0; 3],
+                    opaque: false,
                     texture: Arc::clone(texture),
                     light,
                 });

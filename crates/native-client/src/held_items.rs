@@ -426,6 +426,9 @@ impl Loader {
     ) -> Result<crate::particle_sprites::ParticleSprites> {
         crate::particle_sprites::ParticleSprites::load(&mut self.stack, "bubble")
     }
+    pub(crate) fn load_soul_sprites(&mut self) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "soul")
+    }
     pub(crate) fn load_armor(
         &mut self,
         key: &crate::equipment_visual::ArmorKey,

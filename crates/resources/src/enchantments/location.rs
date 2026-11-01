@@ -12,13 +12,13 @@ use super::{AttributeModifier, AttributeOperation, EquipmentSlot, LevelValue, lo
 use crate::packs::{ResourceId, ResourceProvider};
 
 #[derive(Clone, Debug, PartialEq)]
-enum BlockSet {
+pub(super) enum BlockSet {
     Ids(BTreeSet<String>),
     Tag(ResourceId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Predicate {
+pub(super) enum Predicate {
     Always,
     All(Vec<Self>),
     Any(Vec<Self>),
@@ -28,22 +28,27 @@ enum Predicate {
     OnGround(bool),
     Vehicle(bool),
     MovementBlock(BlockSet),
+    HorizontalSpeed { min: Option<f64>, max: Option<f64> },
+    PeriodicTick(i32),
     Random(Chance),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Chance {
+pub(super) enum Chance {
     Constant(f32),
     EnchantmentLevel(LevelValue),
 }
 
-fn object<'a>(value: &'a Value, description: &str) -> Result<&'a serde_json::Map<String, Value>> {
+pub(super) fn object<'a>(
+    value: &'a Value,
+    description: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
     value
         .as_object()
         .with_context(|| format!("{description} is not an object"))
 }
 
-fn check_keys(value: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<()> {
+pub(super) fn check_keys(value: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<()> {
     ensure!(
         value.keys().all(|key| allowed.contains(&key.as_str())),
         "unsupported location predicate field"
@@ -51,7 +56,7 @@ fn check_keys(value: &serde_json::Map<String, Value>, allowed: &[&str]) -> Resul
     Ok(())
 }
 
-fn id(value: &Value, name: &str) -> Result<ResourceId> {
+pub(super) fn id(value: &Value, name: &str) -> Result<ResourceId> {
     ResourceId::parse(
         value
             .as_str()
@@ -63,14 +68,14 @@ fn canonical(id: ResourceId) -> String {
     format!("{}:{}", id.namespace, id.path)
 }
 
-fn finite_f32(value: &Value) -> Result<f32> {
+pub(super) fn finite_f32(value: &Value) -> Result<f32> {
     let value = value.as_f64().context("expected a number")? as f32;
     ensure!(value.is_finite(), "non-finite location value");
     Ok(value)
 }
 
 impl Predicate {
-    fn parse(value: &Value, depth: usize) -> Result<Self> {
+    pub(super) fn parse(value: &Value, depth: usize) -> Result<Self> {
         ensure!(depth <= 32, "location predicate nesting is too deep");
         let value = object(value, "location predicate")?;
         let kind = id(
@@ -133,6 +138,8 @@ impl Predicate {
                         "minecraft:flags",
                         "minecraft:vehicle",
                         "minecraft:movement_affected_by",
+                        "minecraft:movement",
+                        "minecraft:periodic_tick",
                     ],
                 )?;
                 let mut terms = Vec::new();
@@ -156,6 +163,43 @@ impl Predicate {
                         "unsupported vehicle predicate"
                     );
                     terms.push(Self::Vehicle(true));
+                }
+                if let Some(movement) = entity.get("minecraft:movement") {
+                    let movement = object(movement, "entity movement")?;
+                    check_keys(movement, &["horizontal_speed"])?;
+                    if let Some(bounds) = movement.get("horizontal_speed") {
+                        let bounds = object(bounds, "horizontal speed bounds")?;
+                        check_keys(bounds, &["min", "max"])?;
+                        let parse = |name: &str| -> Result<Option<f64>> {
+                            bounds
+                                .get(name)
+                                .map(|value| {
+                                    let value =
+                                        value.as_f64().context("invalid horizontal speed")?;
+                                    ensure!(
+                                        value.is_finite() && value >= 0.0,
+                                        "invalid horizontal speed bound"
+                                    );
+                                    Ok(value)
+                                })
+                                .transpose()
+                        };
+                        let min = parse("min")?;
+                        let max = parse("max")?;
+                        ensure!(
+                            min.zip(max).is_none_or(|(min, max)| min <= max),
+                            "invalid horizontal speed range"
+                        );
+                        terms.push(Self::HorizontalSpeed { min, max });
+                    }
+                }
+                if let Some(period) = entity.get("minecraft:periodic_tick") {
+                    let period = period
+                        .as_i64()
+                        .and_then(|value| i32::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                        .context("invalid periodic tick")?;
+                    terms.push(Self::PeriodicTick(period));
                 }
                 if let Some(movement) = entity.get("minecraft:movement_affected_by") {
                     let movement = object(movement, "movement predicate")?;
@@ -214,7 +258,7 @@ impl Predicate {
         }
     }
 
-    fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
+    pub(super) fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
         match self {
             Self::All(terms) | Self::Any(terms) => terms.iter().for_each(|term| term.tags(tags)),
             Self::Not(term) => term.tags(tags),
@@ -225,7 +269,7 @@ impl Predicate {
         }
     }
 
-    fn matches(
+    pub(super) fn matches(
         &self,
         context: &LocationContext<'_>,
         tags: &BTreeMap<ResourceId, BTreeSet<String>>,
@@ -263,6 +307,13 @@ impl Predicate {
                 .get(tag)
                 .context("location block tag unavailable")?
                 .contains(context.movement_block),
+            Self::HorizontalSpeed { min, max } => {
+                let [x, _, z] = context.known_movement;
+                let squared = (x * 20.0).powi(2) + (z * 20.0).powi(2);
+                min.is_none_or(|value| squared >= value * value)
+                    && max.is_none_or(|value| squared <= value * value)
+            }
+            Self::PeriodicTick(period) => context.tick_count % period == 0,
             Self::Random(chance) => {
                 random()
                     < match chance {
@@ -420,6 +471,9 @@ pub struct LocationContext<'a> {
     pub vehicle: bool,
     pub movement_block: &'a str,
     pub level: u32,
+    /// Entity tick count and known movement, required by tick effects.
+    pub tick_count: i32,
+    pub known_movement: [f64; 3],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -587,6 +641,8 @@ mod tests {
                         vehicle: false,
                         movement_block: block,
                         level,
+                        tick_count: 0,
+                        known_movement: [0.0; 3],
                     };
                     let mut calls = 0;
                     let (active, actions) = enchantment
@@ -647,6 +703,8 @@ mod tests {
             vehicle: false,
             movement_block: "minecraft:soul_sand",
             level: 1,
+            tick_count: 0,
+            known_movement: [0.0; 3],
         };
         assert_eq!(
             enchantment
@@ -689,6 +747,8 @@ mod tests {
             vehicle: false,
             movement_block: "minecraft:soul_sand",
             level: 2,
+            tick_count: 0,
+            known_movement: [0.0; 3],
         };
         let (active, added) = enchantment
             .evaluate(0, EquipmentSlot::Feet, &context, &mut || panic!())
@@ -769,6 +829,8 @@ mod tests {
                 vehicle: false,
                 movement_block: block,
                 level: 1,
+                tick_count: 0,
+                known_movement: [0.0; 3],
             };
             assert_eq!(
                 enchantment
@@ -823,6 +885,8 @@ mod tests {
                                 vehicle,
                                 movement_block: block,
                                 level: 3,
+                                tick_count: 0,
+                                known_movement: [0.0; 3],
                             };
                             let (active, actions) = enchantment
                                 .evaluate(0, EquipmentSlot::Feet, &context, &mut || {
@@ -948,6 +1012,8 @@ mod tests {
                 vehicle: input["passenger"].as_bool().unwrap(),
                 movement_block: &block,
                 level: input["level"].as_u64().unwrap() as u32,
+                tick_count: 0,
+                known_movement: [0.0; 3],
             };
             let (matched, _) = enchantment
                 .evaluate(

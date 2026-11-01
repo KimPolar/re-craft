@@ -715,12 +715,14 @@ impl Viewer {
             let plant_breaks = play.session.take_plant_break_particles();
             let honey_slides = play.session.take_honey_particles();
             let drown_particles = play.session.take_drown_particles();
+            let soul_particles = play.session.take_soul_particles();
             let smoke = play.session.take_evaporation_smoke();
             let fizz = play.session.take_lava_fizz();
             let fizz_sounds = if let Some(ui) = &mut self.ui {
                 ui.queue_plant_break_particles(plant_breaks);
                 ui.queue_honey_particles(honey_slides);
                 ui.update_drown_particles(&snapshot, drown_particles);
+                ui.update_soul_particles(&snapshot, soul_particles);
                 ui.update_consume_particles(&snapshot, particles);
                 ui.update_evaporation_smoke(&snapshot, smoke, fizz)
             } else {

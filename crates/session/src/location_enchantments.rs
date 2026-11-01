@@ -127,6 +127,8 @@ impl LocationTracker {
                     vehicle: environment.passenger,
                     movement_block: environment.block,
                     level,
+                    tick_count: 0,
+                    known_movement: [0.0; 3],
                 };
                 let (active, actions) =
                     definition

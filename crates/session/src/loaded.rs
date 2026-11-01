@@ -530,6 +530,15 @@ pub struct LoadedSession {
     location_last_position: Option<IVec3>,
     unresolved_player_location_effects: bool,
     location_failure_revision: Option<u64>,
+    tick_enchantment_failure: Option<(u64, u64)>,
+    tick_enchantment_cache: Option<(
+        u64,
+        Vec<(
+            native_resources::enchantments::EquipmentSlot,
+            u32,
+            native_resources::packs::ResourceId,
+        )>,
+    )>,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     mining_attribute_revision: Option<u64>,
     mining_attribute_values: [f64; 3],
@@ -639,6 +648,8 @@ pub struct LoadedSession {
     lava_fizz: VecDeque<LavaFizz>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
     honey_particles: VecDeque<HoneyParticleBurst>,
+    soul_particles: VecDeque<SoulParticleSpawn>,
+    player_known_movement: DVec3,
     drown_particles: VecDeque<DrownParticleSpawn>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
@@ -844,6 +855,14 @@ pub struct HoneyParticleBurst {
 /// A client-side bubble created by the player's drowning entity event.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrownParticleSpawn {
+    pub tick: u64,
+    pub position: DVec3,
+    pub velocity: DVec3,
+}
+
+/// Server particle packet for the soul enchantment effect.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoulParticleSpawn {
     pub tick: u64,
     pub position: DVec3,
     pub velocity: DVec3,
@@ -1739,6 +1758,8 @@ impl LoadedSession {
         self.oxygen_equipment = None;
         self.location_effects = crate::location_enchantments::LocationTracker::default();
         self.location_failure_revision = None;
+        self.tick_enchantment_failure = None;
+        self.tick_enchantment_cache = None;
         self.oxygen_inventory_revision = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
@@ -1866,6 +1887,8 @@ impl LoadedSession {
         self.location_effects = crate::location_enchantments::LocationTracker::default();
         self.location_last_position = None;
         self.location_failure_revision = None;
+        self.tick_enchantment_failure = None;
+        self.tick_enchantment_cache = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.knockback_resistance_revision = None;
@@ -2197,6 +2220,184 @@ impl LoadedSession {
                 self.refresh_movement_speed();
                 self.stream_errors
                     .push(format!("player location enchantment: {error:#}"));
+            }
+        }
+    }
+
+    fn tick_enchantment_effects(&mut self) {
+        use crate::inventory::PlayerSlot;
+        use native_resources::enchantments::{
+            EquipmentSlot,
+            location::LocationContext,
+            tick::{TickAction, TickContext},
+        };
+        let failure_key = (self.inventory.revision(), self.revision);
+        if self.tick_enchantment_failure == Some(failure_key) {
+            return;
+        }
+        let slots = [
+            (
+                EquipmentSlot::Mainhand,
+                PlayerSlot::Storage(self.inventory.selected()),
+            ),
+            (EquipmentSlot::Offhand, PlayerSlot::Offhand),
+            (EquipmentSlot::Feet, PlayerSlot::Armor(3)),
+            (EquipmentSlot::Legs, PlayerSlot::Armor(2)),
+            (EquipmentSlot::Chest, PlayerSlot::Armor(1)),
+            (EquipmentSlot::Head, PlayerSlot::Armor(0)),
+        ];
+        let inventory_revision = self.inventory.revision();
+        if self
+            .tick_enchantment_cache
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != inventory_revision)
+        {
+            let parsed = (|| -> anyhow::Result<_> {
+                let mut effects = Vec::new();
+                for (equipment, slot) in slots {
+                    let Some(item) = self.inventory.slot(slot) else {
+                        continue;
+                    };
+                    let enchantments = crate::inventory::item_enchantments(item)?;
+                    if enchantments.is_empty() {
+                        continue;
+                    }
+                    let (_, registry) = self
+                        .oxygen_equipment
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("enchantment registry is unavailable"))?;
+                    let mut count = 0;
+                    for (id, level) in enchantments {
+                        if registry.tick_effects(&id)?.is_empty() {
+                            continue;
+                        }
+                        count += 1;
+                        anyhow::ensure!(
+                            count == 1,
+                            "multiple tick enchantment iteration order is unknown"
+                        );
+                        effects.push((equipment, level, id));
+                    }
+                }
+                Ok(effects)
+            })();
+            match parsed {
+                Ok(effects) => self.tick_enchantment_cache = Some((inventory_revision, effects)),
+                Err(error) => {
+                    self.unresolved_player_location_effects = true;
+                    self.tick_enchantment_failure = Some(failure_key);
+                    self.stream_errors
+                        .push(format!("player enchantment tick effect: {error:#}"));
+                    return;
+                }
+            }
+        }
+        let effects = &self
+            .tick_enchantment_cache
+            .as_ref()
+            .expect("cache was initialized")
+            .1;
+        if effects.is_empty() {
+            return;
+        }
+        let result = (|| -> anyhow::Result<_> {
+            let (_, registry) = self
+                .oxygen_equipment
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("enchantment registry is unavailable"))?;
+            let block = match cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                self.movement_below(),
+                self.states[0],
+            ) {
+                Cell::State(id) => self.world.state(id).map(|state| state.name.as_str()),
+                Cell::Missing => None,
+            }
+            .ok_or_else(|| anyhow::anyhow!("enchantment movement block is unavailable"))?;
+            let mut level_random = self.level_random.clone();
+            let mut entity_random = self.player_random.clone();
+            let mut actions = Vec::new();
+            for (slot, level, id) in effects {
+                let effect = registry.tick_effects(id)?;
+                let context = TickContext {
+                    location: LocationContext {
+                        active: false,
+                        flying: self.flight.flying,
+                        on_ground: self.motion.on_ground,
+                        vehicle: false,
+                        movement_block: block,
+                        level: *level,
+                        tick_count: self.player_effect_tick,
+                        known_movement: self.player_known_movement.to_array(),
+                    },
+                    position: (self.origin.as_dvec3() + self.motion.position).to_array(),
+                    width: crate::PLAYER_HALF_WIDTH * 2.0,
+                    height: self.player.height(),
+                    silent: self.player_silent,
+                };
+                actions.extend(effect.evaluate(
+                    *slot,
+                    &context,
+                    &mut level_random,
+                    &mut entity_random,
+                )?);
+            }
+            for action in &actions {
+                if let TickAction::Particle { id, .. } = action {
+                    anyhow::ensure!(
+                        id.namespace == "minecraft" && id.path == "soul",
+                        "unsupported enchantment particle {}:{}",
+                        id.namespace,
+                        id.path
+                    );
+                }
+            }
+            Ok(Some((actions, level_random, entity_random)))
+        })();
+        match result {
+            Ok(Some((actions, level_random, entity_random))) => {
+                self.tick_enchantment_failure = None;
+                self.level_random = level_random;
+                self.player_random = entity_random;
+                for action in actions {
+                    match action {
+                        TickAction::Particle {
+                            position,
+                            velocity,
+                            speed,
+                            ..
+                        } => {
+                            if self.soul_particles.len() == 4096 {
+                                self.soul_particles.pop_front();
+                            }
+                            self.soul_particles.push_back(SoulParticleSpawn {
+                                tick: self.tick.saturating_add(1),
+                                position: DVec3::from_array(position),
+                                velocity: DVec3::from_array(velocity) * f64::from(speed),
+                            });
+                        }
+                        TickAction::Sound { id, volume, pitch } => {
+                            crate::queue_player_sound(
+                                &mut self.consume_sounds,
+                                self.origin.as_dvec3() + self.motion.position,
+                                format!("{}:{}", id.namespace, id.path),
+                                volume,
+                                pitch,
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                self.tick_enchantment_failure = None;
+            }
+            Err(error) => {
+                self.unresolved_player_location_effects = true;
+                self.tick_enchantment_failure = Some(failure_key);
+                self.stream_errors
+                    .push(format!("player enchantment tick effect: {error:#}"));
             }
         }
     }
@@ -4541,6 +4742,8 @@ impl LoadedSession {
     /// Replace the temporary demonstration inventory with data from the saved player.
     pub fn set_player_inventory(&mut self, mut inventory: PlayerInventory) {
         self.saved_player_inventory_source = None;
+        self.tick_enchantment_cache = None;
+        self.tick_enchantment_failure = None;
         self.mining.release();
         self.first_person.invalidate_inventory();
         self.oxygen_inventory_revision = None;
@@ -4870,6 +5073,8 @@ impl LoadedSession {
             location_last_position: None,
             unresolved_player_location_effects: false,
             location_failure_revision: None,
+            tick_enchantment_failure: None,
+            tick_enchantment_cache: None,
             mining_attributes: crate::player_data::SavedMiningAttributes::default(),
             mining_attribute_revision: None,
             mining_attribute_values: [0.0, 1.0, 0.2],
@@ -4984,6 +5189,8 @@ impl LoadedSession {
             lava_fizz: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
             honey_particles: VecDeque::new(),
+            soul_particles: VecDeque::new(),
+            player_known_movement: DVec3::ZERO,
             drown_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
@@ -6061,6 +6268,10 @@ impl LoadedSession {
 
     pub fn take_honey_particles(&mut self) -> Vec<HoneyParticleBurst> {
         self.honey_particles.drain(..).collect()
+    }
+
+    pub fn take_soul_particles(&mut self) -> Vec<SoulParticleSpawn> {
+        self.soul_particles.drain(..).collect()
     }
 
     pub fn take_drown_particles(&mut self) -> Vec<DrownParticleSpawn> {
@@ -7512,6 +7723,9 @@ impl LoadedSession {
         self.location_effects = crate::location_enchantments::LocationTracker::default();
         self.location_last_position = None;
         self.location_failure_revision = None;
+        self.tick_enchantment_failure = None;
+        self.tick_enchantment_cache = None;
+        self.player_known_movement = DVec3::ZERO;
         self.camera = crate::camera::CameraMotion::new(position, self.player.pose.eye_height());
         self.vitals = crate::survival::PlayerVitals {
             health: max_health,
@@ -14634,6 +14848,7 @@ impl LoadedSession {
             self.stream_errors
                 .push(format!("player armor equipment: {error:#}"));
         }
+        self.tick_enchantment_effects();
         self.tick_lodestone_compasses();
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
@@ -15238,6 +15453,7 @@ impl LoadedSession {
                 block_speed,
             )
         };
+        self.player_known_movement = actual;
         if let Some(result) = location_result.into_inner() {
             match result {
                 Ok((outcome, efficiency)) => {
@@ -28005,6 +28221,76 @@ mod tests {
         assert_eq!(session.movement_efficiency, Some(1.0));
         let drag = 1.0_f32 - (1.0_f32 - 0.91_f32);
         assert_eq!(session.motion.velocity.x, 0.1 * f64::from(drag));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the installed Minecraft 26.3 assets"]
+    fn soul_speed_tick_enqueues_sound_and_particle_from_the_active_data_pack() {
+        use native_persistence::nbt::Tag;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session
+            .set_saved_breathing(
+                Default::default(),
+                crate::player_data::SavedAttribute::with_base(0.0),
+                registry,
+            )
+            .unwrap();
+        let boots = ItemStack::new(
+            "minecraft:iron_boots".into(),
+            1,
+            1,
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:soul_speed".into(), Tag::Int(3))]),
+            )]),
+        )
+        .unwrap();
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(3), Some(boots));
+        let sand = session.intern_block(state("minecraft:soul_sand", &[]));
+        assert!(session.set(IVec3::new(8, 1, 8), sand));
+        session.motion.position = DVec3::new(8.5, 1.875, 8.5);
+        session.motion.on_ground = true;
+        session.player_known_movement = DVec3::new(0.2, 0.0, -0.1);
+        session.player_effect_tick = 5;
+        session.level_random = native_core::random::LegacyRandom::new(5120);
+        session.player_random = native_core::random::LegacyRandom::new(0);
+        session.tick_enchantment_effects();
+        let particles = session.take_soul_particles();
+        assert_eq!(particles.len(), 1);
+        assert_eq!(particles[0].tick, 1);
+        assert_eq!(
+            particles[0].velocity,
+            DVec3::new(
+                0.2 * f64::from(-0.2_f32),
+                f64::from(0.1_f32),
+                -0.1 * f64::from(-0.2_f32)
+            )
+        );
+        let sounds = session.take_consume_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].info.event, "minecraft:particle.soul_escape");
+        assert_eq!(sounds[0].info.volume, 0.6_f32);
+
+        // A replacement inventory may have the same revision as the old one.
+        let mut replacement = PlayerInventory::default();
+        replacement.set_slot(
+            crate::inventory::PlayerSlot::Armor(3),
+            ItemStack::new("minecraft:iron_boots".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        assert_eq!(replacement.revision(), session.inventory.revision());
+        session.set_player_inventory(replacement);
+        session.level_random = native_core::random::LegacyRandom::new(5120);
+        session.tick_enchantment_effects();
+        assert!(session.take_soul_particles().is_empty());
+        assert!(session.take_consume_sounds().is_empty());
     }
 
     #[test]

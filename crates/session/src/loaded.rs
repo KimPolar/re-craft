@@ -13929,12 +13929,11 @@ impl LoadedSession {
             .fall
             .effects()
             .regeneration_due(self.player_effect_tick);
-        // Java iterates a hash map of effects, whose order is not determined by
-        // the saved NBT. Until that ordering is modeled, do not authorize a save
-        // after both health-changing effects run in the same tick.
-        if poison_due && regeneration_due && self.vitals.health > 0.0 {
-            self.effect_save_invalid = true;
-        }
+        // Java's effect map iteration order is not encoded in player NBT. Keep
+        // the other ordering to check whether it can change the saved state.
+        let alternate =
+            (poison_due && regeneration_due).then_some((self.vitals, self.damage_cooldown));
+        let poison_attempted = poison_due && self.vitals.health > 1.0;
         if self.vitals.health > 1.0
             && poison_due
             && let Err(error) = self.fall.damage(
@@ -13954,6 +13953,32 @@ impl LoadedSession {
         }
         if self.vitals.health < self.vitals.max_health && regeneration_due {
             self.vitals.heal(1.0);
+        }
+        if let Some((mut vitals, mut cooldown)) = alternate {
+            if vitals.health < vitals.max_health {
+                vitals.heal(1.0);
+            }
+            let alternate_attempted = vitals.health > 1.0;
+            let alternate_damage = if alternate_attempted {
+                self.fall.damage(
+                    1.0,
+                    "minecraft:magic",
+                    &self.inventory,
+                    self.armor.value(),
+                    &mut vitals,
+                    self.game_mode,
+                    Some(&mut cooldown),
+                )
+            } else {
+                Ok(())
+            };
+            if alternate_damage.is_err()
+                || poison_attempted != alternate_attempted
+                || vitals != self.vitals
+                || cooldown != self.damage_cooldown
+            {
+                self.effect_save_invalid = true;
+            }
         }
         self.fall
             .effects()
@@ -39294,6 +39319,160 @@ mod tests {
         );
     }
 
+    fn health_effect_damage_registry() -> Arc<OxygenEnchantments> {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, path: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if path == "tags/damage_type" {
+                    [
+                        "bypasses_cooldown",
+                        "bypasses_armor",
+                        "bypasses_effects",
+                        "bypasses_resistance",
+                        "bypasses_enchantments",
+                    ]
+                    .into_iter()
+                    .map(|name| ResourceId::parse(&format!("minecraft:{name}")))
+                    .collect()
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                if path.contains("tags/damage_type/") {
+                    Ok(Some(if path.ends_with("bypasses_armor.json") {
+                        br#"{"values":["minecraft:magic"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        Arc::new(OxygenEnchantments::load(&mut Data).unwrap())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn simultaneous_health_effect_order_matches_java() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ConcurrentHealthEffectsOracle.java");
+        let output = temp.path().join("effects.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ConcurrentHealthEffectsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ConcurrentHealthEffectsOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 36);
+        for row in rows {
+            let health = row["health"].as_f64().unwrap() as f32;
+            let absorption = row["absorption"].as_f64().unwrap() as f32;
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Health".into(), Tag::Float(health)),
+                    ("AbsorptionAmount".into(), Tag::Float(absorption)),
+                    (
+                        "active_effects".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: ["poison", "regeneration"]
+                                .into_iter()
+                                .map(|id| {
+                                    Tag::Compound(vec![
+                                        (
+                                            "id".into(),
+                                            Tag::String(format!("minecraft:{id}").as_str().into()),
+                                        ),
+                                        ("duration".into(), Tag::Int(50)),
+                                    ])
+                                })
+                                .collect(),
+                        },
+                    ),
+                ]),
+            };
+            let mut session = session();
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::player_data::read_saved_fall_effects(&original).unwrap(),
+                health_effect_damage_registry(),
+            );
+            session.set_player_vitals(crate::survival::PlayerVitals {
+                health,
+                absorption,
+                ..Default::default()
+            });
+            session.update(TICK);
+            let first = &row["orders"][0];
+            let second = &row["orders"][1];
+            assert_eq!(
+                session.vitals.health.to_bits(),
+                first["health_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+            assert_eq!(
+                session.vitals.absorption.to_bits(),
+                first["absorption_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+            assert_eq!(session.effect_save_invalid, first != second, "{row}");
+            assert_eq!(
+                session.draft_player_state(&original).is_err(),
+                first != second,
+                "{row}"
+            );
+        }
+    }
+
     #[test]
     fn simultaneous_poison_and_regeneration_do_not_authorize_save() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
@@ -39337,6 +39516,68 @@ mod tests {
         assert_eq!(session.vitals.health, 2.0);
         assert!(session.effect_save_invalid);
         assert!(session.draft_player_state(&original).is_err());
+    }
+
+    #[test]
+    fn commuting_poison_and_regeneration_allow_save() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Health".into(), Tag::Float(10.0)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: ["poison", "regeneration"]
+                            .into_iter()
+                            .map(|id| {
+                                Tag::Compound(vec![
+                                    (
+                                        "id".into(),
+                                        Tag::String(format!("minecraft:{id}").as_str().into()),
+                                    ),
+                                    ("duration".into(), Tag::Int(50)),
+                                ])
+                            })
+                            .collect(),
+                    },
+                ),
+            ]),
+        };
+        for (preexisting_cooldown, expected_health) in [(false, 10.0), (true, 11.0)] {
+            let mut session = session();
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::player_data::read_saved_fall_effects(&original).unwrap(),
+                health_effect_damage_registry(),
+            );
+            session.set_player_vitals(crate::survival::PlayerVitals {
+                health: 10.0,
+                ..Default::default()
+            });
+            if preexisting_cooldown {
+                session
+                    .fall
+                    .damage(
+                        1.0,
+                        "minecraft:magic",
+                        &session.inventory,
+                        session.armor.value(),
+                        &mut session.vitals,
+                        session.game_mode,
+                        Some(&mut session.damage_cooldown),
+                    )
+                    .unwrap();
+                session.vitals.health = 10.0;
+            }
+            session.update(TICK);
+            assert_eq!(session.vitals.health, expected_health);
+            assert!(!session.effect_save_invalid);
+            assert!(session.draft_player_state(&original).is_ok());
+        }
     }
 
     #[test]

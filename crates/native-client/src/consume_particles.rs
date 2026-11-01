@@ -11,7 +11,7 @@ use native_session::{
     SessionWorld,
     consume_particles::ConsumeParticleSpawn,
     inventory::ItemStack,
-    loaded::{PlantBreakParticles, PlantParticleKind},
+    loaded::{HoneySlideParticles, PlantBreakParticles, TerrainParticleKind},
 };
 use native_world::{
     collision::Aabb,
@@ -59,7 +59,7 @@ pub(crate) struct Particle {
 #[derive(Clone, Debug)]
 pub(crate) enum ParticleVisual {
     Item(Arc<ItemStack>),
-    Plant(PlantParticleKind, IVec3),
+    Terrain(TerrainParticleKind, IVec3),
 }
 
 impl Particle {
@@ -221,6 +221,7 @@ pub(crate) struct ParticleSystem {
     particles: VecDeque<Particle>,
     pending: BTreeMap<u64, Vec<ConsumeParticleSpawn>>,
     pending_plants: BTreeMap<u64, Vec<PlantBreakParticles>>,
+    pending_honey: BTreeMap<u64, Vec<HoneySlideParticles>>,
     tick: Option<u64>,
     random: LegacyRandom,
     shapes: HashMap<u32, Option<Vec<Aabb>>>,
@@ -235,6 +236,7 @@ impl Default for ParticleSystem {
             particles: VecDeque::new(),
             pending: BTreeMap::new(),
             pending_plants: BTreeMap::new(),
+            pending_honey: BTreeMap::new(),
             tick: None,
             random: LegacyRandom::new(seed),
             shapes: HashMap::new(),
@@ -251,6 +253,14 @@ impl ParticleSystem {
                 .push(event);
         }
     }
+    pub fn queue_honey_slides(&mut self, events: Vec<HoneySlideParticles>) {
+        for event in events {
+            self.pending_honey
+                .entry(event.tick)
+                .or_default()
+                .push(event);
+        }
+    }
     pub fn update(&mut self, target: u64, world: &SessionWorld, spawns: Vec<ConsumeParticleSpawn>) {
         for spawn in spawns {
             self.pending.entry(spawn.tick).or_default().push(spawn);
@@ -259,6 +269,7 @@ impl ParticleSystem {
             .pending
             .keys()
             .chain(self.pending_plants.keys())
+            .chain(self.pending_honey.keys())
             .copied()
             .min()
             .map_or(target, |tick| tick.saturating_sub(1).min(target));
@@ -267,6 +278,7 @@ impl ParticleSystem {
             self.particles.clear();
             self.pending.clear();
             self.pending_plants.clear();
+            self.pending_honey.clear();
             self.shapes.clear();
             tick = target;
         }
@@ -276,6 +288,8 @@ impl ParticleSystem {
             tick = target - 100;
             self.pending.retain(|&spawn_tick, _| spawn_tick > tick);
             self.pending_plants
+                .retain(|&spawn_tick, _| spawn_tick > tick);
+            self.pending_honey
                 .retain(|&spawn_tick, _| spawn_tick > tick);
         }
         while tick < target {
@@ -302,7 +316,27 @@ impl ParticleSystem {
                     self.particles.push_back(Particle::new_inner(
                         position,
                         velocity,
-                        ParticleVisual::Plant(event.kind, event.position),
+                        ParticleVisual::Terrain(event.kind, event.position),
+                        true,
+                        &mut random,
+                    ));
+                }
+            }
+            let ready = self.pending_honey.split_off(&tick.saturating_add(1));
+            let events = std::mem::replace(&mut self.pending_honey, ready);
+            for event in events.into_values().flatten() {
+                for _ in 0..5 {
+                    if self.particles.len() == MAX_PARTICLES {
+                        self.particles.pop_front();
+                    }
+                    let mut random = LegacyRandom::new(self.random.next_long());
+                    self.particles.push_back(Particle::new_inner(
+                        event.position,
+                        DVec3::ZERO,
+                        ParticleVisual::Terrain(
+                            TerrainParticleKind::HoneyBlock,
+                            event.position.floor().as_ivec3(),
+                        ),
                         true,
                         &mut random,
                     ));
@@ -380,7 +414,7 @@ mod tests {
         let burst = |tick| PlantBreakParticles {
             tick,
             position: IVec3::new(2, 4, 3),
-            kind: PlantParticleKind::Fern,
+            kind: TerrainParticleKind::Fern,
         };
         batched.queue_plant_breaks(vec![burst(2), burst(6)]);
         batched.update(10, &world, vec![]);
@@ -402,6 +436,42 @@ mod tests {
         initial.queue_plant_breaks(vec![burst(2)]);
         initial.update(2, &world, vec![]);
         assert_eq!(initial.particles().count(), 36);
+    }
+
+    #[test]
+    fn honey_slide_spawns_five_terrain_particles_and_handles_frame_batches() {
+        let world = SessionWorld::Demo(native_world::World::demo());
+        let event = |tick| HoneySlideParticles {
+            tick,
+            position: DVec3::new(2.25, 4.5, 3.75),
+        };
+        let mut batched = ParticleSystem::default();
+        let mut individual = ParticleSystem::default();
+        batched.random = LegacyRandom::new(42);
+        individual.random = LegacyRandom::new(42);
+        batched.queue_honey_slides(vec![event(2), event(6)]);
+        batched.update(10, &world, vec![]);
+        for tick in 1..=10 {
+            if tick == 2 || tick == 6 {
+                individual.queue_honey_slides(vec![event(tick)]);
+            }
+            individual.update(tick, &world, vec![]);
+        }
+        let fields = |system: &ParticleSystem| {
+            system
+                .particles()
+                .map(|p| (p.position, p.velocity, p.age, p.lifetime, p.size, p.uv))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(&batched), fields(&individual));
+        let mut initial = ParticleSystem::default();
+        initial.queue_honey_slides(vec![event(2)]);
+        initial.update(2, &world, vec![]);
+        assert_eq!(initial.particles().count(), 5);
+        assert!(initial.particles().all(|p| matches!(
+            p.visual,
+            ParticleVisual::Terrain(TerrainParticleKind::HoneyBlock, _)
+        )));
     }
 
     #[cfg(target_os = "windows")]
@@ -483,7 +553,7 @@ mod tests {
             let mut particle = Particle::new_inner(
                 DVec3::new(1.25, 3.5, -2.25),
                 DVec3::new(0.1, 0.15, -0.05),
-                ParticleVisual::Plant(PlantParticleKind::Fern, IVec3::ZERO),
+                ParticleVisual::Terrain(TerrainParticleKind::Fern, IVec3::ZERO),
                 true,
                 &mut rng,
             );

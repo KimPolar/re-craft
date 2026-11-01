@@ -529,6 +529,7 @@ pub struct LoadedSession {
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
     player_client_random: native_core::random::LegacyRandom,
+    client_level_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     random_tick_speed: u32,
     random_block_position: native_core::random::BlockRandomPosition,
@@ -629,6 +630,7 @@ pub struct LoadedSession {
     evaporation_smoke: VecDeque<EvaporationSmoke>,
     lava_fizz: VecDeque<LavaFizz>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
+    honey_slide_particles: VecDeque<HoneySlideParticles>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -797,18 +799,20 @@ pub struct LavaFizz {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
-pub enum PlantParticleKind {
+pub enum TerrainParticleKind {
     ShortGrass,
     Fern,
     DeadBush,
+    HoneyBlock,
 }
 
-impl PlantParticleKind {
+impl TerrainParticleKind {
     pub fn id(self) -> &'static str {
         match self {
             Self::ShortGrass => "minecraft:short_grass",
             Self::Fern => "minecraft:fern",
             Self::DeadBush => "minecraft:dead_bush",
+            Self::HoneyBlock => "minecraft:honey_block",
         }
     }
 }
@@ -817,7 +821,13 @@ impl PlantParticleKind {
 pub struct PlantBreakParticles {
     pub position: IVec3,
     pub tick: u64,
-    pub kind: PlantParticleKind,
+    pub kind: TerrainParticleKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoneySlideParticles {
+    pub position: DVec3,
+    pub tick: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -4636,6 +4646,7 @@ impl LoadedSession {
             movement_speed_cache: None,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             player_client_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            client_level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             random_tick_speed: 3,
             random_block_position: native_core::random::BlockRandomPosition::new(
@@ -4737,6 +4748,7 @@ impl LoadedSession {
             evaporation_smoke: VecDeque::new(),
             lava_fizz: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
+            honey_slide_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -5809,6 +5821,10 @@ impl LoadedSession {
 
     pub fn take_plant_break_particles(&mut self) -> Vec<PlantBreakParticles> {
         self.plant_break_particles.drain(..).collect()
+    }
+
+    pub fn take_honey_slide_particles(&mut self) -> Vec<HoneySlideParticles> {
+        self.honey_slide_particles.drain(..).collect()
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -9430,9 +9446,9 @@ impl LoadedSession {
                     position: absolute,
                     tick: self.tick.saturating_add(1),
                     kind: match block.name.as_str() {
-                        "minecraft:short_grass" => PlantParticleKind::ShortGrass,
-                        "minecraft:fern" => PlantParticleKind::Fern,
-                        "minecraft:dead_bush" => PlantParticleKind::DeadBush,
+                        "minecraft:short_grass" => TerrainParticleKind::ShortGrass,
+                        "minecraft:fern" => TerrainParticleKind::Fern,
+                        "minecraft:dead_bush" => TerrainParticleKind::DeadBush,
                         _ => unreachable!("plant name was checked"),
                     },
                 });
@@ -15006,9 +15022,9 @@ impl LoadedSession {
         let mut queued_effects = Vec::new();
         if let Some(contacts) = player_fire_contacts {
             for contact in contacts {
-                self.unresolved_player_fire_contact = true;
                 match contact.kind {
-                    crate::fire_contact::FireBlock::Campfire(amount) => {
+                    crate::fire_contact::InsideBlock::Campfire(amount) => {
+                        self.unresolved_player_fire_contact = true;
                         if self.death.is_none() {
                             self.player_fire_damage(
                                 f32::from(amount),
@@ -15017,12 +15033,46 @@ impl LoadedSession {
                             );
                         }
                     }
-                    crate::fire_contact::FireBlock::Fire(amount) => queued_effects.push((
-                        contact.axis_step,
-                        step_for(contact.axis_step, contact.position),
-                        0_u8,
-                        PlayerHeatContact::Fire(amount),
-                    )),
+                    crate::fire_contact::InsideBlock::Fire(amount) => {
+                        self.unresolved_player_fire_contact = true;
+                        queued_effects.push((
+                            contact.axis_step,
+                            step_for(contact.axis_step, contact.position),
+                            0_u8,
+                            PlayerHeatContact::Fire(amount),
+                        ));
+                    }
+                    crate::fire_contact::InsideBlock::Honey => {
+                        if let Some(absolute) = add(self.origin, contact.position)
+                            && let Some(velocity) = crate::honey::slide(
+                                self.origin.as_dvec3() + self.motion.position,
+                                absolute,
+                                self.motion.on_ground,
+                                self.motion.velocity,
+                            )
+                        {
+                            self.motion.velocity = velocity;
+                            self.fall_distance = 0.0;
+                            let (_server_sound, particle_event) =
+                                crate::honey::effects(&mut self.level_random);
+                            let play_sound =
+                                crate::honey::client_sound(&mut self.client_level_random);
+                            // Player.playSound overrides Entity.playSound and
+                            // does not consult the silent entity flag.
+                            if play_sound {
+                                self.queue_player_sound("block.honey_block.slide", 1.0, 1.0);
+                            }
+                            if particle_event {
+                                if self.honey_slide_particles.len() == 4096 {
+                                    self.honey_slide_particles.pop_front();
+                                }
+                                self.honey_slide_particles.push_back(HoneySlideParticles {
+                                    position: self.origin.as_dvec3() + self.motion.position,
+                                    tick: self.tick.saturating_add(1),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -22721,6 +22771,73 @@ mod tests {
             None,
             "the player overlaps the honey collision shape"
         );
+    }
+
+    #[test]
+    fn honey_wall_contact_updates_player_motion_and_world_random() {
+        for seed in [0, 1, 17, 1234567] {
+            let setup = |honey: bool| {
+                let mut test = session();
+                test.set_random_tick_speed(0);
+                test.motion.position = DVec3::new(9.24, 5.2, 8.5);
+                test.motion.velocity = DVec3::new(0.0, -0.5, 0.1);
+                test.motion.on_ground = false;
+                test.player.position = test.motion.position.as_vec3();
+                test.player.on_ground = false;
+                test.fall_distance = 9.0;
+                test.player_silent = true;
+                test.level_random = native_core::random::LegacyRandom::new(seed);
+                test.client_level_random = native_core::random::LegacyRandom::new(seed + 31);
+                if honey {
+                    let id = test.intern_block(state("minecraft:honey_block", &[]));
+                    assert!(test.set(IVec3::new(8, 4, 8), id));
+                    assert!(test.set(IVec3::new(8, 5, 8), id));
+                }
+                test
+            };
+            let mut plain = setup(false);
+            let mut test = setup(true);
+            plain.update(TICK);
+            test.update(TICK);
+            let block = test.origin + IVec3::new(8, 4, 8);
+            let expected = crate::honey::slide(
+                test.origin.as_dvec3() + plain.motion.position,
+                block,
+                false,
+                plain.motion.velocity,
+            )
+            .expect("test must slide");
+            assert!(
+                (test.motion.velocity - expected).abs().max_element() < 1.0e-12,
+                "seed={seed}"
+            );
+            assert_eq!(test.fall_distance, 0.0);
+            assert!(plain.fall_distance > 9.0);
+            assert!(!test.unresolved_player_fire_contact);
+            let mut expected_random = native_core::random::LegacyRandom::new(seed);
+            let (_, particle) = crate::honey::effects(&mut expected_random);
+            let mut expected_client_random = native_core::random::LegacyRandom::new(seed + 31);
+            let sound = crate::honey::client_sound(&mut expected_client_random);
+            let sounds = test.take_consume_sounds();
+            assert_eq!(sounds.len(), usize::from(sound), "seed={seed}");
+            if sound {
+                assert_eq!(sounds[0].info.event, "block.honey_block.slide");
+            }
+            let particles = test.take_honey_slide_particles();
+            assert_eq!(particles.len(), usize::from(particle), "seed={seed}");
+            if particle {
+                assert_eq!(
+                    particles[0].position,
+                    test.origin.as_dvec3() + test.motion.position
+                );
+                assert_eq!(particles[0].tick, 1);
+            }
+            assert_eq!(test.level_random.next_int(), expected_random.next_int());
+            assert_eq!(
+                test.client_level_random.next_int(),
+                expected_client_random.next_int()
+            );
+        }
     }
 
     #[test]

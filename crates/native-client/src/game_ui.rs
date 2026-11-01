@@ -157,14 +157,14 @@ pub struct GameUi {
     consume_particles: crate::consume_particles::ParticleSystem,
     plant_sprites: Option<
         std::collections::BTreeMap<
-            native_session::loaded::PlantParticleKind,
+            native_session::loaded::TerrainParticleKind,
             (Arc<image::RgbaImage>, bool),
         >,
     >,
     plant_sprite_result: std::sync::mpsc::Receiver<
         Result<
             std::collections::BTreeMap<
-                native_session::loaded::PlantParticleKind,
+                native_session::loaded::TerrainParticleKind,
                 (Arc<image::RgbaImage>, bool),
             >,
             String,
@@ -337,6 +337,13 @@ impl GameUi {
         bursts: Vec<native_session::loaded::PlantBreakParticles>,
     ) {
         self.consume_particles.queue_plant_breaks(bursts);
+    }
+
+    pub fn queue_honey_slide_particles(
+        &mut self,
+        bursts: Vec<native_session::loaded::HoneySlideParticles>,
+    ) {
+        self.consume_particles.queue_honey_slides(bursts);
     }
 
     pub fn update_evaporation_smoke(
@@ -2022,7 +2029,7 @@ impl GameUi {
                     };
                     (Arc::clone(texture), [1.0; 3], false)
                 }
-                crate::consume_particles::ParticleVisual::Plant(kind, position) => {
+                crate::consume_particles::ParticleVisual::Terrain(kind, position) => {
                     let Some((texture, opaque)) = self
                         .plant_sprites
                         .as_ref()
@@ -2031,7 +2038,12 @@ impl GameUi {
                         continue;
                     };
                     let color = match (kind, &snapshot.world, biome_colors) {
-                        (native_session::loaded::PlantParticleKind::DeadBush, _, _) => [0.6; 3],
+                        (
+                            native_session::loaded::TerrainParticleKind::DeadBush
+                            | native_session::loaded::TerrainParticleKind::HoneyBlock,
+                            _,
+                            _,
+                        ) => [0.6; 3],
                         (_, native_session::SessionWorld::Loaded(world), Some(biomes)) => {
                             *plant_colors.entry(*position).or_insert_with(|| {
                                 crate::preview::grass_particle_tint(

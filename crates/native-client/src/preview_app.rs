@@ -713,10 +713,12 @@ impl Viewer {
             let snapshot = play.session.snapshot();
             let particles = play.session.take_consume_particles();
             let plant_breaks = play.session.take_plant_break_particles();
+            let honey_slides = play.session.take_honey_slide_particles();
             let smoke = play.session.take_evaporation_smoke();
             let fizz = play.session.take_lava_fizz();
             let fizz_sounds = if let Some(ui) = &mut self.ui {
                 ui.queue_plant_break_particles(plant_breaks);
+                ui.queue_honey_slide_particles(honey_slides);
                 ui.update_consume_particles(&snapshot, particles);
                 ui.update_evaporation_smoke(&snapshot, smoke, fizz)
             } else {

@@ -373,16 +373,17 @@ impl Loader {
         &mut self,
     ) -> Result<
         std::collections::BTreeMap<
-            native_session::loaded::PlantParticleKind,
+            native_session::loaded::TerrainParticleKind,
             (Arc<RgbaImage>, bool),
         >,
     > {
-        use native_session::loaded::PlantParticleKind;
+        use native_session::loaded::TerrainParticleKind;
         let mut result = std::collections::BTreeMap::new();
         for kind in [
-            PlantParticleKind::ShortGrass,
-            PlantParticleKind::Fern,
-            PlantParticleKind::DeadBush,
+            TerrainParticleKind::ShortGrass,
+            TerrainParticleKind::Fern,
+            TerrainParticleKind::DeadBush,
+            TerrainParticleKind::HoneyBlock,
         ] {
             let loaded: Result<_> = (|| {
                 let groups = native_resources::blockstates::resolve_blockstate(
@@ -1334,14 +1335,14 @@ mod tests {
     #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn plant_particle_sprites_follow_blockstate_model_and_resource_pack() {
-        use native_session::loaded::PlantParticleKind;
+        use native_session::loaded::TerrainParticleKind;
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let vanilla = open_loader(&game, &[])
             .load_plant_particle_sprites()
             .unwrap();
-        assert_eq!(vanilla.len(), 3);
+        assert_eq!(vanilla.len(), 4);
         let pack = tempfile::tempdir().unwrap();
         let base = pack.path().join("assets/minecraft");
         std::fs::create_dir_all(base.join("blockstates")).unwrap();
@@ -1352,6 +1353,11 @@ mod tests {
             br#"{"variants":{"":{"model":"minecraft:block/custom_plant"}}}"#,
         )
         .unwrap();
+        std::fs::write(
+            base.join("blockstates/honey_block.json"),
+            br#"{"variants":{"":{"model":"minecraft:block/custom_plant"}}}"#,
+        )
+        .unwrap();
         std::fs::write(base.join("models/block/custom_plant.json"), br##"{"textures":{"particle":"#texture","texture":"minecraft:block/custom_particle"}}"##).unwrap();
         RgbaImage::from_pixel(4, 4, image::Rgba([7, 11, 13, 255]))
             .save(base.join("textures/block/custom_particle.png"))
@@ -1359,10 +1365,17 @@ mod tests {
         let selected = open_loader(&game, &[pack.path().to_path_buf()])
             .load_plant_particle_sprites()
             .unwrap();
-        let (image, opaque) = &selected[&PlantParticleKind::ShortGrass];
+        let (image, opaque) = &selected[&TerrainParticleKind::ShortGrass];
         assert_eq!(image.get_pixel(0, 0).0, [7, 11, 13, 255]);
         assert!(*opaque);
-        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected[&TerrainParticleKind::HoneyBlock]
+                .0
+                .get_pixel(0, 0)
+                .0,
+            [7, 11, 13, 255]
+        );
+        assert_eq!(selected.len(), 4);
     }
 
     #[test]

@@ -1,24 +1,26 @@
-//! Vanilla full-block inside-contact detection for fire and lit campfires.
+//! Vanilla full-block inside-contact detection for selected block effects.
 use std::collections::HashSet;
 
 use glam::{DVec3, IVec3};
 use native_world::{loaded::BlockState, movement::BoundingBox};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FireBlock {
+pub(crate) enum InsideBlock {
     Fire(u8),
     Campfire(u8),
+    Honey,
 }
 
-pub(crate) fn effect(state: &BlockState) -> Option<FireBlock> {
+pub(crate) fn effect(state: &BlockState) -> Option<InsideBlock> {
     match state.name.as_str() {
-        "minecraft:fire" => Some(FireBlock::Fire(1)),
-        "minecraft:soul_fire" => Some(FireBlock::Fire(2)),
+        "minecraft:fire" => Some(InsideBlock::Fire(1)),
+        "minecraft:soul_fire" => Some(InsideBlock::Fire(2)),
+        "minecraft:honey_block" if state.properties.is_empty() => Some(InsideBlock::Honey),
         "minecraft:campfire" if state.properties.get("lit").is_some_and(|v| v == "true") => {
-            Some(FireBlock::Campfire(1))
+            Some(InsideBlock::Campfire(1))
         }
         "minecraft:soul_campfire" if state.properties.get("lit").is_some_and(|v| v == "true") => {
-            Some(FireBlock::Campfire(2))
+            Some(InsideBlock::Campfire(2))
         }
         _ => None,
     }
@@ -28,7 +30,7 @@ pub(crate) fn effect(state: &BlockState) -> Option<FireBlock> {
 pub(crate) struct Contact {
     pub axis_step: u8,
     pub time: f64,
-    pub kind: FireBlock,
+    pub kind: InsideBlock,
     pub position: IVec3,
 }
 
@@ -73,7 +75,7 @@ pub(crate) fn swept(
     bounds: BoundingBox,
     actual: DVec3,
     requested: DVec3,
-    lookup: impl Fn(IVec3) -> Option<Option<FireBlock>>,
+    lookup: impl Fn(IVec3) -> Option<Option<InsideBlock>>,
 ) -> Option<Vec<Contact>> {
     if !bounds.min.is_finite()
         || !bounds.max.is_finite()
@@ -177,7 +179,7 @@ mod tests {
             min: DVec3::new(0.2, 1.0, 0.2),
             max: DVec3::new(0.8, 2.8, 0.8),
         };
-        let lookup = |pos| Some((pos == IVec3::new(2, 1, 0)).then_some(FireBlock::Fire(1)));
+        let lookup = |pos| Some((pos == IVec3::new(2, 1, 0)).then_some(InsideBlock::Fire(1)));
         let events = swept(
             bounds,
             DVec3::new(4.0, 0.0, 0.0),
@@ -187,7 +189,7 @@ mod tests {
         .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].position, IVec3::new(2, 1, 0));
-        assert_eq!(events[0].kind, FireBlock::Fire(1));
+        assert_eq!(events[0].kind, InsideBlock::Fire(1));
         assert!((events[0].time - 0.3).abs() < 0.000_01);
         assert!(
             swept(
@@ -213,19 +215,19 @@ mod tests {
         };
         assert_eq!(
             effect(&state("minecraft:fire", "false")),
-            Some(FireBlock::Fire(1))
+            Some(InsideBlock::Fire(1))
         );
         assert_eq!(
             effect(&state("minecraft:soul_fire", "false")),
-            Some(FireBlock::Fire(2))
+            Some(InsideBlock::Fire(2))
         );
         assert_eq!(
             effect(&state("minecraft:campfire", "true")),
-            Some(FireBlock::Campfire(1))
+            Some(InsideBlock::Campfire(1))
         );
         assert_eq!(
             effect(&state("minecraft:soul_campfire", "true")),
-            Some(FireBlock::Campfire(2))
+            Some(InsideBlock::Campfire(2))
         );
         assert_eq!(effect(&state("minecraft:campfire", "false")), None);
     }
@@ -297,7 +299,8 @@ mod tests {
             let position = DVec3::new(input[0], input[1], input[2]);
             let delta = DVec3::new(input[3], input[4], input[5]);
             let bounds = crate::movement::player_bounds(position, crate::PLAYER_HEIGHT);
-            let contacts = swept(bounds, delta, delta, |_| Some(Some(FireBlock::Fire(1)))).unwrap();
+            let contacts =
+                swept(bounds, delta, delta, |_| Some(Some(InsideBlock::Fire(1)))).unwrap();
             let mut actual = BTreeMap::new();
             for contact in contacts {
                 let step =

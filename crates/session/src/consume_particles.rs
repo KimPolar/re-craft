@@ -6,6 +6,64 @@ use glam::DVec3;
 
 use crate::{inventory::ItemStack, physics::java_sin};
 
+/// Handle a client-side equipment-break event using the item the client saw
+/// before its equipment update. Known default sounds share the normal sound
+/// queue; particles use the same item renderer as consumption particles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn equipment_break(
+    item: &Arc<ItemStack>,
+    silent: bool,
+    position: DVec3,
+    eye: DVec3,
+    yaw: f32,
+    pitch: f32,
+    tick: u64,
+    random: &mut native_core::random::LegacyRandom,
+    sounds: &mut std::collections::VecDeque<crate::ConsumeSound>,
+    particles: &mut std::collections::VecDeque<ConsumeParticleSpawn>,
+) {
+    use native_persistence::nbt::Tag;
+    let sound = if item.components().get("!minecraft:break_sound").is_some() {
+        None
+    } else {
+        match item.components().get("minecraft:break_sound") {
+            None => Some(Some(if item.id() == "minecraft:shield" {
+                "item.shield.break"
+            } else {
+                "entity.item.break"
+            })),
+            Some(Tag::String(value)) => {
+                let id = String::from_utf16_lossy(&value.0);
+                Some(match id.as_str() {
+                    "minecraft:entity.item.break" | "entity.item.break" => {
+                        Some("entity.item.break")
+                    }
+                    "minecraft:item.shield.break" | "item.shield.break" => {
+                        Some("item.shield.break")
+                    }
+                    _ => None,
+                })
+            }
+            Some(_) => None,
+        }
+    };
+    if !silent && let Some(event) = sound {
+        let pitch = 0.8_f32 + random.next_float() * 0.4_f32;
+        if let Some(event) = event {
+            crate::queue_player_sound(sounds, position, event, 0.8, pitch);
+        }
+    }
+    for _ in 0..5 {
+        let samples = [
+            random.next_float(),
+            random.next_float(),
+            random.next_float(),
+            random.next_float(),
+        ];
+        crate::push_consume_particle(particles, item, samples, eye, yaw, pitch, tick);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConsumeParticleSpawn {
     pub item: Arc<ItemStack>,
@@ -50,6 +108,123 @@ pub(crate) fn particle_vectors(
 mod tests {
     use super::*;
     use std::{path::PathBuf, process::Command};
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn equipment_break_feedback_matches_java() {
+        use native_persistence::nbt::Tag;
+        use std::collections::VecDeque;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("EquipmentBreakOracle.java");
+        let output = temp.path().join("break.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/EquipmentBreakOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("EquipmentBreakOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 288);
+        for row in rows {
+            let mut components = Vec::new();
+            if row["missing"].as_bool().unwrap() {
+                components.push(("!minecraft:break_sound".into(), Tag::Compound(vec![])));
+            }
+            let item = Arc::new(
+                ItemStack::new(
+                    "minecraft:iron_helmet".into(),
+                    1,
+                    1,
+                    Tag::Compound(components),
+                )
+                .unwrap(),
+            );
+            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            let mut sounds = VecDeque::new();
+            let mut particles = VecDeque::new();
+            equipment_break(
+                &item,
+                row["silent"].as_bool().unwrap(),
+                DVec3::new(12.25, 64.0, -30.75),
+                DVec3::new(12.25, 65.62, -30.75),
+                row["yaw"].as_f64().unwrap() as f32,
+                row["pitch"].as_f64().unwrap() as f32,
+                1,
+                &mut random,
+                &mut sounds,
+                &mut particles,
+            );
+            let java_sounds = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), java_sounds.len(), "{row}");
+            for (sound, expected) in sounds.iter().zip(java_sounds) {
+                assert_eq!(
+                    format!("minecraft:{}", sound.info.event),
+                    expected["event"].as_str().unwrap()
+                );
+                assert_eq!(
+                    sound.info.volume.to_bits(),
+                    expected["volume"].as_i64().unwrap() as u32
+                );
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    expected["pitch"].as_i64().unwrap() as u32
+                );
+            }
+            for (particle, expected) in particles.iter().zip(row["particles"].as_array().unwrap()) {
+                for (actual, value) in particle
+                    .position
+                    .to_array()
+                    .into_iter()
+                    .chain(particle.velocity.to_array())
+                    .zip(expected.as_array().unwrap())
+                {
+                    assert_eq!(actual.to_bits(), value.as_i64().unwrap() as u64, "{row}");
+                }
+            }
+            assert_eq!(particles.len(), 5);
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

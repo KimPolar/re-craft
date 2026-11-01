@@ -1378,7 +1378,52 @@ impl LoadedSession {
         self.queue_player_sound(event, 1.0, pitch);
     }
 
+    fn queue_broken_equipment(&mut self, before: &PlayerInventory) {
+        use crate::inventory::PlayerSlot;
+        let items: Vec<_> = (0..4)
+            .rev()
+            .filter_map(|index| {
+                let slot = PlayerSlot::Armor(index);
+                if self.inventory.slot(slot).is_none() {
+                    before.slot(slot).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for item in items {
+            self.queue_broken_item(item);
+        }
+    }
+
+    fn queue_broken_item(&mut self, item: ItemStack) {
+        let position = self.origin.as_dvec3() + self.motion.position;
+        crate::consume_particles::equipment_break(
+            &Arc::new(item),
+            self.player_silent,
+            position,
+            position + DVec3::Y * f64::from(self.player.pose.eye_height()),
+            self.player.yaw.to_degrees() - 180.0,
+            -self.player.pitch.to_degrees(),
+            self.tick.saturating_add(1),
+            &mut self.player_client_random,
+            &mut self.consume_sounds,
+            &mut self.consume_particles,
+        );
+    }
+
+    fn damage_held_tool_with_feedback(&mut self, hand: crate::inventory::PlayerSlot, amount: u32) {
+        let before = self.inventory.slot(hand).cloned();
+        if Arc::make_mut(&mut self.inventory).damage_held_tool(hand, amount, &mut self.level_random)
+            && self.inventory.slot(hand).is_none()
+            && let Some(item) = before
+        {
+            self.queue_broken_item(item);
+        }
+    }
+
     fn player_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
+        let previous_inventory = Arc::clone(&self.inventory);
         let outcome = match self.fall.damage_with_equipment(
             amount,
             source,
@@ -1401,6 +1446,7 @@ impl LoadedSession {
         if !outcome.accepted {
             return false;
         }
+        self.queue_broken_equipment(&previous_inventory);
         self.player_damage_feedback(source, outcome);
         if self.death.is_none() && self.vitals.health <= 0.0 {
             self.death = Some(DeathInfo {
@@ -10687,8 +10733,10 @@ impl LoadedSession {
                 properties.map_or(0, |properties| properties.damage_per_block)
             };
             if self.game_mode != GameMode::Creative && damage != 0 {
-                Arc::make_mut(&mut self.inventory)
-                    .damage_selected_tool(damage, &mut self.level_random);
+                self.damage_held_tool_with_feedback(
+                    crate::inventory::PlayerSlot::Storage(self.inventory.selected()),
+                    damage,
+                );
             }
             if player_loot {
                 // Java resolves loot after neighbor notifications and tool wear.
@@ -10869,7 +10917,10 @@ impl LoadedSession {
         }
         let damage = properties.map_or(0, |properties| properties.damage_per_block);
         if self.game_mode != GameMode::Creative && damage != 0 {
-            Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
+            self.damage_held_tool_with_feedback(
+                crate::inventory::PlayerSlot::Storage(self.inventory.selected()),
+                damage,
+            );
         }
         if let Some(components) = components {
             let ((drops, prepared), _) = self
@@ -11110,7 +11161,10 @@ impl LoadedSession {
         }
         let damage = properties.map_or(0, |p| p.damage_per_block);
         if player && self.game_mode != GameMode::Creative && damage != 0 {
-            Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
+            self.damage_held_tool_with_feedback(
+                crate::inventory::PlayerSlot::Storage(self.inventory.selected()),
+                damage,
+            );
         }
         if player && needs_loot {
             // Player destruction resolves the original entity after tool wear.
@@ -11271,11 +11325,7 @@ impl LoadedSession {
                 );
             }
             if self.game_mode != GameMode::Creative && result.damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_held_tool(
-                    hand,
-                    result.damage,
-                    &mut self.level_random,
-                );
+                self.damage_held_tool_with_feedback(hand, result.damage);
             }
             if let Some(checked) = checked {
                 self.apply_block_set(relative, target, true, checked);
@@ -14990,6 +15040,7 @@ impl LoadedSession {
                 .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
             let before_landing_vitals = self.vitals;
             let before_landing_cooldown = self.damage_cooldown;
+            let before_landing_inventory = Arc::clone(&self.inventory);
             let mut landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id))
             {
                 match self.fall.land_with_cooldown(
@@ -15036,6 +15087,9 @@ impl LoadedSession {
                         Default::default()
                     }
                 };
+            }
+            if landing.damage.accepted {
+                self.queue_broken_equipment(&before_landing_inventory);
             }
             let fall_amount = landing.amount;
             if fall_amount > 0 {
@@ -40143,6 +40197,95 @@ mod tests {
     }
 
     #[test]
+    fn broken_armor_emits_client_sound_particles_and_preserves_random_order() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for silent in [false, true] {
+            let mut test = session();
+            test.player_silent = silent;
+            test.player_client_random = native_core::random::LegacyRandom::new(54321);
+            let helmet = ItemStack::new(
+                "minecraft:iron_helmet".into(),
+                1,
+                1,
+                Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(164))]),
+            )
+            .unwrap();
+            Arc::make_mut(&mut test.inventory).set_slot(PlayerSlot::Armor(0), Some(helmet));
+            test.armor.refresh(&test.inventory).unwrap();
+            assert!(test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+            let sounds = test.take_consume_sounds();
+            let broken = sounds
+                .iter()
+                .find(|sound| sound.info.event == "entity.item.break");
+            let mut expected = native_core::random::LegacyRandom::new(54321);
+            if silent {
+                assert!(broken.is_none());
+            } else {
+                let pitch = 0.8_f32 + expected.next_float() * 0.4_f32;
+                let sound = broken.unwrap();
+                assert_eq!(sound.info.volume.to_bits(), 0.8_f32.to_bits());
+                assert_eq!(sound.info.pitch.to_bits(), pitch.to_bits());
+                assert_eq!(sounds[0].info.event, "entity.item.break");
+            }
+            for _ in 0..20 {
+                expected.next_float();
+            }
+            crate::client_damage_pitch(&mut expected);
+            let particles = test.take_consume_particles();
+            assert_eq!(particles.len(), 5);
+            assert!(
+                particles
+                    .iter()
+                    .all(|particle| particle.item.id() == "minecraft:iron_helmet")
+            );
+            assert_eq!(test.player_client_random.next_int(), expected.next_int());
+        }
+        let mut test = session();
+        test.player_client_random = native_core::random::LegacyRandom::new(777);
+        for (slot, id, damage) in [
+            (PlayerSlot::Armor(0), "minecraft:iron_helmet", 164),
+            (PlayerSlot::Armor(3), "minecraft:iron_boots", 194),
+        ] {
+            Arc::make_mut(&mut test.inventory).set_slot(
+                slot,
+                ItemStack::new(
+                    id.into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(damage))]),
+                ),
+            );
+        }
+        test.armor.refresh(&test.inventory).unwrap();
+        assert!(test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+        let sounds = test.take_consume_sounds();
+        assert_eq!(
+            sounds
+                .iter()
+                .map(|sound| sound.info.event)
+                .collect::<Vec<_>>(),
+            [
+                "entity.item.break",
+                "entity.item.break",
+                "entity.player.hurt_on_fire"
+            ]
+        );
+        let particles = test.take_consume_particles();
+        assert_eq!(particles.len(), 10);
+        assert!(
+            particles[..5]
+                .iter()
+                .all(|particle| particle.item.id() == "minecraft:iron_boots")
+        );
+        assert!(
+            particles[5..]
+                .iter()
+                .all(|particle| particle.item.id() == "minecraft:iron_helmet")
+        );
+    }
+
+    #[test]
     fn drowning_and_starvation_use_damage_type_feedback_and_cooldowns() {
         use native_resources::packs::ResourceId;
         struct Pack(bool);
@@ -47305,6 +47448,19 @@ mod tests {
                 "minecraft:air"
             );
             assert!(after.inventory.slot(PlayerSlot::Storage(0)).is_none());
+            let particles = session.take_consume_particles();
+            assert_eq!(particles.len(), 5);
+            assert!(
+                particles
+                    .iter()
+                    .all(|particle| particle.item.id() == "minecraft:stone_pickaxe")
+            );
+            assert!(
+                session
+                    .take_consume_sounds()
+                    .iter()
+                    .any(|sound| sound.info.event == "entity.item.break")
+            );
             assert_eq!(
                 before
                     .inventory

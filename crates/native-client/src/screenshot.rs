@@ -4,7 +4,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread,
     time::Duration,
 };
@@ -15,20 +18,39 @@ use image::ImageEncoder;
 /// Bounded queue: screenshot processing must never stall the render thread or
 /// consume an unbounded amount of GPU and CPU memory.
 pub struct Screenshots {
-    jobs: SyncSender<Job>,
+    sender: ScreenshotSender,
     results: Receiver<Result<PathBuf>>,
 }
 
+#[derive(Clone)]
+pub struct ScreenshotSender {
+    jobs: SyncSender<Job>,
+    feedback: mpsc::Sender<Result<PathBuf>>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+pub struct ScreenshotRequest {
+    pub directory: PathBuf,
+    pub sender: ScreenshotSender,
+}
+
 struct Job {
-    device: wgpu::Device,
-    buffer: wgpu::Buffer,
-    submission: wgpu::SubmissionIndex,
+    source: Source,
     directory: PathBuf,
     timestamp: String,
     width: u32,
     height: u32,
-    stride: u32,
-    bgra: bool,
+}
+
+enum Source {
+    Gpu {
+        device: wgpu::Device,
+        buffer: wgpu::Buffer,
+        submission: wgpu::SubmissionIndex,
+        stride: u32,
+        bgra: bool,
+    },
+    Software(Vec<u32>),
 }
 
 pub struct Readback {
@@ -105,17 +127,36 @@ impl Readback {
 
 impl Screenshots {
     pub fn new() -> Result<Self> {
+        Self::new_with_waker(|| {})
+    }
+
+    pub fn new_with_waker(wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         let (jobs, receiver) = mpsc::sync_channel::<Job>(3);
         let (send_result, results) = mpsc::channel();
+        let feedback = send_result.clone();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
+        let worker_wake = Arc::clone(&wake);
         thread::Builder::new()
             .name("screenshot-writer".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
                     let _ = send_result.send(job.run());
+                    worker_wake();
                 }
             })
             .context("cannot start screenshot writer")?;
-        Ok(Self { jobs, results })
+        Ok(Self {
+            sender: ScreenshotSender {
+                jobs,
+                feedback,
+                wake,
+            },
+            results,
+        })
+    }
+
+    pub fn sender(&self) -> ScreenshotSender {
+        self.sender.clone()
     }
 
     pub fn submit(
@@ -125,21 +166,8 @@ impl Screenshots {
         submission: wgpu::SubmissionIndex,
         minecraft_dir: &Path,
     ) -> Result<()> {
-        let job = Job {
-            device: device.clone(),
-            buffer: readback.buffer,
-            submission,
-            directory: minecraft_dir.join("screenshots"),
-            timestamp: timestamp(),
-            width: readback.width,
-            height: readback.height,
-            stride: readback.stride,
-            bgra: readback.bgra,
-        };
-        self.jobs.try_send(job).map_err(|error| match error {
-            TrySendError::Full(_) => anyhow::anyhow!("screenshot queue is full"),
-            TrySendError::Disconnected(_) => anyhow::anyhow!("screenshot writer stopped"),
-        })
+        self.sender
+            .submit(device, readback, submission, minecraft_dir)
     }
 
     pub fn take_result(&self) -> Option<Result<PathBuf>> {
@@ -147,31 +175,109 @@ impl Screenshots {
     }
 }
 
+impl ScreenshotSender {
+    pub fn report_error(&self, error: anyhow::Error) {
+        let _ = self.feedback.send(Err(error));
+        (self.wake)();
+    }
+    pub fn submit(
+        &self,
+        device: &wgpu::Device,
+        readback: Readback,
+        submission: wgpu::SubmissionIndex,
+        minecraft_dir: &Path,
+    ) -> Result<()> {
+        let job = Job {
+            source: Source::Gpu {
+                device: device.clone(),
+                buffer: readback.buffer,
+                submission,
+                stride: readback.stride,
+                bgra: readback.bgra,
+            },
+            directory: minecraft_dir.join("screenshots"),
+            timestamp: timestamp(),
+            width: readback.width,
+            height: readback.height,
+        };
+        self.send(job)
+    }
+
+    pub fn submit_software(
+        &self,
+        minecraft_dir: &Path,
+        size: (u32, u32),
+        pixels: Vec<u32>,
+    ) -> Result<()> {
+        let expected = u64::from(size.0) * u64::from(size.1);
+        ensure!(
+            size.0 > 0 && size.1 > 0 && u64::try_from(pixels.len())? == expected,
+            "invalid software screenshot dimensions"
+        );
+        self.send(Job {
+            source: Source::Software(pixels),
+            directory: minecraft_dir.join("screenshots"),
+            timestamp: timestamp(),
+            width: size.0,
+            height: size.1,
+        })
+    }
+
+    fn send(&self, job: Job) -> Result<()> {
+        self.jobs.try_send(job).map_err(|error| match error {
+            TrySendError::Full(_) => anyhow::anyhow!("screenshot queue is full"),
+            TrySendError::Disconnected(_) => anyhow::anyhow!("screenshot writer stopped"),
+        })
+    }
+}
+
 impl Job {
     fn run(self) -> Result<PathBuf> {
-        let (sender, receiver) = mpsc::channel();
-        self.buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(self.submission),
-                timeout: Some(Duration::from_secs(30)),
-            })
-            .context("screenshot GPU readback failed")?;
-        receiver
-            .recv_timeout(Duration::from_secs(1))
-            .context("screenshot readback timed out")??;
-        let mapped = self
-            .buffer
-            .slice(..)
-            .get_mapped_range()
-            .context("cannot access screenshot pixels")?;
-        let pixels = unpack(&mapped, self.width, self.height, self.stride, self.bgra)?;
-        drop(mapped);
-        self.buffer.unmap();
+        let pixels = match self.source {
+            Source::Software(pixels) => {
+                let mut rgba = Vec::with_capacity(
+                    pixels
+                        .len()
+                        .checked_mul(4)
+                        .context("screenshot too large")?,
+                );
+                for p in pixels {
+                    rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, 255]);
+                }
+                rgba
+            }
+            Source::Gpu {
+                device,
+                buffer,
+                submission,
+                stride,
+                bgra,
+            } => {
+                let (sender, receiver) = mpsc::channel();
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = sender.send(result);
+                    });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: Some(Duration::from_secs(30)),
+                    })
+                    .context("screenshot GPU readback failed")?;
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .context("screenshot readback timed out")??;
+                let mapped = buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .context("cannot access screenshot pixels")?;
+                let pixels = unpack(&mapped, self.width, self.height, stride, bgra)?;
+                drop(mapped);
+                buffer.unmap();
+                pixels
+            }
+        };
         write_png(
             &self.directory,
             &self.timestamp,
@@ -302,5 +408,30 @@ mod tests {
         let error = write_png(&occupied, "2026-11-01_12.34.56", 1, 1, &[1, 2, 3, 255]).unwrap_err();
         assert!(format!("{error:#}").contains("screenshots directory"));
         assert_eq!(fs::read(occupied).unwrap(), b"not a directory");
+    }
+
+    #[test]
+    fn software_frame_is_encoded_off_thread_with_correct_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Screenshots::new().unwrap();
+        writer
+            .sender()
+            .submit_software(dir.path(), (2, 1), vec![0x00112233, 0x00aabbcc])
+            .unwrap();
+        let file = writer
+            .results
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image::open(file).unwrap().to_rgba8().as_raw(),
+            &[0x11, 0x22, 0x33, 255, 0xaa, 0xbb, 0xcc, 255]
+        );
+        assert!(
+            writer
+                .sender()
+                .submit_software(dir.path(), (2, 2), vec![0])
+                .is_err()
+        );
     }
 }

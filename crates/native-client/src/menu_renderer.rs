@@ -126,6 +126,9 @@ pub struct MenuRenderer {
     overlay_texture: Option<wgpu::Texture>,
     overlay_binding: Option<wgpu::BindGroup>,
     overlay_size: (u32, u32),
+    screenshot_requests: std::collections::VecDeque<crate::screenshot::ScreenshotRequest>,
+    screenshot_surface_copy: bool,
+    screenshot_blitter: Option<wgpu::util::TextureBlitter>,
     lost_device: Arc<AtomicBool>,
     #[cfg(any(debug_assertions, test))]
     frame_timings: Option<GpuFrameTimings>,
@@ -211,6 +214,10 @@ impl MenuRenderer {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| anyhow!("menu surface has no compatible configuration"))?;
         let capabilities = surface.get_capabilities(&adapter);
+        let screenshot_surface_copy = capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if screenshot_surface_copy {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         if let Some(format) = capabilities
             .formats
             .iter()
@@ -326,6 +333,9 @@ impl MenuRenderer {
             overlay_texture: None,
             overlay_binding: None,
             overlay_size: (0, 0),
+            screenshot_requests: std::collections::VecDeque::new(),
+            screenshot_surface_copy,
+            screenshot_blitter: None,
             lost_device,
             #[cfg(any(debug_assertions, test))]
             frame_timings: std::env::var_os("NATIVE_MENU_FRAME_TIMINGS")
@@ -470,6 +480,22 @@ impl MenuRenderer {
             &rgba,
         );
         Ok(())
+    }
+
+    pub fn request_screenshots(&mut self, requests: Vec<crate::screenshot::ScreenshotRequest>) {
+        for request in requests {
+            if self.screenshot_requests.len() >= 4 {
+                request
+                    .sender
+                    .report_error(anyhow::anyhow!("screenshot queue is full"));
+            } else {
+                self.screenshot_requests.push_back(request);
+            }
+        }
+    }
+
+    pub fn has_pending_screenshots(&self) -> bool {
+        !self.screenshot_requests.is_empty()
     }
 
     fn start_blur_pipeline_task(&mut self) -> Result<()> {
@@ -667,9 +693,35 @@ impl MenuRenderer {
         ];
         self.queue
             .write_buffer(&self.params, 0, bytemuck::cast_slice(&params));
-        let view = frame
+        let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let screenshot = self.screenshot_requests.pop_front();
+        let screenshot_texture = screenshot
+            .as_ref()
+            .filter(|_| !self.screenshot_surface_copy)
+            .map(|_| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("menu screenshot frame"),
+                    size: wgpu::Extent3d {
+                        width: self.config.width,
+                        height: self.config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            });
+        let screenshot_view = screenshot_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let view = screenshot_view.as_ref().unwrap_or(&surface_view);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -759,7 +811,7 @@ impl MenuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("menu composite"),
                 color_attachments: &[Some(color_attachment(
-                    &view,
+                    view,
                     wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 ))],
                 depth_stencil_attachment: None,
@@ -801,7 +853,36 @@ impl MenuRenderer {
         }
         #[cfg(any(debug_assertions, test))]
         let encoded = started.map(|start| start.elapsed());
-        self.queue.submit([encoder.finish()]);
+        let readback = if screenshot.is_some() {
+            let texture = screenshot_texture.as_ref().unwrap_or(&frame.texture);
+            let readback = crate::screenshot::Readback::encode(
+                &self.device,
+                &mut encoder,
+                texture,
+                (self.config.width, self.config.height),
+                self.config.format,
+            );
+            if screenshot_texture.is_some() {
+                let blitter = self.screenshot_blitter.get_or_insert_with(|| {
+                    wgpu::util::TextureBlitter::new(&self.device, self.config.format)
+                });
+                blitter.copy(&self.device, &mut encoder, view, &surface_view);
+            }
+            Some(readback)
+        } else {
+            None
+        };
+        let submission = self.queue.submit([encoder.finish()]);
+        if let (Some(request), Some(readback)) = (screenshot, readback) {
+            let result = readback.and_then(|readback| {
+                request
+                    .sender
+                    .submit(&self.device, readback, submission, &request.directory)
+            });
+            if let Err(error) = result {
+                request.sender.report_error(error);
+            }
+        }
         #[cfg(any(debug_assertions, test))]
         let submitted = started.map(|start| start.elapsed());
         self.queue.present(frame);
@@ -832,6 +913,16 @@ impl MenuRenderer {
             self.surface.configure(&self.device, &self.config);
         }
         Ok(true)
+    }
+}
+
+impl Drop for MenuRenderer {
+    fn drop(&mut self) {
+        for request in self.screenshot_requests.drain(..) {
+            request.sender.report_error(anyhow::anyhow!(
+                "menu renderer stopped before taking screenshot"
+            ));
+        }
     }
 }
 

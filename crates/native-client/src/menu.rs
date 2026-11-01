@@ -894,6 +894,8 @@ struct Menu<'a> {
     software_generation: u64,
     software_scene: Option<SoftwareScene>,
     software_frame_due: bool,
+    screenshots: Option<crate::screenshot::Screenshots>,
+    screenshot_requests: std::collections::VecDeque<PathBuf>,
     #[cfg(test)]
     software_presented: Option<((u32, u32), u64, usize)>,
     overlay_dirty: bool,
@@ -927,6 +929,20 @@ struct Menu<'a> {
 }
 
 impl<'a> Menu<'a> {
+    fn request_screenshot(&mut self) {
+        if self.screenshots.is_none() {
+            self.state.error = Some("Screenshot writer unavailable".into());
+            self.invalidate();
+        } else if self.screenshot_requests.len() >= 4 {
+            self.state.error = Some("Screenshot queue is full".into());
+            self.invalidate();
+        } else {
+            self.screenshot_requests
+                .push_back(self.state.minecraft_dir.clone());
+            self.software_frame_due = true;
+        }
+    }
+
     fn new(state: &'a mut State) -> Self {
         let video_ui = VideoUi::new(state.video);
         let fov_ui = FovSlider::new(state.video.fov);
@@ -942,6 +958,8 @@ impl<'a> Menu<'a> {
             software_generation: 0,
             software_scene: None,
             software_frame_due: false,
+            screenshots: None,
+            screenshot_requests: std::collections::VecDeque::new(),
             #[cfg(test)]
             software_presented: None,
             overlay_dirty: true,
@@ -2214,10 +2232,25 @@ impl<'a> Menu<'a> {
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let mut buffer = surface.buffer_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
-                for (dest, source) in buffer.iter_mut().zip(image.pixels) {
+                for (dest, source) in buffer.iter_mut().zip(&image.pixels) {
                     *dest = source & 0x00ff_ffff;
                 }
                 buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Some(directory) = self.screenshot_requests.pop_front()
+                    && let Some(writer) = &self.screenshots
+                {
+                    let sender = writer.sender();
+                    if let Err(error) = sender.submit_software(&directory, image.size, image.pixels)
+                    {
+                        sender.report_error(error);
+                    }
+                    if !self.screenshot_requests.is_empty() {
+                        self.software_frame_due = true;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
                 #[cfg(test)]
                 {
                     let count = self.software_presented.map_or(0, |(_, _, count)| count) + 1;
@@ -2234,6 +2267,21 @@ impl<'a> Menu<'a> {
         let speed = self.state.video.panorama_speed.value();
         let seconds = self.panorama.sample(requested_at, speed);
         let blurred = self.state.screen != Screen::Title && self.state.assets.is_some();
+        let screenshots = if self.gpu.is_some() {
+            self.screenshot_requests
+                .drain(..)
+                .filter_map(|directory| {
+                    self.screenshots
+                        .as_ref()
+                        .map(|writer| crate::screenshot::ScreenshotRequest {
+                            directory,
+                            sender: writer.sender(),
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !self.overlay_dirty
             && let Some(gpu) = &mut self.gpu
         {
@@ -2247,6 +2295,7 @@ impl<'a> Menu<'a> {
                 size: winit::dpi::PhysicalSize::new(width, height),
                 gui_scale: self.scale,
                 overlay: None,
+                screenshots,
             });
         }
         if !self.overlay_dirty && self.software.is_some() {
@@ -2764,6 +2813,7 @@ impl<'a> Menu<'a> {
                     assets: self.state.assets.clone(),
                     canvas,
                 }),
+                screenshots,
             })?;
             self.overlay_dirty = false;
             return Ok(());
@@ -2806,6 +2856,11 @@ impl ApplicationHandler for Menu<'_> {
             .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
         let result = (|| -> Result<_> {
             let window = Arc::new(event_loop.create_window(attributes)?);
+            let screenshot_window = Arc::clone(&window);
+            let screenshots = crate::screenshot::Screenshots::new_with_waker(move || {
+                screenshot_window.request_redraw()
+            })
+            .ok();
             let gpu = match MenuGpuWorker::new(Arc::clone(&window), self.state.video.vsync) {
                 Ok(renderer) => Some(renderer),
                 Err(error) => {
@@ -2823,10 +2878,10 @@ impl ApplicationHandler for Menu<'_> {
             } else {
                 None
             };
-            Ok((window, surface, gpu))
+            Ok((window, surface, gpu, screenshots))
         })();
         match result {
-            Ok((window, surface, gpu)) => {
+            Ok((window, surface, gpu, screenshots)) => {
                 let size = window.inner_size();
                 self.size = (size.width, size.height);
                 self.update_gui_scale();
@@ -2843,6 +2898,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.window = Some(window);
                 self.surface = surface;
                 self.gpu = gpu;
+                self.screenshots = screenshots;
             }
             Err(error) => self.fail(event_loop, error),
         }
@@ -3169,6 +3225,11 @@ impl ApplicationHandler for Menu<'_> {
                         .saturating_add(steps.unsigned_abs() as usize)
                         .min(max);
                 }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if crate::screenshot_shortcut(event.physical_key, event.state, event.repeat) =>
+            {
+                self.request_screenshot();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) =>
@@ -3512,6 +3573,16 @@ impl ApplicationHandler for Menu<'_> {
         if self.action.is_some() {
             return;
         }
+        while let Some(result) = self
+            .screenshots
+            .as_ref()
+            .and_then(|writer| writer.take_result())
+        {
+            if let Err(error) = result {
+                self.state.error = Some(format!("Couldn't save screenshot: {error:#}"));
+                self.invalidate();
+            }
+        }
         if let (Some(gpu), Some(window)) = (&self.gpu, &self.window) {
             gpu.service_surfaces(window);
         }
@@ -3757,6 +3828,111 @@ fn draw_pack_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]
+    fn screenshots_capture_gpu_title_and_software_options() {
+        if !crate::window_test::isolated(
+            "menu::tests::screenshots_capture_gpu_title_and_software_options",
+        ) {
+            return;
+        }
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Harness<'a> {
+            menu: Menu<'a>,
+            start: Instant,
+            stage: u8,
+            files: Vec<PathBuf>,
+        }
+        impl ApplicationHandler for Harness<'_> {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.menu.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                self.menu.window_event(event_loop, id, event);
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.menu.about_to_wait(event_loop);
+                assert!(self.menu.error.is_none(), "{:?}", self.menu.error);
+                assert!(
+                    self.start.elapsed() < Duration::from_secs(45),
+                    "menu screenshot timed out, stage {}",
+                    self.stage
+                );
+                if self.stage == 0
+                    && self
+                        .menu
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|gpu| gpu.completed_frames() > 0)
+                {
+                    self.menu.request_screenshot();
+                    self.menu.invalidate();
+                    self.stage = 1;
+                }
+                let directory = self.menu.state.minecraft_dir.join("screenshots");
+                let mut files = std::fs::read_dir(directory)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| image::open(path).is_ok())
+                    .collect::<Vec<_>>();
+                files.sort();
+                if self.stage == 1 && !files.is_empty() {
+                    self.files = files;
+                    self.menu.use_software_renderer().unwrap();
+                    self.menu.state.screen = Screen::Options;
+                    self.menu.request_screenshot();
+                    self.menu.invalidate();
+                    self.stage = 2;
+                } else if self.stage == 2 && files.len() >= 2 {
+                    assert!(self.menu.software_presented.is_some());
+                    self.files = files;
+                    event_loop.exit();
+                }
+                if self.stage != 2 || self.files.len() < 2 {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + Duration::from_millis(20),
+                    ));
+                }
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_minecraft_dir().unwrap());
+        let temporary = tempfile::tempdir().unwrap();
+        let mut state = State::new(game.clone(), Vec::new());
+        state.asset_load = None;
+        state.minecraft_dir = temporary.path().to_owned();
+        state.assets = Some(Arc::new(MenuAssets::load(&game, &[]).unwrap()));
+        state.screen = Screen::Title;
+        let mut harness = Harness {
+            menu: Menu::new(&mut state),
+            start: Instant::now(),
+            stage: 0,
+            files: Vec::new(),
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert_eq!(harness.files.len(), 2);
+        let size = harness.menu.window.as_ref().unwrap().inner_size();
+        for path in &harness.files {
+            let image = image::open(path).unwrap().to_rgba8();
+            assert_eq!(image.dimensions(), (size.width, size.height));
+            assert!(image.pixels().all(|pixel| pixel[3] == 255));
+            assert!(image.pixels().any(|pixel| pixel != image.get_pixel(0, 0)));
+        }
+    }
 
     #[test]
     fn fallback_cursor_uses_client_coordinates_and_gui_scale() {

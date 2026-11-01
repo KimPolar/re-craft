@@ -58,6 +58,7 @@ pub struct MenuFrame {
     pub size: PhysicalSize<u32>,
     pub gui_scale: u32,
     pub overlay: Option<MenuOverlay>,
+    pub screenshots: Vec<crate::screenshot::ScreenshotRequest>,
 }
 
 #[derive(Default)]
@@ -76,12 +77,29 @@ impl FrameMailbox {
     fn submit(&self, mut frame: MenuFrame) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.closed {
+            for request in frame.screenshots.drain(..) {
+                request
+                    .sender
+                    .report_error(anyhow!("menu renderer stopped before taking screenshot"));
+            }
             return false;
         }
         // A newer animation frame must retain an unconsumed overlay update.
         // A newer overlay supersedes the old one.
         if frame.overlay.is_none() {
             frame.overlay = state.latest.as_mut().and_then(|old| old.overlay.take());
+        }
+        if let Some(old) = &mut state.latest {
+            let mut pending = std::mem::take(&mut old.screenshots);
+            pending.append(&mut frame.screenshots);
+            frame.screenshots = pending;
+        }
+        if frame.screenshots.len() > 4 {
+            for request in frame.screenshots.drain(4..) {
+                request
+                    .sender
+                    .report_error(anyhow!("screenshot queue is full"));
+            }
         }
         state.latest = Some(frame);
         self.changed.notify_one();
@@ -106,6 +124,13 @@ impl FrameMailbox {
     fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.closed = true;
+        if let Some(frame) = &mut state.latest {
+            for request in frame.screenshots.drain(..) {
+                request
+                    .sender
+                    .report_error(anyhow!("menu renderer stopped before taking screenshot"));
+            }
+        }
         state.latest = None;
         self.changed.notify_one();
     }
@@ -155,6 +180,7 @@ impl MenuGpuWorker {
                         // Wake a menu that is otherwise waiting while resources load.
                         window.request_redraw();
                         while let Some(frame) = shared.receive() {
+                            renderer.request_screenshots(frame.screenshots);
                             renderer.resize(frame.size);
                             renderer.set_vsync(frame.vsync);
                             renderer.set_gui_scale(frame.gui_scale);
@@ -169,6 +195,14 @@ impl MenuGpuWorker {
                                 frame.blurred,
                                 frame.blur_radius,
                             )?;
+                            if renderer.has_pending_screenshots() {
+                                // A minimized or temporarily unavailable surface can reject frames.
+                                // Retry off the UI thread without a tight redraw loop.
+                                if !_presented {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                window.request_redraw();
+                            }
                             #[cfg(test)]
                             if _presented {
                                 worker_completed.fetch_add(1, Ordering::Relaxed);
@@ -270,6 +304,7 @@ mod tests {
                     canvas,
                 }
             }),
+            screenshots: Vec::new(),
         }
     }
 
@@ -293,6 +328,33 @@ mod tests {
         mailbox.close();
         assert!(mailbox.receive().is_none());
         assert!(!mailbox.submit(frame(6.0, None)));
+    }
+
+    #[test]
+    fn screenshot_requests_survive_frame_coalescing_and_report_overflow() {
+        let writer = crate::screenshot::Screenshots::new().unwrap();
+        let mailbox = FrameMailbox::default();
+        for index in 0..6 {
+            let mut next = frame(index as f32, None);
+            next.screenshots.push(crate::screenshot::ScreenshotRequest {
+                directory: format!("capture-{index}").into(),
+                sender: writer.sender(),
+            });
+            assert!(mailbox.submit(next));
+        }
+        let pending = mailbox.receive().unwrap();
+        let directories: Vec<_> = pending
+            .screenshots
+            .iter()
+            .map(|request| request.directory.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            directories,
+            ["capture-0", "capture-1", "capture-2", "capture-3"]
+        );
+        assert!(writer.take_result().unwrap().is_err());
+        assert!(writer.take_result().unwrap().is_err());
+        assert!(writer.take_result().is_none());
     }
 
     #[test]
@@ -490,6 +552,7 @@ mod tests {
                     size: window.inner_size(),
                     gui_scale: 1,
                     overlay,
+                    screenshots: Vec::new(),
                 }) {
                     self.error = Some(format!("{error:#}"));
                     event_loop.exit();

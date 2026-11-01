@@ -3787,6 +3787,17 @@ mod tests {
                 ("potion".into(), Tag::String("minecraft:poison".into())),
                 ("custom_color".into(), Tag::Int(0x123456)),
                 ("custom_name".into(), Tag::String("test.potion".into())),
+                (
+                    "custom_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:speed".into())),
+                            ("duration".into(), Tag::Int(123)),
+                            ("amplifier".into(), Tag::Byte(1)),
+                        ])],
+                    },
+                ),
             ]),
         )]);
         let original = NamedTag {

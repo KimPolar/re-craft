@@ -2925,6 +2925,21 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         {
             crate::survival::inventory_potion_contents(components)?;
             65536
+        } else if matches!(id, "minecraft:potion" | "minecraft:tipped_arrow")
+            && name.matches("minecraft:potion_duration_scale")
+        {
+            let scale = crate::player_data::numeric_double(value)? as f32;
+            if !scale.is_finite() || scale < 0.0 {
+                return None;
+            }
+            2097152
+        } else if matches!(id, "minecraft:potion" | "minecraft:tipped_arrow")
+            && name.matches("!minecraft:potion_duration_scale")
+        {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            4194304
         } else if name.matches("minecraft:custom_data") {
             if !matches!(value, Tag::Compound(_)) {
                 return None;
@@ -3029,6 +3044,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & (262144 | 524288) == (262144 | 524288) {
+        return None;
+    }
+    if seen & (2097152 | 4194304) == (2097152 | 4194304) {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
@@ -3194,24 +3212,7 @@ fn potion_components_equal(a: &Tag, b: &Tag) -> bool {
     {
         return false;
     }
-    let id = |components: &Tag| {
-        let value = components.get("minecraft:potion_contents")?;
-        let id = crate::survival::potion_contents_potion(value)?;
-        ResourceId::parse(&String::from_utf16(&id.0).ok()?).ok()
-    };
-    if id(a) != id(b) {
-        return false;
-    }
-    let details = |components: &Tag| {
-        let contents = components.get("minecraft:potion_contents")?;
-        let color = contents.get("custom_color").and_then(Tag::as_java_int);
-        let name = match contents.get("custom_name") {
-            Some(Tag::String(value)) => Some(value.clone()),
-            _ => None,
-        };
-        Some((color, name))
-    };
-    if details(a) != details(b) {
+    if !crate::survival::potion_contents_equal(a, b) {
         return false;
     }
     let (Tag::Compound(a), Tag::Compound(b)) = (a, b) else {
@@ -4796,7 +4797,7 @@ mod tests {
                         element_type: native_persistence::nbt::TagType::Compound,
                         values: vec![Tag::Compound(vec![(
                             "id".into(),
-                            Tag::String("minecraft:speed".into()),
+                            Tag::String("minecraft:wither".into()),
                         )])],
                     },
                 ),
@@ -4807,6 +4808,68 @@ mod tests {
             saved_item_max("minecraft:potion", &compact("example:water")),
             None
         );
+    }
+
+    #[test]
+    fn custom_potion_effects_compare_and_merge_without_losing_components() {
+        use native_persistence::nbt::TagType;
+        let components = |id: &str, duration: i32, explicit_defaults: bool| {
+            let mut effect = vec![
+                ("id".into(), Tag::String(id.into())),
+                ("duration".into(), Tag::Int(duration)),
+            ];
+            if explicit_defaults {
+                effect.extend([
+                    ("amplifier".into(), Tag::Byte(0)),
+                    ("ambient".into(), Tag::Byte(0)),
+                    ("show_particles".into(), Tag::Byte(1)),
+                    ("show_icon".into(), Tag::Byte(1)),
+                ]);
+            }
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![(
+                    "custom_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(effect)],
+                    },
+                )]),
+            )])
+        };
+        let short_components = components("speed", 100, false);
+        let full_components = components("minecraft:speed", 100, true);
+        assert_eq!(
+            saved_item_max("minecraft:tipped_arrow", &short_components),
+            Some(64)
+        );
+        let short =
+            ItemStack::new("minecraft:tipped_arrow".into(), 7, 64, short_components).unwrap();
+        let full = ItemStack::new(
+            "minecraft:tipped_arrow".into(),
+            8,
+            64,
+            full_components.clone(),
+        )
+        .unwrap();
+        let different = ItemStack::new(
+            "minecraft:tipped_arrow".into(),
+            1,
+            64,
+            components("speed", 101, false),
+        )
+        .unwrap();
+        assert!(short.same_item_and_components(&full));
+        assert!(!short.same_item_and_components(&different));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(full.clone()));
+        let mut dropped = Some(short.clone());
+        assert!(inventory.pickup_stack(&mut dropped, false));
+        assert!(dropped.is_none());
+        let merged = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        assert_eq!(merged.count(), 15);
+        assert_eq!(merged.components(), &full_components);
+        assert!(validate_item_balance([&short, &full], [merged]).is_ok());
     }
 
     #[test]

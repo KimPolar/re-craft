@@ -175,86 +175,124 @@ pub fn potion_contents_potion(contents: &Tag) -> Option<&native_persistence::nbt
     }
 }
 
-fn potion_id(components: &Tag) -> Option<ResourceId> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PotionData {
+    potion: Option<ResourceId>,
+    custom_effects: Vec<StatusApplication>,
+    custom_color: Option<i32>,
+    custom_name: Option<native_persistence::nbt::JavaString>,
+}
+
+fn supported_potion(id: &ResourceId) -> bool {
+    id.namespace == "minecraft"
+        && matches!(
+            id.path.as_str(),
+            "water"
+                | "mundane"
+                | "thick"
+                | "awkward"
+                | "night_vision"
+                | "long_night_vision"
+                | "water_breathing"
+                | "long_water_breathing"
+                | "poison"
+                | "long_poison"
+                | "strong_poison"
+                | "slowness"
+                | "long_slowness"
+                | "strong_slowness"
+                | "swiftness"
+                | "long_swiftness"
+                | "strong_swiftness"
+                | "regeneration"
+                | "long_regeneration"
+                | "strong_regeneration"
+                | "leaping"
+                | "long_leaping"
+                | "strong_leaping"
+                | "slow_falling"
+                | "long_slow_falling"
+                | "strength"
+        )
+}
+
+fn parse_potion_contents(components: &Tag) -> Option<PotionData> {
     let contents = components.get("minecraft:potion_contents")?;
-    if let Tag::Compound(fields) = contents {
-        let mut potion = false;
-        let mut empty_effects = false;
-        let mut color = false;
-        let mut custom_name = false;
-        for (name, value) in fields {
-            if name.matches("potion") && !potion && matches!(value, Tag::String(_)) {
-                potion = true;
-            } else if name.matches("custom_effects")
-                && !empty_effects
-                && matches!(value, Tag::List { values, .. } if values.is_empty())
-            {
-                empty_effects = true;
-            } else if name.matches("custom_color") && !color && value.as_java_int().is_some() {
-                color = true;
-            } else if name.matches("custom_name") && !custom_name && matches!(value, Tag::String(_))
-            {
-                custom_name = true;
-            } else {
-                return None;
+    let parse_id = |value: &native_persistence::nbt::JavaString| {
+        let id = ResourceId::parse(&String::from_utf16(&value.0).ok()?).ok()?;
+        supported_potion(&id).then_some(id)
+    };
+    let mut result = PotionData {
+        potion: None,
+        custom_effects: Vec::new(),
+        custom_color: None,
+        custom_name: None,
+    };
+    match contents {
+        Tag::String(id) => result.potion = Some(parse_id(id)?),
+        Tag::Compound(fields) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for (name, value) in fields {
+                let key = String::from_utf16(&name.0).ok()?;
+                if !seen.insert(key.clone()) {
+                    return None;
+                }
+                match (key.as_str(), value) {
+                    ("potion", Tag::String(id)) => result.potion = Some(parse_id(id)?),
+                    ("custom_color", value) => result.custom_color = Some(value.as_java_int()?),
+                    ("custom_name", Tag::String(name)) => result.custom_name = Some(name.clone()),
+                    (
+                        "custom_effects",
+                        Tag::List {
+                            element_type,
+                            values,
+                        },
+                    ) => {
+                        if *element_type != native_persistence::nbt::TagType::Compound
+                            && !values.is_empty()
+                        {
+                            return None;
+                        }
+                        result.custom_effects = values
+                            .iter()
+                            .map(parse_status_effect)
+                            .collect::<Option<_>>()?;
+                    }
+                    _ => return None,
+                }
             }
         }
-        if !potion {
-            return None;
-        }
+        _ => return None,
     }
-    let id = potion_contents_potion(contents)?;
-    let id = String::from_utf16(&id.0).ok()?;
-    ResourceId::parse(&id)
-        .ok()
-        .filter(|id| id.namespace == "minecraft")
+    Some(result)
 }
 
 pub(crate) fn is_plain_water_potion(components: &Tag) -> bool {
-    potion_id(components).is_some_and(|id| id.path == "water")
+    parse_potion_contents(components).is_some_and(|contents| {
+        contents
+            .potion
+            .as_ref()
+            .is_some_and(|id| id.path == "water")
+            && contents.custom_effects.is_empty()
+    })
 }
 
-/// Recognize the built-in contents whose inventory representation is supported.
+/// Recognize only components whose inventory and status behavior is understood.
 pub(crate) fn inventory_potion_contents(components: &Tag) -> Option<()> {
-    let id = potion_id(components)?;
-    matches!(
-        id.path.as_str(),
-        "water"
-            | "mundane"
-            | "thick"
-            | "awkward"
-            | "night_vision"
-            | "long_night_vision"
-            | "water_breathing"
-            | "long_water_breathing"
-            | "poison"
-            | "long_poison"
-            | "strong_poison"
-            | "slowness"
-            | "long_slowness"
-            | "strong_slowness"
-            | "swiftness"
-            | "long_swiftness"
-            | "strong_swiftness"
-            | "regeneration"
-            | "long_regeneration"
-            | "strong_regeneration"
-            | "leaping"
-            | "long_leaping"
-            | "strong_leaping"
-            | "slow_falling"
-            | "long_slow_falling"
-            | "strength"
-    )
-    .then_some(())
+    parse_potion_contents(components).map(|_| ())
 }
 
-/// Resolve the built-in potion definitions whose effects this session simulates.
-pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>> {
-    if components.get("minecraft:potion_contents").is_none() {
-        return Some(Vec::new());
+pub(crate) fn potion_contents_equal(a: &Tag, b: &Tag) -> bool {
+    match (parse_potion_contents(a), parse_potion_contents(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
-    let id = potion_id(components)?;
+}
+
+fn base_potion_effects(id: Option<&ResourceId>) -> Option<Vec<StatusApplication>> {
+    let Some(id) = id else {
+        return Some(Vec::new());
+    };
     if matches!(id.path.as_str(), "water" | "mundane" | "thick" | "awkward") {
         return Some(Vec::new());
     }
@@ -292,24 +330,80 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
     }])
 }
 
-/// Color of supported built-in potion contents; absent/unsupported uses the model default.
+/// Base effects precede custom effects; Java scales both without consuming RNG.
+pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>> {
+    if components.get("minecraft:potion_contents").is_none() {
+        return Some(Vec::new());
+    }
+    let contents = parse_potion_contents(components)?;
+    let mut effects = base_potion_effects(contents.potion.as_ref())?;
+    effects.extend(contents.custom_effects);
+    let scale = match components.get("minecraft:potion_duration_scale") {
+        Some(value) => crate::player_data::numeric_double(value)? as f32,
+        None => 1.0,
+    };
+    if !scale.is_finite() || scale < 0.0 {
+        return None;
+    }
+    for effect in &mut effects {
+        if effect.duration != -1 && effect.duration != 0 {
+            effect.duration = ((effect.duration as f32 * scale).floor() as i32).max(1);
+        }
+    }
+    Some(effects)
+}
+
+/// Java's amplifier-weighted color of visible effects, or the model fallback.
 pub fn potion_color(components: &Tag) -> Option<u32> {
-    let contents = components.get("minecraft:potion_contents")?;
-    if let Some(color) = contents.get("custom_color").and_then(Tag::as_java_int) {
-        potion_id(components)?;
+    let contents = parse_potion_contents(components)?;
+    if let Some(color) = contents.custom_color {
         return Some(color as u32 & 0x00ff_ffff);
     }
-    match potion_id(components)?.path.as_str() {
-        "night_vision" | "long_night_vision" => Some(0xc2ff66),
-        "water_breathing" | "long_water_breathing" => Some(0x98dac0),
-        "poison" | "long_poison" | "strong_poison" => Some(0x87a363),
-        "slowness" | "long_slowness" | "strong_slowness" => Some(0x8bafe0),
-        "swiftness" | "long_swiftness" | "strong_swiftness" => Some(0x33ebff),
-        "regeneration" | "long_regeneration" | "strong_regeneration" => Some(0xcd5cab),
-        "leaping" | "long_leaping" | "strong_leaping" => Some(0xfdff84),
-        "slow_falling" | "long_slow_falling" => Some(0xf3cfb9),
-        "strength" => Some(0xffc700),
-        _ => None,
+    let mut channels = [0_i32; 3];
+    let mut total = 0_i32;
+    let mut add = |rgb: u32, amplifier: u8| {
+        let weight = i32::from(amplifier) + 1;
+        for (sum, shift) in channels.iter_mut().zip([16, 8, 0]) {
+            *sum = sum.wrapping_add(((rgb >> shift) as i32 & 255).wrapping_mul(weight));
+        }
+        total = total.wrapping_add(weight);
+    };
+    if contents
+        .potion
+        .as_ref()
+        .is_some_and(|id| id.path == "strength")
+    {
+        add(0xffc700, 0);
+    } else {
+        for effect in base_potion_effects(contents.potion.as_ref())? {
+            if effect.visible {
+                add(status_color(effect.kind), effect.amplifier);
+            }
+        }
+    }
+    for effect in contents.custom_effects {
+        if effect.visible {
+            add(status_color(effect.kind), effect.amplifier);
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let [red, green, blue] = channels.map(|value| value.wrapping_div(total) as u32 & 255);
+    Some(red << 16 | green << 8 | blue)
+}
+
+fn status_color(kind: FoodStatusKind) -> u32 {
+    match kind {
+        FoodStatusKind::Hunger => 0x587653,
+        FoodStatusKind::Poison => 0x87a363,
+        FoodStatusKind::NightVision => 0xc2ff66,
+        FoodStatusKind::WaterBreathing => 0x98dac0,
+        FoodStatusKind::Regeneration => 0xcd5cab,
+        FoodStatusKind::JumpBoost => 0xfdff84,
+        FoodStatusKind::SlowFalling => 0xf3cfb9,
+        FoodStatusKind::Speed => 0x33ebff,
+        FoodStatusKind::Slowness => 0x8bafe0,
     }
 }
 
@@ -329,8 +423,7 @@ fn parse_status_effect(value: &Tag) -> Option<StatusApplication> {
             duration = value.as_java_int().filter(|value| *value >= -1);
             duration?;
         } else if name.matches("amplifier") && amplifier.is_none() {
-            let Tag::Byte(value) = value else { return None };
-            amplifier = Some(*value as u8);
+            amplifier = Some(value.as_java_int()? as u8);
         } else if name.matches("ambient") && ambient.is_none() {
             ambient = match value {
                 Tag::Byte(0) => Some(false),
@@ -1750,6 +1843,274 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn custom_potion_effects_match_java_colors_scaling_and_consumption() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CustomPotionOracle.java");
+        let helper = temp.path().join("FoodEffectsOracle.java");
+        let input = temp.path().join("cases.json");
+        let output = temp.path().join("results.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CustomPotionOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &helper,
+            include_str!("../tests/java/FoodEffectsOracle.java"),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        for effect in [
+            "hunger",
+            "poison",
+            "night_vision",
+            "water_breathing",
+            "regeneration",
+            "jump_boost",
+            "slow_falling",
+            "speed",
+            "slowness",
+        ] {
+            for duration in [-1, 0, 1, 20, 21, 600] {
+                for amplifier in [0_i32, 1, 255] {
+                    for base in [None, Some("minecraft:water"), Some("minecraft:swiftness")] {
+                        for scale in [0.0, 0.25, 1.0, 1.5] {
+                            let index = cases.len();
+                            let visible = index % 2 == 0;
+                            let mut contents = serde_json::json!({"custom_effects":[{"id":format!("minecraft:{effect}"),"duration":duration,"amplifier":amplifier as u8 as i8,"ambient":index % 3 == 0,"show_particles":visible,"show_icon":index % 4 != 0}]});
+                            if let Some(base) = base {
+                                contents["potion"] = base.into();
+                            }
+                            if index % 5 == 0 {
+                                contents["custom_color"] = serde_json::json!(0x123456);
+                            }
+                            cases.push(serde_json::json!({"contents":contents,"scale":scale,"seed":index % 17}));
+                        }
+                    }
+                }
+            }
+        }
+        for base in [None, Some("minecraft:water"), Some("minecraft:swiftness")] {
+            let mut contents = serde_json::json!({"custom_effects":[{"id":"minecraft:speed","duration":200,"amplifier":1},{"id":"minecraft:poison","duration":100,"amplifier":0},{"id":"minecraft:speed","duration":500,"amplifier":0}]});
+            if let Some(base) = base {
+                contents["potion"] = base.into();
+            }
+            cases.push(serde_json::json!({"contents":contents,"scale":0.5,"seed":23}));
+        }
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&helper),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("CustomPotionOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (case, row) in cases.iter().zip(rows) {
+            let source = &case["contents"];
+            let mut fields = Vec::new();
+            if let Some(id) = source["potion"].as_str() {
+                fields.push(("potion".into(), Tag::String(id.into())));
+            }
+            if let Some(color) = source["custom_color"].as_i64() {
+                fields.push(("custom_color".into(), Tag::Int(color as i32)));
+            }
+            let custom = source["custom_effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|effect| {
+                    let mut fields = vec![
+                        (
+                            "id".into(),
+                            Tag::String(effect["id"].as_str().unwrap().into()),
+                        ),
+                        (
+                            "duration".into(),
+                            Tag::Int(effect["duration"].as_i64().unwrap() as i32),
+                        ),
+                        (
+                            "amplifier".into(),
+                            Tag::Byte(effect["amplifier"].as_i64().unwrap() as i8),
+                        ),
+                    ];
+                    for key in ["ambient", "show_particles", "show_icon"] {
+                        if let Some(value) = effect[key].as_bool() {
+                            fields.push((key.into(), Tag::Byte(i8::from(value))));
+                        }
+                    }
+                    Tag::Compound(fields)
+                })
+                .collect();
+            fields.push((
+                "custom_effects".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: custom,
+                },
+            ));
+            let components = Tag::Compound(vec![
+                ("minecraft:potion_contents".into(), Tag::Compound(fields)),
+                (
+                    "minecraft:potion_duration_scale".into(),
+                    Tag::Float(case["scale"].as_f64().unwrap() as f32),
+                ),
+            ]);
+            assert_eq!(
+                crate::inventory::saved_item_max("minecraft:potion", &components),
+                Some(1),
+                "{case}"
+            );
+            assert_eq!(
+                potion_color(&components).unwrap_or(0x385dc6),
+                row["color"].as_u64().unwrap() as u32,
+                "{case}"
+            );
+            assert_eq!(
+                is_plain_water_potion(&components),
+                row["water"].as_bool().unwrap(),
+                "{case}"
+            );
+            let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 20,
+                saturation: 5.0,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            assert_eq!(
+                usage.start_hand(
+                    &mut inventory,
+                    PlayerSlot::Storage(0),
+                    &mut vitals,
+                    GameMode::Survival
+                ),
+                row["can_consume"].as_bool().unwrap(),
+                "{case}"
+            );
+            let mut random = native_core::random::LegacyRandom::new(case["seed"].as_i64().unwrap());
+            let mut effects = Vec::new();
+            let mut sounds = Vec::new();
+            for _ in 0..32 {
+                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                for event in usage.take_events() {
+                    let (applied, emitted) = event.apply_with_sounds(&mut random);
+                    sounds.extend(emitted.into_iter().flatten());
+                    if let FoodRandomEvent::PotionEffects(values) = event {
+                        assert!(applied);
+                        effects.extend(values);
+                    }
+                }
+            }
+            assert_eq!(
+                inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                row["remainder"].as_str().unwrap(),
+                "{case}"
+            );
+            let expected = row["effects"].as_array().unwrap();
+            assert_eq!(effects.len(), expected.len(), "{case}");
+            for (actual, expected) in effects.iter().zip(expected) {
+                let id = match actual.kind {
+                    FoodStatusKind::Hunger => "hunger",
+                    FoodStatusKind::Poison => "poison",
+                    FoodStatusKind::NightVision => "night_vision",
+                    FoodStatusKind::WaterBreathing => "water_breathing",
+                    FoodStatusKind::Regeneration => "regeneration",
+                    FoodStatusKind::JumpBoost => "jump_boost",
+                    FoodStatusKind::SlowFalling => "slow_falling",
+                    FoodStatusKind::Speed => "speed",
+                    FoodStatusKind::Slowness => "slowness",
+                };
+                assert_eq!(
+                    format!("minecraft:{id}"),
+                    expected["id"].as_str().unwrap(),
+                    "{case}"
+                );
+                assert_eq!(
+                    actual.duration,
+                    expected["duration"].as_i64().unwrap() as i32,
+                    "{case}"
+                );
+                assert_eq!(
+                    actual.amplifier,
+                    expected["amplifier"].as_u64().unwrap() as u8,
+                    "{case}"
+                );
+                assert_eq!(
+                    (actual.ambient, actual.visible, actual.show_icon),
+                    (
+                        expected["ambient"].as_bool().unwrap(),
+                        expected["visible"].as_bool().unwrap(),
+                        expected["icon"].as_bool().unwrap()
+                    ),
+                    "{case}"
+                );
+            }
+            let expected = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), expected.len(), "{case}");
+            for (sound, expected) in sounds.iter().zip(expected) {
+                assert_eq!(
+                    format!("minecraft:{}", sound.event),
+                    expected["event"].as_str().unwrap()
+                );
+                assert_eq!(
+                    sound.volume.to_bits(),
+                    expected["volume_bits"].as_i64().unwrap() as i32 as u32
+                );
+                assert_eq!(
+                    sound.pitch.to_bits(),
+                    expected["pitch_bits"].as_i64().unwrap() as i32 as u32
+                );
+            }
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as i32 as u32,
+                "{case}"
+            );
         }
     }
 

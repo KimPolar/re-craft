@@ -39816,6 +39816,90 @@ mod tests {
     }
 
     #[test]
+    fn custom_potion_effects_update_loaded_session_and_save_draft() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let bytes = native_persistence::nbt::write(&original).unwrap();
+        let effect = |id: &str, duration, amplifier| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("duration".into(), Tag::Int(duration)),
+                ("amplifier".into(), Tag::Byte(amplifier)),
+            ])
+        };
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![
+                    ("potion".into(), Tag::String("minecraft:swiftness".into())),
+                    (
+                        "custom_effects".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![
+                                effect("minecraft:speed", 200, 1),
+                                effect("minecraft:speed", 500, 0),
+                                effect("minecraft:water_breathing", 600, 0),
+                            ],
+                        },
+                    ),
+                ]),
+            ),
+            ("minecraft:potion_duration_scale".into(), Tag::Float(0.5)),
+        ]);
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:potion".into(), 1, 1, components),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..32 {
+            session.update(TICK);
+        }
+
+        let speed = session.fall.effects().speed.as_ref().unwrap();
+        assert_eq!((speed.duration, speed.amplifier), (100, 1));
+        let hidden = speed.hidden.as_ref().unwrap();
+        assert_eq!((hidden.duration, hidden.amplifier), (1800, 0));
+        assert_eq!(
+            session
+                .breathing_effects
+                .water_breathing
+                .as_ref()
+                .unwrap()
+                .duration,
+            300
+        );
+        assert!(!session.effect_save_invalid);
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        assert_eq!(
+            crate::player_data::read_saved_breathing_effects(draft.document()).unwrap(),
+            session.breathing_effects
+        );
+        assert_eq!(
+            session
+                .snapshot()
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .id(),
+            "minecraft:glass_bottle"
+        );
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), bytes);
+    }
+
+    #[test]
     fn jump_and_speed_effects_update_both_saved_attributes_and_clear_with_milk() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::{NamedTag, Tag, TagType};

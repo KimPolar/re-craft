@@ -281,6 +281,15 @@ enum SourceKind {
     End([ResourceId; 5]),
 }
 impl BiomeSource {
+    /// Registry holders the source can return, including all parameter-list
+    /// entries even when climate ranges overlap.
+    pub fn possible_biomes(&self) -> BTreeSet<ResourceId> {
+        match &self.kind {
+            SourceKind::Fixed(id) => [id.clone()].into_iter().collect(),
+            SourceKind::Multi(tree) => tree.biomes.iter().cloned().collect(),
+            SourceKind::End(ids) => ids.iter().cloned().collect(),
+        }
+    }
     pub fn is_end(&self) -> bool {
         matches!(self.kind, SourceKind::End(_))
     }
@@ -592,6 +601,13 @@ mod tests {
         };
         let definition = json!({"type":"multi_noise","biomes":[point("example:a",json!(-1)),point("example:b",json!(1))]});
         let mut source = BiomeSource::load(&mut data, &definition).unwrap();
+        assert_eq!(
+            source.possible_biomes(),
+            BTreeSet::from([
+                ResourceId::parse("example:a").unwrap(),
+                ResourceId::parse("example:b").unwrap()
+            ])
+        );
         assert_eq!(
             source.select([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().path,
             "b"

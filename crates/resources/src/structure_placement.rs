@@ -208,6 +208,35 @@ pub struct RandomSpreadSet {
     pub placement: RandomSpreadPlacement,
     pub structures: Vec<StructureEntry>,
 }
+/// Decode the weighted structure entries independently of placement type.
+pub fn decode_structure_entries(bytes: &[u8]) -> Result<Vec<StructureEntry>> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    entries(&value)
+}
+fn entries(value: &Value) -> Result<Vec<StructureEntry>> {
+    let array = value
+        .get("structures")
+        .and_then(Value::as_array)
+        .context("invalid structure list")?;
+    let mut structures = Vec::with_capacity(array.len());
+    let mut total = 0i32;
+    for entry in array {
+        let id = entry
+            .get("structure")
+            .and_then(Value::as_str)
+            .context("inline or invalid structure is unsupported")?;
+        let weight = integer(entry, "weight")?;
+        ensure!(weight > 0, "invalid structure weight");
+        total = total
+            .checked_add(weight)
+            .context("structure weight total overflow")?;
+        structures.push(StructureEntry {
+            id: ResourceId::parse(id)?,
+            weight,
+        });
+    }
+    Ok(structures)
+}
 impl RandomSpreadSet {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let value: Value = serde_json::from_slice(bytes)?;
@@ -216,27 +245,7 @@ impl RandomSpreadSet {
                 .get("placement")
                 .context("missing structure placement")?,
         )?;
-        let array = value
-            .get("structures")
-            .and_then(Value::as_array)
-            .context("invalid structure list")?;
-        let mut structures = Vec::with_capacity(array.len());
-        let mut total = 0i32;
-        for entry in array {
-            let id = entry
-                .get("structure")
-                .and_then(Value::as_str)
-                .context("inline or invalid structure is unsupported")?;
-            let weight = integer(entry, "weight")?;
-            ensure!(weight > 0, "invalid structure weight");
-            total = total
-                .checked_add(weight)
-                .context("structure weight total overflow")?;
-            structures.push(StructureEntry {
-                id: ResourceId::parse(id)?,
-                weight,
-            });
-        }
+        let structures = entries(&value)?;
         Ok(Self {
             placement,
             structures,
@@ -302,6 +311,22 @@ impl StructureSetCache {
         chunk: [i32; 2],
     ) -> Result<bool> {
         self.resolve(provider, id, seed, chunk, &mut BTreeSet::new())
+    }
+    /// Apply the biome-source filter used before Java tests placement. The
+    /// caller supplies the source's complete possible-biome set.
+    pub fn is_structure_chunk_for_biomes(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        biome_rules: &crate::structure_biomes::StructureBiomes,
+        possible: &BTreeSet<ResourceId>,
+        id: &ResourceId,
+        seed: i64,
+        chunk: [i32; 2],
+    ) -> Result<bool> {
+        if !biome_rules.set_has_possible_biome(&self.load(provider, id)?.structures, possible)? {
+            return Ok(false);
+        }
+        self.is_structure_chunk(provider, id, seed, chunk)
     }
     fn resolve(
         &mut self,

@@ -253,6 +253,10 @@ impl TerrainGenerator {
     pub fn biome_neighborhood(&self) -> Result<BiomeNeighborhood> {
         BiomeNeighborhood::new(self.seed, self.min_y(), self.height())
     }
+    /// Complete set of biome IDs exposed by this generator's biome source.
+    pub fn possible_biomes(&self) -> std::collections::BTreeSet<ResourceId> {
+        self.source.possible_biomes()
+    }
     /// Call in the same chunk order as the world generator; equal-distance
     /// climate matches reuse the previous lookup, as in the Java thread.
     pub fn generate_biomes(

@@ -420,6 +420,32 @@ struct Entry {
 }
 
 impl Entry {
+    fn potential_component_drops(&self) -> Result<Vec<Drop>> {
+        if self.weight == 0 {
+            return Ok(Vec::new());
+        }
+        let mut drops = match &self.kind {
+            EntryKind::Item(item) => vec![Drop {
+                item: item.clone(),
+                count: 1,
+                copy_block_entity_custom_name: false,
+                copy_block_entity_components: Vec::new(),
+            }],
+            EntryKind::Empty => Vec::new(),
+            EntryKind::Alternatives(entries) => entries
+                .iter()
+                .map(Entry::potential_component_drops)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+            EntryKind::Unsupported(reason) => bail!("unsupported loot entry: {reason}"),
+        };
+        for drop in &mut drops {
+            add_possible_component_copies(drop, &self.modifiers)?;
+        }
+        Ok(drops)
+    }
     fn fully_supported(&self) -> bool {
         self.condition.fully_supported()
             && self.modifiers.iter().all(Modifier::fully_supported)
@@ -490,6 +516,27 @@ impl Entry {
     }
 }
 
+/// Conservatively include every conditional component copy. Count modifiers
+/// are inspected for invalid random bounds, but do not affect stack validity.
+fn add_possible_component_copies(drop: &mut Drop, modifiers: &[Modifier]) -> Result<()> {
+    for modifier in modifiers {
+        match &modifier.kind {
+            ModifierKind::CopyBlockEntityCustomName => drop.copy_block_entity_custom_name = true,
+            ModifierKind::CopyBlockEntityComponents(filter) => {
+                drop.copy_block_entity_components.push(filter.clone())
+            }
+            ModifierKind::UniformCount(min, max, _) if min < max => {
+                max.checked_sub(*min)
+                    .and_then(|v| v.checked_add(1))
+                    .context("invalid uniform loot count")?;
+            }
+            ModifierKind::Unsupported(reason) => bail!("unsupported loot modifier: {reason}"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct Pool {
     condition: Condition,
@@ -518,6 +565,38 @@ impl BlockLootTables {
     }
     pub fn fully_supported_player_block_with_components(&self, block: &str) -> bool {
         self.fully_supported_player_block_inner(block, true)
+    }
+
+    /// All possible item/component combinations, independent of conditions and
+    /// RNG. Used to fail closed before a support update can drop several blocks.
+    pub fn potential_block_entity_drops(&self, block: &str) -> Result<Vec<Drop>> {
+        ensure!(
+            self.fully_supported_player_block_with_components(block),
+            "unsupported block loot table"
+        );
+        let block = ResourceId::parse(block)?;
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        let table = self
+            .tables
+            .get(&id)
+            .context("block loot table unavailable")?;
+        let mut result = Vec::new();
+        for pool in &table.pools {
+            if pool.rolls == 0 {
+                continue;
+            }
+            for entry in &pool.entries {
+                for mut drop in entry.potential_component_drops()? {
+                    add_possible_component_copies(&mut drop, &pool.modifiers)?;
+                    add_possible_component_copies(&mut drop, &table.modifiers)?;
+                    result.push(drop);
+                }
+            }
+        }
+        Ok(result)
     }
     fn fully_supported_player_block_inner(&self, block: &str, components: bool) -> bool {
         let Ok(block) = ResourceId::parse(block) else {
@@ -1678,6 +1757,29 @@ mod tests {
         assert!(filters[1].accepts(&id("minecraft:banner_patterns")));
         assert!(filters[1].accepts(&id("minecraft:custom_name")));
         assert!(!filters[1].accepts(&id("minecraft:custom_data")));
+    }
+
+    #[test]
+    fn possible_drops_include_unselected_alternatives_and_parent_modifiers() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/white_banner.json",r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:white_banner","condition":{"type":"minecraft:random_chance","chance":1.0}},{"type":"minecraft:item","name":"minecraft:stone"}],"modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:banner_patterns"]}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let drops = tables
+            .potential_block_entity_drops("minecraft:white_banner")
+            .unwrap();
+        assert_eq!(drops.len(), 2);
+        assert_eq!(
+            drops[0].item,
+            ResourceId::parse("minecraft:white_banner").unwrap()
+        );
+        assert_eq!(drops[1].item, ResourceId::parse("minecraft:stone").unwrap());
+        for drop in drops {
+            assert_eq!(drop.copy_block_entity_components.len(), 1);
+            assert!(
+                drop.copy_block_entity_components[0]
+                    .accepts(&ResourceId::parse("minecraft:banner_patterns").unwrap())
+            );
+        }
     }
 
     #[test]

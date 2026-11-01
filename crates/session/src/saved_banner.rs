@@ -494,6 +494,12 @@ mod tests {
         ] {
             for wall in [false, true] {
                 let item = format!("minecraft:{color}_banner");
+                crate::items::ItemEntities::validate_block_entity_drops(
+                    &item,
+                    &components,
+                    Some(&loot),
+                )
+                .unwrap();
                 let block = BlockState {
                     name: format!(
                         "minecraft:{color}_{}banner",

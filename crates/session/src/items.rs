@@ -22,6 +22,42 @@ use crate::{
     movement,
 };
 
+fn prepare_component_copies(drops: &[Drop], components: &Tag) -> anyhow::Result<Vec<Tag>> {
+    use anyhow::{Context, ensure};
+    use native_resources::packs::ResourceId;
+    let Tag::Compound(source) = components else {
+        anyhow::bail!("block entity components are not a compound")
+    };
+    let mut prepared = Vec::with_capacity(drops.len());
+    for drop in drops {
+        let mut selected = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (key, value) in source {
+            let name = String::from_utf16(&key.0).context("invalid component identifier")?;
+            let id = ResourceId::parse(&name)?;
+            ensure!(seen.insert(id.clone()), "duplicate block entity component");
+            if (drop.copy_block_entity_custom_name
+                && id.namespace == "minecraft"
+                && id.path == "custom_name")
+                || drop
+                    .copy_block_entity_components
+                    .iter()
+                    .any(|filter| filter.accepts(&id))
+            {
+                selected.push((key.clone(), value.clone()));
+            }
+        }
+        let components = Tag::Compound(selected);
+        let item = format!("{}:{}", drop.item.namespace, drop.item.path);
+        ensure!(
+            crate::inventory::saved_item_max(&item, &components).is_some(),
+            "unsupported dropped item components"
+        );
+        prepared.push(components);
+    }
+    Ok(prepared)
+}
+
 #[derive(Clone, Debug)]
 pub struct DroppedItem {
     /// Session-local entity identifier used by item model properties.
@@ -1793,7 +1829,7 @@ impl ItemEntities {
         tables: Option<&BlockLootTables>,
     ) -> anyhow::Result<(Vec<Drop>, Vec<Tag>, LegacyRandom)> {
         use anyhow::{Context, ensure};
-        use native_resources::{loot::LootBlockState, packs::ResourceId};
+        use native_resources::loot::LootBlockState;
         let tables = tables.context("block loot table unavailable")?;
         ensure!(
             tables.fully_supported_player_block_with_components(table),
@@ -1820,38 +1856,20 @@ impl ItemEntities {
             entity_present,
             Some(&mut random),
         )?;
-        let Tag::Compound(source) = components else {
-            anyhow::bail!("block entity components are not a compound")
-        };
-        let mut prepared = Vec::with_capacity(drops.len());
-        for drop in &drops {
-            let mut selected = Vec::new();
-            let mut seen = BTreeSet::new();
-            for (key, value) in source {
-                let key_text =
-                    String::from_utf16(&key.0).context("invalid component identifier")?;
-                let id = ResourceId::parse(&key_text)?;
-                ensure!(seen.insert(id.clone()), "duplicate block entity component");
-                if (drop.copy_block_entity_custom_name
-                    && id.namespace == "minecraft"
-                    && id.path == "custom_name")
-                    || drop
-                        .copy_block_entity_components
-                        .iter()
-                        .any(|filter| filter.accepts(&id))
-                {
-                    selected.push((key.clone(), value.clone()));
-                }
-            }
-            let components = Tag::Compound(selected);
-            let item = format!("{}:{}", drop.item.namespace, drop.item.path);
-            ensure!(
-                crate::inventory::saved_item_max(&item, &components).is_some(),
-                "unsupported dropped item components"
-            );
-            prepared.push(components);
-        }
+        let prepared = prepare_component_copies(&drops, components)?;
         Ok((drops, prepared, random))
+    }
+
+    pub(crate) fn validate_block_entity_drops(
+        table: &str,
+        components: &Tag,
+        tables: Option<&BlockLootTables>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let tables = tables.context("block loot table unavailable")?;
+        let drops = tables.potential_block_entity_drops(table)?;
+        prepare_component_copies(&drops, components)?;
+        Ok(())
     }
 
     pub(crate) fn drop_prepared_block_entity_items(

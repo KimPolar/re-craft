@@ -221,6 +221,7 @@ pub struct Renderer {
     fog_last: Option<FogUniform>,
     end_sky: Option<crate::end_sky::EndSky>,
     sun: Option<crate::sun_render::Sun>,
+    moon: Option<crate::sun_render::Sun>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -359,6 +360,7 @@ impl Renderer {
             self.config.format,
             DEPTH_FORMAT,
             texture,
+            None,
         )?);
         Ok(())
     }
@@ -366,6 +368,32 @@ impl Renderer {
     pub fn set_sun_frame(&mut self, frame: Option<crate::sun_render::Frame>) {
         if let Some(sun) = &mut self.sun {
             sun.set_frame(frame);
+        }
+    }
+
+    pub fn set_moon(&mut self, texture: crate::sun_render::Texture) -> Result<()> {
+        self.moon = Some(crate::sun_render::Sun::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            DEPTH_FORMAT,
+            texture,
+            self.sun.as_ref(),
+        )?);
+        Ok(())
+    }
+
+    pub fn set_moon_frame(
+        &mut self,
+        frame: Option<(crate::sun_render::Frame, crate::moon_phase::Phase)>,
+    ) {
+        if let Some(moon) = &mut self.moon {
+            if let Some((frame, phase)) = frame {
+                moon.set_sprite(phase.index());
+                moon.set_frame(Some(frame));
+            } else {
+                moon.set_frame(None);
+            }
         }
     }
 
@@ -1313,6 +1341,7 @@ impl Renderer {
             fog_last: None,
             end_sky: None,
             sun: None,
+            moon: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2217,7 +2246,10 @@ impl Renderer {
             sky.update(&self.queue, sky_matrix, sky_background);
         }
         if let Some(sun) = &mut self.sun {
-            sun.update(&self.queue, sky_matrix, sky_background);
+            sun.update(&self.queue, sky_matrix, sky_background, None);
+        }
+        if let Some(moon) = &mut self.moon {
+            moon.update(&self.queue, sky_matrix, sky_background, self.sun.as_ref());
         }
         self.consume_renderer.update(
             &self.device,
@@ -2309,6 +2341,9 @@ impl Renderer {
             }
             if let Some(sun) = &self.sun {
                 sun.draw(&mut pass);
+            }
+            if let Some(moon) = &self.moon {
+                moon.draw(&mut pass);
             }
             pass.set_pipeline(&self.terrain_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);

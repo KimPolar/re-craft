@@ -43,6 +43,7 @@ mod menu_settings;
 mod menu_software_worker;
 mod mesh;
 mod mesh_worker;
+mod moon_phase;
 mod mouse_look;
 mod mouse_scroll;
 mod mouse_ui;
@@ -574,6 +575,7 @@ struct PreparedPlayWorld {
     sky_background: Option<sky_background::SkyBackground>,
     end_sky: Option<end_sky::Texture>,
     sun: Option<sun_render::Texture>,
+    moon: Option<sun_render::Texture>,
     video: menu_settings::VideoSettings,
 }
 
@@ -624,6 +626,7 @@ fn run_prepared_world(
                 sky_background,
                 end_sky,
                 sun,
+                moon,
                 video,
             } = *world;
             preview_app::run_play(
@@ -641,6 +644,7 @@ fn run_prepared_world(
                 sky_background,
                 end_sky,
                 sun,
+                moon,
                 video,
                 audio,
                 hud_hidden,
@@ -935,6 +939,20 @@ fn prepare_existing_world(
                 Ok(texture) => Some(texture),
                 Err(error) => {
                     eprintln!("Sun texture is unavailable: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let moon = if sky_background
+            .as_ref()
+            .is_some_and(sky_background::SkyBackground::has_overworld_sky)
+        {
+            match sun_render::Texture::load_moon(&mut resources) {
+                Ok(texture) => Some(texture),
+                Err(error) => {
+                    eprintln!("Moon textures are unavailable: {error:#}");
                     None
                 }
             }
@@ -1535,6 +1553,7 @@ fn prepare_existing_world(
             sky_background,
             end_sky,
             sun,
+            moon,
             video,
         })));
     }

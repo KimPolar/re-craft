@@ -12,14 +12,40 @@ use wgpu::util::DeviceExt;
 #[derive(Clone)]
 pub struct Texture {
     atlas: SpriteAtlas,
-    id: ResourceId,
+    ids: Vec<ResourceId>,
+    size: f32,
+    flip_uv: bool,
 }
 
 impl Texture {
     pub fn load(source: &mut impl ResourceProvider) -> Result<Self> {
         let id = ResourceId::parse("minecraft:environment/celestial/sun")?;
         let atlas = SpriteAtlas::build(source, [id.clone()], 4096)?;
-        Ok(Self { atlas, id })
+        Ok(Self {
+            atlas,
+            ids: vec![id],
+            size: 30.0,
+            flip_uv: false,
+        })
+    }
+
+    pub fn load_moon(source: &mut impl ResourceProvider) -> Result<Self> {
+        let ids: Vec<_> = crate::moon_phase::Phase::ALL
+            .into_iter()
+            .map(|phase| {
+                ResourceId::parse(&format!(
+                    "minecraft:environment/celestial/moon/{}",
+                    phase.name()
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let atlas = SpriteAtlas::build(source, ids.iter().cloned(), 4096)?;
+        Ok(Self {
+            atlas,
+            ids,
+            size: 20.0,
+            flip_uv: true,
+        })
     }
 }
 
@@ -30,15 +56,19 @@ struct Vertex {
     uv: [f32; 2],
 }
 
-fn quad(texture: &Texture) -> Result<[Vertex; 6]> {
+fn quad(texture: &Texture, id: &ResourceId) -> Result<[Vertex; 6]> {
     let rect = texture
         .atlas
-        .rectangle(&texture.id)
-        .context("sun sprite missing from atlas")?;
-    let u0 = rect.x as f32 / texture.atlas.texture.width as f32;
-    let v0 = rect.y as f32 / texture.atlas.texture.height as f32;
-    let u1 = (rect.x + rect.width) as f32 / texture.atlas.texture.width as f32;
-    let v1 = (rect.y + rect.height) as f32 / texture.atlas.texture.height as f32;
+        .rectangle(id)
+        .context("celestial sprite missing from atlas")?;
+    let mut u0 = rect.x as f32 / texture.atlas.texture.width as f32;
+    let mut v0 = rect.y as f32 / texture.atlas.texture.height as f32;
+    let mut u1 = (rect.x + rect.width) as f32 / texture.atlas.texture.width as f32;
+    let mut v1 = (rect.y + rect.height) as f32 / texture.atlas.texture.height as f32;
+    if texture.flip_uv {
+        std::mem::swap(&mut u0, &mut u1);
+        std::mem::swap(&mut v0, &mut v1);
+    }
     let vertices = [
         Vertex {
             position: [-1.0, 0.0, -1.0],
@@ -67,11 +97,11 @@ fn quad(texture: &Texture) -> Result<[Vertex; 6]> {
     ])
 }
 
-fn sun_model(angle_degrees: f32) -> Mat4 {
+fn sun_model(angle_degrees: f32, size: f32) -> Mat4 {
     Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2)
         * Mat4::from_rotation_x(angle_degrees * 0.017_453_292_f32)
         * Mat4::from_translation(Vec3::new(0.0, 100.0, 0.0))
-        * Mat4::from_scale(Vec3::new(30.0, 1.0, 30.0))
+        * Mat4::from_scale(Vec3::new(size, 1.0, size))
 }
 
 #[derive(Clone, Copy)]
@@ -89,7 +119,9 @@ pub struct Sun {
     image: wgpu::Texture,
     source: Texture,
     frame: Option<Frame>,
-    last_state: Option<[[f32; 4]; 6]>,
+    last_state: Option<[[f32; 4]; 12]>,
+    sprite_index: usize,
+    has_sun_texture: bool,
 }
 
 impl Sun {
@@ -99,6 +131,7 @@ impl Sun {
         format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         source: Texture,
+        sun: Option<&Sun>,
     ) -> Result<Self> {
         let atlas = &source.atlas.texture;
         ensure!(
@@ -146,7 +179,7 @@ impl Sun {
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Sun camera and color"),
-            size: 96,
+            size: 192,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -179,9 +212,20 @@ impl Sun {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let view = image.create_view(&Default::default());
+        let sun_view = sun.map(|sun| sun.image.create_view(&Default::default()));
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Sun bindings"),
             layout: &layout,
@@ -197,6 +241,12 @@ impl Sun {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(
+                        sun_view.as_ref().unwrap_or(&view),
+                    ),
                 },
             ],
         });
@@ -251,9 +301,17 @@ impl Sun {
             multiview_mask: None,
             cache: None,
         });
+        let vertices_data: Vec<Vertex> = source
+            .ids
+            .iter()
+            .map(|id| quad(&source, id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sun quad"),
-            contents: bytemuck::cast_slice(&quad(&source)?),
+            contents: bytemuck::cast_slice(&vertices_data),
             usage: wgpu::BufferUsages::VERTEX,
         });
         Ok(Self {
@@ -265,6 +323,8 @@ impl Sun {
             source,
             frame: None,
             last_state: None,
+            sprite_index: 0,
+            has_sun_texture: sun.is_some(),
         })
     }
 
@@ -272,7 +332,18 @@ impl Sun {
         self.frame = frame;
     }
 
-    pub fn update(&mut self, queue: &wgpu::Queue, view_projection: Mat4, background: [f32; 3]) {
+    pub fn set_sprite(&mut self, index: usize) {
+        debug_assert!(index < self.source.ids.len());
+        self.sprite_index = index;
+    }
+
+    pub fn update(
+        &mut self,
+        queue: &wgpu::Queue,
+        view_projection: Mat4,
+        background: [f32; 3],
+        sun: Option<&Sun>,
+    ) {
         let Some(frame) = self.frame else {
             return;
         };
@@ -298,14 +369,46 @@ impl Sun {
                 },
             );
         }
-        let matrix = (view_projection * sun_model(frame.angle_degrees)).to_cols_array_2d();
+        let model = sun_model(frame.angle_degrees, self.source.size);
+        let matrix = (view_projection * model).to_cols_array_2d();
+        let mut sun_transform = [[0.0; 4]; 4];
+        let mut sun_origin = [0.0; 4];
+        let mut sun_rect = [0.0; 4];
+        let mut sun_visible = false;
+        if let Some(sun) = sun.filter(|_| self.has_sun_texture)
+            && let Some(sun_frame) = sun.frame
+            && let Some(rect) = sun.source.atlas.rectangle(&sun.source.ids[0])
+        {
+            let inverse = sun_model(sun_frame.angle_degrees, sun.source.size).inverse();
+            sun_transform = (inverse * model).to_cols_array_2d();
+            sun_origin = inverse.transform_point3(Vec3::ZERO).extend(1.0).to_array();
+            let atlas = &sun.source.atlas.texture;
+            sun_rect = [
+                rect.x as f32 / atlas.width as f32,
+                rect.y as f32 / atlas.height as f32,
+                (rect.x + rect.width) as f32 / atlas.width as f32,
+                (rect.y + rect.height) as f32 / atlas.height as f32,
+            ];
+            sun_visible = true;
+        }
         let state = [
             matrix[0],
             matrix[1],
             matrix[2],
             matrix[3],
             [background[0], background[1], background[2], 1.0],
-            [frame.rain_brightness, 0.0, 0.0, 0.0],
+            [
+                frame.rain_brightness,
+                if sun_visible { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+            sun_transform[0],
+            sun_transform[1],
+            sun_transform[2],
+            sun_transform[3],
+            sun_origin,
+            sun_rect,
         ];
         if self.last_state != Some(state) {
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&state));
@@ -320,7 +423,8 @@ impl Sun {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bindings, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
-        pass.draw(0..6, 0..1);
+        let start = (self.sprite_index * 6) as u32;
+        pass.draw(start..start + 6, 0..1);
     }
 }
 
@@ -341,6 +445,18 @@ mod tests {
                     Some(self.image.clone())
                 }
                 "assets/minecraft/textures/environment/celestial/sun.png.mcmeta" => {
+                    self.metadata.clone()
+                }
+                path if path
+                    .starts_with("assets/minecraft/textures/environment/celestial/moon/")
+                    && path.ends_with(".png") =>
+                {
+                    Some(self.image.clone())
+                }
+                path if path
+                    .starts_with("assets/minecraft/textures/environment/celestial/moon/")
+                    && path.ends_with(".png.mcmeta") =>
+                {
                     self.metadata.clone()
                 }
                 _ => None,
@@ -374,16 +490,61 @@ mod tests {
     #[test]
     fn sprite_uses_resource_pack_and_animated_frames() {
         let mut source = Texture::load(&mut pack(true)).unwrap();
-        let rect = source.atlas.rectangle(&source.id).unwrap();
+        let rect = source.atlas.rectangle(&source.ids[0]).unwrap();
         assert_eq!((rect.width, rect.height), (2, 2));
         let before = source.atlas.texture.rgba.clone();
         assert!(source.atlas.needs_update(1));
         assert!(source.atlas.update(1));
         assert_ne!(source.atlas.texture.rgba, before);
         assert!(!source.atlas.needs_update(1));
-        let vertices = quad(&source).unwrap();
+        let vertices = quad(&source, &source.ids[0]).unwrap();
         assert_eq!(vertices[0].position, [-1.0, 0.0, -1.0]);
         assert_eq!(vertices[2].position, [1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn moon_phase_quads_select_the_matching_sprite() {
+        struct MoonPack;
+        impl ResourceProvider for MoonPack {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                for (index, phase) in crate::moon_phase::Phase::ALL.into_iter().enumerate() {
+                    if path
+                        == format!(
+                            "assets/minecraft/textures/environment/celestial/moon/{}.png",
+                            phase.name()
+                        )
+                    {
+                        let image = image::RgbaImage::from_pixel(
+                            1,
+                            1,
+                            image::Rgba([index as u8 * 23, 17, 31, 255]),
+                        );
+                        let mut png = Cursor::new(Vec::new());
+                        image::DynamicImage::ImageRgba8(image)
+                            .write_to(&mut png, image::ImageFormat::Png)?;
+                        return Ok(Some(png.into_inner()));
+                    }
+                }
+                Ok(None)
+            }
+        }
+        let moon = Texture::load_moon(&mut MoonPack).unwrap();
+        assert_eq!(moon.size, 20.0);
+        for phase in crate::moon_phase::Phase::ALL {
+            let index = phase.index();
+            let rect = moon.atlas.rectangle(&moon.ids[index]).unwrap();
+            let offset = ((rect.y * moon.atlas.texture.width + rect.x) * 4) as usize;
+            assert_eq!(moon.atlas.texture.rgba[offset], index as u8 * 23);
+            let vertices = quad(&moon, &moon.ids[index]).unwrap();
+            let u0 = rect.x as f32 / moon.atlas.texture.width as f32;
+            let v0 = rect.y as f32 / moon.atlas.texture.height as f32;
+            let u1 = (rect.x + rect.width) as f32 / moon.atlas.texture.width as f32;
+            let v1 = (rect.y + rect.height) as f32 / moon.atlas.texture.height as f32;
+            assert_eq!(vertices[0].uv, [u1, v1]);
+            assert_eq!(vertices[1].uv, [u0, v1]);
+            assert_eq!(vertices[2].uv, [u0, v0]);
+            assert_eq!(vertices[5].uv, [u1, v0]);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -433,30 +594,34 @@ mod tests {
         }
         let expected: Vec<[f32; 3]> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(expected.len(), 32);
+        assert_eq!(expected.len(), 64);
         let mut expected = expected.into_iter();
-        for angle in [0.0, 45.0, 90.0, 180.0, 270.0, 359.5, -90.0, 450.0] {
-            for vertex in [
-                Vec3::new(-1.0, 0.0, -1.0),
-                Vec3::new(1.0, 0.0, -1.0),
-                Vec3::new(1.0, 0.0, 1.0),
-                Vec3::new(-1.0, 0.0, 1.0),
-            ] {
-                for (actual, expected) in sun_model(angle)
-                    .transform_point3(vertex)
-                    .to_array()
-                    .into_iter()
-                    .zip(expected.next().unwrap())
-                {
-                    assert!(
-                        (actual - expected).abs() < 0.000_03,
-                        "angle {angle}: {actual} != {expected}"
-                    );
+        for size in [30.0, 20.0] {
+            for angle in [0.0, 45.0, 90.0, 180.0, 270.0, 359.5, -90.0, 450.0] {
+                for vertex in [
+                    Vec3::new(-1.0, 0.0, -1.0),
+                    Vec3::new(1.0, 0.0, -1.0),
+                    Vec3::new(1.0, 0.0, 1.0),
+                    Vec3::new(-1.0, 0.0, 1.0),
+                ] {
+                    for (actual, expected) in sun_model(angle, size)
+                        .transform_point3(vertex)
+                        .to_array()
+                        .into_iter()
+                        .zip(expected.next().unwrap())
+                    {
+                        assert!(
+                            (actual - expected).abs() < 0.000_03,
+                            "angle {angle}: {actual} != {expected}"
+                        );
+                    }
                 }
             }
         }
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         Texture::load(&mut resources).unwrap();
+        let moon = Texture::load_moon(&mut resources).unwrap();
+        assert_eq!(moon.ids.len(), 8);
     }
 
     #[test]
@@ -484,19 +649,32 @@ mod tests {
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .unwrap();
-            let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
             for format in [
                 wgpu::TextureFormat::Rgba8Unorm,
                 wgpu::TextureFormat::Rgba8UnormSrgb,
             ] {
+                let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let mut sun = Sun::new(
                     &device,
                     &queue,
                     format,
                     wgpu::TextureFormat::Depth32Float,
                     Texture::load(&mut pack(false)).unwrap(),
+                    None,
                 )
                 .unwrap();
+                let mut moon = Sun::new(
+                    &device,
+                    &queue,
+                    format,
+                    wgpu::TextureFormat::Depth32Float,
+                    Texture::load_moon(&mut pack(false)).unwrap(),
+                    Some(&sun),
+                )
+                .unwrap();
+                if let Some(error) = errors.pop().await {
+                    panic!("GPU pipeline validation failed: {error}");
+                }
                 let size = wgpu::Extent3d {
                     width: 64,
                     height: 64,
@@ -531,96 +709,106 @@ mod tests {
                     mapped_at_creation: false,
                 });
                 for rain_brightness in [0.0_f32, 0.5, 1.0] {
-                    let background = [0.1, 0.2, 0.3];
-                    let matrix = Mat4::perspective_rh(70_f32.to_radians(), 1.0, 0.05, 1024.0)
-                        * Mat4::look_to_rh(Vec3::ZERO, Vec3::Y, Vec3::Z);
-                    sun.set_frame(Some(Frame {
-                        angle_degrees: 0.0,
-                        rain_brightness,
-                        tick: 0,
-                    }));
-                    sun.update(&queue, matrix, background);
-                    let mut encoder = device.create_command_encoder(&Default::default());
-                    {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("sun test"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: Some(
-                                wgpu::RenderPassDepthStencilAttachment {
-                                    view: &depth_view,
-                                    depth_ops: Some(wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(1.0),
+                    for sun_angle in [0.0_f32, 10.0, 20.0, 180.0] {
+                        let background = [0.1, 0.2, 0.3];
+                        let matrix = Mat4::perspective_rh(70_f32.to_radians(), 1.0, 0.05, 1024.0)
+                            * Mat4::look_to_rh(Vec3::ZERO, Vec3::Y, Vec3::Z);
+                        sun.set_frame(Some(Frame {
+                            angle_degrees: sun_angle,
+                            rain_brightness,
+                            tick: 0,
+                        }));
+                        sun.update(&queue, matrix, background, None);
+                        moon.set_frame(Some(Frame {
+                            angle_degrees: 0.0,
+                            rain_brightness,
+                            tick: 0,
+                        }));
+                        moon.set_sprite(4);
+                        moon.update(&queue, matrix, background, Some(&sun));
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("sun test"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                         store: wgpu::StoreOp::Store,
-                                    }),
-                                    stencil_ops: None,
-                                },
-                            ),
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        sun.draw(&mut pass);
-                    }
-                    encoder.copy_texture_to_buffer(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &color,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: &readback,
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(256),
-                                rows_per_image: Some(64),
+                                    },
+                                })],
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: &depth_view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
+                            sun.draw(&mut pass);
+                            moon.draw(&mut pass);
+                        }
+                        encoder.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &color,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
                             },
-                        },
-                        size,
-                    );
-                    queue.submit([encoder.finish()]);
-                    let (sender, receiver) = mpsc::channel();
-                    readback
-                        .slice(..)
-                        .map_async(wgpu::MapMode::Read, move |result| {
-                            let _ = sender.send(result);
-                        });
-                    device
-                        .poll(wgpu::PollType::Wait {
-                            submission_index: None,
-                            timeout: Some(Duration::from_secs(15)),
-                        })
-                        .unwrap();
-                    receiver
-                        .recv_timeout(Duration::from_secs(15))
-                        .unwrap()
-                        .unwrap();
-                    let pixels = readback.slice(..).get_mapped_range().unwrap();
-                    let pixel = &pixels[(32 * 64 + 32) * 4..][..4];
-                    for (i, value) in [128.0, 64.0, 32.0].into_iter().enumerate() {
-                        let expected = (background[i] * 255.0
-                            + value * (128.0 / 255.0) * rain_brightness)
-                            .round() as i32;
-                        assert!(
-                            (i32::from(pixel[i]) - expected).abs() <= 1,
-                            "{format:?}, rain {rain_brightness}: {pixel:?}, channel {i} expected {expected}"
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &readback,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(256),
+                                    rows_per_image: Some(64),
+                                },
+                            },
+                            size,
                         );
+                        queue.submit([encoder.finish()]);
+                        let (sender, receiver) = mpsc::channel();
+                        readback
+                            .slice(..)
+                            .map_async(wgpu::MapMode::Read, move |result| {
+                                let _ = sender.send(result);
+                            });
+                        device
+                            .poll(wgpu::PollType::Wait {
+                                submission_index: None,
+                                timeout: Some(Duration::from_secs(15)),
+                            })
+                            .unwrap();
+                        receiver
+                            .recv_timeout(Duration::from_secs(15))
+                            .unwrap()
+                            .unwrap();
+                        let pixels = readback.slice(..).get_mapped_range().unwrap();
+                        let pixel = &pixels[(32 * 64 + 32) * 4..][..4];
+                        for (i, value) in [128.0, 64.0, 32.0].into_iter().enumerate() {
+                            let expected = (background[i] * 255.0
+                                + value
+                                    * (128.0 / 255.0)
+                                    * rain_brightness
+                                    * if sun_angle <= 10.0 { 2.0 } else { 1.0 })
+                            .round() as i32;
+                            assert!(
+                                (i32::from(pixel[i]) - expected).abs() <= 1,
+                                "{format:?}, angle {sun_angle}, rain {rain_brightness}: {pixel:?}, channel {i} expected {expected}"
+                            );
+                        }
+                        assert_eq!(pixel[3], 255);
+                        drop(pixels);
+                        readback.unmap();
                     }
-                    assert_eq!(pixel[3], 255);
-                    drop(pixels);
-                    readback.unmap();
                 }
-            }
-            if let Some(error) = errors.pop().await {
-                panic!("GPU validation failed: {error}");
             }
         });
     }

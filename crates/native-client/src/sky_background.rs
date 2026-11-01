@@ -625,6 +625,7 @@ pub struct SkyBackground {
     fog_sky_tracks: Option<Vec<SkyTrack>>,
     sunset: Option<SunsetTimeline>,
     celestial_angles: [Option<CelestialAngle>; 2],
+    moon_phase: Option<crate::moon_phase::Environment>,
     water: WaterFog,
     flat_world: Option<bool>,
     min_y: i32,
@@ -640,6 +641,7 @@ pub struct BackgroundSample {
     pub sky_mix: Option<([f32; 3], f32)>,
     pub sunset: Option<(f32, [f32; 4])>,
     pub celestial_angles: [Option<f32>; 2],
+    pub moon_phase: Option<crate::moon_phase::Phase>,
     pub water: Option<WaterFogSample>,
 }
 
@@ -727,6 +729,19 @@ impl SkyBackground {
         } else {
             [None, None]
         };
+        let mut moon_phase = if skybox == "overworld" {
+            named_attribute(dimension.get("attributes"), "visual/moon_phase")
+                .and_then(|value| value.map(crate::moon_phase::layer).transpose())
+                .ok()
+                .map(|value| crate::moon_phase::Environment {
+                    base: value.unwrap_or(crate::moon_phase::Phase::FullMoon),
+                    biomes: BTreeMap::new(),
+                    has_biome_layer: false,
+                    tracks: Vec::new(),
+                })
+        } else {
+            None
+        };
         let mut fog_sky_biomes = BTreeMap::new();
         let mut fog_color_biomes = BTreeMap::new();
         let fog_color_base = match dimension.get("attributes") {
@@ -786,6 +801,18 @@ impl SkyBackground {
                     );
                 }
             }
+            if let Some(phase) = &mut moon_phase {
+                let layer = named_attribute(biome.get("attributes"), "visual/moon_phase");
+                if !matches!(layer, Ok(None)) {
+                    phase.has_biome_layer = true;
+                }
+                phase.biomes.insert(
+                    name.clone(),
+                    layer
+                        .and_then(|value| value.map(crate::moon_phase::layer).transpose())
+                        .ok(),
+                );
+            }
             fog_biomes.insert(name.clone(), fog_layers(biome.get("attributes")).ok());
             fog_color_biomes.insert(
                 name.clone(),
@@ -829,6 +856,15 @@ impl SkyBackground {
                             }
                             Err(_) => celestial_angles[index] = None,
                         }
+                    }
+                }
+                if id.namespace == "minecraft"
+                    && id.path == "visual/moon_phase"
+                    && moon_phase.is_some()
+                {
+                    match crate::moon_phase::Track::parse(&timeline, value) {
+                        Ok(track) => moon_phase.as_mut().unwrap().tracks.push(track),
+                        Err(_) => moon_phase = None,
                     }
                 }
                 if id.namespace == "minecraft" {
@@ -935,6 +971,7 @@ impl SkyBackground {
             fog_sky_tracks,
             sunset,
             celestial_angles,
+            moon_phase,
             water,
             flat_world: None,
             min_y,
@@ -1076,6 +1113,19 @@ impl SkyBackground {
                 self.celestial_angles[i]
                     .as_ref()
                     .and_then(|angle| angle.sample(&grouped, &mut clock_ticks))
+            }),
+            moon_phase: self.moon_phase.as_ref().and_then(|phase| {
+                let biome = if phase.has_biome_layer {
+                    let p = position.floor();
+                    if p.min_element() < i32::MIN as f64 || p.max_element() > i32::MAX as f64 {
+                        return None;
+                    }
+                    let p = p.as_ivec3();
+                    world.biome(p.x, p.y.clamp(self.min_y, self.max_y - 1), p.z)
+                } else {
+                    None
+                };
+                phase.sample(biome, &mut clock_ticks)
             }),
             water,
         })
@@ -1570,6 +1620,17 @@ mod tests {
         assert!(overworld.fog_tracks.is_some());
         assert!(overworld.fog_color_tracks.is_some());
         assert!(overworld.sunset.is_some());
+        assert!(!overworld.moon_phase.as_ref().unwrap().has_biome_layer);
+        for (day, phase) in crate::moon_phase::Phase::ALL.into_iter().enumerate() {
+            assert_eq!(
+                overworld
+                    .moon_phase
+                    .as_ref()
+                    .unwrap()
+                    .sample(None, |_| Some(day as i64 * 24000)),
+                Some(phase)
+            );
+        }
         assert_eq!(overworld.water.base, Some([-8.0, 96.0, 0.0]));
         assert_eq!(
             overworld.water.color_base,
@@ -1944,6 +2005,7 @@ mod tests {
             fog_sky_tracks: None,
             sunset: None,
             celestial_angles: [None, None],
+            moon_phase: None,
             water: WaterFog::default(),
             flat_world: None,
             min_y: 0,
@@ -1959,6 +2021,7 @@ mod tests {
                 sky_mix: None,
                 sunset: None,
                 celestial_angles: [None, None],
+                moon_phase: None,
                 water: None
             })
         );
@@ -1972,6 +2035,7 @@ mod tests {
                 sky_mix: None,
                 sunset: None,
                 celestial_angles: [None, None],
+                moon_phase: None,
                 water: None
             })
         );

@@ -10,12 +10,12 @@ import org.joml.Vector3f;
 public class SunOracle {
     public static void main(String[] args) throws Exception {
         var output = new ArrayList<float[]>();
-        for (float angle : new float[] {0, 45, 90, 180, 270, 359.5f, -90, 450}) {
+        for (float size : new float[] {30, 20}) for (float angle : new float[] {0, 45, 90, 180, 270, 359.5f, -90, 450}) {
             var matrix = new Matrix4f()
                     .rotate(new Quaternionf().rotationY(-90.0f * 0.017453292f))
                     .rotate(new Quaternionf().rotationX(angle * 0.017453292f))
                     .translate(0, 100, 0)
-                    .scale(30, 1, 30);
+                    .scale(size, 1, size);
             for (float[] vertex : new float[][] {{-1, 0, -1}, {1, 0, -1}, {1, 0, 1}, {-1, 0, 1}}) {
                 var point = matrix.transformPosition(new Vector3f(vertex[0], vertex[1], vertex[2]));
                 output.add(new float[] {point.x, point.y, point.z});

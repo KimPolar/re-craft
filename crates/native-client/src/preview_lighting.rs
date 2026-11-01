@@ -323,14 +323,14 @@ pub(crate) struct SkyTrack {
 }
 
 #[derive(Clone, Copy)]
-enum TrackEasing {
+pub(crate) enum TrackEasing {
     Linear,
     Constant,
     Cubic { x: [f32; 3], y: [f32; 3] },
 }
 
 impl TrackEasing {
-    fn parse(value: Option<&Value>) -> Result<Self> {
+    pub(crate) fn parse(value: Option<&Value>) -> Result<Self> {
         match value {
             None => Ok(Self::Linear),
             Some(Value::String(name)) if name == "linear" => Ok(Self::Linear),
@@ -359,7 +359,7 @@ impl TrackEasing {
         }
     }
 
-    fn apply(self, input: f32) -> f32 {
+    pub(crate) fn apply(self, input: f32) -> f32 {
         match self {
             Self::Linear => input,
             Self::Constant => 0.0,

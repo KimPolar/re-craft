@@ -225,6 +225,7 @@ pub fn run_play(
     sky_background: Option<crate::sky_background::SkyBackground>,
     end_sky: Option<crate::end_sky::Texture>,
     sun: Option<crate::sun_render::Texture>,
+    moon: Option<crate::sun_render::Texture>,
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
     hud_hidden: bool,
@@ -272,6 +273,7 @@ pub fn run_play(
             sky_background,
             end_sky,
             sun,
+            moon,
             weather_textures,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
@@ -287,6 +289,7 @@ pub fn run_play(
             sunset_current: None,
             celestial_angles_previous: [None; 2],
             celestial_angles_current: [None; 2],
+            moon_phase: None,
             sky_background_previous: None,
             sky_background_current: None,
             sky_fog_previous: None,
@@ -406,6 +409,7 @@ struct PlayState {
     sky_background: Option<crate::sky_background::SkyBackground>,
     end_sky: Option<crate::end_sky::Texture>,
     sun: Option<crate::sun_render::Texture>,
+    moon: Option<crate::sun_render::Texture>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
@@ -421,6 +425,7 @@ struct PlayState {
     sunset_current: Option<(f32, [f32; 4])>,
     celestial_angles_previous: [Option<f32>; 2],
     celestial_angles_current: [Option<f32>; 2],
+    moon_phase: Option<crate::moon_phase::Phase>,
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
@@ -934,6 +939,7 @@ impl Viewer {
                     sky_mix,
                     sunset,
                     celestial_angles,
+                    moon_phase,
                     water,
                 }) = value
                 {
@@ -959,6 +965,7 @@ impl Viewer {
                         play.sunset_previous = play.sunset_current.or(sunset);
                     }
                     play.sunset_current = sunset;
+                    play.moon_phase = moon_phase;
                     for (index, angle) in celestial_angles.into_iter().enumerate() {
                         if play.sky_background_tick != Some(snapshot.tick)
                             || play.celestial_angles_previous[index].is_none()
@@ -1015,6 +1022,29 @@ impl Viewer {
                     _ => None,
                 };
                 renderer.set_sun_frame(sun_frame);
+                let moon_frame = match (
+                    play.celestial_angles_previous[1],
+                    play.celestial_angles_current[1],
+                    play.moon_phase,
+                ) {
+                    (Some(previous), Some(current), Some(phase))
+                        if background.has_overworld_sky() =>
+                    {
+                        Some((
+                            crate::sun_render::Frame {
+                                angle_degrees: interpolate_sun_angle(previous, current, partial),
+                                rain_brightness: 1.0
+                                    - snapshot
+                                        .weather
+                                        .map_or(0.0, |weather| weather.rain_at(partial)),
+                                tick: snapshot.tick,
+                            },
+                            phase,
+                        ))
+                    }
+                    _ => None,
+                };
+                renderer.set_moon_frame(moon_frame);
                 let color =
                     std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
                 let mut fog_color = match (play.fog_color_previous, play.fog_color_current) {
@@ -1371,6 +1401,11 @@ impl ApplicationHandler for Viewer {
             && let Err(error) = renderer.set_sun(texture.clone())
         {
             eprintln!("Sun rendering is unavailable: {error:#}");
+        }
+        if let Some(texture) = self.play.as_ref().and_then(|play| play.moon.as_ref())
+            && let Err(error) = renderer.set_moon(texture.clone())
+        {
+            eprintln!("Moon rendering is unavailable: {error:#}");
         }
         if let Some(textures) = self
             .play

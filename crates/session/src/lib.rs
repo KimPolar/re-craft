@@ -402,13 +402,15 @@ pub struct DeathInfo {
 }
 
 /// A client-visible system message produced by a local game event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SystemMessageKind {
     MissingRespawnBlock,
     DebugFocusPause(bool),
+    ScreenshotSaved(Arc<str>),
+    ScreenshotFailed(Arc<str>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SystemMessage {
     pub kind: SystemMessageKind,
     pub tick: u64,

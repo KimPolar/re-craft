@@ -417,6 +417,32 @@ impl GameUi {
         self.merge_chat_messages();
     }
 
+    pub fn screenshot_result(&mut self, result: Result<std::path::PathBuf>, tick: u64) {
+        let kind = match result {
+            Ok(path) => native_session::SystemMessageKind::ScreenshotSaved(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+                    .into(),
+            ),
+            Err(error) => {
+                native_session::SystemMessageKind::ScreenshotFailed(format!("{error:#}").into())
+            }
+        };
+        self.local_messages
+            .push(native_session::SystemMessage { kind, tick });
+        if self.local_messages.len() > 100 {
+            self.local_messages.remove(0);
+        }
+        self.merge_chat_messages();
+    }
+
+    #[cfg(test)]
+    pub fn last_system_message(&self) -> Option<&native_session::SystemMessageKind> {
+        self.system_messages.last().map(|message| &message.kind)
+    }
+
     fn merge_chat_messages(&mut self) {
         let mut messages = self.snapshot_messages.to_vec();
         messages.extend_from_slice(&self.local_messages);
@@ -502,6 +528,10 @@ impl GameUi {
 
     pub fn hud_hidden(&self) -> bool {
         self.hud_hidden
+    }
+
+    pub fn minecraft_dir(&self) -> &std::path::Path {
+        &self.assets.minecraft_dir
     }
 
     pub fn toggle_hud(&mut self) {

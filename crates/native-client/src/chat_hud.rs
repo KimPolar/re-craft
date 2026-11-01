@@ -232,7 +232,7 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
         ) else {
             continue;
         };
-        let (message, debug_prefix) = match message.kind {
+        let (message, debug_prefix) = match &message.kind {
             SystemMessageKind::MissingRespawnBlock => (
                 assets
                     .translate(
@@ -243,12 +243,12 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
                 None,
             ),
             SystemMessageKind::DebugFocusPause(enabled) => {
-                let key = if enabled {
+                let key = if *enabled {
                     "debug.pause_focus.on"
                 } else {
                     "debug.pause_focus.off"
                 };
-                let fallback = if enabled {
+                let fallback = if *enabled {
                     "Pause on lost focus: enabled"
                 } else {
                     "Pause on lost focus: disabled"
@@ -259,6 +259,18 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
                     Some(prefix),
                 )
             }
+            SystemMessageKind::ScreenshotSaved(name) => (
+                assets
+                    .translate("screenshot.success", "Saved screenshot as %s")
+                    .replacen("%s", name, 1),
+                None,
+            ),
+            SystemMessageKind::ScreenshotFailed(reason) => (
+                assets
+                    .translate("screenshot.failure", "Couldn't save screenshot: %s")
+                    .replacen("%s", reason, 1),
+                None,
+            ),
         };
         let prefix_bytes = debug_prefix.map_or(0, str::len);
         for (text, prefix_len) in wrap(canvas, assets, &message, layout.width.max(1), prefix_bytes)
@@ -381,10 +393,19 @@ mod tests {
             kind: SystemMessageKind::MissingRespawnBlock,
             tick: 10,
         };
-        let key = display_key(&settings, &[message], 10).unwrap();
-        assert_eq!(display_key(&settings, &[message], 190), Some(key));
-        assert_ne!(display_key(&settings, &[message], 191), Some(key));
-        assert_eq!(display_key(&settings, &[message], 210), None);
+        let key = display_key(&settings, std::slice::from_ref(&message), 10).unwrap();
+        assert_eq!(
+            display_key(&settings, std::slice::from_ref(&message), 190),
+            Some(key)
+        );
+        assert_ne!(
+            display_key(&settings, std::slice::from_ref(&message), 191),
+            Some(key)
+        );
+        assert_eq!(
+            display_key(&settings, std::slice::from_ref(&message), 210),
+            None
+        );
         assert_eq!(
             LineLayout::new(&settings, 240, 180).unwrap().text_opacity,
             1.0

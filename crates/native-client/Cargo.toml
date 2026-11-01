@@ -27,7 +27,7 @@ lewton = "0.10.2"
 cpal = "0.15.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 flate2.workspace = true

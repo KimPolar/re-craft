@@ -772,6 +772,11 @@ impl Viewer {
         let now = Instant::now();
         if let Some(play) = &self.play {
             let snapshot = play.session.snapshot();
+            if let (Some(ui), Some(renderer)) = (&mut self.ui, &mut self.renderer) {
+                while let Some(result) = renderer.take_screenshot_result() {
+                    ui.screenshot_result(result, snapshot.tick);
+                }
+            }
             if self.death_visible != snapshot.death.is_some() {
                 self.death_visible = snapshot.death.is_some();
                 self.inventory_wait = None;
@@ -1322,6 +1327,10 @@ impl ApplicationHandler for Viewer {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if crate::screenshot_shortcut(event.physical_key, event.state, event.repeat) {
+                    crate::request_game_screenshot(&self.ui, &mut self.renderer);
+                    return;
+                }
                 if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
                     self.toggle_fullscreen();
                     return;

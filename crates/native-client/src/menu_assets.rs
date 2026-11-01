@@ -17,6 +17,7 @@ use native_resources::{
 use serde_json::Value;
 
 pub struct MenuAssets {
+    pub minecraft_dir: std::path::PathBuf,
     pub chat: crate::chat_hud::ChatSettings,
     pub item_models: Arc<Mutex<crate::held_items::Loader>>,
     pub trim_registry: Arc<crate::equipment_visual::TrimRegistry>,
@@ -696,6 +697,7 @@ impl MenuAssets {
         );
         let item_models = Arc::new(Mutex::new(crate::held_items::Loader::from_stack(stack)));
         Ok(Self {
+            minecraft_dir: minecraft_dir.to_owned(),
             chat,
             item_models,
             trim_registry,

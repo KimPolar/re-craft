@@ -49,6 +49,7 @@ mod rain_fog;
 mod recipe_book_ui;
 mod renderer;
 mod screen_blur;
+mod screenshot;
 mod sky_background;
 mod smoke_particles;
 mod sound_ui;
@@ -1560,6 +1561,16 @@ fn fullscreen_shortcut(key: PhysicalKey, state: ElementState, repeat: bool) -> b
     key == PhysicalKey::Code(KeyCode::F11) && state == ElementState::Pressed && !repeat
 }
 
+fn screenshot_shortcut(key: PhysicalKey, state: ElementState, repeat: bool) -> bool {
+    key == PhysicalKey::Code(KeyCode::F2) && state == ElementState::Pressed && !repeat
+}
+
+fn request_game_screenshot(ui: &Option<GameUi>, renderer: &mut Option<Renderer>) {
+    if let (Some(ui), Some(renderer)) = (ui, renderer) {
+        renderer.request_screenshot(ui.minecraft_dir().to_owned());
+    }
+}
+
 fn apply_fullscreen(window: &winit::window::Window, enabled: bool) {
     window.set_fullscreen(fullscreen_mode(enabled));
 }
@@ -1992,6 +2003,11 @@ impl App {
         #[cfg(debug_assertions)]
         let now = Instant::now();
         let snapshot = self.session.snapshot();
+        if let (Some(ui), Some(renderer)) = (&mut self.ui, &mut self.renderer) {
+            while let Some(result) = renderer.take_screenshot_result() {
+                ui.screenshot_result(result, snapshot.tick);
+            }
+        }
         if self.death_visible != snapshot.death.is_some() {
             self.death_visible = snapshot.death.is_some();
             self.inventory_wait = None;
@@ -2218,6 +2234,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if screenshot_shortcut(event.physical_key, event.state, event.repeat) {
+                    request_game_screenshot(&self.ui, &mut self.renderer);
+                    return;
+                }
                 if fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
                     self.toggle_fullscreen();
                     return;
@@ -2732,6 +2752,132 @@ mod world_open_tests {
 mod video_window_tests {
     use super::*;
     use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]
+    fn screenshot_captures_composited_game_and_reports_success() {
+        if !crate::window_test::isolated(
+            "video_window_tests::screenshot_captures_composited_game_and_reports_success",
+        ) {
+            return;
+        }
+        struct Harness {
+            app: App,
+            requested: bool,
+            started: Instant,
+            screenshots: Vec<PathBuf>,
+        }
+        impl ApplicationHandler for Harness {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                let redraw = matches!(event, WindowEvent::RedrawRequested);
+                self.app.window_event(event_loop, id, event);
+                if !redraw {
+                    return;
+                }
+                if !self.requested {
+                    assert!(screenshot_shortcut(
+                        PhysicalKey::Code(KeyCode::F2),
+                        ElementState::Pressed,
+                        false
+                    ));
+                    assert!(!screenshot_shortcut(
+                        PhysicalKey::Code(KeyCode::F2),
+                        ElementState::Pressed,
+                        true
+                    ));
+                    assert!(!screenshot_shortcut(
+                        PhysicalKey::Code(KeyCode::F2),
+                        ElementState::Released,
+                        false
+                    ));
+                    request_game_screenshot(&self.app.ui, &mut self.app.renderer);
+                    self.requested = true;
+                } else if let Some(message) = self.app.ui.as_ref().unwrap().last_system_message() {
+                    match message {
+                        native_session::SystemMessageKind::ScreenshotSaved(name) => {
+                            let path = self
+                                .app
+                                .ui
+                                .as_ref()
+                                .unwrap()
+                                .minecraft_dir()
+                                .join("screenshots")
+                                .join(name.as_ref());
+                            if !self.screenshots.contains(&path) {
+                                self.screenshots.push(path);
+                                if self.screenshots.len() == 1 {
+                                    self.app
+                                        .renderer
+                                        .as_mut()
+                                        .unwrap()
+                                        .force_screenshot_fallback();
+                                    request_game_screenshot(&self.app.ui, &mut self.app.renderer);
+                                } else {
+                                    event_loop.exit();
+                                }
+                            }
+                        }
+                        native_session::SystemMessageKind::ScreenshotFailed(error) => {
+                            panic!("screenshot failed: {error}")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    self.started.elapsed() < Duration::from_secs(30),
+                    "screenshot timed out"
+                );
+                if let Some(window) = &self.app.window {
+                    window.request_redraw();
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.about_to_wait(event_loop);
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temporary = tempfile::tempdir().unwrap();
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.minecraft_dir = temporary.path().to_owned();
+        let mut harness = Harness {
+            app: App::new(
+                native_resources::load_atlas(&game).unwrap(),
+                false,
+                Some(Arc::new(assets)),
+                SessionContent::default(),
+                menu_settings::VideoSettings::default(),
+            ),
+            requested: false,
+            started: Instant::now(),
+            screenshots: Vec::new(),
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+        let size = harness.app.window.as_ref().unwrap().inner_size();
+        assert_eq!(harness.screenshots.len(), 2);
+        for path in harness.screenshots {
+            let image = image::open(path).unwrap().to_rgba8();
+            assert_eq!(image.dimensions(), (size.width, size.height));
+            assert!(image.pixels().all(|pixel| pixel[3] == 255));
+            let first = image.get_pixel(0, 0);
+            assert!(
+                image.pixels().any(|pixel| pixel != first),
+                "captured frame must contain scene and HUD"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]

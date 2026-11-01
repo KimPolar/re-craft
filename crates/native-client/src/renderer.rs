@@ -257,6 +257,11 @@ pub struct Renderer {
     overlay_size: (u32, u32),
     hide_crosshair: bool,
     hud_hidden: bool,
+    screenshots: crate::screenshot::Screenshots,
+    screenshot_requests: std::collections::VecDeque<std::path::PathBuf>,
+    screenshot_errors: std::collections::VecDeque<anyhow::Error>,
+    screenshot_blitter: Option<wgpu::util::TextureBlitter>,
+    screenshot_surface_copy: bool,
     screen_blur: Option<crate::screen_blur::ScreenBlur>,
     screen_blur_radius: u8,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -382,6 +387,27 @@ impl Renderer {
 
     pub fn set_hud_hidden(&mut self, hidden: bool) {
         self.hud_hidden = hidden;
+    }
+
+    pub fn request_screenshot(&mut self, minecraft_dir: std::path::PathBuf) {
+        if self.screenshot_requests.len() >= 4 {
+            self.screenshot_errors
+                .push_back(anyhow!("screenshot queue is full"));
+        } else {
+            self.screenshot_requests.push_back(minecraft_dir);
+        }
+    }
+
+    pub fn take_screenshot_result(&mut self) -> Option<Result<std::path::PathBuf>> {
+        self.screenshot_errors
+            .pop_front()
+            .map(Err)
+            .or_else(|| self.screenshots.take_result())
+    }
+
+    #[cfg(test)]
+    pub fn force_screenshot_fallback(&mut self) {
+        self.screenshot_surface_copy = false;
     }
 
     #[cfg(test)]
@@ -722,6 +748,10 @@ impl Renderer {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| anyhow!("surface has no compatible configuration"))?;
         let caps = surface.get_capabilities(&adapter);
+        let screenshot_surface_copy = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if screenshot_surface_copy {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         if let Some(srgb) = caps
             .formats
             .iter()
@@ -1287,6 +1317,11 @@ impl Renderer {
             overlay_size: (0, 0),
             hide_crosshair: false,
             hud_hidden: false,
+            screenshots: crate::screenshot::Screenshots::new()?,
+            screenshot_requests: std::collections::VecDeque::new(),
+            screenshot_errors: std::collections::VecDeque::new(),
+            screenshot_blitter: None,
+            screenshot_surface_copy,
             screen_blur: Some(screen_blur),
             screen_blur_radius: 0,
             vertex_buffer: None,
@@ -2096,9 +2131,35 @@ impl Renderer {
         )?;
         self.update_fog(eye);
 
-        let output_view = frame
+        let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let screenshot_directory = self.screenshot_requests.pop_front();
+        let screenshot_texture = screenshot_directory
+            .as_ref()
+            .filter(|_| !self.screenshot_surface_copy)
+            .map(|_| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("screenshot frame"),
+                    size: wgpu::Extent3d {
+                        width: self.config.width,
+                        height: self.config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            });
+        let screenshot_view = screenshot_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let output_view = screenshot_view.as_ref().unwrap_or(&surface_view);
         if self.screen_blur_radius > 0 {
             let blur = self.screen_blur.get_or_insert_with(|| {
                 crate::screen_blur::ScreenBlur::new(&self.device, self.config.format)
@@ -2113,7 +2174,7 @@ impl Renderer {
         let view = if self.screen_blur_radius > 0 {
             self.screen_blur.as_ref().unwrap().view()
         } else {
-            &output_view
+            output_view
         };
         let mut encoder = self
             .device
@@ -2268,7 +2329,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GUI overlay pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: output_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -2286,7 +2347,39 @@ impl Renderer {
             pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
-        self.queue.submit([encoder.finish()]);
+        let readback = if screenshot_directory.is_some() {
+            let texture = screenshot_texture.as_ref().unwrap_or(&frame.texture);
+            let readback = crate::screenshot::Readback::encode(
+                &self.device,
+                &mut encoder,
+                texture,
+                (self.config.width, self.config.height),
+                self.config.format,
+            );
+            if screenshot_texture.is_some() {
+                let blitter = self.screenshot_blitter.get_or_insert_with(|| {
+                    wgpu::util::TextureBlitter::new(&self.device, self.config.format)
+                });
+                blitter.copy(&self.device, &mut encoder, output_view, &surface_view);
+            }
+            match readback {
+                Ok(readback) => Some(readback),
+                Err(error) => {
+                    self.screenshot_errors.push_back(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let submission = self.queue.submit([encoder.finish()]);
+        if let (Some(readback), Some(directory)) = (readback, screenshot_directory)
+            && let Err(error) =
+                self.screenshots
+                    .submit(&self.device, readback, submission, &directory)
+        {
+            self.screenshot_errors.push_back(error);
+        }
         self.queue.present(frame);
         if suboptimal {
             self.surface.configure(&self.device, &self.config);

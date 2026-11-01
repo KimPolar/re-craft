@@ -3984,6 +3984,7 @@ impl LoadedSession {
             world_spawn: self.snapshot.world_spawn.clone(),
             last_death: self.snapshot.last_death.clone(),
             player: self.player,
+            tooltip_attack_base: self.snapshot.tooltip_attack_base,
             camera: self.camera,
             game_mode: self.game_mode,
             vitals: self.vitals,
@@ -4051,6 +4052,8 @@ impl LoadedSession {
         let encoded = native_persistence::nbt::write(source)?;
         self.set_player_inventory(inventory);
         Arc::make_mut(&mut self.snapshot).last_death = last_death;
+        Arc::make_mut(&mut self.snapshot).tooltip_attack_base =
+            crate::player_data::tooltip_attack_base(source);
         self.saved_player_inventory_source = Some(encoded);
         Ok(())
     }
@@ -4106,6 +4109,7 @@ impl LoadedSession {
             world_spawn: None,
             last_death: crate::LastDeathLocation::Unknown,
             player,
+            tooltip_attack_base: Some([1.0, 4.0]),
             camera,
             game_mode: GameMode::default(),
             vitals: crate::survival::PlayerVitals::default(),
@@ -14839,6 +14843,7 @@ impl GameSession for LoadedSession {
                 world_spawn: self.snapshot.world_spawn.clone(),
                 last_death: self.snapshot.last_death.clone(),
                 player: self.player,
+                tooltip_attack_base: self.snapshot.tooltip_attack_base,
                 camera: self.camera,
                 game_mode: self.game_mode,
                 vitals: self.vitals,
@@ -28947,6 +28952,45 @@ mod tests {
         draft.add_to_save_plan(&mut plan, &original).unwrap();
         session.set_world_clocks(BTreeMap::new(), true);
         assert!(session.draft_world_clocks(&original).is_err());
+    }
+
+    #[test]
+    fn saved_tooltip_attack_bases_survive_inventory_and_tick_snapshots() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                (
+                    "Inventory".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![],
+                    },
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:attack_damage".into())),
+                                ("base".into(), Tag::Double(3.5)),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:attack_speed".into())),
+                                ("base".into(), Tag::Double(6.0)),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        let mut session = session();
+        session.restore_saved_player_inventory(&player).unwrap();
+        assert_eq!(session.snapshot().tooltip_attack_base, Some([3.5, 6.0]));
+        session.set_player_inventory(PlayerInventory::default());
+        session.update(TICK);
+        assert_eq!(session.snapshot().tooltip_attack_base, Some([3.5, 6.0]));
     }
 
     #[test]

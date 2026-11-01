@@ -141,7 +141,7 @@ fn custom_effect(tag: &Tag) -> Option<Effect> {
     })
 }
 
-fn formatted(assets: &MenuAssets, key: &str, args: &[&str]) -> String {
+pub(crate) fn formatted(assets: &MenuAssets, key: &str, args: &[&str]) -> String {
     let template = assets.translate(key, key);
     let Some(parts) = crate::text_component::format_parts(template) else {
         return template.into();

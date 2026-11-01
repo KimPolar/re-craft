@@ -101,6 +101,7 @@ pub fn lines(
     item: &ItemStack,
     assets: &MenuAssets,
     enchantments: &crate::enchantment_tooltip::Registry,
+    attack_base: Option<[f64; 2]>,
 ) -> Vec<Vec<Span>> {
     let components = item.components();
     let display = components.get("minecraft:tooltip_display");
@@ -174,6 +175,9 @@ pub fn lines(
                 lines.push(line);
             }
         }
+    }
+    if !hidden(display, "minecraft:attribute_modifiers") {
+        lines.extend(crate::attribute_tooltip::lines(item, assets, attack_base));
     }
     lines
 }
@@ -503,6 +507,43 @@ mod tests {
         cases.push(serde_json::json!({"id":"minecraft:apple","potion":"swiftness","enchantments":{"minecraft:mending":1,"minecraft:sharpness":5,"minecraft:binding_curse":1},"stored_enchantments":{"minecraft:vanishing_curse":1,"minecraft:efficiency":3},"lore":["Lore"]}));
         cases.push(serde_json::json!({"id":"minecraft:apple","enchantments":{"minecraft:sharpness":5},"hide_enchantments":true}));
         cases.push(serde_json::json!({"id":"minecraft:enchanted_book","stored_enchantments":{"minecraft:binding_curse":1},"hide_stored":true}));
+        let registry = native_resources::packs::ResourceStack::open(&game)
+            .unwrap()
+            .vanilla_item_registry()
+            .unwrap();
+        for (id, _) in registry.iter() {
+            cases.push(serde_json::json!({"id":id,"attributes_only":true}));
+            cases.push(serde_json::json!({"id":id,"attributes_only":true,"player":true}));
+        }
+        for (damage, speed) in [(0.0, 0.0), (3.5, 7.0), (-5.0, 1.0)] {
+            for id in ["wooden_hoe", "diamond_sword", "netherite_spear"] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"attributes_only":true,"player":true,"damage_base":damage,"speed_base":speed}));
+            }
+        }
+        let custom_attributes = serde_json::json!([
+            {"type":"minecraft:movement_speed","id":"example:swift","amount":0.25,"operation":"add_multiplied_total","slot":"feet"},
+            {"type":"minecraft:burning_time","id":"example:burn","amount":-0.15,"operation":"add_multiplied_base","slot":"head"},
+            {"type":"minecraft:gravity","id":"example:gravity","amount":0.3,"operation":"add_value","slot":"any"},
+            {"type":"minecraft:attack_damage","id":"minecraft:base_attack_damage","amount":2.5,"operation":"add_value","slot":"mainhand"},
+            {"type":"minecraft:armor","id":"example:concealed","amount":3,"operation":"add_value","slot":"chest","display":{"type":"hidden"}}
+            ,{"type":"minecraft:armor","id":"example:custom","amount":0,"operation":"add_value","slot":"legs","display":{"type":"override","value":{"text":"Custom modifier","color":"gold"}}}
+        ]);
+        for id in ["apple", "diamond_sword"] {
+            for player in [false, true] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"attributes_only":true,"player":player,"attributes":custom_attributes}));
+            }
+        }
+        cases.push(serde_json::json!({"id":"minecraft:diamond_sword","attributes_only":true,"player":true,"remove_attributes":true}));
+        cases.push(serde_json::json!({"id":"minecraft:diamond_sword","attributes_only":true,"player":true,"hide_attributes":true}));
+        for amount in [
+            -1234.555, -1.675, -0.005, -0.0, 0.0, 0.005, 0.015, 1.005, 1.675, 1234.555,
+        ] {
+            for operation in ["add_value", "add_multiplied_base", "add_multiplied_total"] {
+                for attribute in ["gravity", "movement_speed"] {
+                    cases.push(serde_json::json!({"id":"minecraft:apple","attributes_only":true,"player":true,"attributes":[{"type":format!("minecraft:{attribute}"),"id":"example:rounding","amount":amount,"operation":operation,"slot":"mainhand"}]}));
+                }
+            }
+        }
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
@@ -570,6 +611,7 @@ mod tests {
             for (flag, component) in [
                 ("hide_enchantments", "minecraft:enchantments"),
                 ("hide_stored", "minecraft:stored_enchantments"),
+                ("hide_attributes", "minecraft:attribute_modifiers"),
             ] {
                 if case[flag].as_bool() == Some(true) {
                     fields.push((
@@ -601,6 +643,18 @@ mod tests {
                         ),
                     ));
                 }
+            }
+            if let Some(attributes) = case.get("attributes") {
+                fields.push((
+                    "minecraft:attribute_modifiers".into(),
+                    crate::enchantment_tooltip::component(attributes).unwrap(),
+                ));
+            }
+            if case["remove_attributes"].as_bool() == Some(true) {
+                fields.push((
+                    "!minecraft:attribute_modifiers".into(),
+                    Tag::Compound(vec![]),
+                ));
             }
             if let Some(scale) = case["scale"].as_f64() {
                 fields.push((
@@ -671,13 +725,30 @@ mod tests {
                 Tag::Compound(fields),
             )
             .unwrap();
-            let actual = lines(&item, &assets, &assets.enchantments);
+            let attribute_case = case["attributes_only"].as_bool() == Some(true);
+            let player = case["player"].as_bool() == Some(true);
+            let attack_base = player.then(|| {
+                [
+                    case["damage_base"].as_f64().unwrap_or(1.0),
+                    case["speed_base"].as_f64().unwrap_or(4.0),
+                ]
+            });
+            let actual = if attribute_case {
+                if case["hide_attributes"].as_bool() == Some(true) {
+                    vec![]
+                } else {
+                    crate::attribute_tooltip::lines(&item, &assets, attack_base)
+                }
+            } else {
+                lines(&item, &assets, &assets.enchantments, attack_base)
+            };
             let expected_lines = expected["spans"].as_array().unwrap();
             if case["hide"].as_bool() == Some(true) {
                 assert!(actual.is_empty() && expected_lines.is_empty(), "{case}");
                 continue;
             }
-            let potion_case = case["potion"].is_string()
+            let potion_case = attribute_case
+                || case["potion"].is_string()
                 || case["enchantments"].is_object()
                 || case["stored_enchantments"].is_object()
                 || case["custom_effects"].is_array()

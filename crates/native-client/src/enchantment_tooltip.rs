@@ -19,7 +19,7 @@ pub struct Registry {
     curses: HashSet<String>,
 }
 
-fn component(value: &serde_json::Value) -> Option<Tag> {
+pub(crate) fn component(value: &serde_json::Value) -> Option<Tag> {
     Some(match value {
         serde_json::Value::String(v) => Tag::String(v.as_str().into()),
         serde_json::Value::Bool(v) => Tag::Byte(i8::from(*v)),

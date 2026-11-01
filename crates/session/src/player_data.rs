@@ -228,6 +228,32 @@ fn saved_attribute(player: &NamedTag, name: &str, default: f64) -> Result<SavedA
     Ok(attribute_state)
 }
 
+/// Base values only: temporary equipment and effects are not included by Java's tooltip.
+pub fn tooltip_attack_base(player: &NamedTag) -> Option<[f64; 2]> {
+    let mut result = [1.0, 4.0];
+    let attributes = match player.value.get("attributes") {
+        None => return Some(result),
+        Some(Tag::List { values, .. }) => values,
+        Some(_) => return None,
+    };
+    for attribute in attributes {
+        let Some(id) = attribute.get("id").and_then(text) else {
+            continue;
+        };
+        let index = match id.strip_prefix("minecraft:").unwrap_or(&id) {
+            "attack_damage" => 0,
+            "attack_speed" => 1,
+            _ => continue,
+        };
+        let base = attribute.get("base").and_then(numeric_double)?;
+        if !base.is_finite() {
+            return None;
+        }
+        result[index] = base;
+    }
+    Some(result)
+}
+
 fn saved_max_health(player: &NamedTag) -> Result<f32> {
     Ok(saved_attribute(player, "max_health", 20.0)?.value(1.0, 1024.0)? as f32)
 }
@@ -2449,6 +2475,47 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tooltip_reads_attack_bases_without_equipment_modifiers() {
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "attributes".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:attack_damage".into())),
+                            ("base".into(), Tag::Double(3.5)),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:attack_speed".into())),
+                            ("base".into(), Tag::Double(6.0)),
+                        ]),
+                    ],
+                },
+            )]),
+        };
+        assert_eq!(tooltip_attack_base(&player), Some([3.5, 6.0]));
+        let missing = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert_eq!(tooltip_attack_base(&missing), Some([1.0, 4.0]));
+        let bad = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("attributes".into(), Tag::String("bad".into()))]),
+        };
+        assert_eq!(tooltip_attack_base(&bad), None);
+    }
 
     #[test]
     fn saved_luck_rejects_ambiguous_attributes_and_unknown_effects() {

@@ -521,6 +521,8 @@ pub struct WorldSnapshot {
     pub world_spawn: Option<Arc<native_persistence::world::RespawnData>>,
     pub last_death: LastDeathLocation,
     pub player: PlayerState,
+    /// Base attack damage and speed used by vanilla item tooltips.
+    pub tooltip_attack_base: Option<[f64; 2]>,
     /// Camera endpoints are visual-only and never used for simulation.
     pub camera: camera::CameraMotion,
     pub game_mode: GameMode,
@@ -771,6 +773,7 @@ impl LocalSession {
             world_spawn: None,
             last_death: LastDeathLocation::Absent,
             player,
+            tooltip_attack_base: Some([1.0, 4.0]),
             camera,
             game_mode: GameMode::default(),
             vitals: survival::PlayerVitals::default(),
@@ -945,6 +948,7 @@ impl LocalSession {
             world_spawn: self.snapshot.world_spawn.clone(),
             last_death: self.snapshot.last_death.clone(),
             player: self.player,
+            tooltip_attack_base: self.snapshot.tooltip_attack_base,
             camera: self.camera,
             game_mode: self.game_mode,
             vitals: self.vitals,
@@ -2069,6 +2073,7 @@ impl GameSession for LocalSession {
                 world_spawn: self.snapshot.world_spawn.clone(),
                 last_death: self.snapshot.last_death.clone(),
                 player: self.player,
+                tooltip_attack_base: self.snapshot.tooltip_attack_base,
                 camera: self.camera,
                 game_mode: self.game_mode,
                 vitals: self.vitals,

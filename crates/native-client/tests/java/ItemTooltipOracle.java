@@ -24,9 +24,24 @@ import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.tags.EnchantmentTags;
 import com.mojang.serialization.Lifecycle;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.ai.attributes.Attribute;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.level.GameType;
 import net.minecraft.core.Holder;
 
 public class ItemTooltipOracle {
+  static class TestPlayer extends Player {
+    double damage, speed;
+    TestPlayer() { super(null,null); }
+    @Override public GameType gameMode() { return GameType.SURVIVAL; }
+    @Override public boolean isLocalPlayer() { return true; }
+    @Override public double getAttributeBaseValue(Holder<Attribute> attribute) {
+      if(attribute.is(Attributes.ATTACK_DAMAGE)) return damage;
+      if(attribute.is(Attributes.ATTACK_SPEED)) return speed;
+      return 0;
+    }
+  }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var lookup=VanillaRegistries.createWorldLookup(); var registries=VanillaRegistries.createReloadableLookup(lookup);
@@ -50,6 +65,17 @@ public class ItemTooltipOracle {
     var result=new JsonArray();
     for(var element:cases) {
       var input=element.getAsJsonObject();
+      if(input.has("all_attributes")) {
+        for(var current:BuiltInRegistries.ITEM) {
+          var stack=new ItemStack(current);
+          var attributes=stack.get(DataComponents.ATTRIBUTE_MODIFIERS);
+          if(attributes==null || attributes.modifiers().isEmpty()) continue;
+          var row=new JsonObject();row.addProperty("id",BuiltInRegistries.ITEM.getKey(current).toString());
+          row.add("attributes",net.minecraft.world.item.component.ItemAttributeModifiers.CODEC.encodeStart(tooltipRegistries.createSerializationContext(JsonOps.INSTANCE),attributes).getOrThrow());
+          result.add(row);
+        }
+        continue;
+      }
       if(input.has("all")) {
         for(var current:BuiltInRegistries.ITEM) {
           var row=new JsonObject();
@@ -62,6 +88,13 @@ public class ItemTooltipOracle {
       }
       var item=BuiltInRegistries.ITEM.getValue(Identifier.parse(input.get("id").getAsString()));
       var stack=new ItemStack(item);
+      TestPlayer player=null;
+      if(input.has("player") && input.get("player").getAsBoolean()) {
+        var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");field.setAccessible(true);
+        player=(TestPlayer)((sun.misc.Unsafe)field.get(null)).allocateInstance(TestPlayer.class);
+        player.damage=input.has("damage_base")?input.get("damage_base").getAsDouble():1.0;
+        player.speed=input.has("speed_base")?input.get("speed_base").getAsDouble():4.0;
+      }
       if(input.has("potion")) {
         @SuppressWarnings("unchecked")
         var holder=(Holder<Potion>)Potions.class.getField(input.get("potion").getAsString().toUpperCase(java.util.Locale.ROOT)).get(null);
@@ -83,6 +116,8 @@ public class ItemTooltipOracle {
         stack.set(DataComponents.POTION_CONTENTS,contents);
       }
       if(input.has("scale")) stack.set(DataComponents.POTION_DURATION_SCALE,input.get("scale").getAsFloat());
+      if(input.has("attributes")) stack.set(DataComponents.ATTRIBUTE_MODIFIERS,net.minecraft.world.item.component.ItemAttributeModifiers.CODEC.parse(tooltipRegistries.createSerializationContext(JsonOps.INSTANCE),input.get("attributes")).getOrThrow());
+      if(input.has("remove_attributes") && input.get("remove_attributes").getAsBoolean()) stack.remove(DataComponents.ATTRIBUTE_MODIFIERS);
       for(var key:java.util.List.of("enchantments","stored_enchantments")) if(input.has(key)) {
         var mutable=new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
         for(var entry:input.getAsJsonObject(key).entrySet()) {
@@ -103,14 +138,22 @@ public class ItemTooltipOracle {
       if(input.has("hide_potion") && input.get("hide_potion").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(false,new java.util.LinkedHashSet<>(java.util.Set.of(DataComponents.POTION_CONTENTS))));
       if(input.has("hide_enchantments") && input.get("hide_enchantments").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(false,new java.util.LinkedHashSet<>(java.util.Set.of(DataComponents.ENCHANTMENTS))));
       if(input.has("hide_stored") && input.get("hide_stored").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(false,new java.util.LinkedHashSet<>(java.util.Set.of(DataComponents.STORED_ENCHANTMENTS))));
+      if(input.has("hide_attributes") && input.get("hide_attributes").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(false,new java.util.LinkedHashSet<>(java.util.Set.of(DataComponents.ATTRIBUTE_MODIFIERS))));
+      java.util.List<Component> components;
+      if(input.has("attributes_only")) {
+        components=new java.util.ArrayList<>();
+        var method=ItemStack.class.getDeclaredMethod("addAttributeTooltips",java.util.function.Consumer.class,TooltipDisplay.class,Player.class);
+        method.setAccessible(true);
+        method.invoke(stack,(java.util.function.Consumer<Component>)components::add,stack.getOrDefault(DataComponents.TOOLTIP_DISPLAY,TooltipDisplay.DEFAULT),player);
+      } else components=stack.getTooltipLines(context,player,TooltipFlag.NORMAL);
       var lines=new JsonArray();
-      for(var component:stack.getTooltipLines(context,null,TooltipFlag.NORMAL)) {
+      for(var component:components) {
         lines.add(ComponentSerialization.CODEC.encodeStart(JsonOps.INSTANCE,component).getOrThrow());
       }
       var row=new JsonObject();row.add("lines",lines);row.addProperty("description",item.getDescriptionId());
       if(input.has("custom_effects")) row.add("contents",PotionContents.CODEC.encodeStart(registries.createSerializationContext(JsonOps.INSTANCE),stack.get(DataComponents.POTION_CONTENTS)).getOrThrow());
       var spans=new JsonArray();
-      for(var component:stack.getTooltipLines(context,null,TooltipFlag.NORMAL)) {
+      for(var component:components) {
         var line=new JsonArray();
         component.visit((style,text)->{
           if(!text.isEmpty()) {

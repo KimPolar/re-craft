@@ -2702,6 +2702,7 @@ mod tests {
             world_spawn: previous.world_spawn.clone(),
             last_death: previous.last_death.clone(),
             player,
+            tooltip_attack_base: previous.tooltip_attack_base,
             camera: native_session::camera::CameraMotion::new(
                 player.position.as_dvec3(),
                 player.pose.eye_height(),

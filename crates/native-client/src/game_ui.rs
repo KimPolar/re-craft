@@ -151,6 +151,7 @@ struct DrawKey {
 pub struct GameUi {
     assets: Arc<MenuAssets>,
     enchantments: Arc<crate::enchantment_tooltip::Registry>,
+    tooltip_attack_base: Option<[f64; 2]>,
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
     consume_particles: crate::consume_particles::ParticleSystem,
@@ -260,6 +261,7 @@ impl GameUi {
         );
         Self {
             enchantments: Arc::clone(&assets.enchantments),
+            tooltip_attack_base: Some([1.0, 4.0]),
             assets,
             skin,
             held_models,
@@ -2155,6 +2157,10 @@ impl GameUi {
     }
 
     fn sync_hud(&mut self, snapshot: &native_session::WorldSnapshot) {
+        if self.tooltip_attack_base != snapshot.tooltip_attack_base {
+            self.tooltip_attack_base = snapshot.tooltip_attack_base;
+            self.last_draw = None;
+        }
         if !Arc::ptr_eq(&self.effect_source, &snapshot.active_effects) {
             self.effect_source = Arc::clone(&snapshot.active_effects);
             self.effects = crate::status_effect_ui::Frame::new(&self.effect_source);
@@ -3118,7 +3124,12 @@ impl GameUi {
                 &tooltip.duration,
             );
         } else if let Some(item) = item_tooltip {
-            let lines = crate::item_tooltip::lines(item, assets, &self.enchantments);
+            let lines = crate::item_tooltip::lines(
+                item,
+                assets,
+                &self.enchantments,
+                self.tooltip_attack_base,
+            );
             crate::tooltip::draw_item(&mut canvas, assets, self.cursor, &lines);
         }
         self.last_draw = Some(key);
@@ -4454,6 +4465,31 @@ mod inventory_tests {
                 .pixels
                 .contains(&red)
         );
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(
+                ItemStack::new(
+                    "minecraft:diamond_sword".into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![]),
+                )
+                .unwrap(),
+            ),
+        );
+        ui.cursor_moved(
+            f64::from(origin.0 + slot.0 + 2) * scale,
+            f64::from(origin.1 + slot.1 + 2) * scale,
+        );
+        let before = ui.compose((960, 720), &inventory, 0).unwrap();
+        use native_session::GameSession;
+        let mut snapshot = (*native_session::LocalSession::demo().snapshot()).clone();
+        snapshot.tooltip_attack_base = Some([15.0, 4.0]);
+        ui.sync_hud(&snapshot);
+        let after = ui
+            .compose((960, 720), &inventory, 0)
+            .expect("changed attack base invalidates tooltip");
+        assert_ne!(before.pixels, after.pixels);
     }
 
     #[test]

@@ -304,6 +304,42 @@ fn valid_created_poi_region(value: &str) -> bool {
     valid_created_region(value, "poi")
 }
 
+/// A new external chunk is only recoverable as part of its owning region's
+/// transaction. Keep the canonical spelling to avoid aliases during recovery.
+fn external_chunk_region(value: &str) -> Option<String> {
+    let parts: Vec<_> = Path::new(value)
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if parts.len() < 5
+        || parts[0] != "dimensions"
+        || !matches!(parts[parts.len() - 2], "region" | "entities" | "poi")
+        || parts.join(std::path::MAIN_SEPARATOR_STR)
+            != value.replace('/', std::path::MAIN_SEPARATOR_STR)
+    {
+        return None;
+    }
+    let dimension = parts[2..parts.len() - 2].join("/");
+    crate::world::DimensionId::parse(&format!("{}:{dimension}", parts[1])).ok()?;
+    let name = parts[parts.len() - 1];
+    let pieces: Vec<_> = name.split('.').collect();
+    if pieces.len() != 4 || pieces[0] != "c" || pieces[3] != "mcc" {
+        return None;
+    }
+    let x = pieces[1].parse::<i32>().ok()?;
+    let z = pieces[2].parse::<i32>().ok()?;
+    if name != format!("c.{x}.{z}.mcc") {
+        return None;
+    }
+    let mut region = parts[..parts.len() - 1].join(std::path::MAIN_SEPARATOR_STR);
+    region.push(std::path::MAIN_SEPARATOR);
+    region.push_str(&format!("r.{}.{}.mca", x.div_euclid(32), z.div_euclid(32)));
+    Some(region)
+}
+
 fn valid_entity_directory(value: &str) -> bool {
     valid_created_entity_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
 }
@@ -318,6 +354,7 @@ fn valid_created_target(value: &str, version: u32) -> bool {
         || (version >= 5 && valid_created_weather(value))
         || (version >= 6 && value == "level.dat_old")
         || (version >= 7 && valid_created_random_sequences(value))
+        || (version >= 8 && external_chunk_region(value).is_some())
 }
 
 fn valid_created_random_sequences(value: &str) -> bool {
@@ -345,7 +382,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8),
         "unsupported transaction version"
     );
     ensure!(
@@ -361,6 +398,11 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     );
     let mut targets = BTreeSet::new();
     let mut backups = BTreeSet::new();
+    let file_targets = manifest
+        .files
+        .iter()
+        .map(|record| relative_path_key(&record.target))
+        .collect::<Result<BTreeSet<_>>>()?;
     for record in &manifest.files {
         ensure!(
             targets.insert(relative_path_key(&record.target)?),
@@ -383,6 +425,14 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                 "invalid created file path"
             ),
             _ => bail!("invalid transaction original"),
+        }
+        if record.original.is_none()
+            && let Some(region) = external_chunk_region(&record.target)
+        {
+            ensure!(
+                file_targets.contains(&relative_path_key(&region)?),
+                "created external chunk requires its region in the same transaction"
+            );
         }
     }
     for record in &manifest.dependencies {
@@ -590,6 +640,10 @@ fn prepare(
     }
     let manifest = Manifest {
         version: if records.iter().any(|record| {
+            record.original.is_none() && external_chunk_region(&record.target).is_some()
+        }) {
+            8
+        } else if records.iter().any(|record| {
             record.original.is_none() && valid_created_random_sequences(&record.target)
         }) {
             7
@@ -1183,6 +1237,170 @@ mod tests {
         fs::write(&target, b"new sequences").unwrap();
         assert!(recover(&root).unwrap());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn created_external_chunks_are_versioned_bound_to_regions_and_recoverable() {
+        let path = "dimensions/minecraft/overworld/region/c.3.0.mcc";
+        assert!(!valid_created_target(path, 7));
+        assert!(valid_created_target(path, 8));
+        assert_eq!(
+            external_chunk_region("dimensions/example/nested/dimension/entities/c.-1.-33.mcc"),
+            Some(format!(
+                "dimensions{0}example{0}nested{0}dimension{0}entities{0}r.-1.-2.mca",
+                std::path::MAIN_SEPARATOR
+            ))
+        );
+        for invalid in [
+            "dimensions/minecraft/overworld/region/c.+3.0.mcc",
+            "dimensions/minecraft/overworld/region/c.03.0.mcc",
+            "dimensions/minecraft/overworld/region/c.3.0.mcc.old",
+            "dimensions/minecraft/overworld/other/c.3.0.mcc",
+            "dimensions/minecraft/../region/c.3.0.mcc",
+            "players/data/c.3.0.mcc",
+        ] {
+            assert!(!valid_created_target(invalid, 8), "{invalid}");
+        }
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join(path);
+        let make_external = || {
+            let mut stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(target.parent().unwrap())
+                .unwrap();
+            stage.write_all(b"new external").unwrap();
+            Replacement {
+                target: target.clone(),
+                backup: None,
+                stage,
+                original_hash: None,
+            }
+        };
+        assert!(prepare(&root, &backup, vec![make_external()], vec![]).is_err());
+        assert!(!root.join(PENDING).exists());
+        let (mut files, deps) = replacements(&root);
+        files.push(make_external());
+        let mut prepared = prepare(&root, &backup, files, deps).unwrap();
+        assert_eq!(prepared.manifest.version, 8);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(1)).unwrap();
+        drop(prepared);
+        assert_eq!(fs::read(&target).unwrap(), b"new external");
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        fs::write(&target, b"new external").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
+    }
+
+    #[test]
+    fn external_chunk_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_EXTERNAL_CHUNK_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let phase = std::env::var("NATIVE_EXTERNAL_CHUNK_CRASH_PHASE").unwrap();
+        let (mut files, dependencies) = replacements(&root);
+        let target = root.join("dimensions/minecraft/overworld/region/c.3.0.mcc");
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new external").unwrap();
+        files.push(Replacement {
+            target,
+            backup: None,
+            stage,
+            original_hash: None,
+        });
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(2)).unwrap();
+        if phase == "both" {
+            replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        }
+        std::process::exit(24);
+    }
+
+    #[test]
+    fn interrupted_external_chunk_creation_recovers_across_processes() {
+        for phase in ["external", "both"] {
+            let dir = fixture();
+            let root = dir.path().canonicalize().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "save_transaction::tests::external_chunk_crash_helper",
+                    "--nocapture",
+                ])
+                .env("NATIVE_EXTERNAL_CHUNK_CRASH_FIXTURE", &root)
+                .env("NATIVE_EXTERNAL_CHUNK_CRASH_PHASE", phase)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(24),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let external = root.join("dimensions/minecraft/overworld/region/c.3.0.mcc");
+            let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+            assert_eq!(fs::read(&external).unwrap(), b"new external");
+            assert_eq!(
+                fs::read(&region).unwrap(),
+                if phase == "both" {
+                    NEW_REGION
+                } else {
+                    OLD_REGION
+                }
+            );
+            assert!(recover(&root).unwrap());
+            assert!(!external.exists());
+            assert_eq!(fs::read(region).unwrap(), OLD_REGION);
+            assert_eq!(
+                fs::read(root.join("players/data/player.dat")).unwrap(),
+                OLD_PLAYER
+            );
+            assert!(!root.join(PENDING).exists());
+        }
+    }
+
+    #[test]
+    fn interrupted_existing_external_replacement_restores_both_files() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (mut files, _) = replacements(&root);
+        let target = root.join("dimensions/minecraft/overworld/region/c.2.0.mcc");
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"replacement external").unwrap();
+        files.push(Replacement {
+            original_hash: Some(hash_file(&target).unwrap()),
+            target: target.clone(),
+            backup: Some(backup.join("external-original")),
+            stage,
+        });
+        let mut prepared = prepare(&root, &backup, files, vec![]).unwrap();
+        replace_one(&root, &prepared.manifest.files[2], prepared.files.remove(2)).unwrap();
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        assert_eq!(fs::read(&target).unwrap(), b"replacement external");
+        assert!(recover(&root).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), EXTERNAL);
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
     }
 
     #[test]

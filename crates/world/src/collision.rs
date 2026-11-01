@@ -209,6 +209,9 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if banner_item_id(state).is_some() {
+        return Some(EMPTY.to_vec());
+    }
     if id == "snow" {
         let layers = snow_layers(state)?;
         return Some(if layers == 1 {
@@ -474,6 +477,20 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if banner_item_id(state).is_some() {
+        let s = 1.0 / 16.0;
+        return Some(vec![if id.contains("_wall_banner") {
+            match state.properties.get("facing")?.as_str() {
+                "north" => cuboid(0.0, 0.0, 14.0 * s, 1.0, 12.5 * s, 1.0),
+                "south" => cuboid(0.0, 0.0, 0.0, 1.0, 12.5 * s, 2.0 * s),
+                "west" => cuboid(14.0 * s, 0.0, 0.0, 1.0, 12.5 * s, 1.0),
+                "east" => cuboid(0.0, 0.0, 0.0, 2.0 * s, 12.5 * s, 1.0),
+                _ => return None,
+            }
+        } else {
+            cuboid(4.0 * s, 0.0, 4.0 * s, 12.0 * s, 1.0, 12.0 * s)
+        }]);
+    }
     if id == "snow" {
         return snow_outline(state);
     }
@@ -548,6 +565,69 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     let shape = block_shape(state)?;
     if shape.is_empty() { None } else { Some(shape) }
+}
+
+/// Resolve both banner block forms to their item, rejecting malformed states.
+pub fn banner_item_id(state: &BlockState) -> Option<String> {
+    let name = state.name.strip_prefix("minecraft:")?;
+    let (color, wall) = if let Some(color) = name.strip_suffix("_wall_banner") {
+        (color, true)
+    } else {
+        (name.strip_suffix("_banner")?, false)
+    };
+    if !matches!(
+        color,
+        "white"
+            | "orange"
+            | "magenta"
+            | "light_blue"
+            | "yellow"
+            | "lime"
+            | "pink"
+            | "gray"
+            | "light_gray"
+            | "cyan"
+            | "purple"
+            | "blue"
+            | "brown"
+            | "green"
+            | "red"
+            | "black"
+    ) || state.properties.len() != 1
+    {
+        return None;
+    }
+    if wall {
+        if !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "west" | "east")
+        ) {
+            return None;
+        }
+    } else {
+        let rotation = state.properties.get("rotation")?;
+        if !matches!(
+            rotation.as_str(),
+            "0" | "1"
+                | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "10"
+                | "11"
+                | "12"
+                | "13"
+                | "14"
+                | "15"
+        ) {
+            return None;
+        }
+    }
+    Some(format!("minecraft:{color}_banner"))
 }
 
 /// The eight vanilla snow-layer states, rejecting malformed or extra properties.

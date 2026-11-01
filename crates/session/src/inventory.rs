@@ -2896,6 +2896,11 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             262144
+        } else if is_banner_item(id) && name.matches("minecraft:custom_name") {
+            if !matches!(value, Tag::String(_) | Tag::Compound(_) | Tag::List { .. }) {
+                return None;
+            }
+            1048576
         } else if is_banner_item(id) && name.matches("!minecraft:banner_patterns") {
             if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
                 return None;

@@ -9654,6 +9654,16 @@ impl LoadedSession {
         let Some(name) = self.world.state(id).map(|state| state.name.clone()) else {
             return;
         };
+        // Banner destruction must preserve its block entity and its loot
+        // components. Until that lifecycle is implemented, leave it intact.
+        if self
+            .world
+            .state(id)
+            .and_then(native_world::collision::banner_item_id)
+            .is_some()
+        {
+            return;
+        }
         if matches!(name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") {
             self.finish_breaking_chest(relative, id);
             return;
@@ -12474,7 +12484,25 @@ impl LoadedSession {
                             hit.position,
                             self.states[0],
                         )
-                        && let Some(item) = self.world.state(id).and_then(picked_loaded_block_item)
+                        && let Some(block) = self.world.state(id)
+                        && let Some(item) =
+                            if let Some(item_id) = native_world::collision::banner_item_id(block) {
+                                add(self.origin, hit.position).and_then(|position| {
+                                    let chunk = ChunkPos {
+                                        x: position.x.div_euclid(16),
+                                        z: position.z.div_euclid(16),
+                                    };
+                                    crate::saved_banner::pick_item(
+                                        self.world.saved_block_entities.get(&chunk)?,
+                                        chunk,
+                                        position,
+                                        item_id,
+                                    )
+                                    .ok()
+                                })
+                            } else {
+                                picked_loaded_block_item(block)
+                            }
                     {
                         Arc::make_mut(&mut self.inventory)
                             .pick_item(item, self.game_mode == GameMode::Creative);
@@ -26853,6 +26881,83 @@ mod tests {
                 .id(),
             "minecraft:stone"
         );
+    }
+
+    #[test]
+    fn pick_block_copies_saved_banner_without_changing_the_world() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        session.set_player_inventory(PlayerInventory::default());
+        let relative = IVec3::new(8, 2, 6);
+        let absolute = session.origin + relative;
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        let block = session.intern_block(state("minecraft:red_banner", &[("rotation", "0")]));
+        assert!(session.set(relative, block));
+        let patterns = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("pattern".into(), Tag::String("minecraft:cross".into())),
+                ("color".into(), Tag::String("blue".into())),
+            ])],
+        };
+        let name = Tag::String("Example".into());
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:banner".into())),
+            ("x".into(), Tag::Int(absolute.x)),
+            ("y".into(), Tag::Int(absolute.y)),
+            ("z".into(), Tag::Int(absolute.z)),
+            ("patterns".into(), patterns.clone()),
+            ("CustomName".into(), name.clone()),
+        ]);
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity],
+            },
+        })
+        .unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Encoded(bytes.clone().into()));
+        assert_eq!(session.ray_hit().unwrap().position, relative);
+        session.submit_command(PlayerCommand::PickBlock);
+        session.update(TICK);
+        let inventory = &session.snapshot().inventory;
+        let item = inventory
+            .slot(crate::inventory::PlayerSlot::Storage(inventory.selected()))
+            .unwrap();
+        assert_eq!(item.id(), "minecraft:red_banner");
+        assert_eq!(
+            item.components().get("minecraft:banner_patterns"),
+            Some(&patterns)
+        );
+        assert_eq!(item.components().get("minecraft:custom_name"), Some(&name));
+        let SavedBlockEntities::Encoded(after) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        assert_eq!(&**after, bytes);
+        session.finish_breaking(absolute);
+        assert!(matches!(
+            cell(
+                &session.world,
+                session.origin,
+                session.bounds,
+                relative,
+                session.states[0]
+            ),
+            Cell::State(actual) if actual == block
+        ));
+        let SavedBlockEntities::Encoded(after) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        assert_eq!(&**after, bytes);
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod respawn_environment;
 pub mod respawn_tags;
 pub mod sounds;
 pub mod sprites;
+pub mod structure_placement;
 pub mod surface_biomes;
 pub mod surface_pass;
 pub mod surface_rules;

@@ -70,6 +70,13 @@ pub(crate) struct DamageOutcome {
     pub health_damage: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct LandingOutcome {
+    pub amount: i32,
+    pub source: Option<&'static str>,
+    pub damage: DamageOutcome,
+}
+
 impl DamageCooldown {
     pub(crate) fn tick(&mut self) {
         if self.ticks > 0 {
@@ -323,6 +330,8 @@ impl FallTracker {
                         | "minecraft:on_fire"
                         | "minecraft:lava"
                         | "minecraft:hot_floor"
+                        | "minecraft:fall"
+                        | "minecraft:stalagmite"
                 ),
                 _ => false,
             })
@@ -437,7 +446,7 @@ impl FallTracker {
         mode: GameMode,
         rules: SurvivalRules,
         cooldown: &mut DamageCooldown,
-    ) -> Result<i32> {
+    ) -> Result<LandingOutcome> {
         self.land_impl(
             distance,
             state,
@@ -461,17 +470,17 @@ impl FallTracker {
         mode: GameMode,
         rules: SurvivalRules,
         cooldown: Option<&mut DamageCooldown>,
-    ) -> Result<i32> {
+    ) -> Result<LandingOutcome> {
         if distance <= 0.0
             || vitals.health <= 0.0
             || matches!(mode, GameMode::Creative | GameMode::Spectator)
         {
-            return Ok(0);
+            return Ok(LandingOutcome::default());
         }
         if let Some(registry) = &self.enchantments
             && registry.fall_damage_immune("minecraft:player")?
         {
-            return Ok(0);
+            return Ok(LandingOutcome::default());
         }
         let surface = FallSurface::for_state(state);
         let safe = self.safe.clone();
@@ -496,13 +505,17 @@ impl FallTracker {
         let distance = distance * surface.distance_multiplier + surface.added_distance;
         let amount = calculate_fall_damage(distance, safe, surface.damage_multiplier, multiplier);
         if amount <= 0 {
-            return Ok(0);
+            return Ok(LandingOutcome::default());
         }
         let damage = surface.damage_type;
         if !rules.fall_damage && self.damage_tag("minecraft:is_fall", damage)? {
-            return Ok(amount);
+            return Ok(LandingOutcome {
+                amount,
+                source: Some(damage),
+                ..Default::default()
+            });
         }
-        self.damage(
+        let outcome = self.damage_outcome(
             amount as f32,
             damage,
             inventory,
@@ -511,7 +524,11 @@ impl FallTracker {
             mode,
             cooldown,
         )?;
-        Ok(amount)
+        Ok(LandingOutcome {
+            amount,
+            source: Some(damage),
+            damage: outcome,
+        })
     }
 
     /// Apply one supported damage source; unsupported tag or enchantment data
@@ -538,17 +555,19 @@ impl FallTracker {
         if let Some(registry) = &self.enchantments {
             return registry.damage_type_info(damage);
         }
-        let exhaustion = match damage {
+        use native_resources::enchantments::DamageEffects;
+        let (exhaustion, effects) = match damage {
             "minecraft:lava"
             | "minecraft:in_fire"
             | "minecraft:campfire"
-            | "minecraft:hot_floor" => 0.1,
-            "minecraft:on_fire" => 0.0,
+            | "minecraft:hot_floor" => (0.1, DamageEffects::Burning),
+            "minecraft:on_fire" => (0.0, DamageEffects::Burning),
+            "minecraft:fall" | "minecraft:stalagmite" => (0.0, DamageEffects::Hurt),
             _ => anyhow::bail!("damage type definition is unavailable"),
         };
         Ok(native_resources::enchantments::DamageTypeInfo {
             exhaustion,
-            effects: native_resources::enchantments::DamageEffects::Burning,
+            effects,
         })
     }
 
@@ -1599,8 +1618,11 @@ mod tests {
                 &mut DamageCooldown::default(),
             )
             .unwrap();
-        assert_eq!(calculated, calculate_fall_damage(30.0, 3.0, 0.2, 1.0));
-        assert!(calculated > 0);
+        assert_eq!(
+            calculated.amount,
+            calculate_fall_damage(30.0, 3.0, 0.2, 1.0)
+        );
+        assert!(calculated.amount > 0);
         assert_eq!(vitals.health, 20.0);
     }
 

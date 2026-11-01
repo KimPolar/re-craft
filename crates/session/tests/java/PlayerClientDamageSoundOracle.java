@@ -34,12 +34,13 @@ public class PlayerClientDamageSoundOracle {
         var world=(World)unsafe.allocateInstance(World.class); var player=(TestPlayer)unsafe.allocateInstance(TestPlayer.class); player.world=world;
         var walk=LivingEntity.class.getDeclaredField("walkAnimation"); walk.setAccessible(true); walk.set(player,new WalkAnimationState());
         var randomField=Entity.class.getDeclaredField("random"); randomField.setAccessible(true);
-        var source=new DamageSource(Holder.direct(new DamageType("test",0.1f,DamageEffects.BURNING)));
         var rows=new JsonArray();
-        for(boolean silent:new boolean[]{false,true}) for(boolean dead:new boolean[]{false,true}) for(long seed:new long[]{0,1,37,1234567}) {
+        for(DamageEffects effects:new DamageEffects[]{DamageEffects.BURNING,DamageEffects.HURT}) for(boolean silent:new boolean[]{false,true}) for(boolean dead:new boolean[]{false,true}) for(long seed:new long[]{0,1,37,1234567}) {
+            var source=new DamageSource(Holder.direct(new DamageType("test",0.1f,effects)));
             player.silent=silent; player.sounds=new JsonArray(); var random=RandomSource.create(seed); randomField.set(player,random);
             player.handleDamageEvent(source); if(dead) player.handleEntityEvent((byte)3);
             var row=new JsonObject(); row.addProperty("silent",silent); row.addProperty("dead",dead); row.addProperty("seed",seed);
+            row.addProperty("effects",effects.name());
             row.add("sounds",player.sounds); row.addProperty("next",random.nextInt()); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),new Gson().toJson(rows));

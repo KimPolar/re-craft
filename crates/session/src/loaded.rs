@@ -1413,6 +1413,26 @@ impl LoadedSession {
         if !outcome.accepted {
             return false;
         }
+        self.player_damage_feedback(source, outcome);
+        if self.death.is_none() && self.vitals.health <= 0.0 {
+            self.death = Some(DeathInfo {
+                cause,
+                tick: self.tick.saturating_add(1),
+                score: self.score,
+                show_message: self.death_rules.show_death_messages,
+                inventory_unresolved: false,
+                respawn_pending: false,
+                can_respawn: false,
+            });
+            self.record_last_death();
+        }
+        true
+    }
+
+    fn player_damage_feedback(&mut self, source: &str, outcome: crate::fall::DamageOutcome) {
+        if !outcome.accepted {
+            return;
+        }
         if outcome.fresh_hit {
             match self.fall.blocks_damage_knockback(source) {
                 Ok(true) => {}
@@ -1458,19 +1478,6 @@ impl LoadedSession {
         if self.vitals.health <= 0.0 {
             self.queue_client_damage_sound("entity.player.death");
         }
-        if self.death.is_none() && self.vitals.health <= 0.0 {
-            self.death = Some(DeathInfo {
-                cause,
-                tick: self.tick.saturating_add(1),
-                score: self.score,
-                show_message: self.death_rules.show_death_messages,
-                inventory_unresolved: false,
-                respawn_pending: false,
-                can_respawn: false,
-            });
-            self.record_last_death();
-        }
-        true
     }
 
     fn play_player_extinguish_sound(&mut self) {
@@ -14986,8 +14993,7 @@ impl LoadedSession {
             let is_stalagmite = landing_state
                 .and_then(|id| self.world.state(id))
                 .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
-            let fall_amount = if let Some(state) = landing_state.and_then(|id| self.world.state(id))
-            {
+            let landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id)) {
                 match self.fall.land_with_cooldown(
                     self.fall_distance,
                     Some(state),
@@ -14998,17 +15004,18 @@ impl LoadedSession {
                     self.survival_rules,
                     &mut self.damage_cooldown,
                 ) {
-                    Ok(amount) => amount,
+                    Ok(outcome) => outcome,
                     Err(error) => {
                         self.stream_errors
                             .push(format!("player fall damage: {error:#}"));
                         self.unresolved_player_damage = true;
-                        0
+                        Default::default()
                     }
                 }
             } else {
-                0
+                Default::default()
             };
+            let fall_amount = landing.amount;
             if honey_landing && fall_amount > 0 {
                 let fall_sound = if fall_amount > 4 {
                     "entity.player.big_fall"
@@ -15025,6 +15032,9 @@ impl LoadedSession {
                     self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
                 }
                 self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
+            }
+            if let Some(source) = landing.source {
+                self.player_damage_feedback(source, landing.damage);
             }
             if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
@@ -22925,6 +22935,9 @@ mod tests {
                                 expected.push("block.honey_block.fall");
                             }
                             expected.push("block.honey_block.fall");
+                            if fall_damage {
+                                expected.push("entity.player.hurt");
+                            }
                         }
                         let sounds = test.take_consume_sounds();
                         assert_eq!(
@@ -23070,6 +23083,9 @@ mod tests {
             assert_eq!(
                 sounds
                     .iter()
+                    // The Java oracle records the synchronous landing effects;
+                    // client damage packets are tested by a separate oracle.
+                    .filter(|sound| sound.info.event != "entity.player.hurt")
                     .map(|sound| sound.info.event)
                     .collect::<Vec<_>>(),
                 expected,
@@ -38460,7 +38476,7 @@ mod tests {
         );
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
-        assert_eq!(rows.len(), 16);
+        assert_eq!(rows.len(), 32);
         for row in rows {
             let mut test = session();
             test.player_client_random =
@@ -38469,7 +38485,24 @@ mod tests {
             if row["dead"].as_bool().unwrap() {
                 test.vitals.health = 3.0;
             }
-            assert!(test.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava));
+            if row["effects"] == "BURNING" {
+                assert!(test.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava));
+            } else {
+                let landing = test
+                    .fall
+                    .land_with_cooldown(
+                        7.0,
+                        None,
+                        &test.inventory,
+                        test.armor.value(),
+                        &mut test.vitals,
+                        test.game_mode,
+                        test.survival_rules,
+                        &mut test.damage_cooldown,
+                    )
+                    .unwrap();
+                test.player_damage_feedback(landing.source.unwrap(), landing.damage);
+            }
             let sounds = test.take_consume_sounds();
             let java_sounds = row["sounds"].as_array().unwrap();
             assert_eq!(sounds.len(), java_sounds.len(), "{row}");
@@ -38771,6 +38804,125 @@ mod tests {
                 20.0 - test.vitals.health,
                 if hits == 0 { 0.0 } else { amount }
             );
+        }
+    }
+
+    #[test]
+    fn fall_damage_uses_active_data_pack_feedback_and_cooldown() {
+        use native_resources::packs::ResourceId;
+        struct Pack;
+        impl native_resources::packs::ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let ids: &[&str] = match folder {
+                    "damage_type" => &["minecraft:fall"],
+                    "tags/damage_type" => &[
+                        "minecraft:is_fall",
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                    ],
+                    _ => &[],
+                };
+                ids.iter().map(|id| ResourceId::parse(id)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/damage_type/fall.json" {
+                    Some(br#"{"exhaustion":0.75,"effects":"drowning"}"#.to_vec())
+                } else if path == "data/minecraft/tags/entity_type/fall_damage_immune.json" {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/is_fall.json"
+                    || path == "data/minecraft/tags/damage_type/bypasses_armor.json"
+                    || path == "data/minecraft/tags/damage_type/no_knockback.json"
+                {
+                    Some(br#"{"values":["minecraft:fall"]}"#.to_vec())
+                } else if path.starts_with("data/minecraft/tags/damage_type/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack).unwrap());
+        // A four-point fall: fresh, fully absorbed, a stronger cooldown hit,
+        // disabled by the game rule, and lethal.
+        for (absorption, cooldown, enabled, health) in [
+            (0.0, false, true, 20.0),
+            (4.0, false, true, 20.0),
+            (0.0, true, true, 20.0),
+            (0.0, false, false, 20.0),
+            (0.0, false, true, 3.0),
+        ] {
+            let mut test = session();
+            test.set_random_tick_speed(0);
+            test.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                Default::default(),
+                Arc::clone(&registry),
+            );
+            if cooldown {
+                test.fall
+                    .damage_outcome(
+                        3.0,
+                        "minecraft:fall",
+                        &test.inventory,
+                        test.armor.value(),
+                        &mut test.vitals,
+                        test.game_mode,
+                        Some(&mut test.damage_cooldown),
+                    )
+                    .unwrap();
+            }
+            test.vitals.health = health;
+            test.vitals.absorption = absorption;
+            test.survival_rules.fall_damage = enabled;
+            let stone = test.intern_block(state("minecraft:stone", &[]));
+            assert!(test.set(IVec3::new(8, 1, 8), stone));
+            test.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            test.motion.on_ground = false;
+            test.player.position = test.motion.position.as_vec3();
+            test.player.on_ground = false;
+            test.fall_distance = 7.0;
+            test.update(TICK);
+            assert!(test.motion.on_ground);
+            let damage = if !enabled || absorption > 0.0 {
+                0.0
+            } else if cooldown {
+                1.0
+            } else {
+                4.0
+            };
+            assert_eq!(
+                test.vitals.health,
+                (health - damage).max(0.0),
+                "errors: {:?}",
+                test.stream_errors
+            );
+            assert_eq!(
+                test.vitals.exhaustion,
+                if damage > 0.0 { 0.75 } else { 0.0 }
+            );
+            let mut expected = Vec::new();
+            if enabled && !cooldown {
+                expected.push("entity.player.hurt_drown");
+            }
+            if enabled && health <= damage {
+                expected.push("entity.player.death");
+            }
+            assert_eq!(
+                test.take_consume_sounds()
+                    .iter()
+                    .map(|s| s.info.event)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(!test.unresolved_player_damage);
         }
     }
 

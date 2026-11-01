@@ -524,6 +524,104 @@ impl Default for PlayerInventory {
 }
 
 impl PlayerInventory {
+    /// Apply a location effect's durability change to one equipped stack.
+    /// Inventory and RNG are committed together after all components resolve.
+    pub(crate) fn change_equipped_item_damage(
+        &mut self,
+        slot: PlayerSlot,
+        amount: i32,
+        infinite_materials: bool,
+        random: &mut LegacyRandom,
+    ) -> anyhow::Result<bool> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            matches!(slot, PlayerSlot::Armor(0..=3) | PlayerSlot::Offhand)
+                || matches!(slot, PlayerSlot::Storage(index) if index == self.selected),
+            "location effect item is not in an equipment slot"
+        );
+        let Some(item) = self.slot(slot) else {
+            return Ok(false);
+        };
+        if amount == 0
+            || infinite_materials
+            || item.components.get("minecraft:unbreakable").is_some()
+            || item.components.get("!minecraft:max_damage").is_some()
+            || item.components.get("!minecraft:damage").is_some()
+        {
+            return Ok(false);
+        }
+        ensure!(
+            item.count == 1 && item.max_count.is_some(),
+            "unresolved equipment stack"
+        );
+        let Tag::Compound(components) = &item.components else {
+            anyhow::bail!("invalid equipment components")
+        };
+        let mut keys = BTreeSet::new();
+        for (name, _) in components {
+            ensure!(keys.insert(&name.0), "duplicate equipment component");
+        }
+        let default_max = ordinary_item_default_durability(item.id())
+            .or_else(|| crate::equippable::vanilla_equipment(item.id()).and_then(|item| item.2));
+        let maximum = match item.components.get("minecraft:max_damage") {
+            Some(Tag::Int(value)) if *value > 0 => *value,
+            Some(_) => anyhow::bail!("invalid equipment maximum damage"),
+            None if default_max.is_some() => default_max.unwrap() as i32,
+            None if item.max_count.is_some_and(|value| value > 1) => return Ok(false),
+            None => anyhow::bail!("equipment maximum damage is unknown"),
+        };
+        let old = match item.components.get("minecraft:damage") {
+            Some(Tag::Int(value)) if *value >= 0 => (*value).min(maximum),
+            Some(_) => anyhow::bail!("invalid equipment damage"),
+            None if default_max.is_some() => 0,
+            None => anyhow::bail!("equipment damage component is unknown"),
+        };
+        let mut next_random = random.clone();
+        let mut change = amount;
+        if change > 0 {
+            let mut adjusted = change as f32;
+            let mut effect_count = 0;
+            for (id, level) in item_enchantments(item)? {
+                let registry = self
+                    .enchantments
+                    .as_ref()
+                    .context("active enchantment registry is unavailable")?;
+                let (value, affected) =
+                    registry.apply_item_damage(&id, level, item.id(), adjusted, &mut || {
+                        next_random.next_float()
+                    })?;
+                effect_count += usize::from(affected);
+                ensure!(
+                    effect_count <= 1,
+                    "multiple durability enchantment order is unsupported"
+                );
+                adjusted = value;
+            }
+            change = adjusted as i32;
+        }
+        if change == 0 {
+            *random = next_random;
+            return Ok(false);
+        }
+        let next = old.wrapping_add(change).clamp(0, maximum);
+        let mut replacement = item.clone();
+        let Tag::Compound(components) = &mut replacement.components else {
+            unreachable!()
+        };
+        if let Some((_, value)) = components
+            .iter_mut()
+            .find(|(name, _)| name.matches("minecraft:damage"))
+        {
+            *value = Tag::Int(next);
+        } else {
+            components.push(("minecraft:damage".into(), Tag::Int(next)));
+        }
+        let replacement = (next < maximum).then_some(replacement);
+        let changed = self.set_slot(slot, replacement);
+        *random = next_random;
+        Ok(changed)
+    }
+
     /// Stage damage to equipped armor in Java's feet-to-head order. The caller
     /// commits both the inventory and the level RNG only after damage resolves.
     pub(crate) fn damage_equipped_armor(
@@ -4157,6 +4255,205 @@ mod tests {
                 describe(inventory.slot(hand)),
                 row["empty"].as_str().unwrap(),
                 "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn location_effect_damage_updates_one_slot_and_stages_rng() {
+        let components = Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(194))]);
+        let boots = ItemStack::new("minecraft:iron_boots".into(), 1, 1, components).unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Armor(3), Some(boots.clone()));
+        let mut random = LegacyRandom::new(7);
+        let before = random.state();
+        assert!(
+            !inventory
+                .change_equipped_item_damage(PlayerSlot::Armor(3), 1, true, &mut random)
+                .unwrap()
+        );
+        assert_eq!(inventory.slot(PlayerSlot::Armor(3)), Some(&boots));
+        assert_eq!(random.state(), before);
+        assert!(
+            inventory
+                .change_equipped_item_damage(PlayerSlot::Armor(3), -2, false, &mut random)
+                .unwrap()
+        );
+        assert_eq!(
+            inventory
+                .slot(PlayerSlot::Armor(3))
+                .unwrap()
+                .components()
+                .get("minecraft:damage"),
+            Some(&Tag::Int(192))
+        );
+        assert!(
+            inventory
+                .change_equipped_item_damage(PlayerSlot::Armor(3), 3, false, &mut random)
+                .unwrap()
+        );
+        assert!(inventory.slot(PlayerSlot::Armor(3)).is_none());
+
+        let invalid = ItemStack::new(
+            "minecraft:iron_boots".into(),
+            1,
+            1,
+            Tag::Compound(vec![
+                ("minecraft:damage".into(), Tag::Int(1)),
+                ("minecraft:damage".into(), Tag::Int(2)),
+            ]),
+        )
+        .unwrap();
+        inventory.set_slot(PlayerSlot::Armor(3), Some(invalid.clone()));
+        let before = random.state();
+        assert!(
+            inventory
+                .change_equipped_item_damage(PlayerSlot::Armor(3), 1, false, &mut random)
+                .is_err()
+        );
+        assert_eq!(inventory.slot(PlayerSlot::Armor(3)), Some(&invalid));
+        assert_eq!(random.state(), before);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn location_effect_item_damage_matches_java() {
+        use std::{path::PathBuf, process::Command, sync::Arc};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LocationItemDamageOracle.java");
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/LocationItemDamageOracle.java"),
+        )
+        .unwrap();
+        let mut inputs = Vec::new();
+        for amount in [-5, 0, 1, 3] {
+            for damage in [0, 5, 194] {
+                for max in [12, 195] {
+                    for unbreaking in [0, 1, 3] {
+                        for unbreakable in [false, true] {
+                            for seed in [0, 1, 4096] {
+                                inputs.push(serde_json::json!({"amount":amount,"damage":damage,"max":max,"unbreaking":unbreaking,"unbreakable":unbreakable,"seed":seed}));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(&input, serde_json::to_vec(&inputs).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("LocationItemDamageOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(inputs.len(), expected.len());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for (input, expected) in inputs.iter().zip(expected) {
+            let number = |key: &str| input[key].as_i64().unwrap() as i32;
+            let mut components = vec![
+                ("minecraft:damage".into(), Tag::Int(number("damage"))),
+                ("minecraft:max_damage".into(), Tag::Int(number("max"))),
+            ];
+            if input["unbreakable"].as_bool().unwrap() {
+                components.push(("minecraft:unbreakable".into(), Tag::Compound(vec![])));
+            }
+            if number("unbreaking") > 0 {
+                components.push((
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:unbreaking".into(),
+                        Tag::Int(number("unbreaking")),
+                    )]),
+                ));
+            }
+            let mut inventory = PlayerInventory::default();
+            inventory.set_enchantments(Arc::clone(&registry));
+            inventory.set_slot(
+                PlayerSlot::Armor(3),
+                ItemStack::new(
+                    "minecraft:iron_boots".into(),
+                    1,
+                    1,
+                    Tag::Compound(components),
+                ),
+            );
+            let mut random = LegacyRandom::new(input["seed"].as_i64().unwrap());
+            inventory
+                .change_equipped_item_damage(
+                    PlayerSlot::Armor(3),
+                    number("amount"),
+                    false,
+                    &mut random,
+                )
+                .unwrap();
+            let actual = inventory.slot(PlayerSlot::Armor(3));
+            assert_eq!(
+                actual.is_none(),
+                expected["empty"].as_bool().unwrap(),
+                "{input}"
+            );
+            let damage = actual.map_or(-1, |item| {
+                item.components()
+                    .get("minecraft:damage")
+                    .unwrap()
+                    .as_java_int()
+                    .unwrap()
+                    .clamp(0, number("max"))
+            });
+            assert_eq!(
+                damage,
+                expected["damage"].as_i64().unwrap() as i32,
+                "{input}"
+            );
+            assert_eq!(
+                random.next_int(),
+                expected["next"].as_i64().unwrap() as i32,
+                "{input}"
+            );
+            assert_eq!(
+                actual.is_none(),
+                expected["broken"].as_bool().unwrap(),
+                "{input}"
             );
         }
     }

@@ -335,6 +335,14 @@ enum Effect {
         amount: LevelValue,
     },
     ChangeItemDamage(LevelValue),
+    ReplaceDisk {
+        radius: LevelValue,
+        height: LevelValue,
+        offset: [i32; 3],
+        predicate: Option<Value>,
+        block_state: Value,
+        trigger_game_event: Option<ResourceId>,
+    },
 }
 
 impl Effect {
@@ -394,6 +402,62 @@ impl Effect {
                     0,
                 )?))
             }
+            "replace_disk" => {
+                check_keys(
+                    value,
+                    &[
+                        "type",
+                        "radius",
+                        "height",
+                        "offset",
+                        "predicate",
+                        "block_state",
+                        "trigger_game_event",
+                    ],
+                )?;
+                let offset = match value.get("offset") {
+                    None => [0; 3],
+                    Some(offset) => {
+                        let values = offset.as_array().context("disk offset is not an array")?;
+                        ensure!(values.len() == 3, "disk offset must have three coordinates");
+                        let mut offset = [0; 3];
+                        for (out, value) in offset.iter_mut().zip(values) {
+                            *out = i32::try_from(value.as_i64().context("invalid disk offset")?)?;
+                        }
+                        offset
+                    }
+                };
+                let predicate = value.get("predicate").cloned();
+                if let Some(predicate) = &predicate {
+                    object(predicate, "disk predicate")?;
+                }
+                let block_state = value
+                    .get("block_state")
+                    .context("disk block state is missing")?
+                    .clone();
+                if block_state.is_string() {
+                    id(&block_state, "disk block state provider")?;
+                } else {
+                    object(&block_state, "disk block state provider")?;
+                }
+                Ok(Self::ReplaceDisk {
+                    radius: LevelValue::parse(
+                        value.get("radius").context("disk radius is missing")?,
+                        0,
+                    )?,
+                    height: LevelValue::parse(
+                        value.get("height").context("disk height is missing")?,
+                        0,
+                    )?,
+                    offset,
+                    predicate,
+                    block_state,
+                    trigger_game_event: value
+                        .get("trigger_game_event")
+                        .map(|event| id(event, "disk game event"))
+                        .transpose()?,
+                })
+            }
             _ => bail!("unsupported location effect {}", kind.path),
         }
     }
@@ -449,6 +513,25 @@ impl Effect {
                     result.push(LocationAction::ChangeItemDamage(amount));
                 }
             }
+            Self::ReplaceDisk {
+                radius,
+                height,
+                offset,
+                predicate,
+                block_state,
+                trigger_game_event,
+            } => {
+                if after {
+                    result.push(LocationAction::ReplaceDisk(ReplaceDiskAction {
+                        radius: radius.calculate(level) as i32,
+                        height: height.calculate(level) as i32,
+                        offset: *offset,
+                        predicate: predicate.clone(),
+                        block_state: block_state.clone(),
+                        trigger_game_event: trigger_game_event.clone(),
+                    }));
+                }
+            }
         }
         Ok(())
     }
@@ -487,6 +570,27 @@ pub enum LocationAction {
         modifier: AttributeModifier,
     },
     ChangeItemDamage(f32),
+    ReplaceDisk(ReplaceDiskAction),
+}
+
+/// The provider and block predicate are preserved for the world evaluator.
+/// Unsupported forms must fail closed when this action is executed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplaceDiskAction {
+    pub radius: i32,
+    pub height: i32,
+    pub offset: [i32; 3],
+    pub predicate: Option<Value>,
+    pub block_state: Value,
+    pub trigger_game_event: Option<ResourceId>,
+}
+
+impl ReplaceDiskAction {
+    /// Ordered geometric candidates. `None` means the requested region cannot
+    /// yet be processed safely; no caller should partially apply it.
+    pub fn positions(&self, origin: [f64; 3]) -> Option<native_core::replace_disk::DiskPositions> {
+        native_core::replace_disk::DiskPositions::new(origin, self.offset, self.radius, self.height)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -625,6 +729,54 @@ mod tests {
                 {"type":"minecraft:entity_properties","entity":"this","predicate":{"minecraft:flags":{"is_on_ground":true},"minecraft:movement_affected_by":{"block":{"blocks":"#example:ground"}}}}
             ]}}
         ]}})
+    }
+
+    #[test]
+    fn replace_disk_preserves_unimplemented_world_inputs_and_evaluates_levels() {
+        let definition = json!({"slots":["feet"],"effects":{"minecraft:location_changed":[
+            {"effect":{"type":"minecraft:replace_disk",
+                "radius":{"type":"minecraft:linear","base":2.75,"per_level_above_first":1.0},
+                "height":1.0, "offset":[0,-1,0],
+                "predicate":{"type":"minecraft:unobstructed"},
+                "block_state":{"id":"minecraft:frosted_ice","properties":{"age":"0"}},
+                "trigger_game_event":"minecraft:block_place"}}
+        ]}});
+        let enchantment = LocationEnchantment::load(&mut Tags, &definition).unwrap();
+        let context = LocationContext {
+            active: false,
+            flying: false,
+            on_ground: true,
+            vehicle: false,
+            movement_block: "minecraft:water",
+            level: 3,
+            tick_count: 0,
+            known_movement: [0.0; 3],
+        };
+        let (_, actions) = enchantment
+            .evaluate(0, EquipmentSlot::Feet, &context, &mut || {
+                panic!("unexpected random condition")
+            })
+            .unwrap();
+        let [LocationAction::ReplaceDisk(disk)] = actions.as_slice() else {
+            panic!("unexpected action")
+        };
+        assert_eq!((disk.radius, disk.height, disk.offset), (4, 1, [0, -1, 0]));
+        assert!(
+            disk.positions([0.5, 3.0, 0.5])
+                .unwrap()
+                .all(|pos| pos[1] == 2)
+        );
+        assert_eq!(
+            disk.predicate.as_ref().unwrap(),
+            &definition["effects"]["minecraft:location_changed"][0]["effect"]["predicate"]
+        );
+        assert_eq!(
+            disk.block_state,
+            definition["effects"]["minecraft:location_changed"][0]["effect"]["block_state"]
+        );
+        let mut invalid = definition.clone();
+        invalid["effects"]["minecraft:location_changed"][0]["effect"]["offset"] = json!([0, 1]);
+        assert!(LocationEnchantment::load(&mut Tags, &invalid).is_err());
     }
 
     #[test]
@@ -862,12 +1014,47 @@ mod tests {
                 .unwrap(),
             &enchantment
         );
-        // Unsupported definitions do not prevent unrelated enchantments from loading.
-        assert!(
-            registry
-                .location_effects(&ResourceId::parse("minecraft:frost_walker").unwrap())
-                .is_err()
-        );
+        let frost = registry
+            .location_effects(&ResourceId::parse("minecraft:frost_walker").unwrap())
+            .unwrap();
+        for level in [1, 2, 14, 255] {
+            for on_ground in [false, true] {
+                for vehicle in [false, true] {
+                    let context = LocationContext {
+                        active: false,
+                        flying: false,
+                        on_ground,
+                        vehicle,
+                        movement_block: "minecraft:water",
+                        level,
+                        tick_count: 0,
+                        known_movement: [0.0; 3],
+                    };
+                    let (active, actions) = frost
+                        .evaluate(0, EquipmentSlot::Feet, &context, &mut || {
+                            panic!("unexpected random condition")
+                        })
+                        .unwrap();
+                    assert_eq!(active, on_ground && !vehicle);
+                    if active {
+                        let [LocationAction::ReplaceDisk(disk)] = actions.as_slice() else {
+                            panic!("unexpected effect")
+                        };
+                        assert_eq!(disk.radius, (level as i32 + 2).min(16));
+                        assert_eq!(disk.height, 1);
+                        assert_eq!(disk.offset, [0, -1, 0]);
+                        assert!(disk.predicate.is_some());
+                        assert_eq!(disk.block_state["id"], "minecraft:frosted_ice");
+                        assert_eq!(
+                            disk.trigger_game_event.as_ref().unwrap().path,
+                            "block_place"
+                        );
+                    } else {
+                        assert!(actions.is_empty());
+                    }
+                }
+            }
+        }
         assert_eq!(enchantment.len(), 2);
         for previous in [false, true] {
             for flying in [false, true] {

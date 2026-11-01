@@ -6,6 +6,7 @@ pub mod normal_noise;
 pub mod ore;
 pub mod perlin;
 pub mod random;
+pub mod replace_disk;
 pub mod simplex;
 pub mod stairs;
 pub mod weather_columns;

@@ -277,6 +277,11 @@ impl LocationTracker {
                                 }
                             }
                         }
+                        LocationAction::ReplaceDisk(_) => {
+                            anyhow::bail!(
+                                "location replace_disk world effects are not yet supported"
+                            );
+                        }
                     }
                 }
                 if active {
@@ -377,6 +382,96 @@ mod tests {
     use native_resources::packs::ResourceProvider;
     use std::sync::Arc;
 
+    #[test]
+    fn replace_disk_candidate_bounds_are_checked() {
+        use native_core::replace_disk::DiskPositions;
+        assert_eq!(
+            DiskPositions::new([0.5, 3.0, 0.5], [0, -1, 0], 0, 1)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            DiskPositions::new([0.5, 3.0, 0.5], [0, -1, 0], 1, 1)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![[0, 2, 0]]
+        );
+        assert!(DiskPositions::new([f64::NAN, 0.0, 0.0], [0; 3], 1, 1).is_none());
+        assert!(DiskPositions::new([0.0; 3], [0; 3], i32::MIN, 1).is_none());
+        assert!(DiskPositions::new([0.0; 3], [0; 3], 1_000, 1).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn replace_disk_candidates_match_java_effect() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ReplaceDiskGeometryOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ReplaceDiskGeometryOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ReplaceDiskGeometryOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 256);
+        for row in rows {
+            let origin = std::array::from_fn(|i| row["origin"][i].as_f64().unwrap());
+            let offset = std::array::from_fn(|i| row["offset"][i].as_i64().unwrap() as i32);
+            let positions: Vec<_> = native_core::replace_disk::DiskPositions::new(
+                origin,
+                offset,
+                row["radius"].as_i64().unwrap() as i32,
+                row["height"].as_i64().unwrap() as i32,
+            )
+            .unwrap()
+            .collect();
+            let expected: Vec<[i32; 3]> = serde_json::from_value(row["positions"].clone()).unwrap();
+            assert_eq!(positions, expected, "{row}");
+        }
+    }
+
     struct Pack;
     impl ResourceProvider for Pack {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -413,6 +508,51 @@ mod tests {
             passenger: false,
             infinite_materials: false,
         }
+    }
+
+    #[test]
+    fn unsupported_disk_execution_rolls_back_location_random_and_equipment() {
+        struct DiskPack;
+        impl ResourceProvider for DiskPack {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(if folder == "enchantment" {
+                    vec![ResourceId::parse("example:location")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/enchantment/location.json").then(|| br#"{"slots":["feet"],"effects":{"minecraft:location_changed":[{"requirements":{"type":"minecraft:random_chance","chance":1.0},"effect":{"type":"minecraft:replace_disk","radius":3.0,"height":1.0,"block_state":{"id":"minecraft:frosted_ice"}}}]}}"#.to_vec()))
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut DiskPack).unwrap());
+        let mut inventory = PlayerInventory::default();
+        inventory.set_enchantments(Arc::clone(&registry));
+        inventory.set_slot(PlayerSlot::Armor(3), Some(boots()));
+        let before = inventory.slot(PlayerSlot::Armor(3)).cloned();
+        let mut random = LegacyRandom::new(42);
+        let expected = random.clone().next_int();
+        let mut tracker = LocationTracker::default();
+        assert!(
+            tracker
+                .sync_equipment(
+                    &mut inventory,
+                    &registry,
+                    env("minecraft:water"),
+                    &mut random
+                )
+                .is_err()
+        );
+        assert!(same_stack(
+            before.as_ref(),
+            inventory.slot(PlayerSlot::Armor(3))
+        ));
+        assert_eq!(random.next_int(), expected);
+        assert!(!tracker.has_active());
+        assert!(tracker.equipment_changed(&inventory));
     }
 
     #[test]

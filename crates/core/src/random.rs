@@ -57,6 +57,16 @@ impl LegacyRandom {
         }
     }
 
+    /// Capture the internal 48-bit state without advancing the generator.
+    pub fn state(&self) -> u64 {
+        self.seed
+    }
+
+    /// Restore a previously captured internal state, rejecting non-48-bit data.
+    pub fn from_state(state: u64) -> Option<Self> {
+        (state < (1u64 << 48)).then_some(Self { seed: state })
+    }
+
     fn bits(&mut self, count: u32) -> u32 {
         self.seed = self.seed.wrapping_mul(0x5deece66d).wrapping_add(11) & ((1u64 << 48) - 1);
         (self.seed >> (48 - count)) as u32
@@ -297,6 +307,19 @@ fn mix_stafford13(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_state_round_trips_and_rejects_invalid_bits() {
+        for seed in [0, 1, -1, i64::MIN, i64::MAX] {
+            let mut original = LegacyRandom::new(seed);
+            for _ in 0..32 {
+                original.next_int();
+                let mut restored = LegacyRandom::from_state(original.state()).unwrap();
+                assert_eq!(restored.next_long(), original.clone().next_long());
+            }
+        }
+        assert!(LegacyRandom::from_state(1u64 << 48).is_none());
+    }
 
     #[test]
     fn skipped_block_positions_match_iterated_and_composed_sequences() {

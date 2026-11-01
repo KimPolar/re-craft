@@ -250,6 +250,18 @@ impl SpriteAtlas {
         self.sprites.get(id).map(|sprite| sprite.transparency)
     }
 
+    /// A stable key for the complete visible animation state at a tick.
+    /// Identical keys produce identical atlas pixels and can reuse GPU images.
+    pub fn animation_key(&self, tick: u64) -> Vec<(u32, u32, u16)> {
+        self.sprites
+            .values()
+            .map(|sprite| {
+                let state = frame_state(sprite, tick);
+                (state.current, state.next, state.progress)
+            })
+            .collect()
+    }
+
     /// Check without copying the shared atlas when all animation frames are unchanged.
     pub fn needs_update(&self, tick: u64) -> bool {
         self.sprites

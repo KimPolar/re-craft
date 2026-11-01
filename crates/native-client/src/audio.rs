@@ -700,6 +700,7 @@ impl Catalog {
         event: native_session::loaded::BucketSoundEvent,
         random: &mut LegacyRandom,
         output_rate: u32,
+        neutral_gain: &Arc<AtomicU32>,
     ) -> Result<Option<Voice>> {
         self.resolve(
             event.kind.event(),
@@ -712,6 +713,9 @@ impl Catalog {
         .map(|voice| {
             voice.map(|mut voice| {
                 voice.player_sound = event.kind.is_player_sound();
+                if event.kind.is_neutral_sound() {
+                    voice.category_gain = Some(neutral_gain.clone());
+                }
                 voice
             })
         })
@@ -964,7 +968,7 @@ fn run(
                 &mut preload_random
             };
             let resolved = if let Some(event) = bucket {
-                catalog.bucket(event, chosen_random, config.sample_rate.0)
+                catalog.bucket(event, chosen_random, config.sample_rate.0, &neutral_gain)
             } else if let Some(event) = consume {
                 catalog.consume(
                     event,
@@ -1054,9 +1058,13 @@ mod tests {
         })
         .unwrap();
         let position = glam::DVec3::new(17.5, 64.5, -3.5);
+        let neutral_gain = Arc::new(AtomicU32::new(0.25_f32.to_bits()));
         for kind in [
             BucketSoundKind::FillWater,
             BucketSoundKind::FillLava,
+            BucketSoundKind::FillBottle,
+            BucketSoundKind::EmptyBottle,
+            BucketSoundKind::Splash,
             BucketSoundKind::EmptyWater,
             BucketSoundKind::EmptyLava,
             BucketSoundKind::Evaporate,
@@ -1070,10 +1078,17 @@ mod tests {
                 sequence: 0,
             };
             let voice = vanilla
-                .bucket(event, &mut LegacyRandom::new(1), 48000)
+                .bucket(event, &mut LegacyRandom::new(1), 48000, &neutral_gain)
                 .unwrap()
                 .unwrap();
             assert_eq!(voice.player_sound, kind.is_player_sound());
+            assert_eq!(voice.category_gain.is_some(), kind.is_neutral_sound());
+            if kind.is_neutral_sound() {
+                assert!(Arc::ptr_eq(
+                    voice.category_gain.as_ref().unwrap(),
+                    &neutral_gain
+                ));
+            }
             assert_eq!(voice.spatial.unwrap().position, position);
             assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
         }
@@ -1094,7 +1109,7 @@ mod tests {
             sequence: 0,
         };
         let voice = catalog
-            .bucket(event, &mut LegacyRandom::new(1), 48000)
+            .bucket(event, &mut LegacyRandom::new(1), 48000, &neutral_gain)
             .unwrap()
             .unwrap();
         assert!(voice.player_sound);
@@ -1108,7 +1123,7 @@ mod tests {
             sequence: 1,
         };
         let voice = catalog
-            .bucket(event, &mut LegacyRandom::new(1), 48000)
+            .bucket(event, &mut LegacyRandom::new(1), 48000, &neutral_gain)
             .unwrap()
             .unwrap();
         assert!(!voice.player_sound);

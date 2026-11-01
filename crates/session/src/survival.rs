@@ -165,6 +165,9 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
     if id.namespace != "minecraft" {
         return None;
     }
+    if matches!(id.path.as_str(), "water" | "mundane" | "thick" | "awkward") {
+        return Some(Vec::new());
+    }
     let (kind, duration, amplifier) = match id.path.as_str() {
         "night_vision" => (FoodStatusKind::NightVision, 3600, 0),
         "long_night_vision" => (FoodStatusKind::NightVision, 9600, 0),
@@ -1419,7 +1422,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 140);
+        assert_eq!(rows.len(), 220);
         for row in rows {
             let name = row["potion"].as_str().unwrap();
             let components = Tag::Compound(vec![(
@@ -1428,8 +1431,8 @@ mod tests {
             )]);
             let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
             assert_eq!(
-                potion_color(item.components()),
-                Some(row["color"].as_i64().unwrap() as u32 & 0xffffff),
+                potion_color(item.components()).unwrap_or(0x385dc6),
+                row["color"].as_i64().unwrap() as u32 & 0xffffff,
                 "{row}"
             );
             let food = food_properties(&item).unwrap();

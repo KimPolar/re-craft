@@ -684,6 +684,9 @@ pub struct LockedChestSoundEvent {
 pub enum BucketSoundKind {
     FillWater,
     FillLava,
+    FillBottle,
+    EmptyBottle,
+    Splash,
     EmptyWater,
     EmptyLava,
     Evaporate,
@@ -695,6 +698,9 @@ impl BucketSoundKind {
         match self {
             Self::FillWater => "item.bucket.fill",
             Self::FillLava => "item.bucket.fill_lava",
+            Self::FillBottle => "item.bottle.fill",
+            Self::EmptyBottle => "item.bottle.empty",
+            Self::Splash => "entity.generic.splash",
             Self::EmptyWater => "item.bucket.empty",
             Self::EmptyLava => "item.bucket.empty_lava",
             Self::Evaporate => "block.fire.extinguish",
@@ -704,6 +710,10 @@ impl BucketSoundKind {
 
     pub fn is_player_sound(self) -> bool {
         matches!(self, Self::FillWater | Self::FillLava)
+    }
+
+    pub fn is_neutral_sound(self) -> bool {
+        matches!(self, Self::FillBottle)
     }
 }
 
@@ -8609,15 +8619,8 @@ impl LoadedSession {
         true
     }
 
-    /// Empty buckets target fluid sources as well as ordinary block outlines.
-    fn try_fill_bucket(&mut self, hand: crate::inventory::PlayerSlot) -> bool {
-        use crate::inventory::ordinary_return_supported;
-        let Some(item) = self.inventory.slot(hand) else {
-            return false;
-        };
-        if item.id() != "minecraft:bucket" || !ordinary_return_supported(item) {
-            return false;
-        }
+    /// Both buckets and bottles target fluid sources as well as block outlines.
+    fn source_fluid_hit(&self) -> Option<ShapeRayHit> {
         const SOURCE: &[Aabb] = &[Aabb {
             min: Vec3::ZERO,
             max: Vec3::new(1.0, 8.0 / 9.0, 1.0),
@@ -8626,7 +8629,7 @@ impl LoadedSession {
             min: Vec3::ZERO,
             max: Vec3::ONE,
         }];
-        let hit = raycast_shapes_with_fluid(
+        raycast_shapes_with_fluid(
             self.player.eye(),
             self.player.direction(),
             if self.game_mode == GameMode::Creative {
@@ -8668,8 +8671,142 @@ impl LoadedSession {
                 }
                 Some((outline, &[]))
             },
+        )
+    }
+
+    fn try_fill_bottle(&mut self, hand: crate::inventory::PlayerSlot) -> bool {
+        let Some(item) = self.inventory.slot(hand) else {
+            return false;
+        };
+        if item.id() != "minecraft:glass_bottle"
+            || !crate::inventory::ordinary_return_supported(item)
+        {
+            return false;
+        }
+        let Some(hit) = self.source_fluid_hit() else {
+            return false;
+        };
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        if !self
+            .fluids
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+        {
+            return false;
+        }
+        let mut inventory = (*self.inventory).clone();
+        let Some(overflow) = inventory.fill_bottle(hand, self.game_mode == GameMode::Creative)
+        else {
+            return false;
+        };
+        self.inventory = Arc::new(inventory);
+        self.push_bucket_sound(
+            BucketSoundKind::FillBottle,
+            self.origin.as_dvec3() + self.motion.position,
+            1.0,
+            1.0,
         );
-        let Some(hit) = hit else { return false };
+        if let Some(stack) = overflow {
+            self.dropped_items.drop_player(
+                stack,
+                self.origin,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+        let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+            crate::animation::Hand::Off
+        } else {
+            crate::animation::Hand::Main
+        };
+        self.first_person.swing.start(swing);
+        self.first_person.used(swing);
+        true
+    }
+
+    fn try_make_mud(&mut self, hand: crate::inventory::PlayerSlot, hit: ShapeRayHit) -> bool {
+        if hit.face == -IVec3::Y {
+            return false;
+        }
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(block) = self.world.state(id) else {
+            return false;
+        };
+        let convertible = match &self.mining_tags {
+            Some(tags) => tags
+                .contains("minecraft:convertible_to_mud", &block.name)
+                .unwrap_or(false),
+            None => matches!(
+                block.name.as_str(),
+                "minecraft:dirt" | "minecraft:coarse_dirt" | "minecraft:rooted_dirt"
+            ),
+        };
+        if !convertible {
+            return false;
+        }
+        let mut inventory = (*self.inventory).clone();
+        let Some(overflow) =
+            inventory.empty_water_bottle(hand, self.game_mode == GameMode::Creative)
+        else {
+            return false;
+        };
+        let mud = self.intern_block(state("minecraft:mud", &[]));
+        if !self.set(hit.position, mud) {
+            return false;
+        }
+        self.inventory = Arc::new(inventory);
+        let position = (self.origin + hit.position).as_dvec3() + DVec3::splat(0.5);
+        self.push_bucket_sound(BucketSoundKind::Splash, position, 1.0, 1.0);
+        self.push_bucket_sound(BucketSoundKind::EmptyBottle, position, 1.0, 1.0);
+        if let Some(stack) = overflow {
+            self.dropped_items.drop_player(
+                stack,
+                self.origin,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+        let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+            crate::animation::Hand::Off
+        } else {
+            crate::animation::Hand::Main
+        };
+        self.first_person.swing.start(swing);
+        self.first_person.used(swing);
+        true
+    }
+
+    fn try_fill_bucket(&mut self, hand: crate::inventory::PlayerSlot) -> bool {
+        use crate::inventory::ordinary_return_supported;
+        let Some(item) = self.inventory.slot(hand) else {
+            return false;
+        };
+        if item.id() != "minecraft:bucket" || !ordinary_return_supported(item) {
+            return false;
+        }
+        let Some(hit) = self.source_fluid_hit() else {
+            return false;
+        };
         let Cell::State(id) = cell(
             &self.world,
             self.origin,
@@ -12242,15 +12379,20 @@ impl LoadedSession {
                                 };
                                 self.first_person.swing.start(swing);
                                 self.first_person.used(swing);
-                            } else if self.food_use.start_hand(
-                                &mut self.inventory,
-                                main_hand,
-                                &mut self.vitals,
-                                self.game_mode,
-                            ) || (self.game_mode.allows_basic_building()
-                                && (self.try_fill_bucket(main_hand)
-                                    || self.try_empty_bucket(main_hand)
-                                    || self.use_tool(hit.position, hit.face)))
+                            } else if (self.game_mode.allows_basic_building()
+                                && self.try_make_mud(main_hand, hit))
+                                || (self.game_mode != GameMode::Spectator
+                                    && self.try_fill_bottle(main_hand))
+                                || self.food_use.start_hand(
+                                    &mut self.inventory,
+                                    main_hand,
+                                    &mut self.vitals,
+                                    self.game_mode,
+                                )
+                                || (self.game_mode.allows_basic_building()
+                                    && (self.try_fill_bucket(main_hand)
+                                        || self.try_empty_bucket(main_hand)
+                                        || self.use_tool(hit.position, hit.face)))
                             {
                                 handled = true;
                             } else if self.game_mode.allows_basic_building()
@@ -12319,6 +12461,8 @@ impl LoadedSession {
                         }
                     }
                     if !handled
+                        && !(self.game_mode != GameMode::Spectator
+                            && self.try_fill_bottle(main_hand))
                         && !(self.game_mode.allows_basic_building()
                             && (self.try_fill_bucket(main_hand)
                                 || self.try_empty_bucket(main_hand)))
@@ -12330,8 +12474,15 @@ impl LoadedSession {
                         )
                     {
                         if !(self.game_mode.allows_basic_building()
-                            && (self.try_fill_bucket(crate::inventory::PlayerSlot::Offhand)
-                                || self.try_empty_bucket(crate::inventory::PlayerSlot::Offhand)))
+                            && self.ray_hit().is_some_and(|hit| {
+                                self.try_make_mud(crate::inventory::PlayerSlot::Offhand, hit)
+                            }))
+                            && !(self.game_mode != GameMode::Spectator
+                                && self.try_fill_bottle(crate::inventory::PlayerSlot::Offhand))
+                            && !(self.game_mode.allows_basic_building()
+                                && (self.try_fill_bucket(crate::inventory::PlayerSlot::Offhand)
+                                    || self
+                                        .try_empty_bucket(crate::inventory::PlayerSlot::Offhand)))
                         {
                             self.food_use.start_hand(
                                 &mut self.inventory,
@@ -16140,6 +16291,231 @@ mod tests {
                     if mode == GameMode::Survival { 1 } else { 2 }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bottle_fills_from_water_without_removing_source_and_can_be_drunk() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let pos = IVec3::new(8, 2, 7);
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set_with_notify(pos, water, false));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new(
+                        "minecraft:glass_bottle".into(),
+                        1,
+                        64,
+                        Tag::Compound(vec![]),
+                    ),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                assert_eq!(
+                    session.take_bucket_sounds()[0].kind,
+                    BucketSoundKind::FillBottle
+                );
+                let p = session.origin + pos;
+                assert_eq!(
+                    session.world.block(p.x, p.y, p.z).unwrap().name,
+                    "minecraft:water"
+                );
+                let slot = if mode == GameMode::Creative {
+                    PlayerSlot::Storage(if hand == PlayerSlot::Offhand { 0 } else { 1 })
+                } else {
+                    hand
+                };
+                let filled = session.inventory.slot(slot).unwrap();
+                assert_eq!(filled.id(), "minecraft:potion");
+                assert_eq!(
+                    filled
+                        .components()
+                        .get("minecraft:potion_contents")
+                        .unwrap()
+                        .get("potion"),
+                    Some(&Tag::String("minecraft:water".into()))
+                );
+                if mode != GameMode::Creative {
+                    session.submit_command(PlayerCommand::Place);
+                    for _ in 0..32 {
+                        session.update(TICK);
+                    }
+                    assert_eq!(
+                        session.inventory.slot(hand).unwrap().id(),
+                        "minecraft:glass_bottle"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn water_bottle_turns_convertible_dirt_to_mud_before_drinking() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for name in [
+            "minecraft:dirt",
+            "minecraft:coarse_dirt",
+            "minecraft:rooted_dirt",
+        ] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for mode in [GameMode::Survival, GameMode::Creative] {
+                    let mut session = session();
+                    session.set_game_mode(mode);
+                    let pos = IVec3::new(8, 2, 7);
+                    let dirt = session.intern_block(state(name, &[]));
+                    session.set_with_notify(pos, dirt, false);
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(
+                        hand,
+                        ItemStack::new(
+                            "minecraft:potion".into(),
+                            1,
+                            1,
+                            Tag::Compound(vec![(
+                                "minecraft:potion_contents".into(),
+                                Tag::Compound(vec![(
+                                    "potion".into(),
+                                    Tag::String("minecraft:water".into()),
+                                )]),
+                            )]),
+                        ),
+                    );
+                    session.set_player_inventory(inventory);
+                    session.submit_command(PlayerCommand::Place);
+                    session.update(TICK);
+                    let p = session.origin + pos;
+                    assert_eq!(
+                        session.world.block(p.x, p.y, p.z).unwrap().name,
+                        "minecraft:mud",
+                        "{name} {mode:?} {hand:?}"
+                    );
+                    let sounds = session.take_bucket_sounds();
+                    assert_eq!(
+                        sounds.iter().map(|sound| sound.kind).collect::<Vec<_>>(),
+                        [BucketSoundKind::Splash, BucketSoundKind::EmptyBottle]
+                    );
+                    assert_eq!(
+                        session.inventory.slot(hand).unwrap().id(),
+                        if mode == GameMode::Creative {
+                            "minecraft:potion"
+                        } else {
+                            "minecraft:glass_bottle"
+                        }
+                    );
+                    assert!(!session.food_use.is_active());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn data_pack_controls_which_blocks_water_bottles_convert() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data(bool);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(vec![
+                    ResourceId::parse("minecraft:convertible_to_mud").unwrap(),
+                ])
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    if path.ends_with("/convertible_to_mud.json") && self.0 {
+                        br#"{"values":["minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    },
+                ])
+            }
+        }
+        for enabled in [false, true] {
+            let registry = BTreeSet::from(["minecraft:air".into(), "minecraft:stone".into()]);
+            let tags =
+                native_resources::mining_tags::MiningTags::load(&mut Data(enabled), &registry)
+                    .unwrap();
+            let mut session = session();
+            session.set_mining_tags(Arc::new(tags));
+            let pos = IVec3::new(8, 2, 7);
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            session.set_with_notify(pos, stone, false);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:potion".into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:potion_contents".into(),
+                        Tag::Compound(vec![(
+                            "potion".into(),
+                            Tag::String("minecraft:water".into()),
+                        )]),
+                    )]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            let p = session.origin + pos;
+            assert_eq!(
+                session.world.block(p.x, p.y, p.z).unwrap().name,
+                if enabled {
+                    "minecraft:mud"
+                } else {
+                    "minecraft:stone"
+                }
+            );
+            assert_eq!(session.food_use.is_active(), !enabled);
+        }
+    }
+
+    #[test]
+    fn bottle_rejects_lava_flowing_water_and_blocked_sources() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for (block, level, blocked) in [
+            ("minecraft:water", "3", false),
+            ("minecraft:lava", "0", false),
+            ("minecraft:water", "0", true),
+        ] {
+            let mut session = session();
+            let pos = IVec3::new(8, 2, 7);
+            let fluid = session.intern_block(state(block, &[("level", level)]));
+            session.set_with_notify(pos, fluid, false);
+            if blocked {
+                let stone = session.intern_block(state("minecraft:stone", &[]));
+                session.set_with_notify(pos + IVec3::Z, stone, false);
+            }
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:glass_bottle".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            assert!(!session.try_fill_bottle(PlayerSlot::Storage(0)));
+            assert!(session.take_bucket_sounds().is_empty());
         }
     }
 

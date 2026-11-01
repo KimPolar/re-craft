@@ -1420,6 +1420,70 @@ impl PlayerInventory {
             return None;
         }
         let filled = ItemStack::new(result.to_owned(), 1, 1, Tag::Compound(vec![]))?;
+        self.fill_container(hand, filled, creative)
+    }
+
+    pub(crate) fn fill_bottle(
+        &mut self,
+        hand: PlayerSlot,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if source.id != "minecraft:glass_bottle" || !ordinary_return_supported(source) {
+            return None;
+        }
+        let filled = ItemStack::new(
+            "minecraft:potion".into(),
+            1,
+            1,
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![(
+                    "potion".into(),
+                    Tag::String("minecraft:water".into()),
+                )]),
+            )]),
+        )?;
+        self.fill_container(hand, filled, creative)
+    }
+
+    pub(crate) fn empty_water_bottle(
+        &mut self,
+        hand: PlayerSlot,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if source.id != "minecraft:potion"
+            || !ordinary_return_supported(source)
+            || source
+                .components
+                .get("minecraft:potion_contents")?
+                .get("potion")
+                != Some(&Tag::String("minecraft:water".into()))
+        {
+            return None;
+        }
+        let filled = ItemStack::new(
+            "minecraft:glass_bottle".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        )?;
+        self.fill_container(hand, filled, creative)
+    }
+
+    fn fill_container(
+        &mut self,
+        hand: PlayerSlot,
+        filled: ItemStack,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
         if creative {
             let already_owned = self
                 .storage
@@ -1434,7 +1498,7 @@ impl PlayerInventory {
             }
             return Some(None);
         }
-        if source.count == 1 {
+        if self.slot(hand)?.count == 1 {
             self.set_slot(hand, Some(filled));
             return Some(None);
         }
@@ -3083,7 +3147,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 64);
+        assert_eq!(rows.len(), 128);
         let describe = |item: Option<&ItemStack>| match item {
             None => "-".to_string(),
             Some(item) => format!(
@@ -3093,6 +3157,8 @@ mod tests {
                     "minecraft:bucket" => "b",
                     "minecraft:water_bucket" => "w",
                     "minecraft:lava_bucket" => "l",
+                    "minecraft:glass_bottle" => "g",
+                    "minecraft:potion" => "p",
                     id => panic!("unexpected {id}"),
                 },
                 item.count()
@@ -3112,10 +3178,23 @@ mod tests {
                 "minecraft:water_bucket"
             };
             if flag("existing") {
-                inventory.set_slot(
-                    PlayerSlot::Storage(5),
-                    ItemStack::new(result.into(), 1, 1, Tag::Compound(vec![])),
-                );
+                let existing = if flag("bottle") {
+                    ItemStack::new(
+                        "minecraft:potion".into(),
+                        1,
+                        1,
+                        Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![(
+                                "potion".into(),
+                                Tag::String("minecraft:water".into()),
+                            )]),
+                        )]),
+                    )
+                } else {
+                    ItemStack::new(result.into(), 1, 1, Tag::Compound(vec![]))
+                };
+                inventory.set_slot(PlayerSlot::Storage(5), existing);
             }
             let hand = if flag("offhand") {
                 PlayerSlot::Offhand
@@ -3125,15 +3204,23 @@ mod tests {
             inventory.set_slot(
                 hand,
                 ItemStack::new(
-                    "minecraft:bucket".into(),
+                    if flag("bottle") {
+                        "minecraft:glass_bottle"
+                    } else {
+                        "minecraft:bucket"
+                    }
+                    .into(),
                     row["count"].as_u64().unwrap() as u32,
-                    16,
+                    if flag("bottle") { 64 } else { 16 },
                     Tag::Compound(vec![]),
                 ),
             );
-            let dropped = inventory
-                .fill_bucket(hand, result, flag("creative"))
-                .unwrap();
+            let dropped = if flag("bottle") {
+                inventory.fill_bottle(hand, flag("creative"))
+            } else {
+                inventory.fill_bucket(hand, result, flag("creative"))
+            }
+            .unwrap();
             assert_eq!(
                 describe(dropped.as_ref()),
                 row["drop"].as_str().unwrap(),

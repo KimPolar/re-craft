@@ -37,7 +37,7 @@ public class RegionWriteOracle {
     static RegionFile open(Path dir, int regionX, RegionFileVersion version) throws Exception {
         return new RegionFile(new RegionStorageInfo("parity", null, "region"), dir.resolve("r." + regionX + ".0.mca"), dir, version, false);
     }
-    static CompoundTag chunk(int x) {
+    static CompoundTag chunk(int x) throws IOException {
         var chunk = new CompoundTag();
         chunk.putInt("DataVersion", 5023);
         chunk.putInt("xPos", x);
@@ -64,6 +64,14 @@ public class RegionWriteOracle {
             new Random(76543).nextBytes(bytes);
             chunk.putByteArray("oversized", bytes);
         }
+        if (x == 3) {
+            chunk.putByteArray("oversized", new byte[0]);
+            var buffer=new ByteArrayOutputStream();
+            NbtIo.write(chunk,(DataOutput)new DataOutputStream(buffer));
+            byte[] bytes=new byte[255*4096-5-buffer.size()];
+            new Random(9876).nextBytes(bytes);
+            chunk.putByteArray("oversized",bytes);
+        }
         return chunk;
     }
     public static void main(String[] args) throws Exception {
@@ -78,7 +86,7 @@ public class RegionWriteOracle {
             level.put("Data", data);
             NbtIo.writeCompressed(level, world.resolve("level.dat"));
             try (var region = open(dir)) {
-                for (int x = 0; x < 3; x++) {
+                for (int x = 0; x < 4; x++) {
                     try (var out = region.getChunkDataOutputStream(new ChunkPos(x, 0))) {
                         NbtIo.write(chunk(x), (DataOutput)out);
                     }
@@ -95,7 +103,7 @@ public class RegionWriteOracle {
             System.out.println("OK");
         } else if (args[0].equals("verify")) {
             try (var region = open(dir)) {
-                for (int x = 0; x < 3; x++) {
+                for (int x = 0; x < 4; x++) {
                     try (var in = region.getChunkDataInputStream(new ChunkPos(x, 0))) {
                         if (in == null || !NbtIo.read((DataInput)in).equals(chunk(x))) throw new AssertionError("chunk mismatch " + x);
                     }
@@ -989,6 +997,158 @@ fn java_and_rust_round_trip_chest_and_player_transfer() {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn coordinated_external_entity_chunks_round_trip_with_java() {
+    use flate2::{Compression, write::GzEncoder};
+    use native_persistence::nbt::{NamedTag, Tag, TagType};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-external-entity-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("ExternalEntityOracle.java");
+    std::fs::write(&source, include_str!("java/ExternalEntityOracle.java")).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir_all(world.join("dimensions/minecraft/overworld")).unwrap();
+    let level = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "Data".into(),
+            Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        )]),
+    };
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(&nbt::write(&level).unwrap()).unwrap();
+    std::fs::write(world.join("level.dat"), gzip.finish().unwrap()).unwrap();
+    let mut seed = 0x913a12d5u32;
+    let payload: Vec<u8> = (0..1_060_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let payload_path = temp.path().join("payload.bin");
+    std::fs::write(&payload_path, &payload).unwrap();
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            ("Position".into(), Tag::IntArray(vec![0, 0])),
+            ("future".into(), Tag::Long(77)),
+            (
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:item".into())),
+                        ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+                        ("payload".into(), Tag::ByteArray(payload.clone())),
+                    ])],
+                },
+            ),
+        ]),
+    };
+    let dimension = DimensionId::parse("overworld").unwrap();
+    let position = ChunkPos { x: 0, z: 0 };
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(dimension.clone(), position, None, &document, 1, |_, _| {
+        Ok(())
+    })
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    let invoke = |mode: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("ExternalEntityOracle")
+            .arg(mode)
+            .arg(&world)
+            .arg(&payload_path))
+    };
+    assert!(invoke("verify").lines().any(|line| line == "OK"));
+    assert!(invoke("rewrite").lines().any(|line| line == "OK"));
+    let region = world.join("dimensions/minecraft/overworld/entities/r.0.0.mca");
+    let external = world.join("dimensions/minecraft/overworld/entities/c.0.0.mcc");
+    let java_external = std::fs::read(&external).unwrap();
+    let changed = RegionReader::open(&region)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let Some(Tag::List { values, .. }) = changed.value.get("Entities") else {
+        panic!()
+    };
+    let Some(Tag::ByteArray(actual)) = values[0].get("payload") else {
+        panic!()
+    };
+    assert_eq!(actual[0], payload[0] ^ 0x5a);
+    assert_eq!(&actual[1..], &payload[1..]);
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(dimension, position, Some(&changed), &document, 2, |_, _| {
+        Ok(())
+    })
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert_eq!(
+        std::fs::read(result.backup_directory.join("region-0/c.0.0.mcc")).unwrap(),
+        java_external
+    );
+    assert!(invoke("verify").lines().any(|line| line == "OK"));
+    let mut small = document.clone();
+    let Tag::Compound(root) = &mut small.value else {
+        unreachable!()
+    };
+    let Tag::List { values, .. } = &mut root
+        .iter_mut()
+        .find(|(name, _)| name.matches("Entities"))
+        .unwrap()
+        .1
+    else {
+        unreachable!()
+    };
+    let Tag::Compound(entity) = &mut values[0] else {
+        unreachable!()
+    };
+    entity
+        .iter_mut()
+        .find(|(name, _)| name.matches("payload"))
+        .unwrap()
+        .1 = Tag::ByteArray(vec![7, 11, 13]);
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(
+        DimensionId::parse("overworld").unwrap(),
+        position,
+        Some(&document),
+        &small,
+        3,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    std::fs::write(&payload_path, [7, 11, 13]).unwrap();
+    assert!(std::fs::metadata(&external).unwrap().len() < 4096);
+    assert!(invoke("verify").lines().any(|line| line == "OK"));
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn entity_chunk_drafts_commit_and_load_in_java() {
     exercise_entity_chunk_drafts(false);
 }
@@ -1519,7 +1679,12 @@ fn lossless_regions_and_session_lock_match_java() {
     );
     let region = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
     let external = region.parent().unwrap().join("c.2.0.mcc");
+    let new_external = region.parent().unwrap().join("c.3.0.mcc");
     assert!(external.is_file(), "Java did not create an external chunk");
+    assert!(
+        !new_external.exists(),
+        "Java should keep the boundary chunk inline"
+    );
     let region_before = std::fs::read(&region).unwrap();
     let external_before = std::fs::read(&external).unwrap();
     let mut original = RegionReader::open(&region).unwrap();
@@ -1574,20 +1739,50 @@ fn lossless_regions_and_session_lock_match_java() {
             saved.backup_directory,
         ));
     }
-    let backups_before = std::fs::read_dir(world.join(".minecraft-native-backups"))
-        .unwrap()
-        .count();
-    let error = guard
+    let region_before_external_rewrite = std::fs::read(&region).unwrap();
+    let external_result = guard
         .rewrite_chunk_losslessly(&DimensionId::parse("overworld").unwrap(), 2, 0)
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("external storage"));
+        .unwrap();
     assert_eq!(
-        std::fs::read_dir(world.join(".minecraft-native-backups"))
-            .unwrap()
-            .count(),
-        backups_before
+        std::fs::read(external_result.backup_directory.join("r.0.0.mca")).unwrap(),
+        region_before_external_rewrite
     );
-    assert_eq!(std::fs::read(&external).unwrap(), external_before);
+    assert_eq!(
+        std::fs::read(external_result.backup_directory.join("c.2.0.mcc")).unwrap(),
+        external_before
+    );
+    assert_ne!(std::fs::read(&external).unwrap(), external_before);
+    let boundary_source = nbt::write(
+        &RegionReader::open(&region)
+            .unwrap()
+            .read_chunk(3, 0)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let boundary_region = std::fs::read(&region).unwrap();
+    let boundary_result = guard
+        .rewrite_chunk_losslessly(&DimensionId::parse("overworld").unwrap(), 3, 0)
+        .unwrap();
+    assert!(
+        new_external.is_file(),
+        "Rust did not create an external chunk"
+    );
+    assert_eq!(
+        std::fs::read(boundary_result.backup_directory.join("r.0.0.mca")).unwrap(),
+        boundary_region
+    );
+    assert_eq!(
+        nbt::write(
+            &RegionReader::open(&region)
+                .unwrap()
+                .read_chunk(3, 0)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        boundary_source
+    );
     drop(guard);
     let reader =
         WorldReader::open_for_session(&world, DimensionId::parse("overworld").unwrap()).unwrap();

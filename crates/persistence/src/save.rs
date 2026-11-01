@@ -1098,6 +1098,7 @@ impl WorldWriteGuard {
                         }
                     }
                 }
+                let mut external_replacement = false;
                 if let Some(replacement) = &planned.replacement {
                     let draft = nbt::read(replacement).context("invalid chunk draft NBT")?;
                     match kind {
@@ -1113,13 +1114,28 @@ impl WorldWriteGuard {
                         nbt::write(&draft)? == *replacement,
                         "chunk draft cannot be reserialized without changing its bytes"
                     );
-                    write_staged_chunk(
+                    let external_path =
+                        region_dir.join(format!("c.{}.{}.mcc", position.x, position.z));
+                    let retain_external = dependencies.contains_key(&external_path);
+                    if let Some(compressed) = write_staged_chunk(
                         stage.as_file_mut(),
                         position.x,
                         position.z,
                         replacement,
-                        planned.timestamp,
-                    )?;
+                        Some(planned.timestamp),
+                        retain_external,
+                    )? {
+                        let original_backup = dependencies.remove(&external_path);
+                        replacements.push(stage_external_chunk(
+                            &region_dir,
+                            position.x,
+                            position.z,
+                            &compressed,
+                            replacement,
+                            original_backup,
+                        )?);
+                        external_replacement = true;
+                    }
                 } else if original_nbt.is_some() {
                     let external_file =
                         region_dir.join(format!("c.{}.{}.mcc", position.x, position.z));
@@ -1137,17 +1153,21 @@ impl WorldWriteGuard {
                         planned.timestamp,
                     )?;
                 }
-                expected_chunks.push((position, planned.replacement));
+                expected_chunks.push((position, planned.replacement, external_replacement));
             }
             stage.as_file_mut().flush()?;
             stage.as_file().sync_all()?;
-            for (position, expected) in expected_chunks {
-                let saved = RegionReader::open_for_region(stage.path(), region_x, region_z)?
-                    .read_chunk_nbt_bytes(position.x, position.z)?;
-                ensure!(
-                    saved == expected,
-                    "staged chunk failed the NBT round-trip check"
-                );
+            for (position, expected, external_replacement) in expected_chunks {
+                if external_replacement {
+                    verify_external_marker(stage.as_file_mut(), position.x, position.z)?;
+                } else {
+                    let saved = RegionReader::open_for_region(stage.path(), region_x, region_z)?
+                        .read_chunk_nbt_bytes(position.x, position.z)?;
+                    ensure!(
+                        saved == expected,
+                        "staged chunk failed the NBT round-trip check"
+                    );
+                }
             }
             replacements.push(crate::save_transaction::Replacement {
                 target: target.clone(),
@@ -1589,7 +1609,7 @@ impl WorldWriteGuard {
         let metadata =
             fs::symlink_metadata(&region_path).context("cannot inspect existing region")?;
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
+            metadata.is_file() && ordinary(&metadata),
             "region must be an ordinary file"
         );
         let canonical = region_path.canonicalize()?;
@@ -1645,67 +1665,34 @@ impl WorldWriteGuard {
             }
             _ => anyhow::bail!("chunk rewrite requires both source and replacement NBT"),
         };
-        let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
-        compressor.write_all(&encoded)?;
-        let compressed = compressor.finish()?;
-        let length = compressed
-            .len()
-            .checked_add(1)
-            .context("chunk payload length overflow")?;
-        let allocation = length
-            .checked_add(4)
-            .context("chunk allocation overflow")?
-            .div_ceil(SECTOR_SIZE as usize);
-        ensure!(
-            allocation <= 255,
-            "rewritten chunk needs external storage, which is not yet supported"
-        );
-
-        let index = chunk_x.rem_euclid(REGION_SIDE) as u64
-            + chunk_z.rem_euclid(REGION_SIDE) as u64 * REGION_SIDE as u64;
-        stage.as_file_mut().seek(SeekFrom::Start(index * 4))?;
-        let mut previous_location = [0u8; 4];
-        stage.as_file_mut().read_exact(&mut previous_location)?;
-        let previous_location = u32::from_be_bytes(previous_location);
-        let previous_offset = u64::from(previous_location >> 8);
-        let previous_sectors = u64::from(previous_location & 255);
-        let reuse = allocation as u64 <= previous_sectors;
-        let offset = if reuse {
-            previous_offset
-        } else {
-            stage.as_file().metadata()?.len() / SECTOR_SIZE
-        };
-        let sectors = if reuse {
-            previous_sectors
-        } else {
-            allocation as u64
-        };
-        ensure!(
-            offset <= MAX_OFFSET && offset + sectors <= MAX_OFFSET + 1,
-            "region has no addressable space for the rewritten chunk"
-        );
         let backup_directory =
             backup_region(&self.root, dimension, &name, stage.path(), &external)?;
-        stage
-            .as_file_mut()
-            .seek(SeekFrom::Start(offset * SECTOR_SIZE))?;
-        stage
-            .as_file_mut()
-            .write_all(&(length as u32).to_be_bytes())?;
-        stage.as_file_mut().write_all(&[2])?;
-        stage.as_file_mut().write_all(&compressed)?;
-        if !reuse {
-            let padding = allocation * SECTOR_SIZE as usize - length - 4;
-            stage.as_file_mut().write_all(&vec![0; padding])?;
-        }
-        stage.as_file_mut().seek(SeekFrom::Start(index * 4))?;
-        let location = ((offset as u32) << 8) | sectors as u32;
-        stage.as_file_mut().write_all(&location.to_be_bytes())?;
-        if let Some(timestamp) = timestamp_seconds {
-            stage
-                .as_file_mut()
-                .seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
-            stage.as_file_mut().write_all(&timestamp.to_be_bytes())?;
+        let external_path = region_dir.join(format!("c.{chunk_x}.{chunk_z}.mcc"));
+        let retain_external = external.iter().any(|path| *path == external_path);
+        let compressed = write_staged_chunk(
+            stage.as_file_mut(),
+            chunk_x,
+            chunk_z,
+            &encoded,
+            timestamp_seconds,
+            retain_external,
+        )?;
+        let mut replacements = Vec::new();
+        if let Some(compressed) = &compressed {
+            let backup = external
+                .iter()
+                .find(|path| **path == external_path)
+                .map(|path| {
+                    backup_directory.join(path.file_name().expect("external chunk filename"))
+                });
+            replacements.push(stage_external_chunk(
+                &region_dir,
+                chunk_x,
+                chunk_z,
+                compressed,
+                &encoded,
+                backup,
+            )?);
         }
         stage.as_file_mut().flush()?;
         stage
@@ -1713,17 +1700,22 @@ impl WorldWriteGuard {
             .sync_all()
             .context("cannot flush staged region")?;
 
-        let verify = RegionReader::open_for_region(stage.path(), region_x, region_z)?
-            .read_chunk(chunk_x, chunk_z)?
-            .context("staged chunk disappeared")?;
-        ensure!(
-            nbt::write(&verify)? == encoded,
-            "staged chunk failed the NBT round-trip check"
-        );
+        if compressed.is_some() {
+            verify_external_marker(stage.as_file_mut(), chunk_x, chunk_z)?;
+        } else {
+            let verify = RegionReader::open_for_region(stage.path(), region_x, region_z)?
+                .read_chunk(chunk_x, chunk_z)?
+                .context("staged chunk disappeared")?;
+            ensure!(
+                nbt::write(&verify)? == encoded,
+                "staged chunk failed the NBT round-trip check"
+            );
+        }
         drop(original);
         let backup = backup_directory.join(&name);
         let dependencies = external
             .iter()
+            .filter(|path| compressed.is_none() || **path != external_path)
             .map(|path| {
                 let name = path.file_name().context("external chunk has no filename")?;
                 Ok(crate::save_transaction::Dependency::Present {
@@ -1732,23 +1724,19 @@ impl WorldWriteGuard {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        crate::save_transaction::commit(
-            &self.root,
-            &backup_directory,
-            vec![crate::save_transaction::Replacement {
-                target: canonical.clone(),
-                backup: Some(backup),
-                stage,
-                original_hash: Some(baseline_hash),
-            }],
-            dependencies,
-        )
-        .with_context(|| {
-            format!(
-                "cannot atomically replace region; backup retained at {}",
-                backup_directory.display()
-            )
-        })?;
+        replacements.push(crate::save_transaction::Replacement {
+            target: canonical.clone(),
+            backup: Some(backup),
+            stage,
+            original_hash: Some(baseline_hash),
+        });
+        crate::save_transaction::commit(&self.root, &backup_directory, replacements, dependencies)
+            .with_context(|| {
+                format!(
+                    "cannot atomically replace region; backup retained at {}",
+                    backup_directory.display()
+                )
+            })?;
         Ok(RewriteResult {
             region_path: canonical,
             backup_directory,
@@ -1761,8 +1749,9 @@ fn write_staged_chunk(
     chunk_x: i32,
     chunk_z: i32,
     encoded: &[u8],
-    timestamp_seconds: u32,
-) -> Result<()> {
+    timestamp_seconds: Option<u32>,
+    retain_external: bool,
+) -> Result<Option<Vec<u8>>> {
     let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
     compressor.write_all(encoded)?;
     let compressed = compressor.finish()?;
@@ -1774,14 +1763,18 @@ fn write_staged_chunk(
         length <= u32::MAX as usize,
         "chunk payload exceeds 32-bit length"
     );
-    let allocation = length
+    let inline_allocation = length
         .checked_add(4)
         .context("chunk allocation overflow")?
         .div_ceil(SECTOR_SIZE as usize);
-    ensure!(
-        allocation <= 255,
-        "rewritten chunk needs external storage, which is not yet supported"
-    );
+    let external = retain_external || inline_allocation > 255;
+    if external {
+        ensure!(
+            compressed.len() <= nbt::MAX_NBT_BYTES,
+            "compressed external chunk exceeds size limit"
+        );
+    }
+    let allocation = if external { 1 } else { inline_allocation };
 
     let index = chunk_x.rem_euclid(REGION_SIDE) as u64
         + chunk_z.rem_euclid(REGION_SIDE) as u64 * REGION_SIDE as u64;
@@ -1801,7 +1794,7 @@ fn write_staged_chunk(
     } else {
         file.metadata()?.len() / SECTOR_SIZE
     };
-    let sectors = if reuse {
+    let sectors = if reuse && !external {
         previous_sectors
     } else {
         allocation as u64
@@ -1811,19 +1804,93 @@ fn write_staged_chunk(
         "region has no addressable space for the rewritten chunk"
     );
     file.seek(SeekFrom::Start(offset * SECTOR_SIZE))?;
-    file.write_all(&(length as u32).to_be_bytes())?;
-    file.write_all(&[2])?;
-    file.write_all(&compressed)?;
+    file.write_all(&(if external { 1u32 } else { length as u32 }).to_be_bytes())?;
+    file.write_all(&[if external { 0x82 } else { 2 }])?;
+    if !external {
+        file.write_all(&compressed)?;
+    }
     if !reuse {
-        let padding = allocation * SECTOR_SIZE as usize - length - 4;
+        let padding = allocation * SECTOR_SIZE as usize - if external { 5 } else { length + 4 };
         file.write_all(&vec![0; padding])?;
     }
     file.seek(SeekFrom::Start(index * 4))?;
     let location = ((offset as u32) << 8) | sectors as u32;
     file.write_all(&location.to_be_bytes())?;
-    file.seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
-    file.write_all(&timestamp_seconds.to_be_bytes())?;
+    if let Some(timestamp_seconds) = timestamp_seconds {
+        file.seek(SeekFrom::Start(SECTOR_SIZE + index * 4))?;
+        file.write_all(&timestamp_seconds.to_be_bytes())?;
+    }
+    Ok(external.then_some(compressed))
+}
+
+fn verify_external_marker(file: &mut File, x: i32, z: i32) -> Result<()> {
+    let index =
+        x.rem_euclid(REGION_SIDE) as u64 + z.rem_euclid(REGION_SIDE) as u64 * REGION_SIDE as u64;
+    file.seek(SeekFrom::Start(index * 4))?;
+    let mut location = [0u8; 4];
+    file.read_exact(&mut location)?;
+    let location = u32::from_be_bytes(location);
+    ensure!(
+        location >> 8 >= 2 && location & 255 == 1,
+        "invalid staged external chunk allocation"
+    );
+    file.seek(SeekFrom::Start(u64::from(location >> 8) * SECTOR_SIZE))?;
+    let mut record = [0u8; 5];
+    file.read_exact(&mut record)?;
+    ensure!(
+        record == [0, 0, 0, 1, 0x82],
+        "invalid staged external chunk marker"
+    );
     Ok(())
+}
+
+fn stage_external_chunk(
+    region_dir: &Path,
+    x: i32,
+    z: i32,
+    compressed: &[u8],
+    expected: &[u8],
+    backup: Option<PathBuf>,
+) -> Result<crate::save_transaction::Replacement> {
+    let target = region_dir.join(format!("c.{x}.{z}.mcc"));
+    let original_hash = if let Some(backup) = &backup {
+        let meta =
+            fs::symlink_metadata(&target).context("external chunk disappeared during staging")?;
+        ensure!(
+            meta.is_file() && ordinary(&meta),
+            "external chunk must be an ordinary file"
+        );
+        ensure!(
+            target.canonicalize()?.parent() == Some(region_dir),
+            "external chunk resolves outside its region directory"
+        );
+        Some(hash_file(backup)?)
+    } else {
+        match fs::symlink_metadata(&target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!("unreferenced external chunk already exists"),
+            Err(error) => return Err(error.into()),
+        }
+        None
+    };
+    let mut stage = tempfile::Builder::new()
+        .prefix(".native-stage-")
+        .tempfile_in(region_dir)?;
+    stage.write_all(compressed)?;
+    stage.flush()?;
+    stage.as_file().sync_all()?;
+    let decoded =
+        nbt::decompress_limited(flate2::read::ZlibDecoder::new(File::open(stage.path())?))?;
+    ensure!(
+        decoded == expected,
+        "staged external chunk failed the NBT round-trip check"
+    );
+    Ok(crate::save_transaction::Replacement {
+        target,
+        backup,
+        stage,
+        original_hash,
+    })
 }
 
 fn clear_staged_chunk(file: &mut File, x: i32, z: i32, timestamp: u32) -> Result<()> {
@@ -1930,7 +1997,7 @@ fn audit_region(
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("external chunk is missing: {}", path.display()))?;
             ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
+                metadata.is_file() && ordinary(&metadata),
                 "external chunk is not an ordinary file"
             );
             ensure!(
@@ -1962,7 +2029,7 @@ fn backup_region(
     let backups = root.join(".minecraft-native-backups");
     match fs::symlink_metadata(&backups) {
         Ok(meta) => ensure!(
-            meta.is_dir() && !meta.file_type().is_symlink(),
+            meta.is_dir() && ordinary(&meta),
             "backup directory must be an ordinary directory"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&backups)?,
@@ -2583,6 +2650,336 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    fn incompressible_bytes(length: usize) -> Vec<u8> {
+        let mut seed = 0x913a12d5u32;
+        (0..length)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect()
+    }
+
+    fn large_entity_chunk() -> NamedTag {
+        entity_chunk(
+            0,
+            vec![Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:item".into())),
+                ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+                (
+                    "payload".into(),
+                    Tag::ByteArray(incompressible_bytes(1_060_000)),
+                ),
+            ])],
+        )
+    }
+
+    #[test]
+    fn coordinated_external_chunks_create_replace_and_detect_stale_sources() {
+        let world = test_world();
+        let (terrain_path, terrain, _) = fixture(world.path());
+        let dir = world.path().join("dimensions/minecraft/overworld/entities");
+        let region = dir.join("r.0.0.mca");
+        let external = dir.join("c.0.0.mcc");
+        let dimension = DimensionId::parse("minecraft:overworld").unwrap();
+        let position = crate::world::ChunkPos { x: 0, z: 0 };
+        let source = large_entity_chunk();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(dimension.clone(), position, None, &source, 123, |_, _| {
+            Ok(())
+        })
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(&terrain_path).unwrap(), terrain);
+        let first_region = fs::read(&region).unwrap();
+        let first_external = fs::read(&external).unwrap();
+        assert!(first_external.len() > 255 * SECTOR_SIZE as usize - 5);
+        assert_eq!(
+            &first_region[2 * SECTOR_SIZE as usize..2 * SECTOR_SIZE as usize + 5],
+            &[0, 0, 0, 1, 0x82]
+        );
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            nbt::write(&source).unwrap()
+        );
+        let mut replacement = source.clone();
+        let Tag::Compound(fields) = &mut replacement.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Entities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(entity) = &mut values[0] else {
+            unreachable!()
+        };
+        let Tag::ByteArray(bytes) = &mut entity
+            .iter_mut()
+            .find(|(name, _)| name.matches("payload"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        bytes[0] ^= 1;
+        let make_plan = || {
+            let mut plan = WorldSavePlan::new();
+            plan.add_entity_chunk(
+                dimension.clone(),
+                position,
+                Some(&source),
+                &replacement,
+                124,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            plan
+        };
+        let mut changed_source = source.clone();
+        let Tag::Compound(root) = &mut changed_source.value else {
+            unreachable!()
+        };
+        root.push(("outside".into(), Tag::Int(9)));
+        let outside = compressed(&changed_source);
+        fs::write(&external, &outside).unwrap();
+        assert!(guard.write_plan(make_plan(), |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region).unwrap(), first_region);
+        assert_eq!(fs::read(&external).unwrap(), outside);
+        fs::write(&external, &first_external).unwrap();
+        let result = guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/c.0.0.mcc")).unwrap(),
+            first_external
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            first_region
+        );
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            nbt::write(&replacement).unwrap()
+        );
+        let previous_external = fs::read(&external).unwrap();
+        let small = entity_chunk(
+            0,
+            vec![Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:item".into())),
+                ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+            ])],
+        );
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            dimension,
+            position,
+            Some(&replacement),
+            &small,
+            125,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/c.0.0.mcc")).unwrap(),
+            previous_external
+        );
+        assert!(fs::metadata(&external).unwrap().len() < SECTOR_SIZE);
+        let region_bytes = fs::read(&region).unwrap();
+        assert_eq!(
+            &region_bytes[2 * SECTOR_SIZE as usize..2 * SECTOR_SIZE as usize + 5],
+            &[0, 0, 0, 1, 0x82]
+        );
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            nbt::write(&small).unwrap()
+        );
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn unreferenced_external_file_is_never_overwritten() {
+        let world = test_world();
+        fixture(world.path());
+        let dir = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir(&dir).unwrap();
+        let external = dir.join("c.0.0.mcc");
+        fs::write(&external, b"unrelated external data").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            crate::world::ChunkPos { x: 0, z: 0 },
+            None,
+            &large_entity_chunk(),
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(external).unwrap(), b"unrelated external data");
+        assert!(!dir.join("r.0.0.mca").exists());
+        assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn one_region_can_stage_external_and_inline_chunks_together() {
+        let world = test_world();
+        fixture(world.path());
+        let large = large_entity_chunk();
+        let small = entity_chunk(
+            1,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            dimension.clone(),
+            crate::world::ChunkPos { x: 0, z: 0 },
+            None,
+            &large,
+            123,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        plan.add_entity_chunk(
+            dimension,
+            crate::world::ChunkPos { x: 1, z: 0 },
+            None,
+            &small,
+            124,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let directory = world.path().join("dimensions/minecraft/overworld/entities");
+        let region = directory.join("r.0.0.mca");
+        assert!(directory.join("c.0.0.mcc").is_file());
+        assert!(!directory.join("c.1.0.mcc").exists());
+        let mut reader = RegionReader::open(&region).unwrap();
+        assert_eq!(
+            nbt::write(&reader.read_chunk(0, 0).unwrap().unwrap()).unwrap(),
+            nbt::write(&large).unwrap()
+        );
+        assert_eq!(
+            nbt::write(&reader.read_chunk(1, 0).unwrap().unwrap()).unwrap(),
+            nbt::write(&small).unwrap()
+        );
+        let bytes = fs::read(region).unwrap();
+        assert_eq!(
+            &bytes[SECTOR_SIZE as usize..SECTOR_SIZE as usize + 8],
+            &[0, 0, 0, 123, 0, 0, 0, 124]
+        );
+    }
+
+    #[test]
+    fn lossless_rewrite_moves_oversized_chunk_to_external_and_replaces_it_safely() {
+        let world = test_world();
+        let (region, _, _) = fixture(world.path());
+        let mut source = chunk(0, "large");
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("payload".into(), Tag::ByteArray(Vec::new())));
+        let target_size = 255 * SECTOR_SIZE as usize - 5;
+        let filler = target_size - nbt::write(&source).unwrap().len();
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.last_mut().unwrap().1 = Tag::ByteArray(incompressible_bytes(filler));
+        let encoded = nbt::write(&source).unwrap();
+        assert_eq!(encoded.len(), target_size);
+        assert!(compressed(&source).len() + 5 > 255 * SECTOR_SIZE as usize);
+        let mut original = vec![0u8; 257 * SECTOR_SIZE as usize];
+        original[..4].copy_from_slice(&((2u32 << 8) | 255).to_be_bytes());
+        original[SECTOR_SIZE as usize..SECTOR_SIZE as usize + 4]
+            .copy_from_slice(&12345u32.to_be_bytes());
+        let start = 2 * SECTOR_SIZE as usize;
+        original[start..start + 4].copy_from_slice(&((encoded.len() as u32 + 1).to_be_bytes()));
+        original[start + 4] = 3;
+        original[start + 5..start + 5 + encoded.len()].copy_from_slice(&encoded);
+        fs::write(&region, &original).unwrap();
+        let external = region.parent().unwrap().join("c.0.0.mcc");
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard
+            .rewrite_chunk_losslessly(&DimensionId::parse("overworld").unwrap(), 0, 0)
+            .unwrap();
+        assert_eq!(
+            fs::read(result.backup_directory.join("r.0.0.mca")).unwrap(),
+            original
+        );
+        let after = fs::read(&region).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(after[..4].try_into().unwrap()),
+            (2 << 8) | 1
+        );
+        assert_eq!(&after[start..start + 5], &[0, 0, 0, 1, 0x82]);
+        assert_eq!(
+            &after[SECTOR_SIZE as usize..SECTOR_SIZE as usize + 4],
+            &12345u32.to_be_bytes()
+        );
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            encoded
+        );
+        let first_external = fs::read(&external).unwrap();
+        let again = guard
+            .rewrite_chunk_losslessly(&DimensionId::parse("overworld").unwrap(), 0, 0)
+            .unwrap();
+        assert_eq!(
+            fs::read(again.backup_directory.join("c.0.0.mcc")).unwrap(),
+            first_external
+        );
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            encoded
+        );
     }
 
     #[test]

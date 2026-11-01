@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 pub trait ChestLootRandom: Clone {
     fn next_int(&mut self, bound: i32) -> Option<i32>;
     fn next_bool(&mut self) -> bool;
+    fn next_float(&mut self) -> f32;
 }
 impl ChestLootRandom for LegacyRandom {
     fn next_int(&mut self, bound: i32) -> Option<i32> {
@@ -19,6 +20,9 @@ impl ChestLootRandom for LegacyRandom {
     fn next_bool(&mut self) -> bool {
         LegacyRandom::next_bool(self)
     }
+    fn next_float(&mut self) -> f32 {
+        LegacyRandom::next_float(self)
+    }
 }
 impl ChestLootRandom for XoroshiroRandom {
     fn next_int(&mut self, bound: i32) -> Option<i32> {
@@ -26,6 +30,9 @@ impl ChestLootRandom for XoroshiroRandom {
     }
     fn next_bool(&mut self) -> bool {
         XoroshiroRandom::next_bool(self)
+    }
+    fn next_float(&mut self) -> f32 {
+        XoroshiroRandom::next_float(self)
     }
 }
 
@@ -42,6 +49,11 @@ enum IntProvider {
     Uniform(i32, i32),
 }
 #[derive(Clone, Debug)]
+enum FloatProvider {
+    Constant(f32),
+    Uniform(Box<FloatProvider>, Box<FloatProvider>),
+}
+#[derive(Clone, Debug)]
 enum Modifier {
     SetCount(IntProvider),
     SetPotion(ResourceId),
@@ -56,7 +68,7 @@ struct Entry {
 #[derive(Clone, Debug)]
 struct Pool {
     rolls: IntProvider,
-    bonus_rolls: f32,
+    bonus_rolls: FloatProvider,
     entries: Vec<Entry>,
     modifiers: Vec<Modifier>,
 }
@@ -147,6 +159,76 @@ fn provider(value: &Value) -> Result<IntProvider> {
             Ok(IntProvider::Uniform(min, max))
         }
         _ => bail!("unsupported chest loot number provider {}", kind.path),
+    }
+}
+fn float_provider(value: &Value, depth: usize) -> Result<FloatProvider> {
+    ensure!(depth <= 32, "float provider nesting is too deep");
+    let constant = |value: &Value| -> Result<FloatProvider> {
+        let n = value.as_f64().context("invalid float provider constant")? as f32;
+        ensure!(n.is_finite(), "invalid float provider constant");
+        Ok(FloatProvider::Constant(n))
+    };
+    if value.is_number() {
+        return constant(value);
+    }
+    allowed_fields(value, &["type", "min", "max", "value"])?;
+    let kind = ResourceId::parse(
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .context("missing float provider type")?,
+    )?;
+    ensure!(
+        kind.namespace == "minecraft",
+        "unsupported float provider namespace"
+    );
+    match kind.path.as_str() {
+        "constant" => {
+            ensure!(
+                value.get("min").is_none() && value.get("max").is_none(),
+                "invalid constant float provider"
+            );
+            constant(value.get("value").context("missing float constant")?)
+        }
+        "uniform" => {
+            ensure!(
+                value.get("value").is_none(),
+                "invalid uniform float provider"
+            );
+            Ok(FloatProvider::Uniform(
+                Box::new(float_provider(
+                    value.get("min").context("missing float minimum")?,
+                    depth + 1,
+                )?),
+                Box::new(float_provider(
+                    value.get("max").context("missing float maximum")?,
+                    depth + 1,
+                )?),
+            ))
+        }
+        _ => bail!("unsupported chest loot float provider {}", kind.path),
+    }
+}
+impl FloatProvider {
+    fn sample(&self, random: &mut impl ChestLootRandom) -> f32 {
+        match self {
+            Self::Constant(value) => *value,
+            Self::Uniform(min, max) => {
+                let min = min.sample(random);
+                let max = max.sample(random);
+                if min >= max {
+                    min
+                } else {
+                    random.next_float() * (max - min) + min
+                }
+            }
+        }
+    }
+    fn may_be_nonzero(&self) -> bool {
+        match self {
+            Self::Constant(value) => *value != 0.0,
+            Self::Uniform(min, max) => min.may_be_nonzero() || max.may_be_nonzero(),
+        }
     }
 }
 fn modifiers(value: Option<&Value>) -> Result<Vec<Modifier>> {
@@ -254,13 +336,9 @@ impl ChestLootTable {
         for pool in list {
             allowed_fields(pool, &["rolls", "bonus_rolls", "entries", "modifier"])?;
             let bonus_rolls = match pool.get("bonus_rolls") {
-                None => 0.0,
-                Some(value) => value
-                    .as_f64()
-                    .context("non-constant bonus rolls are unsupported")?
-                    as f32,
+                None => FloatProvider::Constant(0.0),
+                Some(value) => float_provider(value, 0)?,
             };
-            ensure!(bonus_rolls.is_finite(), "invalid bonus rolls");
             let rolls = provider(pool.get("rolls").context("missing pool rolls")?)?;
             rolls.validate_nonnegative(4096)?;
             let raw = pool
@@ -351,7 +429,7 @@ impl ChestLootTable {
     /// True when the player's luck changes the table's selection or roll count.
     pub fn requires_luck(&self) -> bool {
         self.pools.iter().any(|pool| {
-            pool.bonus_rolls != 0.0 || pool.entries.iter().any(|entry| entry.quality != 0)
+            pool.bonus_rolls.may_be_nonzero() || pool.entries.iter().any(|entry| entry.quality != 0)
         })
     }
     /// Fill empty slots with luck zero. A zero saved seed uses the world's named
@@ -460,10 +538,11 @@ impl ChestLootTable {
                 .iter()
                 .try_fold(0i32, |sum, (_, _, weight)| sum.checked_add(*weight))
                 .context("loot weight overflow")?;
-            let rolls = pool
-                .rolls
-                .sample(&mut rng)?
-                .checked_add(java_floor(pool.bonus_rolls * luck))
+            let rolls = pool.rolls.sample(&mut rng)?;
+            let bonus = pool.bonus_rolls.sample(&mut rng);
+            let bonus = if bonus.is_finite() { bonus } else { 0.0 };
+            let rolls = rolls
+                .checked_add(java_floor(bonus * luck))
                 .context("loot rolls overflow")?;
             ensure!(rolls <= 4096, "too many loot rolls");
             for _ in 0..rolls {
@@ -744,12 +823,32 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("condition");
-        invalid["pools"][0]["bonus_rolls"] = json!({"type":"minecraft:uniform","min":0,"max":1});
+        invalid["pools"][0]["bonus_rolls"] = json!({"type":"example:unknown","min":0,"max":1});
         assert!(ChestLootTable::decode(&invalid).is_err());
     }
     #[derive(Clone)]
     struct BadRandom {
         calls: usize,
+    }
+    #[test]
+    fn nested_bonus_provider_samples_in_order_and_handles_zero_luck() {
+        let nested = float_provider(&json!({"type":"minecraft:uniform","min":{"type":"minecraft:uniform","min":-1.0,"max":1.0},"max":{"type":"minecraft:uniform","min":1.0,"max":3.0}}), 0).unwrap();
+        let mut random = LegacyRandom::new(42);
+        let mut expected = random.clone();
+        let min = expected.next_float() * 2.0 - 1.0;
+        let max = expected.next_float() * 2.0 + 1.0;
+        let value = expected.next_float() * (max - min) + min;
+        assert_eq!(nested.sample(&mut random).to_bits(), value.to_bits());
+        assert_eq!(random.state(), expected.state());
+        let table = ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":0,"bonus_rolls":{"type":"minecraft:uniform","min":0.0,"max":2.0},"entries":[]}]})).unwrap();
+        let mut actual = LegacyRandom::new(7);
+        let mut expected = actual.clone();
+        expected.next_float();
+        // Empty containers avoid slot shuffling, leaving only the bonus sample.
+        table
+            .fill_with_random_and_luck(&[], &mut actual, 0.0, |_| Ok(64))
+            .unwrap();
+        assert_eq!(actual.state(), expected.state());
     }
     impl ChestLootRandom for BadRandom {
         fn next_int(&mut self, bound: i32) -> Option<i32> {
@@ -758,6 +857,10 @@ mod tests {
         }
         fn next_bool(&mut self) -> bool {
             false
+        }
+        fn next_float(&mut self) -> f32 {
+            self.calls += 1;
+            0.5
         }
     }
     #[test]

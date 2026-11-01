@@ -27230,7 +27230,7 @@ mod tests {
                 Ok(vec![ResourceId::parse("example:chests/luck")?])
             }
             fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
-                Ok(Some(br#"{"type":"minecraft:chest","random_sequence":"example:luck","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0,"quality":1},{"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}]}]}"#.to_vec()))
+                Ok(Some(br#"{"type":"minecraft:chest","random_sequence":"example:luck","pools":[{"rolls":2,"bonus_rolls":{"type":"minecraft:uniform","min":0.0,"max":0.25},"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0,"quality":1},{"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}]}]}"#.to_vec()))
             }
         }
         let game = std::env::var_os("MINECRAFT_DIR")

@@ -382,6 +382,7 @@ pub struct LoadedSession {
     loot: Option<Arc<BlockLootTables>>,
     chest_loot: Option<Arc<native_resources::chest_loot::ChestLootTables>>,
     random_sequences: Option<SessionRandomSequences>,
+    loot_events: Vec<IVec3>,
     mining_tags: Option<Arc<native_resources::mining_tags::MiningTags>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
@@ -1746,6 +1747,7 @@ impl LoadedSession {
             self.placed_chests.is_empty() && self.removed_chests.is_empty(),
             "chest creation or removal requires separate accounting"
         );
+        self.validate_generated_chest_loot()?;
         let original = crate::player_data::read_saved_player(player_source)?;
         let before = crate::player_data::saved_slots(&original).chain(
             self.chest_contents
@@ -1758,6 +1760,104 @@ impl LoadedSession {
                 .flat_map(|chest| chest.slots.iter().flatten()),
         );
         crate::inventory::validate_item_balance(before, after)
+    }
+
+    /// Replay all generated chest loot in its actual order and confirm that
+    /// each named stream begins at the captured world source and ends at the
+    /// current session state. Untracked use of the same stream fails closed.
+    fn validate_generated_chest_loot(&self) -> anyhow::Result<()> {
+        use crate::saved_chest::LootRandomTrace;
+        use anyhow::{Context, ensure};
+        let mut visited = BTreeSet::new();
+        let mut streams = BTreeMap::<
+            native_resources::packs::ResourceId,
+            native_core::random::XoroshiroRandom,
+        >::new();
+        let mut initial_sequences = None;
+        for position in &self.loot_events {
+            ensure!(
+                visited.insert(position.to_array()),
+                "duplicate generated chest event"
+            );
+            let chest = self
+                .chest_contents
+                .get(&(position.x, position.y, position.z))
+                .context("generated chest is no longer available")?;
+            let trace = chest
+                .loot_trace()
+                .context("generated chest has no random trace")?;
+            let table_id = match trace {
+                LootRandomTrace::Fixed { table, .. } | LootRandomTrace::Named { table, .. } => {
+                    table
+                }
+            };
+            let table = self
+                .chest_loot
+                .as_ref()
+                .and_then(|tables| tables.get(table_id))
+                .context("generated chest loot table is unavailable")?;
+            let registry = self
+                .item_registry
+                .as_ref()
+                .context("item registry is unavailable")?;
+            if let LootRandomTrace::Named {
+                sequence,
+                before,
+                after,
+                ..
+            } = trace
+            {
+                let saved = self
+                    .random_sequences
+                    .as_ref()
+                    .context("world random sequences are unavailable")?;
+                if !streams.contains_key(sequence) {
+                    if initial_sequences.is_none() {
+                        initial_sequences =
+                            Some(native_persistence::random_sequences::RandomSequences::read(
+                                saved.data.source().cloned(),
+                            )?);
+                    }
+                    let name = format!("{}:{}", sequence.namespace, sequence.path);
+                    streams.insert(
+                        sequence.clone(),
+                        initial_sequences
+                            .as_ref()
+                            .unwrap()
+                            .get(&name, saved.world_seed)?,
+                    );
+                }
+                let random = streams.get_mut(sequence).unwrap();
+                ensure!(
+                    random.state() == *before,
+                    "generated chest random sequence order differs"
+                );
+                *random = native_core::random::XoroshiroRandom::from_state(after.0, after.1);
+            }
+            chest.verify_generated_loot(table_id, table, |item| {
+                Self::resolve_chest_loot_item(item, registry)
+            })?;
+        }
+        ensure!(
+            self.chest_contents
+                .values()
+                .filter(|chest| chest.has_generated_loot())
+                .count()
+                == visited.len(),
+            "generated chest event is missing"
+        );
+        for (sequence, random) in streams {
+            let saved = self
+                .random_sequences
+                .as_ref()
+                .context("world random sequences are unavailable")?;
+            let name = format!("{}:{}", sequence.namespace, sequence.path);
+            ensure!(
+                saved.data.get(&name, saved.world_seed)?.state() == random.state(),
+                "world random sequence changed outside tracked loot events"
+            );
+        }
+        Ok(())
     }
 
     /// Stage the player and every dirty terrain chunk, including known block,
@@ -1827,10 +1927,11 @@ impl LoadedSession {
     ) -> anyhow::Result<PartialSessionSaveDraft> {
         let player_and_terrain =
             self.draft_player_and_dirty_chunks_inner(player, terrain, tags, air_and_fluid)?;
-        if player_and_terrain
-            .chunks
-            .values()
-            .any(|chunk| chunk.checked_chest_inventory_count() != 0)
+        if !self.loot_events.is_empty()
+            || player_and_terrain
+                .chunks
+                .values()
+                .any(|chunk| chunk.checked_chest_inventory_count() != 0)
         {
             self.validate_closed_chest_item_balance(player)?;
         }
@@ -3395,6 +3496,7 @@ impl LoadedSession {
             loot: None,
             chest_loot: None,
             random_sequences: None,
+            loot_events: Vec::new(),
             mining_tags: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
@@ -4235,6 +4337,39 @@ impl LoadedSession {
         )
     }
 
+    fn resolve_chest_loot_item(
+        item: &native_resources::chest_loot::ChestLootItem,
+        registry: &native_resources::item_registry::ItemRegistry,
+    ) -> anyhow::Result<ItemStack> {
+        use anyhow::{Context, ensure};
+        let id = format!("{}:{}", item.id.namespace, item.id.path);
+        ensure!(
+            registry.id(&id).is_some() && id != "minecraft:air",
+            "unknown loot item"
+        );
+        let components = if let Some(potion) = &item.potion {
+            ensure!(
+                id == "minecraft:potion"
+                    && potion.namespace == "minecraft"
+                    && potion.path == "water_breathing",
+                "unsupported potion loot prototype"
+            );
+            native_persistence::nbt::Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                native_persistence::nbt::Tag::Compound(vec![(
+                    "potion".into(),
+                    native_persistence::nbt::Tag::String("minecraft:water_breathing".into()),
+                )]),
+            )])
+        } else {
+            native_persistence::nbt::Tag::Compound(vec![])
+        };
+        let maximum = crate::equippable::saved_inventory_max(&id, &components)
+            .context("loot item prototype is unsupported")?;
+        crate::inventory::ItemStack::new(id, 1, maximum, components)
+            .context("invalid loot item prototype")
+    }
+
     fn unpack_chest_loot(
         &self,
         chest: &mut crate::saved_chest::SavedChest,
@@ -4242,6 +4377,7 @@ impl LoadedSession {
             native_resources::packs::ResourceId,
             native_core::random::XoroshiroRandom,
         >,
+        events: &mut Vec<IVec3>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         let Some((id, seed)) = chest.pending_loot() else {
@@ -4262,35 +4398,10 @@ impl LoadedSession {
             .as_ref()
             .context("item registry is unavailable")?;
         let resolve = |item: &native_resources::chest_loot::ChestLootItem| {
-            let id = format!("{}:{}", item.id.namespace, item.id.path);
-            ensure!(
-                registry.id(&id).is_some() && id != "minecraft:air",
-                "unknown loot item"
-            );
-            let components = if let Some(potion) = &item.potion {
-                ensure!(
-                    id == "minecraft:potion"
-                        && potion.namespace == "minecraft"
-                        && potion.path == "water_breathing",
-                    "unsupported potion loot prototype"
-                );
-                native_persistence::nbt::Tag::Compound(vec![(
-                    "minecraft:potion_contents".into(),
-                    native_persistence::nbt::Tag::Compound(vec![(
-                        "potion".into(),
-                        native_persistence::nbt::Tag::String("minecraft:water_breathing".into()),
-                    )]),
-                )])
-            } else {
-                native_persistence::nbt::Tag::Compound(vec![])
-            };
-            let maximum = crate::equippable::saved_inventory_max(&id, &components)
-                .context("loot item prototype is unsupported")?;
-            crate::inventory::ItemStack::new(id, 1, maximum, components)
-                .context("invalid loot item prototype")
+            Self::resolve_chest_loot_item(item, registry)
         };
         if seed != 0 {
-            chest.unpack_seeded_loot(&id, table, resolve)
+            chest.unpack_seeded_loot(&id, table, resolve)?;
         } else {
             let sequence = table
                 .random_sequence()
@@ -4303,8 +4414,13 @@ impl LoadedSession {
                 let name = format!("{}:{}", sequence.namespace, sequence.path);
                 staged.insert(sequence.clone(), saved.data.get(&name, saved.world_seed)?);
             }
-            chest.unpack_loot_with_random(&id, table, staged.get_mut(sequence).unwrap(), resolve)
+            let random = staged.get_mut(sequence).unwrap();
+            let before = random.state();
+            chest.unpack_loot_with_random(&id, table, random, resolve)?;
+            chest.record_named_loot(&id, sequence, before, random.state())?;
         }
+        events.push(chest.position);
+        Ok(())
     }
 
     fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
@@ -4388,17 +4504,23 @@ impl LoadedSession {
             return false;
         }
         let mut staged = BTreeMap::new();
+        let mut events = Vec::new();
         // Java resolves the first (right) half before the second half, regardless
         // of which side was clicked. Both may consume the same named stream.
         let resolved = if kind == Some("left") {
-            pair.as_mut()
-                .is_none_or(|(_, other)| self.unpack_chest_loot(other, &mut staged).is_ok())
-                && self.unpack_chest_loot(&mut chest, &mut staged).is_ok()
+            pair.as_mut().is_none_or(|(_, other)| {
+                self.unpack_chest_loot(other, &mut staged, &mut events)
+                    .is_ok()
+            }) && self
+                .unpack_chest_loot(&mut chest, &mut staged, &mut events)
+                .is_ok()
         } else {
-            self.unpack_chest_loot(&mut chest, &mut staged).is_ok()
-                && pair
-                    .as_mut()
-                    .is_none_or(|(_, other)| self.unpack_chest_loot(other, &mut staged).is_ok())
+            self.unpack_chest_loot(&mut chest, &mut staged, &mut events)
+                .is_ok()
+                && pair.as_mut().is_none_or(|(_, other)| {
+                    self.unpack_chest_loot(other, &mut staged, &mut events)
+                        .is_ok()
+                })
         };
         if !resolved {
             return false;
@@ -4464,6 +4586,7 @@ impl LoadedSession {
                     .expect("validated random sequence identifier");
             }
         }
+        self.loot_events.extend(events);
         true
     }
 
@@ -22797,6 +22920,7 @@ mod tests {
                 assert!(!session.try_open_saved_chest(clicked - session.origin));
                 assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
                 assert!(session.chest_contents.is_empty());
+                assert!(session.loot_events.is_empty());
                 continue;
             }
             assert!(session.try_open_saved_chest(clicked - session.origin));
@@ -22827,6 +22951,16 @@ mod tests {
                     .state(),
                 expected_rng.state()
             );
+            session.validate_generated_chest_loot().unwrap();
+            session.loot_events.swap(0, 1);
+            assert!(session.validate_generated_chest_loot().is_err());
+            session.loot_events.swap(0, 1);
+            let data = &mut session.random_sequences.as_mut().unwrap().data;
+            let mut extra = data.get("minecraft:chests/buried_treasure", 42).unwrap();
+            extra.next_long();
+            data.set("minecraft:chests/buried_treasure", &extra)
+                .unwrap();
+            assert!(session.validate_generated_chest_loot().is_err());
         }
     }
 

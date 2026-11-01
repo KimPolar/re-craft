@@ -10,6 +10,20 @@ use native_resources::packs::ResourceId;
 use native_world::loaded::{ChunkPos, SavedBlockEntities};
 use std::{collections::BTreeSet, sync::Arc};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LootRandomTrace {
+    Fixed {
+        table: ResourceId,
+        seed: i64,
+    },
+    Named {
+        table: ResourceId,
+        sequence: ResourceId,
+        before: (u64, u64),
+        after: (u64, u64),
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct SavedChest {
     pub position: IVec3,
@@ -19,6 +33,7 @@ pub struct SavedChest {
     pending_loot: Option<(ResourceId, i64)>,
     loot_unpacked: bool,
     generated_loot: Option<[Option<ItemStack>; 27]>,
+    loot_trace: Option<LootRandomTrace>,
 }
 
 /// Validate item-carried contents without recursively resolving item prototypes.
@@ -181,6 +196,7 @@ impl SavedChest {
             pending_loot: None,
             loot_unpacked: false,
             generated_loot: None,
+            loot_trace: None,
         })
     }
     pub fn source(&self) -> &Tag {
@@ -376,6 +392,55 @@ impl SavedChest {
         self.pending_loot.as_ref().map(|(id, seed)| (id, *seed))
     }
 
+    pub(crate) fn loot_trace(&self) -> Option<&LootRandomTrace> {
+        self.loot_trace.as_ref()
+    }
+
+    pub(crate) fn has_generated_loot(&self) -> bool {
+        self.generated_loot.is_some()
+    }
+
+    pub(crate) fn record_named_loot(
+        &mut self,
+        table: &ResourceId,
+        sequence: &ResourceId,
+        before: (u64, u64),
+        after: (u64, u64),
+    ) -> Result<()> {
+        ensure!(
+            self.loot_unpacked && self.generated_loot.is_some() && self.loot_trace.is_none(),
+            "loot trace cannot be recorded"
+        );
+        let Some(Tag::String(saved_table)) = unique(&self.source, "LootTable")? else {
+            bail!("loot source is missing its table")
+        };
+        ensure!(
+            unique(&self.source, "Items")?.is_none(),
+            "pending loot source contains conflicting items"
+        );
+        let saved_table = ResourceId::parse(
+            &String::from_utf16(&saved_table.0).context("invalid loot table identifier")?,
+        )?;
+        ensure!(
+            &saved_table == table,
+            "loot trace table differs from source"
+        );
+        ensure!(
+            matches!(
+                unique(&self.source, "LootTableSeed")?,
+                None | Some(Tag::Long(0))
+            ),
+            "named loot must have a zero seed"
+        );
+        self.loot_trace = Some(LootRandomTrace::Named {
+            table: table.clone(),
+            sequence: sequence.clone(),
+            before,
+            after,
+        });
+        Ok(())
+    }
+
     /// Generate a seeded chest into memory without changing the saved source.
     /// The resolver must validate registry membership, feature flags and item
     /// components against the active world and return the exact prototype.
@@ -389,9 +454,15 @@ impl SavedChest {
             .pending_loot
             .as_ref()
             .context("chest has no pending loot")?;
-        ensure!(*seed != 0, "zero loot seed needs a world random source");
-        let mut random = native_core::random::LegacyRandom::new(*seed);
-        self.unpack_loot_with_random(id, table, &mut random, resolve)
+        let seed = *seed;
+        ensure!(seed != 0, "zero loot seed needs a world random source");
+        let mut random = native_core::random::LegacyRandom::new(seed);
+        self.unpack_loot_with_random(id, table, &mut random, resolve)?;
+        self.loot_trace = Some(LootRandomTrace::Fixed {
+            table: id.clone(),
+            seed,
+        });
+        Ok(())
     }
 
     /// Resolve one chest with a supplied stream. Neither the chest nor the
@@ -454,6 +525,79 @@ impl SavedChest {
         self.pending_loot = None;
         self.loot_unpacked = true;
         *random = next;
+        Ok(())
+    }
+
+    /// Replay the recorded generation against the active table and item
+    /// prototypes. The player's subsequent inventory moves are not replayed.
+    pub(crate) fn verify_generated_loot(
+        &self,
+        table_id: &ResourceId,
+        table: &ChestLootTable,
+        mut resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        let trace = self
+            .loot_trace
+            .as_ref()
+            .context("generated loot trace is unavailable")?;
+        let (expected_id, seed) = match trace {
+            LootRandomTrace::Fixed { table, seed } => (table, *seed),
+            LootRandomTrace::Named { table, .. } => (table, 0),
+        };
+        ensure!(
+            expected_id == table_id && self.loot_unpacked,
+            "generated loot table differs"
+        );
+        let Some(Tag::String(saved_table)) = unique(&self.source, "LootTable")? else {
+            bail!("loot source is missing its table")
+        };
+        ensure!(
+            unique(&self.source, "Items")?.is_none(),
+            "pending loot source contains conflicting items"
+        );
+        ensure!(
+            ResourceId::parse(
+                &String::from_utf16(&saved_table.0).context("invalid loot table identifier")?
+            )? == *table_id,
+            "loot source table differs"
+        );
+        let saved_seed = match unique(&self.source, "LootTableSeed")? {
+            None => 0,
+            Some(Tag::Long(value)) => *value,
+            _ => bail!("invalid loot source seed"),
+        };
+        ensure!(saved_seed == seed, "loot source seed differs");
+        let mut replay = self.clone();
+        replay.pending_loot = Some((table_id.clone(), seed));
+        replay.generated_loot = None;
+        replay.loot_trace = None;
+        replay.loot_unpacked = false;
+        match trace {
+            LootRandomTrace::Fixed { seed, .. } => {
+                ensure!(*seed != 0, "fixed loot seed cannot be zero");
+                let mut random = native_core::random::LegacyRandom::new(*seed);
+                replay.unpack_loot_with_random(table_id, table, &mut random, &mut resolve)?;
+            }
+            LootRandomTrace::Named {
+                sequence,
+                before,
+                after,
+                ..
+            } => {
+                ensure!(
+                    table.random_sequence() == Some(sequence),
+                    "loot random sequence differs"
+                );
+                let mut random =
+                    native_core::random::XoroshiroRandom::from_state(before.0, before.1);
+                replay.unpack_loot_with_random(table_id, table, &mut random, &mut resolve)?;
+                ensure!(random.state() == *after, "loot random state differs");
+            }
+        }
+        ensure!(
+            replay.generated_loot == self.generated_loot,
+            "generated chest contents differ from replay"
+        );
         Ok(())
     }
 
@@ -687,6 +831,7 @@ fn read_internal(
         pending_loot,
         loot_unpacked: false,
         generated_loot: None,
+        loot_trace: None,
     }))
 }
 
@@ -760,6 +905,27 @@ mod tests {
                 .is_err()
         );
         saved.unpack_seeded_loot(&id, &table, resolve).unwrap();
+        saved.verify_generated_loot(&id, &table, resolve).unwrap();
+        let changed_table = ChestLootTable::decode(&serde_json::json!({
+            "type":"minecraft:chest", "pools":[{"rolls":2,"entries":[
+                {"type":"minecraft:item","name":"minecraft:stone"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            saved
+                .verify_generated_loot(&id, &changed_table, resolve)
+                .is_err()
+        );
+        let mut corrupted = saved.clone();
+        let generated = corrupted.generated_loot.as_mut().unwrap();
+        let item = generated.iter_mut().flatten().next().unwrap();
+        *item = item.with_count(item.count() + 1).unwrap();
+        assert!(
+            corrupted
+                .verify_generated_loot(&id, &table, resolve)
+                .is_err()
+        );
         assert!(saved.pending_loot().is_none());
         assert!(saved.inventory_changed());
         assert_eq!(saved.slots.iter().flatten().count(), 1);

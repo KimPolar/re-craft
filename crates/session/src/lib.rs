@@ -696,6 +696,42 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
+    fn player_damage_feedback(&mut self, source: &str, outcome: fall::DamageOutcome) {
+        if !outcome.accepted {
+            return;
+        }
+        if outcome.health_damage > 0.0 || outcome.fresh_hit {
+            match self.fall.damage_info(source) {
+                Ok(info) => {
+                    if outcome.health_damage > 0.0 {
+                        self.vitals.add_exhaustion(info.exhaustion);
+                    }
+                    if outcome.fresh_hit {
+                        let pitch = client_damage_pitch(&mut self.player_client_random);
+                        queue_player_sound(
+                            &mut self.consume_sounds,
+                            self.motion.position,
+                            info.effects.player_hurt_sound(),
+                            1.0,
+                            pitch,
+                        );
+                    }
+                }
+                Err(error) => eprintln!("player damage type: {error:#}"),
+            }
+        }
+        if self.vitals.health <= 0.0 {
+            let pitch = client_damage_pitch(&mut self.player_client_random);
+            queue_player_sound(
+                &mut self.consume_sounds,
+                self.motion.position,
+                "entity.player.death",
+                1.0,
+                pitch,
+            );
+        }
+    }
+
     fn movement_effect_speeds(&mut self) -> [f32; 2] {
         let speed = self
             .fall
@@ -1918,37 +1954,8 @@ impl LocalSession {
                     );
                 }
             }
-            if landing.damage.accepted {
-                if let Some(source) = landing.source {
-                    match self.fall.damage_info(source) {
-                        Ok(info) => {
-                            if landing.damage.health_damage > 0.0 {
-                                self.vitals.add_exhaustion(info.exhaustion);
-                            }
-                            if landing.damage.fresh_hit {
-                                let pitch = client_damage_pitch(&mut self.player_client_random);
-                                queue_player_sound(
-                                    &mut self.consume_sounds,
-                                    self.motion.position,
-                                    info.effects.player_hurt_sound(),
-                                    1.0,
-                                    pitch,
-                                );
-                            }
-                        }
-                        Err(error) => eprintln!("player damage type: {error:#}"),
-                    }
-                }
-                if self.vitals.health <= 0.0 {
-                    let pitch = client_damage_pitch(&mut self.player_client_random);
-                    queue_player_sound(
-                        &mut self.consume_sounds,
-                        self.motion.position,
-                        "entity.player.death",
-                        1.0,
-                        pitch,
-                    );
-                }
+            if let Some(source) = landing.source {
+                self.player_damage_feedback(source, landing.damage);
             }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
@@ -2043,7 +2050,7 @@ impl LocalSession {
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
             if effect == survival::FoodEffect::Starve {
-                if let Err(error) = self.fall.damage(
+                match self.fall.damage_outcome(
                     1.0,
                     "minecraft:starve",
                     &self.inventory,
@@ -2052,7 +2059,8 @@ impl LocalSession {
                     self.game_mode,
                     Some(&mut self.damage_cooldown),
                 ) {
-                    eprintln!("player starvation damage: {error:#}");
+                    Ok(outcome) => self.player_damage_feedback("minecraft:starve", outcome),
+                    Err(error) => eprintln!("player starvation damage: {error:#}"),
                 }
             } else {
                 self.vitals.apply_food_effect(effect, self.game_mode);
@@ -2732,6 +2740,73 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_starvation_feedback_respects_absorption_cooldown_and_death() {
+        for absorption in [0.0_f32, 2.0] {
+            for cooldown in [false, true] {
+                for health in [20.0_f32, 1.0] {
+                    for frames in [1_u32, 5] {
+                        let mut test = LocalSession::demo();
+                        test.set_survival_rules(survival::SurvivalRules {
+                            difficulty: native_persistence::world::Difficulty::Hard,
+                            natural_health_regeneration: false,
+                            ..Default::default()
+                        });
+                        if cooldown {
+                            test.fall
+                                .damage_outcome(
+                                    0.5,
+                                    "minecraft:starve",
+                                    &test.inventory,
+                                    test.armor.value(),
+                                    &mut test.vitals,
+                                    test.game_mode,
+                                    Some(&mut test.damage_cooldown),
+                                )
+                                .unwrap();
+                        }
+                        test.vitals.health = health;
+                        test.vitals.absorption = absorption;
+                        test.vitals.food = 0;
+                        test.vitals.saturation = 0.0;
+                        test.vitals.food_tick_timer = 79;
+                        test.player_client_random = native_core::random::LegacyRandom::new(17);
+                        let mut expected_random = test.player_client_random.clone();
+                        for _ in 0..frames {
+                            test.update(TICK / frames);
+                        }
+                        let damage =
+                            (1.0_f32 - if cooldown { 0.5 } else { 0.0 } - absorption).max(0.0);
+                        assert_eq!(test.vitals.health, (health - damage).max(0.0));
+                        let mut expected = Vec::new();
+                        if !cooldown {
+                            expected.push((
+                                "entity.player.hurt",
+                                client_damage_pitch(&mut expected_random),
+                            ));
+                        }
+                        if damage >= health {
+                            expected.push((
+                                "entity.player.death",
+                                client_damage_pitch(&mut expected_random),
+                            ));
+                        }
+                        let sounds = test.take_consume_sounds();
+                        assert_eq!(sounds.len(), expected.len());
+                        for (sound, (event, pitch)) in sounds.iter().zip(expected) {
+                            assert_eq!(sound.info.event, event);
+                            assert_eq!(sound.info.pitch.to_bits(), pitch.to_bits());
+                        }
+                        assert_eq!(
+                            test.player_client_random.next_int(),
+                            expected_random.next_int()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn demo_landing_sounds_and_client_random_are_frame_rate_independent() {

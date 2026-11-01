@@ -35,7 +35,7 @@ public class PlayerClientDamageSoundOracle {
         var walk=LivingEntity.class.getDeclaredField("walkAnimation"); walk.setAccessible(true); walk.set(player,new WalkAnimationState());
         var randomField=Entity.class.getDeclaredField("random"); randomField.setAccessible(true);
         var rows=new JsonArray();
-        for(DamageEffects effects:new DamageEffects[]{DamageEffects.BURNING,DamageEffects.HURT}) for(boolean silent:new boolean[]{false,true}) for(boolean dead:new boolean[]{false,true}) for(long seed:new long[]{0,1,37,1234567}) {
+        for(DamageEffects effects:new DamageEffects[]{DamageEffects.BURNING,DamageEffects.HURT,DamageEffects.DROWNING}) for(boolean silent:new boolean[]{false,true}) for(boolean dead:new boolean[]{false,true}) for(long seed:new long[]{0,1,37,1234567}) {
             var source=new DamageSource(Holder.direct(new DamageType("test",0.1f,effects)));
             player.silent=silent; player.sounds=new JsonArray(); var random=RandomSource.create(seed); randomField.set(player,random);
             player.handleDamageEvent(source); if(dead) player.handleEntityEvent((byte)3);

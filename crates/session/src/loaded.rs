@@ -1369,7 +1369,7 @@ impl LoadedSession {
         self.queue_player_sound(event, 1.0, pitch);
     }
 
-    fn player_fire_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
+    fn player_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
         let outcome = match self.fall.damage_outcome(
             amount,
             source,
@@ -1381,8 +1381,9 @@ impl LoadedSession {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
+                let label = source.strip_prefix("minecraft:").unwrap_or(source);
                 self.stream_errors
-                    .push(format!("player fire damage: {error:#}"));
+                    .push(format!("player {label} damage: {error:#}"));
                 self.unresolved_player_damage = true;
                 return false;
             }
@@ -1510,7 +1511,7 @@ impl LoadedSession {
 
     fn ignite_player_from_lava(&mut self) {
         self.ignite_player_for(300);
-        if self.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava) && !self.player_silent {
+        if self.player_damage(4.0, "minecraft:lava", DeathCause::Lava) && !self.player_silent {
             let pitch = 2.0_f32 + self.player_random.next_float() * 0.4_f32;
             self.queue_player_sound("entity.generic.burn", 0.4, pitch);
         }
@@ -14407,7 +14408,7 @@ impl LoadedSession {
             }
             let in_lava = self.tick > 0 && contacts.lava.depth > 0.0;
             if self.player_fire_ticks % 20 == 0 && !in_lava {
-                self.player_fire_damage(1.0, "minecraft:on_fire", DeathCause::OnFire);
+                self.player_damage(1.0, "minecraft:on_fire", DeathCause::OnFire);
             }
             self.player_fire_ticks -= 1;
             if matches!(self.game_mode, GameMode::Creative | GameMode::Spectator) {
@@ -14441,34 +14442,13 @@ impl LoadedSession {
                 breathing_oxygen,
                 &mut || self.player_random.next_double(),
             );
-            if drowning
-                && let Err(error) = self.fall.damage(
-                    2.0,
-                    "minecraft:drown",
-                    &self.inventory,
-                    self.armor.value(),
-                    &mut self.vitals,
-                    self.game_mode,
-                    Some(&mut self.damage_cooldown),
-                )
-            {
-                self.stream_errors
-                    .push(format!("player drowning damage: {error:#}"));
-                self.unresolved_player_damage = true;
-            }
-            if self.death.is_none() && self.vitals.health <= 0.0 {
-                self.death = Some(DeathInfo {
-                    cause: DeathCause::Drown,
-                    tick: self.tick.saturating_add(1),
-                    score: self.score,
-                    show_message: self.death_rules.show_death_messages,
-                    inventory_unresolved: false,
-                    respawn_pending: false,
-                    can_respawn: false,
-                });
-                self.record_last_death();
-                self.movement = (0.0, 0.0, false);
-                self.sprint = crate::physics::SprintState::default();
+            if drowning {
+                let was_alive = self.death.is_none();
+                self.player_damage(2.0, "minecraft:drown", DeathCause::Drown);
+                if was_alive && self.death.is_some() {
+                    self.movement = (0.0, 0.0, false);
+                    self.sprint = crate::physics::SprintState::default();
+                }
             }
         }
         let tracking = self.ensure_effect_save_tracking();
@@ -15052,7 +15032,7 @@ impl LoadedSession {
                     .is_some_and(|state| state.name == "minecraft:magma_block")
             {
                 self.unresolved_player_fire_contact = true;
-                self.player_fire_damage(1.0, "minecraft:hot_floor", DeathCause::HotFloor);
+                self.player_damage(1.0, "minecraft:hot_floor", DeathCause::HotFloor);
             }
             self.fall_distance = 0.0;
         } else {
@@ -15077,7 +15057,7 @@ impl LoadedSession {
                     crate::fire_contact::InsideBlock::Campfire(amount) => {
                         self.unresolved_player_fire_contact = true;
                         if self.death.is_none() {
-                            self.player_fire_damage(
+                            self.player_damage(
                                 f32::from(amount),
                                 "minecraft:campfire",
                                 DeathCause::Campfire,
@@ -15158,11 +15138,7 @@ impl LoadedSession {
                         self.ignite_player_from_fire();
                         last_fire_step = Some(step);
                     }
-                    self.player_fire_damage(
-                        f32::from(amount),
-                        "minecraft:in_fire",
-                        DeathCause::InFire,
-                    );
+                    self.player_damage(f32::from(amount), "minecraft:in_fire", DeathCause::InFire);
                 }
                 PlayerHeatContact::Lava => {
                     self.unresolved_player_fire_contact = true;
@@ -15372,23 +15348,11 @@ impl LoadedSession {
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
             if effect == crate::survival::FoodEffect::Starve {
-                if let Err(error) = self.fall.damage(
-                    1.0,
-                    "minecraft:starve",
-                    &self.inventory,
-                    self.armor.value(),
-                    &mut self.vitals,
-                    self.game_mode,
-                    Some(&mut self.damage_cooldown),
-                ) {
-                    self.stream_errors
-                        .push(format!("player starvation damage: {error:#}"));
-                    self.unresolved_player_damage = true;
-                }
+                self.player_damage(1.0, "minecraft:starve", DeathCause::Starve);
             } else {
                 self.vitals.apply_food_effect(effect, self.game_mode);
             }
-            if self.vitals.health <= 0.0 {
+            if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
                     cause: DeathCause::Starve,
                     tick: self.tick.saturating_add(1),
@@ -38661,56 +38625,70 @@ mod tests {
         );
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
-        assert_eq!(rows.len(), 32);
+        assert_eq!(rows.len(), 48);
         for row in rows {
-            let mut test = session();
-            test.player_client_random =
-                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
-            test.player_silent = row["silent"].as_bool().unwrap();
-            if row["dead"].as_bool().unwrap() {
-                test.vitals.health = 3.0;
-            }
-            if row["effects"] == "BURNING" {
-                assert!(test.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava));
-            } else {
-                let landing = test
-                    .fall
-                    .land_with_cooldown(
-                        7.0,
-                        None,
-                        &test.inventory,
-                        test.armor.value(),
-                        &mut test.vitals,
-                        test.game_mode,
-                        test.survival_rules,
-                        &mut test.damage_cooldown,
-                    )
-                    .unwrap();
-                test.player_damage_feedback(landing.source.unwrap(), landing.damage);
-            }
-            let sounds = test.take_consume_sounds();
-            let java_sounds = row["sounds"].as_array().unwrap();
-            assert_eq!(sounds.len(), java_sounds.len(), "{row}");
-            for (sound, expected) in sounds.iter().zip(java_sounds) {
+            let sources: &[&str] = match row["effects"].as_str().unwrap() {
+                "BURNING" => &["lava"],
+                "DROWNING" => &["drown"],
+                "HURT" => &["fall", "starve"],
+                _ => panic!("unexpected damage effect"),
+            };
+            for source in sources {
+                let mut test = session();
+                test.player_client_random =
+                    native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+                test.player_silent = row["silent"].as_bool().unwrap();
+                if row["dead"].as_bool().unwrap() {
+                    test.vitals.health = 3.0;
+                }
+                if *source == "fall" {
+                    let landing = test
+                        .fall
+                        .land_with_cooldown(
+                            7.0,
+                            None,
+                            &test.inventory,
+                            test.armor.value(),
+                            &mut test.vitals,
+                            test.game_mode,
+                            test.survival_rules,
+                            &mut test.damage_cooldown,
+                        )
+                        .unwrap();
+                    test.player_damage_feedback(landing.source.unwrap(), landing.damage);
+                } else {
+                    let (id, cause) = match *source {
+                        "lava" => ("minecraft:lava", DeathCause::Lava),
+                        "drown" => ("minecraft:drown", DeathCause::Drown),
+                        "starve" => ("minecraft:starve", DeathCause::Starve),
+                        _ => unreachable!(),
+                    };
+                    assert!(test.player_damage(4.0, id, cause));
+                }
+                let sounds = test.take_consume_sounds();
+                let java_sounds = row["sounds"].as_array().unwrap();
+                assert_eq!(sounds.len(), java_sounds.len(), "{row}");
+                for (sound, expected) in sounds.iter().zip(java_sounds) {
+                    assert_eq!(
+                        expected["sound"].as_str().unwrap(),
+                        format!("minecraft:{}", sound.info.event)
+                    );
+                    assert_eq!(expected["category"].as_str().unwrap(), "player");
+                    assert_eq!(sound.info.category, crate::ConsumeSoundCategory::Player);
+                    assert_eq!(
+                        sound.info.volume.to_bits(),
+                        expected["volume_bits"].as_i64().unwrap() as u32
+                    );
+                    assert_eq!(
+                        sound.info.pitch.to_bits(),
+                        expected["pitch_bits"].as_i64().unwrap() as u32
+                    );
+                }
                 assert_eq!(
-                    expected["sound"].as_str().unwrap(),
-                    format!("minecraft:{}", sound.info.event)
-                );
-                assert_eq!(expected["category"].as_str().unwrap(), "player");
-                assert_eq!(sound.info.category, crate::ConsumeSoundCategory::Player);
-                assert_eq!(
-                    sound.info.volume.to_bits(),
-                    expected["volume_bits"].as_i64().unwrap() as u32
-                );
-                assert_eq!(
-                    sound.info.pitch.to_bits(),
-                    expected["pitch_bits"].as_i64().unwrap() as u32
+                    test.player_client_random.next_int(),
+                    row["next"].as_i64().unwrap() as i32
                 );
             }
-            assert_eq!(
-                test.player_client_random.next_int(),
-                row["next"].as_i64().unwrap() as i32
-            );
         }
     }
 
@@ -39947,6 +39925,199 @@ mod tests {
                 error.contains("player damage could not be resolved"),
                 "{cause}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn drowning_and_starvation_use_damage_type_feedback_and_cooldowns() {
+        use native_resources::packs::ResourceId;
+        struct Pack(bool);
+        impl native_resources::packs::ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let ids: &[&str] = match folder {
+                    "damage_type" => &["minecraft:drown", "minecraft:starve"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                    ],
+                    _ => &[],
+                };
+                ids.iter().map(|id| ResourceId::parse(id)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/damage_type/drown.json" {
+                    Some(br#"{"exhaustion":0.75,"effects":"burning"}"#.to_vec())
+                } else if path == "data/minecraft/damage_type/starve.json" {
+                    Some(br#"{"exhaustion":0.25,"effects":"drowning"}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/bypasses_armor.json"
+                    || (self.0 && path == "data/minecraft/tags/damage_type/no_knockback.json")
+                {
+                    Some(br#"{"values":["minecraft:drown","minecraft:starve"]}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/bypasses_effects.json" {
+                    Some(br#"{"values":["minecraft:starve"]}"#.to_vec())
+                } else if path.starts_with("data/minecraft/tags/damage_type/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack(true)).unwrap());
+        for source in ["minecraft:drown", "minecraft:starve"] {
+            for custom in [false, true] {
+                for absorption in [0.0_f32, 4.0] {
+                    for cooldown in [false, true] {
+                        for health in [20.0_f32, 1.0] {
+                            let mut test = session();
+                            test.set_random_tick_speed(0);
+                            test.set_survival_rules(crate::survival::SurvivalRules {
+                                difficulty: native_persistence::world::Difficulty::Hard,
+                                natural_health_regeneration: false,
+                                ..Default::default()
+                            });
+                            if custom {
+                                test.fall.configure(
+                                    crate::player_data::SavedAttribute::with_base(3.0),
+                                    crate::player_data::SavedAttribute::with_base(1.0),
+                                    Default::default(),
+                                    Arc::clone(&registry),
+                                );
+                            }
+                            if cooldown {
+                                test.fall
+                                    .damage_outcome(
+                                        0.5,
+                                        source,
+                                        &test.inventory,
+                                        test.armor.value(),
+                                        &mut test.vitals,
+                                        test.game_mode,
+                                        Some(&mut test.damage_cooldown),
+                                    )
+                                    .unwrap();
+                            }
+                            test.vitals.health = health;
+                            test.vitals.absorption = absorption;
+                            if source == "minecraft:drown" {
+                                let water =
+                                    test.intern_block(state("minecraft:water", &[("level", "0")]));
+                                for x in 7..=9 {
+                                    for y in 1..=3 {
+                                        for z in 7..=9 {
+                                            assert!(test.set(IVec3::new(x, y, z), water));
+                                        }
+                                    }
+                                }
+                                test.vitals.air = -19;
+                            } else {
+                                test.vitals.food = 0;
+                                test.vitals.saturation = 0.0;
+                                test.vitals.food_tick_timer = 79;
+                            }
+                            test.player_client_random = native_core::random::LegacyRandom::new(73);
+                            let mut expected_random = test.player_client_random.clone();
+                            test.update(TICK);
+                            let base = if source == "minecraft:drown" {
+                                2.0_f32
+                            } else {
+                                1.0
+                            };
+                            let amount = base - if cooldown { 0.5 } else { 0.0 };
+                            let damage = (amount - absorption).max(0.0);
+                            assert_eq!(
+                                test.vitals.health,
+                                (health - damage).max(0.0),
+                                "{source} {custom} {absorption} {cooldown}"
+                            );
+                            let exhaustion = if custom && damage > 0.0 {
+                                if source == "minecraft:drown" {
+                                    0.75
+                                } else {
+                                    0.25
+                                }
+                            } else {
+                                0.0
+                            };
+                            assert_eq!(
+                                test.vitals.exhaustion, exhaustion,
+                                "{source} {custom} {absorption} {cooldown}"
+                            );
+                            let mut expected = Vec::new();
+                            if !cooldown {
+                                let event = match (source, custom) {
+                                    ("minecraft:drown", false) | ("minecraft:starve", true) => {
+                                        "entity.player.hurt_drown"
+                                    }
+                                    ("minecraft:drown", true) => "entity.player.hurt_on_fire",
+                                    _ => "entity.player.hurt",
+                                };
+                                expected.push((
+                                    event,
+                                    crate::client_damage_pitch(&mut expected_random),
+                                ));
+                            }
+                            if health <= damage {
+                                expected.push((
+                                    "entity.player.death",
+                                    crate::client_damage_pitch(&mut expected_random),
+                                ));
+                            }
+                            let sounds = test.take_consume_sounds();
+                            assert_eq!(
+                                sounds.len(),
+                                expected.len(),
+                                "{source} {custom} {absorption} {cooldown}: {sounds:?}"
+                            );
+                            for (sound, (event, pitch)) in sounds.iter().zip(expected) {
+                                assert_eq!(sound.info.event, event);
+                                assert_eq!(sound.info.pitch.to_bits(), pitch.to_bits());
+                            }
+                            assert_eq!(
+                                test.player_client_random.next_int(),
+                                expected_random.next_int()
+                            );
+                            assert!(!test.unresolved_player_damage, "{:?}", test.stream_errors);
+                        }
+                    }
+                }
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack(false)).unwrap());
+        for (source, cause) in [
+            ("minecraft:drown", DeathCause::Drown),
+            ("minecraft:starve", DeathCause::Starve),
+        ] {
+            let mut test = session();
+            test.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                Default::default(),
+                Arc::clone(&registry),
+            );
+            test.motion.velocity = DVec3::new(0.2, -0.1, -0.3);
+            test.motion.on_ground = true;
+            test.player_random = native_core::random::LegacyRandom::new(17);
+            let mut expected_random = test.player_random.clone();
+            let velocity = crate::knockback::from_unlocated_damage(
+                test.motion.velocity,
+                true,
+                0.0,
+                &mut expected_random,
+            );
+            assert!(test.player_damage(1.0, source, cause));
+            assert_eq!(test.motion.velocity, velocity, "{source}");
+            assert_eq!(
+                test.player_random.next_int(),
+                expected_random.next_int(),
+                "{source}"
+            );
+            assert!(!test.unresolved_player_damage, "{:?}", test.stream_errors);
         }
     }
 

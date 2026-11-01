@@ -732,6 +732,46 @@ fn protection_effects(value: &Value) -> Result<Vec<ProtectionEffect>> {
         .collect()
 }
 
+fn damage_immunity_effects(value: &Value) -> Result<Vec<DamagePredicate>> {
+    let Some(effects) = value.get("effects") else {
+        return Ok(Vec::new());
+    };
+    let effects = effects
+        .as_object()
+        .context("enchantment effects are not an object")?;
+    let mut entries = None;
+    for key in [
+        "minecraft:damage_immunity",
+        "damage_immunity",
+        ":damage_immunity",
+    ] {
+        if let Some(value) = effects.get(key) {
+            ensure!(entries.is_none(), "duplicate damage immunity effect");
+            entries = Some(value);
+        }
+    }
+    let Some(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    entries
+        .as_array()
+        .context("damage immunity is not a list")?
+        .iter()
+        .map(|entry| {
+            let effect = entry
+                .get("effect")
+                .and_then(Value::as_object)
+                .context("invalid damage immunity effect")?;
+            ensure!(effect.is_empty(), "unsupported damage immunity effect");
+            entry
+                .get("requirements")
+                .map(|v| DamagePredicate::parse(v, 0))
+                .transpose()
+                .map(|v| v.unwrap_or(DamagePredicate::Any))
+        })
+        .collect()
+}
+
 fn tag_contains(
     tags: &BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     id: &ResourceId,
@@ -951,6 +991,7 @@ fn damage_type_info(bytes: &[u8]) -> Result<DamageTypeInfo> {
 pub struct OxygenEnchantments {
     definitions: BTreeMap<ResourceId, std::result::Result<Definition, String>>,
     protection: BTreeMap<ResourceId, std::result::Result<Vec<ProtectionEffect>, String>>,
+    damage_immunity: BTreeMap<ResourceId, std::result::Result<Vec<DamagePredicate>, String>>,
     repair: BTreeMap<ResourceId, std::result::Result<Option<Vec<RepairValueEffect>>, String>>,
     item_damage: BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
     block_experience: BTreeMap<ResourceId, std::result::Result<Vec<ItemDamageEffect>, String>>,
@@ -965,6 +1006,7 @@ impl OxygenEnchantments {
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut definitions = BTreeMap::new();
         let mut protection = BTreeMap::new();
+        let mut damage_immunity = BTreeMap::new();
         let mut repair = BTreeMap::new();
         let mut item_damage = BTreeMap::new();
         let mut block_experience = BTreeMap::new();
@@ -984,6 +1026,11 @@ impl OxygenEnchantments {
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
                 .and_then(protection_effects)
+                .map_err(|error| format!("{error:#}"));
+            let immunity_effect = value
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                .and_then(damage_immunity_effects)
                 .map_err(|error| format!("{error:#}"));
             let repair_effect = value
                 .as_ref()
@@ -1011,6 +1058,7 @@ impl OxygenEnchantments {
                 }
             }
             protection.insert(id.clone(), protection_effect);
+            damage_immunity.insert(id.clone(), immunity_effect);
             repair.insert(id.clone(), repair_effect);
             item_damage.insert(id.clone(), damage_effect);
             block_experience.insert(id.clone(), experience_effect);
@@ -1079,6 +1127,7 @@ impl OxygenEnchantments {
         Ok(Self {
             definitions,
             protection,
+            damage_immunity,
             repair,
             item_damage,
             block_experience,
@@ -1305,6 +1354,38 @@ impl OxygenEnchantments {
             .contains(entity))
     }
 
+    /// Check an equipped enchantment's conditional damage immunity.
+    pub fn prevents_damage(
+        &self,
+        id: &ResourceId,
+        level: u32,
+        slot: EquipmentSlot,
+        damage: &str,
+    ) -> Result<bool> {
+        ensure!((1..=255).contains(&level), "invalid enchantment level");
+        let definition = self
+            .definitions
+            .get(id)
+            .context("enchantment is absent from the active registry")?
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("unsupported enchantment: {error}"))?;
+        if !definition.slots.iter().any(|group| slot.matches(group)) {
+            return Ok(false);
+        }
+        let effects = self
+            .damage_immunity
+            .get(id)
+            .context("enchantment immunity is absent")?
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("unsupported enchantment immunity: {error}"))?;
+        for effect in effects {
+            if effect.test(&self.damage_tags, damage)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply one equipped enchantment's conditional protection effects.
     pub fn protect_damage(
         &self,
@@ -1406,10 +1487,44 @@ mod tests {
             ("minecraft:in_fire", 0.1),
             ("minecraft:campfire", 0.1),
             ("minecraft:on_fire", 0.0),
+            ("minecraft:hot_floor", 0.1),
         ] {
             let info = registry.damage_type_info(id).unwrap();
             assert_eq!(info.exhaustion, exhaustion, "{id}");
             assert_eq!(info.effects, DamageEffects::Burning, "{id}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed Minecraft 26.3 client"]
+    fn installed_frost_walker_immunity_uses_active_damage_tags_and_slots() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut stack = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut stack).unwrap();
+        let id = ResourceId::parse("minecraft:frost_walker").unwrap();
+        for damage in ["minecraft:hot_floor", "minecraft:sulfur_cube_hot"] {
+            assert!(
+                registry
+                    .prevents_damage(&id, 1, EquipmentSlot::Feet, damage)
+                    .unwrap(),
+                "{damage}"
+            );
+            assert!(
+                !registry
+                    .prevents_damage(&id, 1, EquipmentSlot::Head, damage)
+                    .unwrap(),
+                "{damage}"
+            );
+        }
+        for damage in ["minecraft:lava", "minecraft:on_fire", "minecraft:fall"] {
+            assert!(
+                !registry
+                    .prevents_damage(&id, 2, EquipmentSlot::Feet, damage)
+                    .unwrap(),
+                "{damage}"
+            );
         }
     }
 
@@ -1451,7 +1566,12 @@ mod tests {
         }
         fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
             let ids = match folder {
-                "enchantment" => vec!["example:soft", "example:unsupported"],
+                "enchantment" => vec![
+                    "example:soft",
+                    "example:unsupported",
+                    "example:immune",
+                    "example:bad_immunity",
+                ],
                 "tags/damage_type" => {
                     vec!["minecraft:is_fall", "minecraft:bypasses_invulnerability"]
                 }
@@ -1466,6 +1586,12 @@ mod tests {
                 }
                 "data/example/enchantment/unsupported.json" => {
                     json!({"slots":["head"],"effects":{"minecraft:damage_protection":[{"effect":{"type":"minecraft:add","value":1},"requirements":{"type":"example:unknown"}}]}})
+                }
+                "data/example/enchantment/immune.json" => {
+                    json!({"slots":["feet"],"effects":{"minecraft:damage_immunity":[{"effect":{},"requirements":{"type":"minecraft:damage_source_properties","predicate":{"tags":[{"id":"#minecraft:is_fall","expected":true},{"id":"#minecraft:bypasses_invulnerability","expected":false}]}}}]}})
+                }
+                "data/example/enchantment/bad_immunity.json" => {
+                    json!({"slots":["head"],"effects":{"minecraft:damage_immunity":[{"effect":{},"requirements":{"type":"example:unknown"}}]}})
                 }
                 _ => return Ok(None),
             };
@@ -1572,6 +1698,56 @@ mod tests {
             registry
                 .modifiers_for(&unknown, 1, EquipmentSlot::Head, "oxygen_bonus")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn damage_immunity_uses_replaced_tags_and_equipment_slots() {
+        let registry = OxygenEnchantments::load(&mut Data).unwrap();
+        let id = ResourceId::parse("example:immune").unwrap();
+        assert!(
+            registry
+                .prevents_damage(&id, 1, EquipmentSlot::Feet, "minecraft:stalagmite")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .prevents_damage(&id, 1, EquipmentSlot::Feet, "minecraft:fall")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .prevents_damage(&id, 1, EquipmentSlot::Head, "minecraft:stalagmite")
+                .unwrap()
+        );
+        let bad = ResourceId::parse("example:bad_immunity").unwrap();
+        assert!(
+            registry
+                .prevents_damage(&bad, 1, EquipmentSlot::Head, "minecraft:fall")
+                .is_err()
+        );
+        assert!(
+            !registry
+                .prevents_damage(&bad, 1, EquipmentSlot::Feet, "minecraft:fall")
+                .unwrap()
+        );
+        for key in [
+            "minecraft:damage_immunity",
+            "damage_immunity",
+            ":damage_immunity",
+        ] {
+            assert_eq!(
+                damage_immunity_effects(&json!({"effects":{key:[{"effect":{}}]}}))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            damage_immunity_effects(
+                &json!({"effects":{"damage_immunity":[], "minecraft:damage_immunity":[]}})
+            )
+            .is_err()
         );
     }
 }

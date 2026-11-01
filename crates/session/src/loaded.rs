@@ -14887,6 +14887,16 @@ impl LoadedSession {
             if self.game_mode != GameMode::Spectator && !self.sneak {
                 self.set_redstone_ore_lit(legacy, true);
             }
+            if self.death.is_none()
+                && self.game_mode != GameMode::Spectator
+                && !self.sneak
+                && landing_state
+                    .and_then(|id| self.world.state(id))
+                    .is_some_and(|state| state.name == "minecraft:magma_block")
+            {
+                self.unresolved_player_fire_contact = true;
+                self.player_fire_damage(1.0, "minecraft:hot_floor", DeathCause::HotFloor);
+            }
             self.fall_distance = 0.0;
         } else {
             self.ground_without_support = false;
@@ -37777,6 +37787,160 @@ mod tests {
         assert!(session.take_consume_sounds().is_empty());
         assert_eq!(session.vitals.exhaustion, 0.0);
         assert_eq!(session.player_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn magma_step_damage_respects_sneaking_fire_resistance_and_death() {
+        for (sneak, resistant, mode, initial, expected) in [
+            (false, false, GameMode::Survival, 20.0, 19.0),
+            (true, false, GameMode::Survival, 20.0, 20.0),
+            (false, true, GameMode::Survival, 20.0, 20.0),
+            (false, false, GameMode::Creative, 20.0, 20.0),
+            (false, false, GameMode::Survival, 1.0, 0.0),
+        ] {
+            let mut test = session();
+            let magma = test.intern_block(state("minecraft:magma_block", &[]));
+            assert!(test.set(IVec3::new(8, 0, 8), magma));
+            test.set_game_mode(mode);
+            test.vitals.health = initial;
+            if resistant {
+                test.fall.add_status(crate::survival::StatusApplication {
+                    kind: crate::survival::FoodStatusKind::FireResistance,
+                    duration: 20,
+                    amplifier: 0,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                });
+            }
+            test.submit_command(PlayerCommand::Sneak(sneak));
+            test.update(TICK * 3);
+            assert_eq!(
+                test.vitals.health, expected,
+                "sneak={sneak} resistant={resistant} mode={mode:?}"
+            );
+            if initial == 1.0 {
+                assert_eq!(test.snapshot().death.unwrap().cause, DeathCause::HotFloor);
+            }
+            if expected < initial {
+                assert_eq!(
+                    test.take_consume_sounds()[0].info.event,
+                    "entity.player.hurt_on_fire"
+                );
+                assert_eq!(test.vitals.exhaustion, 0.1);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an installed Minecraft 26.3 client"]
+    fn magma_step_uses_installed_frost_walker_damage_immunity() {
+        use native_persistence::nbt::Tag;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut stack = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut stack).unwrap());
+        for equipped in [false, true] {
+            let mut test = session();
+            let magma = test.intern_block(state("minecraft:magma_block", &[]));
+            assert!(test.set(IVec3::new(8, 0, 8), magma));
+            let mut inventory = PlayerInventory::default();
+            if equipped {
+                let boots = crate::inventory::ItemStack::unresolved(
+                    "minecraft:iron_boots".into(),
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:enchantments".into(),
+                        Tag::Compound(vec![("minecraft:frost_walker".into(), Tag::Int(1))]),
+                    )]),
+                )
+                .unwrap();
+                inventory.set_slot(crate::PlayerSlot::Armor(3), Some(boots));
+            }
+            test.set_player_inventory(inventory);
+            test.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                Default::default(),
+                Arc::clone(&registry),
+            );
+            test.set_saved_breathing(
+                Default::default(),
+                crate::player_data::SavedAttribute::with_base(0.0),
+                Arc::clone(&registry),
+            )
+            .unwrap();
+            test.update(TICK * 3);
+            assert_eq!(
+                test.vitals.health,
+                if equipped { 20.0 } else { 19.0 },
+                "equipped={equipped}"
+            );
+            assert_eq!(test.take_consume_sounds().is_empty(), equipped);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn magma_step_matches_java_block() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("MagmaStepOracle.java");
+        let output = temp.path().join("result.json");
+        std::fs::write(&source, include_str!("../tests/java/MagmaStepOracle.java")).unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MagmaStepOracle")
+            .arg(&output));
+        let rows: Vec<(u32, f32)> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for (sneak, (hits, amount)) in [false, true].into_iter().zip(rows) {
+            let mut test = session();
+            let magma = test.intern_block(state("minecraft:magma_block", &[]));
+            assert!(test.set(IVec3::new(8, 0, 8), magma));
+            test.submit_command(PlayerCommand::Sneak(sneak));
+            test.update(TICK * 3);
+            assert_eq!(
+                20.0 - test.vitals.health,
+                if hits == 0 { 0.0 } else { amount }
+            );
+        }
     }
 
     #[test]

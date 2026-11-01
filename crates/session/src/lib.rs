@@ -381,6 +381,7 @@ pub enum DeathCause {
     OnFire,
     InFire,
     Campfire,
+    HotFloor,
     Starve,
 }
 

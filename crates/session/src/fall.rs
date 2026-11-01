@@ -322,6 +322,7 @@ impl FallTracker {
                         | "minecraft:campfire"
                         | "minecraft:on_fire"
                         | "minecraft:lava"
+                        | "minecraft:hot_floor"
                 ),
                 _ => false,
             })
@@ -330,6 +331,44 @@ impl FallTracker {
 
     pub(crate) fn blocks_damage_knockback(&self, damage: &str) -> Result<bool> {
         self.damage_tag("minecraft:no_knockback", damage)
+    }
+
+    fn immune_to_damage(&self, inventory: &PlayerInventory, damage: &str) -> Result<bool> {
+        let Some(registry) = &self.enchantments else {
+            return Ok(false);
+        };
+        for (slot, player_slot) in [
+            (
+                EquipmentSlot::Mainhand,
+                PlayerSlot::Storage(inventory.selected()),
+            ),
+            (EquipmentSlot::Offhand, PlayerSlot::Offhand),
+            (EquipmentSlot::Feet, PlayerSlot::Armor(3)),
+            (EquipmentSlot::Legs, PlayerSlot::Armor(2)),
+            (EquipmentSlot::Chest, PlayerSlot::Armor(1)),
+            (EquipmentSlot::Head, PlayerSlot::Armor(0)),
+        ] {
+            let Some(item) = inventory.slot(player_slot) else {
+                continue;
+            };
+            let Some(enchantments) = item.components().get("minecraft:enchantments") else {
+                continue;
+            };
+            let Tag::Compound(entries) = enchantments else {
+                anyhow::bail!("item enchantments are not a compound")
+            };
+            for (id, level) in entries {
+                let id = ResourceId::parse(
+                    &String::from_utf16(&id.0).context("invalid enchantment id")?,
+                )?;
+                let level =
+                    u32::try_from(level.as_java_int().context("invalid enchantment level")?)?;
+                if registry.prevents_damage(&id, level, slot, damage)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn protection(&self, inventory: &PlayerInventory, damage: &str) -> Result<f32> {
@@ -491,7 +530,10 @@ impl FallTracker {
             return registry.damage_type_info(damage);
         }
         let exhaustion = match damage {
-            "minecraft:lava" | "minecraft:in_fire" | "minecraft:campfire" => 0.1,
+            "minecraft:lava"
+            | "minecraft:in_fire"
+            | "minecraft:campfire"
+            | "minecraft:hot_floor" => 0.1,
             "minecraft:on_fire" => 0.0,
             _ => anyhow::bail!("damage type definition is unavailable"),
         };
@@ -513,6 +555,9 @@ impl FallTracker {
         cooldown: Option<&mut DamageCooldown>,
     ) -> Result<DamageOutcome> {
         if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
+            return Ok(DamageOutcome::default());
+        }
+        if self.immune_to_damage(inventory, damage)? {
             return Ok(DamageOutcome::default());
         }
         if self.effects.fire_resistance.is_some() && self.damage_tag("minecraft:is_fire", damage)? {

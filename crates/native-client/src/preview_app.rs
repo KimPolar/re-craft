@@ -1068,6 +1068,20 @@ impl Viewer {
                     _ => None,
                 };
                 renderer.set_star_frame(star_frame);
+                let sunrise_frame = match (play.sunset_previous, play.sunset_current) {
+                    (Some((old_angle, old_color)), Some((new_angle, new_color)))
+                        if background.has_overworld_sky() =>
+                    {
+                        Some(crate::sunrise_render::Frame {
+                            angle_degrees: interpolate_sun_angle(old_angle, new_angle, partial),
+                            color: std::array::from_fn(|i| {
+                                old_color[i] + partial * (new_color[i] - old_color[i])
+                            }),
+                        })
+                    }
+                    _ => None,
+                };
+                renderer.set_sunrise_frame(sunrise_frame);
                 let color =
                     std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
                 let mut fog_color = match (play.fog_color_previous, play.fog_color_current) {

@@ -119,9 +119,8 @@ pub struct Sun {
     image: wgpu::Texture,
     source: Texture,
     frame: Option<Frame>,
-    last_state: Option<[[f32; 4]; 12]>,
+    last_state: Option<[[f32; 4]; 5]>,
     sprite_index: usize,
-    has_sun_texture: bool,
 }
 
 impl Sun {
@@ -131,8 +130,11 @@ impl Sun {
         format: wgpu::TextureFormat,
         depth_format: Option<wgpu::TextureFormat>,
         source: Texture,
-        sun: Option<&Sun>,
     ) -> Result<Self> {
+        ensure!(
+            !format.is_srgb(),
+            "celestial blending requires an unorm target"
+        );
         let atlas = &source.atlas.texture;
         ensure!(
             atlas.width > 0
@@ -179,7 +181,7 @@ impl Sun {
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Sun camera and color"),
-            size: 192,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -212,20 +214,9 @@ impl Sun {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
             ],
         });
         let view = image.create_view(&Default::default());
-        let sun_view = sun.map(|sun| sun.image.create_view(&Default::default()));
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Sun bindings"),
             layout: &layout,
@@ -241,12 +232,6 @@ impl Sun {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(
-                        sun_view.as_ref().unwrap_or(&view),
-                    ),
                 },
             ],
         });
@@ -286,15 +271,22 @@ impl Sun {
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some(if format.is_srgb() {
-                    "fragment_srgb_target"
-                } else {
-                    "fragment_unorm_target"
-                }),
+                entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -324,7 +316,6 @@ impl Sun {
             frame: None,
             last_state: None,
             sprite_index: 0,
-            has_sun_texture: sun.is_some(),
         })
     }
 
@@ -337,13 +328,7 @@ impl Sun {
         self.sprite_index = index;
     }
 
-    pub fn update(
-        &mut self,
-        queue: &wgpu::Queue,
-        view_projection: Mat4,
-        background: [f32; 3],
-        sun: Option<&Sun>,
-    ) {
+    pub fn update(&mut self, queue: &wgpu::Queue, view_projection: Mat4) {
         let Some(frame) = self.frame else {
             return;
         };
@@ -371,44 +356,12 @@ impl Sun {
         }
         let model = sun_model(frame.angle_degrees, self.source.size);
         let matrix = (view_projection * model).to_cols_array_2d();
-        let mut sun_transform = [[0.0; 4]; 4];
-        let mut sun_origin = [0.0; 4];
-        let mut sun_rect = [0.0; 4];
-        let mut sun_visible = false;
-        if let Some(sun) = sun.filter(|_| self.has_sun_texture)
-            && let Some(sun_frame) = sun.frame
-            && let Some(rect) = sun.source.atlas.rectangle(&sun.source.ids[0])
-        {
-            let inverse = sun_model(sun_frame.angle_degrees, sun.source.size).inverse();
-            sun_transform = (inverse * model).to_cols_array_2d();
-            sun_origin = inverse.transform_point3(Vec3::ZERO).extend(1.0).to_array();
-            let atlas = &sun.source.atlas.texture;
-            sun_rect = [
-                rect.x as f32 / atlas.width as f32,
-                rect.y as f32 / atlas.height as f32,
-                (rect.x + rect.width) as f32 / atlas.width as f32,
-                (rect.y + rect.height) as f32 / atlas.height as f32,
-            ];
-            sun_visible = true;
-        }
         let state = [
             matrix[0],
             matrix[1],
             matrix[2],
             matrix[3],
-            [background[0], background[1], background[2], 1.0],
-            [
-                frame.rain_brightness,
-                if sun_visible { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
-            ],
-            sun_transform[0],
-            sun_transform[1],
-            sun_transform[2],
-            sun_transform[3],
-            sun_origin,
-            sun_rect,
+            [frame.rain_brightness, 0.0, 0.0, 0.0],
         ];
         if self.last_state != Some(state) {
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&state));
@@ -649,10 +602,7 @@ mod tests {
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .unwrap();
-            for format in [
-                wgpu::TextureFormat::Rgba8Unorm,
-                wgpu::TextureFormat::Rgba8UnormSrgb,
-            ] {
+            for format in [wgpu::TextureFormat::Rgba8Unorm] {
                 let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let mut sun = Sun::new(
                     &device,
@@ -660,7 +610,6 @@ mod tests {
                     format,
                     Some(wgpu::TextureFormat::Depth32Float),
                     Texture::load(&mut pack(false)).unwrap(),
-                    None,
                 )
                 .unwrap();
                 let mut moon = Sun::new(
@@ -669,7 +618,6 @@ mod tests {
                     format,
                     Some(wgpu::TextureFormat::Depth32Float),
                     Texture::load_moon(&mut pack(false)).unwrap(),
-                    Some(&sun),
                 )
                 .unwrap();
                 if let Some(error) = errors.pop().await {
@@ -718,14 +666,14 @@ mod tests {
                             rain_brightness,
                             tick: 0,
                         }));
-                        sun.update(&queue, matrix, background, None);
+                        sun.update(&queue, matrix);
                         moon.set_frame(Some(Frame {
                             angle_degrees: 0.0,
                             rain_brightness,
                             tick: 0,
                         }));
                         moon.set_sprite(4);
-                        moon.update(&queue, matrix, background, Some(&sun));
+                        moon.update(&queue, matrix);
                         let mut encoder = device.create_command_encoder(&Default::default());
                         {
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -735,7 +683,12 @@ mod tests {
                                     depth_slice: None,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                                            r: background[0] as f64,
+                                            g: background[1] as f64,
+                                            b: background[2] as f64,
+                                            a: 1.0,
+                                        }),
                                         store: wgpu::StoreOp::Store,
                                     },
                                 })],
@@ -804,7 +757,10 @@ mod tests {
                                 "{format:?}, angle {sun_angle}, rain {rain_brightness}: {pixel:?}, channel {i} expected {expected}"
                             );
                         }
-                        assert_eq!(pixel[3], 255);
+                        assert!(
+                            (i32::from(pixel[3]) - (128.0 * rain_brightness).round() as i32).abs()
+                                <= 1
+                        );
                         drop(pixels);
                         readback.unmap();
                     }

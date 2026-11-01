@@ -68,6 +68,7 @@ mod star_geometry;
 mod star_render;
 mod status_effect_ui;
 mod sun_render;
+mod sunrise_render;
 mod survival_hud;
 mod text_component;
 mod toggle_key;

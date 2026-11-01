@@ -18,6 +18,7 @@ struct Target {
 }
 
 pub struct Sky {
+    sunrise: crate::sunrise_render::Sunrise,
     star_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
@@ -187,6 +188,7 @@ impl Sky {
             usage: wgpu::BufferUsages::VERTEX,
         });
         Self {
+            sunrise: crate::sunrise_render::Sunrise::new(device),
             star_pipeline,
             composite_pipeline,
             composite_layout,
@@ -204,6 +206,10 @@ impl Sky {
         self.frame = frame;
     }
 
+    pub fn set_sunrise_frame(&mut self, frame: Option<crate::sunrise_render::Frame>) {
+        self.sunrise.set_frame(frame);
+    }
+
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -211,6 +217,7 @@ impl Sky {
         size: (u32, u32),
         view_projection: Mat4,
     ) {
+        self.sunrise.prepare(queue, view_projection);
         if self
             .target
             .as_ref()
@@ -294,6 +301,7 @@ impl Sky {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        self.sunrise.draw(&mut pass);
         if let Some(sun) = sun {
             sun.draw(&mut pass);
         }
@@ -535,7 +543,6 @@ mod tests {
                     FORMAT,
                     None,
                     crate::sun_render::Texture::load(&mut assets).unwrap(),
-                    None,
                 )
                 .unwrap();
                 let mut moon = crate::sun_render::Sun::new(
@@ -544,7 +551,6 @@ mod tests {
                     FORMAT,
                     None,
                     crate::sun_render::Texture::load_moon(&mut assets).unwrap(),
-                    Some(&sun),
                 )
                 .unwrap();
                 if let Some(error) = errors.pop().await {
@@ -603,9 +609,9 @@ mod tests {
                             tick: 0,
                         };
                         sun.set_frame(Some(body_frame));
-                        sun.update(&queue, matrix, background, None);
+                        sun.update(&queue, matrix);
                         moon.set_frame(Some(body_frame));
-                        moon.update(&queue, matrix, background, Some(&sun));
+                        moon.update(&queue, matrix);
                         let mut encoder = device.create_command_encoder(&Default::default());
                         sky.render(
                             &mut encoder,

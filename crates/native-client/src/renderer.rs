@@ -361,7 +361,6 @@ impl Renderer {
             crate::star_render::FORMAT,
             None,
             texture,
-            None,
         )?);
         Ok(())
     }
@@ -379,7 +378,6 @@ impl Renderer {
             crate::star_render::FORMAT,
             None,
             texture,
-            self.sun.as_ref(),
         )?);
         Ok(())
     }
@@ -395,6 +393,12 @@ impl Renderer {
     pub fn set_star_frame(&mut self, frame: Option<crate::star_render::Frame>) {
         if let Some(sky) = &mut self.celestial_sky {
             sky.set_frame(frame);
+        }
+    }
+
+    pub fn set_sunrise_frame(&mut self, frame: Option<crate::sunrise_render::Frame>) {
+        if let Some(sky) = &mut self.celestial_sky {
+            sky.set_sunrise_frame(frame);
         }
     }
 
@@ -2262,10 +2266,10 @@ impl Renderer {
             sky.update(&self.queue, sky_matrix, sky_background);
         }
         if let Some(sun) = &mut self.sun {
-            sun.update(&self.queue, sky_matrix, sky_background, None);
+            sun.update(&self.queue, sky_matrix);
         }
         if let Some(moon) = &mut self.moon {
-            moon.update(&self.queue, sky_matrix, sky_background, self.sun.as_ref());
+            moon.update(&self.queue, sky_matrix);
         }
         if let Some(sky) = &mut self.celestial_sky {
             sky.prepare(

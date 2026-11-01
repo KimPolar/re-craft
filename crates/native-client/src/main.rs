@@ -886,7 +886,7 @@ fn prepare_existing_world(
                 }
             }
         });
-        let sky_background = world.dimension_type.as_deref().and_then(|dimension_type| {
+        let mut sky_background = world.dimension_type.as_deref().and_then(|dimension_type| {
             match sky_background::SkyBackground::load(&mut resources, dimension_type, min_y, max_y)
             {
                 Ok(background) => background,
@@ -896,6 +896,15 @@ fn prepare_existing_world(
                 }
             }
         });
+        if let Some(background) = &mut sky_background {
+            let flat = reader
+                .saved_dimension_generators()
+                .and_then(|saved| preview_lighting::is_flat_world(&mut resources, saved.as_ref()));
+            match flat {
+                Ok(value) => background.set_flat_world(value),
+                Err(error) => eprintln!("World generator for fog is unavailable: {error:#}"),
+            }
+        }
         let default_clock = world.dimension_type.as_deref().and_then(|dimension_type| {
             match native_resources::world_clock::dimension_default_clock(
                 &mut resources,

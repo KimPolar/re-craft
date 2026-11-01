@@ -572,6 +572,7 @@ pub struct SkyBackground {
     fog_sky_tracks: Option<Vec<SkyTrack>>,
     sunset: Option<SunsetTimeline>,
     water: WaterFog,
+    flat_world: Option<bool>,
     min_y: i32,
     max_y: i32,
 }
@@ -585,6 +586,11 @@ pub struct BackgroundSample {
     pub sky_mix: Option<([f32; 3], f32)>,
     pub sunset: Option<(f32, [f32; 4])>,
     pub water: Option<WaterFogSample>,
+}
+
+pub(crate) fn void_darkness_at(min_y: i32, flat: bool, camera_y: f64) -> f32 {
+    let range = if flat { 1.0_f32 } else { 32.0_f32 };
+    ((range + min_y as f32 - camera_y as f32) / range).clamp(0.0, 1.0)
 }
 
 impl SkyBackground {
@@ -845,9 +851,21 @@ impl SkyBackground {
             fog_sky_tracks,
             sunset,
             water,
+            flat_world: None,
             min_y,
             max_y,
         }))
+    }
+
+    pub fn set_flat_world(&mut self, flat: Option<bool>) {
+        self.flat_world = flat;
+    }
+
+    pub fn void_darkness(&self, camera_y: f64) -> f32 {
+        let Some(flat) = self.flat_world else {
+            return 0.0;
+        };
+        void_darkness_at(self.min_y, flat, camera_y)
     }
 
     pub fn sample(
@@ -1735,6 +1753,7 @@ mod tests {
             fog_sky_tracks: None,
             sunset: None,
             water: WaterFog::default(),
+            flat_world: None,
             min_y: 0,
             max_y: 16,
         };

@@ -54,6 +54,40 @@ pub fn apply_night_vision(mut settings: LightmapSettings, factor: f32) -> Lightm
     settings.night_vision_factor = factor;
     settings
 }
+
+/// Java derives the flat-world flag from the overworld generator for all dimensions.
+pub fn is_flat_world(
+    source: &mut impl ResourceProvider,
+    saved: Option<&BTreeMap<DimensionId, native_persistence::nbt::Tag>>,
+) -> Result<Option<bool>> {
+    use native_persistence::nbt::Tag;
+    let overworld = DimensionId::parse("minecraft:overworld")?;
+    let kind = if let Some(bytes) = source.read_data("data/minecraft/dimension/overworld.json")? {
+        let data: Value = serde_json::from_slice(&bytes)?;
+        data.get("generator")
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .context("overworld generator type is missing")?
+            .to_owned()
+    } else {
+        let Some(generator) = saved.and_then(|dimensions| dimensions.get(&overworld)) else {
+            return Ok(None);
+        };
+        let Some(Tag::String(kind)) = generator.get("type") else {
+            bail!("overworld generator type is missing");
+        };
+        String::from_utf16(&kind.0)?
+    };
+    let kind = ResourceId::parse(&kind)?;
+    if kind.namespace != "minecraft" {
+        return Ok(None);
+    }
+    Ok(match kind.path.as_str() {
+        "flat" => Some(true),
+        "noise" | "debug" => Some(false),
+        _ => None,
+    })
+}
 /// Resolve the generator's sea level without substituting overworld defaults.
 pub fn generator_sea_level(
     source: &mut impl ResourceProvider,
@@ -725,6 +759,64 @@ mod tests {
         assert_eq!(cache.sample(2, None, 0.5, false, 0.9), 0.0);
         assert_eq!(cache.sample(2, None, 0.5, true, 0.9), 0.5);
         assert_eq!(cache.sample(2, Some(-1), 0.5, true, 0.9), 1.0);
+    }
+
+    #[test]
+    fn flat_world_uses_active_overworld_generator_and_saved_fallback() {
+        use native_persistence::nbt::Tag;
+        struct Data(Option<&'static [u8]>);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/dimension/overworld.json")
+                    .then_some(self.0)
+                    .flatten()
+                    .map(<[u8]>::to_vec))
+            }
+        }
+        let generator = |id: &str| Tag::Compound(vec![("type".into(), Tag::String(id.into()))]);
+        let dimensions = BTreeMap::from([
+            (
+                DimensionId::parse("minecraft:overworld").unwrap(),
+                generator("flat"),
+            ),
+            (
+                DimensionId::parse("minecraft:the_nether").unwrap(),
+                generator("noise"),
+            ),
+        ]);
+        assert_eq!(
+            is_flat_world(&mut Data(None), Some(&dimensions)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            is_flat_world(
+                &mut Data(Some(br#"{"generator":{"type":"minecraft:noise"}}"#)),
+                Some(&dimensions)
+            )
+            .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            is_flat_world(
+                &mut Data(Some(br#"{"generator":{"type":"minecraft:debug"}}"#)),
+                Some(&dimensions)
+            )
+            .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            is_flat_world(
+                &mut Data(Some(br#"{"generator":{"type":"example:unknown"}}"#)),
+                Some(&dimensions)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(is_flat_world(&mut Data(None), None).unwrap(), None);
+        assert!(is_flat_world(&mut Data(Some(br#"{"generator":{}}"#)), Some(&dimensions)).is_err());
     }
 
     #[test]

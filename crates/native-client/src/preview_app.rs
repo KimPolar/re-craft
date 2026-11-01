@@ -47,15 +47,32 @@ pub(crate) fn atmospheric_fog_color(
     std::array::from_fn(|i| fog[i] + amount * (sky[i] - fog[i]))
 }
 
-/// Water fog uses the player's adaptation even without a status effect.
-pub(crate) fn water_fog(color: [f32; 3], range: [f32; 2], vision: f32) -> ([f32; 3], [f32; 2]) {
+pub(crate) fn adjusted_fog_color(mut color: [f32; 3], darkness: f32, vision: f32) -> [f32; 3] {
+    if darkness > 0.0 {
+        let brightness = 1.0 - darkness;
+        let scale = brightness * brightness;
+        color = color.map(|component| component * scale);
+    }
     let color = if color.iter().all(|component| *component != 0.0) {
         let scale = 1.0 / color[0].max(color[1]).max(color[2]);
         color.map(|component| component + vision * (component * scale - component))
     } else {
         color
     };
-    (color, [range[0], range[1] * vision.max(0.25)])
+    color
+}
+
+/// Water fog uses the player's adaptation even without a status effect.
+pub(crate) fn water_fog(
+    color: [f32; 3],
+    range: [f32; 2],
+    vision: f32,
+    darkness: f32,
+) -> ([f32; 3], [f32; 2]) {
+    (
+        adjusted_fog_color(color, darkness, vision),
+        [range[0], range[1] * vision.max(0.25)],
+    )
 }
 
 pub(crate) fn weather_darken_sky(mut color: [f32; 3], rain: f32, thunder: f32) -> [f32; 3] {
@@ -1004,6 +1021,14 @@ impl Viewer {
                         play.streamer.radius().max(2),
                     ));
                 }
+                let camera_y = f64::from(snapshot.origin.y) + snapshot.camera.eye(partial).y;
+                let void_darkness = background.void_darkness(camera_y);
+                let night_vision = crate::preview_lighting::night_vision_scale(
+                    snapshot.night_vision_duration,
+                    partial,
+                );
+                fog_color =
+                    fog_color.map(|color| adjusted_fog_color(color, void_darkness, night_vision));
                 let fog_range = match (play.sky_fog_previous, play.sky_fog_current) {
                     (Some(previous), Some(current)) => {
                         Some(play.rain_fog.apply(std::array::from_fn(|i| {
@@ -1021,7 +1046,12 @@ impl Viewer {
                             let range = std::array::from_fn(|i| {
                                 previous.range[i] + partial * (current.range[i] - previous.range[i])
                             });
-                            Some(water_fog(color, range, snapshot.water_vision))
+                            Some(water_fog(
+                                color,
+                                range,
+                                snapshot.water_vision,
+                                void_darkness,
+                            ))
                         }
                         _ => None,
                     }

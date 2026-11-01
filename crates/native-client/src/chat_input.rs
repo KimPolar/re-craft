@@ -645,7 +645,54 @@ mod tests {
         let mut water_vision_cases = 0;
         let mut water_fog_cases = 0;
         let mut water_fog_color_cases = 0;
+        let mut void_fog_cases = 0;
+        let mut air_fog_cases = 0;
         for row in rows {
+            if let Some(duration) = row["airFogDuration"].as_i64() {
+                air_fog_cases += 1;
+                let partial = row["partial"].as_f64().unwrap() as f32;
+                let vision = crate::preview_lighting::night_vision_scale(
+                    (duration != -2).then_some(duration as i32),
+                    partial,
+                );
+                let darkness = crate::sky_background::void_darkness_at(
+                    -64,
+                    row["flat"].as_bool().unwrap(),
+                    row["y"].as_f64().unwrap(),
+                );
+                let color =
+                    crate::preview_app::adjusted_fog_color([0.2, 0.4, 0.6], darkness, vision);
+                for (value, key) in color.into_iter().zip(["rBits", "gBits", "bBits"]) {
+                    assert_eq!(
+                        value.to_bits(),
+                        row[key].as_i64().unwrap() as i32 as u32,
+                        "{row}"
+                    );
+                }
+                continue;
+            }
+            if let Some(time) = row["voidFogTime"].as_u64() {
+                void_fog_cases += 1;
+                let vision = native_session::survival::water_vision_scale(
+                    time as u16,
+                    row["waterEye"].as_bool().unwrap(),
+                );
+                let darkness = crate::sky_background::void_darkness_at(
+                    -64,
+                    row["flat"].as_bool().unwrap(),
+                    row["y"].as_f64().unwrap(),
+                );
+                let (color, _) =
+                    crate::preview_app::water_fog([0.2, 0.4, 0.6], [-8.0, 96.0], vision, darkness);
+                for (value, key) in color.into_iter().zip(["rBits", "gBits", "bBits"]) {
+                    assert_eq!(
+                        value.to_bits(),
+                        row[key].as_i64().unwrap() as i32 as u32,
+                        "{row}"
+                    );
+                }
+                continue;
+            }
             if let Some(time) = row["waterFogColorTime"].as_u64() {
                 water_fog_color_cases += 1;
                 let vision = native_session::survival::water_vision_scale(
@@ -653,7 +700,7 @@ mod tests {
                     row["waterEye"].as_bool().unwrap(),
                 );
                 let color = ["r", "g", "b"].map(|channel| row[channel].as_f64().unwrap() as f32);
-                let (color, _) = crate::preview_app::water_fog(color, [-8.0, 96.0], vision);
+                let (color, _) = crate::preview_app::water_fog(color, [-8.0, 96.0], vision, 0.0);
                 for (value, key) in color.into_iter().zip(["rBits", "gBits", "bBits"]) {
                     assert_eq!(
                         value.to_bits(),
@@ -672,7 +719,7 @@ mod tests {
                 let start = row["waterFogStart"].as_f64().unwrap() as f32;
                 let end = row["waterFogEnd"].as_f64().unwrap() as f32;
                 let (_, range) =
-                    crate::preview_app::water_fog([0.1, 0.2, 0.3], [start, end], vision);
+                    crate::preview_app::water_fog([0.1, 0.2, 0.3], [start, end], vision, 0.0);
                 assert_eq!(
                     range[0].to_bits(),
                     row["waterFogStartBits"].as_i64().unwrap() as i32 as u32,
@@ -895,6 +942,8 @@ mod tests {
         assert_eq!(water_vision_cases, 1242);
         assert_eq!(water_fog_cases, 168);
         assert_eq!(water_fog_color_cases, 56);
+        assert_eq!(void_fog_cases, 180);
+        assert_eq!(air_fog_cases, 150);
         assert_eq!(clock_definitions, 7);
     }
 }

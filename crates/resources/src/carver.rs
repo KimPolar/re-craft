@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 
 pub mod canyon;
 pub mod cave;
+pub mod schedule;
 
 fn source_random(
     seed: i64,

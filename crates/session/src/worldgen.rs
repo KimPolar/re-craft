@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 use glam::IVec3;
 use native_resources::{
     biome_source::{BiomeSource, ClimateVolume},
+    carver::{CarvingMask, schedule::CarverCache},
     density::DensityEvaluator,
     noise_stage::NoiseStageGenerator,
     packs::{ResourceId, ResourceProvider},
@@ -364,6 +365,31 @@ impl TerrainGenerator {
             |x, y, z| Ok(neighborhood.biome_at_block(x, y, z)?.clone()),
         )
     }
+
+    /// Generate the fresh-terrain carving mask. The caller must still apply it
+    /// to the surface chunk with aquifer and block-replacement rules.
+    pub fn generate_carving_mask(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut CarverCache,
+        chunk: [i32; 2],
+    ) -> Result<CarvingMask> {
+        let min_y = self.noise.router().min_y;
+        let height = self.noise.router().height;
+        cache.generate(provider, self.seed, chunk, min_y, height, |source| {
+            let x = source[0]
+                .checked_mul(4)
+                .context("carver biome quart X overflow")?;
+            let z = source[1]
+                .checked_mul(4)
+                .context("carver biome quart Z overflow")?;
+            Ok(self
+                .source
+                .sample_quart(self.noise.router(), evaluator, [x, 0, z])
+                .clone())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -377,7 +403,7 @@ mod tests {
         }
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
             Ok(if path.starts_with("data/minecraft/worldgen/biome/") {
-                Some(br#"{"has_precipitation":true,"temperature":0.8}"#.to_vec())
+                Some(br#"{"has_precipitation":true,"temperature":0.8,"carvers":[]}"#.to_vec())
             } else if path.starts_with("data/minecraft/worldgen/noise/") {
                 Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
             } else {
@@ -505,5 +531,20 @@ mod tests {
             .generate_biomes([0, 0], &mut DensityEvaluator::default())
             .unwrap();
         assert!(center.values().iter().all(|id| id.path == "the_end"));
+    }
+
+    #[test]
+    fn carving_uses_noise_height_not_larger_dimension_height() {
+        let mut data = Data;
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, -16, 48)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut cache = CarverCache::default();
+        let mask = generator
+            .generate_carving_mask(&mut data, &mut evaluator, &mut cache, [0, 0])
+            .unwrap();
+        assert!(mask.is_empty());
+        assert_eq!((mask.min_y(), mask.max_y()), (1, 8));
     }
 }

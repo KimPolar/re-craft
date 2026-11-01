@@ -87,12 +87,24 @@ impl ChunkDraft {
         self.checked_chest_inventories.len()
     }
 
+    pub(crate) fn checked_chest_inventories(&self) -> &[BlockEntityChange] {
+        &self.checked_chest_inventories
+    }
+
     /// Check the invariants that persistence can verify, then require the
     /// active game registry to approve every changed block state. That check
     /// must reject any light, block-entity, fluid, neighbor, tick, or POI effect
     /// that this draft does not also represent.
     pub(crate) fn validate_for_write(
         &self,
+        validate_change: impl FnMut(&BlockChange) -> Result<()>,
+    ) -> Result<()> {
+        self.validate_for_plan(false, validate_change)
+    }
+
+    pub(crate) fn validate_for_plan(
+        &self,
+        chest_inventories_coordinated: bool,
         mut validate_change: impl FnMut(&BlockChange) -> Result<()>,
     ) -> Result<()> {
         ensure!(
@@ -100,7 +112,8 @@ impl ChunkDraft {
             "chunk draft change count is inconsistent"
         );
         ensure!(
-            !self.uncoordinated_block_entities && self.checked_chest_inventories.is_empty(),
+            !self.uncoordinated_block_entities
+                && (chest_inventories_coordinated || self.checked_chest_inventories.is_empty()),
             "block entity edits require a coordinated world save"
         );
         ensure!(
@@ -1859,6 +1872,16 @@ mod tests {
             .unwrap();
         assert_eq!(draft.checked_chest_inventories.len(), 1);
         assert!(draft.validate_for_write(|_| Ok(())).is_err());
+        assert!(draft.validate_for_plan(true, |_| Ok(())).is_ok());
+        let mut tampered = replacement.clone();
+        *unique_field_mut(&mut tampered, "future").unwrap().unwrap() = Tag::Int(99);
+        draft
+            .replace_block_entities(&[BlockEntityChange {
+                expected: replacement.clone(),
+                replacement: tampered,
+            }])
+            .unwrap();
+        assert!(draft.validate_for_plan(true, |_| Ok(())).is_err());
         let mut invalid = Vec::new();
         let mut changed = replacement.clone();
         *unique_field_mut(&mut changed, "future").unwrap().unwrap() = Tag::Int(0);

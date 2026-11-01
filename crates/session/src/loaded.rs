@@ -1827,6 +1827,13 @@ impl LoadedSession {
     ) -> anyhow::Result<PartialSessionSaveDraft> {
         let player_and_terrain =
             self.draft_player_and_dirty_chunks_inner(player, terrain, tags, air_and_fluid)?;
+        if player_and_terrain
+            .chunks
+            .values()
+            .any(|chunk| chunk.checked_chest_inventory_count() != 0)
+        {
+            self.validate_closed_chest_item_balance(player)?;
+        }
         let entity_chunks = self.draft_tracked_entity_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
         anyhow::ensure!(

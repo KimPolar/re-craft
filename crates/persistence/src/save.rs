@@ -719,11 +719,32 @@ impl WorldWriteGuard {
                 || plan.level_time.is_some(),
             "world save plan is empty"
         );
+        let chest_changes: Vec<_> = plan
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.draft.checked_chest_inventories())
+            .collect();
+        if !chest_changes.is_empty() {
+            ensure!(
+                plan.players.len() == 1,
+                "chest inventory changes require exactly one player"
+            );
+            let player = &plan.players[0];
+            let source = nbt::read(&player.source_nbt)?;
+            crate::chest_transfer::validate(
+                &source,
+                &player.document,
+                player.uuid_words,
+                &chest_changes,
+            )?;
+        }
         let mut groups = BTreeMap::<(RegionKind, DimensionId, i32, i32), Vec<RegionChange>>::new();
         for chunk in &plan.chunks {
             chunk
                 .draft
-                .validate_for_write(|change| validate_change(&chunk.dimension, change))?;
+                .validate_for_plan(!chest_changes.is_empty(), |change| {
+                    validate_change(&chunk.dimension, change)
+                })?;
             let position = chunk.draft.position();
             let replacement = nbt::write(chunk.draft.document())?;
             groups
@@ -3177,6 +3198,170 @@ mod tests {
         fs::write(directory.join("c.2.0.mcc"), &outside).unwrap();
         fs::write(&path, &region).unwrap();
         (path, region, outside)
+    }
+
+    #[test]
+    fn checked_chest_and_player_transfer_commit_together_or_not_at_all() {
+        use crate::edit::BlockEntityChange;
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let position = ChunkPos { x: 0, z: 0 };
+        let terrain = editable_chunk(0);
+        let mut source = draft_chunk_blocks(
+            &terrain,
+            position,
+            &[BlockChange {
+                x: 0,
+                y: 0,
+                z: 0,
+                expected: block_state("minecraft:stone"),
+                replacement: block_state("minecraft:chest"),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let stack = |slot, count| {
+            Tag::Compound(vec![
+                ("Slot".into(), Tag::Byte(slot)),
+                ("id".into(), Tag::String("minecraft:diamond".into())),
+                ("count".into(), Tag::Int(count)),
+            ])
+        };
+        let items = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let chest = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(0)),
+            ("y".into(), Tag::Int(0)),
+            ("z".into(), Tag::Int(0)),
+            ("Items".into(), items(vec![stack(3, 5)])),
+            ("future".into(), Tag::Int(42)),
+        ]);
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), items(vec![chest.clone()])));
+        store_record(&mut region, 0, 2, &source, 10);
+        fs::write(&region_path, &region).unwrap();
+        let mut new_chest = chest.clone();
+        let Tag::Compound(fields) = &mut new_chest else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Items"))
+            .unwrap()
+            .1 = items(vec![]);
+        let change = BlockEntityChange {
+            expected: chest,
+            replacement: new_chest.clone(),
+        };
+        let make_draft = || {
+            let mut draft = draft_chunk_blocks(&source, position, &[]).unwrap();
+            draft
+                .stage_checked_chest_inventories(std::slice::from_ref(&change))
+                .unwrap();
+            draft
+        };
+        let uuid = [0, 0, 0, 1];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                ("future_player".into(), Tag::Int(17)),
+            ]),
+        };
+        let mut updated = player.clone();
+        let Tag::Compound(fields) = &mut updated.value else {
+            unreachable!()
+        };
+        fields.push(("Inventory".into(), items(vec![stack(8, 5)])));
+        let player_dir = world.path().join("players/data");
+        fs::create_dir_all(&player_dir).unwrap();
+        let player_path = player_dir.join(player_data_filename(uuid));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&player).unwrap()).unwrap();
+        let player_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &player_bytes).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let mut missing_player = WorldSavePlan::new();
+        missing_player
+            .add_chunk(dimension.clone(), make_draft(), 20)
+            .unwrap();
+        assert!(guard.write_plan(missing_player, |_, _| Ok(())).is_err());
+        let mut wrong = updated.clone();
+        let Tag::Compound(fields) = &mut wrong.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Inventory"))
+            .unwrap()
+            .1 = items(vec![stack(8, 6)]);
+        let mut unbalanced = WorldSavePlan::new();
+        unbalanced
+            .add_chunk(dimension.clone(), make_draft(), 20)
+            .unwrap();
+        unbalanced
+            .add_player_data(uuid, &player, &wrong, |_, _| Ok(()))
+            .unwrap();
+        assert!(guard.write_plan(unbalanced, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(fs::read(&player_path).unwrap(), player_bytes);
+        let mut stale_plan = WorldSavePlan::new();
+        stale_plan
+            .add_chunk(dimension.clone(), make_draft(), 20)
+            .unwrap();
+        stale_plan
+            .add_player_data(uuid, &player, &updated, |_, _| Ok(()))
+            .unwrap();
+        let mut changed_player = player.clone();
+        let Tag::Compound(fields) = &mut changed_player.value else {
+            unreachable!()
+        };
+        fields.push(("outside_change".into(), Tag::Int(1)));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&changed_player).unwrap())
+            .unwrap();
+        let changed_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &changed_bytes).unwrap();
+        assert!(guard.write_plan(stale_plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(fs::read(&player_path).unwrap(), changed_bytes);
+        fs::write(&player_path, &player_bytes).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_chunk(dimension.clone(), make_draft(), 20).unwrap();
+        plan.add_player_data(uuid, &player, &updated, |_, _| Ok(()))
+            .unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let saved = RegionReader::open_for_region(&region_path, 0, 0)
+            .unwrap()
+            .read_chunk(0, 0)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(saved.value.get("block_entities"), Some(Tag::List { values, .. }) if values == &vec![new_chest])
+        );
+        assert_eq!(
+            nbt::read_gzip(File::open(&player_path).unwrap()).unwrap(),
+            updated
+        );
+        assert_eq!(
+            fs::read(
+                result
+                    .backup_directory
+                    .join("players")
+                    .join(player_data_filename(uuid))
+            )
+            .unwrap(),
+            player_bytes
+        );
+        assert!(!world.path().join(".minecraft-native-pending").exists());
     }
 
     #[test]

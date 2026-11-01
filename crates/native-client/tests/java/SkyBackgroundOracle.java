@@ -95,6 +95,13 @@ public class SkyBackgroundOracle {
                 var row = new JsonArray(); row.add(color.x()); row.add(color.y()); row.add(color.z()); row.add(color.w()); output.add(row);
             }
         }
+        var moonTrack = AttributeTrack.createCodec(EnvironmentAttributes.MOON_ANGLE)
+            .parse(JsonOps.INSTANCE, input.get("moonTrack")).getOrThrow();
+        var moonSampler = moonTrack.bakeSampler(EnvironmentAttributes.MOON_ANGLE, Holder.direct(new WorldClock()), Optional.of(24000), manager);
+        for (int tick = -100; tick <= 24100; tick += 37) {
+            clock.loadFrom(new ClockState(tick, 0, 1, false));
+            var row = new JsonArray(); row.add(moonSampler.applyTimeBased(0f, ++tickId)); output.add(row);
+        }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }
 }

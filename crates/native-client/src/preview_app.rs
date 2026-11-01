@@ -285,6 +285,8 @@ pub fn run_play(
             fog_is_background: false,
             sunset_previous: None,
             sunset_current: None,
+            celestial_angles_previous: [None; 2],
+            celestial_angles_current: [None; 2],
             sky_background_previous: None,
             sky_background_current: None,
             sky_fog_previous: None,
@@ -417,6 +419,8 @@ struct PlayState {
     fog_is_background: bool,
     sunset_previous: Option<(f32, [f32; 4])>,
     sunset_current: Option<(f32, [f32; 4])>,
+    celestial_angles_previous: [Option<f32>; 2],
+    celestial_angles_current: [Option<f32>; 2],
     sky_background_previous: Option<[f32; 3]>,
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
@@ -929,6 +933,7 @@ impl Viewer {
                     fog_range,
                     sky_mix,
                     sunset,
+                    celestial_angles,
                     water,
                 }) = value
                 {
@@ -954,6 +959,16 @@ impl Viewer {
                         play.sunset_previous = play.sunset_current.or(sunset);
                     }
                     play.sunset_current = sunset;
+                    for (index, angle) in celestial_angles.into_iter().enumerate() {
+                        if play.sky_background_tick != Some(snapshot.tick)
+                            || play.celestial_angles_previous[index].is_none()
+                            || play.celestial_angles_current[index].is_none()
+                        {
+                            play.celestial_angles_previous[index] =
+                                play.celestial_angles_current[index].or(angle);
+                        }
+                        play.celestial_angles_current[index] = angle;
+                    }
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_fog_previous.is_none()
                         || play.sky_fog_current.is_none()
@@ -983,8 +998,11 @@ impl Viewer {
                 (play.sky_background_previous, play.sky_background_current)
             {
                 let partial = play.session.partial_tick().clamp(0.0, 1.0);
-                let sun_frame = match (play.sunset_previous, play.sunset_current) {
-                    (Some((previous, _)), Some((current, _))) if background.has_overworld_sky() => {
+                let sun_frame = match (
+                    play.celestial_angles_previous[0],
+                    play.celestial_angles_current[0],
+                ) {
+                    (Some(previous), Some(current)) if background.has_overworld_sky() => {
                         Some(crate::sun_render::Frame {
                             angle_degrees: interpolate_sun_angle(previous, current, partial),
                             rain_brightness: 1.0

@@ -347,6 +347,58 @@ struct SunsetTimeline {
     color: Vec<SunsetColorTrack>,
 }
 
+// Each celestial angle is an independent environment attribute. In particular,
+// an unsupported sunrise color must not suppress the sun or the moon.
+struct CelestialAngle {
+    base: f32,
+    biomes: BTreeMap<String, Option<Option<FloatLayer>>>,
+    tracks: Vec<FogTrack>,
+}
+
+impl CelestialAngle {
+    fn new(attributes: Option<&Value>, name: &str) -> Result<Self> {
+        let base = named_attribute(attributes, name)?
+            .map(FloatLayer::parse)
+            .transpose()?
+            .map_or(0.0, |layer| layer.apply(0.0));
+        Ok(Self {
+            base,
+            biomes: BTreeMap::new(),
+            tracks: Vec::new(),
+        })
+    }
+
+    fn sample(
+        &self,
+        grouped: &[(&str, f64)],
+        mut clock: impl FnMut(&ResourceId) -> Option<i64>,
+    ) -> Option<f32> {
+        let mut total = 0.0;
+        let mut result = None;
+        for &(id, weight) in grouped {
+            let value = self
+                .biomes
+                .get(id)?
+                .as_ref()?
+                .map_or(self.base, |layer| layer.apply(self.base));
+            total += weight;
+            result = Some(match result {
+                None => value,
+                Some(previous) => previous + (weight / total) as f32 * (value - previous),
+            });
+        }
+        let mut result = result?;
+        for track in &self.tracks {
+            result = FloatLayer {
+                value: track.track.sample(clock(&track.track.clock)?)[0],
+                modifier: track.modifier,
+            }
+            .apply(result);
+        }
+        result.is_finite().then_some(result)
+    }
+}
+
 fn named_attribute<'a>(attributes: Option<&'a Value>, name: &str) -> Result<Option<&'a Value>> {
     let Some(attributes) = attributes else {
         return Ok(None);
@@ -572,6 +624,7 @@ pub struct SkyBackground {
     fog_sky_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
     fog_sky_tracks: Option<Vec<SkyTrack>>,
     sunset: Option<SunsetTimeline>,
+    celestial_angles: [Option<CelestialAngle>; 2],
     water: WaterFog,
     flat_world: Option<bool>,
     min_y: i32,
@@ -586,6 +639,7 @@ pub struct BackgroundSample {
     pub fog_range: Option<[f32; 2]>,
     pub sky_mix: Option<([f32; 3], f32)>,
     pub sunset: Option<(f32, [f32; 4])>,
+    pub celestial_angles: [Option<f32>; 2],
     pub water: Option<WaterFogSample>,
 }
 
@@ -667,6 +721,12 @@ impl SkyBackground {
         };
         let mut fog_biomes = BTreeMap::new();
         let mut sunset = SunsetTimeline::new(dimension.get("attributes")).ok();
+        let angle_names = ["visual/sun_angle", "visual/moon_angle"];
+        let mut celestial_angles = if skybox == "overworld" {
+            angle_names.map(|name| CelestialAngle::new(dimension.get("attributes"), name).ok())
+        } else {
+            [None, None]
+        };
         let mut fog_sky_biomes = BTreeMap::new();
         let mut fog_color_biomes = BTreeMap::new();
         let fog_color_base = match dimension.get("attributes") {
@@ -716,6 +776,16 @@ impl SkyBackground {
                         .ok(),
                 );
             }
+            for (angle, attribute_name) in celestial_angles.iter_mut().zip(angle_names) {
+                if let Some(angle) = angle {
+                    angle.biomes.insert(
+                        name.clone(),
+                        named_attribute(biome.get("attributes"), attribute_name)
+                            .and_then(|layer| layer.map(FloatLayer::parse).transpose())
+                            .ok(),
+                    );
+                }
+            }
             fog_biomes.insert(name.clone(), fog_layers(biome.get("attributes")).ok());
             fog_color_biomes.insert(
                 name.clone(),
@@ -748,6 +818,19 @@ impl SkyBackground {
             let mut found = false;
             for (name, value) in entries {
                 let id = ResourceId::parse(name)?;
+                for (index, attribute_name) in angle_names.iter().enumerate() {
+                    if id.namespace == "minecraft"
+                        && id.path == *attribute_name
+                        && celestial_angles[index].is_some()
+                    {
+                        match FogTrack::parse(0, &timeline, value) {
+                            Ok(track) => {
+                                celestial_angles[index].as_mut().unwrap().tracks.push(track)
+                            }
+                            Err(_) => celestial_angles[index] = None,
+                        }
+                    }
+                }
                 if id.namespace == "minecraft" {
                     if let Some(index) = match id.path.as_str() {
                         "visual/water_fog_start_distance" => Some(0),
@@ -851,6 +934,7 @@ impl SkyBackground {
             fog_sky_biomes,
             fog_sky_tracks,
             sunset,
+            celestial_angles,
             water,
             flat_world: None,
             min_y,
@@ -988,6 +1072,11 @@ impl SkyBackground {
                 .sunset
                 .as_ref()
                 .and_then(|sunset| sunset.sample(&grouped, &mut clock_ticks)),
+            celestial_angles: std::array::from_fn(|i| {
+                self.celestial_angles[i]
+                    .as_ref()
+                    .and_then(|angle| angle.sample(&grouped, &mut clock_ticks))
+            }),
             water,
         })
     }
@@ -1207,7 +1296,7 @@ mod tests {
         ];
         let sunset_modifier_cases: Vec<_> = modifier_values.iter().map(|(name, value, _)| json!({"attributes":{"minecraft:visual/sunrise_sunset_color":{"modifier":name,"argument":value}}})).collect();
         let sunset_track_cases: Vec<_> = modifier_values.iter().map(|(name, a, b)| json!({"track":{"modifier":name,"keyframes":[{"ticks":0,"value":a},{"ticks":10,"value":b}]},"ticks":[0,3,7,10,17]})).collect();
-        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases,"sunriseCases":sunrise_cases,"sunsetModifierCases":sunset_modifier_cases,"sunsetTrackCases":sunset_track_cases});
+        let input = json!({"biomes":biomes,"track":track,"fogTrack":fog_track,"cases":cases,"fogColorCases":fog_color_cases,"weatherCases":weather_cases,"sunriseCases":sunrise_cases,"sunsetModifierCases":sunset_modifier_cases,"sunsetTrackCases":sunset_track_cases,"moonTrack":day["tracks"]["minecraft:visual/moon_angle"]});
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("SkyBackgroundOracle.java");
         let input_file = temp.path().join("input.json");
@@ -1315,6 +1404,7 @@ mod tests {
                 + sunrise_cases.len()
                 + sunset_modifier_cases.len()
                 + sunset_track_cases.len() * 5
+                + (-100..=24100).step_by(37).count()
         );
         for (case, expected) in cases.iter().zip(&expected) {
             let p = &case["position"];
@@ -1518,7 +1608,27 @@ mod tests {
                 .sample(&[("minecraft:plains", 1.0)], |_| Some(tick))
                 .unwrap();
             assert_eq!(angle, sun.sample(tick)[0]);
+            assert_eq!(
+                overworld.celestial_angles[0]
+                    .as_ref()
+                    .unwrap()
+                    .sample(&[("minecraft:plains", 1.0)], |_| Some(tick)),
+                Some(angle)
+            );
             assert_eq!(color, sunset.apply(tick, [0.0; 4]));
+        }
+        for tick in (-100..=24100).step_by(37) {
+            let actual = overworld.celestial_angles[1]
+                .as_ref()
+                .unwrap()
+                .sample(&[("minecraft:plains", 1.0)], |_| Some(tick))
+                .unwrap();
+            assert!(
+                (actual - expected[offset][0]).abs() < 0.000_1,
+                "moon tick {tick}: {actual} != {}",
+                expected[offset][0]
+            );
+            offset += 1;
         }
         let nether = SkyBackground::load(&mut resources, "minecraft:the_nether", 0, 128)
             .unwrap()
@@ -1566,6 +1676,72 @@ mod tests {
                 [1.0; 3]
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn celestial_angles_are_independent_of_sunset_and_each_other() {
+        use serde_json::json;
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/example/dimension_type/test.json" => {
+                        json!({"timelines":["example:day"],"attributes":{
+                            "visual/sun_angle":10.0,"visual/moon_angle":100.0,
+                            "visual/sunrise_sunset_color":{"modifier":"unsupported","argument":"#ffffff"}
+                        }})
+                    }
+                    "data/example/worldgen/biome/test.json" => json!({"attributes":{
+                        "visual/sun_angle":{"modifier":"add","argument":5.0},
+                        "visual/moon_angle":{"modifier":"multiply","argument":2.0}
+                    }}),
+                    "data/example/timeline/day.json" => {
+                        json!({"clock":"example:clock","period_ticks":20,"tracks":{
+                            "visual/sun_angle":{"modifier":"add","keyframes":[{"ticks":0,"value":20.0}]},
+                            "visual/moon_angle":{"modifier":"subtract","keyframes":[{"ticks":0,"value":30.0}]}
+                        }})
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(if folder == "worldgen/biome" {
+                    vec![ResourceId::parse("example:test")?]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let background = SkyBackground::load(&mut Data, "example:test", 0, 16)
+            .unwrap()
+            .unwrap();
+        assert!(background.sunset.is_none());
+        let groups = [("example:test", 1.0)];
+        assert_eq!(
+            background.celestial_angles[0]
+                .as_ref()
+                .unwrap()
+                .sample(&groups, |_| Some(0)),
+            Some(35.0)
+        );
+        assert_eq!(
+            background.celestial_angles[1]
+                .as_ref()
+                .unwrap()
+                .sample(&groups, |_| Some(0)),
+            Some(170.0)
+        );
+        assert_eq!(
+            background.celestial_angles[1]
+                .as_ref()
+                .unwrap()
+                .sample(&groups, |_| None),
+            None
         );
     }
 
@@ -1767,6 +1943,7 @@ mod tests {
             fog_sky_biomes: BTreeMap::new(),
             fog_sky_tracks: None,
             sunset: None,
+            celestial_angles: [None, None],
             water: WaterFog::default(),
             flat_world: None,
             min_y: 0,
@@ -1781,6 +1958,7 @@ mod tests {
                 fog_range: None,
                 sky_mix: None,
                 sunset: None,
+                celestial_angles: [None, None],
                 water: None
             })
         );
@@ -1793,6 +1971,7 @@ mod tests {
                 fog_range: None,
                 sky_mix: None,
                 sunset: None,
+                celestial_angles: [None, None],
                 water: None
             })
         );

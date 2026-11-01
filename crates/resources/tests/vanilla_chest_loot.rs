@@ -129,7 +129,17 @@ fn buried_treasure_chest_loot_matches_java() {
             );
             (slots, rng.next_long())
         } else {
-            let mut rng = XoroshiroRandom::new(seed);
+            let mut rng = if mode == 1 {
+                XoroshiroRandom::new(seed)
+            } else {
+                assert_eq!(mode, 2);
+                XoroshiroRandom::for_world_sequence(
+                    seed,
+                    0,
+                    true,
+                    Some("minecraft:chests/buried_treasure"),
+                )
+            };
             let slots = table
                 .fill_with_random(&[false; 27], &mut rng, max_stack)
                 .unwrap();
@@ -156,5 +166,5 @@ fn buried_treasure_chest_loot_matches_java() {
         assert_eq!(actual_next, next, "random state mode={mode} seed={seed}");
         cases += 1;
     }
-    assert_eq!(cases, 20);
+    assert_eq!(cases, 32);
 }

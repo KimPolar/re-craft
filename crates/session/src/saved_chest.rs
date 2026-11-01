@@ -375,15 +375,34 @@ impl SavedChest {
         &mut self,
         id: &ResourceId,
         table: &ChestLootTable,
+        resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        let (_, seed) = self
+            .pending_loot
+            .as_ref()
+            .context("chest has no pending loot")?;
+        ensure!(*seed != 0, "zero loot seed needs a world random source");
+        let mut random = native_core::random::LegacyRandom::new(*seed);
+        self.unpack_loot_with_random(id, table, &mut random, resolve)
+    }
+
+    /// Resolve one chest with a supplied stream. Neither the chest nor the
+    /// caller's stream is modified if any prototype or item is unsupported.
+    pub(crate) fn unpack_loot_with_random<R: native_resources::chest_loot::ChestLootRandom>(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        random: &mut R,
         mut resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
     ) -> Result<()> {
-        let (expected, seed) = self
+        let (expected, _) = self
             .pending_loot
             .as_ref()
             .context("chest has no pending loot")?;
         ensure!(expected == id, "loot table does not match the chest");
         let mut prototypes = Vec::new();
-        let generated = table.fill_seeded(&[false; 27], *seed, |item| {
+        let mut next = random.clone();
+        let generated = table.fill_with_random(&[false; 27], &mut next, |item| {
             let stack = resolve(item)?;
             let expected_id = format!("{}:{}", item.id.namespace, item.id.path);
             ensure!(
@@ -425,6 +444,7 @@ impl SavedChest {
         self.slots = slots;
         self.pending_loot = None;
         self.loot_unpacked = true;
+        *random = next;
         Ok(())
     }
 

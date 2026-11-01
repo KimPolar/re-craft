@@ -142,6 +142,7 @@ pub struct PartialSessionSaveDraft {
     clocks: WorldClockDraft,
     weather: Option<WeatherSaveDraft>,
     level_time: Option<LevelTimeSaveDraft>,
+    random_sequences: Option<native_persistence::random_sequences::RandomSequences>,
 }
 
 struct WeatherSaveDraft {
@@ -152,6 +153,11 @@ struct WeatherSaveDraft {
 struct LevelTimeSaveDraft {
     source: Arc<native_persistence::nbt::NamedTag>,
     time: i64,
+}
+
+struct SessionRandomSequences {
+    world_seed: i64,
+    data: native_persistence::random_sequences::RandomSequences,
 }
 
 /// A partial same-tick snapshot including all recorded POI block transitions.
@@ -232,6 +238,9 @@ impl PartialSessionSaveDraft {
         }
         if let Some(level) = &self.level_time {
             plan.add_level_time(&level.source, level.time)?;
+        }
+        if let Some(sequences) = &self.random_sequences {
+            plan.add_random_sequences(sequences)?;
         }
         for (position, draft) in &self.entity_chunks {
             draft.add_to_save_plan(
@@ -372,6 +381,7 @@ pub struct LoadedSession {
     item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     loot: Option<Arc<BlockLootTables>>,
     chest_loot: Option<Arc<native_resources::chest_loot::ChestLootTables>>,
+    random_sequences: Option<SessionRandomSequences>,
     mining_tags: Option<Arc<native_resources::mining_tags::MiningTags>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
@@ -1683,6 +1693,12 @@ impl LoadedSession {
             self.chest_dirty_chunks.is_empty(),
             "changed chest inventories require a coordinated world save"
         );
+        anyhow::ensure!(
+            self.random_sequences
+                .as_ref()
+                .is_none_or(|sequences| !sequences.data.is_dirty()),
+            "changed random sequences require a coordinated world save"
+        );
         self.draft_player_state_inner(original)
     }
 
@@ -1714,6 +1730,24 @@ impl LoadedSession {
     /// heightmap, scheduled tick, chest inventory and completed light changes.
     /// Entity regions, clocks and unsupported effects are still separate.
     pub fn draft_player_and_dirty_chunks(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        sources: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PlayerWorldDraft> {
+        anyhow::ensure!(
+            self.random_sequences
+                .as_ref()
+                .is_none_or(|sequences| !sequences.data.is_dirty()),
+            "changed random sequences require a coordinated world save"
+        );
+        self.draft_player_and_dirty_chunks_inner(player, sources, tags, air_and_fluid)
+    }
+
+    fn draft_player_and_dirty_chunks_inner(
         &self,
         player: &native_persistence::nbt::NamedTag,
         sources: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
@@ -1758,7 +1792,7 @@ impl LoadedSession {
         ) -> anyhow::Result<(bool, bool)>,
     ) -> anyhow::Result<PartialSessionSaveDraft> {
         let player_and_terrain =
-            self.draft_player_and_dirty_chunks(player, terrain, tags, air_and_fluid)?;
+            self.draft_player_and_dirty_chunks_inner(player, terrain, tags, air_and_fluid)?;
         let entity_chunks = self.draft_tracked_entity_chunks()?;
         let clocks = self.draft_world_clocks(clock)?;
         anyhow::ensure!(
@@ -1796,6 +1830,11 @@ impl LoadedSession {
             } else {
                 None
             },
+            random_sequences: self
+                .random_sequences
+                .as_ref()
+                .filter(|sequences| sequences.data.is_dirty())
+                .map(|sequences| sequences.data.clone()),
         })
     }
 
@@ -3299,6 +3338,7 @@ impl LoadedSession {
             item_registry: None,
             loot: None,
             chest_loot: None,
+            random_sequences: None,
             mining_tags: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
@@ -3969,6 +4009,24 @@ impl LoadedSession {
         self.chest_loot = Some(loot);
     }
 
+    /// Capture the shared source before the session consumes any sequence.
+    pub fn set_random_sequences(
+        &mut self,
+        world_seed: i64,
+        data: native_persistence::random_sequences::RandomSequences,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "random sequences must be loaded before the first tick"
+        );
+        anyhow::ensure!(
+            self.random_sequences.is_none() && !data.is_dirty(),
+            "random sequence source is already set or dirty"
+        );
+        self.random_sequences = Some(SessionRandomSequences { world_seed, data });
+        Ok(())
+    }
+
     fn saved_chest_internal(
         &self,
         position: IVec3,
@@ -4121,9 +4179,16 @@ impl LoadedSession {
         )
     }
 
-    fn unpack_chest_loot(&self, chest: &mut crate::saved_chest::SavedChest) -> anyhow::Result<()> {
+    fn unpack_chest_loot(
+        &self,
+        chest: &mut crate::saved_chest::SavedChest,
+        staged: &mut BTreeMap<
+            native_resources::packs::ResourceId,
+            native_core::random::XoroshiroRandom,
+        >,
+    ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
-        let Some((id, _)) = chest.pending_loot() else {
+        let Some((id, seed)) = chest.pending_loot() else {
             return Ok(());
         };
         ensure!(
@@ -4140,7 +4205,7 @@ impl LoadedSession {
             .item_registry
             .as_ref()
             .context("item registry is unavailable")?;
-        chest.unpack_seeded_loot(&id, table, |item| {
+        let resolve = |item: &native_resources::chest_loot::ChestLootItem| {
             let id = format!("{}:{}", item.id.namespace, item.id.path);
             ensure!(
                 registry.id(&id).is_some() && id != "minecraft:air",
@@ -4167,7 +4232,23 @@ impl LoadedSession {
                 .context("loot item prototype is unsupported")?;
             crate::inventory::ItemStack::new(id, 1, maximum, components)
                 .context("invalid loot item prototype")
-        })
+        };
+        if seed != 0 {
+            chest.unpack_seeded_loot(&id, table, resolve)
+        } else {
+            let sequence = table
+                .random_sequence()
+                .context("loot table has no named random sequence")?;
+            if !staged.contains_key(sequence) {
+                let saved = self
+                    .random_sequences
+                    .as_ref()
+                    .context("world random sequences are unavailable")?;
+                let name = format!("{}:{}", sequence.namespace, sequence.path);
+                staged.insert(sequence.clone(), saved.data.get(&name, saved.world_seed)?);
+            }
+            chest.unpack_loot_with_random(&id, table, staged.get_mut(sequence).unwrap(), resolve)
+        }
     }
 
     fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
@@ -4250,11 +4331,20 @@ impl LoadedSession {
             self.notify_chest_locked(position, other_position, custom_name);
             return false;
         }
-        if self.unpack_chest_loot(&mut chest).is_err()
-            || pair
-                .as_mut()
-                .is_some_and(|(_, other)| self.unpack_chest_loot(other).is_err())
-        {
+        let mut staged = BTreeMap::new();
+        // Java resolves the first (right) half before the second half, regardless
+        // of which side was clicked. Both may consume the same named stream.
+        let resolved = if kind == Some("left") {
+            pair.as_mut()
+                .is_none_or(|(_, other)| self.unpack_chest_loot(other, &mut staged).is_ok())
+                && self.unpack_chest_loot(&mut chest, &mut staged).is_ok()
+        } else {
+            self.unpack_chest_loot(&mut chest, &mut staged).is_ok()
+                && pair
+                    .as_mut()
+                    .is_none_or(|(_, other)| self.unpack_chest_loot(other, &mut staged).is_ok())
+        };
+        if !resolved {
             return false;
         }
         let key = |p: IVec3| (p.x, p.y, p.z);
@@ -4303,6 +4393,19 @@ impl LoadedSession {
             self.push_chest_sound(position, None, true);
             if self.game_mode != GameMode::Spectator {
                 self.set_trapped_chest_open(position, true);
+            }
+        }
+        if !staged.is_empty() {
+            let sequences = self
+                .random_sequences
+                .as_mut()
+                .expect("a staged sequence has a source");
+            for (id, random) in staged {
+                let name = format!("{}:{}", id.namespace, id.path);
+                sequences
+                    .data
+                    .set(&name, &random)
+                    .expect("validated random sequence identifier");
             }
         }
         true
@@ -22404,8 +22507,14 @@ mod tests {
             while lines.peek().is_some_and(|line| line.starts_with("P ")) {
                 expected.push(lines.next().unwrap().to_owned());
             }
-            assert!(lines.next().unwrap().starts_with("R "));
-            if mode != 0 {
+            let next: i64 = lines
+                .next()
+                .unwrap()
+                .strip_prefix("R ")
+                .unwrap()
+                .parse()
+                .unwrap();
+            if mode == 1 {
                 continue;
             }
             let (mut session, _, position, chunk) = saved_chest_fixture();
@@ -22425,7 +22534,9 @@ mod tests {
                 "LootTable".into(),
                 Tag::String("minecraft:chests/buried_treasure".into()),
             ));
-            fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            if mode == 0 {
+                fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            }
             Arc::make_mut(&mut session.world)
                 .saved_block_entities
                 .insert(
@@ -22434,6 +22545,18 @@ mod tests {
                 );
             session.set_chest_loot(Arc::clone(&tables));
             session.set_item_registry(Arc::clone(&registry));
+            if mode == 2 {
+                session
+                    .set_random_sequences(
+                        seed,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                assert!(Arc::make_mut(&mut session.inventory).toggle());
+                assert!(!session.try_open_saved_chest(position - session.origin));
+                assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
+                assert!(Arc::make_mut(&mut session.inventory).toggle());
+            }
             assert!(
                 session.try_open_saved_chest(position - session.origin),
                 "seed {seed}"
@@ -22457,6 +22580,14 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, expected, "seed {seed}");
+            if mode == 2 {
+                let sequences = &session.random_sequences.as_ref().unwrap().data;
+                assert!(sequences.is_dirty());
+                let mut random = sequences
+                    .get("minecraft:chests/buried_treasure", seed)
+                    .unwrap();
+                assert_eq!(random.next_long(), next, "seed {seed}");
+            }
             assert!(Arc::make_mut(&mut session.inventory).toggle());
             session.collect_closed_chest();
             let chest = session.saved_chest(position).unwrap().unwrap();
@@ -22479,7 +22610,146 @@ mod tests {
             assert_eq!(restored.slots, chest.slots);
             cases += 1;
         }
-        assert_eq!(cases, 10);
+        assert_eq!(cases, 21);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn double_chest_named_loot_uses_right_first_and_rolls_back_on_failure() {
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::{
+            chest_loot::{ChestLootItem, ChestLootTables},
+            packs::{ResourceId, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let tables = Arc::new(ChestLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let id = ResourceId::parse("minecraft:chests/buried_treasure").unwrap();
+        let table = tables.get(&id).unwrap();
+        let base = native_persistence::random_sequences::RandomSequences::read(None).unwrap();
+        let mut expected_rng = base.get("minecraft:chests/buried_treasure", 42).unwrap();
+        let limit = |item: &ChestLootItem| -> anyhow::Result<u32> {
+            Ok(match item.id.path.as_str() {
+                "potion"
+                | "leather_chestplate"
+                | "iron_sword"
+                | "iron_spear"
+                | "copper_nautilus_armor"
+                | "iron_nautilus_armor"
+                | "golden_nautilus_armor"
+                | "diamond_nautilus_armor" => 1,
+                _ => 64,
+            })
+        };
+        let right_expected = table
+            .fill_with_random(&[false; 27], &mut expected_rng, limit)
+            .unwrap();
+        let left_expected = table
+            .fill_with_random(&[false; 27], &mut expected_rng, limit)
+            .unwrap();
+        for (click_left, invalid_left) in [(true, false), (false, false), (true, true)] {
+            let (mut session, _, left, chunk) = saved_chest_fixture();
+            let right = left + IVec3::X;
+            let left_state = session.intern_block(state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "left"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            let right_state = session.intern_block(state(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "right"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(left - session.origin, left_state));
+            assert!(session.set(right - session.origin, right_state));
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!()
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                panic!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String(
+                    if invalid_left {
+                        "example:missing"
+                    } else {
+                        "minecraft:chests/buried_treasure"
+                    }
+                    .into(),
+                ),
+            ));
+            values.push(Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(right.x)),
+                ("y".into(), Tag::Int(right.y)),
+                ("z".into(), Tag::Int(right.z)),
+                (
+                    "LootTable".into(),
+                    Tag::String("minecraft:chests/buried_treasure".into()),
+                ),
+            ]));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_chest_loot(Arc::clone(&tables));
+            session.set_item_registry(Arc::clone(&registry));
+            session.set_random_sequences(42, base.clone()).unwrap();
+            let clicked = if click_left { left } else { right };
+            if invalid_left {
+                assert!(!session.try_open_saved_chest(clicked - session.origin));
+                assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
+                assert!(session.chest_contents.is_empty());
+                continue;
+            }
+            assert!(session.try_open_saved_chest(clicked - session.origin));
+            for (offset, expected) in [(0, &right_expected), (27, &left_expected)] {
+                for (slot, expected) in expected.iter().enumerate() {
+                    let actual = session
+                        .inventory
+                        .slot(crate::inventory::PlayerSlot::Chest((offset + slot) as u8));
+                    assert_eq!(
+                        actual.map(|item| (item.id().to_owned(), item.count())),
+                        expected.as_ref().map(|item| (
+                            format!("{}:{}", item.id.namespace, item.id.path),
+                            item.count
+                        )),
+                        "clicked left={click_left} slot={}",
+                        offset + slot
+                    );
+                }
+            }
+            assert_eq!(
+                session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("minecraft:chests/buried_treasure", 42)
+                    .unwrap()
+                    .state(),
+                expected_rng.state()
+            );
+        }
     }
 
     #[test]
@@ -25442,6 +25712,31 @@ mod tests {
                 .capture_level_time_source(Arc::clone(&level))
                 .is_err()
         );
+        session
+            .set_random_sequences(
+                42,
+                native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            )
+            .unwrap();
+        let sequences = &mut session.random_sequences.as_mut().unwrap().data;
+        let mut random = sequences
+            .get("minecraft:chests/buried_treasure", 42)
+            .unwrap();
+        random.next_long();
+        sequences
+            .set("minecraft:chests/buried_treasure", &random)
+            .unwrap();
+        assert!(session.draft_player_state(&player).is_err());
+        assert!(
+            session
+                .draft_player_and_dirty_chunks(
+                    &player,
+                    &BTreeMap::new(),
+                    &test_heightmap_tags(),
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
         session.update(TICK);
         let state = session.weather.as_ref().unwrap().data;
         let draft = session
@@ -25464,6 +25759,7 @@ mod tests {
             .unwrap();
         assert!(plan.has_weather());
         assert!(plan.has_level_time());
+        assert!(plan.has_random_sequences());
         assert!(session.capture_weather_source(None).is_err());
         let mut existing = self::session();
         existing.set_weather(Some(true), Some(SavedWeather::default()), false);

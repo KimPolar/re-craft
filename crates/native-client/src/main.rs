@@ -706,10 +706,16 @@ fn prepare_existing_world(
         BTreeMap::new()
     };
     let mut world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
-    match reader.saved_world_seed() {
-        Ok(seed) => world.set_biome_world_seed(seed),
-        Err(error) => eprintln!("Cannot read the world seed for biome colors: {error:#}"),
-    }
+    let world_seed = match reader.saved_world_seed() {
+        Ok(seed) => {
+            world.set_biome_world_seed(seed);
+            seed
+        }
+        Err(error) => {
+            eprintln!("Cannot read the world seed for biome colors: {error:#}");
+            None
+        }
+    };
     let origin = IVec3::new(
         center
             .x
@@ -871,6 +877,12 @@ fn prepare_existing_world(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        if let Some(seed) = world_seed {
+            match reader.random_sequences() {
+                Ok(sequences) => session.set_random_sequences(seed, sequences)?,
+                Err(error) => eprintln!("World random sequences are unavailable: {error:#}"),
+            }
+        }
         session
             .set_initial_game_time(reader.game_time()?)
             .map_err(anyhow::Error::msg)?;

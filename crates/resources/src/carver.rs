@@ -2,6 +2,7 @@
 //! Aquifer application and world integration are separate stages.
 use anyhow::{Context, Result, ensure};
 
+pub mod apply;
 pub mod canyon;
 pub mod cave;
 pub mod schedule;

@@ -12,6 +12,9 @@ import net.minecraft.world.item.*;
 import net.minecraft.world.item.component.TooltipDisplay;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.item.alchemy.*;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.core.Holder;
 
 public class ItemTooltipOracle {
@@ -40,6 +43,21 @@ public class ItemTooltipOracle {
         var holder=(Holder<Potion>)Potions.class.getField(input.get("potion").getAsString().toUpperCase(java.util.Locale.ROOT)).get(null);
         stack.set(DataComponents.POTION_CONTENTS,new PotionContents(holder));
       }
+      if(input.has("custom_effects")) {
+        var contents=stack.getOrDefault(DataComponents.POTION_CONTENTS,PotionContents.EMPTY);
+        for(var value:input.getAsJsonArray("custom_effects")) {
+          var effect=value.getAsJsonObject();
+          @SuppressWarnings("unchecked")
+          var holder=(Holder<MobEffect>)MobEffects.class.getField(effect.get("id").getAsString().toUpperCase(java.util.Locale.ROOT)).get(null);
+          int duration=effect.has("duration")?effect.get("duration").getAsInt():0;
+          int amplifier=effect.has("amplifier")?effect.get("amplifier").getAsInt():0;
+          boolean ambient=effect.has("ambient")&&effect.get("ambient").getAsBoolean();
+          boolean visible=!effect.has("show_particles")||effect.get("show_particles").getAsBoolean();
+          boolean icon=!effect.has("show_icon")||effect.get("show_icon").getAsBoolean();
+          contents=contents.withEffectAdded(new MobEffectInstance(holder,duration,amplifier,ambient,visible,icon));
+        }
+        stack.set(DataComponents.POTION_CONTENTS,contents);
+      }
       if(input.has("scale")) stack.set(DataComponents.POTION_DURATION_SCALE,input.get("scale").getAsFloat());
       if(input.has("custom")) stack.set(DataComponents.CUSTOM_NAME,Component.literal(input.get("custom").getAsString()));
       if(input.has("item_name")) stack.set(DataComponents.ITEM_NAME,Component.literal(input.get("item_name").getAsString()));
@@ -56,6 +74,7 @@ public class ItemTooltipOracle {
         lines.add(ComponentSerialization.CODEC.encodeStart(JsonOps.INSTANCE,component).getOrThrow());
       }
       var row=new JsonObject();row.add("lines",lines);row.addProperty("description",item.getDescriptionId());
+      if(input.has("custom_effects")) row.add("contents",PotionContents.CODEC.encodeStart(registries.createSerializationContext(JsonOps.INSTANCE),stack.get(DataComponents.POTION_CONTENTS)).getOrThrow());
       var spans=new JsonArray();
       for(var component:stack.getTooltipLines(Item.TooltipContext.EMPTY,null,TooltipFlag.NORMAL)) {
         var line=new JsonArray();

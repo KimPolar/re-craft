@@ -399,6 +399,76 @@ mod tests {
             serde_json::json!({"id":"minecraft:potion","potion":"swiftness","hide_potion":true}),
         );
         cases.push(serde_json::json!({"id":"minecraft:potion","hide_potion":true}));
+        for effect in [
+            "speed",
+            "slowness",
+            "haste",
+            "mining_fatigue",
+            "strength",
+            "instant_health",
+            "instant_damage",
+            "jump_boost",
+            "nausea",
+            "regeneration",
+            "resistance",
+            "fire_resistance",
+            "water_breathing",
+            "invisibility",
+            "blindness",
+            "night_vision",
+            "hunger",
+            "weakness",
+            "poison",
+            "wither",
+            "health_boost",
+            "absorption",
+            "saturation",
+            "glowing",
+            "levitation",
+            "luck",
+            "unluck",
+            "slow_falling",
+            "conduit_power",
+            "dolphins_grace",
+            "bad_omen",
+            "hero_of_the_village",
+            "darkness",
+            "trial_omen",
+            "raid_omen",
+            "wind_charged",
+            "weaving",
+            "oozing",
+            "infested",
+            "breath_of_the_nautilus",
+        ] {
+            for (amplifier, duration) in
+                [(0, -1), (1, 0), (5, 20), (9, 21), (10, 1801), (255, 72001)]
+            {
+                for id in [
+                    "potion",
+                    "splash_potion",
+                    "lingering_potion",
+                    "tipped_arrow",
+                    "apple",
+                ] {
+                    cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"custom_effects":[{"id":effect,"amplifier":amplifier,"duration":duration}]}));
+                }
+            }
+        }
+        cases.push(serde_json::json!({"id":"minecraft:potion","potion":"swiftness","custom_effects":[{"id":"speed","duration":-1,"amplifier":255},{"id":"weakness","duration":40,"amplifier":1,"ambient":true,"show_particles":false,"show_icon":false}],"lore":["Lore"]}));
+        cases.push(serde_json::json!({"id":"minecraft:apple","custom_effects":[]}));
+        cases.push(serde_json::json!({"id":"minecraft:potion","custom_effects":[{"id":"haste","duration":100}],"hide_potion":true}));
+        cases.push(serde_json::json!({"id":"minecraft:potion","custom_effects":[{"id":"haste"}]}));
+        for id in [
+            "potion",
+            "splash_potion",
+            "lingering_potion",
+            "tipped_arrow",
+        ] {
+            for scale in [0.0, 0.125, 0.5, 1.5, 2.0] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"scale":scale,"custom_effects":[{"id":"haste","duration":1801,"amplifier":1}]}));
+            }
+        }
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
@@ -481,14 +551,49 @@ mod tests {
                     },
                 ));
             }
-            if let Some(potion) = case["potion"].as_str() {
-                fields.push((
-                    "minecraft:potion_contents".into(),
-                    Tag::Compound(vec![(
+            if case["potion"].is_string() || case["custom_effects"].is_array() {
+                let mut contents = Vec::new();
+                if let Some(potion) = case["potion"].as_str() {
+                    contents.push((
                         "potion".into(),
                         Tag::String(format!("minecraft:{potion}").as_str().into()),
-                    )]),
-                ));
+                    ));
+                }
+                if let Some(effects) = case["custom_effects"].as_array() {
+                    let values = effects
+                        .iter()
+                        .map(|effect| {
+                            let mut fields = vec![(
+                                "id".into(),
+                                Tag::String(
+                                    format!("minecraft:{}", effect["id"].as_str().unwrap())
+                                        .as_str()
+                                        .into(),
+                                ),
+                            )];
+                            if let Some(duration) = effect["duration"].as_i64() {
+                                fields.push(("duration".into(), Tag::Int(duration as i32)));
+                            }
+                            if let Some(amplifier) = effect["amplifier"].as_u64() {
+                                fields.push(("amplifier".into(), Tag::Byte(amplifier as u8 as i8)));
+                            }
+                            for flag in ["ambient", "show_particles", "show_icon"] {
+                                if let Some(value) = effect[flag].as_bool() {
+                                    fields.push((flag.into(), Tag::Byte(i8::from(value))));
+                                }
+                            }
+                            Tag::Compound(fields)
+                        })
+                        .collect();
+                    contents.push((
+                        "custom_effects".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values,
+                        },
+                    ));
+                }
+                fields.push(("minecraft:potion_contents".into(), Tag::Compound(contents)));
             }
             let item = ItemStack::new(
                 case["id"].as_str().unwrap().into(),
@@ -504,6 +609,7 @@ mod tests {
                 continue;
             }
             let potion_case = case["potion"].is_string()
+                || case["custom_effects"].is_array()
                 || matches!(
                     case["id"].as_str(),
                     Some(

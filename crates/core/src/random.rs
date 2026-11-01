@@ -1,4 +1,5 @@
 //! The integer and uniform floating-point methods of 26.3 random sources.
+use md5::{Digest, Md5};
 
 const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SILVER: u64 = 0x6a09_e667_f3bc_c909;
@@ -148,6 +149,30 @@ impl XoroshiroRandom {
         } else {
             Self { low, high }
         }
+    }
+
+    /// Initialize the named sequence used by Java's `RandomSequences`.
+    /// `id`, when supplied, must be the canonical namespace-qualified ID.
+    pub fn for_world_sequence(
+        world_seed: i64,
+        salt: i32,
+        include_world_seed: bool,
+        id: Option<&str>,
+    ) -> Self {
+        let seed = (if include_world_seed { world_seed } else { 0 }) ^ i64::from(salt);
+        let mut low = seed as u64 ^ SILVER;
+        let mut high = low.wrapping_add(GOLDEN);
+        if let Some(id) = id {
+            let hash = Md5::digest(id.as_bytes());
+            low ^= u64::from_be_bytes(hash[..8].try_into().expect("MD5 has 16 bytes"));
+            high ^= u64::from_be_bytes(hash[8..].try_into().expect("MD5 has 16 bytes"));
+        }
+        Self::from_state(mix_stafford13(low), mix_stafford13(high))
+    }
+
+    /// State words in the order used by Java's xoroshiro codec.
+    pub fn state(&self) -> (u64, u64) {
+        (self.low, self.high)
     }
 
     fn next_u64(&mut self) -> u64 {

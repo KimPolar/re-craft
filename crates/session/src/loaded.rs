@@ -968,6 +968,38 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
     }
 }
 
+// Sound types are properties of vanilla block code, not of resource-pack
+// sounds.json. Unknown block types are left unresolved until implemented.
+fn block_fall_sound(state: &BlockState) -> Option<&'static str> {
+    match state.name.as_str() {
+        "minecraft:stone"
+        | "minecraft:cobblestone"
+        | "minecraft:stone_bricks"
+        | "minecraft:granite"
+        | "minecraft:diorite"
+        | "minecraft:andesite"
+        | "minecraft:end_stone"
+        | "minecraft:sandstone"
+        | "minecraft:red_sandstone"
+        | "minecraft:terracotta"
+        | "minecraft:blackstone"
+        | "minecraft:obsidian" => Some("block.stone.fall"),
+        "minecraft:deepslate" | "minecraft:cobbled_deepslate" => Some("block.deepslate.fall"),
+        "minecraft:netherrack" => Some("block.netherrack.fall"),
+        "minecraft:nether_bricks" => Some("block.nether_bricks.fall"),
+        "minecraft:basalt" => Some("block.basalt.fall"),
+        "minecraft:snow_block" => Some("block.snow.fall"),
+        "minecraft:ice" | "minecraft:glass" => Some("block.glass.fall"),
+        "minecraft:moss_block" => Some("block.moss.fall"),
+        "minecraft:dirt" | "minecraft:gravel" => Some("block.gravel.fall"),
+        "minecraft:grass_block" | "minecraft:hay_block" => Some("block.grass.fall"),
+        "minecraft:sand" | "minecraft:red_sand" => Some("block.sand.fall"),
+        "minecraft:oak_planks" | "minecraft:oak_log" => Some("block.wood.fall"),
+        "minecraft:honey_block" if state.properties.is_empty() => Some("block.honey_block.fall"),
+        _ => None,
+    }
+}
+
 fn stair_octants(state: &BlockState, shape: Option<&[Aabb]>) -> Option<u8> {
     if !state.name.ends_with("_stairs")
         || native_world::collision::slab_stair_solid(state) != Some(true)
@@ -15016,7 +15048,7 @@ impl LoadedSession {
                 Default::default()
             };
             let fall_amount = landing.amount;
-            if honey_landing && fall_amount > 0 {
+            if fall_amount > 0 {
                 let fall_sound = if fall_amount > 4 {
                     "entity.player.big_fall"
                 } else {
@@ -15027,11 +15059,15 @@ impl LoadedSession {
                     .floor()
                     .as_ivec3();
                 if !self.player_silent
-                    && matches!(cell(&self.world, self.origin, self.bounds, below, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:honey_block" && state.properties.is_empty()))
+                    && let Cell::State(id) =
+                        cell(&self.world, self.origin, self.bounds, below, self.states[0])
+                    && let Some(sound) = self.world.state(id).and_then(block_fall_sound)
                 {
+                    self.queue_player_sound(sound, 0.5, 0.75);
+                }
+                if honey_landing {
                     self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
                 }
-                self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
             }
             if let Some(source) = landing.source {
                 self.player_damage_feedback(source, landing.damage);
@@ -22899,6 +22935,49 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_fall_sounds_follow_damage_threshold_silence_and_gamerule() {
+        for (distance, player_sound) in [
+            (3.0, None),
+            (4.0, Some("entity.player.small_fall")),
+            (7.0, Some("entity.player.small_fall")),
+            (8.0, Some("entity.player.big_fall")),
+        ] {
+            for silent in [false, true] {
+                let mut test = session();
+                test.set_random_tick_speed(0);
+                test.survival_rules.fall_damage = false;
+                test.player_silent = silent;
+                let stone = test.intern_block(state("minecraft:stone", &[]));
+                assert!(test.set(IVec3::new(8, 1, 8), stone));
+                test.motion.position = DVec3::new(8.5, 2.0, 8.5);
+                test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                test.motion.on_ground = false;
+                test.player.position = test.motion.position.as_vec3();
+                test.player.on_ground = false;
+                test.fall_distance = distance;
+                test.update(TICK);
+                assert!(test.motion.on_ground);
+                assert_eq!(test.vitals.health, 20.0);
+                let mut expected = Vec::new();
+                if let Some(sound) = player_sound {
+                    expected.push(sound);
+                    if !silent {
+                        expected.push("block.stone.fall");
+                    }
+                }
+                assert_eq!(
+                    test.take_consume_sounds()
+                        .iter()
+                        .map(|s| s.info.event)
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "distance={distance} silent={silent}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn honey_landing_sounds_particles_and_fall_rule_follow_player_state() {
         for distance in [0.1, 3.0, 8.1, 23.1, 42.5] {
             for mode in [GameMode::Survival, GameMode::Creative] {
@@ -22965,6 +23044,122 @@ mod tests {
                         assert!(test.take_consume_sounds().is_empty());
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn ordinary_landing_sounds_match_java_player_and_blocks() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerLandingSoundOracle.java");
+        let result = temp.path().join("sounds.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerLandingSoundOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .output()
+                .unwrap(),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("PlayerLandingSoundOracle")
+                .arg(&result)
+                .output()
+                .unwrap(),
+        ] {
+            assert!(
+                command.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&command.stdout),
+                String::from_utf8_lossy(&command.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 300);
+        for row in rows {
+            let mut test = session();
+            test.set_random_tick_speed(0);
+            let name = format!("minecraft:{}", row["block"].as_str().unwrap());
+            let block = test.intern_block(state(&name, &[]));
+            let actual_shapes = test.shapes[block.0 as usize]
+                .as_ref()
+                .expect("unsupported block shape");
+            let expected_shapes = row["boxes"].as_array().unwrap();
+            assert_eq!(actual_shapes.len(), expected_shapes.len(), "{row}");
+            for (shape, expected) in actual_shapes.iter().zip(expected_shapes) {
+                let coords = [
+                    shape.min.x,
+                    shape.min.y,
+                    shape.min.z,
+                    shape.max.x,
+                    shape.max.y,
+                    shape.max.z,
+                ];
+                for (actual, expected) in coords.iter().zip(expected.as_array().unwrap()) {
+                    assert_eq!(*actual, expected.as_f64().unwrap() as f32, "{row}");
+                }
+            }
+            assert!(test.set(IVec3::new(8, 1, 8), block));
+            test.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            test.motion.on_ground = false;
+            test.player.position = test.motion.position.as_vec3();
+            test.player.on_ground = false;
+            test.fall_distance = row["distance"].as_f64().unwrap();
+            test.player_silent = row["silent"].as_bool().unwrap();
+            test.update(TICK);
+            assert!(test.motion.on_ground, "{row}");
+            let sounds = test.take_consume_sounds();
+            let actual: Vec<_> = sounds
+                .iter()
+                .filter(|sound| {
+                    !matches!(
+                        sound.info.event,
+                        "entity.player.hurt" | "entity.player.death"
+                    )
+                })
+                .collect();
+            let expected = row["events"].as_array().unwrap();
+            assert_eq!(actual.len(), expected.len(), "{row}");
+            for (sound, expected) in actual.iter().zip(expected) {
+                let expected = expected.as_str().unwrap();
+                let (event, numbers) = expected
+                    .strip_prefix("minecraft:")
+                    .unwrap()
+                    .split_once(':')
+                    .unwrap();
+                let (volume, pitch) = numbers.split_once(':').unwrap();
+                assert_eq!(sound.info.event, event, "{row}");
+                assert_eq!(sound.info.volume, volume.parse::<f32>().unwrap(), "{row}");
+                assert_eq!(sound.info.pitch, pitch.parse::<f32>().unwrap(), "{row}");
             }
         }
     }
@@ -38908,7 +39103,7 @@ mod tests {
                 test.vitals.exhaustion,
                 if damage > 0.0 { 0.75 } else { 0.0 }
             );
-            let mut expected = Vec::new();
+            let mut expected = vec!["entity.player.small_fall", "block.stone.fall"];
             if enabled && !cooldown {
                 expected.push("entity.player.hurt_drown");
             }

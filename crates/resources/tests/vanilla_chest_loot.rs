@@ -167,4 +167,80 @@ fn buried_treasure_chest_loot_matches_java() {
         cases += 1;
     }
     assert_eq!(cases, 32);
+
+    // Even when quality is zero, Java computes entry weights in f32.
+    let synthetic = serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":8,"entries":[
+        {"type":"minecraft:item","name":"minecraft:stone","weight":16777217},
+        {"type":"minecraft:item","name":"minecraft:stick","weight":16777219},
+        {"type":"minecraft:item","name":"minecraft:dirt","weight":-1}
+    ]}]});
+    let table = ChestLootTable::decode(&synthetic).unwrap();
+    std::fs::write(&input, serde_json::to_vec(&synthetic).unwrap()).unwrap();
+    let output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ChestLootOracle")
+        .arg(&input));
+    let mut lines = output
+        .lines()
+        .filter(|line| line.starts_with("S ") || line.starts_with("P ") || line.starts_with("R "))
+        .peekable();
+    let mut cases = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let mode: i32 = fields[1].parse().unwrap();
+        let seed: i64 = fields[2].parse().unwrap();
+        let mut expected = Vec::new();
+        while lines.peek().is_some_and(|line| line.starts_with("P ")) {
+            expected.push(lines.next().unwrap().to_owned());
+        }
+        let next: i64 = lines
+            .next()
+            .unwrap()
+            .strip_prefix("R ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (slots, actual_next) = if mode == 0 {
+            let mut random = LegacyRandom::new(seed);
+            let slots = table
+                .fill_with_random(&[false; 27], &mut random, max_stack)
+                .unwrap();
+            (slots, random.next_long())
+        } else {
+            let mut random = if mode == 1 {
+                XoroshiroRandom::new(seed)
+            } else {
+                XoroshiroRandom::for_world_sequence(
+                    seed,
+                    0,
+                    true,
+                    Some("minecraft:chests/buried_treasure"),
+                )
+            };
+            let slots = table
+                .fill_with_random(&[false; 27], &mut random, max_stack)
+                .unwrap();
+            (slots, random.next_long())
+        };
+        let actual: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, item)| {
+                item.as_ref().map(|item| {
+                    format!(
+                        "P {slot} {}:{} {} -",
+                        item.id.namespace, item.id.path, item.count
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(actual, expected, "weighted chest mode={mode} seed={seed}");
+        assert_eq!(
+            actual_next, next,
+            "weighted chest random mode={mode} seed={seed}"
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 32);
 }

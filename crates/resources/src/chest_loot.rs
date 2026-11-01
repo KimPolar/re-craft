@@ -295,7 +295,9 @@ impl ChestLootTable {
                     );
                 }
                 let weight = entry.get("weight").map(int_value).transpose()?.unwrap_or(1);
-                ensure!(weight >= 0, "negative loot weight");
+                // With supported zero quality, luck cannot affect the weight.
+                // Java still converts it to float before flooring and clamping.
+                let weight = ((weight as f32) as i32).max(0);
                 total = total.checked_add(weight).context("loot weight overflow")?;
                 let modifiers = modifiers(entry.get("modifier"))?;
                 if item.is_none() {
@@ -591,6 +593,27 @@ mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn chest_weight_uses_java_float_rounding_and_clamps_negative_values() {
+        let table = ChestLootTable::decode(
+            &json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[
+                {"type":"minecraft:item","name":"minecraft:stone","weight":16777217},
+                {"type":"minecraft:item","name":"minecraft:stick","weight":16777219},
+                {"type":"minecraft:item","name":"minecraft:dirt","weight":-1}
+            ]}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            table.pools[0]
+                .entries
+                .iter()
+                .map(|entry| entry.weight)
+                .collect::<Vec<_>>(),
+            vec![16_777_216, 16_777_220, 0]
+        );
+        assert!(ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","quality":1}]}]})).is_err());
+    }
+
     #[test]
     fn retains_the_named_world_random_sequence() {
         let mut value = json!({"type":"minecraft:chest", "pools":[]});

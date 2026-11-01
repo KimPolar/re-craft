@@ -1287,17 +1287,14 @@ fn parse_entry(
         .map(|value| value.as_i64().context("invalid loot weight"))
         .transpose()?
         .unwrap_or(1);
-    let weight = i32::try_from(weight)
-        .context("loot weight out of range")?
-        .max(0) as u32;
-    let kind = if json
-        .get("quality")
-        .is_some_and(|value| value.as_i64() != Some(0))
-    {
-        EntryKind::Unsupported("loot quality requires the player's luck".into())
-    } else {
-        kind
-    };
+    let weight = i32::try_from(weight).context("loot weight out of range")?;
+    if let Some(quality) = json.get("quality") {
+        i32::try_from(quality.as_i64().context("invalid loot quality")?)
+            .context("loot quality out of range")?;
+    }
+    // Block and block-interaction LootParams use the builder's default luck
+    // of zero. Java still converts the weight to f32 before flooring it.
+    let weight = ((weight as f32) as i32).max(0) as u32;
     Ok(Entry {
         condition,
         kind,
@@ -1874,11 +1871,14 @@ mod tests {
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn weighted_block_loot_matches_java_26_3() {
         use std::{path::PathBuf, process::Command};
-        const TABLES: [&str; 4] = [
+        const TABLES: [&str; 7] = [
             r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:set_count","count":{"type":"minecraft:uniform","min":1,"max":3}}},{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":0.5}},{"type":"minecraft:empty","weight":2}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:stone","weight":4,"condition":{"type":"minecraft:random_chance","chance":0.3}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]},{"type":"minecraft:item","name":"minecraft:diamond","weight":3},{"type":"minecraft:empty","weight":2}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":5,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0},{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":3,"condition":{"type":"minecraft:random_chance","chance":0.5},"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":3,"modifier":{"type":"minecraft:set_count","count":2,"condition":{"type":"minecraft:random_chance","chance":0.5}}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":16777217,"quality":2147483647},{"type":"minecraft:item","name":"minecraft:stick","weight":16777219,"quality":-2147483648}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":-17,"quality":13},{"type":"minecraft:item","name":"minecraft:stick","weight":2,"quality":-11}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":2147483647,"quality":1},{"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}]}]}"#,
         ];
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -1981,6 +1981,33 @@ mod tests {
                     index += 1;
                 }
             }
+        }
+    }
+
+    #[test]
+    fn block_loot_quality_uses_zero_luck_and_java_float_weights() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/stone.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":16777217,"quality":2147483647},{"type":"minecraft:item","name":"minecraft:stick","weight":16777219,"quality":-2147483648},{"type":"minecraft:item","name":"minecraft:dirt","weight":-1,"quality":1}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let table = &tables.tables[&ResourceId::parse("minecraft:blocks/stone").unwrap()];
+        assert_eq!(
+            table.pools[0]
+                .entries
+                .iter()
+                .map(|entry| entry.weight)
+                .collect::<Vec<_>>(),
+            vec![16_777_216, 16_777_220, 0]
+        );
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        assert!(tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
+        for quality in [r#"1.5"#, r#"2147483648"#, r#""bad""#] {
+            source.put("data/minecraft/loot_table/blocks/stone.json", &format!(r#"{{"type":"minecraft:block","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"minecraft:stone","quality":{quality}}}]}}]}}"#));
+            let tables = BlockLootTables::load(&mut source).unwrap();
+            assert!(!tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
         }
     }
 

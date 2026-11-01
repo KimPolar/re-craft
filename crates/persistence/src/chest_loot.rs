@@ -35,9 +35,33 @@ impl VerifiedChestLoot {
         table: &ChestLootTable,
         max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
     ) -> Result<Self> {
+        Self::replay_inner(source, table_id, table, None, max_stack)
+    }
+
+    /// Replay a chest opened with a previously verified player luck value.
+    pub fn replay_with_luck(
+        source: &Tag,
+        table_id: &ResourceId,
+        table: &ChestLootTable,
+        luck: f32,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Self> {
+        Self::replay_inner(source, table_id, table, Some(luck), max_stack)
+    }
+
+    fn replay_inner(
+        source: &Tag,
+        table_id: &ResourceId,
+        table: &ChestLootTable,
+        luck: Option<f32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Self> {
         let seed = validate_source(source, table_id)?;
         ensure!(seed != 0, "zero seed requires the world random sequence");
-        let slots = table.fill_seeded(&[false; 27], seed, max_stack)?;
+        let slots = match luck {
+            Some(luck) => table.fill_seeded_with_luck(&[false; 27], seed, luck, max_stack)?,
+            None => table.fill_seeded(&[false; 27], seed, max_stack)?,
+        };
         Ok(Self {
             source: source.clone(),
             items: encode_slots(slots)?,
@@ -55,6 +79,39 @@ impl VerifiedChestLoot {
         before: (u64, u64),
         max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
     ) -> Result<Self> {
+        Self::replay_named_inner(source, table_id, table, world_seed, before, None, max_stack)
+    }
+
+    /// Replay a named sequence with the verified luck captured at chest opening.
+    pub fn replay_named_with_luck(
+        source: &Tag,
+        table_id: &ResourceId,
+        table: &ChestLootTable,
+        world_seed: i64,
+        before: (u64, u64),
+        luck: f32,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Self> {
+        Self::replay_named_inner(
+            source,
+            table_id,
+            table,
+            world_seed,
+            before,
+            Some(luck),
+            max_stack,
+        )
+    }
+
+    fn replay_named_inner(
+        source: &Tag,
+        table_id: &ResourceId,
+        table: &ChestLootTable,
+        world_seed: i64,
+        before: (u64, u64),
+        luck: Option<f32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Self> {
         ensure!(
             validate_source(source, table_id)? == 0,
             "named sequence requires a zero loot seed"
@@ -64,7 +121,12 @@ impl VerifiedChestLoot {
             .context("loot table has no named sequence")?
             .clone();
         let mut random = XoroshiroRandom::from_state(before.0, before.1);
-        let slots = table.fill_with_random(&[false; 27], &mut random, max_stack)?;
+        let slots = match luck {
+            Some(luck) => {
+                table.fill_with_random_and_luck(&[false; 27], &mut random, luck, max_stack)?
+            }
+            None => table.fill_with_random(&[false; 27], &mut random, max_stack)?,
+        };
         Ok(Self {
             source: source.clone(),
             items: encode_slots(slots)?,

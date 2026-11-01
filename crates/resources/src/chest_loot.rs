@@ -50,11 +50,13 @@ enum Modifier {
 struct Entry {
     item: Option<ResourceId>,
     weight: i32,
+    quality: i32,
     modifiers: Vec<Modifier>,
 }
 #[derive(Clone, Debug)]
 struct Pool {
     rolls: IntProvider,
+    bonus_rolls: f32,
     entries: Vec<Entry>,
     modifiers: Vec<Modifier>,
 }
@@ -251,9 +253,14 @@ impl ChestLootTable {
         let mut pools = Vec::with_capacity(list.len());
         for pool in list {
             allowed_fields(pool, &["rolls", "bonus_rolls", "entries", "modifier"])?;
-            if let Some(bonus) = pool.get("bonus_rolls") {
-                ensure!(bonus.as_f64() == Some(0.0), "bonus rolls are unsupported");
-            }
+            let bonus_rolls = match pool.get("bonus_rolls") {
+                None => 0.0,
+                Some(value) => value
+                    .as_f64()
+                    .context("non-constant bonus rolls are unsupported")?
+                    as f32,
+            };
+            ensure!(bonus_rolls.is_finite(), "invalid bonus rolls");
             let rolls = provider(pool.get("rolls").context("missing pool rolls")?)?;
             rolls.validate_nonnegative(4096)?;
             let raw = pool
@@ -262,7 +269,6 @@ impl ChestLootTable {
                 .context("missing pool entries")?;
             ensure!(raw.len() <= 4096, "too many loot entries");
             let mut entries = Vec::with_capacity(raw.len());
-            let mut total = 0i32;
             for entry in raw {
                 allowed_fields(entry, &["type", "name", "weight", "quality", "modifier"])?;
                 let kind = ResourceId::parse(
@@ -288,17 +294,12 @@ impl ChestLootTable {
                     }
                     _ => bail!("unsupported chest loot entry {}", kind.path),
                 };
-                if let Some(quality) = entry.get("quality") {
-                    ensure!(
-                        int_value(quality)? == 0,
-                        "loot entry quality requires luck support"
-                    );
-                }
+                let quality = entry
+                    .get("quality")
+                    .map(int_value)
+                    .transpose()?
+                    .unwrap_or(0);
                 let weight = entry.get("weight").map(int_value).transpose()?.unwrap_or(1);
-                // With supported zero quality, luck cannot affect the weight.
-                // Java still converts it to float before flooring and clamping.
-                let weight = ((weight as f32) as i32).max(0);
-                total = total.checked_add(weight).context("loot weight overflow")?;
                 let modifiers = modifiers(entry.get("modifier"))?;
                 if item.is_none() {
                     ensure!(
@@ -314,6 +315,7 @@ impl ChestLootTable {
                 entries.push(Entry {
                     item,
                     weight,
+                    quality,
                     modifiers,
                 });
             }
@@ -325,6 +327,7 @@ impl ChestLootTable {
             }
             pools.push(Pool {
                 rolls,
+                bonus_rolls,
                 entries,
                 modifiers,
             });
@@ -345,6 +348,12 @@ impl ChestLootTable {
     pub fn random_sequence(&self) -> Option<&ResourceId> {
         self.random_sequence.as_ref()
     }
+    /// True when the player's luck changes the table's selection or roll count.
+    pub fn requires_luck(&self) -> bool {
+        self.pools.iter().any(|pool| {
+            pool.bonus_rolls != 0.0 || pool.entries.iter().any(|entry| entry.quality != 0)
+        })
+    }
     /// Fill empty slots with luck zero. A zero saved seed uses the world's named
     /// random sequence: pass that sequence explicitly to `fill_with_random`.
     pub fn fill_seeded(
@@ -359,6 +368,20 @@ impl ChestLootTable {
         );
         self.fill_with_random(occupied, &mut LegacyRandom::new(seed), max_stack)
     }
+    /// Fill a fixed-seed chest with the verified luck of its opener.
+    pub fn fill_seeded_with_luck(
+        &self,
+        occupied: &[bool],
+        seed: i64,
+        luck: f32,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Vec<Option<ChestLootItem>>> {
+        ensure!(
+            seed != 0,
+            "zero loot seed requires the world's random sequence"
+        );
+        self.fill_with_random_and_luck(occupied, &mut LegacyRandom::new(seed), luck, max_stack)
+    }
     /// Returns new items by slot, leaving occupied slots as `None`. `max_stack`
     /// must validate item and potion IDs and enabled features against the active
     /// registries, and return the component-dependent limit. On error the
@@ -367,9 +390,35 @@ impl ChestLootTable {
         &self,
         occupied: &[bool],
         random: &mut R,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Vec<Option<ChestLootItem>>> {
+        ensure!(
+            !self.requires_luck(),
+            "loot table requires verified player luck"
+        );
+        self.fill_with_random_and_luck(occupied, random, 0.0, max_stack)
+    }
+
+    pub fn fill_with_random_and_luck<R: ChestLootRandom>(
+        &self,
+        occupied: &[bool],
+        random: &mut R,
+        luck: f32,
         mut max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
     ) -> Result<Vec<Option<ChestLootItem>>> {
         ensure!(occupied.len() <= 4096, "container is too large");
+        ensure!(
+            luck.is_finite() && (-1024.0..=1024.0).contains(&luck),
+            "invalid player luck"
+        );
+        fn java_floor(value: f32) -> i32 {
+            let truncated = value as i32;
+            if value < truncated as f32 {
+                truncated.wrapping_sub(1)
+            } else {
+                truncated
+            }
+        }
         let mut prepared = Vec::with_capacity(self.pools.len());
         for pool in &self.pools {
             let mut entries = Vec::with_capacity(pool.entries.len());
@@ -396,8 +445,10 @@ impl ChestLootTable {
                 } else {
                     0
                 };
-                if entry.weight > 0 {
-                    entries.push((entry, maximum));
+                let weight =
+                    java_floor((entry.weight as f32) + (entry.quality as f32) * luck).max(0);
+                if weight > 0 {
+                    entries.push((entry, maximum, weight));
                 }
             }
             prepared.push(entries);
@@ -407,22 +458,27 @@ impl ChestLootTable {
         for (pool, candidates) in self.pools.iter().zip(prepared) {
             let total = candidates
                 .iter()
-                .try_fold(0i32, |sum, (entry, _)| sum.checked_add(entry.weight))
+                .try_fold(0i32, |sum, (_, _, weight)| sum.checked_add(*weight))
                 .context("loot weight overflow")?;
-            let rolls = pool.rolls.sample(&mut rng)?;
+            let rolls = pool
+                .rolls
+                .sample(&mut rng)?
+                .checked_add(java_floor(pool.bonus_rolls * luck))
+                .context("loot rolls overflow")?;
+            ensure!(rolls <= 4096, "too many loot rolls");
             for _ in 0..rolls {
                 if candidates.is_empty() {
                     continue;
                 }
-                let (selected, maximum) = if candidates.len() == 1 {
+                let (selected, maximum, _) = if candidates.len() == 1 {
                     candidates[0]
                 } else {
                     let mut n = bounded(&mut rng, total)?;
                     let mut selected = candidates[0];
-                    for &(entry, maximum) in &candidates {
-                        n -= entry.weight;
+                    for &(entry, maximum, weight) in &candidates {
+                        n -= weight;
                         if n < 0 {
-                            selected = (entry, maximum);
+                            selected = (entry, maximum, weight);
                             break;
                         }
                     }
@@ -609,9 +665,35 @@ mod tests {
                 .iter()
                 .map(|entry| entry.weight)
                 .collect::<Vec<_>>(),
-            vec![16_777_216, 16_777_220, 0]
+            vec![16_777_217, 16_777_219, -1]
         );
-        assert!(ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","quality":1}]}]})).is_err());
+        let dependent = ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","quality":1}]}]})).unwrap();
+        let mut random = LegacyRandom::new(42);
+        let before = random.clone().next_long();
+        assert!(dependent.requires_luck());
+        assert!(
+            dependent
+                .fill_with_random(&[false; 27], &mut random, |_| Ok(64))
+                .is_err()
+        );
+        assert_eq!(random.next_long(), before);
+        let mut random = LegacyRandom::new(42);
+        let before = random.clone().next_long();
+        assert!(
+            dependent
+                .fill_with_random_and_luck(&[false; 27], &mut random, f32::NAN, |_| Ok(64))
+                .is_err()
+        );
+        assert_eq!(random.next_long(), before);
+        let mut random = LegacyRandom::new(42);
+        assert!(
+            dependent
+                .fill_with_random_and_luck(&[false; 27], &mut random, 1.0, |_| Ok(64))
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|item| item.id.path == "stone")
+        );
     }
 
     #[test]

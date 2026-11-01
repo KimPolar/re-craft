@@ -1,17 +1,24 @@
 //! Intermediate noise, biome, surface and carver generation for fresh terrain.
 //! Structures, features, lighting, persistence and playable world integration
 //! are not implemented by this module.
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
 use native_core::beardifier::Beardifier;
+use native_persistence::heightmap::BlockHeightFlags;
 use native_resources::{
     biome_source::{BiomeSource, ClimateVolume},
     carver::{CarvingMask, schedule::CarverCache},
     density::DensityEvaluator,
-    noise_stage::NoiseStageGenerator,
+    noise_stage::{BaseNoiseColumn, NoiseMaterial, NoiseStageGenerator},
     packs::{ResourceId, ResourceProvider},
+    structure_start::{
+        BiomeQuery, Heightmap, SimpleStructure, SimpleStructureStart, StartEnvironment,
+    },
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk, apply_surface},
     surface_rules::{SeededSurfaceInputs, SurfaceRule, SurfaceRuleCompiler},
 };
@@ -168,6 +175,80 @@ pub struct TerrainGenerator {
     seed: i64,
     min_y: i32,
     height: i32,
+}
+
+struct StructureStartEnvironment<'a> {
+    noise: &'a NoiseStageGenerator,
+    evaluator: &'a mut DensityEvaluator,
+    biome_rules: &'a native_resources::structure_biomes::StructureBiomes,
+    structure: &'a ResourceId,
+    column_source: BiomeSource,
+    point_source: BiomeSource,
+    climate: Option<ClimateVolume>,
+    columns: &'a mut HashMap<[i32; 2], BaseNoiseColumn>,
+    flags: &'a [BlockHeightFlags; 4],
+    min_y: i32,
+    max_y: i32,
+}
+impl StartEnvironment for StructureStartEnvironment<'_> {
+    fn vertical_bounds(&self) -> (i32, i32) {
+        (self.min_y, self.max_y)
+    }
+    fn sea_level(&self) -> i32 {
+        self.noise.sea_level()
+    }
+    fn first_occupied_height(&mut self, x: i32, z: i32, map: Heightmap) -> Result<i32> {
+        if !self.columns.contains_key(&[x, z]) {
+            self.columns
+                .insert([x, z], self.noise.base_column(self.evaluator, x, z)?);
+        }
+        self.columns[&[x, z]].first_occupied_height(self.min_y, |material| {
+            let index = match material {
+                NoiseMaterial::DefaultBlock => 0,
+                NoiseMaterial::DefaultFluid => 1,
+                NoiseMaterial::Lava => 2,
+                NoiseMaterial::Air => 3,
+            };
+            let flags = self.flags[index];
+            Ok(match map {
+                Heightmap::WorldSurface => !flags.is_air,
+                Heightmap::OceanFloor => flags.blocks_motion,
+            })
+        })
+    }
+    fn biome_allowed(&mut self, quart: [i32; 3], query: BiomeQuery) -> Result<bool> {
+        let biome = match query {
+            BiomeQuery::Point => {
+                self.point_source
+                    .sample_quart(self.noise.router(), self.evaluator, quart)
+            }
+            BiomeQuery::Column if self.column_source.uses_bulk_climate() => {
+                if self.climate.is_none() {
+                    let first = self
+                        .min_y
+                        .checked_sub(1)
+                        .context("biome column minimum overflow")?
+                        .div_euclid(4);
+                    let last = self.max_y.div_euclid(4);
+                    self.climate = Some(ClimateVolume::sample(
+                        self.noise.router(),
+                        self.evaluator,
+                        [quart[0], first, quart[2]],
+                        [1, u32::try_from(last - first + 1)?, 1],
+                    )?);
+                }
+                self.climate
+                    .as_ref()
+                    .unwrap()
+                    .select(&mut self.column_source, quart)?
+            }
+            BiomeQuery::Column => {
+                self.column_source
+                    .sample_quart(self.noise.router(), self.evaluator, quart)
+            }
+        };
+        self.biome_rules.permits(self.structure, biome)
+    }
 }
 impl TerrainGenerator {
     /// The caller must guarantee no old-chunk blending or structure adjustment.
@@ -338,6 +419,75 @@ impl TerrainGenerator {
             generate,
             |provider, _, placement| {
                 self.concentric_structure_positions(provider, evaluator, placement)
+            },
+        )
+    }
+    /// Attempt the supported simple structure types using this generator's
+    /// unadjusted base heights and noise-biome source. Other structure types
+    /// return an error, so they cannot silently lose their generation attempt.
+    /// The caller resolves air and heightmap tags from the active block registry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_simple_structure_set<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<SimpleStructureStart>>
+    {
+        let mut columns = HashMap::new();
+        let mut structure_evaluator = DensityEvaluator::default();
+        let mut flags = None;
+        let max_y = self
+            .min_y
+            .checked_add(self.height - 1)
+            .context("dimension height overflow")?;
+        self.try_generate_structure_set(
+            provider,
+            evaluator,
+            cache,
+            biome_rules,
+            id,
+            chunk,
+            existing,
+            |provider, entry| {
+                let path = format!(
+                    "data/{}/worldgen/structure/{}.json",
+                    entry.id.namespace, entry.id.path
+                );
+                let bytes = provider
+                    .read_data(&path)?
+                    .with_context(|| format!("missing structure {path}"))?;
+                let definition: Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid structure {path}"))?;
+                let structure = SimpleStructure::decode(&definition)
+                    .with_context(|| format!("in structure {path}"))?;
+                if flags.is_none() {
+                    flags = Some([
+                        classify(self.noise.default_block())?,
+                        classify(self.noise.default_fluid())?,
+                        classify(&serde_json::json!("minecraft:lava"))?,
+                        classify(&serde_json::json!("minecraft:air"))?,
+                    ]);
+                }
+                let mut env = StructureStartEnvironment {
+                    noise: &self.noise,
+                    evaluator: &mut structure_evaluator,
+                    biome_rules,
+                    structure: &entry.id,
+                    column_source: self.source.fresh_sampler(),
+                    point_source: self.source.fresh_sampler(),
+                    climate: None,
+                    columns: &mut columns,
+                    flags: flags.as_ref().unwrap(),
+                    min_y: self.min_y,
+                    max_y,
+                };
+                structure.generate(&mut env, self.seed, chunk)
             },
         )
     }
@@ -1072,6 +1222,83 @@ mod tests {
             &structure,
             evaluator.structure_terrain_context().unwrap()
         ));
+    }
+
+    #[test]
+    fn simple_structure_set_uses_base_noise_and_fixed_biome() {
+        use native_core::beardifier::Beardifier;
+        use native_resources::{
+            structure_biomes::StructureBiomes,
+            structure_placement::{StructureSetCache, StructureSetStart},
+        };
+        struct StructureData(BTreeMap<String, Vec<u8>>);
+        impl ResourceProvider for StructureData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if let Some(value) = self.0.get(path) {
+                    Ok(Some(value.clone()))
+                } else {
+                    Data.read_data(path)
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Data.list_data(folder)
+            }
+        }
+        let mut data=StructureData(BTreeMap::from([
+            ("data/example/worldgen/structure/pyramid.json".into(),serde_json::to_vec(&json!({"type":"minecraft:desert_pyramid","biomes":["minecraft:plains"],"terrain_adaptation":"bury"})).unwrap()),
+            ("data/example/worldgen/structure_set/pyramid.json".into(),serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap()),
+        ]));
+        let generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let structure_id = ResourceId::parse("example:pyramid").unwrap();
+        let rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+        let set_id = ResourceId::parse("example:pyramid").unwrap();
+        let mut cache = StructureSetCache::default();
+        let mut evaluator = DensityEvaluator::default();
+        let classify = |v: &Value| -> Result<BlockHeightFlags> {
+            let id = v.as_str().unwrap();
+            Ok(BlockHeightFlags {
+                is_air: id == "minecraft:air",
+                blocks_motion: id == "minecraft:stone",
+                blocks_motion_no_leaves: id == "minecraft:stone",
+                has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let result = generator
+            .try_generate_simple_structure_set(
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                &rules,
+                &set_id,
+                [0, 0],
+                |_| Ok(false),
+                classify,
+            )
+            .unwrap();
+        let StructureSetStart::Generated { structure, start } = result else {
+            panic!("expected generated structure")
+        };
+        assert_eq!(structure, structure_id);
+        assert_eq!(start.generation_point, [8, 15, 8]);
+        let adjustment = Beardifier::for_chunk([0, 0], &[start.terrain_piece()]).unwrap();
+        assert!(adjustment.affected_bounds().is_some());
+        let existing = generator
+            .try_generate_simple_structure_set(
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                &rules,
+                &set_id,
+                [0, 0],
+                |_| Ok(true),
+                |_| panic!("existing start must not classify blocks"),
+            )
+            .unwrap();
+        assert!(matches!(existing, StructureSetStart::Existing));
     }
 
     #[test]

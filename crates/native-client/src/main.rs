@@ -16,6 +16,7 @@ mod consume_particles;
 mod death_ui;
 mod equipment_visual;
 mod experience_hud;
+mod file_open;
 mod first_person;
 mod fluid_mesh;
 mod focus_pause;
@@ -2525,7 +2526,11 @@ impl ApplicationHandler for App {
                     && ui.chat_open()
                 {
                     if button == MouseButton::Left {
-                        ui.chat_click(self.inventory_shift);
+                        if let Some(path) = ui.chat_click(self.inventory_shift)
+                            && let Err(error) = file_open::open(&path)
+                        {
+                            eprintln!("Cannot open screenshot: {error:#}");
+                        }
                     }
                     update_chat_ime_area(&self.window, &self.ui);
                     return;

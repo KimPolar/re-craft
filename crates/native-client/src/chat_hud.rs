@@ -1,6 +1,7 @@
 //! The unfocused chat overlay for local system messages.
 
 use native_session::{SystemMessage, SystemMessageKind};
+use std::{ops::Range, sync::Arc};
 
 use crate::{
     menu_assets::MenuAssets,
@@ -173,24 +174,36 @@ impl LineLayout {
 
 // Split at words where possible, with character boundaries as a fallback. The
 // canvas uses the same local font data for measuring and drawing the text.
+struct WrappedLine {
+    text: String,
+    bold_prefix: usize,
+    source_start: usize,
+}
+
 fn wrap(
     canvas: &Canvas,
     assets: &MenuAssets,
     text: &str,
     max_width: i32,
     bold_prefix: usize,
-) -> Vec<(String, usize)> {
+) -> Vec<WrappedLine> {
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut line_bold: usize = 0;
     let mut width = 0;
     let mut last_space = None;
+    let mut line_start = 0;
     for (index, ch) in text.char_indices().take(16_384) {
         if ch == '\n' {
-            lines.push((std::mem::take(&mut line), line_bold));
+            lines.push(WrappedLine {
+                text: std::mem::take(&mut line),
+                bold_prefix: line_bold,
+                source_start: line_start,
+            });
             line_bold = 0;
             width = 0;
             last_space = None;
+            line_start = index + ch.len_utf8();
             continue;
         }
         let bold = index < bold_prefix;
@@ -203,22 +216,33 @@ fn wrap(
                 let remainder = line.split_off(space);
                 line.pop();
                 let remainder_bold = line_bold.saturating_sub(space);
-                lines.push((
-                    std::mem::replace(&mut line, remainder),
-                    line_bold.min(space - 1),
-                ));
+                lines.push(WrappedLine {
+                    text: std::mem::replace(&mut line, remainder),
+                    bold_prefix: line_bold.min(space - 1),
+                    source_start: line_start,
+                });
+                line_start += space;
                 line_bold = remainder_bold;
                 width = canvas.bold_text_width(Some(assets), &line[..line_bold])
                     + canvas.text_width(Some(assets), &line[line_bold..]);
                 last_space = None;
             } else {
-                lines.push((std::mem::take(&mut line), line_bold));
+                lines.push(WrappedLine {
+                    text: std::mem::take(&mut line),
+                    bold_prefix: line_bold,
+                    source_start: line_start,
+                });
+                line_start = index;
                 line_bold = 0;
                 width = 0;
             }
         }
         if wrapped && line.is_empty() && ch == ' ' {
+            line_start = index + 1;
             continue;
+        }
+        if line.is_empty() {
+            line_start = index;
         }
         if ch == ' ' {
             last_space = Some(line.len() + 1);
@@ -230,9 +254,202 @@ fn wrap(
         width += char_width;
     }
     if !line.is_empty() || lines.is_empty() {
-        lines.push((line, line_bold));
+        lines.push(WrappedLine {
+            text: line,
+            bold_prefix: line_bold,
+            source_start: line_start,
+        });
     }
     lines
+}
+
+struct ChatLine {
+    text: String,
+    layout: LineLayout,
+    bold_prefix: usize,
+    links: Vec<Range<usize>>,
+    screenshot: Option<Arc<str>>,
+}
+
+fn screenshot_message(template: &str, name: &str) -> (String, Vec<Range<usize>>) {
+    use crate::text_component::{Part, format_parts};
+    let Some(parts) = format_parts(template) else {
+        return (template.to_owned(), Vec::new());
+    };
+    let mut message = String::new();
+    let mut links = Vec::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => message.push_str(&text),
+            Part::Argument(0) => {
+                let start = message.len();
+                message.push_str(name);
+                if start != message.len() {
+                    links.push(start..message.len());
+                }
+            }
+            Part::Argument(_) => return (template.to_owned(), Vec::new()),
+        }
+    }
+    (message, links)
+}
+
+fn prepare_lines(
+    canvas: &Canvas,
+    assets: &MenuAssets,
+    messages: &[SystemMessage],
+    tick: u64,
+    focused: bool,
+    scroll: usize,
+    height: i32,
+) -> Option<(Vec<ChatLine>, usize)> {
+    let base = LineLayout::for_mode(&assets.chat, height, 0, focused)?;
+    let mut lines = Vec::new();
+    for message in messages.iter().rev() {
+        let Some(layout) = LineLayout::for_mode(
+            &assets.chat,
+            height,
+            tick.saturating_sub(message.tick),
+            focused,
+        ) else {
+            continue;
+        };
+        let (text, debug_prefix, links, screenshot) = match &message.kind {
+            SystemMessageKind::MissingRespawnBlock => (
+                assets
+                    .translate(
+                        "block.minecraft.spawn.not_valid",
+                        "block.minecraft.spawn.not_valid",
+                    )
+                    .to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::DebugFocusPause(enabled) => {
+                let (key, fallback) = if *enabled {
+                    ("debug.pause_focus.on", "Pause on lost focus: enabled")
+                } else {
+                    ("debug.pause_focus.off", "Pause on lost focus: disabled")
+                };
+                let prefix = assets.translate("debug.prefix", "[Debug]:");
+                (
+                    format!("{} {}", prefix, assets.translate(key, fallback)),
+                    Some(prefix),
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::ScreenshotSaved(name) => {
+                let (text, links) = screenshot_message(
+                    assets.translate("screenshot.success", "Saved screenshot as %s"),
+                    name,
+                );
+                (text, None, links, Some(Arc::clone(name)))
+            }
+            SystemMessageKind::ScreenshotFailed(reason) => (
+                assets
+                    .translate("screenshot.failure", "Couldn't save screenshot: %s")
+                    .replacen("%s", reason, 1),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::LocalChat(text) => (
+                assets
+                    .translate("chat.type.text", "<%s> %s")
+                    .replacen("%s", "Player", 1)
+                    .replacen("%s", text, 1),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::CommandUnavailable => (
+                "Commands are not available yet.".to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+        };
+        let prefix_bytes = debug_prefix.map_or(0, str::len);
+        for line in wrap(canvas, assets, &text, layout.width.max(1), prefix_bytes)
+            .into_iter()
+            .rev()
+        {
+            if !focused && lines.len() >= base.max_lines {
+                break;
+            }
+            let end = line.source_start + line.text.len();
+            let visible_links = links
+                .iter()
+                .filter_map(|link| {
+                    let start = link.start.max(line.source_start);
+                    let finish = link.end.min(end);
+                    (start < finish)
+                        .then(|| (start - line.source_start)..(finish - line.source_start))
+                })
+                .collect();
+            lines.push(ChatLine {
+                text: line.text,
+                layout,
+                bold_prefix: line.bold_prefix,
+                links: visible_links,
+                screenshot: screenshot.clone(),
+            });
+        }
+        if !focused && lines.len() >= base.max_lines {
+            break;
+        }
+    }
+    let max_scroll = lines.len().saturating_sub(base.max_lines);
+    if focused {
+        lines = lines
+            .into_iter()
+            .skip(scroll.min(max_scroll))
+            .take(base.max_lines)
+            .collect();
+    }
+    Some((lines, max_scroll))
+}
+
+fn position(line: &ChatLine, index: usize) -> (i32, i32) {
+    let bottom = line.layout.bottom - index as i32 * line.layout.line_height;
+    (
+        (4.0 * line.layout.scale).floor() as i32,
+        ((bottom - line.layout.text_offset) as f32 * line.layout.scale).floor() as i32,
+    )
+}
+
+fn prefix_width(canvas: &Canvas, assets: &MenuAssets, line: &ChatLine, end: usize) -> i32 {
+    let bold_end = end.min(line.bold_prefix);
+    canvas.bold_text_width(Some(assets), &line.text[..bold_end])
+        + canvas.text_width(Some(assets), &line.text[bold_end..end])
+}
+
+pub fn screenshot_at(
+    assets: &MenuAssets,
+    messages: &[SystemMessage],
+    height: i32,
+    scroll: usize,
+    cursor: (i32, i32),
+) -> Option<Arc<str>> {
+    let measure = Canvas::new(1, 1);
+    let (lines, _) = prepare_lines(&measure, assets, messages, 0, true, scroll, height)?;
+    for (index, line) in lines.iter().enumerate() {
+        let (x, y) = position(line, index);
+        for range in &line.links {
+            let start = (prefix_width(&measure, assets, line, range.start) as f32
+                * line.layout.scale)
+                .floor() as i32;
+            let end = (prefix_width(&measure, assets, line, range.end) as f32 * line.layout.scale)
+                .ceil() as i32;
+            let height = (9.0 * line.layout.scale).ceil() as i32;
+            if (x + start..x + end).contains(&cursor.0) && (y..y + height).contains(&cursor.1) {
+                return line.screenshot.clone();
+            }
+        }
+    }
+    None
 }
 
 pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage], tick: u64) {
@@ -262,100 +479,29 @@ fn draw_mode(
     focused: bool,
     scroll: usize,
 ) -> usize {
-    let Some(base) = LineLayout::for_mode(&assets.chat, canvas.height, 0, focused) else {
+    let Some((lines, max_scroll)) = prepare_lines(
+        canvas,
+        assets,
+        messages,
+        tick,
+        focused,
+        scroll,
+        canvas.height,
+    ) else {
         return 0;
     };
-    let mut lines = Vec::new();
-    for message in messages.iter().rev() {
-        let Some(layout) = LineLayout::for_mode(
-            &assets.chat,
-            canvas.height,
-            tick.saturating_sub(message.tick),
-            focused,
-        ) else {
-            continue;
-        };
-        let (message, debug_prefix) = match &message.kind {
-            SystemMessageKind::MissingRespawnBlock => (
-                assets
-                    .translate(
-                        "block.minecraft.spawn.not_valid",
-                        "block.minecraft.spawn.not_valid",
-                    )
-                    .to_owned(),
-                None,
-            ),
-            SystemMessageKind::DebugFocusPause(enabled) => {
-                let key = if *enabled {
-                    "debug.pause_focus.on"
-                } else {
-                    "debug.pause_focus.off"
-                };
-                let fallback = if *enabled {
-                    "Pause on lost focus: enabled"
-                } else {
-                    "Pause on lost focus: disabled"
-                };
-                let prefix = assets.translate("debug.prefix", "[Debug]:");
-                (
-                    format!("{} {}", prefix, assets.translate(key, fallback)),
-                    Some(prefix),
-                )
-            }
-            SystemMessageKind::ScreenshotSaved(name) => (
-                assets
-                    .translate("screenshot.success", "Saved screenshot as %s")
-                    .replacen("%s", name, 1),
-                None,
-            ),
-            SystemMessageKind::ScreenshotFailed(reason) => (
-                assets
-                    .translate("screenshot.failure", "Couldn't save screenshot: %s")
-                    .replacen("%s", reason, 1),
-                None,
-            ),
-            SystemMessageKind::LocalChat(text) => (
-                assets
-                    .translate("chat.type.text", "<%s> %s")
-                    .replacen("%s", "Player", 1)
-                    .replacen("%s", text, 1),
-                None,
-            ),
-            SystemMessageKind::CommandUnavailable => {
-                ("Commands are not available yet.".to_owned(), None)
-            }
-        };
-        let prefix_bytes = debug_prefix.map_or(0, str::len);
-        for (text, prefix_len) in wrap(canvas, assets, &message, layout.width.max(1), prefix_bytes)
-            .into_iter()
-            .rev()
-        {
-            if !focused && lines.len() >= base.max_lines {
-                break;
-            }
-            lines.push((text, layout, prefix_len));
-        }
-        if !focused && lines.len() >= base.max_lines {
-            break;
-        }
-    }
-    let max_scroll = lines.len().saturating_sub(base.max_lines);
-    if focused {
-        let offset = scroll.min(max_scroll);
-        lines = lines
-            .into_iter()
-            .skip(offset)
-            .take(base.max_lines)
-            .collect();
-    }
-    for (index, (_, layout, _)) in lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
+        let layout = line.layout;
         let bottom = layout.bottom - index as i32 * layout.line_height;
         canvas.fill(
             layout.rect(-4, bottom - layout.line_height, layout.width + 8, bottom),
             [0, 0, 0, layout.background_alpha],
         );
     }
-    for (index, (text, layout, prefix_len)) in lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
+        let layout = line.layout;
+        let text = &line.text;
+        let prefix_len = line.bold_prefix;
         let bottom = layout.bottom - index as i32 * layout.line_height;
         let opacity = (layout.text_opacity * 255.0) as u8;
         canvas.fill(
@@ -365,15 +511,28 @@ fn draw_mode(
         let x = (4.0 * layout.scale).floor() as i32;
         let y = ((bottom - layout.text_offset) as f32 * layout.scale).floor() as i32;
         let draw_text = |canvas: &mut Canvas, x, y| {
-            let (prefix, rest) = text.split_at(*prefix_len);
+            let (prefix, rest) = text.split_at(prefix_len);
             canvas.bold_text_alpha(Some(assets), x, y, prefix, [255, 255, 85], opacity);
             let offset = canvas.bold_text_width(Some(assets), prefix);
             canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
+            for range in &line.links {
+                let left = prefix_width(canvas, assets, line, range.start);
+                let right = prefix_width(canvas, assets, line, range.end);
+                canvas.fill(
+                    Rect {
+                        x: x + left,
+                        y: y + 8,
+                        w: right - left,
+                        h: 1,
+                    },
+                    [255, 255, 255, opacity],
+                );
+            }
         };
         if layout.scale == 1.0 {
             draw_text(canvas, x, y);
         } else {
-            let (prefix, rest) = text.split_at(*prefix_len);
+            let (prefix, rest) = text.split_at(prefix_len);
             let width = (canvas.bold_text_width(Some(assets), prefix)
                 + canvas.text_width(Some(assets), rest))
             .clamp(1, 32768) as u32
@@ -406,6 +565,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screenshot_translation_keeps_only_filename_clickable() {
+        let (text, links) = screenshot_message("파일 %1$s 완료 %% %1$s", "한글.png");
+        assert_eq!(text, "파일 한글.png 완료 % 한글.png");
+        assert_eq!(links.len(), 2);
+        for link in links {
+            assert_eq!(&text[link], "한글.png");
+        }
+        assert_eq!(
+            screenshot_message("invalid %2$s", "a.png"),
+            ("invalid %2$s".into(), vec![])
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn wrapped_link_hit_testing_tracks_text_scale_and_scroll() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = ChatSettings::default();
+        assets.chat.width = 0.0;
+        assets.chat.focused_height = 0.0;
+        assets
+            .language
+            .insert("screenshot.success".into(), "사진 %1$s 완료".into());
+        let messages = [
+            SystemMessage {
+                tick: 0,
+                kind: SystemMessageKind::ScreenshotSaved("first-long-name.png".into()),
+            },
+            SystemMessage {
+                tick: 1,
+                kind: SystemMessageKind::LocalChat("new message".into()),
+            },
+            SystemMessage {
+                tick: 2,
+                kind: SystemMessageKind::ScreenshotSaved("second-long-name.png".into()),
+            },
+        ];
+        let measure = Canvas::new(1, 1);
+        for scale in [0.5, 1.0] {
+            assets.chat.scale = scale;
+            let (all, max_scroll) =
+                prepare_lines(&measure, &assets, &messages, 0, true, 0, 240).unwrap();
+            assert!(max_scroll > 0);
+            assert!(!all.is_empty());
+            for scroll in 0..=max_scroll {
+                let (lines, _) =
+                    prepare_lines(&measure, &assets, &messages, 0, true, scroll, 240).unwrap();
+                for (index, line) in lines.iter().enumerate() {
+                    let (x, y) = position(line, index);
+                    for range in &line.links {
+                        let start = (prefix_width(&measure, &assets, line, range.start) as f32
+                            * line.layout.scale)
+                            .floor() as i32;
+                        let end = (prefix_width(&measure, &assets, line, range.end) as f32
+                            * line.layout.scale)
+                            .ceil() as i32;
+                        if end > start {
+                            let hit =
+                                screenshot_at(&assets, &messages, 240, scroll, (x + start, y))
+                                    .unwrap();
+                            assert_eq!(Some(hit), line.screenshot);
+                        }
+                    }
+                    assert!(screenshot_at(&assets, &messages, 240, scroll, (x - 1, y)).is_none());
+                }
+            }
+            let wrapped = wrap(&measure, &assets, "한글  a b\n😀 long name", 25, 0);
+            for line in wrapped {
+                assert_eq!(
+                    &"한글  a b\n😀 long name"
+                        [line.source_start..line.source_start + line.text.len()],
+                    line.text
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn wrapped_debug_prefix_keeps_bold_width_and_unicode_boundaries() {
         let directory = std::env::var_os("MINECRAFT_DIR")
@@ -420,8 +660,8 @@ mod tests {
         assert!(lines.len() > 2);
         let mut bold = String::new();
         let mut regular = String::new();
-        for (text, bold_bytes) in lines {
-            let (head, tail) = text.split_at(bold_bytes);
+        for line in lines {
+            let (head, tail) = line.text.split_at(line.bold_prefix);
             assert!(
                 canvas.bold_text_width(Some(&assets), head)
                     + canvas.text_width(Some(&assets), tail)

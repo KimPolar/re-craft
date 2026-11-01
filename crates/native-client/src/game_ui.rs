@@ -491,8 +491,32 @@ impl GameUi {
         self.last_draw = None;
     }
 
-    pub fn chat_click(&mut self, shift: bool) {
+    pub fn chat_click(&mut self, shift: bool) -> Option<std::path::PathBuf> {
+        if !self.chat_input.is_open() {
+            return None;
+        }
         let (width, height) = self.logical_size();
+        if !shift
+            && let Some(name) = crate::chat_hud::screenshot_at(
+                &self.assets,
+                &self.system_messages,
+                height,
+                self.chat_input.scroll_offset(),
+                self.cursor,
+            )
+        {
+            let mut components = std::path::Path::new(name.as_ref()).components();
+            if matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+            {
+                return Some(
+                    self.assets
+                        .minecraft_dir
+                        .join("screenshots")
+                        .join(name.as_ref()),
+                );
+            }
+        }
         if self.cursor.0 >= 4
             && self.cursor.0 < width
             && self.cursor.1 >= height - 12
@@ -502,6 +526,7 @@ impl GameUi {
                 .start_drag(&self.assets, width, self.cursor.0, shift);
             self.last_draw = None;
         }
+        None
     }
 
     pub fn chat_release(&mut self) {
@@ -3420,6 +3445,42 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn screenshot_click_only_resolves_a_visible_safe_filename() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = crate::chat_hud::ChatSettings::default();
+        assets
+            .language
+            .insert("screenshot.success".into(), "Saved screenshot as %s".into());
+        let mut ui = GameUi::new(Arc::new(assets));
+        ui.resize((1280, 720));
+        ui.screenshot_result(Ok(game.join("screenshots/test.png")), 0);
+        ui.open_chat(false);
+        let height = ui.logical_size().1;
+        let measure = Canvas::new(1, 1);
+        let prefix = measure.text_width(Some(&ui.assets), "Saved screenshot as ");
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        assert_eq!(ui.chat_click(true), None);
+        assert_eq!(
+            ui.chat_click(false),
+            Some(game.join("screenshots/test.png"))
+        );
+        ui.cursor = (4, height - 40 - 8 + 1);
+        assert_eq!(ui.chat_click(false), None);
+        ui.system_messages = Arc::from([native_session::SystemMessage {
+            tick: 0,
+            kind: native_session::SystemMessageKind::ScreenshotSaved("../outside.png".into()),
+        }]);
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        assert_eq!(ui.chat_click(false), None);
+        ui.close_chat();
+        assert_eq!(ui.chat_click(false), None);
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

@@ -280,11 +280,11 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
     Some(spans)
 }
 
-enum Part {
+pub(crate) enum Part {
     Text(String),
     Argument(usize),
 }
-fn format_parts(template: &str) -> Option<Vec<Part>> {
+pub(crate) fn format_parts(template: &str) -> Option<Vec<Part>> {
     let bytes = template.as_bytes();
     let mut at = 0;
     let mut start = 0;

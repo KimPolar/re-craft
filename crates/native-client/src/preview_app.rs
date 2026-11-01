@@ -1720,7 +1720,11 @@ impl ApplicationHandler for Viewer {
                     && ui.chat_open()
                 {
                     if button == MouseButton::Left {
-                        ui.chat_click(self.inventory_shift);
+                        if let Some(path) = ui.chat_click(self.inventory_shift)
+                            && let Err(error) = crate::file_open::open(&path)
+                        {
+                            eprintln!("Cannot open screenshot: {error:#}");
+                        }
                     }
                     crate::update_chat_ime_area(&self.window, &self.ui);
                     return;

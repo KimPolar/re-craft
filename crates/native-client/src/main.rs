@@ -1286,6 +1286,12 @@ fn prepare_existing_world(
             session
                 .set_saved_fall(safe, multiplier, fall_effects)
                 .context("cannot configure fall damage")?;
+            match native_session::player_data::read_saved_luck_attribute(player_data) {
+                Ok(luck) => session
+                    .restore_saved_luck_attribute(luck)
+                    .context("cannot restore saved luck")?,
+                Err(error) => eprintln!("Luck-dependent chest loot is unavailable: {error:#}"),
+            }
             session
                 .set_saved_movement_speed(
                     native_session::player_data::read_loaded_movement_speed_attribute(player_data)

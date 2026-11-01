@@ -1052,6 +1052,8 @@ pub struct FallEffects {
     pub mining_fatigue: Option<EffectDuration>,
     pub hunger: Option<EffectDuration>,
     pub poison: Option<EffectDuration>,
+    pub luck: Option<EffectDuration>,
+    pub unluck: Option<EffectDuration>,
 }
 
 impl FallEffects {
@@ -1095,6 +1097,8 @@ impl FallEffects {
         EffectDuration::tick(&mut self.mining_fatigue);
         EffectDuration::tick(&mut self.hunger);
         EffectDuration::tick(&mut self.poison);
+        EffectDuration::tick(&mut self.luck);
+        EffectDuration::tick(&mut self.unluck);
     }
 }
 

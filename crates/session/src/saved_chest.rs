@@ -15,12 +15,14 @@ pub(crate) enum LootRandomTrace {
     Fixed {
         table: ResourceId,
         seed: i64,
+        luck: Option<u32>,
     },
     Named {
         table: ResourceId,
         sequence: ResourceId,
         before: (u64, u64),
         after: (u64, u64),
+        luck: Option<u32>,
     },
 }
 
@@ -444,6 +446,7 @@ impl SavedChest {
         sequence: &ResourceId,
         before: (u64, u64),
         after: (u64, u64),
+        luck: Option<f32>,
     ) -> Result<()> {
         ensure!(
             self.loot_unpacked && self.generated_loot.is_some() && self.loot_trace.is_none(),
@@ -475,6 +478,7 @@ impl SavedChest {
             sequence: sequence.clone(),
             before,
             after,
+            luck: luck.map(f32::to_bits),
         });
         Ok(())
     }
@@ -488,6 +492,26 @@ impl SavedChest {
         table: &ChestLootTable,
         resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
     ) -> Result<()> {
+        self.unpack_seeded_loot_inner(id, table, None, resolve)
+    }
+
+    pub(crate) fn unpack_seeded_loot_with_luck(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        luck: f32,
+        resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        self.unpack_seeded_loot_inner(id, table, Some(luck), resolve)
+    }
+
+    fn unpack_seeded_loot_inner(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        luck: Option<f32>,
+        resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
         let (_, seed) = self
             .pending_loot
             .as_ref()
@@ -495,10 +519,11 @@ impl SavedChest {
         let seed = *seed;
         ensure!(seed != 0, "zero loot seed needs a world random source");
         let mut random = native_core::random::LegacyRandom::new(seed);
-        self.unpack_loot_with_random(id, table, &mut random, resolve)?;
+        self.unpack_loot_with_random_inner(id, table, &mut random, luck, resolve)?;
         self.loot_trace = Some(LootRandomTrace::Fixed {
             table: id.clone(),
             seed,
+            luck: luck.map(f32::to_bits),
         });
         Ok(())
     }
@@ -510,6 +535,30 @@ impl SavedChest {
         id: &ResourceId,
         table: &ChestLootTable,
         random: &mut R,
+        resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        self.unpack_loot_with_random_inner(id, table, random, None, resolve)
+    }
+
+    pub(crate) fn unpack_loot_with_random_and_luck<
+        R: native_resources::chest_loot::ChestLootRandom,
+    >(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        random: &mut R,
+        luck: f32,
+        resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        self.unpack_loot_with_random_inner(id, table, random, Some(luck), resolve)
+    }
+
+    fn unpack_loot_with_random_inner<R: native_resources::chest_loot::ChestLootRandom>(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        random: &mut R,
+        luck: Option<f32>,
         mut resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
     ) -> Result<()> {
         let (expected, _) = self
@@ -519,7 +568,7 @@ impl SavedChest {
         ensure!(expected == id, "loot table does not match the chest");
         let mut prototypes = Vec::new();
         let mut next = random.clone();
-        let generated = table.fill_with_random(&[false; 27], &mut next, |item| {
+        let mut resolve_max = |item: &ChestLootItem| {
             let stack = resolve(item)?;
             let expected_id = format!("{}:{}", item.id.namespace, item.id.path);
             ensure!(
@@ -543,7 +592,13 @@ impl SavedChest {
                 prototypes.push((item.id.clone(), item.potion.clone(), stack));
             }
             Ok(maximum)
-        })?;
+        };
+        let generated = match luck {
+            Some(luck) => {
+                table.fill_with_random_and_luck(&[false; 27], &mut next, luck, &mut resolve_max)?
+            }
+            None => table.fill_with_random(&[false; 27], &mut next, &mut resolve_max)?,
+        };
         let mut slots: [Option<ItemStack>; 27] = std::array::from_fn(|_| None);
         for (index, item) in generated.into_iter().enumerate() {
             let Some(item) = item else { continue };
@@ -579,7 +634,7 @@ impl SavedChest {
             .as_ref()
             .context("generated loot trace is unavailable")?;
         let (expected_id, seed) = match trace {
-            LootRandomTrace::Fixed { table, seed } => (table, *seed),
+            LootRandomTrace::Fixed { table, seed, .. } => (table, *seed),
             LootRandomTrace::Named { table, .. } => (table, 0),
         };
         ensure!(
@@ -611,15 +666,22 @@ impl SavedChest {
         replay.loot_trace = None;
         replay.loot_unpacked = false;
         match trace {
-            LootRandomTrace::Fixed { seed, .. } => {
+            LootRandomTrace::Fixed { seed, luck, .. } => {
                 ensure!(*seed != 0, "fixed loot seed cannot be zero");
                 let mut random = native_core::random::LegacyRandom::new(*seed);
-                replay.unpack_loot_with_random(table_id, table, &mut random, &mut resolve)?;
+                replay.unpack_loot_with_random_inner(
+                    table_id,
+                    table,
+                    &mut random,
+                    luck.map(f32::from_bits),
+                    &mut resolve,
+                )?;
             }
             LootRandomTrace::Named {
                 sequence,
                 before,
                 after,
+                luck,
                 ..
             } => {
                 ensure!(
@@ -628,7 +690,13 @@ impl SavedChest {
                 );
                 let mut random =
                     native_core::random::XoroshiroRandom::from_state(before.0, before.1);
-                replay.unpack_loot_with_random(table_id, table, &mut random, &mut resolve)?;
+                replay.unpack_loot_with_random_inner(
+                    table_id,
+                    table,
+                    &mut random,
+                    luck.map(f32::from_bits),
+                    &mut resolve,
+                )?;
                 ensure!(random.state() == *after, "loot random state differs");
             }
         }
@@ -892,6 +960,75 @@ mod tests {
         assert!(matches_partial_nbt(&parse("{}"), &actual));
     }
     use native_persistence::nbt::NamedTag;
+    #[test]
+    fn generated_loot_replays_the_luck_captured_at_opening() {
+        let position = IVec3::new(-1, 64, 32);
+        let chunk = ChunkPos { x: -1, z: 2 };
+        let id = ResourceId::parse("example:chests/luck").unwrap();
+        let table = ChestLootTable::decode(&serde_json::json!({"type":"minecraft:chest", "random_sequence":"example:luck", "pools":[{"rolls":1,"entries":[
+            {"type":"minecraft:item","name":"minecraft:stone","weight":0,"quality":1},
+            {"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}
+        ]}]})).unwrap();
+        let resolve = |item: &ChestLootItem| {
+            ItemStack::new(
+                format!("{}:{}", item.id.namespace, item.id.path),
+                1,
+                64,
+                Tag::Compound(vec![]),
+            )
+            .ok_or_else(|| anyhow::anyhow!("invalid prototype"))
+        };
+        for seed in [42, 0] {
+            let mut original = chest();
+            let Tag::Compound(fields) = &mut original else {
+                unreachable!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String("example:chests/luck".into()),
+            ));
+            fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            let mut saved = read_with_pending_loot(&payload(vec![original]), chunk, position)
+                .unwrap()
+                .unwrap();
+            if seed != 0 {
+                saved
+                    .unpack_seeded_loot_with_luck(&id, &table, 1.0, resolve)
+                    .unwrap();
+            } else {
+                let mut random = native_core::random::XoroshiroRandom::new(42);
+                let before = random.state();
+                saved
+                    .unpack_loot_with_random_and_luck(&id, &table, &mut random, 1.0, resolve)
+                    .unwrap();
+                saved
+                    .record_named_loot(
+                        &id,
+                        &ResourceId::parse("example:luck").unwrap(),
+                        before,
+                        random.state(),
+                        Some(1.0),
+                    )
+                    .unwrap();
+            }
+            assert!(
+                saved
+                    .slots
+                    .iter()
+                    .flatten()
+                    .any(|stack| stack.id() == "minecraft:stone")
+            );
+            saved.verify_generated_loot(&id, &table, resolve).unwrap();
+            match saved.loot_trace.as_mut().unwrap() {
+                LootRandomTrace::Fixed { luck, .. } | LootRandomTrace::Named { luck, .. } => {
+                    *luck = Some((-1.0_f32).to_bits())
+                }
+            }
+            assert!(saved.verify_generated_loot(&id, &table, resolve).is_err());
+        }
+    }
+
     #[test]
     fn seeded_loot_is_staged_atomically_and_keeps_original_source() {
         let position = IVec3::new(-1, 64, 32);

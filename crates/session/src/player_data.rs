@@ -250,6 +250,215 @@ pub fn read_saved_oxygen_attribute(player: &NamedTag) -> Result<SavedAttribute> 
     saved_attribute(player, "oxygen_bonus", 0.0)
 }
 
+/// Preserve the player's luck base and persistent modifiers for chest loot.
+pub fn read_saved_luck_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    if let Some(effects) = unique_field(&player.value, "active_effects")? {
+        let Tag::List {
+            element_type,
+            values,
+        } = effects
+        else {
+            bail!("active effects are not a list")
+        };
+        ensure!(
+            *element_type == TagType::Compound || values.is_empty(),
+            "active effects are not compounds"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for effect in values {
+            let id = unique_field(effect, "id")?
+                .and_then(text)
+                .context("effect id missing")?;
+            let id = ResourceId::parse(&id)?;
+            ensure!(
+                id.namespace == "minecraft"
+                    && matches!(
+                        id.path.as_str(),
+                        "speed"
+                            | "slowness"
+                            | "haste"
+                            | "mining_fatigue"
+                            | "strength"
+                            | "instant_health"
+                            | "instant_damage"
+                            | "jump_boost"
+                            | "nausea"
+                            | "regeneration"
+                            | "resistance"
+                            | "fire_resistance"
+                            | "water_breathing"
+                            | "invisibility"
+                            | "blindness"
+                            | "night_vision"
+                            | "hunger"
+                            | "weakness"
+                            | "poison"
+                            | "wither"
+                            | "health_boost"
+                            | "absorption"
+                            | "saturation"
+                            | "glowing"
+                            | "levitation"
+                            | "luck"
+                            | "unluck"
+                            | "slow_falling"
+                            | "conduit_power"
+                            | "dolphins_grace"
+                            | "bad_omen"
+                            | "hero_of_the_village"
+                            | "darkness"
+                            | "trial_omen"
+                            | "raid_omen"
+                            | "wind_charged"
+                            | "weaving"
+                            | "oozing"
+                            | "infested"
+                            | "breath_of_the_nautilus"
+                    ),
+                "unknown status effect may affect luck"
+            );
+            ensure!(seen.insert(id.path.clone()), "duplicate status effect");
+            if matches!(id.path.as_str(), "luck" | "unluck") {
+                fn validate(effect: &Tag, depth: usize) -> Result<()> {
+                    ensure!(depth <= 256, "luck effect nesting too deep");
+                    let Tag::Compound(fields) = effect else {
+                        bail!("invalid luck effect")
+                    };
+                    ensure!(
+                        fields.iter().all(|(key, _)| [
+                            "amplifier",
+                            "duration",
+                            "ambient",
+                            "show_particles",
+                            "show_icon",
+                            "hidden_effect"
+                        ]
+                        .iter()
+                        .any(|name| key.matches(name))
+                            || (depth == 0 && key.matches("id"))),
+                        "unknown luck effect data"
+                    );
+                    for name in ["ambient", "show_particles", "show_icon"] {
+                        if let Some(value) = unique_field(effect, name)? {
+                            ensure!(
+                                matches!(value, Tag::Byte(0 | 1)),
+                                "invalid luck effect flag"
+                            );
+                        }
+                    }
+                    if let Some(value) = unique_field(effect, "amplifier")? {
+                        ensure!(
+                            matches!(value, Tag::Byte(_)),
+                            "invalid luck effect amplifier"
+                        );
+                    }
+                    if let Some(value) = unique_field(effect, "duration")? {
+                        ensure!(
+                            matches!(value, Tag::Int(-1..)),
+                            "invalid luck effect duration"
+                        );
+                    }
+                    if let Some(hidden) = unique_field(effect, "hidden_effect")? {
+                        validate(hidden, depth + 1)?;
+                    }
+                    Ok(())
+                }
+                validate(effect, 0)?;
+            }
+        }
+    }
+    if let Some(attributes) = unique_field(&player.value, "attributes")? {
+        let Tag::List {
+            element_type,
+            values,
+        } = attributes
+        else {
+            bail!("attributes are not a list")
+        };
+        ensure!(
+            *element_type == TagType::Compound || values.is_empty(),
+            "attributes are not compounds"
+        );
+        let mut count = 0;
+        for attribute in values {
+            let Some(id) = unique_field(attribute, "id")?.and_then(text) else {
+                continue;
+            };
+            let id = ResourceId::parse(&id)?;
+            if id.namespace != "minecraft" || id.path != "luck" {
+                continue;
+            }
+            let Tag::Compound(fields) = attribute else {
+                bail!("invalid luck attribute")
+            };
+            ensure!(
+                fields.iter().all(|(key, _)| ["id", "base", "modifiers"]
+                    .iter()
+                    .any(|name| key.matches(name))),
+                "unknown luck attribute data"
+            );
+            count += 1;
+            ensure!(count == 1, "duplicate luck attribute");
+            if let Some(base) = unique_field(attribute, "base")? {
+                ensure!(
+                    numeric_double(base).is_some_and(f64::is_finite),
+                    "invalid luck base"
+                );
+            }
+            if let Some(modifiers) = unique_field(attribute, "modifiers")? {
+                let Tag::List {
+                    element_type,
+                    values,
+                } = modifiers
+                else {
+                    bail!("invalid luck modifiers")
+                };
+                ensure!(
+                    *element_type == TagType::Compound || values.is_empty(),
+                    "invalid luck modifiers"
+                );
+                let mut ids = std::collections::BTreeSet::new();
+                for modifier in values {
+                    let Tag::Compound(fields) = modifier else {
+                        bail!("invalid luck modifier")
+                    };
+                    ensure!(
+                        fields.iter().all(|(key, _)| ["id", "amount", "operation"]
+                            .iter()
+                            .any(|name| key.matches(name))),
+                        "unknown luck modifier data"
+                    );
+                    let id = unique_field(modifier, "id")?
+                        .and_then(text)
+                        .context("luck modifier id missing")?;
+                    ensure!(
+                        ids.insert(ResourceId::parse(&id)?),
+                        "duplicate luck modifier"
+                    );
+                    ensure!(
+                        unique_field(modifier, "amount")?
+                            .and_then(numeric_double)
+                            .is_some_and(f64::is_finite),
+                        "invalid luck modifier amount"
+                    );
+                    let operation = unique_field(modifier, "operation")?
+                        .and_then(text)
+                        .context("luck modifier operation missing")?;
+                    AttributeOperation::parse(&operation)?;
+                }
+            }
+        }
+    }
+    let attribute = saved_attribute(player, "luck", 0.0)?;
+    for id in ["minecraft:effect.luck", "minecraft:effect.unluck"] {
+        ensure!(
+            !attribute.contains_modifier(&ResourceId::parse(id)?),
+            "persistent luck effect modifier cannot be reconciled"
+        );
+    }
+    Ok(attribute)
+}
+
 /// Persistent bounciness is combined with transient equipped-item modifiers.
 pub fn read_saved_bounciness_attribute(player: &NamedTag) -> Result<SavedAttribute> {
     saved_attribute(player, "bounciness", 0.0)
@@ -405,6 +614,8 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "mining_fatigue") => &mut effects.mining_fatigue,
             ("minecraft", "hunger") => &mut effects.hunger,
             ("minecraft", "poison") => &mut effects.poison,
+            ("minecraft", "luck") => &mut effects.luck,
+            ("minecraft", "unluck") => &mut effects.unluck,
             _ => continue,
         };
         *slot = Some(effect_duration(effect, 0)?);
@@ -1243,6 +1454,8 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "breath_of_the_nautilus"
                         | "hunger"
                         | "poison"
+                        | "luck"
+                        | "unluck"
                 ),
             "unsupported status effect {id}"
         );
@@ -2141,6 +2354,75 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_luck_rejects_ambiguous_attributes_and_unknown_effects() {
+        let attribute = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:luck".into())),
+            ("base".into(), Tag::Double(4.5)),
+        ]);
+        let make = |attributes: Vec<Tag>, effects: Vec<Tag>| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: attributes,
+                    },
+                ),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: effects,
+                    },
+                ),
+            ]),
+        };
+        assert_eq!(
+            read_saved_luck_attribute(&make(vec![attribute.clone()], vec![]))
+                .unwrap()
+                .value(-1024.0, 1024.0)
+                .unwrap(),
+            4.5
+        );
+        assert!(
+            read_saved_luck_attribute(&make(vec![attribute.clone(), attribute], vec![])).is_err()
+        );
+        let effect = |id: &str| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("amplifier".into(), Tag::Byte(0)),
+                ("duration".into(), Tag::Int(100)),
+            ])
+        };
+        assert!(read_saved_luck_attribute(&make(vec![], vec![effect("example:unknown")])).is_err());
+        assert!(
+            read_saved_luck_attribute(&make(
+                vec![],
+                vec![effect("minecraft:luck"), effect("minecraft:luck")]
+            ))
+            .is_err()
+        );
+        let good = make(
+            vec![],
+            vec![effect("minecraft:luck"), effect("minecraft:unluck")],
+        );
+        assert!(read_saved_luck_attribute(&good).is_ok());
+        let effects = read_saved_fall_effects(&good).unwrap();
+        assert!(effects.luck.is_some() && effects.unluck.is_some());
+        let advanced = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                advance_saved_effects(&good, 1).unwrap().unwrap(),
+            )]),
+        };
+        let mut expected = effects;
+        expected.tick();
+        assert_eq!(read_saved_fall_effects(&advanced).unwrap(), expected);
+    }
 
     #[test]
     fn hunger_replay_rejects_bad_timeline_and_unrecognized_effects() {

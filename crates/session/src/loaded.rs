@@ -475,6 +475,7 @@ pub struct LoadedSession {
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
     oxygen_valid: bool,
+    luck_attribute: Option<crate::player_data::SavedAttribute>,
     bounciness_attribute: crate::player_data::SavedAttribute,
     bounciness_inventory_revision: Option<u64>,
     bounciness: Option<f64>,
@@ -1288,6 +1289,94 @@ impl LoadedSession {
         self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         Ok(())
+    }
+
+    /// Restore persistent luck before the first player tick.
+    pub fn restore_saved_luck_attribute(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "luck must be restored before the first tick"
+        );
+        attribute.value(-1024.0, 1024.0)?;
+        self.luck_attribute = Some(attribute);
+        Ok(())
+    }
+
+    fn chest_opening_luck(&self) -> anyhow::Result<f32> {
+        use anyhow::{Context, ensure};
+        use native_resources::enchantments::{AttributeModifier, AttributeOperation};
+        let mut attribute = self
+            .luck_attribute
+            .clone()
+            .context("saved player luck is unavailable")?;
+        for (id, effect, sign) in [
+            ("minecraft:effect.luck", &self.fall.effects().luck, 1.0),
+            ("minecraft:effect.unluck", &self.fall.effects().unluck, -1.0),
+        ] {
+            let id = native_resources::packs::ResourceId::parse(id)?;
+            ensure!(
+                !attribute.contains_modifier(&id),
+                "persistent effect modifier is unresolved"
+            );
+            if let Some(effect) = effect {
+                attribute.apply(AttributeModifier {
+                    id,
+                    operation: AttributeOperation::AddValue,
+                    amount: sign * (f64::from(effect.amplifier) + 1.0),
+                });
+            }
+        }
+        if self.tick > 0 {
+            let revision = self
+                .oxygen_inventory_revision
+                .context("equipment attributes have not been refreshed")?;
+            ensure!(
+                revision == self.inventory.revision(),
+                "equipment changes have not reached the player tick"
+            );
+            for slot in [
+                crate::inventory::PlayerSlot::Storage(self.inventory.selected()),
+                crate::inventory::PlayerSlot::Offhand,
+                crate::inventory::PlayerSlot::Armor(0),
+                crate::inventory::PlayerSlot::Armor(1),
+                crate::inventory::PlayerSlot::Armor(2),
+                crate::inventory::PlayerSlot::Armor(3),
+            ] {
+                if let Some(item) = self.inventory.slot(slot) {
+                    ensure!(
+                        item.components()
+                            .get("minecraft:attribute_modifiers")
+                            .is_none()
+                            || item
+                                .components()
+                                .get("!minecraft:attribute_modifiers")
+                                .is_none(),
+                        "conflicting equipped attribute patches"
+                    );
+                    let maximum =
+                        crate::equippable::saved_inventory_max(item.id(), item.components())
+                            .context("equipped item prototype is unavailable")?;
+                    ensure!(
+                        item.max_count() == Some(maximum),
+                        "equipped item prototype differs"
+                    );
+                }
+            }
+            let (_, enchantments) = self
+                .oxygen_equipment
+                .as_ref()
+                .context("equipment enchantments unavailable")?;
+            attribute = crate::equipment_attributes::equipped_attribute(
+                &attribute,
+                &self.inventory,
+                enchantments,
+                "luck",
+            )?;
+        }
+        Ok(attribute.value(-1024.0, 1024.0)? as f32)
     }
 
     /// Resolve the saved attribute together with active data-pack equipment effects.
@@ -3016,28 +3105,33 @@ impl LoadedSession {
                             .context("loot item maximum is unavailable")
                     };
                     match trace {
-                        crate::saved_chest::LootRandomTrace::Fixed { .. } => {
-                            native_persistence::chest_loot::VerifiedChestLoot::replay(
+                        crate::saved_chest::LootRandomTrace::Fixed { luck, .. } => match luck {
+                            Some(bits) => {
+                                native_persistence::chest_loot::VerifiedChestLoot::replay_with_luck(
+                                    chest.source(),
+                                    table,
+                                    loot,
+                                    f32::from_bits(*bits),
+                                    resolve,
+                                )
+                            }
+                            None => native_persistence::chest_loot::VerifiedChestLoot::replay(
                                 chest.source(),
                                 table,
                                 loot,
                                 resolve,
-                            )
-                        }
-                        crate::saved_chest::LootRandomTrace::Named { before, .. } => {
+                            ),
+                        },
+                        crate::saved_chest::LootRandomTrace::Named { before, luck, .. } => {
                             let seed = self
                                 .random_sequences
                                 .as_ref()
                                 .context("world random sequences are unavailable")?
                                 .world_seed;
-                            native_persistence::chest_loot::VerifiedChestLoot::replay_named(
-                                chest.source(),
-                                table,
-                                loot,
-                                seed,
-                                *before,
-                                resolve,
-                            )
+                            match luck {
+                                Some(bits) => native_persistence::chest_loot::VerifiedChestLoot::replay_named_with_luck(chest.source(), table, loot, seed, *before, f32::from_bits(*bits), resolve),
+                                None => native_persistence::chest_loot::VerifiedChestLoot::replay_named(chest.source(), table, loot, seed, *before, resolve),
+                            }
                         }
                     }
                 })();
@@ -4039,6 +4133,7 @@ impl LoadedSession {
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
             oxygen_valid: true,
+            luck_attribute: None,
             bounciness_attribute: crate::player_data::SavedAttribute::with_base(0.0),
             bounciness_inventory_revision: None,
             bounciness: Some(0.0),
@@ -4889,8 +4984,15 @@ impl LoadedSession {
         let resolve = |item: &native_resources::chest_loot::ChestLootItem| {
             Self::resolve_chest_loot_item(item, registry)
         };
+        let luck = table
+            .requires_luck()
+            .then(|| self.chest_opening_luck())
+            .transpose()?;
         if seed != 0 {
-            chest.unpack_seeded_loot(&id, table, resolve)?;
+            match luck {
+                Some(luck) => chest.unpack_seeded_loot_with_luck(&id, table, luck, resolve)?,
+                None => chest.unpack_seeded_loot(&id, table, resolve)?,
+            }
         } else {
             let sequence = table
                 .random_sequence()
@@ -4905,8 +5007,13 @@ impl LoadedSession {
             }
             let random = staged.get_mut(sequence).unwrap();
             let before = random.state();
-            chest.unpack_loot_with_random(&id, table, random, resolve)?;
-            chest.record_named_loot(&id, sequence, before, random.state())?;
+            match luck {
+                Some(luck) => {
+                    chest.unpack_loot_with_random_and_luck(&id, table, random, luck, resolve)?
+                }
+                None => chest.unpack_loot_with_random(&id, table, random, resolve)?,
+            }
+            chest.record_named_loot(&id, sequence, before, random.state(), luck)?;
         }
         events.push(chest.position);
         Ok(())
@@ -6660,6 +6767,9 @@ impl LoadedSession {
         self.ground_without_support = false;
         self.ground_support = None;
         self.bounciness_attribute.clear_modifiers();
+        if let Some(attribute) = &mut self.luck_attribute {
+            attribute.clear_modifiers();
+        }
         self.bounciness_inventory_revision = None;
         self.bounciness = self.bounciness_attribute.value(0.0, 1.0).ok();
         self.jump_strength_attribute.clear_modifiers();
@@ -26856,6 +26966,382 @@ mod tests {
         session.collect_closed_chest();
         assert_eq!(session.inventory.chest_title(), None);
         assert_eq!(snapshot.inventory.chest_title(), Some("보관함 ♠"));
+    }
+
+    #[test]
+    fn chest_luck_combines_saved_equipment_and_ticking_effects() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let modifier = |id: &str, amount: f64| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("amount".into(), Tag::Double(amount)),
+                ("operation".into(), Tag::String("add_value".into())),
+            ])
+        };
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "attributes".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:luck".into())),
+                        ("base".into(), Tag::Double(2.5)),
+                        (
+                            "modifiers".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![modifier("example:persistent", 1.0)],
+                            },
+                        ),
+                    ])],
+                },
+            )]),
+        };
+        let mut session = session();
+        assert!(session.chest_opening_luck().is_err());
+        session
+            .restore_saved_luck_attribute(
+                crate::player_data::read_saved_luck_attribute(&source).unwrap(),
+            )
+            .unwrap();
+        let mut inventory = PlayerInventory::default();
+        let mut equipment_modifier = match modifier("example:equipment", 3.0) {
+            Tag::Compound(fields) => fields,
+            _ => unreachable!(),
+        };
+        equipment_modifier.push(("type".into(), Tag::String("minecraft:luck".into())));
+        equipment_modifier.push(("slot".into(), Tag::String("mainhand".into())));
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(
+                ItemStack::new(
+                    "minecraft:wooden_hoe".into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:attribute_modifiers".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![Tag::Compound(equipment_modifier)],
+                        },
+                    )]),
+                )
+                .unwrap(),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        let effect = |amplifier, duration| {
+            Some(crate::survival::EffectDuration {
+                amplifier,
+                duration,
+                hidden: None,
+            })
+        };
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                luck: effect(1, 1),
+                unluck: effect(0, 5),
+                ..Default::default()
+            },
+            Arc::new(OxygenEnchantments::default()),
+        );
+        assert_eq!(session.chest_opening_luck().unwrap(), 4.5);
+        session.oxygen_equipment = Some((
+            crate::player_data::SavedAttribute::with_base(0.0),
+            Arc::new(OxygenEnchantments::default()),
+        ));
+        session.oxygen_inventory_revision = Some(session.inventory.revision());
+        session.tick = 1;
+        assert_eq!(session.chest_opening_luck().unwrap(), 7.5);
+        session.fall.tick_effects();
+        assert_eq!(session.chest_opening_luck().unwrap(), 5.5);
+        Arc::make_mut(&mut session.inventory).set_slot(
+            PlayerSlot::Storage(1),
+            Some(ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap()),
+        );
+        assert!(session.chest_opening_luck().is_err());
+        session.refresh_equipment_oxygen();
+        assert_eq!(session.chest_opening_luck().unwrap(), 5.5);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn chest_luck_attributes_match_java_effects_and_equipment() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{Tag, TagType};
+        use native_resources::enchantments::{AttributeModifier, AttributeOperation};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChestLuckOracle.java");
+        let output = temp.path().join("luck.json");
+        std::fs::write(&source, include_str!("../tests/java/ChestLuckOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ChestLuckOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 270);
+        for row in rows {
+            let mut session = session();
+            let mut saved =
+                crate::player_data::SavedAttribute::with_base(row["base"].as_f64().unwrap());
+            saved.apply(AttributeModifier {
+                id: native_resources::packs::ResourceId::parse("example:persistent").unwrap(),
+                amount: row["persistent"].as_f64().unwrap(),
+                operation: AttributeOperation::AddValue,
+            });
+            session.restore_saved_luck_attribute(saved).unwrap();
+            let effect = |name: &str| {
+                let amp = row[name].as_i64().unwrap();
+                (amp >= 0).then_some(crate::survival::EffectDuration {
+                    amplifier: amp as u8,
+                    duration: 10,
+                    hidden: None,
+                })
+            };
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::survival::FallEffects {
+                    luck: effect("luck"),
+                    unluck: effect("unluck"),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                Some(
+                    ItemStack::new(
+                        "minecraft:wooden_hoe".into(),
+                        1,
+                        1,
+                        Tag::Compound(vec![(
+                            "minecraft:attribute_modifiers".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("id".into(), Tag::String("example:equipment".into())),
+                                    ("type".into(), Tag::String("minecraft:luck".into())),
+                                    ("operation".into(), Tag::String("add_value".into())),
+                                    (
+                                        "amount".into(),
+                                        Tag::Double(row["equipment"].as_f64().unwrap()),
+                                    ),
+                                    ("slot".into(), Tag::String("mainhand".into())),
+                                ])],
+                            },
+                        )]),
+                    )
+                    .unwrap(),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            session.oxygen_equipment = Some((
+                crate::player_data::SavedAttribute::with_base(0.0),
+                Arc::new(OxygenEnchantments::default()),
+            ));
+            session.oxygen_inventory_revision = Some(session.inventory.revision());
+            session.tick = 1;
+            assert_eq!(
+                session.chest_opening_luck().unwrap().to_bits(),
+                row["bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn luck_dependent_chest_opening_preserves_trace_and_requires_verified_luck() {
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceId, ResourceProvider, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:chests/luck")?])
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(Some(br#"{"type":"minecraft:chest","random_sequence":"example:luck","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0,"quality":1},{"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}]}]}"#.to_vec()))
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let tables = Arc::new(ChestLootTables::load(&mut Source).unwrap());
+        let id = ResourceId::parse("example:chests/luck").unwrap();
+        for seed in [0_i64, 42] {
+            for luck in [-1.0_f32, 1.0] {
+                let (mut session, _, position, chunk) = saved_chest_fixture();
+                let SavedBlockEntities::Encoded(bytes) =
+                    &session.world.saved_block_entities[&chunk]
+                else {
+                    panic!()
+                };
+                let mut document = nbt::read(bytes).unwrap();
+                let Tag::List { values, .. } = &mut document.value else {
+                    panic!()
+                };
+                let Tag::Compound(fields) = &mut values[0] else {
+                    panic!()
+                };
+                fields.retain(|(name, _)| !name.matches("Items"));
+                fields.push((
+                    "LootTable".into(),
+                    Tag::String("example:chests/luck".into()),
+                ));
+                fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+                let source = values[0].clone();
+                Arc::make_mut(&mut session.world)
+                    .saved_block_entities
+                    .insert(
+                        chunk,
+                        SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                    );
+                session.set_chest_loot(Arc::clone(&tables));
+                session.set_item_registry(Arc::clone(&registry));
+                session
+                    .set_random_sequences(
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                assert!(!session.try_open_saved_chest(position - session.origin));
+                assert!(!session.chest_dirty_chunks.contains(&chunk));
+                assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
+                session
+                    .restore_saved_luck_attribute(crate::player_data::SavedAttribute::with_base(
+                        f64::from(luck),
+                    ))
+                    .unwrap();
+                session
+                    .set_saved_breathing(
+                        Default::default(),
+                        crate::player_data::SavedAttribute::with_base(0.0),
+                        Arc::new(OxygenEnchantments::default()),
+                    )
+                    .unwrap();
+                session.update(TICK);
+                assert_eq!(
+                    session.oxygen_inventory_revision,
+                    Some(session.inventory.revision())
+                );
+                assert!(session.try_open_saved_chest(position - session.origin));
+                let item = (0..27)
+                    .find_map(|slot| {
+                        session
+                            .inventory
+                            .slot(crate::inventory::PlayerSlot::Chest(slot))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    item.id(),
+                    if luck > 0.0 {
+                        "minecraft:stone"
+                    } else {
+                        "minecraft:stick"
+                    }
+                );
+                assert!(Arc::make_mut(&mut session.inventory).toggle());
+                session.collect_closed_chest();
+                let chest = session.saved_chest(position).unwrap().unwrap();
+                let table = tables.get(&id).unwrap();
+                chest
+                    .verify_generated_loot(&id, table, |item| {
+                        LoadedSession::resolve_chest_loot_item(item, &registry)
+                    })
+                    .unwrap();
+                let trace = chest.loot_trace().unwrap();
+                let max = |item: &native_resources::chest_loot::ChestLootItem| {
+                    LoadedSession::resolve_chest_loot_item(item, &registry)?
+                        .max_count()
+                        .ok_or_else(|| anyhow::anyhow!("missing max"))
+                };
+                match trace {
+                    crate::saved_chest::LootRandomTrace::Fixed {
+                        luck: Some(bits), ..
+                    } => {
+                        assert_eq!(*bits, luck.to_bits());
+                        assert!(
+                            native_persistence::chest_loot::VerifiedChestLoot::replay(
+                                &source, &id, table, max
+                            )
+                            .is_err()
+                        );
+                        native_persistence::chest_loot::VerifiedChestLoot::replay_with_luck(
+                            &source, &id, table, luck, max,
+                        )
+                        .unwrap();
+                    }
+                    crate::saved_chest::LootRandomTrace::Named {
+                        luck: Some(bits),
+                        before,
+                        ..
+                    } => {
+                        assert_eq!(*bits, luck.to_bits());
+                        assert!(
+                            native_persistence::chest_loot::VerifiedChestLoot::replay_named(
+                                &source, &id, table, 42, *before, max
+                            )
+                            .is_err()
+                        );
+                        native_persistence::chest_loot::VerifiedChestLoot::replay_named_with_luck(
+                            &source, &id, table, 42, *before, luck, max,
+                        )
+                        .unwrap();
+                    }
+                    _ => panic!("luck trace was not captured"),
+                }
+            }
+        }
     }
 
     #[test]

@@ -19,8 +19,11 @@ public class DarkSkyOracle {
         });
         Method build = SkyRenderer.class.getDeclaredMethod("buildSkyDisc", VertexConsumer.class, float.class);
         build.setAccessible(true);
-        build.invoke(sky, consumer, -16.0f);
-        for (float[] p : points) System.out.println(Float.floatToRawIntBits(p[0]) + " " + Float.floatToRawIntBits(p[1] + 12.0f) + " " + Float.floatToRawIntBits(p[2]));
+        for (float height : new float[]{-16.0f, 16.0f}) {
+            points.clear();
+            build.invoke(sky, consumer, height);
+            for (float[] p : points) System.out.println(Float.floatToRawIntBits(p[0]) + " " + Float.floatToRawIntBits(p[1]) + " " + Float.floatToRawIntBits(p[2]));
+        }
         for (boolean flat : new boolean[]{false, true}) {
             ClientLevelData data = new ClientLevelData(Difficulty.NORMAL, false, flat);
             for (int minY : new int[]{-128, -64, 0, 32}) {

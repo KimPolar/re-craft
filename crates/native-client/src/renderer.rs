@@ -408,6 +408,12 @@ impl Renderer {
         }
     }
 
+    pub fn set_sky_atmosphere(&mut self, atmosphere: Option<crate::star_render::Atmosphere>) {
+        if let Some(sky) = &mut self.celestial_sky {
+            sky.set_atmosphere(atmosphere);
+        }
+    }
+
     pub fn set_moon_frame(
         &mut self,
         frame: Option<(crate::sun_render::Frame, crate::moon_phase::Phase)>,
@@ -2278,6 +2284,7 @@ impl Renderer {
             moon.update(&self.queue, sky_matrix);
         }
         if let Some(sky) = &mut self.celestial_sky {
+            sky.set_sky_color(sky_background);
             sky.prepare(
                 &self.device,
                 &self.queue,

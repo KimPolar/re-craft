@@ -1167,9 +1167,27 @@ impl Viewer {
                 } else {
                     None
                 };
-                if let Some((color, range)) = water {
+                let atmosphere = if underwater {
+                    water.map(|(fog_color, range)| crate::star_render::Atmosphere {
+                        fog_color,
+                        sky_end: range[1],
+                    })
+                } else {
+                    match (fog_color, play.sky_mix_previous, play.sky_mix_current) {
+                        (Some(fog_color), Some((_, previous)), Some((_, current))) => {
+                            Some(crate::star_render::Atmosphere {
+                                fog_color,
+                                sky_end: (previous + partial * (current - previous))
+                                    .min(play.streamer.radius().max(2) as f32 * 16.0),
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                renderer.set_sky_atmosphere(atmosphere);
+                if let Some((water_color, range)) = water {
                     renderer.set_sky_color(color);
-                    renderer.set_fog_color(Some(color));
+                    renderer.set_fog_color(Some(water_color));
                     renderer.set_fog_range(Some(range));
                 } else {
                     renderer.set_sky_color(if play.fog_is_background {

@@ -4,18 +4,26 @@ use wgpu::util::DeviceExt;
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-fn dark_disc_vertices() -> [[f32; 3]; 24] {
+fn disc_vertices(top: bool) -> [[f32; 3]; 24] {
+    let y = if top { 16.0 } else { -16.0 };
+    let x_scale = if top { 512.0 } else { -512.0 };
     let edge = |i: usize| {
         let radians = ((i as i32 * 45 - 180) as f32) * 0.017_453_292_f32;
         let cos = native_session::physics::java_sin(f64::from(radians), true);
         let sin = native_session::physics::java_sin(f64::from(radians), false);
-        [-512.0 * cos, -4.0, 512.0 * sin]
+        [x_scale * cos, y, 512.0 * sin]
     };
     std::array::from_fn(|index| match index % 3 {
-        0 => [0.0, -4.0, 0.0],
+        0 => [0.0, y, 0.0],
         1 => edge(index / 3),
         _ => edge(index / 3 + 1),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Atmosphere {
+    pub fog_color: [f32; 3],
+    pub sky_end: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -37,8 +45,14 @@ pub struct Sky {
     dark_binding: wgpu::BindGroup,
     dark_uniform: wgpu::Buffer,
     dark_vertices: wgpu::Buffer,
+    top_binding: wgpu::BindGroup,
+    top_uniform: wgpu::Buffer,
+    top_vertices: wgpu::Buffer,
+    atmosphere: Option<Atmosphere>,
+    sky_color: [f32; 3],
+    top_last_state: Option<[[f32; 4]; 7]>,
     dark_disc: bool,
-    dark_last_matrix: Option<[[f32; 4]; 4]>,
+    dark_last_state: Option<[[f32; 4]; 7]>,
     star_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
@@ -99,7 +113,7 @@ impl Sky {
         });
         let dark_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dark sky transform"),
-            size: 80,
+            size: 112,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -111,9 +125,27 @@ impl Sky {
                 resource: dark_uniform.as_entire_binding(),
             }],
         });
+        let top_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("top sky transform and fog"),
+            size: 112,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let top_binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("top sky uniforms"),
+            layout: &star_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: top_uniform.as_entire_binding(),
+            }],
+        });
         let star_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("star shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("star_render.wgsl").into()),
+        });
+        let disc_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky disc fog shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky_disc.wgsl").into()),
         });
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky composite shader"),
@@ -215,8 +247,8 @@ impl Sky {
             label: Some("dark sky disc"),
             layout: Some(&star_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &star_shader,
-                entry_point: Some("star_vertex"),
+                module: &disc_shader,
+                entry_point: Some("vertex"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 12,
@@ -231,8 +263,8 @@ impl Sky {
             depth_stencil: None,
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &star_shader,
-                entry_point: Some("star_fragment"),
+                module: &disc_shader,
+                entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: FORMAT,
@@ -245,7 +277,12 @@ impl Sky {
         });
         let dark_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dark sky disc vertices"),
-            contents: bytemuck::cast_slice(&dark_disc_vertices()),
+            contents: bytemuck::cast_slice(&disc_vertices(false)),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let top_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("top sky disc vertices"),
+            contents: bytemuck::cast_slice(&disc_vertices(true)),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let mut triangles = Vec::new();
@@ -264,8 +301,14 @@ impl Sky {
             dark_binding,
             dark_uniform,
             dark_vertices,
+            top_binding,
+            top_uniform,
+            top_vertices,
+            atmosphere: None,
+            sky_color: [0.0; 3],
+            top_last_state: None,
             dark_disc: false,
-            dark_last_matrix: None,
+            dark_last_state: None,
             star_pipeline,
             composite_pipeline,
             composite_layout,
@@ -291,6 +334,14 @@ impl Sky {
         self.dark_disc = visible;
     }
 
+    pub fn set_atmosphere(&mut self, atmosphere: Option<Atmosphere>) {
+        self.atmosphere = atmosphere;
+    }
+
+    pub fn set_sky_color(&mut self, color: [f32; 3]) {
+        self.sky_color = color;
+    }
+
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -299,17 +350,43 @@ impl Sky {
         view_projection: Mat4,
     ) {
         self.sunrise.prepare(queue, view_projection);
-        let matrix = view_projection.to_cols_array_2d();
-        if self.dark_disc && self.dark_last_matrix != Some(matrix) {
+        let fog = self.atmosphere.unwrap_or(Atmosphere {
+            fog_color: [0.0; 3],
+            sky_end: f32::MAX,
+        });
+        if self.atmosphere.is_some() {
+            let matrix = view_projection.to_cols_array_2d();
+            let state = [
+                matrix[0],
+                matrix[1],
+                matrix[2],
+                matrix[3],
+                [self.sky_color[0], self.sky_color[1], self.sky_color[2], 1.0],
+                [fog.fog_color[0], fog.fog_color[1], fog.fog_color[2], 1.0],
+                [fog.sky_end, 0.0, 0.0, 0.0],
+            ];
+            if self.top_last_state != Some(state) {
+                queue.write_buffer(&self.top_uniform, 0, bytemuck::cast_slice(&state));
+                self.top_last_state = Some(state);
+            }
+        }
+        if self.dark_disc {
+            let matrix = (view_projection
+                * Mat4::from_translation(glam::Vec3::new(0.0, 12.0, 0.0)))
+            .to_cols_array_2d();
             let state = [
                 matrix[0],
                 matrix[1],
                 matrix[2],
                 matrix[3],
                 [0.0, 0.0, 0.0, 1.0],
+                [fog.fog_color[0], fog.fog_color[1], fog.fog_color[2], 1.0],
+                [fog.sky_end, 0.0, 0.0, 0.0],
             ];
-            queue.write_buffer(&self.dark_uniform, 0, bytemuck::cast_slice(&state));
-            self.dark_last_matrix = Some(matrix);
+            if self.dark_last_state != Some(state) {
+                queue.write_buffer(&self.dark_uniform, 0, bytemuck::cast_slice(&state));
+                self.dark_last_state = Some(state);
+            }
         }
         if self
             .target
@@ -373,6 +450,7 @@ impl Sky {
         moon: Option<&crate::sun_render::Sun>,
     ) {
         let target = self.target.as_ref().expect("prepared sky");
+        let clear = self.atmosphere.map_or(background, |fog| fog.fog_color);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("celestial pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -381,9 +459,9 @@ impl Sky {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: background[0] as f64,
-                        g: background[1] as f64,
-                        b: background[2] as f64,
+                        r: clear[0] as f64,
+                        g: clear[1] as f64,
+                        b: clear[2] as f64,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -394,6 +472,12 @@ impl Sky {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if self.atmosphere.is_some() {
+            pass.set_pipeline(&self.dark_pipeline);
+            pass.set_bind_group(0, &self.top_binding, &[]);
+            pass.set_vertex_buffer(0, self.top_vertices.slice(..));
+            pass.draw(0..24, 0..1);
+        }
         self.sunrise.draw(&mut pass);
         if let Some(sun) = sun {
             sun.draw(&mut pass);
@@ -477,7 +561,7 @@ mod tests {
         );
         let text = String::from_utf8(output.stdout).unwrap();
         let mut lines = text.lines();
-        let java: Vec<[f32; 3]> = (0..10)
+        let java: Vec<[f32; 3]> = (0..20)
             .map(|_| {
                 let values: Vec<_> = lines
                     .next()
@@ -488,19 +572,21 @@ mod tests {
                 values.try_into().unwrap()
             })
             .collect();
-        let vertices = dark_disc_vertices();
-        for triangle in 0..8 {
-            for (actual, expected) in vertices[triangle * 3..triangle * 3 + 3].iter().zip([
-                java[0],
-                java[triangle + 1],
-                java[triangle + 2],
-            ]) {
-                for axis in 0..3 {
-                    assert_eq!(
-                        actual[axis].to_bits(),
-                        expected[axis].to_bits(),
-                        "triangle {triangle}, axis {axis}"
-                    );
+        for (disc, top) in [false, true].into_iter().enumerate() {
+            let vertices = disc_vertices(top);
+            for triangle in 0..8 {
+                for (actual, expected) in vertices[triangle * 3..triangle * 3 + 3].iter().zip([
+                    java[disc * 10],
+                    java[disc * 10 + triangle + 1],
+                    java[disc * 10 + triangle + 2],
+                ]) {
+                    for axis in 0..3 {
+                        assert_eq!(
+                            actual[axis].to_bits(),
+                            expected[axis].to_bits(),
+                            "disc {disc}, triangle {triangle}, axis {axis}"
+                        );
+                    }
                 }
             }
         }
@@ -988,14 +1074,37 @@ mod dark_gpu_tests {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            for (direction, visible, black) in [
-                (Vec3::NEG_Y, false, false),
-                (Vec3::NEG_Y, true, true),
-                (Vec3::Y, true, false),
+            sky.set_sky_color([0.2, 0.4, 0.6]);
+            let fog = |sky_end| {
+                Some(Atmosphere {
+                    fog_color: [0.8, 0.2, 0.1],
+                    sky_end,
+                })
+            };
+            for (direction, visible, atmosphere, expected) in [
+                (Vec3::NEG_Y, false, None, [255, 255, 255, 255]),
+                (Vec3::NEG_Y, true, None, [0, 0, 0, 255]),
+                (Vec3::Y, true, None, [51, 102, 153, 255]),
+                (Vec3::NEG_Y, true, fog(64.0), [51, 13, 6, 255]),
+                (Vec3::Y, true, fog(64.0), [89, 89, 121, 255]),
+                (
+                    Vec3::new(1.0, 1.0, 0.0).normalize(),
+                    true,
+                    fog(64.0),
+                    [126, 77, 90, 255],
+                ),
+                (Vec3::Y, true, fog(0.0), [204, 51, 26, 255]),
+                (Vec3::X, false, fog(64.0), [204, 51, 26, 255]),
             ] {
-                let matrix = Mat4::perspective_rh(30.0_f32.to_radians(), 1.0, 0.05, 1024.0)
-                    * Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Z);
+                let up = if direction == Vec3::X {
+                    Vec3::Y
+                } else {
+                    Vec3::Z
+                };
+                let matrix = Mat4::perspective_rh(0.1_f32.to_radians(), 1.0, 0.05, 1024.0)
+                    * Mat4::look_to_rh(Vec3::ZERO, direction, up);
                 sky.set_dark_disc(visible);
+                sky.set_atmosphere(atmosphere);
                 sky.prepare(&device, &queue, (64, 64), matrix);
                 sun.update(&queue, matrix);
                 let mut encoder = device.create_command_encoder(&Default::default());
@@ -1064,16 +1173,12 @@ mod dark_gpu_tests {
                     .unwrap();
                 let pixels = readback.slice(..).get_mapped_range().unwrap();
                 let center = &pixels[(32 * 64 + 32) * 4..][..4];
-                assert_eq!(
-                    center,
-                    if black {
-                        &[0, 0, 0, 255]
-                    } else if direction == Vec3::NEG_Y {
-                        &[255, 255, 255, 255]
-                    } else {
-                        &[51, 102, 153, 255]
-                    }
-                );
+                for channel in 0..4 {
+                    assert!(
+                        (i32::from(center[channel]) - expected[channel]).abs() <= 2,
+                        "direction {direction:?}, atmosphere {atmosphere:?}, actual {center:?}, expected {expected:?}"
+                    );
+                }
                 drop(pixels);
                 readback.unmap();
             }

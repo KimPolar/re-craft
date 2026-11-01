@@ -192,6 +192,7 @@ pub fn run_play(
     assets: Option<Arc<MenuAssets>>,
     skin: Option<Arc<crate::player_skin::PlayerSkin>>,
     trims: Arc<crate::equipment_visual::TrimRegistry>,
+    enchantments: Arc<crate::enchantment_tooltip::Registry>,
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
     video: VideoSettings,
@@ -236,6 +237,7 @@ pub fn run_play(
             streamer,
             mesher,
             trims,
+            enchantments,
             sky_timeline,
             sky_background,
             weather_textures,
@@ -301,6 +303,7 @@ fn run_inner(
     if let (Some(ui), Some(play)) = (&mut ui, &play) {
         ui.set_crafting_recipes(play.session.crafting_recipes());
         ui.set_trim_registry(Arc::clone(&play.trims));
+        ui.set_enchantments(Arc::clone(&play.enchantments));
     }
     if let (Some(ui), Some(skin)) = (&mut ui, skin) {
         ui.set_player_skin(skin);
@@ -362,6 +365,7 @@ struct PlayState {
     streamer: ChunkStreamer,
     mesher: MeshWorker,
     trims: Arc<crate::equipment_visual::TrimRegistry>,
+    enchantments: Arc<crate::enchantment_tooltip::Registry>,
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,

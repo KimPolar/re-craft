@@ -15,6 +15,7 @@ mod compass_motion;
 mod consume_particle_render;
 mod consume_particles;
 mod death_ui;
+mod enchantment_tooltip;
 mod equipment_visual;
 mod experience_hud;
 mod file_open;
@@ -565,6 +566,7 @@ struct PreparedPlayWorld {
     assets: Option<Arc<MenuAssets>>,
     player_skin: Option<Arc<player_skin::PlayerSkin>>,
     trims: Arc<equipment_visual::TrimRegistry>,
+    enchantments: Arc<enchantment_tooltip::Registry>,
     sky_timeline: Option<preview_lighting::SkyTimeline>,
     sky_background: Option<sky_background::SkyBackground>,
     video: menu_settings::VideoSettings,
@@ -612,6 +614,7 @@ fn run_prepared_world(
                 assets,
                 player_skin,
                 trims,
+                enchantments,
                 sky_timeline,
                 sky_background,
                 video,
@@ -626,6 +629,7 @@ fn run_prepared_world(
                 assets,
                 player_skin,
                 trims,
+                enchantments,
                 sky_timeline,
                 sky_background,
                 video,
@@ -1464,6 +1468,13 @@ fn prepare_existing_world(
             equipment_visual::TrimRegistry::load(&mut resources)
                 .context("cannot load armor trim definitions")?,
         );
+        let enchantments = Arc::new(match enchantment_tooltip::Registry::load(&mut resources) {
+            Ok(registry) => registry,
+            Err(error) => {
+                eprintln!("Enchantment tooltips are unavailable: {error:#}");
+                Default::default()
+            }
+        });
         return Ok(PreparedWorld::Play(Box::new(PreparedPlayWorld {
             scene,
             session,
@@ -1473,6 +1484,7 @@ fn prepare_existing_world(
             assets,
             player_skin,
             trims,
+            enchantments,
             sky_timeline,
             sky_background,
             video,

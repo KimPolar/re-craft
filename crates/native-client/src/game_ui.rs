@@ -150,6 +150,7 @@ struct DrawKey {
 
 pub struct GameUi {
     assets: Arc<MenuAssets>,
+    enchantments: Arc<crate::enchantment_tooltip::Registry>,
     skin: Arc<crate::player_skin::PlayerSkin>,
     held_models: ItemModelCache,
     consume_particles: crate::consume_particles::ParticleSystem,
@@ -258,6 +259,7 @@ impl GameUi {
             Arc::clone(&assets.trim_registry),
         );
         Self {
+            enchantments: Arc::clone(&assets.enchantments),
             assets,
             skin,
             held_models,
@@ -347,6 +349,11 @@ impl GameUi {
 
     pub fn set_trim_registry(&mut self, trims: Arc<crate::equipment_visual::TrimRegistry>) {
         self.armor_models.set_trims(trims);
+        self.last_draw = None;
+    }
+
+    pub fn set_enchantments(&mut self, enchantments: Arc<crate::enchantment_tooltip::Registry>) {
+        self.enchantments = enchantments;
         self.last_draw = None;
     }
 
@@ -3111,7 +3118,7 @@ impl GameUi {
                 &tooltip.duration,
             );
         } else if let Some(item) = item_tooltip {
-            let lines = crate::item_tooltip::lines(item, assets);
+            let lines = crate::item_tooltip::lines(item, assets, &self.enchantments);
             crate::tooltip::draw_item(&mut canvas, assets, self.cursor, &lines);
         }
         self.last_draw = Some(key);

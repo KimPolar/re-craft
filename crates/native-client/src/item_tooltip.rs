@@ -97,7 +97,11 @@ fn potion_name(item: &ItemStack) -> Option<String> {
 
 /// Supported title and lore lines. Additional item-specific detail lines are
 /// still being implemented and must not be interpreted as complete tooltips.
-pub fn lines(item: &ItemStack, assets: &MenuAssets) -> Vec<Vec<Span>> {
+pub fn lines(
+    item: &ItemStack,
+    assets: &MenuAssets,
+    enchantments: &crate::enchantment_tooltip::Registry,
+) -> Vec<Vec<Span>> {
     let components = item.components();
     let display = components.get("minecraft:tooltip_display");
     if display
@@ -147,6 +151,13 @@ pub fn lines(item: &ItemStack, assets: &MenuAssets) -> Vec<Vec<Span>> {
         && let Some(potion_lines) = crate::potion_tooltip::lines(item, assets)
     {
         lines.extend(potion_lines);
+    }
+    for component in ["minecraft:stored_enchantments", "minecraft:enchantments"] {
+        if !hidden(display, component)
+            && let Some(value) = components.get(component)
+        {
+            lines.extend(enchantments.lines(value, assets));
+        }
     }
     if !hidden(display, "minecraft:lore")
         && let Some(Tag::List { values, .. }) = components.get("minecraft:lore")
@@ -469,6 +480,29 @@ mod tests {
                 cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"scale":scale,"custom_effects":[{"id":"haste","duration":1801,"amplifier":1}]}));
             }
         }
+        let tag = native_resources::packs::ResourceStack::open(&game)
+            .unwrap()
+            .read_builtin_data("data/minecraft/tags/enchantment/tooltip_order.json")
+            .unwrap()
+            .unwrap();
+        let tag: serde_json::Value = serde_json::from_slice(&tag).unwrap();
+        for enchantment in tag["values"].as_array().unwrap() {
+            let enchantment = enchantment.as_str().unwrap();
+            for level in [1, 2, 5, 255] {
+                for item in ["apple", "enchanted_book"] {
+                    for component in ["enchantments", "stored_enchantments"] {
+                        let mut values = serde_json::Map::new();
+                        values.insert(enchantment.to_owned(), serde_json::json!(level));
+                        let mut case = serde_json::json!({"id":format!("minecraft:{item}")});
+                        case[component] = values.into();
+                        cases.push(case);
+                    }
+                }
+            }
+        }
+        cases.push(serde_json::json!({"id":"minecraft:apple","potion":"swiftness","enchantments":{"minecraft:mending":1,"minecraft:sharpness":5,"minecraft:binding_curse":1},"stored_enchantments":{"minecraft:vanishing_curse":1,"minecraft:efficiency":3},"lore":["Lore"]}));
+        cases.push(serde_json::json!({"id":"minecraft:apple","enchantments":{"minecraft:sharpness":5},"hide_enchantments":true}));
+        cases.push(serde_json::json!({"id":"minecraft:enchanted_book","stored_enchantments":{"minecraft:binding_curse":1},"hide_stored":true}));
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
@@ -532,6 +566,41 @@ mod tests {
                         },
                     )]),
                 ));
+            }
+            for (flag, component) in [
+                ("hide_enchantments", "minecraft:enchantments"),
+                ("hide_stored", "minecraft:stored_enchantments"),
+            ] {
+                if case[flag].as_bool() == Some(true) {
+                    fields.push((
+                        "minecraft:tooltip_display".into(),
+                        Tag::Compound(vec![(
+                            "hidden_components".into(),
+                            Tag::List {
+                                element_type: TagType::String,
+                                values: vec![Tag::String(component.into())],
+                            },
+                        )]),
+                    ));
+                }
+            }
+            for (key, component) in [
+                ("enchantments", "minecraft:enchantments"),
+                ("stored_enchantments", "minecraft:stored_enchantments"),
+            ] {
+                if let Some(values) = case[key].as_object() {
+                    fields.push((
+                        component.into(),
+                        Tag::Compound(
+                            values
+                                .iter()
+                                .map(|(id, level)| {
+                                    (id.as_str().into(), Tag::Int(level.as_i64().unwrap() as i32))
+                                })
+                                .collect(),
+                        ),
+                    ));
+                }
             }
             if let Some(scale) = case["scale"].as_f64() {
                 fields.push((
@@ -602,13 +671,15 @@ mod tests {
                 Tag::Compound(fields),
             )
             .unwrap();
-            let actual = lines(&item, &assets);
+            let actual = lines(&item, &assets, &assets.enchantments);
             let expected_lines = expected["spans"].as_array().unwrap();
             if case["hide"].as_bool() == Some(true) {
                 assert!(actual.is_empty() && expected_lines.is_empty(), "{case}");
                 continue;
             }
             let potion_case = case["potion"].is_string()
+                || case["enchantments"].is_object()
+                || case["stored_enchantments"].is_object()
                 || case["custom_effects"].is_array()
                 || matches!(
                     case["id"].as_str(),
@@ -624,7 +695,10 @@ mod tests {
             } else {
                 1
             };
-            if potion_case {
+            if potion_case
+                && !case["enchantments"].is_object()
+                && !case["stored_enchantments"].is_object()
+            {
                 assert_eq!(actual.len(), expected_lines.len(), "{case} {expected}");
             }
             assert!(expected_lines.len() >= count, "{case}");

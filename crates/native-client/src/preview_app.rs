@@ -319,6 +319,13 @@ pub fn run_play(
             None
         }
     };
+    let fire_overlay = match crate::fire_overlay::Texture::load(&mut resources) {
+        Ok(texture) => Some(texture),
+        Err(error) => {
+            eprintln!("Fire overlay is unavailable: {error:#}");
+            None
+        }
+    };
     let mesher = MeshWorker::start(resources)?;
     run_inner(
         event_loop,
@@ -340,6 +347,7 @@ pub fn run_play(
             moon,
             weather_textures,
             water_overlay,
+            fire_overlay,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
             weather_frame: None,
@@ -478,6 +486,7 @@ struct PlayState {
     moon: Option<crate::sun_render::Texture>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
     water_overlay: Option<crate::water_overlay::Texture>,
+    fire_overlay: Option<crate::fire_overlay::Texture>,
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
     weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
@@ -1371,6 +1380,10 @@ impl Viewer {
                 None
             };
             renderer.set_water_overlay_frame(frame);
+            renderer.set_fire_overlay_tick(
+                (snapshot.on_fire && snapshot.game_mode != native_session::GameMode::Spectator)
+                    .then_some(snapshot.tick),
+            );
             let tick = snapshot.tick;
             let base_changed = play
                 .sky_base
@@ -1658,6 +1671,14 @@ impl ApplicationHandler for Viewer {
             && let Err(error) = renderer.set_water_overlay_texture(texture)
         {
             eprintln!("Underwater overlay rendering is unavailable: {error:#}");
+        }
+        if let Some(texture) = self
+            .play
+            .as_ref()
+            .and_then(|play| play.fire_overlay.as_ref())
+            && let Err(error) = renderer.set_fire_overlay_texture(texture.clone())
+        {
+            eprintln!("Fire overlay rendering is unavailable: {error:#}");
         }
         #[cfg(debug_assertions)]
         println!("World viewer graphics backend: {}", renderer.backend_name);
@@ -3220,6 +3241,7 @@ mod tests {
             experience: previous.experience,
             death: previous.death,
             armor: previous.armor,
+            on_fire: previous.on_fire,
             eyes_in_water: previous.eyes_in_water,
             under_water: previous.under_water,
             water_vision: previous.water_vision,

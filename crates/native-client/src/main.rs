@@ -21,6 +21,7 @@ mod end_sky;
 mod equipment_visual;
 mod experience_hud;
 mod file_open;
+mod fire_overlay;
 mod first_person;
 mod fluid_mesh;
 mod focus_pause;

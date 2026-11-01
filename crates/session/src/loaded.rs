@@ -486,6 +486,7 @@ pub struct LoadedSession {
     unresolved_player_damage: bool,
     unresolved_player_lava: bool,
     player_fire_ticks: i32,
+    player_visual_on_fire: bool,
     burning_time_attribute: crate::player_data::SavedAttribute,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
@@ -4203,6 +4204,7 @@ impl LoadedSession {
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
+            on_fire: self.player_visual_on_fire,
             eyes_in_water: self.previous_eye_in_water,
             under_water: self.sprint.under_water,
             water_vision: self.water_vision.factor(self.previous_eye_in_water),
@@ -4326,6 +4328,7 @@ impl LoadedSession {
             experience: crate::experience::Experience::default(),
             death: None,
             armor: Some(crate::ArmorValues::default()),
+            on_fire: false,
             eyes_in_water: false,
             under_water: false,
             water_vision: 0.0,
@@ -4437,6 +4440,7 @@ impl LoadedSession {
             unresolved_player_damage: false,
             unresolved_player_lava: false,
             player_fire_ticks: 0,
+            player_visual_on_fire: false,
             burning_time_attribute: crate::player_data::SavedAttribute::with_base(1.0),
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
@@ -7090,6 +7094,7 @@ impl LoadedSession {
         self.swimming = false;
         self.fall_distance = 0.0;
         self.player_fire_ticks = 0;
+        self.player_visual_on_fire = false;
         self.burning_time_attribute.clear_modifiers();
         self.ground_without_support = false;
         self.ground_support = None;
@@ -14127,6 +14132,7 @@ impl LoadedSession {
                 self.player_fire_ticks = self.player_fire_ticks.min(1);
             }
         }
+        self.player_visual_on_fire = self.player_fire_ticks > 0;
         let under_water = in_water && self.previous_eye_in_water;
         self.previous_eye_in_water = contacts.water.eyes_inside;
         self.water_vision.tick(
@@ -15156,6 +15162,7 @@ impl GameSession for LoadedSession {
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),
+                on_fire: self.player_visual_on_fire,
                 eyes_in_water: self.previous_eye_in_water,
                 under_water: self.sprint.under_water,
                 water_vision: self.water_vision.factor(self.previous_eye_in_water),
@@ -37238,9 +37245,11 @@ mod tests {
         burning.update(TICK);
         assert_eq!(burning.vitals.health, 16.0);
         assert_eq!(burning.player_fire_ticks, 300);
+        assert!(!burning.snapshot().on_fire);
         for _ in 0..9 {
             burning.update(TICK);
         }
+        assert!(burning.snapshot().on_fire);
         assert_eq!(burning.vitals.health, 16.0);
         burning.update(TICK);
         assert_eq!(burning.vitals.health, 12.0);
@@ -37248,6 +37257,9 @@ mod tests {
         put_fluid(&mut burning, "minecraft:water");
         burning.update(TICK);
         assert_eq!(burning.player_fire_ticks, -20);
+        assert!(burning.snapshot().on_fire);
+        burning.update(TICK);
+        assert!(!burning.snapshot().on_fire);
 
         let mut protected = session();
         protected
@@ -37293,6 +37305,8 @@ mod tests {
         creative.update(TICK);
         assert_eq!(creative.vitals.health, 20.0);
         assert_eq!(creative.player_fire_ticks, 1);
+        creative.update(TICK);
+        assert!(!creative.snapshot().on_fire);
 
         let mut lethal = session();
         lethal.set_player_vitals(crate::survival::PlayerVitals {

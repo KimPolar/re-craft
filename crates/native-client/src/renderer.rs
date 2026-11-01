@@ -224,6 +224,7 @@ pub struct Renderer {
     moon: Option<crate::sun_render::Sun>,
     celestial_sky: Option<crate::star_render::Sky>,
     water_overlay: Option<crate::water_overlay::Overlay>,
+    fire_overlay: Option<crate::fire_overlay::Overlay>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -425,6 +426,25 @@ impl Renderer {
     pub fn set_water_overlay_frame(&mut self, frame: Option<crate::water_overlay::Frame>) {
         if let Some(overlay) = &mut self.water_overlay {
             overlay.set_frame(frame);
+        }
+    }
+
+    pub fn set_fire_overlay_texture(
+        &mut self,
+        texture: crate::fire_overlay::Texture,
+    ) -> Result<()> {
+        self.fire_overlay = Some(crate::fire_overlay::Overlay::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            texture,
+        )?);
+        Ok(())
+    }
+
+    pub fn set_fire_overlay_tick(&mut self, tick: Option<u64>) {
+        if let Some(overlay) = &mut self.fire_overlay {
+            overlay.set_tick(tick);
         }
     }
 
@@ -1395,6 +1415,7 @@ impl Renderer {
             moon: None,
             celestial_sky: None,
             water_overlay: None,
+            fire_overlay: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2485,6 +2506,9 @@ impl Renderer {
         }
         if let Some(overlay) = &mut self.water_overlay {
             overlay.draw(&self.queue, &mut encoder, view);
+        }
+        if let Some(overlay) = &mut self.fire_overlay {
+            overlay.draw(&self.queue, &mut encoder, view, hand_projection);
         }
         if !self.hide_crosshair && !self.hud_hidden {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

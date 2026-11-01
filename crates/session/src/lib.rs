@@ -539,6 +539,8 @@ pub struct WorldSnapshot {
     pub death: Option<DeathInfo>,
     /// None means the equipped modifiers could not be resolved safely.
     pub armor: Option<ArmorValues>,
+    /// Server-synchronized visual fire flag from the player's last base tick.
+    pub on_fire: bool,
     /// Whether the most recent fluid-contact tick placed the player's eyes in water.
     pub eyes_in_water: bool,
     /// Previous eye-fluid state combined with current body-water contact.
@@ -790,6 +792,7 @@ impl LocalSession {
             experience: experience::Experience::default(),
             death: None,
             armor: Some(ArmorValues::default()),
+            on_fire: false,
             eyes_in_water: false,
             under_water: false,
             water_vision: 0.0,
@@ -972,6 +975,7 @@ impl LocalSession {
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
+            on_fire: false,
             eyes_in_water: false,
             under_water: false,
             water_vision: 0.0,
@@ -2102,6 +2106,7 @@ impl GameSession for LocalSession {
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),
+                on_fire: false,
                 eyes_in_water: false,
                 under_water: false,
                 water_vision: 0.0,

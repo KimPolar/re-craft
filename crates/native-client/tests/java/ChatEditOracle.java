@@ -10,6 +10,14 @@ import net.minecraft.client.gui.Font;
 import net.minecraft.client.StringSplitter;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.input.MouseButtonInfo;
+import com.mojang.brigadier.CommandDispatcher;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.server.commands.SeedCommand;
+import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.ComponentUtils;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.contents.TranslatableContents;
 import net.minecraft.client.input.KeyEvent;
 
 // Compare the real 26.3 EditBox input state without creating a game window.
@@ -30,6 +38,26 @@ public final class ChatEditOracle {
         Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         field.setAccessible(true);
         sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+        CommandSourceStack source = (CommandSourceStack) unsafe.allocateInstance(CommandSourceStack.class);
+        for (boolean dedicated : new boolean[]{false, true}) {
+            CommandDispatcher<CommandSourceStack> dispatcher = new CommandDispatcher<>();
+            SeedCommand.register(dispatcher, dedicated);
+            for (boolean allowed : new boolean[]{false, true}) {
+                set(source, CommandSourceStack.class, "permissions", allowed ? PermissionSet.ALL_PERMISSIONS : PermissionSet.NO_PERMISSIONS);
+                if (dispatcher.getRoot().getChild("seed").canUse(source) != (!dedicated || allowed))
+                    throw new AssertionError("seed permissions");
+            }
+        }
+        String seed = "-9223372036854775808";
+        Component wrapped = ComponentUtils.copyOnClickText(seed);
+        TranslatableContents bracket = (TranslatableContents) wrapped.getContents();
+        Component digit = (Component) bracket.getArgs()[0];
+        if (!bracket.getKey().equals("chat.square_brackets") ||
+            digit.getStyle().getColor().getValue() != 0x55ff55 ||
+            !(digit.getStyle().getClickEvent() instanceof ClickEvent.CopyToClipboard copy) ||
+            !copy.value().equals(seed) || !seed.equals(digit.getStyle().getInsertion()) ||
+            digit.getStyle().getHoverEvent() == null || digit.getStyle().isUnderlined())
+            throw new AssertionError("seed component style");
         String[] texts = {"", "abc  def", " a   b ", "한글  😀-two  끝", "a\u00a0b c", "a\tb c"};
         int[] codes = {1073741904, 1073741903, 8, 127};
         JsonArray rows = new JsonArray();

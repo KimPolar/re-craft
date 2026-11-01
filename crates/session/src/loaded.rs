@@ -411,6 +411,7 @@ pub struct LoadedSession {
     entity_drops: bool,
     game_mode: GameMode,
     game_master_permission: bool,
+    world_seed: Option<i64>,
     vitals: crate::survival::PlayerVitals,
     experience: crate::experience::Experience,
     death: Option<DeathInfo>,
@@ -3148,6 +3149,10 @@ impl LoadedSession {
         self.game_master_permission = allowed;
     }
 
+    pub fn set_world_seed(&mut self, seed: Option<i64>) {
+        self.world_seed = seed;
+    }
+
     pub fn set_falling_fire_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.falling_fire_tag = Some(tag);
         self.sand_deferred_revision = None;
@@ -3582,6 +3587,7 @@ impl LoadedSession {
             entity_drops: true,
             game_mode: GameMode::default(),
             game_master_permission: false,
+            world_seed: None,
             vitals: crate::survival::PlayerVitals::default(),
             experience: crate::experience::Experience::default(),
             death: None,
@@ -11525,6 +11531,17 @@ impl LoadedSession {
             let before_inventory = Arc::clone(&self.inventory);
             match command {
                 PlayerCommand::Respawn => {}
+                PlayerCommand::QueryWorldSeed => {
+                    let kind = self.world_seed.map_or(
+                        crate::SystemMessageKind::CommandUnavailable,
+                        crate::SystemMessageKind::WorldSeed,
+                    );
+                    crate::push_system_message(
+                        &mut self.system_messages,
+                        kind,
+                        self.tick.saturating_add(1),
+                    );
+                }
                 PlayerCommand::Move {
                     forward,
                     strafe,
@@ -14132,6 +14149,41 @@ fn move_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_query_is_tick_ordered_and_does_not_require_cheats() {
+        for seed in [
+            None,
+            Some(i64::MIN),
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(i64::MAX),
+        ] {
+            for cheats in [false, true] {
+                let mut session = session();
+                session.set_game_master_permission(cheats);
+                session.set_world_seed(seed);
+                session.submit_command(PlayerCommand::QueryWorldSeed);
+                session.update(Duration::from_millis(49));
+                assert!(session.snapshot().system_messages.is_empty());
+                session.update(Duration::from_millis(1));
+                let expected = seed.map_or(
+                    crate::SystemMessageKind::CommandUnavailable,
+                    crate::SystemMessageKind::WorldSeed,
+                );
+                assert_eq!(
+                    session.snapshot().system_messages.as_ref(),
+                    &[crate::SystemMessage {
+                        kind: expected,
+                        tick: 1
+                    }]
+                );
+                session.update(Duration::from_millis(50));
+                assert_eq!(session.snapshot().system_messages.len(), 1);
+            }
+        }
+    }
     use crate::PLAYER_HALF_WIDTH;
     use native_world::loaded::{Chunk, LIGHT_BYTES};
     use std::collections::BTreeMap;

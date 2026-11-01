@@ -205,6 +205,8 @@ pub struct GameUi {
     snapshot_messages: Arc<[native_session::SystemMessage]>,
     local_messages: Vec<native_session::SystemMessage>,
     chat_input: crate::chat_input::ChatInput,
+    pending_chat_command: Option<native_session::PlayerCommand>,
+    pending_chat_copy: Option<Arc<str>>,
 }
 
 impl GameUi {
@@ -300,6 +302,8 @@ impl GameUi {
             snapshot_messages: Arc::from([]),
             local_messages: Vec::new(),
             chat_input: crate::chat_input::ChatInput::default(),
+            pending_chat_command: None,
+            pending_chat_copy: None,
         }
     }
 
@@ -506,26 +510,39 @@ impl GameUi {
             return None;
         }
         let (width, height) = self.logical_size();
-        if !shift
-            && let Some(path) = crate::chat_hud::screenshot_at(
-                &self.assets,
-                &self.system_messages,
-                height,
-                self.chat_input.scroll_offset(),
-                self.cursor,
-            )
-        {
-            if path
-                .parent()
-                .and_then(std::path::Path::file_name)
-                .is_some_and(|name| name == "screenshots")
-                && path.file_name().is_some()
-                && !path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                self.chat_input.register_click(std::time::Instant::now());
-                return Some(path.as_ref().clone());
+        if let Some(action) = crate::chat_hud::interaction_at(
+            &self.assets,
+            &self.system_messages,
+            height,
+            self.chat_input.scroll_offset(),
+            self.cursor,
+        ) {
+            match action {
+                crate::chat_hud::ChatClick::CopySeed(text) => {
+                    self.chat_input.register_click(std::time::Instant::now());
+                    if shift {
+                        self.chat_input.insert(&text);
+                        self.last_draw = None;
+                    } else {
+                        self.pending_chat_copy = Some(text);
+                    }
+                    return None;
+                }
+                crate::chat_hud::ChatClick::Screenshot(path)
+                    if !shift
+                        && path
+                            .parent()
+                            .and_then(std::path::Path::file_name)
+                            .is_some_and(|name| name == "screenshots")
+                        && path.file_name().is_some()
+                        && !path.components().any(|component| {
+                            matches!(component, std::path::Component::ParentDir)
+                        }) =>
+                {
+                    self.chat_input.register_click(std::time::Instant::now());
+                    return Some(path.as_ref().clone());
+                }
+                _ => {}
             }
         }
         if self.cursor.0 >= 4
@@ -538,6 +555,10 @@ impl GameUi {
             self.last_draw = None;
         }
         None
+    }
+
+    pub fn take_chat_copy(&mut self) -> Option<Arc<str>> {
+        self.pending_chat_copy.take()
     }
 
     pub fn chat_release(&mut self) {
@@ -573,6 +594,11 @@ impl GameUi {
         if let crate::chat_input::ChatAction::Submit(text) = &action
             && !text.is_empty()
         {
+            if text == "/seed" {
+                self.pending_chat_command = Some(native_session::PlayerCommand::QueryWorldSeed);
+                self.last_draw = None;
+                return action;
+            }
             let kind = if text.starts_with('/') {
                 native_session::SystemMessageKind::CommandUnavailable
             } else {
@@ -589,6 +615,10 @@ impl GameUi {
         }
         self.last_draw = None;
         action
+    }
+
+    pub fn take_chat_command(&mut self) -> Option<native_session::PlayerCommand> {
+        self.pending_chat_command.take()
     }
 
     #[cfg(test)]
@@ -3470,6 +3500,63 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn seed_command_and_clickable_result_follow_chat_input() {
+        use native_session::{PlayerCommand, SystemMessage, SystemMessageKind};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = crate::chat_hud::ChatSettings::default();
+        assets
+            .language
+            .insert("commands.seed.success".into(), "Seed: %1$s".into());
+        assets
+            .language
+            .insert("chat.square_brackets".into(), "[%s]".into());
+        let mut ui = GameUi::new(Arc::new(assets));
+        ui.resize((1280, 720));
+        ui.open_chat(true);
+        ui.chat_text("seed");
+        ui.chat_key(KeyCode::Enter, false, false, 0);
+        assert!(matches!(
+            ui.take_chat_command(),
+            Some(PlayerCommand::QueryWorldSeed)
+        ));
+        assert!(ui.last_system_message().is_none());
+        assert!(ui.take_chat_command().is_none());
+        ui.system_messages = Arc::from([SystemMessage {
+            kind: SystemMessageKind::WorldSeed(i64::MIN),
+            tick: CHAT_AGE_OFFSET,
+        }]);
+        ui.open_chat(false);
+        let height = ui.logical_size().1;
+        let canvas = Canvas::new(1, 1);
+        let prefix = canvas.text_width(Some(&ui.assets), "Seed: [");
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        assert_eq!(ui.chat_click(false), None);
+        assert_eq!(ui.take_chat_copy().as_deref(), Some("-9223372036854775808"));
+        assert!(ui.take_chat_copy().is_none());
+        assert_eq!(ui.chat_click(true), None);
+        ui.chat_key(KeyCode::KeyA, true, false, 0);
+        assert_eq!(ui.chat_selected_text(), "-9223372036854775808");
+        let mut image = Canvas::new(500, 240);
+        crate::chat_hud::draw_focused(
+            &mut image,
+            &ui.assets,
+            &ui.system_messages,
+            CHAT_AGE_OFFSET,
+            0,
+        );
+        assert!(
+            image
+                .pixels
+                .iter()
+                .any(|pixel| (pixel >> 8 & 255) > (pixel >> 16 & 255))
+        );
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

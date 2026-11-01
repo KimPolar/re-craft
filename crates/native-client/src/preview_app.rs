@@ -1420,6 +1420,11 @@ impl ApplicationHandler for Viewer {
                         self.inventory_alt,
                         tick,
                     );
+                    if let Some(command) = ui.take_chat_command()
+                        && let Some(play) = &mut self.play
+                    {
+                        play.session.submit_command(command);
+                    }
                     if closed {
                         if let Some(window) = &self.window {
                             window.set_ime_allowed(false);
@@ -1733,11 +1738,7 @@ impl ApplicationHandler for Viewer {
                     && ui.chat_open()
                 {
                     if button == MouseButton::Left {
-                        if let Some(path) = ui.chat_click(self.inventory_shift)
-                            && let Err(error) = crate::file_open::open(&path)
-                        {
-                            eprintln!("Cannot open screenshot: {error:#}");
-                        }
+                        crate::handle_chat_click(ui, self.inventory_shift, self.window.as_deref());
                     }
                     crate::update_chat_ime_area(&self.window, &self.ui);
                     return;

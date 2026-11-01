@@ -1099,6 +1099,7 @@ fn prepare_existing_world(
                 .map_err(anyhow::Error::msg)?;
         }
         session.set_game_master_permission(reader.allow_commands()?);
+        session.set_world_seed(world_seed);
         match resources.vanilla_block_ids() {
             Ok(registry) => {
                 session.set_vanilla_block_ids(Arc::new(registry.clone()));
@@ -1587,6 +1588,20 @@ fn deliver_menu_screenshots(
     if let (Some(ui), Some(screenshots)) = (ui, screenshots) {
         while let Some((result, age)) = screenshots.take() {
             ui.screenshot_result_with_age(result, tick, age);
+        }
+    }
+}
+
+fn handle_chat_click(ui: &mut GameUi, shift: bool, window: Option<&Window>) {
+    if let Some(path) = ui.chat_click(shift)
+        && let Err(error) = file_open::open(&path)
+    {
+        eprintln!("Cannot open screenshot: {error:#}");
+    }
+    if let Some(text) = ui.take_chat_copy() {
+        let mut clipboard = clipboard::SystemClipboard::new(window);
+        if let Err(error) = clipboard::Clipboard::write(&mut clipboard, &text) {
+            eprintln!("Cannot copy chat text: {error:#}");
         }
     }
 }
@@ -2440,6 +2455,9 @@ impl ApplicationHandler for App {
                         self.inventory_alt,
                         self.session.snapshot().tick,
                     );
+                    if let Some(command) = ui.take_chat_command() {
+                        self.session.submit_command(command);
+                    }
                     if closed {
                         if let Some(window) = &self.window {
                             window.set_ime_allowed(false);
@@ -2553,11 +2571,7 @@ impl ApplicationHandler for App {
                     && ui.chat_open()
                 {
                     if button == MouseButton::Left {
-                        if let Some(path) = ui.chat_click(self.inventory_shift)
-                            && let Err(error) = file_open::open(&path)
-                        {
-                            eprintln!("Cannot open screenshot: {error:#}");
-                        }
+                        handle_chat_click(ui, self.inventory_shift, self.window.as_deref());
                     }
                     update_chat_ime_area(&self.window, &self.ui);
                     return;

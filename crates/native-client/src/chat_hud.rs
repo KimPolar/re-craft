@@ -268,7 +268,13 @@ struct ChatLine {
     layout: LineLayout,
     bold_prefix: usize,
     links: Vec<Range<usize>>,
-    screenshot: Option<Arc<std::path::PathBuf>>,
+    action: Option<ChatClick>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatClick {
+    Screenshot(Arc<std::path::PathBuf>),
+    CopySeed(Arc<str>),
 }
 
 fn screenshot_message(template: &str, name: &str) -> (String, Vec<Range<usize>>) {
@@ -314,7 +320,7 @@ fn prepare_lines(
         ) else {
             continue;
         };
-        let (text, debug_prefix, links, screenshot) = match &message.kind {
+        let (text, debug_prefix, links, action) = match &message.kind {
             SystemMessageKind::MissingRespawnBlock => (
                 assets
                     .translate(
@@ -346,7 +352,30 @@ fn prepare_lines(
                     assets.translate("screenshot.success", "Saved screenshot as %s"),
                     &name,
                 );
-                (text, None, links, Some(Arc::clone(path)))
+                (
+                    text,
+                    None,
+                    links,
+                    Some(ChatClick::Screenshot(Arc::clone(path))),
+                )
+            }
+            SystemMessageKind::WorldSeed(seed) => {
+                let seed: Arc<str> = seed.to_string().into();
+                let (brackets, inner) =
+                    screenshot_message(assets.translate("chat.square_brackets", "[%s]"), &seed);
+                let (text, outer) = screenshot_message(
+                    assets.translate("commands.seed.success", "Seed: %s"),
+                    &brackets,
+                );
+                let links = outer
+                    .into_iter()
+                    .flat_map(|range| {
+                        inner
+                            .iter()
+                            .map(move |part| (range.start + part.start)..(range.start + part.end))
+                    })
+                    .collect();
+                (text, None, links, Some(ChatClick::CopySeed(seed)))
             }
             SystemMessageKind::ScreenshotFailed(reason) => (
                 assets
@@ -395,7 +424,7 @@ fn prepare_lines(
                 layout,
                 bold_prefix: line.bold_prefix,
                 links: visible_links,
-                screenshot: screenshot.clone(),
+                action: action.clone(),
             });
         }
         if !focused && lines.len() >= base.max_lines {
@@ -427,13 +456,13 @@ fn prefix_width(canvas: &Canvas, assets: &MenuAssets, line: &ChatLine, end: usiz
         + canvas.text_width(Some(assets), &line.text[bold_end..end])
 }
 
-pub fn screenshot_at(
+pub fn interaction_at(
     assets: &MenuAssets,
     messages: &[SystemMessage],
     height: i32,
     scroll: usize,
     cursor: (i32, i32),
-) -> Option<Arc<std::path::PathBuf>> {
+) -> Option<ChatClick> {
     let measure = Canvas::new(1, 1);
     let (lines, _) = prepare_lines(&measure, assets, messages, 0, true, scroll, height)?;
     for (index, line) in lines.iter().enumerate() {
@@ -446,7 +475,7 @@ pub fn screenshot_at(
                 .ceil() as i32;
             let height = (9.0 * line.layout.scale).ceil() as i32;
             if (x + start..x + end).contains(&cursor.0) && (y..y + height).contains(&cursor.1) {
-                return line.screenshot.clone();
+                return line.action.clone();
             }
         }
     }
@@ -515,8 +544,43 @@ fn draw_mode(
             let (prefix, rest) = text.split_at(prefix_len);
             canvas.bold_text_alpha(Some(assets), x, y, prefix, [255, 255, 85], opacity);
             let offset = canvas.bold_text_width(Some(assets), prefix);
-            canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
-            for range in &line.links {
+            if matches!(line.action, Some(ChatClick::CopySeed(_))) {
+                let mut start = prefix_len;
+                for range in &line.links {
+                    canvas.text_alpha(
+                        Some(assets),
+                        x + prefix_width(canvas, assets, line, start),
+                        y,
+                        &text[start..range.start],
+                        [255, 255, 255],
+                        opacity,
+                    );
+                    canvas.text_alpha(
+                        Some(assets),
+                        x + prefix_width(canvas, assets, line, range.start),
+                        y,
+                        &text[range.clone()],
+                        [85, 255, 85],
+                        opacity,
+                    );
+                    start = range.end;
+                }
+                canvas.text_alpha(
+                    Some(assets),
+                    x + prefix_width(canvas, assets, line, start),
+                    y,
+                    &text[start..],
+                    [255, 255, 255],
+                    opacity,
+                );
+            } else {
+                canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
+            }
+            for range in line
+                .links
+                .iter()
+                .filter(|_| matches!(line.action, Some(ChatClick::Screenshot(_))))
+            {
                 let left = prefix_width(canvas, assets, line, range.start);
                 let right = prefix_width(canvas, assets, line, range.end);
                 canvas.fill(
@@ -581,6 +645,50 @@ mod tests {
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn seed_links_survive_localization_wrapping_and_scaling() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = ChatSettings::default();
+        assets.chat.width = 0.0;
+        assets
+            .language
+            .insert("chat.square_brackets".into(), "[%1$s]".into());
+        assets
+            .language
+            .insert("commands.seed.success".into(), "시드: %1$s".into());
+        let messages = [SystemMessage {
+            tick: 0,
+            kind: SystemMessageKind::WorldSeed(i64::MIN),
+        }];
+        for scale in [0.5, 1.0] {
+            assets.chat.scale = scale;
+            let canvas = Canvas::new(1, 1);
+            let (lines, _) = prepare_lines(&canvas, &assets, &messages, 0, true, 0, 240).unwrap();
+            assert!(lines.len() > 1);
+            for (index, line) in lines.iter().enumerate() {
+                let (x, y) = position(line, index);
+                for range in &line.links {
+                    let left = (prefix_width(&canvas, &assets, line, range.start) as f32
+                        * line.layout.scale)
+                        .floor() as i32;
+                    let right = (prefix_width(&canvas, &assets, line, range.end) as f32
+                        * line.layout.scale)
+                        .ceil() as i32;
+                    if right > left {
+                        assert_eq!(
+                            interaction_at(&assets, &messages, 240, 0, (x + left, y)),
+                            Some(ChatClick::CopySeed("-9223372036854775808".into()))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn wrapped_link_hit_testing_tracks_text_scale_and_scroll() {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
@@ -631,12 +739,12 @@ mod tests {
                             .ceil() as i32;
                         if end > start {
                             let hit =
-                                screenshot_at(&assets, &messages, 240, scroll, (x + start, y))
+                                interaction_at(&assets, &messages, 240, scroll, (x + start, y))
                                     .unwrap();
-                            assert_eq!(Some(hit), line.screenshot);
+                            assert_eq!(Some(hit), line.action);
                         }
                     }
-                    assert!(screenshot_at(&assets, &messages, 240, scroll, (x - 1, y)).is_none());
+                    assert!(interaction_at(&assets, &messages, 240, scroll, (x - 1, y)).is_none());
                 }
             }
             let wrapped = wrap(&measure, &assets, "한글  a b\n😀 long name", 25, 0);

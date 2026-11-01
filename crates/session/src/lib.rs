@@ -218,6 +218,8 @@ impl GameMode {
 
 #[derive(Clone, Copy, Debug)]
 pub enum PlayerCommand {
+    /// Read the verified seed of this local world.
+    QueryWorldSeed,
     /// Request respawn after a supported death transition.
     Respawn,
     Move {
@@ -409,6 +411,7 @@ pub enum SystemMessageKind {
     ScreenshotSaved(Arc<std::path::PathBuf>),
     ScreenshotFailed(Arc<str>),
     LocalChat(Arc<str>),
+    WorldSeed(i64),
     CommandUnavailable,
 }
 
@@ -416,6 +419,15 @@ pub enum SystemMessageKind {
 pub struct SystemMessage {
     pub kind: SystemMessageKind,
     pub tick: u64,
+}
+
+fn push_system_message(messages: &mut Arc<[SystemMessage]>, kind: SystemMessageKind, tick: u64) {
+    let mut next = messages.to_vec();
+    if next.len() >= 100 {
+        next.remove(0);
+    }
+    next.push(SystemMessage { kind, tick });
+    *messages = next.into();
 }
 
 /// A transient overlay message from a chest that could not be unlocked.
@@ -1120,6 +1132,13 @@ impl LocalSession {
             let before_inventory = Arc::clone(&self.inventory);
             match command {
                 PlayerCommand::Respawn => {}
+                PlayerCommand::QueryWorldSeed => {
+                    push_system_message(
+                        &mut Arc::make_mut(&mut self.snapshot).system_messages,
+                        SystemMessageKind::CommandUnavailable,
+                        self.tick.saturating_add(1),
+                    );
+                }
                 PlayerCommand::Move {
                     forward,
                     strafe,

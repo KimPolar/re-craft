@@ -1033,6 +1033,11 @@ impl Viewer {
                 play.night_vision_cache.sample(
                     tick,
                     snapshot.night_vision_duration,
+                    snapshot.water_vision,
+                    snapshot
+                        .active_effects
+                        .iter()
+                        .any(|effect| effect.id == "conduit_power"),
                     play.session.partial_tick().clamp(0.0, 1.0),
                 ),
             );
@@ -2717,6 +2722,7 @@ mod tests {
             death: previous.death,
             armor: previous.armor,
             eyes_in_water: previous.eyes_in_water,
+            water_vision: previous.water_vision,
             sprinting: previous.sprinting,
             selected_block: previous.selected_block,
             inventory: Arc::clone(&previous.inventory),

@@ -22,15 +22,28 @@ pub fn night_vision_scale(duration: Option<i32>, partial: f32) -> f32 {
 /// Java's lightmap extractor samples once per client tick, not once per frame.
 #[derive(Default)]
 pub struct NightVisionCache {
-    key: Option<(u64, Option<i32>)>,
+    key: Option<(u64, Option<i32>, u32, bool)>,
     factor: f32,
 }
 
 impl NightVisionCache {
-    pub fn sample(&mut self, tick: u64, duration: Option<i32>, partial: f32) -> f32 {
-        let key = (tick, duration);
+    pub fn sample(
+        &mut self,
+        tick: u64,
+        duration: Option<i32>,
+        water_vision: f32,
+        conduit: bool,
+        partial: f32,
+    ) -> f32 {
+        let key = (tick, duration, water_vision.to_bits(), conduit);
         if self.key != Some(key) {
-            self.factor = night_vision_scale(duration, partial);
+            self.factor = if duration.is_some() {
+                night_vision_scale(duration, partial)
+            } else if conduit {
+                water_vision
+            } else {
+                0.0
+            };
             self.key = Some(key);
         }
         self.factor
@@ -706,10 +719,12 @@ mod tests {
             0.0
         );
         let mut cache = NightVisionCache::default();
-        let first = cache.sample(1, Some(42), 0.1);
-        assert_eq!(cache.sample(1, Some(42), 0.9), first);
-        assert_ne!(cache.sample(2, Some(41), 0.9), first);
-        assert_eq!(cache.sample(2, None, 0.9), 0.0);
+        let first = cache.sample(1, Some(42), 0.5, true, 0.1);
+        assert_eq!(cache.sample(1, Some(42), 0.5, true, 0.9), first);
+        assert_ne!(cache.sample(2, Some(41), 0.5, true, 0.9), first);
+        assert_eq!(cache.sample(2, None, 0.5, false, 0.9), 0.0);
+        assert_eq!(cache.sample(2, None, 0.5, true, 0.9), 0.5);
+        assert_eq!(cache.sample(2, Some(-1), 0.5, true, 0.9), 1.0);
     }
 
     #[test]

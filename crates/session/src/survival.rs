@@ -1437,6 +1437,46 @@ impl FallEffects {
     }
 }
 
+/// Client-side water vision adaptation, advanced on the fixed player tick.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WaterVision {
+    ticks: u16,
+}
+
+impl WaterVision {
+    pub(crate) fn tick(&mut self, eyes_in_water: bool, spectator: bool) {
+        self.ticks = if eyes_in_water {
+            self.ticks
+                .saturating_add(if spectator { 10 } else { 1 })
+                .min(600)
+        } else {
+            self.ticks.saturating_sub(10)
+        };
+    }
+
+    pub(crate) fn factor(self, eyes_in_water: bool) -> f32 {
+        water_vision_scale(self.ticks, eyes_in_water)
+    }
+}
+
+/// Java LocalPlayer.getWaterVision for the current adaptation time.
+pub fn water_vision_scale(ticks: u16, eyes_in_water: bool) -> f32 {
+    if !eyes_in_water {
+        return 0.0;
+    }
+    if ticks >= 600 {
+        return 1.0;
+    }
+    let ticks = f32::from(ticks);
+    let initial = (ticks / 100.0).clamp(0.0, 1.0);
+    let remaining = if ticks < 100.0 {
+        0.0
+    } else {
+        ((ticks - 100.0) / 500.0).clamp(0.0, 1.0)
+    };
+    initial * 0.6_f32 + remaining * (1.0_f32 - 0.6_f32)
+}
+
 /// Effects that change ordinary player breathing. Their durations advance at
 /// the end of the entity's base tick, after the breathing decision.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3758,6 +3798,26 @@ mod tests {
     }
     use native_persistence::nbt::Tag;
     use std::time::Duration;
+
+    #[test]
+    fn water_vision_adapts_and_fades_at_vanilla_tick_rates() {
+        let mut vision = WaterVision::default();
+        for _ in 0..100 {
+            vision.tick(true, false);
+        }
+        assert_eq!(vision.factor(true), water_vision_scale(100, true));
+        vision.tick(false, false);
+        assert_eq!(vision.factor(false), 0.0);
+        assert_eq!(vision.factor(true), water_vision_scale(90, true));
+        for _ in 0..51 {
+            vision.tick(true, true);
+        }
+        assert_eq!(vision.factor(true), 1.0);
+        for _ in 0..61 {
+            vision.tick(false, false);
+        }
+        assert_eq!(vision.factor(true), 0.0);
+    }
 
     #[test]
     fn ordinary_air_depletes_recovers_and_damages_on_the_drowning_boundary() {

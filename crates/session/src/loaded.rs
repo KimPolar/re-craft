@@ -516,6 +516,7 @@ pub struct LoadedSession {
     sneak: bool,
     previous_sneak: bool,
     previous_eye_in_water: bool,
+    water_vision: crate::survival::WaterVision,
     swimming: bool,
     fall_distance: f64,
     ground_without_support: bool,
@@ -4019,6 +4020,7 @@ impl LoadedSession {
             death: self.death,
             armor: self.armor.value(),
             eyes_in_water: self.previous_eye_in_water,
+            water_vision: self.water_vision.factor(self.previous_eye_in_water),
             sprinting: self.sprint.active,
             selected_block: self.selected,
             inventory: Arc::clone(&self.inventory),
@@ -4136,6 +4138,7 @@ impl LoadedSession {
             death: None,
             armor: Some(crate::ArmorValues::default()),
             eyes_in_water: false,
+            water_vision: 0.0,
             sprinting: false,
             selected_block: Block::Grass,
             inventory: Arc::clone(&inventory),
@@ -4293,6 +4296,7 @@ impl LoadedSession {
             sneak: false,
             previous_sneak: false,
             previous_eye_in_water: false,
+            water_vision: crate::survival::WaterVision::default(),
             swimming: false,
             fall_distance: 0.0,
             ground_without_support: false,
@@ -6889,6 +6893,7 @@ impl LoadedSession {
         self.sneak = false;
         self.previous_sneak = false;
         self.previous_eye_in_water = false;
+        self.water_vision = crate::survival::WaterVision::default();
         self.swimming = false;
         self.fall_distance = 0.0;
         self.ground_without_support = false;
@@ -13910,6 +13915,10 @@ impl LoadedSession {
         let in_water = contacts.water.depth > 0.0;
         let under_water = in_water && self.previous_eye_in_water;
         self.previous_eye_in_water = contacts.water.eyes_inside;
+        self.water_vision.tick(
+            self.previous_eye_in_water,
+            self.game_mode == GameMode::Spectator,
+        );
         if fluid_chunks_loaded && breathing_oxygen_valid {
             let bubble_column = contacts.water.eyes_inside
                 && {
@@ -14878,6 +14887,7 @@ impl GameSession for LoadedSession {
                 death: self.death,
                 armor: self.armor.value(),
                 eyes_in_water: self.previous_eye_in_water,
+                water_vision: self.water_vision.factor(self.previous_eye_in_water),
                 sprinting: self.sprint.active,
                 selected_block: self.selected,
                 inventory: Arc::clone(&self.inventory),
@@ -37577,10 +37587,18 @@ mod tests {
             }
             b.update(TICK);
             assert_eq!(a.snapshot().vitals.air, b.snapshot().vitals.air);
+            assert_eq!(
+                a.snapshot().water_vision.to_bits(),
+                b.snapshot().water_vision.to_bits()
+            );
         }
         assert_eq!(original.vitals.air, 300);
         assert_eq!(a.snapshot().vitals.air, 260);
         assert!(a.snapshot().eyes_in_water);
+        assert_eq!(
+            a.snapshot().water_vision,
+            crate::survival::water_vision_scale(40, true)
+        );
         let bubble = a.intern_block(state("minecraft:bubble_column", &[("drag", "true")]));
         assert!(a.set(IVec3::new(8, 2, 8), bubble));
         a.motion.position = DVec3::new(8.5, 1.0, 8.5);
@@ -37588,6 +37606,17 @@ mod tests {
         a.update(TICK);
         assert!(a.snapshot().eyes_in_water);
         assert_eq!(a.snapshot().vitals.air, 264);
+        a.motion.position = DVec3::new(8.5, 10.0, 8.5);
+        a.motion.velocity = DVec3::ZERO;
+        a.update(TICK);
+        assert_eq!(a.snapshot().water_vision, 0.0);
+        a.motion.position = DVec3::new(8.5, 1.0, 8.5);
+        a.motion.velocity = DVec3::ZERO;
+        a.update(TICK);
+        assert_eq!(
+            a.snapshot().water_vision,
+            crate::survival::water_vision_scale(32, true)
+        );
 
         let mut unloaded = session();
         unloaded.motion.position = DVec3::new(0.1, 1.0, 8.5);

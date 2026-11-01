@@ -41,6 +41,11 @@ import net.minecraft.client.input.KeyEvent;
 
 // Compare the real 26.3 EditBox input state without creating a game window.
 public final class ChatEditOracle {
+    static final class WaterPlayer extends net.minecraft.client.player.LocalPlayer {
+        boolean underwater;
+        WaterPlayer() { super(null, null, null, null, null, null, false, null, null); }
+        @Override public boolean isEyeInFluid(net.minecraft.tags.TagKey<net.minecraft.world.level.material.Fluid> tag) { return underwater; }
+    }
     static void set(Object object, Class<?> owner, String name, Object value) throws Exception {
         Field field = owner.getDeclaredField(name);
         field.setAccessible(true);
@@ -80,6 +85,14 @@ public final class ChatEditOracle {
         String[] texts = {"", "abc  def", " a   b ", "한글  😀-two  끝", "a\u00a0b c", "a\tb c"};
         int[] codes = {1073741904, 1073741903, 8, 127};
         JsonArray rows = new JsonArray();
+        var waterPlayer = (WaterPlayer) unsafe.allocateInstance(WaterPlayer.class);
+        for (int time = 0; time <= 620; time++) for (boolean underwater : new boolean[]{false, true}) {
+            set(waterPlayer, net.minecraft.client.player.LocalPlayer.class, "waterVisionTime", time);
+            waterPlayer.underwater = underwater;
+            JsonObject row = new JsonObject();
+            row.addProperty("waterVisionTime", time); row.addProperty("waterEye", underwater);
+            row.addProperty("waterVisionBits", Float.floatToRawIntBits(waterPlayer.getWaterVision())); rows.add(row);
+        }
         for (String text : texts) {
             ArrayList<Integer> positions = new ArrayList<>();
             for (int at = 0; ; at = text.offsetByCodePoints(at, 1)) {

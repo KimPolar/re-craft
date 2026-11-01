@@ -404,7 +404,61 @@ mod tests {
             );
             let image = Arc::new(RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])));
             let particle = particles.particles().next().unwrap();
+            struct Memory(std::collections::BTreeMap<String, Vec<u8>>);
+            impl native_resources::packs::ResourceProvider for Memory {
+                fn read_asset(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                    Ok(self.0.get(path).cloned())
+                }
+            }
+            let mut sheet = RgbaImage::from_pixel(4, 8, image::Rgba([0, 255, 0, 255]));
+            for y in 4..8 {
+                for x in 0..4 {
+                    sheet.put_pixel(x, y, image::Rgba([200, 0, 200, 255]));
+                }
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(sheet)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let mut source = Memory(std::collections::BTreeMap::from([
+                (
+                    "assets/minecraft/particles/bubble.json".into(),
+                    br#"{"textures":["minecraft:test"]}"#.to_vec(),
+                ),
+                (
+                    "assets/minecraft/textures/particle/test.png".into(),
+                    png.into_inner(),
+                ),
+                (
+                    "assets/minecraft/textures/particle/test.png.mcmeta".into(),
+                    br#"{"animation":{"frametime":1}}"#.to_vec(),
+                ),
+            ]));
+            let mut atlas =
+                crate::particle_sprites::ParticleSprites::load(&mut source, "bubble").unwrap();
+            atlas.advance(1);
+            let (bubble_texture, bubble_uv) = atlas.get(0).unwrap();
             let entries = vec![
+                RenderParticle {
+                    previous: DVec3::new(-0.5, 0.0, 0.5),
+                    position: DVec3::new(-0.5, 0.0, 0.5),
+                    size: 0.25,
+                    uv: bubble_uv,
+                    color: [1.0; 3],
+                    opaque: true,
+                    texture: Arc::clone(bubble_texture),
+                    light: u32::MAX,
+                },
+                RenderParticle {
+                    previous: DVec3::new(-0.5, 0.6, 0.5),
+                    position: DVec3::new(-0.5, 0.6, 0.5),
+                    size: 0.2,
+                    uv: bubble_uv,
+                    color: [1.0; 3],
+                    opaque: true,
+                    texture: Arc::clone(bubble_texture),
+                    light: u32::MAX,
+                },
                 RenderParticle {
                     previous: particle.previous,
                     position: particle.position,
@@ -458,6 +512,11 @@ mod tests {
                     0.0,
                 )
                 .unwrap();
+            assert_eq!(
+                renderer.draws.len(),
+                4,
+                "particles sharing an atlas should share a draw"
+            );
             let size = wgpu::Extent3d {
                 width: 64,
                 height: 64,
@@ -568,6 +627,11 @@ mod tests {
                 data.chunks_exact(4)
                     .any(|pixel| pixel[0] > 200 && pixel[1] == 0 && pixel[2] == 0),
                 "fragment was not rendered"
+            );
+            let bubble = &data[(32 * 64 + 16) * 4..(32 * 64 + 16) * 4 + 4];
+            assert!(
+                bubble[0] > 100 && bubble[1] == 0 && bubble[2] > 100,
+                "animated atlas sprite was not rendered: {bubble:?}"
             );
             for y in [28, 36] {
                 let pixel = &data[(y * 64 + 48) * 4..(y * 64 + 48) * 4 + 4];

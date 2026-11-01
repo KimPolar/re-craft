@@ -415,39 +415,16 @@ impl Loader {
         Ok(result)
     }
 
-    pub(crate) fn load_large_smoke_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
-        self.load_particle_sprites("large_smoke")
+    pub(crate) fn load_large_smoke_sprites(
+        &mut self,
+    ) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "large_smoke")
     }
 
-    pub(crate) fn load_bubble_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
-        self.load_particle_sprites("bubble")
-    }
-
-    fn load_particle_sprites(&mut self, name: &str) -> Result<Vec<Arc<RgbaImage>>> {
-        let bytes = self
-            .stack
-            .read_asset(&format!("assets/minecraft/particles/{name}.json"))?
-            .with_context(|| format!("missing {name} particle definition"))?;
-        let definition: Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid {name} particle definition"))?;
-        let textures = definition
-            .get("textures")
-            .and_then(Value::as_array)
-            .with_context(|| format!("missing {name} textures"))?;
-        ensure!(
-            !textures.is_empty() && textures.len() <= 256,
-            "invalid {name} texture count"
-        );
-        textures
-            .iter()
-            .map(|value| {
-                let id = ResourceId::parse(value.as_str().context("invalid particle texture ID")?)?;
-                self.texture(&ResourceId {
-                    namespace: id.namespace,
-                    path: format!("particle/{}", id.path),
-                })
-            })
-            .collect()
+    pub(crate) fn load_bubble_sprites(
+        &mut self,
+    ) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "bubble")
     }
     pub(crate) fn load_armor(
         &mut self,
@@ -1410,8 +1387,19 @@ mod tests {
             .load_bubble_sprites()
             .unwrap();
         assert_eq!(sprites.len(), 2);
-        assert!(Arc::ptr_eq(&sprites[0], &sprites[1]));
-        assert_eq!(sprites[0].get_pixel(0, 0).0, [7, 11, 13, 255]);
+        let (image, uv) = sprites.get(0).unwrap();
+        let (second, second_uv) = sprites.get(1).unwrap();
+        assert!(Arc::ptr_eq(image, second));
+        assert_eq!(uv, second_uv);
+        assert_eq!(
+            image
+                .get_pixel(
+                    (uv[0] * image.width() as f32) as u32,
+                    (uv[1] * image.height() as f32) as u32
+                )
+                .0,
+            [7, 11, 13, 255]
+        );
     }
 
     #[test]
@@ -1438,8 +1426,19 @@ mod tests {
             .load_large_smoke_sprites()
             .unwrap();
         assert_eq!(sprites.len(), 2);
-        assert!(Arc::ptr_eq(&sprites[0], &sprites[1]));
-        assert_eq!(sprites[0].get_pixel(0, 0).0, [7, 11, 13, 255]);
+        let (image, uv) = sprites.get(0).unwrap();
+        let (second, second_uv) = sprites.get(1).unwrap();
+        assert!(Arc::ptr_eq(image, second));
+        assert_eq!(uv, second_uv);
+        assert_eq!(
+            image
+                .get_pixel(
+                    (uv[0] * image.width() as f32) as u32,
+                    (uv[1] * image.height() as f32) as u32
+                )
+                .0,
+            [7, 11, 13, 255]
+        );
     }
 
     #[test]

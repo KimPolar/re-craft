@@ -50,6 +50,7 @@ mod mouse_look;
 mod mouse_scroll;
 mod mouse_ui;
 mod orb_render;
+mod particle_sprites;
 mod player_inventory;
 mod player_preview;
 mod player_skin;

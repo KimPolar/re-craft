@@ -171,11 +171,14 @@ pub struct GameUi {
         >,
     >,
     smoke_particles: crate::smoke_particles::SmokeSystem,
-    smoke_sprites: Option<Vec<Arc<image::RgbaImage>>>,
-    smoke_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
+    smoke_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    smoke_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     bubble_particles: crate::bubble_particles::BubbleSystem,
-    bubble_sprites: Option<Vec<Arc<image::RgbaImage>>>,
-    bubble_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
+    bubble_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    bubble_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
+    bubble_load_failed: bool,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
     hud_hidden: bool,
@@ -287,6 +290,7 @@ impl GameUi {
             bubble_particles: crate::bubble_particles::BubbleSystem::default(),
             bubble_sprites: None,
             bubble_sprite_result,
+            bubble_load_failed: false,
             armor_models,
             paused: false,
             hud_hidden: false,
@@ -368,22 +372,23 @@ impl GameUi {
         spawns: Vec<native_session::loaded::DrownParticleSpawn>,
     ) {
         self.bubble_particles.enqueue(spawns);
-        if self.bubble_sprites.is_none() {
+        if self.bubble_sprites.is_none() && !self.bubble_load_failed {
             match self.bubble_sprite_result.try_recv() {
                 Ok(Ok(sprites)) => self.bubble_sprites = Some(sprites),
                 Ok(Err(error)) => {
                     eprintln!("Cannot load bubble sprites: {error}");
-                    self.bubble_sprites = Some(Vec::new());
+                    self.bubble_load_failed = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.bubble_sprites = Some(Vec::new())
-                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.bubble_load_failed = true,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(sprites) = &self.bubble_sprites {
             self.bubble_particles
                 .update(snapshot.tick, &snapshot.world, sprites.len());
+        } else if self.bubble_load_failed {
+            self.bubble_particles
+                .update(snapshot.tick, &snapshot.world, 0);
         }
     }
 
@@ -2128,9 +2133,12 @@ impl GameUi {
                 light,
             });
         }
-        if let Some(sprites) = &self.smoke_sprites {
+        if let Some(sprites) = &mut self.smoke_sprites {
+            if self.smoke_particles.particles().next().is_some() {
+                sprites.advance(snapshot.tick);
+            }
             for particle in self.smoke_particles.particles() {
-                let Some(texture) = sprites.get(particle.frame(sprites.len())) else {
+                let Some((texture, uv)) = sprites.get(particle.frame(sprites.len())) else {
                     continue;
                 };
                 let light = match &snapshot.world {
@@ -2147,7 +2155,7 @@ impl GameUi {
                     previous: particle.previous,
                     position: particle.position,
                     size: particle.display_size(partial),
-                    uv: [0.0, 0.0, 1.0, 1.0],
+                    uv,
                     color: [particle.color; 3],
                     opaque: true,
                     texture: Arc::clone(texture),
@@ -2155,9 +2163,12 @@ impl GameUi {
                 });
             }
         }
-        if let Some(sprites) = &self.bubble_sprites {
+        if let Some(sprites) = &mut self.bubble_sprites {
+            if self.bubble_particles.particles().next().is_some() {
+                sprites.advance(snapshot.tick);
+            }
             for particle in self.bubble_particles.particles() {
-                let Some(texture) = sprites.get(particle.sprite) else {
+                let Some((texture, uv)) = sprites.get(particle.sprite) else {
                     continue;
                 };
                 let light = match &snapshot.world {
@@ -2174,7 +2185,7 @@ impl GameUi {
                     previous: particle.previous,
                     position: particle.position,
                     size: particle.size,
-                    uv: [0.0, 0.0, 1.0, 1.0],
+                    uv,
                     color: [1.0; 3],
                     opaque: true,
                     texture: Arc::clone(texture),

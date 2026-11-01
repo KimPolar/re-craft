@@ -235,13 +235,21 @@ impl ItemStack {
         )
     }
 
-    /// Vanilla's default durability bar for the supported ordinary tools.
+    /// Vanilla durability bar for known prototypes and supported component patches.
     pub fn durability_bar(&self) -> Option<(u32, [u8; 3])> {
-        if self.max_count != Some(1) {
+        if self.components.get("minecraft:unbreakable").is_some()
+            || self.components.get("!minecraft:max_damage").is_some()
+            || self.components.get("!minecraft:damage").is_some()
+        {
             return None;
         }
-        let maximum = ordinary_item_default_durability(&self.id)
-            .or_else(|| crate::equippable::vanilla_equipment(&self.id).and_then(|item| item.2))?;
+        let maximum = match self.components.get("minecraft:max_damage") {
+            Some(Tag::Int(maximum)) if *maximum > 0 => *maximum as u32,
+            Some(_) => return None,
+            None => ordinary_item_default_durability(&self.id).or_else(|| {
+                crate::equippable::vanilla_equipment(&self.id).and_then(|item| item.2)
+            })?,
+        };
         let damage = self
             .components
             .get("minecraft:damage")?
@@ -3316,6 +3324,128 @@ pub(crate) fn validate_item_balance<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durability_bar_respects_item_component_overrides() {
+        let make = |components| {
+            ItemStack::unresolved("minecraft:iron_boots".into(), 1, Tag::Compound(components))
+                .unwrap()
+        };
+        let damage = ("minecraft:damage".into(), Tag::Int(2));
+        assert!(make(vec![damage.clone()]).durability_bar().is_some());
+        assert_eq!(
+            make(vec![
+                damage.clone(),
+                ("minecraft:unbreakable".into(), Tag::Compound(vec![]))
+            ])
+            .durability_bar(),
+            None
+        );
+        assert_eq!(
+            make(vec![
+                damage.clone(),
+                ("!minecraft:max_damage".into(), Tag::Compound(vec![]))
+            ])
+            .durability_bar(),
+            None
+        );
+        assert_eq!(
+            make(vec![damage, ("minecraft:max_damage".into(), Tag::Int(4))])
+                .durability_bar()
+                .unwrap()
+                .0,
+            7
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn durability_bar_components_match_java_item_stacks() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemDurabilityBarOracle.java");
+        let output = temp.path().join("bars.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ItemDurabilityBarOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("ItemDurabilityBarOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 216);
+        for row in rows {
+            let mut components = Vec::new();
+            let maximum = row["maximum"].as_i64().unwrap() as i32;
+            let kind = row["kind"].as_i64().unwrap();
+            if kind == 2 {
+                components.push(("!minecraft:max_damage".into(), Tag::Compound(vec![])));
+            } else if maximum > 0 {
+                components.push(("minecraft:max_damage".into(), Tag::Int(maximum)));
+            }
+            if kind == 3 {
+                components.push(("!minecraft:damage".into(), Tag::Compound(vec![])));
+            } else {
+                components.push((
+                    "minecraft:damage".into(),
+                    Tag::Int(row["damage"].as_i64().unwrap() as i32),
+                ));
+            }
+            if kind == 1 {
+                components.push(("minecraft:unbreakable".into(), Tag::Compound(vec![])));
+            }
+            let item = ItemStack::unresolved(
+                format!("minecraft:{}", row["name"].as_str().unwrap()),
+                1,
+                Tag::Compound(components),
+            )
+            .unwrap();
+            let actual = item.durability_bar();
+            assert_eq!(actual.is_some(), row["visible"].as_bool().unwrap(), "{row}");
+            if let Some((width, rgb)) = actual {
+                let color =
+                    (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
+                assert_eq!(width, row["width"].as_u64().unwrap() as u32, "{row}");
+                assert_eq!(color, row["color"].as_u64().unwrap() as u32, "{row}");
+            }
+        }
+    }
 
     #[test]
     fn banner_patterns_require_valid_layers_and_empty_matches_the_default() {

@@ -405,6 +405,66 @@ fn validate_random_sequences_document(document: &nbt::NamedTag) -> Result<()> {
     Ok(())
 }
 
+fn validate_named_chest_sequences(
+    changes: &[&crate::edit::CheckedChestInventory],
+    planned: Option<&PlannedSharedData>,
+) -> Result<Option<i64>> {
+    let mut proofs: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut seed = None;
+    for proof in changes
+        .iter()
+        .filter_map(|change| change.generated.as_ref())
+    {
+        let Some(sequence) = &proof.sequence else {
+            continue;
+        };
+        if let Some(existing) = seed {
+            ensure!(
+                existing == sequence.world_seed,
+                "chest loot world seeds differ"
+            );
+        } else {
+            seed = Some(sequence.world_seed);
+        }
+        proofs
+            .entry(sequence.id.clone())
+            .or_default()
+            .push(sequence);
+    }
+    let Some(seed) = seed else { return Ok(None) };
+    let planned = planned.context("named chest loot requires a random-sequence transaction")?;
+    let source = crate::random_sequences::RandomSequences::read(
+        planned
+            .source_nbt
+            .as_ref()
+            .map(|bytes| nbt::read(bytes))
+            .transpose()?,
+    )?;
+    let replacement =
+        crate::random_sequences::RandomSequences::read(Some(planned.document.clone()))?;
+    for (id, events) in proofs {
+        let id = format!("{}:{}", id.namespace, id.path);
+        let mut current = source.get(&id, seed)?.state();
+        let mut by_start = BTreeMap::new();
+        for event in events {
+            ensure!(
+                by_start.insert(event.before, event.after).is_none(),
+                "ambiguous chest loot random sequence order"
+            );
+        }
+        while !by_start.is_empty() {
+            current = by_start
+                .remove(&current)
+                .context("chest loot random sequence has a gap")?;
+        }
+        ensure!(
+            replacement.get(&id, seed)?.state() == current,
+            "saved random sequence does not match chest loot"
+        );
+    }
+    Ok(Some(seed))
+}
+
 fn validate_poi_preservation(
     source: Option<&nbt::NamedTag>,
     document: &nbt::NamedTag,
@@ -724,6 +784,8 @@ impl WorldWriteGuard {
             .iter()
             .flat_map(|chunk| chunk.draft.checked_chest_inventories())
             .collect();
+        let named_loot_seed =
+            validate_named_chest_sequences(&chest_changes, plan.random_sequences.as_ref())?;
         if !chest_changes.is_empty() {
             ensure!(
                 plan.players.len() == 1,
@@ -826,6 +888,51 @@ impl WorldWriteGuard {
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut absent_dependencies = Vec::new();
+        if let Some(expected_seed) = named_loot_seed {
+            let directory = self.root.join("data/minecraft");
+            ensure!(
+                crate::save_transaction::checked_directory(&self.root, &directory)?.1,
+                "world generation directory is missing"
+            );
+            let directory = directory.canonicalize()?;
+            ensure!(
+                directory.starts_with(&self.root),
+                "world generation directory is outside the world"
+            );
+            let path = directory.join("world_gen_settings.dat");
+            let metadata =
+                fs::symlink_metadata(&path).context("world generation settings are missing")?;
+            ensure!(
+                metadata.is_file() && ordinary(&metadata),
+                "world generation settings must be an ordinary file"
+            );
+            let path = path.canonicalize()?;
+            ensure!(
+                path.parent() == Some(directory.as_path()),
+                "world generation settings resolve outside the world"
+            );
+            let bytes = nbt::decompress_limited(File::open(&path)?)?;
+            let document = if bytes.starts_with(&[0x1f, 0x8b]) {
+                nbt::read_gzip(bytes.as_slice())?
+            } else {
+                nbt::read(&bytes)?
+            };
+            ensure!(
+                crate::world::WorldReader::world_seed_from_document(&document)? == expected_seed,
+                "world seed differs from chest loot proof"
+            );
+            let backup_dir = backup.path().join("world-data");
+            fs::create_dir_all(&backup_dir)?;
+            let backup_path = backup_dir.join("world_gen_settings.dat");
+            copy_sync(&path, &backup_path)?;
+            // Bind the parsed bytes to the dependency copy even if another
+            // process changes the settings between reading and staging.
+            ensure!(
+                hash_file(&backup_path)? == <[u8; 32]>::from(Sha256::digest(&bytes)),
+                "world generation settings changed during staging"
+            );
+            dependencies.insert(path, backup_path);
+        }
         let mut extra_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
         for ((kind, dimension, _, _), chunks) in &groups {
             let directory = match kind {
@@ -3198,6 +3305,230 @@ mod tests {
         fs::write(directory.join("c.2.0.mcc"), &outside).unwrap();
         fs::write(&path, &region).unwrap();
         (path, region, outside)
+    }
+
+    #[test]
+    fn named_chest_loot_requires_complete_sequence_and_world_seed_transaction() {
+        use crate::{
+            chest_loot::VerifiedChestLoot, edit::BlockEntityChange,
+            random_sequences::RandomSequences,
+        };
+        use native_core::random::XoroshiroRandom;
+        use native_resources::{chest_loot::ChestLootTable, packs::ResourceId};
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let position = ChunkPos { x: 0, z: 0 };
+        let mut source = draft_chunk_blocks(
+            &editable_chunk(0),
+            position,
+            &(0..2)
+                .map(|x| BlockChange {
+                    x,
+                    y: 0,
+                    z: 0,
+                    expected: block_state("minecraft:stone"),
+                    replacement: block_state("minecraft:chest"),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let chest = |x| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(x)),
+                ("y".into(), Tag::Int(0)),
+                ("z".into(), Tag::Int(0)),
+                ("LootTable".into(), Tag::String("example:treasure".into())),
+            ])
+        };
+        let chests = [chest(0), chest(1)];
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), list(chests.to_vec())));
+        store_record(&mut region, 0, 2, &source, 10);
+        fs::write(&region_path, &region).unwrap();
+        let changes: Vec<_> = chests
+            .iter()
+            .map(|chest| {
+                let mut replacement = chest.clone();
+                let Tag::Compound(fields) = &mut replacement else {
+                    unreachable!()
+                };
+                fields.retain(|(key, _)| !key.matches("LootTable"));
+                fields.push(("Items".into(), list(vec![])));
+                BlockEntityChange {
+                    expected: chest.clone(),
+                    replacement,
+                }
+            })
+            .collect();
+        let id = ResourceId::parse("example:treasure").unwrap();
+        let table = ChestLootTable::decode(&serde_json::json!({
+            "type": "minecraft:chest", "random_sequence": "example:treasure",
+            "pools": [{"rolls": 1, "entries": [{"type": "minecraft:item", "name": "minecraft:diamond"}]}]
+        })).unwrap();
+        let mut sequences = RandomSequences::read(None).unwrap();
+        let seed = 42;
+        let first = VerifiedChestLoot::replay_named(
+            &chests[0],
+            &id,
+            &table,
+            seed,
+            sequences.get("example:treasure", seed).unwrap().state(),
+            |_| Ok(64),
+        )
+        .unwrap();
+        let first_end = first.sequence.as_ref().unwrap().after;
+        let second =
+            VerifiedChestLoot::replay_named(&chests[1], &id, &table, seed, first_end, |_| Ok(64))
+                .unwrap();
+        let end = second.sequence.as_ref().unwrap().after;
+        sequences
+            .set(
+                "example:treasure",
+                &XoroshiroRandom::from_state(end.0, end.1),
+            )
+            .unwrap();
+        let make_draft = |proofs: &[VerifiedChestLoot]| {
+            let mut draft = draft_chunk_blocks(&source, position, &[]).unwrap();
+            draft
+                .stage_checked_chest_inventories_with_loot(&changes, proofs)
+                .unwrap();
+            draft
+        };
+        let proofs = [second.clone(), first.clone()];
+        let uuid = [0, 0, 0, 1];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        let mut updated = player.clone();
+        let Tag::Compound(fields) = &mut updated.value else {
+            unreachable!()
+        };
+        fields.push((
+            "Inventory".into(),
+            list(vec![Tag::Compound(vec![
+                ("Slot".into(), Tag::Byte(0)),
+                ("id".into(), Tag::String("minecraft:diamond".into())),
+                ("count".into(), Tag::Int(2)),
+            ])]),
+        ));
+        let player_dir = world.path().join("players/data");
+        fs::create_dir_all(&player_dir).unwrap();
+        let player_path = player_dir.join(player_data_filename(uuid));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&player).unwrap()).unwrap();
+        let player_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &player_bytes).unwrap();
+        let data_dir = world.path().join("data/minecraft");
+        fs::create_dir_all(&data_dir).unwrap();
+        let seed_doc = |seed| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(seed))]),
+                ),
+            ]),
+        };
+        let seed_path = data_dir.join("world_gen_settings.dat");
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let plan = |with_sequences: bool, proofs: &[VerifiedChestLoot]| {
+            let mut plan = WorldSavePlan::new();
+            plan.add_chunk(dimension.clone(), make_draft(proofs), 20)
+                .unwrap();
+            plan.add_player_data(uuid, &player, &updated, |_, _| Ok(()))
+                .unwrap();
+            if with_sequences {
+                plan.add_random_sequences(&sequences).unwrap();
+            }
+            plan
+        };
+        assert!(
+            guard
+                .write_plan(plan(false, &proofs), |_, _| Ok(()))
+                .is_err()
+        );
+        let mut wrong_sequences = sequences.clone();
+        wrong_sequences
+            .set("example:treasure", &XoroshiroRandom::from_state(1, 2))
+            .unwrap();
+        let mut wrong_final = WorldSavePlan::new();
+        wrong_final
+            .add_chunk(dimension.clone(), make_draft(&proofs), 20)
+            .unwrap();
+        wrong_final
+            .add_player_data(uuid, &player, &updated, |_, _| Ok(()))
+            .unwrap();
+        wrong_final.add_random_sequences(&wrong_sequences).unwrap();
+        assert!(guard.write_plan(wrong_final, |_, _| Ok(())).is_err());
+        let broken = VerifiedChestLoot::replay_named(
+            &chests[1],
+            &id,
+            &table,
+            seed,
+            sequences.get("example:treasure", seed).unwrap().state(),
+            |_| Ok(64),
+        )
+        .unwrap();
+        assert!(
+            guard
+                .write_plan(plan(true, &[first.clone(), broken]), |_, _| Ok(()))
+                .is_err()
+        );
+        fs::write(&seed_path, nbt::write(&seed_doc(seed + 1)).unwrap()).unwrap();
+        assert!(
+            guard
+                .write_plan(plan(true, &proofs), |_, _| Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(fs::read(&player_path).unwrap(), player_bytes);
+        assert!(!data_dir.join("random_sequences.dat").exists());
+        fs::write(&seed_path, nbt::write(&seed_doc(seed)).unwrap()).unwrap();
+        let result = guard
+            .write_plan(plan(true, &proofs), |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            result.random_sequences_path,
+            Some(
+                data_dir
+                    .join("random_sequences.dat")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+        assert!(
+            result
+                .backup_directory
+                .join("world-data/world_gen_settings.dat")
+                .exists()
+        );
+        let saved_sequences =
+            nbt::read_gzip(File::open(data_dir.join("random_sequences.dat")).unwrap()).unwrap();
+        assert_eq!(
+            RandomSequences::read(Some(saved_sequences))
+                .unwrap()
+                .get("example:treasure", seed)
+                .unwrap()
+                .state(),
+            end
+        );
+        assert_ne!(fs::read(&region_path).unwrap(), region);
+        assert_ne!(fs::read(&player_path).unwrap(), player_bytes);
     }
 
     #[test]

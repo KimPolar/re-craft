@@ -35,7 +35,7 @@ pub struct BlockEntityChange {
 #[derive(Clone, Debug)]
 pub(crate) struct CheckedChestInventory {
     pub(crate) change: BlockEntityChange,
-    pub(crate) generated: Option<crate::chest_loot::VerifiedFixedChestLoot>,
+    pub(crate) generated: Option<crate::chest_loot::VerifiedChestLoot>,
 }
 
 /// A block entity added, removed, or replaced in an incomplete chunk draft.
@@ -197,11 +197,12 @@ impl ChunkDraft {
         self.stage_checked_chest_inventories_with_loot(changes, &[])
     }
 
-    /// Fixed-seed proofs must come from the active loot tables and item registry.
+    /// Proofs must come from the active loot tables and item registry. Named
+    /// sequence proofs also require coordinated random-sequence data at save.
     pub fn stage_checked_chest_inventories_with_loot(
         &mut self,
         changes: &[BlockEntityChange],
-        proofs: &[crate::chest_loot::VerifiedFixedChestLoot],
+        proofs: &[crate::chest_loot::VerifiedChestLoot],
     ) -> Result<()> {
         if changes.is_empty() {
             ensure!(proofs.is_empty(), "unused chest loot proof");

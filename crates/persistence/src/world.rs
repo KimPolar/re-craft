@@ -1193,6 +1193,27 @@ impl WorldReader {
         let Some(document) = self.saved_world_gen_document()? else {
             return Ok(None);
         };
+        Ok(Some(Self::world_seed_from_document(&document)?))
+    }
+
+    /// Validate and read the seed from a captured 26.3 world-generation document.
+    pub(crate) fn world_seed_from_document(document: &NamedTag) -> Result<i64> {
+        let Tag::Compound(root) = &document.value else {
+            bail!("world generation root must be a compound")
+        };
+        for name in ["DataVersion", "data"] {
+            ensure!(
+                root.iter().filter(|(key, _)| key.matches(name)).count() == 1,
+                "missing or duplicate world generation {name}"
+            );
+        }
+        ensure!(
+            matches!(
+                document.value.get("DataVersion"),
+                Some(Tag::Int(TARGET_DATA_VERSION))
+            ),
+            "unsupported world generation DataVersion"
+        );
         let data = document
             .value
             .get("data")
@@ -1210,7 +1231,7 @@ impl WorldReader {
             None => bail!("world generation data is missing seed"),
         };
         ensure!(seeds.next().is_none(), "duplicate world seeds");
-        Ok(Some(seed))
+        Ok(seed)
     }
 
     /// Read the dimension/type mappings in the shared 26.3 world-generation

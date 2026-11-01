@@ -2900,8 +2900,9 @@ impl LoadedSession {
             }
             if let Some(trace) = chest.loot_trace() {
                 let proof = (|| -> anyhow::Result<_> {
-                    let crate::saved_chest::LootRandomTrace::Fixed { table, .. } = trace else {
-                        anyhow::bail!("named loot requires a coordinated random sequence");
+                    let table = match trace {
+                        crate::saved_chest::LootRandomTrace::Fixed { table, .. }
+                        | crate::saved_chest::LootRandomTrace::Named { table, .. } => table,
                     };
                     let loot = self
                         .chest_loot
@@ -2915,16 +2916,36 @@ impl LoadedSession {
                     chest.verify_generated_loot(table, loot, |item| {
                         Self::resolve_chest_loot_item(item, registry)
                     })?;
-                    native_persistence::chest_loot::VerifiedFixedChestLoot::replay(
-                        chest.source(),
-                        table,
-                        loot,
-                        |item| {
-                            Self::resolve_chest_loot_item(item, registry)?
-                                .max_count()
-                                .context("loot item maximum is unavailable")
-                        },
-                    )
+                    let resolve = |item: &native_resources::chest_loot::ChestLootItem| {
+                        Self::resolve_chest_loot_item(item, registry)?
+                            .max_count()
+                            .context("loot item maximum is unavailable")
+                    };
+                    match trace {
+                        crate::saved_chest::LootRandomTrace::Fixed { .. } => {
+                            native_persistence::chest_loot::VerifiedChestLoot::replay(
+                                chest.source(),
+                                table,
+                                loot,
+                                resolve,
+                            )
+                        }
+                        crate::saved_chest::LootRandomTrace::Named { before, .. } => {
+                            let seed = self
+                                .random_sequences
+                                .as_ref()
+                                .context("world random sequences are unavailable")?
+                                .world_seed;
+                            native_persistence::chest_loot::VerifiedChestLoot::replay_named(
+                                chest.source(),
+                                table,
+                                loot,
+                                seed,
+                                *before,
+                                resolve,
+                            )
+                        }
+                    }
                 })();
                 match proof {
                     Ok(proof) => proofs.push(proof),
@@ -22869,7 +22890,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 chunk_draft.checked_chest_inventory_count(),
-                usize::from(mode == 0),
+                1,
                 "seed {seed}"
             );
             let chest = session.saved_chest(position).unwrap().unwrap();

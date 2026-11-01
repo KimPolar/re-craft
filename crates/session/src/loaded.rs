@@ -371,6 +371,7 @@ pub struct LoadedSession {
     recipes: Option<Arc<CraftingRecipes>>,
     item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     loot: Option<Arc<BlockLootTables>>,
+    chest_loot: Option<Arc<native_resources::chest_loot::ChestLootTables>>,
     mining_tags: Option<Arc<native_resources::mining_tags::MiningTags>>,
     tool_transforms: [Option<Arc<BlockTransformers>>; 3],
     soil_ticks: BTreeMap<(i128, i32, i64, u64), (IVec3, SoilKind)>,
@@ -3297,6 +3298,7 @@ impl LoadedSession {
             recipes: None,
             item_registry: None,
             loot: None,
+            chest_loot: None,
             mining_tags: None,
             tool_transforms: [None, None, None],
             soil_ticks: BTreeMap::new(),
@@ -3960,6 +3962,18 @@ impl LoadedSession {
         &self,
         position: IVec3,
     ) -> anyhow::Result<Option<crate::saved_chest::SavedChest>> {
+        self.saved_chest_internal(position, false)
+    }
+
+    pub fn set_chest_loot(&mut self, loot: Arc<native_resources::chest_loot::ChestLootTables>) {
+        self.chest_loot = Some(loot);
+    }
+
+    fn saved_chest_internal(
+        &self,
+        position: IVec3,
+        allow_pending: bool,
+    ) -> anyhow::Result<Option<crate::saved_chest::SavedChest>> {
         use anyhow::{Context, ensure};
         let chunk = ChunkPos {
             x: position.x.div_euclid(16),
@@ -4011,7 +4025,7 @@ impl LoadedSession {
             .saved_block_entities
             .get(&chunk)
             .context("block entity chunk is unavailable")?;
-        let saved = crate::saved_chest::read(payload, chunk, position)?;
+        let saved = crate::saved_chest::read_with_pending_loot(payload, chunk, position)?;
         if let Some(saved) = &saved {
             let id = saved.source().get("id");
             let expected_short = block
@@ -4032,6 +4046,13 @@ impl LoadedSession {
             );
             return Ok(Some(current.clone()));
         }
+        anyhow::ensure!(
+            allow_pending
+                || saved
+                    .as_ref()
+                    .is_none_or(|chest| chest.pending_loot().is_none()),
+            "chest loot table must be generated first"
+        );
         Ok(saved)
     }
 
@@ -4100,6 +4121,43 @@ impl LoadedSession {
         )
     }
 
+    fn unpack_chest_loot(&self, chest: &mut crate::saved_chest::SavedChest) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        let Some((id, _)) = chest.pending_loot() else {
+            return Ok(());
+        };
+        ensure!(
+            self.game_mode != GameMode::Spectator,
+            "spectators cannot open pending loot"
+        );
+        let id = id.clone();
+        let table = self
+            .chest_loot
+            .as_ref()
+            .and_then(|tables| tables.get(&id))
+            .context("chest loot table is unavailable or unsupported")?;
+        let registry = self
+            .item_registry
+            .as_ref()
+            .context("item registry is unavailable")?;
+        chest.unpack_seeded_loot(&id, table, |item| {
+            ensure!(
+                item.potion.is_none(),
+                "potion loot requires its active registry"
+            );
+            let id = format!("{}:{}", item.id.namespace, item.id.path);
+            ensure!(
+                registry.id(&id).is_some() && id != "minecraft:air",
+                "unknown loot item"
+            );
+            let components = native_persistence::nbt::Tag::Compound(vec![]);
+            let maximum = crate::equippable::saved_inventory_max(&id, &components)
+                .context("loot item prototype is unsupported")?;
+            crate::inventory::ItemStack::new(id, 1, maximum, components)
+                .context("invalid loot item prototype")
+        })
+    }
+
     fn try_open_saved_chest(&mut self, relative: IVec3) -> bool {
         let Some(position) = add(self.origin, relative) else {
             return false;
@@ -4111,10 +4169,10 @@ impl LoadedSession {
             return false;
         };
         let kind = block.properties.get("type").map(String::as_str);
-        let Ok(Some(chest)) = self.saved_chest(position) else {
+        let Ok(Some(mut chest)) = self.saved_chest_internal(position, true) else {
             return false;
         };
-        let pair = match kind {
+        let mut pair = match kind {
             Some("single") => None,
             Some("left" | "right") => {
                 let Some(direction) = native_world::collision::chest_connection(block) else {
@@ -4147,7 +4205,7 @@ impl LoadedSession {
                 {
                     return false;
                 }
-                let Ok(Some(other)) = self.saved_chest(other_position) else {
+                let Ok(Some(other)) = self.saved_chest_internal(other_position, true) else {
                     return false;
                 };
                 Some((other_position, other))
@@ -4180,6 +4238,13 @@ impl LoadedSession {
             self.notify_chest_locked(position, other_position, custom_name);
             return false;
         }
+        if self.unpack_chest_loot(&mut chest).is_err()
+            || pair
+                .as_mut()
+                .is_some_and(|(_, other)| self.unpack_chest_loot(other).is_err())
+        {
+            return false;
+        }
         let key = |p: IVec3| (p.x, p.y, p.z);
         if let Some((other_position, other)) = pair {
             let (right_position, right, left_position, left) = if kind == Some("right") {
@@ -4196,6 +4261,14 @@ impl LoadedSession {
                 return false;
             }
             Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&right, Some(&left)));
+            for chest in [&right, &left] {
+                if chest.inventory_changed() {
+                    self.chest_dirty_chunks.insert(ChunkPos {
+                        x: chest.position.x.div_euclid(16),
+                        z: chest.position.z.div_euclid(16),
+                    });
+                }
+            }
             self.chest_contents.insert(key(right_position), right);
             self.chest_contents.insert(key(left_position), left);
             self.push_chest_sound(right_position, Some(left_position), true);
@@ -4208,6 +4281,12 @@ impl LoadedSession {
                 return false;
             }
             Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&chest, None));
+            if chest.inventory_changed() {
+                self.chest_dirty_chunks.insert(ChunkPos {
+                    x: position.x.div_euclid(16),
+                    z: position.z.div_euclid(16),
+                });
+            }
             self.chest_contents.insert(key(position), chest);
             self.push_chest_sound(position, None, true);
             if self.game_mode != GameMode::Spectator {
@@ -22137,6 +22216,92 @@ mod tests {
         session.collect_closed_chest();
         assert_eq!(session.inventory.chest_title(), None);
         assert_eq!(snapshot.inventory.chest_title(), Some("보관함 ♠"));
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn pending_seeded_chest_opens_once_and_marks_its_chunk_dirty() {
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceId, ResourceProvider},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:custom").unwrap()])
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(Some(br#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_vec()))
+            }
+        }
+        let (mut session, _, position, chunk) = saved_chest_fixture();
+        let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk] else {
+            panic!()
+        };
+        let mut document = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut document.value else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!()
+        };
+        fields.retain(|(name, _)| !name.matches("Items"));
+        fields.push(("LootTable".into(), Tag::String("example:custom".into())));
+        fields.push(("LootTableSeed".into(), Tag::Long(42)));
+        fields.push(("future".into(), Tag::Int(17)));
+        let source = values[0].clone();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+            );
+        let relative = position - session.origin;
+        assert!(!session.try_open_saved_chest(relative));
+        assert!(!session.chest_dirty_chunks.contains(&chunk));
+        session.set_chest_loot(Arc::new(ChestLootTables::load(&mut Source).unwrap()));
+        assert!(!session.try_open_saved_chest(relative));
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        session.set_item_registry(Arc::new(resources.vanilla_item_registry().unwrap()));
+        session.game_mode = GameMode::Spectator;
+        assert!(!session.try_open_saved_chest(relative));
+        session.game_mode = GameMode::Survival;
+        assert!(session.try_open_saved_chest(relative));
+        assert!(session.chest_dirty_chunks.contains(&chunk));
+        assert_eq!(
+            (0..27)
+                .filter(|slot| session
+                    .inventory
+                    .slot(crate::inventory::PlayerSlot::Chest(*slot))
+                    .is_some())
+                .count(),
+            1
+        );
+        assert!(Arc::make_mut(&mut session.inventory).toggle());
+        session.collect_closed_chest();
+        let chest = session.saved_chest(position).unwrap().unwrap();
+        assert_eq!(chest.source(), &source);
+        let draft = chest.draft_inventory(&chest.slots).unwrap();
+        assert!(draft.get("LootTable").is_none());
+        assert_eq!(draft.get("future"), Some(&Tag::Int(17)));
+        assert!(session.try_open_saved_chest(relative));
+        assert_eq!(
+            (0..27)
+                .filter(|slot| session
+                    .inventory
+                    .slot(crate::inventory::PlayerSlot::Chest(*slot))
+                    .is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]

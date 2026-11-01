@@ -1303,6 +1303,10 @@ fn prepare_existing_world(
             eprintln!("loot issue: {warning}");
         }
         session.set_block_loot(Arc::new(loot));
+        match native_resources::chest_loot::ChestLootTables::load(&mut resources) {
+            Ok(loot) => session.set_chest_loot(Arc::new(loot)),
+            Err(error) => eprintln!("Chest loot is unavailable: {error:#}"),
+        }
         for (kind, transforms) in [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe]
             .into_iter()
             .zip(transforms)

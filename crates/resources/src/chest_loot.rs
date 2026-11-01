@@ -6,6 +6,7 @@ use crate::packs::{ResourceId, ResourceProvider};
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::{LegacyRandom, XoroshiroRandom};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub trait ChestLootRandom: Clone {
     fn next_int(&mut self, bound: i32) -> Option<i32>;
@@ -62,6 +63,37 @@ pub struct ChestLootTable {
     pools: Vec<Pool>,
     modifiers: Vec<Modifier>,
     random_sequence: Option<ResourceId>,
+}
+
+/// Supported chest tables from the active data-pack stack. Unsupported or
+/// malformed tables are omitted, so they can never be treated as empty loot.
+#[derive(Clone, Debug, Default)]
+pub struct ChestLootTables {
+    tables: BTreeMap<ResourceId, ChestLootTable>,
+}
+impl ChestLootTables {
+    pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
+        let mut tables = BTreeMap::new();
+        for id in provider.list_data("loot_table")? {
+            let path = format!("data/{}/loot_table/{}.json", id.namespace, id.path);
+            let Some(bytes) = provider.read_data(&path)? else {
+                continue;
+            };
+            if bytes.len() > 16 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice(&bytes) else {
+                continue;
+            };
+            if let Ok(table) = ChestLootTable::decode(&value) {
+                tables.insert(id, table);
+            }
+        }
+        Ok(Self { tables })
+    }
+    pub fn get(&self, id: &ResourceId) -> Option<&ChestLootTable> {
+        self.tables.get(id)
+    }
 }
 
 fn allowed_fields(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -500,6 +532,65 @@ fn bounded(random: &mut impl ChestLootRandom, bound: i32) -> Result<i32> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn catalog_uses_active_data_and_omits_unsupported_tables() {
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                [
+                    "example:custom",
+                    "minecraft:chests/unsupported",
+                    "minecraft:blocks/stone",
+                ]
+                .iter()
+                .map(|id| ResourceId::parse(id))
+                .collect()
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = if path.contains("custom") {
+                    json!({"type":"minecraft:chest", "pools":[]})
+                } else if path.contains("unsupported") {
+                    json!({"type":"minecraft:chest", "pools":[], "condition":{}})
+                } else {
+                    json!({"type":"minecraft:block", "pools":[]})
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+        }
+        let tables = ChestLootTables::load(&mut Source).unwrap();
+        assert!(
+            tables
+                .get(&ResourceId::parse("example:custom").unwrap())
+                .is_some()
+        );
+        assert!(
+            tables
+                .get(&ResourceId::parse("minecraft:chests/unsupported").unwrap())
+                .is_none()
+        );
+        assert!(
+            tables
+                .get(&ResourceId::parse("minecraft:blocks/stone").unwrap())
+                .is_none()
+        );
+    }
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn installed_catalog_contains_buried_treasure() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let catalog = ChestLootTables::load(&mut source).unwrap();
+        assert!(
+            catalog
+                .get(&ResourceId::parse("minecraft:chests/buried_treasure").unwrap())
+                .is_some()
+        );
+    }
     #[test]
     fn retains_the_named_world_random_sequence() {
         let mut value = json!({"type":"minecraft:chest", "pools":[]});

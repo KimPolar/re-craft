@@ -1,10 +1,11 @@
 //! Read saved chest halves and stage inventory changes while retaining NBT.
-//! Loot-table generation and coordinated world saving are not implemented here.
+//! Coordinated world saving remains the responsibility of the caller.
 
 use crate::inventory::ItemStack;
 use anyhow::{Context, Result, bail, ensure};
 use glam::IVec3;
 use native_persistence::nbt::{self, Tag, TagType};
+use native_resources::chest_loot::{ChestLootItem, ChestLootTable};
 use native_resources::packs::ResourceId;
 use native_world::loaded::{ChunkPos, SavedBlockEntities};
 use std::{collections::BTreeSet, sync::Arc};
@@ -15,6 +16,8 @@ pub struct SavedChest {
     pub slots: [Option<ItemStack>; 27],
     original_slots: [Option<ItemStack>; 27],
     source: Arc<Tag>,
+    pending_loot: Option<(ResourceId, i64)>,
+    loot_unpacked: bool,
 }
 
 /// Validate item-carried contents without recursively resolving item prototypes.
@@ -174,6 +177,8 @@ impl SavedChest {
             slots: slots.clone(),
             original_slots: slots,
             source: Arc::new(Tag::Compound(fields)),
+            pending_loot: None,
+            loot_unpacked: false,
         })
     }
     pub fn source(&self) -> &Tag {
@@ -354,16 +359,86 @@ impl SavedChest {
     }
 
     pub(crate) fn inventory_changed(&self) -> bool {
-        self.slots != self.original_slots
+        self.loot_unpacked || self.slots != self.original_slots
+    }
+
+    /// The still-unopened table and its saved seed. Zero requires a world
+    /// random sequence and cannot be resolved by `unpack_seeded_loot`.
+    pub(crate) fn pending_loot(&self) -> Option<(&ResourceId, i64)> {
+        self.pending_loot.as_ref().map(|(id, seed)| (id, *seed))
+    }
+
+    /// Generate a seeded chest into memory without changing the saved source.
+    /// The resolver must validate registry membership, feature flags and item
+    /// components against the active world and return the exact prototype.
+    pub(crate) fn unpack_seeded_loot(
+        &mut self,
+        id: &ResourceId,
+        table: &ChestLootTable,
+        mut resolve: impl FnMut(&ChestLootItem) -> Result<ItemStack>,
+    ) -> Result<()> {
+        let (expected, seed) = self
+            .pending_loot
+            .as_ref()
+            .context("chest has no pending loot")?;
+        ensure!(expected == id, "loot table does not match the chest");
+        let mut prototypes = Vec::new();
+        let generated = table.fill_seeded(&[false; 27], *seed, |item| {
+            let stack = resolve(item)?;
+            let expected_id = format!("{}:{}", item.id.namespace, item.id.path);
+            ensure!(
+                stack.id() == expected_id && stack.count() == 1,
+                "invalid loot item prototype"
+            );
+            let maximum = stack
+                .max_count()
+                .context("unresolved loot item prototype")?;
+            ensure!(
+                crate::equippable::saved_inventory_max(stack.id(), stack.components())
+                    == Some(maximum),
+                "loot item prototype cannot be safely saved"
+            );
+            if let Some((_, _, previous)) = prototypes
+                .iter()
+                .find(|(id, potion, _)| *id == item.id && *potion == item.potion)
+            {
+                ensure!(*previous == stack, "inconsistent loot item prototype");
+            } else {
+                prototypes.push((item.id.clone(), item.potion.clone(), stack));
+            }
+            Ok(maximum)
+        })?;
+        let mut slots: [Option<ItemStack>; 27] = std::array::from_fn(|_| None);
+        for (index, item) in generated.into_iter().enumerate() {
+            let Some(item) = item else { continue };
+            let prototype = prototypes
+                .iter()
+                .find(|(id, potion, _)| *id == item.id && *potion == item.potion)
+                .context("missing generated item prototype")?;
+            slots[index] = Some(
+                prototype
+                    .2
+                    .with_count(item.count)
+                    .context("invalid generated item count")?,
+            );
+        }
+        self.slots = slots;
+        self.pending_loot = None;
+        self.loot_unpacked = true;
+        Ok(())
     }
 
     /// Prepare a chest entity in memory. The source, player, chunk and all
     /// other affected world data must be checked and committed together before
     /// this can be used for a world save.
     pub fn draft_inventory(&self, slots: &[Option<ItemStack>; 27]) -> Result<Tag> {
-        if slots == &self.original_slots {
+        if !self.loot_unpacked && slots == &self.original_slots {
             return Ok((*self.source).clone());
         }
+        ensure!(
+            self.pending_loot.is_none(),
+            "chest loot has not been generated"
+        );
         let original_items = match unique(&self.source, "Items")? {
             Some(Tag::List { values, .. }) => values.as_slice(),
             None => &[],
@@ -428,6 +503,9 @@ impl SavedChest {
         let Tag::Compound(fields) = &mut document else {
             unreachable!()
         };
+        if self.loot_unpacked {
+            fields.retain(|(name, _)| !name.matches("LootTable") && !name.matches("LootTableSeed"));
+        }
         let items = Tag::List {
             element_type: TagType::Compound,
             values,
@@ -457,6 +535,23 @@ pub fn read(
     payload: &SavedBlockEntities,
     chunk: ChunkPos,
     position: IVec3,
+) -> Result<Option<SavedChest>> {
+    read_internal(payload, chunk, position, false)
+}
+
+pub(crate) fn read_with_pending_loot(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    position: IVec3,
+) -> Result<Option<SavedChest>> {
+    read_internal(payload, chunk, position, true)
+}
+
+fn read_internal(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    position: IVec3,
+    allow_pending_loot: bool,
 ) -> Result<Option<SavedChest>> {
     ensure!(
         position.x.div_euclid(16) == chunk.x && position.z.div_euclid(16) == chunk.z,
@@ -503,10 +598,29 @@ pub fn read(
         "saved block entity is not a chest"
     );
     unique(&entity, "CustomName")?;
-    ensure!(
-        unique(&entity, "LootTable")?.is_none(),
-        "chest loot table must be generated first"
-    );
+    let pending_loot = match unique(&entity, "LootTable")? {
+        None => None,
+        Some(Tag::String(id)) => {
+            ensure!(
+                allow_pending_loot,
+                "chest loot table must be generated first"
+            );
+            ensure!(
+                unique(&entity, "Items")?.is_none(),
+                "pending chest has conflicting items"
+            );
+            let id = ResourceId::parse(
+                &String::from_utf16(&id.0).context("invalid loot table identifier")?,
+            )?;
+            let seed = match unique(&entity, "LootTableSeed")? {
+                None => 0,
+                Some(Tag::Long(seed)) => *seed,
+                _ => bail!("invalid chest loot seed"),
+            };
+            Some((id, seed))
+        }
+        _ => bail!("invalid chest loot table"),
+    };
     unique(&entity, "lock")?;
     unique(&entity, "Lock")?;
     let mut slots: [Option<ItemStack>; 27] = std::array::from_fn(|_| None);
@@ -541,6 +655,8 @@ pub fn read(
         original_slots: slots.clone(),
         slots,
         source: Arc::new(entity),
+        pending_loot,
+        loot_unpacked: false,
     }))
 }
 
@@ -563,6 +679,87 @@ mod tests {
         assert!(matches_partial_nbt(&parse("{}"), &actual));
     }
     use native_persistence::nbt::NamedTag;
+    #[test]
+    fn seeded_loot_is_staged_atomically_and_keeps_original_source() {
+        let position = IVec3::new(-1, 64, 32);
+        let chunk = ChunkPos { x: -1, z: 2 };
+        let mut original = chest();
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| !name.matches("Items"));
+        fields.push((
+            "LootTable".into(),
+            Tag::String("example:chests/test".into()),
+        ));
+        fields.push(("LootTableSeed".into(), Tag::Long(42)));
+        let mut saved = read_with_pending_loot(&payload(vec![original.clone()]), chunk, position)
+            .unwrap()
+            .unwrap();
+        let id = ResourceId::parse("example:chests/test").unwrap();
+        assert_eq!(saved.pending_loot(), Some((&id, 42)));
+        assert!(!saved.inventory_changed());
+        assert_eq!(saved.draft_inventory(&saved.slots).unwrap(), original);
+        let mut premature = saved.slots.clone();
+        premature[0] = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![]));
+        assert!(saved.draft_inventory(&premature).is_err());
+        let table = ChestLootTable::decode(&serde_json::json!({
+            "type":"minecraft:chest", "pools":[{"rolls":1,"entries":[
+                {"type":"minecraft:item","name":"minecraft:stone"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            saved
+                .unpack_seeded_loot(&id, &table, |_| bail!("missing registry"))
+                .is_err()
+        );
+        assert_eq!(saved.source(), &original);
+        assert!(saved.pending_loot().is_some());
+        assert!(!saved.inventory_changed());
+        let resolve = |_: &ChestLootItem| {
+            Ok(ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap())
+        };
+        assert!(
+            saved
+                .unpack_seeded_loot(
+                    &ResourceId::parse("example:other").unwrap(),
+                    &table,
+                    resolve
+                )
+                .is_err()
+        );
+        saved.unpack_seeded_loot(&id, &table, resolve).unwrap();
+        assert!(saved.pending_loot().is_none());
+        assert!(saved.inventory_changed());
+        assert_eq!(saved.slots.iter().flatten().count(), 1);
+        assert_eq!(saved.source(), &original);
+        let draft = saved.draft_inventory(&saved.slots).unwrap();
+        assert_eq!(draft.get("future"), original.get("future"));
+        assert!(draft.get("LootTable").is_none());
+        assert!(draft.get("LootTableSeed").is_none());
+        let restored = read(&payload(vec![draft]), chunk, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.slots, saved.slots);
+        let empty = std::array::from_fn(|_| None);
+        let emptied = saved.draft_inventory(&empty).unwrap();
+        assert!(emptied.get("LootTable").is_none());
+        assert!(
+            matches!(emptied.get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        let mut no_seed = original.clone();
+        let Tag::Compound(fields) = &mut no_seed else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| !name.matches("LootTableSeed"));
+        let mut zero = read_with_pending_loot(&payload(vec![no_seed]), chunk, position)
+            .unwrap()
+            .unwrap();
+        assert!(zero.unpack_seeded_loot(&id, &table, resolve).is_err());
+        assert_eq!(zero.pending_loot(), Some((&id, 0)));
+        assert!(!zero.inventory_changed());
+    }
     #[test]
     fn placed_container_rejects_ambiguous_or_unpreservable_items() {
         let item = Tag::Compound(vec![("id".into(), Tag::String("minecraft:stone".into()))]);

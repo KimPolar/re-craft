@@ -686,6 +686,10 @@ impl LocalSession {
                             }
                         }
                     }
+                    survival::FoodRandomEvent::ClearAllStatuses => {
+                        self.fall.clear_effects();
+                        self.breathing_effects = survival::BreathingEffects::default();
+                    }
                     _ => {}
                 }
             }

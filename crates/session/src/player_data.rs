@@ -1542,6 +1542,7 @@ pub fn replay_saved_hunger_effects(
             kind: crate::survival::FoodStatusKind::Hunger,
             update,
             remove: false,
+            clear_all: false,
         })
         .collect();
     replay_saved_status_effects(player, ticks, &updates)
@@ -1552,6 +1553,7 @@ pub(crate) struct StatusUpdate {
     pub kind: crate::survival::FoodStatusKind,
     pub update: HungerUpdate,
     pub remove: bool,
+    pub clear_all: bool,
 }
 
 pub(crate) fn replay_saved_status_effects(
@@ -1671,6 +1673,7 @@ pub(crate) fn replay_saved_status_effects(
         kind,
         update,
         remove,
+        clear_all,
     } in updates
     {
         let event_tick = update.tick;
@@ -1692,6 +1695,13 @@ pub(crate) fn replay_saved_status_effects(
             unreachable!()
         };
         *element_type = TagType::Compound;
+        if clear_all {
+            ensure!(remove, "invalid clear-all status update");
+            values.clear();
+            effects = Some(list);
+            elapsed = event_tick;
+            continue;
+        }
         if remove {
             values.retain(|effect| {
                 !effect
@@ -2680,6 +2690,7 @@ mod tests {
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
                             remove: false,
+                            clear_all: false,
                             update: HungerUpdate {
                                 tick: 0,
                                 duration: 10,
@@ -2692,6 +2703,7 @@ mod tests {
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Hunger,
                             remove: false,
+                            clear_all: false,
                             update: HungerUpdate {
                                 tick: 0,
                                 duration: 100,
@@ -2704,6 +2716,7 @@ mod tests {
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
                             remove: false,
+                            clear_all: false,
                             update: HungerUpdate {
                                 tick: 3,
                                 duration: 200,
@@ -2716,6 +2729,7 @@ mod tests {
                         StatusUpdate {
                             kind: crate::survival::FoodStatusKind::Poison,
                             remove: false,
+                            clear_all: false,
                             update: HungerUpdate {
                                 tick: 15,
                                 duration: -1,
@@ -2734,6 +2748,7 @@ mod tests {
                                 StatusUpdate {
                                     kind: crate::survival::FoodStatusKind::Poison,
                                     remove: true,
+                                    clear_all: false,
                                     update: HungerUpdate {
                                         tick: 3,
                                         duration: 0,

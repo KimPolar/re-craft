@@ -44,6 +44,7 @@ public class CustomHungerOracle {
       if(effect==MobEffects.HUNGER) { boolean had=active!=null; active=null; return had; }
       return false;
     }
+    @Override public boolean removeAllEffects() { boolean had=active!=null||poison!=null; active=null; poison=null; return had; }
   }
   public static void main(String[] args) throws Exception {
     net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -61,7 +62,9 @@ public class CustomHungerOracle {
       "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"probability\":0.35,\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":70,\"amplifier\":1},{\"id\":\"minecraft:poison\",\"duration\":100}]},{\"type\":\"minecraft:apply_effects\",\"probability\":0.8,\"effects\":[{\"id\":\"minecraft:poison\",\"duration\":20,\"amplifier\":2}]}]}",
       "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:remove_effects\",\"effects\":\"minecraft:poison\"},{\"type\":\"minecraft:apply_effects\",\"probability\":0.35,\"effects\":[{\"id\":\"minecraft:poison\",\"duration\":100}]}]}",
       "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:remove_effects\",\"effects\":[\"minecraft:hunger\",\"minecraft:poison\"]},{\"type\":\"minecraft:apply_effects\",\"probability\":0.8,\"effects\":[{\"id\":\"minecraft:poison\",\"duration\":20,\"amplifier\":2}]}]}",
-      "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:remove_effects\",\"effects\":[]}]}"
+      "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:remove_effects\",\"effects\":[]}]}",
+      "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:clear_all_effects\"},{\"type\":\"minecraft:apply_effects\",\"probability\":0.8,\"effects\":[{\"id\":\"minecraft:poison\",\"duration\":20,\"amplifier\":2}]}]}",
+      "{\"consume_seconds\":0,\"on_consume_effects\":[{\"type\":\"minecraft:apply_effects\",\"effects\":[{\"id\":\"minecraft:hunger\",\"duration\":40}]},{\"type\":\"minecraft:clear_all_effects\"}]}"
     };
     var out=new JsonArray();
     for(int index=0;index<cases.length;index++) {

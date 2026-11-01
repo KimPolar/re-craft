@@ -156,6 +156,10 @@ impl FallTracker {
         &self.effects
     }
 
+    pub(crate) fn clear_effects(&mut self) {
+        self.effects = FallEffects::default();
+    }
+
     pub(crate) fn remove_status(&mut self, kind: crate::survival::FoodStatusKind) {
         match kind {
             crate::survival::FoodStatusKind::Hunger => self.effects.hunger = None,

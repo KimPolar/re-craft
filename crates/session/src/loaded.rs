@@ -1008,6 +1008,33 @@ impl LoadedSession {
                     }],
                     crate::survival::FoodRandomEvent::StatusGroup { effects, .. }
                     | crate::survival::FoodRandomEvent::PotionEffects(effects) => effects,
+                    crate::survival::FoodRandomEvent::ClearAllStatuses => {
+                        let transitions = [
+                            self.fall.effects().speed.is_some(),
+                            self.fall.effects().slowness.is_some(),
+                        ];
+                        let tracking = self.ensure_effect_save_tracking();
+                        tracking
+                            .status_updates
+                            .push(crate::player_data::StatusUpdate {
+                                kind: crate::survival::FoodStatusKind::Hunger,
+                                update: crate::player_data::HungerUpdate {
+                                    tick: tracking.ticks,
+                                    duration: 0,
+                                    amplifier: 0,
+                                    ambient: false,
+                                    visible: false,
+                                    show_icon: false,
+                                },
+                                remove: true,
+                                clear_all: true,
+                            });
+                        self.fall.clear_effects();
+                        self.breathing_effects = crate::survival::BreathingEffects::default();
+                        self.update_movement_effect_modifiers(transitions);
+                        self.refresh_movement_speed();
+                        continue;
+                    }
                     crate::survival::FoodRandomEvent::RemoveStatuses(effects) => {
                         for kind in effects {
                             let active = match kind {
@@ -1041,6 +1068,7 @@ impl LoadedSession {
                                         show_icon: false,
                                     },
                                     remove: true,
+                                    clear_all: false,
                                 });
                             if kind == crate::survival::FoodStatusKind::WaterBreathing {
                                 self.breathing_effects.water_breathing = None;
@@ -1059,6 +1087,7 @@ impl LoadedSession {
                         .push(crate::player_data::StatusUpdate {
                             kind: effect.kind,
                             remove: false,
+                            clear_all: false,
                             update: crate::player_data::HungerUpdate {
                                 tick: tracking.ticks,
                                 duration: effect.duration,
@@ -38974,6 +39003,7 @@ mod tests {
             vec![crate::player_data::StatusUpdate {
                 kind: crate::survival::FoodStatusKind::Hunger,
                 remove: false,
+                clear_all: false,
                 update: crate::player_data::HungerUpdate {
                     tick: 32,
                     duration: 600,
@@ -39107,6 +39137,286 @@ mod tests {
             crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
             *session.fall.effects()
         );
+    }
+
+    #[test]
+    fn custom_clear_all_then_apply_preserves_status_event_order() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:hunger".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:poison".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        let components = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![(
+                                "type".into(),
+                                Tag::String("minecraft:clear_all_effects".into()),
+                            )]),
+                            Tag::Compound(vec![
+                                ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                                (
+                                    "effects".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![
+                                            ("id".into(), Tag::String("minecraft:poison".into())),
+                                            ("duration".into(), Tag::Int(14)),
+                                        ])],
+                                    },
+                                ),
+                            ]),
+                        ],
+                    },
+                ),
+            ]),
+        )]);
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, components),
+        );
+        session.set_player_inventory(inventory);
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            food: 10,
+            ..Default::default()
+        });
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(!session.snapshot().hunger_effect && session.snapshot().poison_effect);
+        assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 13);
+        let events = &session
+            .effect_save_tracking
+            .as_ref()
+            .unwrap()
+            .status_updates;
+        assert_eq!(events.len(), 2);
+        assert!(events[0].clear_all);
+        assert!(!events[1].clear_all && !events[1].remove);
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+    }
+
+    #[test]
+    fn milk_clears_all_tracked_effects_and_replays_player_draft() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let effects = [
+            "night_vision",
+            "jump_boost",
+            "resistance",
+            "slow_falling",
+            "levitation",
+            "speed",
+            "slowness",
+            "dolphins_grace",
+            "hunger",
+            "poison",
+            "luck",
+            "unluck",
+            "water_breathing",
+            "conduit_power",
+            "breath_of_the_nautilus",
+        ]
+        .into_iter()
+        .map(|id| {
+            Tag::Compound(vec![
+                (
+                    "id".into(),
+                    Tag::String(format!("minecraft:{id}").as_str().into()),
+                ),
+                ("duration".into(), Tag::Int(200)),
+                ("amplifier".into(), Tag::Byte(0)),
+                (
+                    "hidden_effect".into(),
+                    Tag::Compound(vec![("duration".into(), Tag::Int(300))]),
+                ),
+            ])
+        })
+        .collect();
+        let modifier = |id: &str, amount| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("amount".into(), Tag::Double(amount)),
+                (
+                    "operation".into(),
+                    Tag::String("add_multiplied_total".into()),
+                ),
+            ])
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Health".into(), Tag::Float(1.0)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: effects,
+                    },
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![
+                                        modifier("minecraft:effect.speed", f64::from(0.2_f32)),
+                                        modifier("minecraft:effect.slowness", f64::from(-0.15_f32)),
+                                        modifier("example:keep", 0.1),
+                                    ],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let mut session = session();
+        session.set_survival_rules(crate::survival::SurvivalRules {
+            natural_health_regeneration: false,
+            ..Default::default()
+        });
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session
+            .set_saved_breathing(
+                crate::player_data::read_saved_breathing_effects(&original).unwrap(),
+                crate::player_data::SavedAttribute::with_base(0.0),
+                Arc::new(OxygenEnchantments::default()),
+            )
+            .unwrap();
+        session
+            .set_saved_movement_speed(
+                crate::player_data::read_loaded_movement_speed_attribute(&original).unwrap(),
+            )
+            .unwrap();
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            health: 1.0,
+            food: 20,
+            saturation: 0.0,
+            ..Default::default()
+        });
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:milk_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..31 {
+            session.update(TICK);
+        }
+        assert!(session.snapshot().poison_effect);
+        session.update(TICK);
+        assert_eq!(
+            *session.fall.effects(),
+            crate::survival::FallEffects::default()
+        );
+        assert_eq!(
+            session.breathing_effects,
+            crate::survival::BreathingEffects::default()
+        );
+        assert!(!session.snapshot().poison_effect && !session.snapshot().hunger_effect);
+        assert_eq!(session.snapshot().night_vision_duration, None);
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:bucket"
+        );
+        let resource = |id| native_resources::packs::ResourceId::parse(id).unwrap();
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&resource("minecraft:effect.speed"))
+                .is_none()
+        );
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&resource("minecraft:effect.slowness"))
+                .is_none()
+        );
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&resource("example:keep"))
+                .is_some()
+        );
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        assert_eq!(
+            crate::player_data::read_saved_breathing_effects(draft.document()).unwrap(),
+            session.breathing_effects
+        );
+        assert_eq!(
+            crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap(),
+            session.movement_speed_attribute
+        );
+        let mut unsupported = original.clone();
+        let Tag::Compound(fields) = &mut unsupported.value else {
+            panic!()
+        };
+        let (_, Tag::List { values, .. }) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("active_effects"))
+            .unwrap()
+        else {
+            panic!()
+        };
+        values.push(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:weakness".into())),
+            ("duration".into(), Tag::Int(100)),
+        ]));
+        assert!(session.draft_player_state(&unsupported).is_err());
     }
 
     #[test]

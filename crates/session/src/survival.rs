@@ -124,6 +124,7 @@ struct StatusGroup {
 enum ConsumeStatusAction {
     Apply(StatusGroup),
     Remove(Vec<FoodStatusKind>),
+    ClearAll,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +349,9 @@ fn parse_consume_action(value: &Tag, collect: bool) -> Option<ConsumeStatusActio
         }
     }
     let kind = kind?;
+    if kind.matches("minecraft:clear_all_effects") || kind.matches("clear_all_effects") {
+        return (fields.len() == 1).then_some(ConsumeStatusAction::ClearAll);
+    }
     if kind.matches("minecraft:apply_effects") || kind.matches("apply_effects") {
         return Some(ConsumeStatusAction::Apply(parse_status_group(
             value, collect,
@@ -513,6 +517,9 @@ fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
             Tag::Compound(vec![]),
         );
     }
+    if item.id() == "minecraft:milk_bucket" {
+        return ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![]));
+    }
     matches!(
         item.id(),
         "minecraft:mushroom_stew" | "minecraft:rabbit_stew" | "minecraft:beetroot_soup"
@@ -523,14 +530,16 @@ fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
 
 pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
     let components = item.components();
-    if item.id() == "minecraft:potion" {
+    if matches!(item.id(), "minecraft:potion" | "minecraft:milk_bucket") {
         if components.get("!minecraft:consumable").is_some()
             || components.get("minecraft:consumable").is_some()
             || components.get("minecraft:food").is_some()
         {
             return None;
         }
-        potion_effects(components)?;
+        if item.id() == "minecraft:potion" {
+            potion_effects(components)?;
+        }
         return Some(FoodProperties {
             nutrition: 0,
             saturation: 0.0,
@@ -613,6 +622,7 @@ pub(crate) enum FoodRandomEvent {
     },
     PotionEffects(Vec<StatusApplication>),
     RemoveStatuses(Vec<FoodStatusKind>),
+    ClearAllStatuses,
 }
 
 impl FoodRandomEvent {
@@ -652,7 +662,9 @@ impl FoodRandomEvent {
             Self::StatusGroup { probability, .. } => {
                 return (random.next_float() < *probability, [None; 3]);
             }
-            Self::RemoveStatuses(_) | Self::PotionEffects(_) => return (true, [None; 3]),
+            Self::RemoveStatuses(_) | Self::PotionEffects(_) | Self::ClearAllStatuses => {
+                return (true, [None; 3]);
+            }
         };
         let volume = if random.next_bool() { 0.5 } else { 1.0 };
         let eat_pitch = 1.0_f32 + 0.2_f32 * (random.next_float() - random.next_float());
@@ -874,6 +886,10 @@ impl FoodUse {
             item.id() == "minecraft:honey_bottle"
                 && item.components().get("minecraft:consumable").is_none()
         });
+        let clear_all = inventory.slot(hand).is_some_and(|item| {
+            item.id() == "minecraft:milk_bucket"
+                && item.components().get("minecraft:consumable").is_none()
+        });
         let causes_hunger = inventory.slot(hand).is_some_and(|item| {
             item.id() == "minecraft:rotten_flesh"
                 && item.components().get("minecraft:consumable").is_none()
@@ -924,7 +940,11 @@ impl FoodUse {
                     ConsumeStatusAction::Remove(effects) => {
                         FoodRandomEvent::RemoveStatuses(effects)
                     }
+                    ConsumeStatusAction::ClearAll => FoodRandomEvent::ClearAllStatuses,
                 }));
+            if clear_all {
+                self.events.push(FoodRandomEvent::ClearAllStatuses);
+            }
             if remove_poison {
                 self.events.push(FoodRandomEvent::RemoveStatuses(vec![
                     FoodStatusKind::Poison,
@@ -1400,6 +1420,164 @@ impl PlayerVitals {
 mod tests {
     use super::*;
     use crate::{GameMode, GameSession, LocalSession, PlayerCommand};
+
+    #[test]
+    fn interrupted_milk_use_does_not_consume_or_clear_effects() {
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:milk_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        let mut inventory = Arc::new(inventory);
+        let mut vitals = PlayerVitals::default();
+        let mut usage = FoodUse::default();
+        assert!(usage.start_hand(
+            &mut inventory,
+            PlayerSlot::Storage(0),
+            &mut vitals,
+            GameMode::Survival
+        ));
+        for _ in 0..31 {
+            usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+        }
+        usage.cancel();
+        usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+        assert_eq!(
+            inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:milk_bucket"
+        );
+        assert!(
+            !usage
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, FoodRandomEvent::ClearAllStatuses))
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn milk_use_matches_java_sounds_timing_and_random() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("MilkOracle.java");
+        let base = temp.path().join("FoodEffectsOracle.java");
+        let output = temp.path().join("milk.json");
+        std::fs::write(&source, include_str!("../tests/java/MilkOracle.java")).unwrap();
+        std::fs::write(&base, include_str!("../tests/java/FoodEffectsOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&base),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("MilkOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32);
+        for row in rows {
+            assert_eq!(row["ticks"], 32);
+            assert_eq!(row["particles"], false);
+            assert_eq!(row["animation"], "DRINK");
+            assert_eq!(row["food"], false);
+            assert_eq!(row["can_consume"], true);
+            assert_eq!(row["cleared"], true);
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for mode in [GameMode::Survival, GameMode::Creative] {
+                    let item =
+                        ItemStack::new("minecraft:milk_bucket".into(), 1, 1, Tag::Compound(vec![]))
+                            .unwrap();
+                    let food = food_properties(&item).unwrap();
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(hand, Some(item));
+                    let mut inventory = Arc::new(inventory);
+                    let mut vitals = PlayerVitals {
+                        food: 20,
+                        saturation: 5.0,
+                        ..Default::default()
+                    };
+                    let mut usage = FoodUse::default();
+                    assert!(usage.start_hand(&mut inventory, hand, &mut vitals, mode));
+                    let mut random =
+                        native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+                    let mut sounds = Vec::new();
+                    let mut cleared = 0;
+                    for tick in 0..food.use_ticks {
+                        usage.tick(&mut inventory, &mut vitals, mode);
+                        for event in usage.take_events() {
+                            let (applied, emitted) = event.apply_with_sounds(&mut random);
+                            sounds.extend(emitted.into_iter().flatten());
+                            if matches!(event, FoodRandomEvent::ClearAllStatuses) {
+                                assert!(applied);
+                                assert_eq!(tick, 31);
+                                cleared += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(cleared, 1);
+                    assert_eq!(
+                        inventory.slot(hand).unwrap().id(),
+                        if mode == GameMode::Creative {
+                            "minecraft:milk_bucket"
+                        } else {
+                            "minecraft:bucket"
+                        }
+                    );
+                    assert_eq!((vitals.food, vitals.saturation), (20, 5.0));
+                    let expected = row["sounds"].as_array().unwrap();
+                    assert_eq!(sounds.len(), expected.len());
+                    for (sound, expected) in sounds.iter().zip(expected) {
+                        assert_eq!(
+                            format!("minecraft:{}", sound.event),
+                            expected["event"].as_str().unwrap()
+                        );
+                        assert_eq!(
+                            sound.volume.to_bits(),
+                            expected["volume_bits"].as_i64().unwrap() as i32 as u32
+                        );
+                        assert_eq!(
+                            sound.pitch.to_bits(),
+                            expected["pitch_bits"].as_i64().unwrap() as i32 as u32
+                        );
+                    }
+                    assert_eq!(
+                        random.next_float().to_bits(),
+                        row["next_bits"].as_i64().unwrap() as i32 as u32
+                    );
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -2430,10 +2608,42 @@ mod tests {
                     },
                 ),
             ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            Tag::Compound(vec![(
+                                "type".into(),
+                                Tag::String("minecraft:clear_all_effects".into()),
+                            )]),
+                            group(0.8, vec![poison(20, 2)]),
+                        ],
+                    },
+                ),
+            ]),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![
+                            group(1.0, vec![effect(40, 0)]),
+                            Tag::Compound(vec![(
+                                "type".into(),
+                                Tag::String("minecraft:clear_all_effects".into()),
+                            )]),
+                        ],
+                    },
+                ),
+            ]),
         ];
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 280);
+        assert_eq!(rows.len(), 360);
         for row in rows {
             let case = row["case"].as_u64().unwrap() as usize;
             let components =
@@ -2505,6 +2715,10 @@ mod tests {
                                 }
                             }
                         }
+                    }
+                    FoodRandomEvent::ClearAllStatuses => {
+                        active = None;
+                        active_poison = None;
                     }
                     _ => {}
                 }

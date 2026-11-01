@@ -526,6 +526,10 @@ pub struct LoadedSession {
     movement_efficiency_inventory_revision: Option<u64>,
     movement_efficiency: Option<f64>,
     unresolved_player_movement_efficiency: bool,
+    location_effects: crate::location_enchantments::LocationTracker,
+    location_last_position: Option<IVec3>,
+    unresolved_player_location_effects: bool,
+    location_failure_revision: Option<u64>,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     mining_attribute_revision: Option<u64>,
     mining_attribute_values: [f64; 3],
@@ -1733,6 +1737,8 @@ impl LoadedSession {
             crate::survival::display_effects(self.fall.effects(), &self.breathing_effects);
         self.oxygen_bonus = oxygen_bonus;
         self.oxygen_equipment = None;
+        self.location_effects = crate::location_enchantments::LocationTracker::default();
+        self.location_failure_revision = None;
         self.oxygen_inventory_revision = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
@@ -1857,6 +1863,9 @@ impl LoadedSession {
         Arc::make_mut(&mut self.snapshot).inventory = Arc::clone(&self.inventory);
         Arc::make_mut(&mut self.snapshot).armor = self.armor.value();
         self.oxygen_equipment = Some((attribute, enchantments));
+        self.location_effects = crate::location_enchantments::LocationTracker::default();
+        self.location_last_position = None;
+        self.location_failure_revision = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
         self.knockback_resistance_revision = None;
@@ -2096,6 +2105,10 @@ impl LoadedSession {
             &registry,
             "movement_efficiency",
         )
+        .and_then(|attribute| {
+            self.location_effects
+                .apply("movement_efficiency", attribute)
+        })
         .and_then(|attribute| attribute.value(0.0, 1.0))
         {
             Ok(value) => self.movement_efficiency = Some(value),
@@ -2103,6 +2116,87 @@ impl LoadedSession {
                 self.movement_efficiency = None;
                 self.stream_errors
                     .push(format!("player movement efficiency equipment: {error:#}"));
+            }
+        }
+    }
+
+    fn run_location_effects(&mut self, equipment_changed: bool) {
+        if !self.location_effects.needs_processing(&self.inventory) {
+            return;
+        }
+        if equipment_changed && !self.location_effects.equipment_changed(&self.inventory) {
+            return;
+        }
+        if equipment_changed && self.location_failure_revision == Some(self.inventory.revision()) {
+            return;
+        }
+        let Some((_, registry)) = &self.oxygen_equipment else {
+            self.unresolved_player_location_effects = true;
+            return;
+        };
+        let registry = Arc::clone(registry);
+        let below = self.movement_below();
+        let name = match cell(&self.world, self.origin, self.bounds, below, self.states[0]) {
+            Cell::State(id) => self.world.state(id).map(|state| state.name.clone()),
+            Cell::Missing => None,
+        };
+        let Some(name) = name else {
+            self.unresolved_player_location_effects = true;
+            return;
+        };
+        let environment = crate::location_enchantments::Environment {
+            block: &name,
+            flying: self.flight.flying,
+            on_ground: self.motion.on_ground,
+            passenger: false,
+            infinite_materials: matches!(self.game_mode, GameMode::Creative | GameMode::Spectator),
+        };
+        let mut inventory = (*self.inventory).clone();
+        let result = if equipment_changed {
+            self.location_effects.sync_equipment(
+                &mut inventory,
+                &registry,
+                environment,
+                &mut self.level_random,
+            )
+        } else {
+            self.location_effects.block_changed(
+                &mut inventory,
+                &registry,
+                environment,
+                &mut self.level_random,
+            )
+        };
+        match result {
+            Ok(outcome) => {
+                self.location_failure_revision = None;
+                if outcome.attributes_changed || outcome.inventory_changed {
+                    // Location transitions and inventory changes still need coordinated save accounting.
+                    self.unresolved_player_location_effects = true;
+                }
+                if outcome.inventory_changed {
+                    self.inventory = Arc::new(inventory);
+                }
+                if outcome.attributes_changed || outcome.inventory_changed {
+                    self.movement_speed_cache = None;
+                    self.movement_efficiency_inventory_revision = None;
+                    self.refresh_movement_efficiency();
+                    self.refresh_movement_speed();
+                }
+                for item in outcome.broken {
+                    self.queue_broken_item(item);
+                }
+            }
+            Err(error) => {
+                self.unresolved_player_location_effects = true;
+                self.location_failure_revision = Some(self.inventory.revision());
+                self.location_effects = crate::location_enchantments::LocationTracker::default();
+                self.movement_speed_cache = None;
+                self.movement_efficiency_inventory_revision = None;
+                self.refresh_movement_efficiency();
+                self.refresh_movement_speed();
+                self.stream_errors
+                    .push(format!("player location enchantment: {error:#}"));
             }
         }
     }
@@ -2217,6 +2311,7 @@ impl LoadedSession {
             &registry,
             "movement_speed",
         )
+        .and_then(|attribute| self.location_effects.apply("movement_speed", attribute))
         .and_then(|attribute| {
             Ok([
                 attribute.movement_speed(None, None, false)?,
@@ -2760,6 +2855,10 @@ impl LoadedSession {
         anyhow::ensure!(
             !self.unresolved_player_movement_efficiency,
             "player movement efficiency could not be resolved during this session"
+        );
+        anyhow::ensure!(
+            !self.unresolved_player_location_effects,
+            "location effects could not be safely preserved during this session"
         );
         anyhow::ensure!(
             !self.unresolved_player_fire_contact,
@@ -4767,6 +4866,10 @@ impl LoadedSession {
             movement_efficiency_inventory_revision: None,
             movement_efficiency: Some(0.0),
             unresolved_player_movement_efficiency: false,
+            location_effects: crate::location_enchantments::LocationTracker::default(),
+            location_last_position: None,
+            unresolved_player_location_effects: false,
+            location_failure_revision: None,
             mining_attributes: crate::player_data::SavedMiningAttributes::default(),
             mining_attribute_revision: None,
             mining_attribute_values: [0.0, 1.0, 0.2],
@@ -7406,6 +7509,9 @@ impl LoadedSession {
             on_ground: false,
             jump_delay: 0,
         };
+        self.location_effects = crate::location_enchantments::LocationTracker::default();
+        self.location_last_position = None;
+        self.location_failure_revision = None;
         self.camera = crate::camera::CameraMotion::new(position, self.player.pose.eye_height());
         self.vitals = crate::survival::PlayerVitals {
             health: max_health,
@@ -14621,6 +14727,11 @@ impl LoadedSession {
                 }
             }
         }
+        let location_position = add(self.origin, self.motion.position.floor().as_ivec3());
+        if self.location_last_position != location_position {
+            self.location_last_position = location_position;
+            self.run_location_effects(false);
+        }
         let tracking = self.ensure_effect_save_tracking();
         tracking.ticks = tracking.ticks.saturating_add(1);
         self.breathing_effects.tick();
@@ -14703,6 +14814,7 @@ impl LoadedSession {
         self.fall.tick_effects();
         // LivingEntity updates equipped attributes after baseTick; lava and
         // block contacts later in this tick see the refreshed equipment.
+        self.run_location_effects(true);
         self.refresh_knockback_resistance();
         self.update_movement_effect_modifiers(transitions);
         self.refresh_movement_speed();
@@ -14939,6 +15051,21 @@ impl LoadedSession {
             )
         };
         let movement_efficiency = self.movement_efficiency.unwrap_or(0.0);
+        let location_needed = self.location_effects.needs_processing(&self.inventory);
+        let location_registry = location_needed
+            .then(|| {
+                self.oxygen_equipment
+                    .as_ref()
+                    .map(|(_, registry)| Arc::clone(registry))
+            })
+            .flatten();
+        let location_result = std::cell::RefCell::new(None);
+        let location_effects = &mut self.location_effects;
+        let location_inventory = &mut self.inventory;
+        let location_random = &mut self.level_random;
+        let efficiency_attribute = &self.movement_efficiency_attribute;
+        let infinite_materials = matches!(self.game_mode, GameMode::Creative | GameMode::Spectator);
+        let eye_height = self.player.pose.eye_height();
         let block_speed = |position: DVec3, actual: DVec3, on_ground: bool| {
             let support = if on_ground {
                 let support = collision_support.get().unwrap_or_else(|| {
@@ -14968,10 +15095,74 @@ impl LoadedSession {
                     .map_or("minecraft:air", |state| state.name.as_str()),
                 Cell::Missing => "minecraft:air",
             };
+            let mut efficiency = movement_efficiency;
+            if location_needed && on_ground && fall_distance > 0.0 {
+                let outcome = (|| -> anyhow::Result<_> {
+                    let moved_bounds = crate::movement::player_bounds(position, player_height);
+                    let landed_in_water = in_water
+                        || (actual != DVec3::ZERO
+                            && fluid_view.chunks_loaded(moved_bounds)
+                            && fluid::contacts(
+                                moved_bounds,
+                                position.y + f64::from(eye_height),
+                                &|pos| fluid_view.at(pos),
+                                &|pos, direction| fluid_view.sturdy_face(pos, direction),
+                            )
+                            .water
+                            .depth
+                                > 0.0);
+                    if landed_in_water {
+                        return Ok((crate::location_enchantments::Outcome::default(), efficiency));
+                    }
+                    let registry = location_registry.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("location enchantment registry is unavailable")
+                    })?;
+                    let below_name = match cell(world, origin, bounds, below, air) {
+                        Cell::State(id) => world.state(id).map(|state| state.name.as_str()),
+                        Cell::Missing => None,
+                    }
+                    .ok_or_else(|| anyhow::anyhow!("landing support is unavailable"))?;
+                    let environment = crate::location_enchantments::Environment {
+                        block: below_name,
+                        flying: false,
+                        on_ground,
+                        passenger: false,
+                        infinite_materials,
+                    };
+                    let mut staged_effects = location_effects.clone();
+                    let mut inventory = (**location_inventory).clone();
+                    let mut random = location_random.clone();
+                    let outcome = staged_effects.block_changed(
+                        &mut inventory,
+                        registry,
+                        environment,
+                        &mut random,
+                    )?;
+                    if outcome.attributes_changed || outcome.inventory_changed {
+                        efficiency = crate::equipment_attributes::equipped_attribute(
+                            efficiency_attribute,
+                            &inventory,
+                            registry,
+                            "movement_efficiency",
+                        )
+                        .and_then(|attribute| {
+                            staged_effects.apply("movement_efficiency", attribute)
+                        })?
+                        .value(0.0, 1.0)?;
+                    }
+                    *location_effects = staged_effects;
+                    if outcome.inventory_changed {
+                        *location_inventory = Arc::new(inventory);
+                    }
+                    *location_random = random;
+                    Ok((outcome, efficiency))
+                })();
+                *location_result.borrow_mut() = Some(outcome);
+            }
             crate::physics::effective_block_speed_factor(
                 name(position.floor().as_ivec3()),
                 name(below),
-                movement_efficiency,
+                efficiency,
             )
         };
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
@@ -15047,6 +15238,46 @@ impl LoadedSession {
                 block_speed,
             )
         };
+        if let Some(result) = location_result.into_inner() {
+            match result {
+                Ok((outcome, efficiency)) => {
+                    if outcome.attributes_changed || outcome.inventory_changed {
+                        self.unresolved_player_location_effects = true;
+                    }
+                    if outcome.attributes_changed || outcome.inventory_changed {
+                        self.movement_speed_cache = None;
+                        self.movement_efficiency_inventory_revision = None;
+                        self.movement_efficiency = Some(efficiency);
+                    }
+                    for item in outcome.broken {
+                        let position = self.origin.as_dvec3() + self.motion.position;
+                        crate::consume_particles::equipment_break(
+                            &Arc::new(item),
+                            self.player_silent,
+                            position,
+                            position + DVec3::Y * f64::from(self.player.pose.eye_height()),
+                            self.player.yaw.to_degrees() - 180.0,
+                            -self.player.pitch.to_degrees(),
+                            self.tick.saturating_add(1),
+                            &mut self.player_client_random,
+                            &mut self.consume_sounds,
+                            &mut self.consume_particles,
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.unresolved_player_location_effects = true;
+                    self.location_failure_revision = Some(self.inventory.revision());
+                    self.location_effects =
+                        crate::location_enchantments::LocationTracker::default();
+                    self.movement_speed_cache = None;
+                    self.movement_efficiency_inventory_revision = None;
+                    self.movement_efficiency = None;
+                    self.stream_errors
+                        .push(format!("player landing enchantment: {error:#}"));
+                }
+            }
+        }
         if !flying && self.game_mode != GameMode::Spectator && self.movement_efficiency.is_none() {
             self.unresolved_player_movement_efficiency = true;
         }
@@ -27666,6 +27897,116 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the installed Minecraft 26.3 assets"]
+    fn soul_speed_location_effect_tracks_equipment_and_block_changes() {
+        use native_persistence::nbt::Tag;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.level_random = native_core::random::LegacyRandom::new(0);
+        session
+            .set_saved_breathing(
+                Default::default(),
+                crate::player_data::SavedAttribute::with_base(0.0),
+                registry,
+            )
+            .unwrap();
+        let boots = ItemStack::new(
+            "minecraft:iron_boots".into(),
+            1,
+            1,
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:soul_speed".into(), Tag::Int(3))]),
+            )]),
+        )
+        .unwrap();
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(3), Some(boots));
+        let sand = session.intern_block(state("minecraft:soul_sand", &[]));
+        assert!(session.set(IVec3::new(8, 1, 8), sand));
+        session.motion.position = DVec3::new(8.5, 1.875, 8.5);
+        session.motion.velocity = DVec3::new(0.15, -0.05, 0.0);
+        session.motion.on_ground = true;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = true;
+        let inventory_before = Arc::clone(&session.inventory);
+        session.update(TICK);
+        assert_eq!(session.movement_efficiency, Some(1.0));
+        assert!(Arc::ptr_eq(&session.inventory, &inventory_before));
+        let bonus = 0.0405_f32 + 0.0105_f32 * 2.0;
+        assert_eq!(
+            session.movement_speed(false),
+            (f64::from(0.1_f32) + f64::from(bonus)) as f32
+        );
+        assert!(session.unresolved_player_location_effects);
+        session.motion.position = DVec3::new(10.5, 1.875, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.ground_support = None;
+        session.player.position = session.motion.position.as_vec3();
+        session.update(TICK);
+        assert_eq!(session.movement_efficiency, Some(0.0));
+        assert_eq!(session.movement_speed(false), 0.1_f32);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the installed Minecraft 26.3 assets"]
+    fn soul_speed_activates_before_landing_speed_factor() {
+        use native_persistence::nbt::Tag;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.level_random = native_core::random::LegacyRandom::new(0);
+        session
+            .set_saved_breathing(
+                Default::default(),
+                crate::player_data::SavedAttribute::with_base(0.0),
+                registry,
+            )
+            .unwrap();
+        let boots = ItemStack::new(
+            "minecraft:iron_boots".into(),
+            1,
+            1,
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:soul_speed".into(), Tag::Int(3))]),
+            )]),
+        )
+        .unwrap();
+        Arc::make_mut(&mut session.inventory)
+            .set_slot(crate::inventory::PlayerSlot::Armor(3), Some(boots));
+        let sand = session.intern_block(state("minecraft:soul_sand", &[]));
+        session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+        session.motion.velocity = DVec3::new(0.1, -0.3, 0.0);
+        session.motion.on_ground = false;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = false;
+        session.fall_distance = 1.0;
+        // Prevent the earlier base-tick coordinate event: only the landing event activates it.
+        session.location_last_position =
+            add(session.origin, session.motion.position.floor().as_ivec3());
+        session.run_location_effects(true);
+        assert_eq!(session.movement_efficiency, Some(0.0));
+        assert!(session.set(IVec3::new(8, 1, 8), sand));
+        session.update(TICK);
+        assert!(session.motion.on_ground);
+        assert_eq!(session.movement_efficiency, Some(1.0));
+        let drag = 1.0_f32 - (1.0_f32 - 0.91_f32);
+        assert_eq!(session.motion.velocity.x, 0.1 * f64::from(drag));
+    }
+
     #[test]
     fn unresolved_movement_efficiency_blocks_player_save_draft() {
         let mut session = session();
@@ -27676,6 +28017,18 @@ mod tests {
         };
         let error = session.draft_player_state(&original).err().unwrap();
         assert!(error.to_string().contains("movement efficiency"));
+    }
+
+    #[test]
+    fn location_effect_changes_block_unverified_player_save() {
+        let mut session = session();
+        session.unresolved_player_location_effects = true;
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(Vec::new()),
+        };
+        let error = session.draft_player_state(&original).err().unwrap();
+        assert!(error.to_string().contains("location effects"));
     }
 
     #[test]

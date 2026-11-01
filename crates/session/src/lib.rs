@@ -36,6 +36,7 @@ pub mod inventory;
 pub mod items;
 mod knockback;
 pub mod loaded;
+mod location_enchantments;
 pub mod lodestone;
 pub mod mining;
 mod movement;

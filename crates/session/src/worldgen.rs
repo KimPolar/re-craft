@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
+use native_core::beardifier::Beardifier;
 use native_resources::{
     biome_source::{BiomeSource, ClimateVolume},
     carver::{CarvingMask, schedule::CarverCache},
@@ -160,6 +161,7 @@ impl BiomeNeighborhood {
 /// settings. It must be used with the same data-pack stack throughout its life.
 pub struct TerrainGenerator {
     noise: NoiseStageGenerator,
+    structure_context: bool,
     source: BiomeSource,
     possible_biomes: std::collections::BTreeSet<ResourceId>,
     surface: SurfaceRule,
@@ -176,6 +178,26 @@ impl TerrainGenerator {
         seed: i64,
         min_y: i32,
         height: i32,
+    ) -> Result<Self> {
+        Self::build(provider, definition, seed, min_y, height, false)
+    }
+    /// Compile a generator accepting per-chunk structure contexts. Old-chunk blending is absent.
+    pub fn with_structure_context(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        seed: i64,
+        min_y: i32,
+        height: i32,
+    ) -> Result<Self> {
+        Self::build(provider, definition, seed, min_y, height, true)
+    }
+    fn build(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        seed: i64,
+        min_y: i32,
+        height: i32,
+        structure_context: bool,
     ) -> Result<Self> {
         let kind = ResourceId::parse(
             definition
@@ -216,8 +238,11 @@ impl TerrainGenerator {
                 .context("missing surface material rule")?,
         )?;
         drop(compiler);
-        let noise =
-            NoiseStageGenerator::from_json_without_terrain_adjustments(provider, &bytes, seed)?;
+        let noise = if structure_context {
+            NoiseStageGenerator::from_json_with_structure_context(provider, &bytes, seed)?
+        } else {
+            NoiseStageGenerator::from_json_without_terrain_adjustments(provider, &bytes, seed)?
+        };
         let end = min_y
             .checked_add(height)
             .context("dimension height overflow")?;
@@ -239,6 +264,7 @@ impl TerrainGenerator {
         let possible_biomes = source.possible_biomes();
         Ok(Self {
             noise,
+            structure_context,
             source,
             possible_biomes,
             surface,
@@ -292,6 +318,17 @@ impl TerrainGenerator {
         evaluator: &mut DensityEvaluator,
         placement: &native_resources::structure_placement::ConcentricRingsPlacement,
     ) -> Result<Vec<[i32; 2]>> {
+        let previous = evaluator.replace_structure_terrain_context(None);
+        let result = self.concentric_structure_positions_unadjusted(provider, evaluator, placement);
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
+    fn concentric_structure_positions_unadjusted(
+        &self,
+        provider: &mut impl ResourceProvider,
+        evaluator: &mut DensityEvaluator,
+        placement: &native_resources::structure_placement::ConcentricRingsPlacement,
+    ) -> Result<Vec<[i32; 2]>> {
         let selector = placement.preferred_biomes();
         let allowed = native_resources::surface_biomes::SurfaceBiomes::load(
             provider,
@@ -325,6 +362,16 @@ impl TerrainGenerator {
     /// Call in the same chunk order as the world generator; equal-distance
     /// climate matches reuse the previous lookup, as in the Java thread.
     pub fn generate_biomes(
+        &mut self,
+        chunk: [i32; 2],
+        evaluator: &mut DensityEvaluator,
+    ) -> Result<QuartBiomeChunk> {
+        let previous = evaluator.replace_structure_terrain_context(None);
+        let result = self.generate_biomes_unadjusted(chunk, evaluator);
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
+    fn generate_biomes_unadjusted(
         &mut self,
         chunk: [i32; 2],
         evaluator: &mut DensityEvaluator,
@@ -419,14 +466,28 @@ impl TerrainGenerator {
             .preliminary_surface(evaluator, chunk[0], chunk[1])?;
         let x = chunk[0].checked_mul(16).context("block X overflow")?;
         let z = chunk[1].checked_mul(16).context("block Z overflow")?;
-        let mut inputs = SeededSurfaceInputs::without_terrain_adjustments(
-            provider,
-            &self.surface,
-            self.seed,
-            self.noise.random_algorithm(),
-            [x, self.noise.router().min_y, z],
-            [16, self.noise.router().height as u32, 16],
-        )?;
+        let min = [x, self.noise.router().min_y, z];
+        let size = [16, self.noise.router().height as u32, 16];
+        let mut inputs = if self.structure_context {
+            SeededSurfaceInputs::with_structure_context(
+                provider,
+                &self.surface,
+                self.seed,
+                self.noise.random_algorithm(),
+                min,
+                size,
+                evaluator.structure_terrain_context().cloned(),
+            )?
+        } else {
+            SeededSurfaceInputs::without_terrain_adjustments(
+                provider,
+                &self.surface,
+                self.seed,
+                self.noise.random_algorithm(),
+                min,
+                size,
+            )?
+        };
         apply_surface(
             &blocks,
             &self.surface,
@@ -436,6 +497,26 @@ impl TerrainGenerator {
             classify,
             |x, y, z| Ok(neighborhood.biome_at_block(x, y, z)?.clone()),
         )
+    }
+
+    /// Generate a surface with already generated structure pieces affecting this chunk.
+    pub fn generate_surface_with_structure_context(
+        &self,
+        provider: &mut impl ResourceProvider,
+        evaluator: &mut DensityEvaluator,
+        chunk: [i32; 2],
+        neighborhood: &BiomeNeighborhood,
+        structure: Arc<Beardifier>,
+        classify: impl FnMut(&Value) -> Result<SurfaceBlockKind>,
+    ) -> Result<SurfaceStageChunk> {
+        ensure!(
+            self.structure_context,
+            "generator was compiled without structure context"
+        );
+        let previous = evaluator.replace_structure_terrain_context(Some(structure));
+        let result = self.generate_surface(provider, evaluator, chunk, neighborhood, classify);
+        evaluator.replace_structure_terrain_context(previous);
+        result
     }
 
     /// Generate the fresh-terrain carving mask. The caller must still apply it
@@ -449,7 +530,8 @@ impl TerrainGenerator {
     ) -> Result<CarvingMask> {
         let min_y = self.noise.router().min_y;
         let height = self.noise.router().height;
-        cache.generate(provider, self.seed, chunk, min_y, height, |source| {
+        let previous = evaluator.replace_structure_terrain_context(None);
+        let result = cache.generate(provider, self.seed, chunk, min_y, height, |source| {
             let x = source[0]
                 .checked_mul(4)
                 .context("carver biome quart X overflow")?;
@@ -460,7 +542,9 @@ impl TerrainGenerator {
                 .source
                 .sample_quart(self.noise.router(), evaluator, [x, 0, z])
                 .clone())
-        })
+        });
+        evaluator.replace_structure_terrain_context(previous);
+        result
     }
 
     /// Produce fresh terrain after surface rules and carvers. This is still an
@@ -499,6 +583,37 @@ impl TerrainGenerator {
         Ok(result)
     }
 
+    /// Generate surface and carvers with one chunk-specific structure context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_carved_surface_with_structure_context<P: ResourceProvider>(
+        &mut self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut CarverCache,
+        chunk: [i32; 2],
+        neighborhood: &BiomeNeighborhood,
+        tags: &native_resources::carver::tags::CarverBlockTags,
+        structure: Arc<Beardifier>,
+        classify: impl FnMut(&Value) -> Result<CarverBlockState>,
+    ) -> Result<SurfaceStageChunk> {
+        ensure!(
+            self.structure_context,
+            "generator was compiled without structure context"
+        );
+        let previous = evaluator.replace_structure_terrain_context(Some(structure));
+        let result = self.generate_carved_surface(
+            provider,
+            evaluator,
+            cache,
+            chunk,
+            neighborhood,
+            tags,
+            classify,
+        );
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
+
     /// Apply a mask to a fresh surface-stage chunk from this generator. On
     /// error the partially modified chunk must be discarded.
     pub fn apply_carving_to_surface<P: ResourceProvider>(
@@ -515,6 +630,7 @@ impl TerrainGenerator {
             "surface chunk height does not match generator"
         );
         if !mask.is_empty() {
+            let structure = evaluator.structure_terrain_context().cloned();
             let aquifer = self
                 .noise
                 .carving_aquifer(evaluator, chunk.chunk_position)?;
@@ -526,6 +642,8 @@ impl TerrainGenerator {
                 &self.surface,
                 &mut self.source,
                 self.seed,
+                self.structure_context,
+                structure,
                 &mut classify,
             );
             native_resources::carver::apply::apply_mask(chunk, mask, &mut inputs)?;
@@ -546,6 +664,8 @@ mod tests {
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
             Ok(if path.starts_with("data/minecraft/worldgen/biome/") {
                 Some(br#"{"has_precipitation":true,"temperature":0.8,"carvers":[]}"#.to_vec())
+            } else if path == "data/minecraft/tags/block/uncarvable.json" {
+                Some(br#"{"values":[]}"#.to_vec())
             } else if path.starts_with("data/minecraft/worldgen/noise/") {
                 Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
             } else {
@@ -639,6 +759,213 @@ mod tests {
     }
 
     #[test]
+    fn structure_context_reaches_noise_and_surface_rules_and_is_restored() {
+        use native_core::beardifier::{BoundingBox, RigidPiece, TerrainAdjustment};
+        let mut data = Data;
+        let mut definition = definition();
+        definition["settings"]["noise_router"]["final_density"] = json!({
+            "type":"add","left":-0.25,"right":{"type":"beardifier"}
+        });
+        definition["settings"]["material_rule"] = json!({
+            "type":"ore_vein", "density":{"type":"beardifier"}, "richness":1,
+            "filler_gap":-1, "raw_ore_chance":1, "ore_block":"minecraft:dirt",
+            "raw_ore_block":"minecraft:dirt", "filler_block":"minecraft:dirt"
+        });
+        let mut generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition, 42, 0, 16).unwrap();
+        let without =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition, 42, 0, 16)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut neighbors = generator.biome_neighborhood().unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                neighbors
+                    .insert(Arc::new(
+                        generator.generate_biomes([x, z], &mut evaluator).unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let bounds = BoundingBox::new([0, 5, 0], [2, 7, 2]).unwrap();
+        let structure = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([-24, -19, -24], [26, 31, 26]).unwrap()),
+        ));
+        let classify = |v: &Value| -> Result<SurfaceBlockKind> {
+            Ok(match v.as_str().unwrap() {
+                "minecraft:air" => SurfaceBlockKind::Air,
+                "minecraft:water" | "minecraft:lava" => SurfaceBlockKind::Fluid,
+                _ => SurfaceBlockKind::Solid,
+            })
+        };
+        assert!(
+            without
+                .generate_surface_with_structure_context(
+                    &mut data,
+                    &mut evaluator,
+                    [0, 0],
+                    &neighbors,
+                    Arc::clone(&structure),
+                    classify
+                )
+                .is_err()
+        );
+        let index = (16 + 1) * 16 + 5;
+        let plain = generator
+            .generate_surface(&mut data, &mut evaluator, [0, 0], &neighbors, classify)
+            .unwrap();
+        assert_eq!(plain.states[index].as_str(), Some("minecraft:water"));
+        let adjusted = generator
+            .generate_surface_with_structure_context(
+                &mut data,
+                &mut evaluator,
+                [0, 0],
+                &neighbors,
+                Arc::clone(&structure),
+                classify,
+            )
+            .unwrap();
+        assert_eq!(adjusted.states[index].as_str(), Some("minecraft:dirt"));
+        assert!(evaluator.structure_terrain_context().is_none());
+        let registry = ["air", "stone", "water", "lava", "dirt"]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}"))
+            .collect();
+        let tags =
+            native_resources::carver::tags::CarverBlockTags::load(&mut data, &registry).unwrap();
+        let mut cache = CarverCache::default();
+        let carved = generator
+            .generate_carved_surface_with_structure_context(
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                [0, 0],
+                &neighbors,
+                &tags,
+                Arc::clone(&structure),
+                |v| {
+                    Ok(CarverBlockState {
+                        is_air: v.as_str() == Some("minecraft:air"),
+                        has_fluid: matches!(v.as_str(), Some("minecraft:water" | "minecraft:lava")),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(carved.states[index].as_str(), Some("minecraft:dirt"));
+        assert!(evaluator.structure_terrain_context().is_none());
+        let previous = Arc::new(Beardifier::new(vec![], vec![], None));
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
+        assert!(
+            generator
+                .generate_surface_with_structure_context(
+                    &mut data,
+                    &mut evaluator,
+                    [i32::MAX, 0],
+                    &neighbors,
+                    structure,
+                    classify
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &previous,
+            evaluator.structure_terrain_context().unwrap()
+        ));
+    }
+
+    #[test]
+    fn carving_surface_repair_uses_structure_context() {
+        use native_core::beardifier::{BoundingBox, RigidPiece, TerrainAdjustment};
+        let mut data = Data;
+        let mut config = definition();
+        config["settings"]["material_rule"] = json!({
+            "type":"ore_vein", "density":{"type":"beardifier"}, "richness":1,
+            "filler_gap":-1, "raw_ore_chance":1, "ore_block":"minecraft:stone",
+            "raw_ore_block":"minecraft:stone", "filler_block":"minecraft:stone"
+        });
+        let mut generator =
+            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 16).unwrap();
+        let registry = ["air", "stone", "water", "lava", "dirt", "grass_block"]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}"))
+            .collect();
+        let tags =
+            native_resources::carver::tags::CarverBlockTags::load(&mut data, &registry).unwrap();
+        let bounds = BoundingBox::new([0, 5, 0], [2, 7, 2]).unwrap();
+        let structure = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([-24, -19, -24], [26, 31, 26]).unwrap()),
+        ));
+        let mut evaluator = DensityEvaluator::default();
+        let mut mask = CarvingMask::new(1, 8).unwrap();
+        native_resources::carver::carve_ellipsoid(
+            &mut mask,
+            [0, 0],
+            [1.5, 6.0, 1.5],
+            0.5,
+            1.0,
+            |_, _, _, y| y != 6,
+        )
+        .unwrap();
+        let index = (16 + 1) * 16;
+        let make_chunk = || {
+            let mut chunk = SurfaceStageChunk {
+                chunk_position: [0, 0],
+                min_y: 0,
+                height: 16,
+                states: vec![Arc::new(json!("minecraft:stone")); 4096],
+                fluid_updates: vec![false; 4096],
+            };
+            chunk.states[index + 5] = Arc::new(json!("minecraft:dirt"));
+            chunk.states[index + 6] = Arc::new(json!("minecraft:grass_block"));
+            chunk
+        };
+        let classify = |v: &Value| -> Result<CarverBlockState> {
+            Ok(CarverBlockState {
+                is_air: v.as_str() == Some("minecraft:air"),
+                has_fluid: matches!(v.as_str(), Some("minecraft:water" | "minecraft:lava")),
+            })
+        };
+        let mut plain = make_chunk();
+        generator
+            .apply_carving_to_surface(
+                &mut data,
+                &mut evaluator,
+                &mut plain,
+                &mask,
+                &tags,
+                classify,
+            )
+            .unwrap();
+        assert_eq!(plain.states[index + 5].as_str(), Some("minecraft:dirt"));
+        evaluator.replace_structure_terrain_context(Some(structure));
+        let mut adjusted = make_chunk();
+        generator
+            .apply_carving_to_surface(
+                &mut data,
+                &mut evaluator,
+                &mut adjusted,
+                &mask,
+                &tags,
+                classify,
+            )
+            .unwrap();
+        assert_eq!(adjusted.states[index + 5].as_str(), Some("minecraft:stone"));
+        assert_eq!(adjusted.states[index + 6].as_str(), Some("minecraft:water"));
+    }
+
+    #[test]
     fn end_chunk_respects_y_dependent_datapack_erosion() {
         let mut data = Data;
         let mut config = definition();
@@ -673,6 +1000,46 @@ mod tests {
             .generate_biomes([0, 0], &mut DensityEvaluator::default())
             .unwrap();
         assert!(center.values().iter().all(|id| id.path == "the_end"));
+    }
+
+    #[test]
+    fn biome_generation_ignores_chunk_structure_context() {
+        use native_core::beardifier::{BoundingBox, RigidPiece, TerrainAdjustment};
+        let mut data = Data;
+        let mut config = definition();
+        config["biome_source"] = json!({"type":"minecraft:the_end"});
+        config["settings"]["noise_router"]["erosion"] =
+            json!({"type":"add", "left":-0.5, "right":{"type":"beardifier"}});
+        let mut generator =
+            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 16).unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let baseline = generator.generate_biomes([65, 0], &mut evaluator).unwrap();
+        let bounds = BoundingBox::new([1040, 0, 0], [1055, 16, 15]).unwrap();
+        let structure = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([1016, -24, -24], [1079, 40, 39]).unwrap()),
+        ));
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&structure)));
+        let adjusted = generator.generate_biomes([65, 0], &mut evaluator).unwrap();
+        assert_eq!(baseline.values(), adjusted.values());
+        assert!(Arc::ptr_eq(
+            &structure,
+            evaluator.structure_terrain_context().unwrap()
+        ));
+        assert!(
+            generator
+                .generate_biomes([i32::MAX, 0], &mut evaluator)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &structure,
+            evaluator.structure_terrain_context().unwrap()
+        ));
     }
 
     #[test]

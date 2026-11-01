@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use native_core::{
+    beardifier::Beardifier,
     normal_noise::{
         LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
     },
@@ -471,6 +472,28 @@ impl<'a, P: ResourceProvider> SurfaceDensitySampler<'a, P> {
         min: [i32; 3],
         size: [u32; 3],
     ) -> Result<Self> {
+        Self::build(provider, seed, algorithm, min, size, false, None)
+    }
+    /// Use the given chunk's structure adjustment; older-chunk blending must be absent.
+    pub fn with_structure_context(
+        provider: &'a mut P,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+        structure: Option<Arc<Beardifier>>,
+    ) -> Result<Self> {
+        Self::build(provider, seed, algorithm, min, size, true, structure)
+    }
+    fn build(
+        provider: &'a mut P,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+        structure_context: bool,
+        structure: Option<Arc<Beardifier>>,
+    ) -> Result<Self> {
         ensure!(
             size.iter().all(|n| *n > 0),
             "surface density volume dimensions must be positive"
@@ -488,11 +511,18 @@ impl<'a, P: ResourceProvider> SurfaceDensitySampler<'a, P> {
             max[axis] = i32::try_from(i64::from(min[axis]) + i64::from(size[axis]) - 1)
                 .context("surface density volume coordinates overflow")?;
         }
+        let compiler = DensityCompiler::with_world_seed(provider, seed, algorithm)
+            .without_old_chunk_blending();
+        let compiler = if structure_context {
+            compiler.with_structure_terrain_context()
+        } else {
+            compiler.without_structure_terrain_adjustment()
+        };
+        let mut evaluator = DensityEvaluator::default();
+        evaluator.replace_structure_terrain_context(structure);
         Ok(Self {
-            compiler: DensityCompiler::with_world_seed(provider, seed, algorithm)
-                .without_old_chunk_blending()
-                .without_structure_terrain_adjustment(),
-            evaluator: DensityEvaluator::default(),
+            compiler,
+            evaluator,
             min,
             max,
             size,
@@ -853,8 +883,8 @@ impl SurfaceRule {
     }
 }
 
-/// A seeded material-rule context for a fresh volume without structure or
-/// old-chunk terrain adjustments. Biome identity is supplied by the caller.
+/// A seeded material-rule context for a fresh volume without old-chunk
+/// blending. Biome identity is supplied by the caller.
 pub struct SeededSurfaceInputs<'a, P: ResourceProvider> {
     biomes: crate::surface_biomes::SurfaceBiomes,
     biome: Option<ResourceId>,
@@ -876,7 +906,23 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         min: [i32; 3],
         size: [u32; 3],
     ) -> Result<Self> {
-        Self::build(provider, rule, seed, algorithm, min, size, true)
+        Self::build(
+            provider, rule, seed, algorithm, min, size, true, false, None,
+        )
+    }
+    /// Bind the same structure adjustment used by this chunk's noise stage.
+    pub fn with_structure_context(
+        provider: &'a mut P,
+        rule: &SurfaceRule,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        min: [i32; 3],
+        size: [u32; 3],
+        structure: Option<Arc<Beardifier>>,
+    ) -> Result<Self> {
+        Self::build(
+            provider, rule, seed, algorithm, min, size, true, true, structure,
+        )
     }
     /// Build the single-block context used to repair surface material after
     /// carving. Biome pillar and iceberg extensions do not run in this pass.
@@ -886,7 +932,36 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         seed: i64,
         algorithm: WorldgenRandom,
     ) -> Result<Self> {
-        Self::build(provider, rule, seed, algorithm, [0, 0, 0], [1, 1, 1], false)
+        Self::build(
+            provider,
+            rule,
+            seed,
+            algorithm,
+            [0, 0, 0],
+            [1, 1, 1],
+            false,
+            false,
+            None,
+        )
+    }
+    pub fn for_carver_top_material_with_structure_context(
+        provider: &'a mut P,
+        rule: &SurfaceRule,
+        seed: i64,
+        algorithm: WorldgenRandom,
+        structure: Option<Arc<Beardifier>>,
+    ) -> Result<Self> {
+        Self::build(
+            provider,
+            rule,
+            seed,
+            algorithm,
+            [0, 0, 0],
+            [1, 1, 1],
+            false,
+            true,
+            structure,
+        )
     }
     fn build(
         provider: &'a mut P,
@@ -896,6 +971,8 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         min: [i32; 3],
         size: [u32; 3],
         extensions: bool,
+        structure_context: bool,
+        structure: Option<Arc<Beardifier>>,
     ) -> Result<Self> {
         let biomes =
             crate::surface_biomes::SurfaceBiomes::load(provider, &rule.biome_dependencies())?;
@@ -909,9 +986,15 @@ impl<'a, P: ResourceProvider> SeededSurfaceInputs<'a, P> {
         let noise = SurfaceNoise::load(provider, seed, algorithm, noises)?;
         let random = SurfaceRandomFactory::new(seed, algorithm);
         let bands = SurfaceBands::new(seed, algorithm);
-        let density = SurfaceDensitySampler::without_terrain_adjustments(
-            provider, seed, algorithm, min, size,
-        )?;
+        let density = if structure_context {
+            SurfaceDensitySampler::with_structure_context(
+                provider, seed, algorithm, min, size, structure,
+            )?
+        } else {
+            SurfaceDensitySampler::without_terrain_adjustments(
+                provider, seed, algorithm, min, size,
+            )?
+        };
         Ok(Self {
             biomes,
             biome: None,
@@ -1417,6 +1500,48 @@ mod tests {
         let second = single.sample(&def, true, 0, 8, 0).unwrap();
         assert_ne!(first.to_bits(), second.to_bits());
         assert_eq!(single.entries.len(), 1);
+    }
+
+    #[test]
+    fn surface_density_uses_structure_for_volume_and_single_position() {
+        use native_core::beardifier::{BoundingBox, RigidPiece, TerrainAdjustment};
+        let mut data = Data(BTreeMap::new());
+        let bounds = BoundingBox::new([0, 4, 0], [2, 6, 2]).unwrap();
+        let adjustment = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([-24, -20, -24], [26, 30, 26]).unwrap()),
+        ));
+        let marker = json!({"type":"minecraft:beardifier"});
+        let mut sampler = SurfaceDensitySampler::with_structure_context(
+            &mut data,
+            0,
+            WorldgenRandom::Legacy,
+            [0, 0, 0],
+            [4, 8, 4],
+            Some(Arc::clone(&adjustment)),
+        )
+        .unwrap();
+        assert_eq!(sampler.sample(&marker, true, 1, 4, 1).unwrap(), 1.0);
+        assert_eq!(sampler.sample(&marker, false, 1, 4, 1).unwrap(), 1.0);
+        drop(sampler);
+        let mut single = SurfaceDensitySampler::with_structure_context(
+            &mut data,
+            0,
+            WorldgenRandom::Legacy,
+            [0, 0, 0],
+            [1, 1, 1],
+            Some(adjustment),
+        )
+        .unwrap();
+        single.set_single_position([1, 4, 1]).unwrap();
+        assert_eq!(single.sample(&marker, true, 1, 4, 1).unwrap(), 1.0);
+        single.set_single_position([20, 4, 20]).unwrap();
+        assert_eq!(single.sample(&marker, true, 20, 4, 20).unwrap(), 0.0);
     }
 
     #[test]

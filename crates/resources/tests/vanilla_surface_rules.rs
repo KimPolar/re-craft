@@ -1,9 +1,11 @@
 //! Compare material-rule control flow and conditions with Java 26.3.
+use native_core::beardifier::{Beardifier, BoundingBox, RigidPiece, TerrainAdjustment};
 use native_resources::{
     density::WorldgenRandom,
     packs::{ResourceId, ResourceProvider, ResourceStack},
     surface_rules::{
-        SurfaceInputs, SurfacePosition, SurfaceRandom, SurfaceRandomFactory, SurfaceRuleCompiler,
+        SurfaceDensitySampler, SurfaceInputs, SurfacePosition, SurfaceRandom, SurfaceRandomFactory,
+        SurfaceRuleCompiler,
     },
 };
 use serde_json::{Value, json};
@@ -15,8 +17,8 @@ impl ResourceProvider for Empty {
         Ok(None)
     }
 }
-struct Inputs(SurfaceRandomFactory);
-impl SurfaceInputs for Inputs {
+struct Inputs<'a>(SurfaceRandomFactory, SurfaceDensitySampler<'a, Empty>);
+impl SurfaceInputs for Inputs<'_> {
     fn biome_matches(&mut self, _: &Value, _: &SurfacePosition) -> anyhow::Result<bool> {
         anyhow::bail!("unexpected biome")
     }
@@ -34,8 +36,13 @@ impl SurfaceInputs for Inputs {
             .0
             .at(&ResourceId::parse("minecraft:ore")?, p.x, p.y, p.z))
     }
-    fn density(&mut self, value: &Value, _: bool, _: &SurfacePosition) -> anyhow::Result<f32> {
-        Ok(value.as_f64().expect("synthetic density constant") as f32)
+    fn density(
+        &mut self,
+        value: &Value,
+        in_chunk: bool,
+        p: &SurfacePosition,
+    ) -> anyhow::Result<f32> {
+        self.1.sample(value, in_chunk, p.x, p.y, p.z)
     }
     fn bandlands(&mut self, _: &SurfacePosition) -> anyhow::Result<Arc<Value>> {
         anyhow::bail!("unexpected bandlands")
@@ -113,6 +120,8 @@ fn material_conditions_and_control_flow_match_java() {
         fixtures.push(json!({"type":"ore_vein","ore_block":"minecraft:stone","raw_ore_block":"minecraft:dirt",
             "filler_block":"minecraft:grass_block","raw_ore_chance":raw,"density":density,"richness":richness,"filler_gap":gap}));
     }
+    fixtures.push(json!({"type":"ore_vein","ore_block":"minecraft:stone","raw_ore_block":"minecraft:dirt",
+        "filler_block":"minecraft:grass_block","raw_ore_chance":0.5,"density":{"type":"minecraft:beardifier"},"richness":0.6,"filler_gap":-0.2}));
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -149,7 +158,30 @@ fn material_conditions_and_control_flow_match_java() {
     let mut data = Empty;
     let mut compiler = SurfaceRuleCompiler::new(&mut data);
     let mut current = None;
-    let mut inputs = Inputs(SurfaceRandomFactory::new(12345, WorldgenRandom::Xoroshiro));
+    let bounds = BoundingBox::new([0, -100, -30], [30, 100, 0]).unwrap();
+    let structure = Arc::new(Beardifier::new(
+        vec![RigidPiece {
+            bounds,
+            adjustment: TerrainAdjustment::Encapsulate,
+            ground_delta: 0,
+        }],
+        vec![],
+        Some(BoundingBox::new([-24, -124, -54], [54, 124, 24]).unwrap()),
+    ));
+    let mut density_data = Empty;
+    let density = SurfaceDensitySampler::with_structure_context(
+        &mut density_data,
+        12345,
+        WorldgenRandom::Xoroshiro,
+        [0, -64, 0],
+        [16, 128, 16],
+        Some(structure),
+    )
+    .unwrap();
+    let mut inputs = Inputs(
+        SurfaceRandomFactory::new(12345, WorldgenRandom::Xoroshiro),
+        density,
+    );
     let mut groups = 0;
     let mut samples = 0;
     let mut random_samples = 0;

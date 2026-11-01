@@ -84,6 +84,9 @@ pub struct DensityEvaluator {
 }
 
 impl DensityEvaluator {
+    pub fn structure_terrain_context(&self) -> Option<&Arc<Beardifier>> {
+        self.memo.structure.as_ref()
+    }
     /// Set the chunk-specific structure context used by graphs compiled with
     /// `with_structure_terrain_context`. `None` is Java's empty context.
     pub fn replace_structure_terrain_context(

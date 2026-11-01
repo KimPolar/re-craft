@@ -1,6 +1,7 @@
 //! Fresh-chunk carver inputs backed by the active world data and terrain.
 use anyhow::{Context, Result};
 use glam::IVec3;
+use native_core::beardifier::Beardifier;
 use native_resources::{
     biome_source::BiomeSource,
     carver::{
@@ -34,6 +35,9 @@ pub(super) struct FreshCarvingInputs<'a, 'b, P: ResourceProvider, F> {
     surface: &'a SurfaceRule,
     source: &'a mut BiomeSource,
     evaluator: DensityEvaluator,
+    biome_evaluator: DensityEvaluator,
+    structure_context: bool,
+    structure: Option<Arc<Beardifier>>,
     zoom_seed: i64,
     seed: i64,
     classify: &'a mut F,
@@ -55,8 +59,12 @@ impl<'a, 'b, P: ResourceProvider, F: FnMut(&Value) -> Result<CarverBlockState>>
         surface: &'a SurfaceRule,
         source: &'a mut BiomeSource,
         seed: i64,
+        structure_context: bool,
+        structure: Option<Arc<Beardifier>>,
         classify: &'a mut F,
     ) -> Self {
+        let mut evaluator = DensityEvaluator::default();
+        evaluator.replace_structure_terrain_context(structure.clone());
         Self {
             provider: Some(provider),
             surface_inputs: None,
@@ -65,7 +73,10 @@ impl<'a, 'b, P: ResourceProvider, F: FnMut(&Value) -> Result<CarverBlockState>>
             noise,
             surface,
             source,
-            evaluator: DensityEvaluator::default(),
+            evaluator,
+            biome_evaluator: DensityEvaluator::default(),
+            structure_context,
+            structure,
             zoom_seed: obfuscate_seed(seed),
             seed,
             classify,
@@ -148,7 +159,7 @@ impl<P: ResourceProvider, F: FnMut(&Value) -> Result<CarverBlockState>> CarvingI
             .source
             .sample_quart(
                 self.noise.router(),
-                &mut self.evaluator,
+                &mut self.biome_evaluator,
                 [quart.x, quart.y, quart.z],
             )
             .clone();
@@ -169,12 +180,22 @@ impl<P: ResourceProvider, F: FnMut(&Value) -> Result<CarverBlockState>> CarvingI
                 .provider
                 .take()
                 .context("surface provider unavailable")?;
-            self.surface_inputs = Some(SeededSurfaceInputs::for_carver_top_material(
-                provider,
-                self.surface,
-                self.seed,
-                self.noise.random_algorithm(),
-            )?);
+            self.surface_inputs = Some(if self.structure_context {
+                SeededSurfaceInputs::for_carver_top_material_with_structure_context(
+                    provider,
+                    self.surface,
+                    self.seed,
+                    self.noise.random_algorithm(),
+                    self.structure.clone(),
+                )?
+            } else {
+                SeededSurfaceInputs::for_carver_top_material(
+                    provider,
+                    self.surface,
+                    self.seed,
+                    self.noise.random_algorithm(),
+                )?
+            });
         }
         let inputs = self
             .surface_inputs

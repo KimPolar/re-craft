@@ -232,8 +232,28 @@ fn implemented_item_defaults_and_click_assumptions_match_vanilla() {
             "{id}: durability"
         );
         assert_eq!(value["special_click"], false, "{id}: special click");
-        assert_eq!(value["equippable"], false, "{id}: equippable");
-        assert_eq!(value["remainder"], false, "{id}: crafting remainder");
+        let entity_armor = matches!(
+            id.as_str(),
+            "minecraft:leather_horse_armor"
+                | "minecraft:wolf_armor"
+                | "minecraft:copper_nautilus_armor"
+                | "minecraft:iron_nautilus_armor"
+                | "minecraft:golden_nautilus_armor"
+                | "minecraft:diamond_nautilus_armor"
+        );
+        assert_eq!(value["equippable"], entity_armor, "{id}: equippable");
+        let has_remainder = matches!(
+            id.as_str(),
+            "minecraft:water_bucket"
+                | "minecraft:lava_bucket"
+                | "minecraft:milk_bucket"
+                | "minecraft:honey_bottle"
+                | "minecraft:dragon_breath"
+        );
+        assert_eq!(
+            value["remainder"], has_remainder,
+            "{id}: crafting remainder"
+        );
         if max == 64 {
             assert_eq!(value["tool"], false, "{id}: tool component");
         }
@@ -371,7 +391,7 @@ fn ordinary_wood_recipes_consume_inputs_and_create_vanilla_results() {
         inventory.refresh_crafting(&recipes);
         let result = inventory.slot(PlayerSlot::CraftResult).unwrap();
         assert_eq!((result.id(), result.count()), (output, count));
-        assert!(inventory.take_crafting_result(&recipes));
+        assert!(inventory.take_crafting_result(&recipes).is_some());
         assert_eq!(
             (
                 inventory.cursor().unwrap().id(),

@@ -1593,7 +1593,7 @@ fn craft_result_pickup_matches_vanilla_result_container() {
             inventory.click(PlayerSlot::Storage(10), ClickButton::Primary);
         }
         inventory.refresh_crafting(&recipes);
-        let took = inventory.take_crafting_result(&recipes);
+        let took = inventory.take_crafting_result(&recipes).is_some();
         let actual = json!([
             output(&inventory.slot(PlayerSlot::CraftResult).cloned()),
             output(&inventory.cursor().cloned())

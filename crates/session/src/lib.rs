@@ -1345,13 +1345,21 @@ impl LocalSession {
                 PlayerCommand::InventoryClick { slot, button }
                     if self.game_mode != GameMode::Spectator =>
                 {
-                    inventory_click(
+                    for stack in inventory_click(
                         &mut self.inventory,
                         self.recipes.as_deref(),
                         slot,
                         button,
                         self.game_mode == GameMode::Creative,
-                    );
+                    ) {
+                        self.dropped_items.drop_player(
+                            stack,
+                            IVec3::ZERO,
+                            self.motion.position,
+                            self.player,
+                            crate::items::PlayerDropOrigin::ContainerReturn,
+                        );
+                    }
                 }
                 PlayerCommand::InventoryQuickMove { slot }
                     if self.game_mode != GameMode::Spectator =>
@@ -1423,7 +1431,11 @@ impl LocalSession {
                                 IVec3::ZERO,
                                 self.motion.position,
                                 self.player,
-                                crate::items::PlayerDropOrigin::Direct,
+                                if slot == PlayerSlot::CraftResult {
+                                    crate::items::PlayerDropOrigin::ContainerReturn
+                                } else {
+                                    crate::items::PlayerDropOrigin::Direct
+                                },
                             );
                         }
                     }
@@ -2389,21 +2401,22 @@ fn inventory_click(
     slot: PlayerSlot,
     button: ClickButton,
     creative: bool,
-) {
+) -> Vec<inventory::ItemStack> {
     let state = Arc::make_mut(inventory);
     if matches!(slot, PlayerSlot::Crafting(_) | PlayerSlot::CraftResult) {
         state.clear_ghost_recipe();
     }
     if slot == PlayerSlot::CraftResult {
-        if let Some(recipes) = recipes {
-            state.take_crafting_result(recipes);
-        }
+        return recipes
+            .and_then(|recipes| state.take_crafting_result_with_mode(recipes, creative))
+            .unwrap_or_default();
     } else if state.click_with_mode(slot, button, creative)
         && matches!(slot, PlayerSlot::Crafting(_))
         && let Some(recipes) = recipes
     {
         state.refresh_crafting(recipes);
     }
+    Vec::new()
 }
 
 fn inventory_pointer(
@@ -2428,8 +2441,10 @@ fn inventory_pointer(
                     .collect()
             }
             InventoryPointerTarget::Slot(slot) => {
-                inventory_click(inventory, recipes, slot, button, creative);
-                Vec::new()
+                inventory_click(inventory, recipes, slot, button, creative)
+                    .into_iter()
+                    .map(|stack| (stack, items::PlayerDropOrigin::ContainerReturn))
+                    .collect()
             }
             InventoryPointerTarget::Outside => Arc::make_mut(inventory)
                 .drop_cursor(button)
@@ -2514,7 +2529,7 @@ fn inventory_quick_move(
     }
     if slot == PlayerSlot::CraftResult {
         return recipes
-            .and_then(|recipes| state.quick_crafting_result(recipes))
+            .and_then(|recipes| state.quick_crafting_result_with_mode(recipes, creative))
             .unwrap_or_default();
     }
     if state.quick_move_with_mode(slot, creative)

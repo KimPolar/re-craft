@@ -13784,13 +13784,21 @@ impl LoadedSession {
                 PlayerCommand::InventoryClick { slot, button }
                     if self.game_mode != GameMode::Spectator =>
                 {
-                    inventory_click(
+                    for stack in inventory_click(
                         &mut self.inventory,
                         self.recipes.as_deref(),
                         slot,
                         button,
                         self.game_mode == GameMode::Creative,
-                    );
+                    ) {
+                        self.dropped_items.drop_player(
+                            stack,
+                            self.origin,
+                            self.motion.position,
+                            self.player,
+                            crate::items::PlayerDropOrigin::ContainerReturn,
+                        );
+                    }
                 }
                 PlayerCommand::InventoryQuickMove { slot }
                     if self.game_mode != GameMode::Spectator =>
@@ -13862,7 +13870,11 @@ impl LoadedSession {
                                 self.origin,
                                 self.motion.position,
                                 self.player,
-                                crate::items::PlayerDropOrigin::Direct,
+                                if slot == crate::PlayerSlot::CraftResult {
+                                    crate::items::PlayerDropOrigin::ContainerReturn
+                                } else {
+                                    crate::items::PlayerDropOrigin::Direct
+                                },
                             );
                         }
                     }
@@ -22572,9 +22584,74 @@ mod tests {
         inventory.refresh_crafting(&recipes);
         let output = inventory.slot(PlayerSlot::CraftResult).unwrap();
         assert_eq!((output.id(), output.count()), ("minecraft:snow_block", 1));
-        assert!(inventory.take_crafting_result(&recipes));
+        assert!(inventory.take_crafting_result(&recipes).is_some());
         assert_eq!(inventory.cursor().unwrap().id(), "minecraft:snow_block");
         assert!((0..4).all(|index| inventory.slot(PlayerSlot::Crafting(index)).is_none()));
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn honey_block_recipe_drops_remaining_bottles_when_inventory_is_full() {
+        use crate::inventory::{ClickButton, ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::ResourceStack;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let recipes =
+            Arc::new(CraftingRecipes::load(&mut ResourceStack::open(&game).unwrap()).unwrap());
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        for index in 0..4 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Crafting(index),
+                ItemStack::new(
+                    "minecraft:honey_bottle".into(),
+                    2,
+                    16,
+                    Tag::Compound(vec![])
+                )
+            ));
+        }
+        for index in 0..36 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(index),
+                ItemStack::new("minecraft:dirt".into(), 64, 64, Tag::Compound(vec![]))
+            ));
+        }
+        inventory.refresh_crafting(&recipes);
+        assert_eq!(
+            inventory.slot(PlayerSlot::CraftResult).unwrap().id(),
+            "minecraft:honey_block"
+        );
+        let mut test = session();
+        test.set_crafting_recipes(recipes);
+        test.set_player_inventory(inventory);
+        test.submit_command(PlayerCommand::InventoryClick {
+            slot: PlayerSlot::CraftResult,
+            button: ClickButton::Primary,
+        });
+        test.update(TICK);
+        assert_eq!(
+            test.inventory.cursor().unwrap().id(),
+            "minecraft:honey_block"
+        );
+        assert_eq!(test.dropped_items.snapshot().len(), 4);
+        assert!(
+            test.dropped_items
+                .snapshot()
+                .iter()
+                .all(|item| item.stack.id() == "minecraft:glass_bottle")
+        );
+        for index in 0..4 {
+            assert_eq!(
+                test.inventory
+                    .slot(PlayerSlot::Crafting(index))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

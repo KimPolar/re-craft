@@ -1267,12 +1267,14 @@ impl PlayerInventory {
         // ResultSlot only allows taking its output into an empty target and
         // invokes crafting callbacks; supported recipes already have a handler.
         if source == PlayerSlot::CraftResult {
-            if self.slot(target).is_some() || !self.take_crafting_result(recipes?) {
+            if self.slot(target).is_some() {
                 return None;
             }
-            let output = self.cursor.take();
-            *self.mutable_slot(target)? = output;
-            return Some(Vec::new());
+            let recipes = recipes?;
+            self.refresh_crafting(recipes);
+            let output = self.craft_result.clone()?;
+            *self.mutable_slot(target)? = Some(output);
+            return Some(self.consume_crafting_ingredients(recipes, creative));
         }
         if let PlayerSlot::Armor(index) = source
             && (!matches!(self.menu, Some(InventoryMenu::Player))
@@ -2489,14 +2491,20 @@ impl PlayerInventory {
     }
 
     /// A vanilla result slot yields the whole output even for a secondary click.
-    pub fn take_crafting_result(&mut self, recipes: &CraftingRecipes) -> bool {
+    pub fn take_crafting_result(&mut self, recipes: &CraftingRecipes) -> Option<Vec<ItemStack>> {
+        self.take_crafting_result_with_mode(recipes, false)
+    }
+
+    pub(crate) fn take_crafting_result_with_mode(
+        &mut self,
+        recipes: &CraftingRecipes,
+        creative: bool,
+    ) -> Option<Vec<ItemStack>> {
         if !self.is_open() || matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
-            return false;
+            return None;
         }
         self.refresh_crafting(recipes);
-        let Some(output) = self.craft_result.clone() else {
-            return false;
-        };
+        let output = self.craft_result.clone()?;
         match &mut self.cursor {
             None => self.cursor = Some(output),
             Some(cursor)
@@ -2506,28 +2514,49 @@ impl PlayerInventory {
             {
                 cursor.count += output.count;
             }
-            Some(_) => return false,
+            Some(_) => return None,
         }
-        self.consume_crafting_ingredients(recipes);
-        true
+        Some(self.consume_crafting_ingredients(recipes, creative))
     }
 
-    fn consume_crafting_ingredients(&mut self, recipes: &CraftingRecipes) {
-        for ingredient in &mut self.crafting {
-            if let Some(item) = ingredient {
-                item.count -= 1;
-                if item.count == 0 {
-                    *ingredient = None;
+    fn consume_crafting_ingredients(
+        &mut self,
+        recipes: &CraftingRecipes,
+        creative: bool,
+    ) -> Vec<ItemStack> {
+        let mut drops = Vec::new();
+        for index in 0..self.crafting_width() * self.crafting_width() {
+            let Some(item) = self.crafting[index].as_mut() else {
+                continue;
+            };
+            let remainder = crafting_remainder(item.id());
+            item.count -= 1;
+            if item.count == 0 {
+                self.crafting[index] = remainder;
+            } else if let Some(remainder) = remainder
+                && let Some(remainder) = self.insert_returned(remainder)
+            {
+                if !creative {
+                    drops.push(remainder);
                 }
             }
         }
         self.revision = self.revision.wrapping_add(1);
         self.refresh_crafting(recipes);
+        drops
     }
 
     /// Shift-click the result of an open crafting menu, including partial
     /// output that vanilla drops when the inventory cannot accept it all.
     pub fn quick_crafting_result(&mut self, recipes: &CraftingRecipes) -> Option<Vec<ItemStack>> {
+        self.quick_crafting_result_with_mode(recipes, false)
+    }
+
+    pub(crate) fn quick_crafting_result_with_mode(
+        &mut self,
+        recipes: &CraftingRecipes,
+        creative: bool,
+    ) -> Option<Vec<ItemStack>> {
         if !self.is_open() || matches!(self.menu, Some(InventoryMenu::Chest { .. })) {
             return None;
         }
@@ -2550,10 +2579,21 @@ impl PlayerInventory {
             if output.count > 0 {
                 drops.push(output);
             }
-            self.consume_crafting_ingredients(recipes);
+            drops.extend(self.consume_crafting_ingredients(recipes, creative));
         }
         moved_any.then_some(drops)
     }
+}
+
+fn crafting_remainder(id: &str) -> Option<ItemStack> {
+    let (id, max) = match id {
+        "minecraft:water_bucket" | "minecraft:lava_bucket" | "minecraft:milk_bucket" => {
+            ("minecraft:bucket", 16)
+        }
+        "minecraft:honey_bottle" | "minecraft:dragon_breath" => ("minecraft:glass_bottle", 64),
+        _ => return None,
+    };
+    ItemStack::new(id.into(), 1, max, Tag::Compound(vec![]))
 }
 
 fn move_stack_to(slots: &mut [Option<ItemStack>], indexes: &[usize], item: &mut ItemStack) -> bool {
@@ -2642,6 +2682,7 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:lodestone"
         | "minecraft:redstone_lamp"
         | "minecraft:diamond_block"
+        | "minecraft:honey_block"
         | "minecraft:emerald_block"
         | "minecraft:iron_block"
         | "minecraft:moss_block"
@@ -2719,6 +2760,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "stick",
     "bowl",
     "glass_bottle",
+    "dragon_breath",
     "brick",
     "clay_ball",
     "slime_ball",
@@ -3324,6 +3366,235 @@ pub(crate) fn validate_item_balance<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn honey_recipes() -> CraftingRecipes {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Pack;
+        impl ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                if folder == "recipe" {
+                    Ok(vec![ResourceId::parse("example:honey")?])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/recipe/honey.json").then(|| br###"{"type":"minecraft:crafting_shaped","pattern":["##","##"],"key":{"#":"minecraft:honey_bottle"},"result":{"id":"minecraft:honey_block"}}"###.to_vec()))
+            }
+        }
+        CraftingRecipes::load(&mut Pack).unwrap()
+    }
+
+    fn honey_grid(count: u32, storage: u8) -> PlayerInventory {
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        let item =
+            |id: &str, count, max| ItemStack::new(id.into(), count, max, Tag::Compound(vec![]));
+        for index in 0..4 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Crafting(index),
+                item("minecraft:honey_bottle", count, 16)
+            ));
+        }
+        if storage != 0 {
+            for index in 0..36 {
+                assert!(
+                    inventory.set_slot(PlayerSlot::Storage(index), item("minecraft:dirt", 64, 64))
+                );
+            }
+        }
+        if storage == 1 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Storage(0),
+                item("minecraft:glass_bottle", 63, 64)
+            ));
+        }
+        inventory
+    }
+
+    #[test]
+    fn crafting_returns_bottles_to_grid_inventory_and_drops() {
+        let recipes = honey_recipes();
+        let mut single = honey_grid(1, 2);
+        assert!(single.take_crafting_result(&recipes).unwrap().is_empty());
+        for index in 0..4 {
+            assert_eq!(
+                single.slot(PlayerSlot::Crafting(index)).unwrap().id(),
+                "minecraft:glass_bottle"
+            );
+        }
+        assert_eq!(single.cursor().unwrap().id(), "minecraft:honey_block");
+
+        let mut stacked = honey_grid(2, 1);
+        let drops = stacked.take_crafting_result(&recipes).unwrap();
+        assert_eq!(stacked.slot(PlayerSlot::Storage(0)).unwrap().count(), 64);
+        assert_eq!(drops.len(), 3);
+        assert!(
+            drops
+                .iter()
+                .all(|item| item.id() == "minecraft:glass_bottle" && item.count() == 1)
+        );
+        for index in 0..4 {
+            assert_eq!(
+                stacked.slot(PlayerSlot::Crafting(index)).unwrap().count(),
+                1
+            );
+        }
+
+        let mut swap = honey_grid(2, 2);
+        assert!(swap.set_slot(PlayerSlot::Storage(0), None));
+        let drops = swap
+            .swap_slot(
+                PlayerSlot::CraftResult,
+                PlayerSlot::Storage(0),
+                false,
+                Some(&recipes),
+            )
+            .unwrap();
+        assert_eq!(
+            swap.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:honey_block"
+        );
+        assert_eq!(drops.len(), 4);
+
+        let mut quick = honey_grid(2, 2);
+        assert!(quick.set_slot(
+            PlayerSlot::Storage(8),
+            ItemStack::new(
+                "minecraft:honey_block".into(),
+                63,
+                64,
+                Tag::Compound(vec![])
+            )
+        ));
+        let drops = quick.quick_crafting_result(&recipes).unwrap();
+        assert_eq!(quick.slot(PlayerSlot::Storage(8)).unwrap().count(), 64);
+        assert_eq!(drops.len(), 4);
+        assert!(
+            drops
+                .iter()
+                .all(|item| item.id() == "minecraft:glass_bottle")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn crafting_remainders_and_result_slot_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        for (name, source) in [
+            (
+                "CraftingRemainderOracle",
+                include_str!("../tests/java/CraftingRemainderOracle.java"),
+            ),
+            (
+                "CraftingRemainderSlotOracle",
+                include_str!("../tests/java/CraftingRemainderSlotOracle.java"),
+            ),
+        ] {
+            let file = temp.path().join(format!("{name}.java"));
+            std::fs::write(&file, source).unwrap();
+            run(Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&file));
+            run(Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(name)
+                .arg(temp.path().join(format!("{name}.json"))));
+        }
+        let prototypes: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(temp.path().join("CraftingRemainderOracle.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prototypes.as_object().unwrap().len(), 5);
+        for (id, expected) in prototypes.as_object().unwrap() {
+            let item = crafting_remainder(id).unwrap();
+            assert_eq!(item.id(), expected[0].as_str().unwrap(), "{id}");
+            assert_eq!(item.count(), expected[1].as_u64().unwrap() as u32, "{id}");
+            assert_eq!(
+                ordinary_item_default_max(id),
+                Some(expected[2].as_u64().unwrap() as u32),
+                "{id}"
+            );
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(temp.path().join("CraftingRemainderSlotOracle.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 18);
+        let describe = |item: Option<&ItemStack>| {
+            item.map_or_else(String::new, |item| {
+                format!("{}:{}", item.id(), item.count())
+            })
+        };
+        for row in rows {
+            let mut inventory = honey_grid(
+                row["count"].as_u64().unwrap() as u32,
+                row["storage"].as_u64().unwrap() as u8,
+            );
+            let drops = inventory
+                .take_crafting_result_with_mode(
+                    &honey_recipes(),
+                    row["creative"].as_bool().unwrap(),
+                )
+                .unwrap();
+            for index in 0..4 {
+                assert_eq!(
+                    describe(inventory.slot(PlayerSlot::Crafting(index))),
+                    row["grid"][index as usize].as_str().unwrap(),
+                    "{row}"
+                );
+            }
+            for index in 0..36 {
+                assert_eq!(
+                    describe(inventory.slot(PlayerSlot::Storage(index))),
+                    row["slots"][index as usize].as_str().unwrap(),
+                    "{row}"
+                );
+            }
+            let actual: Vec<_> = drops.iter().map(|item| describe(Some(item))).collect();
+            let expected: Vec<_> = row["drops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{row}");
+        }
+    }
 
     #[test]
     fn durability_bar_respects_item_component_overrides() {

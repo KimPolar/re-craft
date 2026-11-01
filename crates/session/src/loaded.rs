@@ -9780,9 +9780,6 @@ impl LoadedSession {
         ) else {
             return;
         };
-        let Some(name) = self.world.state(id).map(|state| state.name.clone()) else {
-            return;
-        };
         if self
             .world
             .state(id)
@@ -9792,6 +9789,34 @@ impl LoadedSession {
             self.finish_breaking_banner(relative, id);
             return;
         }
+        // A banner in an unloaded neighboring chunk may depend on this block.
+        // Wait for the normal streaming window before committing the player's
+        // break; otherwise its block entity and drop would be missed entirely.
+        if self
+            .world
+            .state(id)
+            .is_none_or(|state| self.banner_support_solid(state) != Some(false))
+            && [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+                .into_iter()
+                .filter_map(|offset| add(relative, offset))
+                .any(|neighbor| {
+                    matches!(
+                        cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            neighbor,
+                            self.states[0],
+                        ),
+                        Cell::Missing
+                    )
+                })
+        {
+            return;
+        }
+        let Some(name) = self.world.state(id).map(|state| state.name.clone()) else {
+            return;
+        };
         if matches!(name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") {
             self.finish_breaking_chest(relative, id);
             return;
@@ -16588,6 +16613,175 @@ mod tests {
             session.rain_at(pos),
             None,
             "pending sky-light work is not trusted"
+        );
+    }
+
+    #[test]
+    fn player_break_waits_for_neighbor_before_dropping_boundary_banner() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/white_banner.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:custom_name"]}}]}]}"#.to_vec()))
+            }
+        }
+        let (mut world, origin, mut player) = fixture();
+        player.position = Vec3::new(15.5, 1.0, 6.5);
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let east = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut adjacent = (*world.chunks[&home]).clone();
+        adjacent.position = east;
+        world.chunks.insert(east, Arc::new(adjacent));
+        let support = origin + IVec3::new(15, 2, 4);
+        let banner = support + IVec3::X;
+        let stone = world.intern_state(state("minecraft:stone", &[]));
+        world
+            .set_block_id(support.x, support.y, support.z, stone)
+            .unwrap();
+        let banner_id =
+            world.intern_state(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        world
+            .set_block_id(banner.x, banner.y, banner.z, banner_id)
+            .unwrap();
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:banner".into())),
+            ("x".into(), Tag::Int(banner.x)),
+            ("y".into(), Tag::Int(banner.y)),
+            ("z".into(), Tag::Int(banner.z)),
+            ("CustomName".into(), Tag::String("Boundary".into())),
+        ]);
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity.clone()],
+            },
+        })
+        .unwrap();
+        world
+            .saved_block_entities
+            .insert(east, SavedBlockEntities::Encoded(bytes.into()));
+        let incoming = world.clone();
+        world.chunks.remove(&east);
+        world.saved_block_entities.remove(&east);
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_game_mode(GameMode::Creative);
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+
+        assert_eq!(session.ray_hit().unwrap().position, IVec3::new(15, 2, 4));
+        session.submit_command(PlayerCommand::Break);
+        session.update(TICK);
+        assert_eq!(
+            session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name,
+            "minecraft:stone"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert!(session.removed_banners.is_empty());
+
+        session.queue_chunk_window(home, 1);
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        for _ in 0..10 {
+            session.update(TICK);
+            if session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name
+                == "minecraft:air"
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session.removed_banners[&(banner.x, banner.y, banner.z)],
+            entity
+        );
+        let drops = session.dropped_items.snapshot();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(
+            drops[0].stack.components().get("minecraft:custom_name"),
+            Some(&Tag::String("Boundary".into()))
+        );
+    }
+
+    #[test]
+    fn player_can_break_boundary_banner_without_neighbor() {
+        use native_world::loaded::SavedBlockEntities;
+
+        let (mut world, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let position = origin + IVec3::new(15, 2, 4);
+        let banner =
+            world.intern_state(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        world
+            .set_block_id(position.x, position.y, position.z, banner)
+            .unwrap();
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_game_mode(GameMode::Creative);
+        session.finish_breaking(position);
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
         );
     }
 

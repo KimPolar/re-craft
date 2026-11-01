@@ -1822,6 +1822,37 @@ impl ItemEntities {
         enabled: bool,
         random: &mut LegacyRandom,
     ) {
+        self.spawn_level_resources(position, None, drops, components, enabled, random);
+    }
+
+    pub(crate) fn drop_interaction_with_level_random(
+        &mut self,
+        position: IVec3,
+        face: IVec3,
+        strategy: DropStrategy,
+        drops: Vec<Drop>,
+        enabled: bool,
+        random: &mut LegacyRandom,
+    ) {
+        self.spawn_level_resources(
+            position,
+            (strategy == DropStrategy::ClickedFace).then_some(face),
+            drops,
+            None,
+            enabled,
+            random,
+        );
+    }
+
+    fn spawn_level_resources(
+        &mut self,
+        position: IVec3,
+        face: Option<IVec3>,
+        drops: Vec<Drop>,
+        components: Option<&[Tag]>,
+        enabled: bool,
+        random: &mut LegacyRandom,
+    ) {
         for (index, drop) in drops.into_iter().enumerate() {
             let id = format!("{}:{}", drop.item.namespace, drop.item.path);
             let empty = Tag::Compound(vec![]);
@@ -1839,11 +1870,38 @@ impl ItemEntities {
             while remaining > 0 {
                 let count = remaining.min(maximum.unwrap_or(99));
                 remaining -= count;
+                let offset = |axis: i32, random: &mut LegacyRandom| {
+                    if axis == 0 {
+                        -0.25 + random.next_double() * 0.5
+                    } else {
+                        f64::from(axis) * 0.625
+                    }
+                };
+                let direction = face.unwrap_or(IVec3::ZERO);
                 let location = DVec3::new(
-                    f64::from(position.x) + 0.5 + (-0.25 + random.next_double() * 0.5),
-                    f64::from(position.y) + 0.5 + (-0.25 + random.next_double() * 0.5) - 0.125,
-                    f64::from(position.z) + 0.5 + (-0.25 + random.next_double() * 0.5),
+                    f64::from(position.x) + 0.5 + offset(direction.x, random),
+                    f64::from(position.y) + 0.5 + offset(direction.y, random) - 0.125,
+                    f64::from(position.z) + 0.5 + offset(direction.z, random),
                 );
+                let face_velocity = face.map(|face| {
+                    DVec3::new(
+                        if face.x == 0 {
+                            random.next_double() * 0.2 - 0.1
+                        } else {
+                            f64::from(face.x) * 0.1
+                        },
+                        if face.y == 0 {
+                            random.next_double() * 0.1
+                        } else {
+                            f64::from(face.y) * 0.1 + 0.1
+                        },
+                        if face.z == 0 {
+                            random.next_double() * 0.2 - 0.1
+                        } else {
+                            f64::from(face.z) * 0.1
+                        },
+                    )
+                });
                 if !enabled {
                     continue;
                 }
@@ -1853,11 +1911,13 @@ impl ItemEntities {
                 }
                 .expect("validated loot item");
                 let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
-                let velocity = DVec3::new(
-                    entity_random.next_double() * 0.2 - 0.1,
-                    0.2,
-                    entity_random.next_double() * 0.2 - 0.1,
-                );
+                let velocity = face_velocity.unwrap_or_else(|| {
+                    DVec3::new(
+                        entity_random.next_double() * 0.2 - 0.1,
+                        0.2,
+                        entity_random.next_double() * 0.2 - 0.1,
+                    )
+                });
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -5518,7 +5578,7 @@ mod tests {
                 assert_eq!(chest.slots, java_chest.slots);
             }
         }
-        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(rows.len(), 32);
         for (seed, row) in rows.iter().enumerate() {
             let mut items = ItemEntities::default();
@@ -5597,6 +5657,70 @@ mod tests {
                     row["blockNext"].as_f64().unwrap().to_bits(),
                     "seed {seed} block random enabled={enabled}"
                 );
+            }
+        }
+        let faces: Vec<Value> = serde_json::from_slice(
+            &std::fs::read(output.with_file_name("drops.json.faces.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(faces.len(), 16 * 6 * 2);
+        for row in faces {
+            let seed = row["seed"].as_i64().unwrap();
+            let face = match row["face"].as_str().unwrap() {
+                "down" => IVec3::NEG_Y,
+                "up" => IVec3::Y,
+                "north" => IVec3::NEG_Z,
+                "south" => IVec3::Z,
+                "west" => IVec3::NEG_X,
+                "east" => IVec3::X,
+                _ => unreachable!(),
+            };
+            let enabled = row["enabled"].as_bool().unwrap();
+            let pos = IVec3::new(
+                if seed % 2 == 0 {
+                    -16_000_000
+                } else {
+                    16_000_000
+                },
+                seed as i32 - 64,
+                -(seed as i32) * 31,
+            );
+            let mut random = LegacyRandom::new(seed);
+            let mut items = ItemEntities::default();
+            items.drop_interaction_with_level_random(
+                pos,
+                face,
+                DropStrategy::ClickedFace,
+                vec![Drop {
+                    item: native_resources::packs::ResourceId::parse("minecraft:dirt").unwrap(),
+                    count: 1,
+                    copy_block_entity_custom_name: false,
+                    copy_block_entity_components: vec![],
+                }],
+                enabled,
+                &mut random,
+            );
+            assert_eq!(items.entities.len(), usize::from(enabled));
+            assert_eq!(
+                random.next_double().to_bits(),
+                row["next"].as_f64().unwrap().to_bits(),
+                "seed={seed} face={face:?} enabled={enabled}"
+            );
+            if let Some(item) = items.entities.first() {
+                for (actual, field) in [
+                    (item.item.position.x, "x"),
+                    (item.item.position.y, "y"),
+                    (item.item.position.z, "z"),
+                    (item.velocity.x, "vx"),
+                    (item.velocity.y, "vy"),
+                    (item.velocity.z, "vz"),
+                ] {
+                    assert_eq!(
+                        actual.to_bits(),
+                        row[field].as_f64().unwrap().to_bits(),
+                        "seed={seed} face={face:?} field={field}"
+                    );
+                }
             }
         }
     }

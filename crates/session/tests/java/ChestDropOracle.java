@@ -21,6 +21,14 @@ public class ChestDropOracle {
         @Override public RandomSource getRandom() { return seeded; }
         @Override public boolean addFreshEntity(Entity entity) { items.add((ItemEntity)entity); return true; }
     }
+    static class ServerWorld extends net.minecraft.server.level.ServerLevel {
+        RandomSource seeded; List<ItemEntity> items; net.minecraft.world.level.gamerules.GameRules rules;
+        ServerWorld() { super(null,null,null,null,null,null,false,0L,null,false); }
+        @Override public RandomSource getRandom() { return seeded; }
+        @Override public net.minecraft.world.level.gamerules.GameRules getGameRules() { return rules; }
+        @Override public int getNextEntityId() { return 7; }
+        @Override public boolean addFreshEntity(Entity entity) { items.add((ItemEntity)entity); return true; }
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(net.minecraft.data.registries.VanillaRegistries.createWorldLookup());
@@ -69,5 +77,18 @@ public class ChestDropOracle {
             row.addProperty("blockNext",world.seeded.nextDouble()); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
+        var server=(ServerWorld)unsafe.allocateInstance(ServerWorld.class);
+        server.rules=new net.minecraft.world.level.gamerules.GameRules(net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS);
+        var faces=new JsonArray();
+        for(int seed=0;seed<16;seed++) for(var face:net.minecraft.core.Direction.values()) for(boolean enabled:new boolean[]{false,true}) {
+            server.seeded=new LegacyRandomSource(seed); server.items=new ArrayList<>();
+            server.rules.set(net.minecraft.world.level.gamerules.GameRules.BLOCK_DROPS,enabled,null);
+            var pos=new BlockPos(seed%2==0 ? -16000000 : 16000000,seed-64,-seed*31);
+            net.minecraft.world.level.block.Block.popResourceFromFace(server,pos,face,new ItemStack(Items.DIRT));
+            var row=new JsonObject(); row.addProperty("seed",seed); row.addProperty("face",face.getName()); row.addProperty("enabled",enabled); row.addProperty("next",server.seeded.nextDouble());
+            if(!server.items.isEmpty()) { var item=server.items.get(0); row.addProperty("x",item.getX()); row.addProperty("y",item.getY()); row.addProperty("z",item.getZ()); row.addProperty("vx",item.getDeltaMovement().x); row.addProperty("vy",item.getDeltaMovement().y); row.addProperty("vz",item.getDeltaMovement().z); }
+            faces.add(row);
+        }
+        Files.writeString(Path.of(args[0]+".faces.json"),faces.toString());
     }
 }

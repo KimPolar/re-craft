@@ -173,6 +173,17 @@ struct LootContext<'a> {
 }
 
 impl Condition {
+    fn fully_supported_in_interaction(&self) -> bool {
+        match self {
+            Self::ThisEntityPresent | Self::Unsupported(_) => false,
+            Self::BlockState { .. } => true,
+            Self::All(values) | Self::Any(values) => {
+                values.iter().all(Self::fully_supported_in_interaction)
+            }
+            Self::Not(value) => value.fully_supported_in_interaction(),
+            _ => self.fully_supported(),
+        }
+    }
     fn fully_supported(&self) -> bool {
         self.fully_supported_in_player_block(false)
     }
@@ -851,11 +862,107 @@ impl BlockLootTables {
     }
 
     pub fn interaction_drops(&self, id: &ResourceId, tool: BasicTool<'_>) -> Result<Vec<Drop>> {
+        self.interaction_drops_with_random(id, tool, None, None)
+    }
+
+    pub fn interaction_random_sequence(&self, id: &ResourceId) -> Result<Option<&ResourceId>> {
+        Ok(self
+            .interaction_tables
+            .get(id)
+            .context("interaction loot table unavailable")?
+            .random_sequence
+            .as_ref())
+    }
+
+    /// Validate every branch before an interaction modifies the world.
+    pub fn fully_supported_interaction_for_tool(
+        &self,
+        id: &ResourceId,
+        tool: BasicTool<'_>,
+    ) -> bool {
+        fn modifier_valid(modifier: &Modifier, tool: BasicTool<'_>) -> bool {
+            if !modifier.condition.fully_supported_in_interaction()
+                || matches!(
+                    modifier.kind,
+                    ModifierKind::Unsupported(_) | ModifierKind::CopyBlockEntityComponents(_)
+                )
+                || matches!(modifier.kind, ModifierKind::CopyBlockEntityCustomName)
+            {
+                return false;
+            }
+            match &modifier.kind {
+                ModifierKind::UniformCount(min, max, _) if min < max => max
+                    .checked_sub(*min)
+                    .and_then(|v| v.checked_add(1))
+                    .is_some(),
+                ModifierKind::UniformBonus(enchantment, multiplier) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|v| multiplier.checked_mul(v))
+                        .and_then(|v| v.checked_add(1))
+                        .is_some_and(|v| v > 0)
+                }
+                ModifierKind::OreDrops(enchantment) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|v| v.checked_add(2))
+                        .is_some()
+                }
+                _ => true,
+            }
+        }
+        fn entry_valid(entry: &Entry, tool: BasicTool<'_>) -> bool {
+            entry.condition.fully_supported_in_interaction()
+                && entry.modifiers.iter().all(|m| modifier_valid(m, tool))
+                && match &entry.kind {
+                    EntryKind::Unsupported(_) => false,
+                    EntryKind::Alternatives(children) => {
+                        children.iter().all(|child| entry_valid(child, tool))
+                    }
+                    _ => true,
+                }
+        }
+        self.interaction_tables.get(id).is_some_and(|table| {
+            table.modifiers.iter().all(|m| modifier_valid(m, tool))
+                && table.pools.iter().all(|pool| {
+                    pool.condition.fully_supported_in_interaction()
+                        && pool.modifiers.iter().all(|m| modifier_valid(m, tool))
+                        && pool.entries.len() <= 1
+                        && pool.entries.iter().all(|entry| entry_valid(entry, tool))
+                })
+        })
+    }
+
+    pub fn interaction_drops_with_random(
+        &self,
+        id: &ResourceId,
+        tool: BasicTool<'_>,
+        block: Option<&LootBlockState<'_>>,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
         let table = self
             .interaction_tables
             .get(id)
             .context("interaction loot table is not supported or was not loaded")?;
-        Self::evaluate(table, tool, None, LootContext::default())
+        Self::evaluate(
+            table,
+            tool,
+            random,
+            LootContext {
+                block,
+                ..LootContext::default()
+            },
+        )
     }
 
     pub fn drops(&self, block: &str, tool: BasicTool<'_>) -> Result<Vec<Drop>> {
@@ -1648,6 +1755,45 @@ mod tests {
                 .drops_without_entity("minecraft:short_grass", Some(&mut || 0.0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn interaction_preflight_checks_unselected_branches_and_original_block() {
+        let mut source = Memory::default();
+        source.put("data/example/loot_table/valid.json", r#"{"type":"minecraft:block_interact","random_sequence":"example:stream","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:match_block","blocks":"minecraft:rooted_dirt"}}]}]}"#);
+        source.put("data/example/loot_table/invalid.json", r#"{"type":"minecraft:block_interact","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":1.0}},{"type":"minecraft:item","name":"minecraft:stick","modifier":{"type":"minecraft:apply_bonus","enchantment":"minecraft:fortune","formula":"minecraft:uniform_bonus_count","parameters":{"bonusMultiplier":-2}}}]}]}]}"#);
+        let valid = ResourceId::parse("example:valid").unwrap();
+        let invalid = ResourceId::parse("example:invalid").unwrap();
+        let mut tables = BlockLootTables::load(&mut source).unwrap();
+        tables
+            .load_interactions(&mut source, [&valid, &invalid])
+            .unwrap();
+        let enchantments = [(ResourceId::parse("minecraft:fortune").unwrap(), 1)];
+        let tool = BasicTool {
+            item: Some("minecraft:wooden_hoe"),
+            count: 1,
+            enchantments: &enchantments,
+        };
+        assert_eq!(
+            tables.interaction_random_sequence(&valid).unwrap(),
+            Some(&ResourceId::parse("example:stream").unwrap())
+        );
+        assert!(tables.fully_supported_interaction_for_tool(&valid, tool));
+        assert!(!tables.fully_supported_interaction_for_tool(&invalid, tool));
+        let properties = BTreeMap::new();
+        for (name, count) in [("minecraft:rooted_dirt", 1), ("minecraft:dirt", 0)] {
+            let block = LootBlockState {
+                name,
+                properties: &properties,
+            };
+            assert_eq!(
+                tables
+                    .interaction_drops_with_random(&valid, tool, Some(&block), None)
+                    .unwrap()
+                    .len(),
+                count
+            );
+        }
     }
 
     #[test]

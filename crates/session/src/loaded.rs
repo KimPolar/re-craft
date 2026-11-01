@@ -39,7 +39,6 @@ use crate::{
     MAX_TICKS_PER_UPDATE, PLAYER_HEIGHT, PlayerCommand, PlayerPose, PlayerState, SessionWorld,
     SoilKind, TICK, WorldSnapshot, face_name,
     falling_block::FallingKind,
-    interaction_drops,
     inventory::{InventoryMenu, ItemStack, PlayerInventory},
     inventory_click, inventory_pointer, inventory_quick_move, inventory_throw, mining, placed_soil,
     placement_hand, player_intersects_block, select_block, selected_inventory_block,
@@ -10467,11 +10466,6 @@ impl LoadedSession {
                     return true;
                 }
             }
-            let Some(drops) =
-                interaction_drops(&result, self.loot.as_deref(), &self.inventory, hand)
-            else {
-                return true;
-            };
             let Some(absolute) = add(self.origin, relative) else {
                 return true;
             };
@@ -10479,16 +10473,57 @@ impl LoadedSession {
                 name: result.state.name,
                 properties: result.state.properties,
             });
-            if target != id && !self.set(relative, target) {
-                return true;
-            }
-            if let Some((_, strategy)) = &result.loot {
-                self.dropped_items.drop_interaction(
+            let checked = if target != id {
+                let Some(checked) = self.check_block_set(relative, target, true, false) else {
+                    return true;
+                };
+                Some(checked)
+            } else {
+                None
+            };
+            if let Some((loot_id, strategy)) = &result.loot {
+                let item = self.inventory.slot(hand).cloned();
+                let Ok(enchantments) = item
+                    .as_ref()
+                    .map(crate::inventory::item_enchantments)
+                    .transpose()
+                else {
+                    return true;
+                };
+                let enchantments = enchantments.unwrap_or_default();
+                let tool = native_resources::loot::BasicTool {
+                    item: item.as_ref().map(crate::inventory::ItemStack::id),
+                    count: item.as_ref().map_or(0, crate::inventory::ItemStack::count),
+                    enchantments: &enchantments,
+                };
+                let Some(tables) = self.loot.as_ref() else {
+                    return true;
+                };
+                if !tables.fully_supported_interaction_for_tool(loot_id, tool) {
+                    return true;
+                }
+                let Ok(sequence) = tables
+                    .interaction_random_sequence(loot_id)
+                    .map(|value| value.cloned())
+                else {
+                    return true;
+                };
+                let block = native_resources::loot::LootBlockState {
+                    name: &source.name,
+                    properties: &source.properties,
+                };
+                let Ok((drops, _)) = self.stage_loot_sequence(sequence, |tables, random| {
+                    tables.interaction_drops_with_random(loot_id, tool, Some(&block), Some(random))
+                }) else {
+                    return true;
+                };
+                self.dropped_items.drop_interaction_with_level_random(
                     absolute,
                     face,
                     *strategy,
                     drops,
                     self.block_drops,
+                    &mut self.level_random,
                 );
             }
             if self.game_mode != GameMode::Creative && result.damage != 0 {
@@ -10497,6 +10532,9 @@ impl LoadedSession {
                     result.damage,
                     &mut self.level_random,
                 );
+            }
+            if let Some(checked) = checked {
+                self.apply_block_set(relative, target, true, checked);
             }
             let swing = if hand == crate::inventory::PlayerSlot::Offhand {
                 crate::animation::Hand::Off
@@ -12393,8 +12431,26 @@ impl LoadedSession {
         ) -> anyhow::Result<T>,
     ) -> anyhow::Result<(T, BlockLootCheckpoint)> {
         use anyhow::Context;
+        let sequence = self
+            .loot
+            .as_ref()
+            .context("block loot table unavailable")?
+            .random_sequence_for_block(table)?
+            .cloned();
+        self.stage_loot_sequence(sequence, evaluate)
+    }
+
+    fn stage_loot_sequence<T>(
+        &mut self,
+        sequence: Option<native_resources::packs::ResourceId>,
+        evaluate: impl Fn(
+            &BlockLootTables,
+            &mut dyn native_resources::loot::LootRandom,
+        ) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, BlockLootCheckpoint)> {
+        use anyhow::Context;
         let tables = self.loot.as_ref().context("block loot table unavailable")?;
-        match tables.random_sequence_for_block(table)? {
+        match sequence {
             Some(id) => {
                 let name = format!("{}:{}", id.namespace, id.path);
                 let sequences = self
@@ -39429,6 +39485,108 @@ mod tests {
     }
 
     #[test]
+    fn tool_interaction_uses_world_and_named_loot_random_before_transforming() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{
+            loot::BlockLootTables, packs::ResourceProvider, transforms::BlockTransformers,
+        };
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/block_transformer/hoe.json" => Some(br#"[{"item_damage_per_use":1,"drop_strategy":"clicked_face","loot":"example:test","block_state_provider":{"type":"minecraft:rule_based","rules":[{"if_true":{"type":"minecraft:matching_blocks","blocks":"minecraft:rooted_dirt"},"then":{"id":"minecraft:dirt"}}]}}]"#.to_vec()),
+                    "data/example/loot_table/test.json" => Some(br#"{"type":"minecraft:block_interact","random_sequence":"example:tool","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:hanging_roots","condition":{"type":"minecraft:all_of","terms":[{"type":"minecraft:match_block","blocks":"minecraft:rooted_dirt"},{"type":"minecraft:random_chance","chance":1.0}]}}]}]}"#.to_vec()),
+                    _ => None,
+                })
+            }
+        }
+        let transforms = Arc::new(BlockTransformers::load_for(&mut Data, ToolKind::Hoe).unwrap());
+        let mut tables = BlockLootTables::load(&mut Data).unwrap();
+        tables
+            .load_interactions(&mut Data, transforms.referenced_loot())
+            .unwrap();
+        for enabled in [false, true] {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                session.set_block_drops(enabled);
+                session.set_tool_transformers(ToolKind::Hoe, Arc::clone(&transforms));
+                session.set_block_loot(Arc::new(tables.clone()));
+                let relative = IVec3::new(8, 2, 6);
+                let position = session.origin + relative;
+                let id = session.intern_block(state("minecraft:rooted_dirt", &[]));
+                assert!(session.set(relative, id));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    Some(
+                        ItemStack::new("minecraft:wooden_hoe".into(), 1, 1, Tag::Compound(vec![]))
+                            .unwrap(),
+                    ),
+                );
+                session.set_player_inventory(inventory);
+                session.level_random = native_core::random::LegacyRandom::new(9182);
+                let mut expected_level = session.level_random.clone();
+                assert!(session.use_tool(relative, IVec3::Z));
+                assert_eq!(
+                    session
+                        .world
+                        .block(position.x, position.y, position.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:rooted_dirt"
+                );
+                assert!(session.dropped_items.snapshot().is_empty());
+                assert_eq!(
+                    session.level_random.clone().next_double(),
+                    expected_level.clone().next_double()
+                );
+                session
+                    .set_random_sequences(
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                let mut expected_sequence =
+                    native_persistence::random_sequences::RandomSequences::read(None)
+                        .unwrap()
+                        .get("example:tool", 42)
+                        .unwrap();
+                expected_sequence.next_float();
+                assert!(session.use_tool(relative, IVec3::Z));
+                assert_eq!(
+                    session
+                        .world
+                        .block(position.x, position.y, position.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:dirt"
+                );
+                assert_eq!(session.dropped_items.snapshot().len(), usize::from(enabled));
+                for _ in 0..4 {
+                    expected_level.next_double();
+                }
+                assert_eq!(
+                    session.level_random.next_double().to_bits(),
+                    expected_level.next_double().to_bits()
+                );
+                let mut actual_sequence = session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("example:tool", 42)
+                    .unwrap();
+                assert_eq!(actual_sequence.next_long(), expected_sequence.next_long());
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn loaded_rooted_dirt_interaction_respects_block_drops_rule() {
         use crate::inventory::{ItemStack, PlayerSlot};
@@ -39441,6 +39599,12 @@ mod tests {
                 session.set_block_drops(enabled);
                 session.set_tool_transformers(ToolKind::Hoe, Arc::clone(&hoe));
                 session.set_block_loot(Arc::clone(&loot));
+                session
+                    .set_random_sequences(
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
                 let relative = IVec3::new(8, 2, 6);
                 let id = session.intern_block(state("minecraft:rooted_dirt", &[]));
                 assert!(session.set(relative, id));

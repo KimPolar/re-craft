@@ -75,6 +75,63 @@ pub(crate) fn water_fog(
     )
 }
 
+fn near_plane_offsets(
+    direction: Vec3,
+    yaw: f32,
+    fov: f32,
+    width: u32,
+    height: u32,
+) -> [glam::DVec3; 5] {
+    let direction = direction.normalize_or_zero();
+    let reference_up = crate::renderer::camera_up(direction, yaw);
+    let right = direction.cross(reference_up).normalize_or_zero();
+    let up = right.cross(direction).normalize_or_zero();
+    let forward = direction.as_dvec3() * f64::from(0.05_f32);
+    let height_scale = (f64::from(fov * 0.017_453_292_f32) / 2.0).tan() * f64::from(0.05_f32);
+    let width_scale = height_scale * f64::from(width.max(1)) / f64::from(height.max(1));
+    let left = -right.as_dvec3() * width_scale;
+    let up = up.as_dvec3() * height_scale;
+    [
+        forward,
+        forward + up + left,
+        forward + up - left,
+        forward - up + left,
+        forward - up - left,
+    ]
+}
+
+fn special_fog(
+    medium: native_session::loaded::CameraMedium,
+    spectator: bool,
+    fire_resistance: bool,
+    render_distance: u32,
+    night_vision: f32,
+) -> Option<([f32; 3], [f32; 2])> {
+    use native_session::loaded::CameraMedium;
+    let (color, range) = match medium {
+        CameraMedium::Lava => (
+            [153.0 / 255.0, 25.0 / 255.0, 0.0],
+            if spectator {
+                [-8.0, render_distance as f32 * 16.0 * 0.5]
+            } else if fire_resistance {
+                [0.0, 5.0]
+            } else {
+                [0.25, 1.0]
+            },
+        ),
+        CameraMedium::PowderSnow => (
+            [159.0 / 255.0, 187.0 / 255.0, 204.0 / 255.0],
+            if spectator {
+                [-8.0, render_distance as f32 * 16.0 * 0.5]
+            } else {
+                [0.0, 2.0]
+            },
+        ),
+        _ => return None,
+    };
+    Some((adjusted_fog_color(color, 0.0, night_vision), range))
+}
+
 pub(crate) fn weather_darken_sky(mut color: [f32; 3], rain: f32, thunder: f32) -> [f32; 3] {
     if rain > 0.0 {
         let red_green = 1.0 - rain * 0.5;
@@ -1127,7 +1184,22 @@ impl Viewer {
                     ));
                 }
                 let camera_y = f64::from(snapshot.origin.y) + snapshot.camera.eye(partial).y;
-                let underwater = play.session.camera_in_water(snapshot.camera.eye(partial));
+                let size = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.inner_size())
+                    .unwrap_or_default();
+                let offsets = near_plane_offsets(
+                    self.camera.direction(),
+                    self.camera.yaw,
+                    f32::from(self.video.fov),
+                    size.width,
+                    size.height,
+                );
+                let medium = play
+                    .session
+                    .camera_medium(snapshot.camera.eye(partial), offsets);
+                let underwater = medium == native_session::loaded::CameraMedium::Water;
                 renderer.set_dark_sky_disc(
                     background.dark_disc_visible(camera_y, snapshot.under_water),
                 );
@@ -1135,6 +1207,16 @@ impl Viewer {
                 let night_vision = crate::preview_lighting::night_vision_scale(
                     snapshot.night_vision_duration,
                     partial,
+                );
+                let special = special_fog(
+                    medium,
+                    snapshot.game_mode == native_session::GameMode::Spectator,
+                    snapshot
+                        .active_effects
+                        .iter()
+                        .any(|effect| effect.id == "fire_resistance"),
+                    play.streamer.radius().max(2),
+                    night_vision,
                 );
                 fog_color =
                     fog_color.map(|color| adjusted_fog_color(color, void_darkness, night_vision));
@@ -1167,7 +1249,12 @@ impl Viewer {
                 } else {
                     None
                 };
-                let atmosphere = if underwater {
+                let atmosphere = if let Some((fog_color, range)) = special {
+                    Some(crate::star_render::Atmosphere {
+                        fog_color,
+                        sky_end: range[1],
+                    })
+                } else if underwater {
                     water.map(|(fog_color, range)| crate::star_render::Atmosphere {
                         fog_color,
                         sky_end: range[1],
@@ -1185,7 +1272,15 @@ impl Viewer {
                     }
                 };
                 renderer.set_sky_atmosphere(atmosphere);
-                if let Some((water_color, range)) = water {
+                if let Some((special_color, range)) = special {
+                    renderer.set_sky_color(if background.has_overworld_sky() {
+                        color
+                    } else {
+                        special_color
+                    });
+                    renderer.set_fog_color(Some(special_color));
+                    renderer.set_fog_range(Some(range));
+                } else if let Some((water_color, range)) = water {
                     renderer.set_sky_color(color);
                     renderer.set_fog_color(Some(water_color));
                     renderer.set_fog_range(Some(range));
@@ -2227,6 +2322,102 @@ impl ApplicationHandler for Viewer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn special_fog_and_camera_near_plane_respect_mode_and_order() {
+        use native_session::loaded::CameraMedium;
+        let offsets = super::near_plane_offsets(glam::Vec3::NEG_Z, 0.0, 90.0, 1600, 800);
+        assert!((offsets[0].z + f64::from(0.05_f32)).abs() < 1e-12);
+        assert!(offsets[1].x < 0.0 && offsets[1].y > 0.0);
+        assert!(offsets[2].x > 0.0 && offsets[2].y > 0.0);
+        assert!(offsets[3].x < 0.0 && offsets[3].y < 0.0);
+        assert!(offsets[4].x > 0.0 && offsets[4].y < 0.0);
+        assert_eq!(
+            super::special_fog(CameraMedium::Lava, false, true, 12, 0.0)
+                .unwrap()
+                .1,
+            [0.0, 5.0]
+        );
+        assert_eq!(
+            super::special_fog(CameraMedium::Lava, true, true, 12, 0.0)
+                .unwrap()
+                .1,
+            [-8.0, 96.0]
+        );
+        assert!(super::special_fog(CameraMedium::Water, false, false, 12, 0.0).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn special_fog_matches_java_environments() {
+        use native_session::loaded::CameraMedium;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SpecialFogOracle.java");
+        let result_file = temp.path().join("fog.txt");
+        std::fs::write(&source, include_str!("../tests/java/SpecialFogOracle.java")).unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("SpecialFogOracle")
+            .arg(&result_file)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = std::fs::read_to_string(result_file).unwrap();
+        let mut lines = result.lines();
+        for medium in [CameraMedium::Lava, CameraMedium::PowderSnow] {
+            for spectator in [false, true] {
+                for chunks in [2, 8, 12, 32] {
+                    let expected: Vec<f32> = lines
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .map(|v| v.parse().unwrap())
+                        .collect();
+                    let (color, range) =
+                        super::special_fog(medium, spectator, false, chunks, 0.0).unwrap();
+                    for i in 0..3 {
+                        assert_eq!(color[i].to_bits(), expected[i].to_bits());
+                    }
+                    assert_eq!(range, [expected[3], expected[4]]);
+                    assert_eq!(range[1], expected[5]);
+                }
+            }
+        }
+        assert!(lines.next().is_none());
+    }
     #[test]
     fn sun_angle_interpolation_wraps_and_snaps_large_changes() {
         assert_eq!(super::interpolate_sun_angle(359.0, 1.0, 0.5), 360.0);

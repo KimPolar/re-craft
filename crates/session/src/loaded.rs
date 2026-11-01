@@ -953,6 +953,14 @@ fn fresh_breathing_seed() -> i64 {
     (unique ^ now) as i64
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraMedium {
+    Air,
+    Water,
+    Lava,
+    PowderSnow,
+}
+
 impl LoadedSession {
     /// Test the interpolated camera position against Java's water surface rule.
     /// The position is relative to this session's current origin.
@@ -987,6 +995,57 @@ impl LoadedSession {
         let world_block_y = i64::from(self.origin.y) + i64::from(block.y);
         let camera_y = position.y + f64::from(self.origin.y);
         camera_y < f64::from(world_block_y as f32 + height)
+    }
+
+    /// Java samples water at the eye, then checks the five near-plane points
+    /// for lava and powder snow in order. Positions are relative to the origin.
+    pub fn camera_medium(&self, eye: DVec3, offsets: [DVec3; 5]) -> CameraMedium {
+        if !eye.is_finite() || offsets.iter().any(|offset| !offset.is_finite()) {
+            return CameraMedium::Air;
+        }
+        if self.camera_in_water(eye) {
+            return CameraMedium::Water;
+        }
+        let view = FluidView {
+            world: &self.world,
+            shapes: &self.shapes,
+            fluids: &self.fluids,
+            origin: self.origin,
+            bounds: self.bounds,
+            air: self.states[0],
+        };
+        for offset in offsets {
+            let position = eye + offset;
+            let block = position.floor().as_ivec3();
+            if let fluid::Cell::Fluid(state) = view.at(block)
+                && state.kind == fluid::FluidKind::Lava
+            {
+                let above = block
+                    .y
+                    .checked_add(1)
+                    .map(|y| IVec3::new(block.x, y, block.z));
+                let height =
+                    if state.source && above.is_some_and(|p| view.sturdy_face(p, IVec3::NEG_Y)) {
+                        1.0
+                    } else {
+                        fluid::height(&|p| view.at(p), block, state.kind)
+                    };
+                let world_block_y = i64::from(self.origin.y) + i64::from(block.y);
+                let world_y = position.y + f64::from(self.origin.y);
+                if world_y <= f64::from(world_block_y as f32 + height) {
+                    return CameraMedium::Lava;
+                }
+            } else if let Cell::State(id) =
+                cell(&self.world, self.origin, self.bounds, block, self.states[0])
+                && self
+                    .world
+                    .state(id)
+                    .is_some_and(|state| state.name == "minecraft:powder_snow")
+            {
+                return CameraMedium::PowderSnow;
+            }
+        }
+        CameraMedium::Air
     }
     fn ensure_effect_save_tracking(&mut self) -> &mut EffectSaveTracking {
         self.effect_save_tracking
@@ -37592,6 +37651,64 @@ mod tests {
         assert_eq!(
             unsupported.vitals.health, 20.0,
             "an unknown collision barrier must not invent fall behavior"
+        );
+    }
+
+    #[test]
+    fn camera_medium_prioritizes_water_then_near_plane_lava_and_snow() {
+        let mut session = session();
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        let lava = session.intern_block(state("minecraft:lava", &[("level", "0")]));
+        let snow = session.intern_block(state("minecraft:powder_snow", &[]));
+        let eye = DVec3::new(8.5, 5.25, 8.5);
+        let lava_offset = DVec3::X * 2.0;
+        let snow_offset = -DVec3::X * 2.0;
+        assert!(session.set(IVec3::new(8, 5, 8), water));
+        assert!(session.set(IVec3::new(10, 5, 8), lava));
+        assert!(session.set(IVec3::new(6, 5, 8), snow));
+        assert_eq!(
+            session.camera_medium(eye, [lava_offset; 5]),
+            CameraMedium::Water
+        );
+        assert!(session.set(IVec3::new(8, 5, 8), session.states[0]));
+        assert_eq!(
+            session.camera_medium(
+                eye,
+                [
+                    lava_offset,
+                    snow_offset,
+                    DVec3::ZERO,
+                    DVec3::ZERO,
+                    DVec3::ZERO
+                ]
+            ),
+            CameraMedium::Lava
+        );
+        assert_eq!(
+            session.camera_medium(
+                eye,
+                [
+                    snow_offset,
+                    lava_offset,
+                    DVec3::ZERO,
+                    DVec3::ZERO,
+                    DVec3::ZERO
+                ]
+            ),
+            CameraMedium::PowderSnow
+        );
+        assert_eq!(
+            session.camera_medium(eye, [DVec3::ZERO; 5]),
+            CameraMedium::Air
+        );
+        let surface = f64::from(5.0_f32 + 8.0_f32 / 9.0_f32);
+        assert_eq!(
+            session.camera_medium(DVec3::new(8.5, surface, 8.5), [lava_offset; 5]),
+            CameraMedium::Lava
+        );
+        assert_eq!(
+            session.camera_medium(DVec3::new(8.5, surface + 0.00001, 8.5), [lava_offset; 5]),
+            CameraMedium::Air
         );
     }
 

@@ -121,7 +121,7 @@ impl Sky {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: depth_state(),
+            depth_stencil: None,
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &star_shader,
@@ -268,7 +268,6 @@ impl Sky {
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        depth: &wgpu::TextureView,
         background: [f32; 3],
         sun: Option<&crate::sun_render::Sun>,
         moon: Option<&crate::sun_render::Sun>,
@@ -290,14 +289,7 @@ impl Sky {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
+            depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -327,6 +319,7 @@ impl Sky {
 mod tests {
     use super::*;
     use glam::Vec3;
+    use sha1::{Digest, Sha1};
     use std::{io::Cursor, sync::mpsc, time::Duration};
 
     struct Assets(Vec<u8>);
@@ -338,6 +331,147 @@ mod tests {
                 .then(|| self.0.clone()),
             )
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU; measures offscreen 1080p submission and completion time"]
+    fn gpu_sky_cost_1080p() {
+        use std::time::Instant;
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = match std::env::var("NATIVE_TEST_GPU_BACKEND").ok().as_deref() {
+                Some("dx12") => wgpu::Backends::DX12,
+                Some("vulkan") => wgpu::Backends::VULKAN,
+                _ => wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            };
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("GPU adapter unavailable");
+            let info = adapter.get_info();
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let size = wgpu::Extent3d {
+                width: 1920,
+                height: 1080,
+                depth_or_array_layers: 1,
+            };
+            let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+            let color = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sky benchmark output"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sky benchmark depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = color.create_view(&Default::default());
+            let depth_view = depth.create_view(&Default::default());
+            let mut sky = Sky::new(&device, format, wgpu::TextureFormat::Depth32Float);
+            let matrix = Mat4::perspective_rh(70_f32.to_radians(), 1920.0 / 1080.0, 0.05, 1024.0)
+                * Mat4::look_to_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+            let background = [0.1, 0.2, 0.3];
+            println!(
+                "adapter: {} ({:?}), 1920x1080, 30 warmup + 90 timed frames, synchronous completion",
+                info.name, info.backend
+            );
+            let scenarios = [
+                ("clear", 0.0, false),
+                ("sky day", 0.0, true),
+                ("sky night", 0.5, true),
+            ];
+            let mut timings = [
+                Vec::with_capacity(90),
+                Vec::with_capacity(90),
+                Vec::with_capacity(90),
+            ];
+            for frame in 0..120 {
+                for n in 0..scenarios.len() {
+                    let index = (frame + n) % scenarios.len();
+                    let (_, brightness, enabled) = scenarios[index];
+                    let start = Instant::now();
+                    if enabled {
+                        sky.set_frame(Some(Frame {
+                            angle_degrees: 0.0,
+                            brightness,
+                        }));
+                        sky.prepare(&device, &queue, (1920, 1080), matrix);
+                    }
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    if enabled {
+                        sky.render(&mut encoder, background, None, None);
+                    }
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("sky benchmark composite"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(1.0),
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        if enabled {
+                            sky.composite(&mut pass);
+                        }
+                    }
+                    queue.submit([encoder.finish()]);
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(Duration::from_secs(15)),
+                        })
+                        .unwrap();
+                    if frame >= 30 {
+                        timings[index].push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+            for ((label, _, _), mut samples) in scenarios.into_iter().zip(timings) {
+                samples.sort_by(f64::total_cmp);
+                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                println!(
+                    "{label}: mean {mean:.3} ms, median {:.3} ms, p95 {:.3} ms",
+                    samples[45], samples[85]
+                );
+            }
+        });
     }
 
     #[test]
@@ -399,7 +533,7 @@ mod tests {
                     &device,
                     &queue,
                     FORMAT,
-                    wgpu::TextureFormat::Depth32Float,
+                    None,
                     crate::sun_render::Texture::load(&mut assets).unwrap(),
                     None,
                 )
@@ -408,7 +542,7 @@ mod tests {
                     &device,
                     &queue,
                     FORMAT,
-                    wgpu::TextureFormat::Depth32Float,
+                    None,
                     crate::sun_render::Texture::load_moon(&mut assets).unwrap(),
                     Some(&sun),
                 )
@@ -475,7 +609,6 @@ mod tests {
                         let mut encoder = device.create_command_encoder(&Default::default());
                         sky.render(
                             &mut encoder,
-                            &depth_view,
                             background,
                             with_bodies.then_some(&sun),
                             with_bodies.then_some(&moon),
@@ -543,6 +676,10 @@ mod tests {
                             .unwrap()
                             .unwrap();
                         let pixels = readback.slice(..).get_mapped_range().unwrap();
+                        println!(
+                            "sky hash {format:?} {brightness} {with_bodies}: {:x}",
+                            Sha1::digest(pixels.as_ref())
+                        );
                         let center = &pixels[(32 * 64 + 32) * 4..][..4];
                         for i in 0..3 {
                             let body = if with_bodies {

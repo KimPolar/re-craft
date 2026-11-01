@@ -359,7 +359,7 @@ impl Renderer {
             &self.device,
             &self.queue,
             crate::star_render::FORMAT,
-            DEPTH_FORMAT,
+            None,
             texture,
             None,
         )?);
@@ -377,7 +377,7 @@ impl Renderer {
             &self.device,
             &self.queue,
             crate::star_render::FORMAT,
-            DEPTH_FORMAT,
+            None,
             texture,
             self.sun.as_ref(),
         )?);
@@ -2339,7 +2339,6 @@ impl Renderer {
         if let Some(sky) = &self.celestial_sky {
             sky.render(
                 &mut encoder,
-                &self.depth,
                 sky_background,
                 self.sun.as_ref(),
                 self.moon.as_ref(),

@@ -129,7 +129,7 @@ impl Sun {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
-        depth_format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
         source: Texture,
         sun: Option<&Sun>,
     ) -> Result<Self> {
@@ -276,8 +276,8 @@ impl Sun {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
+            depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
+                format,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: Default::default(),
@@ -658,7 +658,7 @@ mod tests {
                     &device,
                     &queue,
                     format,
-                    wgpu::TextureFormat::Depth32Float,
+                    Some(wgpu::TextureFormat::Depth32Float),
                     Texture::load(&mut pack(false)).unwrap(),
                     None,
                 )
@@ -667,7 +667,7 @@ mod tests {
                     &device,
                     &queue,
                     format,
-                    wgpu::TextureFormat::Depth32Float,
+                    Some(wgpu::TextureFormat::Depth32Float),
                     Texture::load_moon(&mut pack(false)).unwrap(),
                     Some(&sun),
                 )

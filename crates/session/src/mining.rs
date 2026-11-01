@@ -110,6 +110,7 @@ pub enum Material {
     Planks,
     CraftingTable,
     Chest,
+    Banner,
     Stair {
         hardness_tenths: u8,
         tool: StairTool,
@@ -123,6 +124,12 @@ pub enum Material {
 
 impl Material {
     pub fn from_block_name(name: &str) -> Option<Self> {
+        let banner = name
+            .strip_suffix("_wall_banner")
+            .map(|prefix| format!("{prefix}_banner"));
+        if crate::inventory::is_banner_item(banner.as_deref().unwrap_or(name)) {
+            return Some(Self::Banner);
+        }
         if let Some(material) = crate::slab_mining::material(name) {
             return Some(material);
         }
@@ -227,6 +234,7 @@ impl Material {
             Self::Snow => 0.1,
             Self::SnowBlock => 0.2,
             Self::RedstoneLamp => 0.3,
+            Self::Banner => 1.0,
             Self::RedstoneBlock => 5.0,
             Self::Lodestone => 3.5,
             Self::Stone | Self::StoneBricks => 1.5,
@@ -406,6 +414,7 @@ pub fn mining_properties(material: Material, item: Option<&ItemStack>) -> Option
             Material::Planks
                 | Material::CraftingTable
                 | Material::Chest
+                | Material::Banner
                 | Material::Wood
                 | Material::WoodButton
                 | Material::Stair {

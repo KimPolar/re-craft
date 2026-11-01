@@ -98,6 +98,23 @@ pub struct Drop {
     pub count: u32,
     /// The supported copy_components operation reads this from a block entity.
     pub copy_block_entity_custom_name: bool,
+    /// Component copy operations that require an explicit block-entity context.
+    pub copy_block_entity_components: Vec<ComponentFilter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentFilter {
+    pub include: Option<BTreeSet<ResourceId>>,
+    pub exclude: BTreeSet<ResourceId>,
+}
+
+impl ComponentFilter {
+    pub fn accepts(&self, component: &ResourceId) -> bool {
+        self.include
+            .as_ref()
+            .is_none_or(|ids| ids.contains(component))
+            && !self.exclude.contains(component)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +169,7 @@ pub struct LootBlockState<'a> {
 struct LootContext<'a> {
     entity_present: Option<bool>,
     block: Option<&'a LootBlockState<'a>>,
+    block_entity_components: bool,
 }
 
 impl Condition {
@@ -278,16 +296,22 @@ enum ModifierKind {
     UniformBonus(ResourceId, i32),
     ExplosionDecay,
     CopyBlockEntityCustomName,
+    CopyBlockEntityComponents(ComponentFilter),
     Unsupported(String),
 }
 
 impl Modifier {
     fn fully_supported(&self) -> bool {
-        self.condition.fully_supported() && !matches!(self.kind, ModifierKind::Unsupported(_))
+        self.condition.fully_supported()
+            && !matches!(
+                self.kind,
+                ModifierKind::Unsupported(_) | ModifierKind::CopyBlockEntityComponents(_)
+            )
     }
-    fn fully_supported_in_player_block(&self) -> bool {
+    fn fully_supported_in_player_block_with_components(&self, components: bool) -> bool {
         self.condition.fully_supported_in_player_block(true)
             && !matches!(self.kind, ModifierKind::Unsupported(_))
+            && (components || !matches!(self.kind, ModifierKind::CopyBlockEntityComponents(_)))
     }
     fn apply(
         &self,
@@ -366,6 +390,13 @@ impl Modifier {
             // Normal player mining does not have an explosion radius.
             ModifierKind::ExplosionDecay => {}
             ModifierKind::CopyBlockEntityCustomName => drop.copy_block_entity_custom_name = true,
+            ModifierKind::CopyBlockEntityComponents(filter) => {
+                ensure!(
+                    context.block_entity_components,
+                    "block entity component copy context is unavailable"
+                );
+                drop.copy_block_entity_components.push(filter.clone());
+            }
             ModifierKind::Unsupported(reason) => bail!("unsupported loot modifier: {reason}"),
         }
         Ok(())
@@ -398,17 +429,16 @@ impl Entry {
                 _ => true,
             }
     }
-    fn fully_supported_in_player_block(&self) -> bool {
+    fn fully_supported_in_player_block_with_components(&self, components: bool) -> bool {
         self.condition.fully_supported_in_player_block(true)
-            && self
-                .modifiers
-                .iter()
-                .all(Modifier::fully_supported_in_player_block)
+            && self.modifiers.iter().all(|modifier| {
+                modifier.fully_supported_in_player_block_with_components(components)
+            })
             && match &self.kind {
                 EntryKind::Unsupported(_) => false,
-                EntryKind::Alternatives(entries) => {
-                    entries.iter().all(Self::fully_supported_in_player_block)
-                }
+                EntryKind::Alternatives(entries) => entries
+                    .iter()
+                    .all(|entry| entry.fully_supported_in_player_block_with_components(components)),
                 _ => true,
             }
     }
@@ -429,6 +459,7 @@ impl Entry {
                     item: id.clone(),
                     count: 1,
                     copy_block_entity_custom_name: false,
+                    copy_block_entity_components: Vec::new(),
                 }),
             ),
             EntryKind::Empty => (self.weight, None),
@@ -483,6 +514,12 @@ pub struct BlockLootTables {
 impl BlockLootTables {
     /// Check all branches using the entity and original state supplied by a player break.
     pub fn fully_supported_player_block(&self, block: &str) -> bool {
+        self.fully_supported_player_block_inner(block, false)
+    }
+    pub fn fully_supported_player_block_with_components(&self, block: &str) -> bool {
+        self.fully_supported_player_block_inner(block, true)
+    }
+    fn fully_supported_player_block_inner(&self, block: &str, components: bool) -> bool {
         let Ok(block) = ResourceId::parse(block) else {
             return false;
         };
@@ -491,22 +528,18 @@ impl BlockLootTables {
             path: format!("blocks/{}", block.path),
         };
         self.tables.get(&id).is_some_and(|table| {
-            table
-                .modifiers
-                .iter()
-                .all(Modifier::fully_supported_in_player_block)
-                && table.pools.iter().all(|pool| {
-                    pool.condition.fully_supported_in_player_block(true)
-                        && pool
-                            .modifiers
-                            .iter()
-                            .all(Modifier::fully_supported_in_player_block)
-                        && pool.entries.len() <= 1
-                        && pool
-                            .entries
-                            .iter()
-                            .all(Entry::fully_supported_in_player_block)
-                })
+            table.modifiers.iter().all(|modifier| {
+                modifier.fully_supported_in_player_block_with_components(components)
+            }) && table.pools.iter().all(|pool| {
+                pool.condition.fully_supported_in_player_block(true)
+                    && pool.modifiers.iter().all(|modifier| {
+                        modifier.fully_supported_in_player_block_with_components(components)
+                    })
+                    && pool.entries.len() <= 1
+                    && pool.entries.iter().all(|entry| {
+                        entry.fully_supported_in_player_block_with_components(components)
+                    })
+            })
         })
     }
     /// Reject tables that could enter an unsupported branch under another RNG
@@ -563,6 +596,27 @@ impl BlockLootTables {
                         "smooth_stone_slab",
                     ]
                     .map(str::to_owned),
+                )
+                .chain(
+                    [
+                        "white",
+                        "orange",
+                        "magenta",
+                        "light_blue",
+                        "yellow",
+                        "lime",
+                        "pink",
+                        "gray",
+                        "light_gray",
+                        "cyan",
+                        "purple",
+                        "blue",
+                        "brown",
+                        "green",
+                        "red",
+                        "black",
+                    ]
+                    .map(|color| format!("{color}_banner")),
                 );
         for name in names {
             let id = ResourceId::parse(&format!("minecraft:blocks/{name}"))?;
@@ -673,6 +727,7 @@ impl BlockLootTables {
                 enchantments: &[],
             },
             false,
+            false,
             random,
         )
     }
@@ -685,7 +740,39 @@ impl BlockLootTables {
         tool: BasicTool<'_>,
         random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
-        self.drops_at(block, Some(properties), tool, true, random)
+        self.drops_at(block, Some(properties), tool, true, false, random)
+    }
+
+    /// Evaluate a block table while retaining explicit component-copy filters.
+    /// `table_block` may differ from `state.name`, as wall banners use their
+    /// standing banner's loot table.
+    pub fn drops_with_block_entity_at(
+        &self,
+        table_block: &str,
+        state: &LootBlockState<'_>,
+        tool: BasicTool<'_>,
+        entity_present: bool,
+        random: Option<&mut dyn LootRandom>,
+    ) -> Result<Vec<Drop>> {
+        let block = ResourceId::parse(table_block)?;
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        let table = self
+            .tables
+            .get(&id)
+            .context("block loot table is not supported or was not loaded")?;
+        Self::evaluate(
+            table,
+            tool,
+            random,
+            LootContext {
+                entity_present: Some(entity_present),
+                block: Some(state),
+                block_entity_components: true,
+            },
+        )
     }
 
     fn drops_at(
@@ -694,6 +781,7 @@ impl BlockLootTables {
         properties: Option<&BTreeMap<String, String>>,
         tool: BasicTool<'_>,
         entity_present: bool,
+        block_entity_components: bool,
         random: Option<&mut dyn LootRandom>,
     ) -> Result<Vec<Drop>> {
         let block = ResourceId::parse(block)?;
@@ -717,6 +805,7 @@ impl BlockLootTables {
             LootContext {
                 entity_present: Some(entity_present),
                 block: state.as_ref(),
+                block_entity_components,
             },
         )
     }
@@ -956,6 +1045,22 @@ fn parse_modifiers(
                         })
                     {
                         ModifierKind::CopyBlockEntityCustomName
+                    } else if source == Some("block_entity")
+                        && modifier.as_object().is_some_and(|fields| {
+                            fields.keys().all(|key| {
+                                matches!(
+                                    key.as_str(),
+                                    "type" | "source" | "include" | "exclude" | "condition"
+                                )
+                            })
+                        })
+                    {
+                        match component_filter(modifier) {
+                            Ok(filter) => ModifierKind::CopyBlockEntityComponents(filter),
+                            Err(error) => ModifierKind::Unsupported(format!(
+                                "unsupported copy_components: {error:#}"
+                            )),
+                        }
                     } else {
                         ModifierKind::Unsupported("unsupported copy_components".into())
                     }
@@ -965,6 +1070,45 @@ fn parse_modifiers(
             Ok(Modifier { condition, kind })
         })
         .collect()
+}
+
+fn component_filter(value: &Value) -> Result<ComponentFilter> {
+    let parse = |key: &str| -> Result<Option<BTreeSet<ResourceId>>> {
+        value
+            .get(key)
+            .map(|list| -> Result<_> {
+                let list = list.as_array().context("component filter must be a list")?;
+                list.iter()
+                    .map(|value| {
+                        let id = ResourceId::parse(
+                            value.as_str().context("component ID is not a string")?,
+                        )?;
+                        ensure!(
+                            id.namespace == "minecraft"
+                                && matches!(
+                                    id.path.as_str(),
+                                    "custom_name"
+                                        | "item_name"
+                                        | "tooltip_display"
+                                        | "banner_patterns"
+                                        | "rarity"
+                                        | "custom_data"
+                                        | "max_stack_size"
+                                        | "damage"
+                                        | "lore"
+                                ),
+                            "component ID is not yet verified"
+                        );
+                        Ok(id)
+                    })
+                    .collect()
+            })
+            .transpose()
+    };
+    Ok(ComponentFilter {
+        include: parse("include")?,
+        exclude: parse("exclude")?.unwrap_or_default(),
+    })
 }
 
 fn parse_optional_condition(
@@ -1502,6 +1646,41 @@ mod tests {
     }
 
     #[test]
+    fn component_copy_filters_require_explicit_context_and_preserve_include_exclude() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/white_banner.json",r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","modifier":[{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:banner_patterns","minecraft:custom_name"],"exclude":["minecraft:custom_name"]},{"type":"minecraft:copy_components","source":"block_entity","exclude":["minecraft:custom_data"]}]}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let tool = BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        let properties = BTreeMap::new();
+        assert!(!tables.fully_supported_player_block("minecraft:white_banner"));
+        assert!(tables.fully_supported_player_block_with_components("minecraft:white_banner"));
+        assert!(
+            tables
+                .drops_with_entity_at("minecraft:white_banner", &properties, tool, None)
+                .is_err()
+        );
+        let state = LootBlockState {
+            name: "minecraft:white_wall_banner",
+            properties: &properties,
+        };
+        let drops = tables
+            .drops_with_block_entity_at("minecraft:white_banner", &state, tool, true, None)
+            .unwrap();
+        let filters = &drops[0].copy_block_entity_components;
+        assert_eq!(filters.len(), 2);
+        let id = |name| ResourceId::parse(name).unwrap();
+        assert!(filters[0].accepts(&id("minecraft:banner_patterns")));
+        assert!(!filters[0].accepts(&id("minecraft:custom_name")));
+        assert!(filters[1].accepts(&id("minecraft:banner_patterns")));
+        assert!(filters[1].accepts(&id("minecraft:custom_name")));
+        assert!(!filters[1].accepts(&id("minecraft:custom_data")));
+    }
+
+    #[test]
     fn conditions_alternatives_and_modifiers_follow_the_selected_resources() {
         let mut source = Memory::default();
         source.put(
@@ -1521,6 +1700,8 @@ mod tests {
                 item: ResourceId::parse("minecraft:dirt").unwrap(),
                 count: 2,
                 copy_block_entity_custom_name: false,
+
+                copy_block_entity_components: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1531,6 +1712,8 @@ mod tests {
                 item: ResourceId::parse("minecraft:stone").unwrap(),
                 count: 2,
                 copy_block_entity_custom_name: false,
+
+                copy_block_entity_components: Vec::new(),
             }]
         );
         assert!(tables.drops("minecraft:grass_block", pick(None)).is_err());
@@ -1705,6 +1888,8 @@ mod tests {
                     item: ResourceId::parse(expected).unwrap(),
                     count: 1,
                     copy_block_entity_custom_name: false,
+
+                    copy_block_entity_components: Vec::new(),
                 }]
             );
             assert_eq!(calls, 1);
@@ -1726,6 +1911,8 @@ mod tests {
                     item: ResourceId::parse(&format!("minecraft:{expected}")).unwrap(),
                     count: 1,
                     copy_block_entity_custom_name: false,
+
+                    copy_block_entity_components: Vec::new(),
                 }]
             );
         }
@@ -1740,6 +1927,8 @@ mod tests {
                     item: ResourceId::parse(id).unwrap(),
                     count: 1,
                     copy_block_entity_custom_name: false,
+
+                    copy_block_entity_components: Vec::new(),
                 }],
                 "{id}"
             );

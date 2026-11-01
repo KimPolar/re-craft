@@ -1684,6 +1684,7 @@ impl ItemEntities {
             DropStrategy::FromMiddle,
             drops,
             custom_name,
+            None,
         );
     }
 
@@ -1705,9 +1706,14 @@ impl ItemEntities {
             enchantments: &[],
         };
         match tables.drops_with_random(name, tool, Some(&mut self.random)) {
-            Ok(drops) => {
-                self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops, None)
-            }
+            Ok(drops) => self.spawn_drops(
+                position,
+                IVec3::ZERO,
+                DropStrategy::FromMiddle,
+                drops,
+                None,
+                None,
+            ),
             Err(error) => eprintln!("unsupported loot for {name}: {error:#}"),
         }
     }
@@ -1743,7 +1749,14 @@ impl ItemEntities {
         let drops = tables.drops_without_entity_at(name, Some(properties), Some(&mut random))?;
         self.random = random;
         if enabled {
-            self.spawn_drops(position, IVec3::ZERO, DropStrategy::FromMiddle, drops, None);
+            self.spawn_drops(
+                position,
+                IVec3::ZERO,
+                DropStrategy::FromMiddle,
+                drops,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -1770,6 +1783,93 @@ impl ItemEntities {
         Ok((drops, random))
     }
 
+    pub(crate) fn prepare_block_entity_drops(
+        &self,
+        table: &str,
+        block: &native_world::loaded::BlockState,
+        hand: Option<&ItemStack>,
+        entity_present: bool,
+        components: &Tag,
+        tables: Option<&BlockLootTables>,
+    ) -> anyhow::Result<(Vec<Drop>, Vec<Tag>, LegacyRandom)> {
+        use anyhow::{Context, ensure};
+        use native_resources::{loot::LootBlockState, packs::ResourceId};
+        let tables = tables.context("block loot table unavailable")?;
+        ensure!(
+            tables.fully_supported_player_block_with_components(table),
+            "unsupported block loot table"
+        );
+        let enchantments = hand
+            .map(crate::inventory::item_enchantments)
+            .transpose()?
+            .unwrap_or_default();
+        let tool = BasicTool {
+            item: hand.map(ItemStack::id),
+            count: hand.map_or(0, ItemStack::count),
+            enchantments: &enchantments,
+        };
+        let state = LootBlockState {
+            name: &block.name,
+            properties: &block.properties,
+        };
+        let mut random = self.random.clone();
+        let drops = tables.drops_with_block_entity_at(
+            table,
+            &state,
+            tool,
+            entity_present,
+            Some(&mut random),
+        )?;
+        let Tag::Compound(source) = components else {
+            anyhow::bail!("block entity components are not a compound")
+        };
+        let mut prepared = Vec::with_capacity(drops.len());
+        for drop in &drops {
+            let mut selected = Vec::new();
+            let mut seen = BTreeSet::new();
+            for (key, value) in source {
+                let key_text =
+                    String::from_utf16(&key.0).context("invalid component identifier")?;
+                let id = ResourceId::parse(&key_text)?;
+                ensure!(seen.insert(id.clone()), "duplicate block entity component");
+                if (drop.copy_block_entity_custom_name
+                    && id.namespace == "minecraft"
+                    && id.path == "custom_name")
+                    || drop
+                        .copy_block_entity_components
+                        .iter()
+                        .any(|filter| filter.accepts(&id))
+                {
+                    selected.push((key.clone(), value.clone()));
+                }
+            }
+            let components = Tag::Compound(selected);
+            let item = format!("{}:{}", drop.item.namespace, drop.item.path);
+            ensure!(
+                crate::inventory::saved_item_max(&item, &components).is_some(),
+                "unsupported dropped item components"
+            );
+            prepared.push(components);
+        }
+        Ok((drops, prepared, random))
+    }
+
+    pub(crate) fn drop_prepared_block_entity_items(
+        &mut self,
+        position: IVec3,
+        drops: Vec<Drop>,
+        components: &[Tag],
+    ) {
+        self.spawn_drops(
+            position,
+            IVec3::ZERO,
+            DropStrategy::FromMiddle,
+            drops,
+            None,
+            Some(components),
+        );
+    }
+
     pub(crate) fn stage_player_block_drops(
         &mut self,
         (drops, random): (Vec<Drop>, LegacyRandom),
@@ -1791,7 +1891,7 @@ impl ItemEntities {
         enabled: bool,
     ) {
         if enabled {
-            self.spawn_drops(position, face, strategy, drops, None);
+            self.spawn_drops(position, face, strategy, drops, None, None);
         }
     }
 
@@ -1802,24 +1902,31 @@ impl ItemEntities {
         strategy: DropStrategy,
         drops: Vec<Drop>,
         custom_name: Option<&Tag>,
+        prepared: Option<&[Tag]>,
     ) {
-        for drop in drops {
+        for (index, drop) in drops.into_iter().enumerate() {
             let id = format!("{}:{}", drop.item.namespace, drop.item.path);
-            let maximum = ordinary_item_default_max(&id)
-                .or_else(|| native_world::Block::from_item_id(&id).map(|_| 64));
-            let mut remaining = drop.count;
-            while remaining > 0 {
-                let count = remaining.min(maximum.unwrap_or(99));
-                let components = Tag::Compound(if drop.copy_block_entity_custom_name {
+            let components = prepared.map(|all| all[index].clone()).unwrap_or_else(|| {
+                Tag::Compound(if drop.copy_block_entity_custom_name {
                     custom_name
                         .map(|value| vec![("minecraft:custom_name".into(), value.clone())])
                         .unwrap_or_default()
                 } else {
                     Vec::new()
-                });
+                })
+            });
+            let maximum = if prepared.is_some() {
+                crate::inventory::saved_item_max(&id, &components)
+            } else {
+                ordinary_item_default_max(&id)
+                    .or_else(|| native_world::Block::from_item_id(&id).map(|_| 64))
+            };
+            let mut remaining = drop.count;
+            while remaining > 0 {
+                let count = remaining.min(maximum.unwrap_or(99));
                 let stack = match maximum {
-                    Some(max) => ItemStack::new(id.clone(), count, max, components),
-                    None => ItemStack::unresolved(id.clone(), count, components),
+                    Some(max) => ItemStack::new(id.clone(), count, max, components.clone()),
+                    None => ItemStack::unresolved(id.clone(), count, components.clone()),
                 }
                 .expect("validated loot stack");
                 remaining -= count;

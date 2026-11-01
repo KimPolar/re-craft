@@ -532,6 +532,7 @@ pub struct LoadedSession {
     placed_chests: BTreeSet<(i32, i32, i32)>,
     removed_chests: BTreeSet<(i32, i32, i32)>,
     placed_banners: BTreeMap<(i32, i32, i32), native_persistence::nbt::Tag>,
+    removed_banners: BTreeMap<(i32, i32, i32), native_persistence::nbt::Tag>,
     chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
     open_trapped_chests: BTreeSet<(i32, i32, i32)>,
@@ -3147,7 +3148,13 @@ impl LoadedSession {
         use anyhow::{Context, ensure};
         use native_persistence::edit::BlockEntityMutation;
         let mut changes = Vec::new();
-        for (&(x, y, z), entity) in &self.placed_banners {
+        let keys: BTreeSet<_> = self
+            .placed_banners
+            .keys()
+            .chain(self.removed_banners.keys())
+            .copied()
+            .collect();
+        for (x, y, z) in keys {
             if x.div_euclid(16) != position.x || z.div_euclid(16) != position.z {
                 continue;
             }
@@ -3164,13 +3171,14 @@ impl LoadedSession {
                 .world
                 .state(edit.current)
                 .context("banner state is unavailable")?;
+            let replacement = self.placed_banners.get(&(x, y, z)).cloned();
             ensure!(
-                native_world::collision::banner_item_id(state).is_some(),
-                "placed banner block is missing"
+                native_world::collision::banner_item_id(state).is_some() == replacement.is_some(),
+                "banner block and entity differ"
             );
             changes.push(BlockEntityMutation {
-                expected: None,
-                replacement: Some(entity.clone()),
+                expected: self.removed_banners.get(&(x, y, z)).cloned(),
+                replacement,
             });
         }
         draft.stage_block_entity_mutations(&changes)
@@ -4066,6 +4074,7 @@ impl LoadedSession {
             placed_chests: BTreeSet::new(),
             removed_chests: BTreeSet::new(),
             placed_banners: BTreeMap::new(),
+            removed_banners: BTreeMap::new(),
             chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
             open_trapped_chests: BTreeSet::new(),
@@ -9780,14 +9789,13 @@ impl LoadedSession {
         let Some(name) = self.world.state(id).map(|state| state.name.clone()) else {
             return;
         };
-        // Banner destruction must preserve its block entity and its loot
-        // components. Until that lifecycle is implemented, leave it intact.
         if self
             .world
             .state(id)
             .and_then(native_world::collision::banner_item_id)
             .is_some()
         {
+            self.finish_breaking_banner(relative, id);
             return;
         }
         if matches!(name.as_str(), "minecraft:chest" | "minecraft:trapped_chest") {
@@ -10078,6 +10086,102 @@ impl LoadedSession {
         );
     }
 
+    fn finish_breaking_banner(&mut self, relative: IVec3, id: BlockStateId) {
+        let Some(position) = add(self.origin, relative) else {
+            return;
+        };
+        let Some(block) = self.world.state(id).cloned() else {
+            return;
+        };
+        let Some(item_id) = native_world::collision::banner_item_id(&block) else {
+            return;
+        };
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let Some(payload) = self.world.visible_block_entities(&chunk) else {
+            return;
+        };
+        let Ok(entity) = crate::saved_banner::find(payload, chunk, position) else {
+            return;
+        };
+        let view = if entity.is_some() {
+            let Ok((view, _)) = crate::saved_banner::remove(payload, chunk, position) else {
+                return;
+            };
+            Some(view)
+        } else {
+            None
+        };
+        let key = (position.x, position.y, position.z);
+        if !self.placed_banners.contains_key(&key) {
+            let Some(source) = self.world.saved_block_entities.get(&chunk) else {
+                return;
+            };
+            if crate::saved_banner::find(source, chunk, position).ok() != Some(entity.clone()) {
+                return;
+            }
+        }
+        let hand = self
+            .inventory
+            .slot(crate::inventory::PlayerSlot::Storage(
+                self.inventory.selected(),
+            ))
+            .cloned();
+        let properties =
+            self.mining_properties_for(&block.name, mining::Material::Banner, hand.as_ref());
+        if self.game_mode != GameMode::Creative && properties.is_none() {
+            return;
+        }
+        let mut drops = None;
+        if self.game_mode != GameMode::Creative
+            && self.block_drops
+            && properties.is_some_and(|p| p.correct_for_drops)
+        {
+            let Ok(components) = crate::saved_banner::collected_components(entity.as_ref()) else {
+                return;
+            };
+            let Ok((loot, components, random)) = self.dropped_items.prepare_block_entity_drops(
+                &item_id,
+                &block,
+                hand.as_ref(),
+                true,
+                &components,
+                self.loot.as_deref(),
+            ) else {
+                return;
+            };
+            let (loot, previous) = self.dropped_items.stage_player_block_drops((loot, random));
+            drops = Some((loot, components, previous));
+        }
+        if !self.set_with_banner_removal(relative, self.states[0], true, true) {
+            if let Some((_, _, previous)) = drops {
+                self.dropped_items.restore_drop_random(previous);
+            }
+            return;
+        }
+        if !self.placed_banners.contains_key(&key)
+            && let Some(entity) = entity
+        {
+            self.removed_banners.insert(key, entity);
+        }
+        self.placed_banners.remove(&key);
+        if let Some(view) = view {
+            Arc::make_mut(&mut self.world)
+                .live_block_entities
+                .insert(chunk, view);
+        }
+        let damage = properties.map_or(0, |p| p.damage_per_block);
+        if self.game_mode != GameMode::Creative && damage != 0 {
+            Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
+        }
+        if let Some((loot, components, _)) = drops {
+            self.dropped_items
+                .drop_prepared_block_entity_items(position, loot, &components);
+        }
+    }
+
     fn use_tool(&mut self, relative: IVec3, face: IVec3) -> bool {
         let Cell::State(id) = cell(
             &self.world,
@@ -10300,6 +10404,16 @@ impl LoadedSession {
     }
 
     fn set_with_notify(&mut self, relative: IVec3, id: BlockStateId, notify: bool) -> bool {
+        self.set_with_banner_removal(relative, id, notify, false)
+    }
+
+    fn set_with_banner_removal(
+        &mut self,
+        relative: IVec3,
+        id: BlockStateId,
+        notify: bool,
+        allow_banner_removal: bool,
+    ) -> bool {
         let Some(pos) = add(self.origin, relative) else {
             return false;
         };
@@ -10337,10 +10451,11 @@ impl LoadedSession {
         };
         // Removing a banner or its support also requires the block entity and
         // loot lifecycle. Until that is modeled, keep both changes atomic.
-        if original_state
-            .as_ref()
-            .and_then(native_world::collision::banner_item_id)
-            .is_some()
+        if !allow_banner_removal
+            && original_state
+                .as_ref()
+                .and_then(native_world::collision::banner_item_id)
+                .is_some()
         {
             return false;
         }
@@ -27321,6 +27436,251 @@ mod tests {
     }
 
     #[test]
+    fn breaking_placed_banner_copies_selected_components_and_keeps_source() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{Tag, TagType};
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path=="data/minecraft/loot_table/blocks/red_banner.json").then(||br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:red_banner","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:banner_patterns","minecraft:custom_name"]}}]}]}"#.to_vec()))
+            }
+        }
+        struct UnsupportedLoot;
+        impl ResourceProvider for UnsupportedLoot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path=="data/minecraft/loot_table/blocks/red_banner.json").then(||br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:banner_patterns"]}}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        let patterns = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![Tag::Compound(vec![
+                ("pattern".into(), Tag::String("minecraft:cross".into())),
+                ("color".into(), Tag::String("blue".into())),
+            ])],
+        };
+        let name = Tag::String("Named".into());
+        let components = Tag::Compound(vec![
+            ("minecraft:banner_patterns".into(), patterns.clone()),
+            ("minecraft:custom_name".into(), name.clone()),
+            (
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("future".into(), Tag::Int(42))]),
+            ),
+        ]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:red_banner".into(), 1, 16, components),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let position = session.origin + IVec3::new(8, 2, 7);
+        let key = (position.x, position.y, position.z);
+        assert!(session.placed_banners.contains_key(&key));
+        session.finish_breaking(position);
+        assert!(
+            session.placed_banners.contains_key(&key),
+            "unsupported loot must not erase the banner"
+        );
+        session.set_block_loot(Arc::new(
+            BlockLootTables::load(&mut UnsupportedLoot).unwrap(),
+        ));
+        session.finish_breaking(position);
+        assert!(
+            session.placed_banners.contains_key(&key),
+            "unsupported destination components must not erase the banner"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        session.submit_command(PlayerCommand::Break);
+        for _ in 0..200 {
+            session.update(TICK);
+            if !session.placed_banners.contains_key(&key) {
+                break;
+            }
+        }
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert!(!session.placed_banners.contains_key(&key));
+        assert!(!session.removed_banners.contains_key(&key));
+        assert!(matches!(
+            session.world.saved_block_entities[&chunk],
+            SavedBlockEntities::Empty
+        ));
+        assert!(matches!(
+            session.world.visible_block_entities(&chunk),
+            Some(SavedBlockEntities::Empty)
+        ));
+        let drops = session.dropped_items.snapshot();
+        assert_eq!(drops.len(), 1);
+        let item = &drops[0].stack;
+        assert_eq!(item.id(), "minecraft:red_banner");
+        assert_eq!(
+            item.components().get("minecraft:banner_patterns"),
+            Some(&patterns)
+        );
+        assert_eq!(item.components().get("minecraft:custom_name"), Some(&name));
+        assert!(item.components().get("minecraft:custom_data").is_none());
+    }
+
+    #[test]
+    fn breaking_saved_banner_stages_exact_entity_removal_and_rejects_stale_source() {
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{self, NamedTag, Tag, TagType},
+            palette::BlockState as SavedState,
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let (mut world, origin, player) = fixture();
+        let position = origin + IVec3::new(8, 2, 6);
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let block = state("minecraft:white_banner", &[("rotation", "0")]);
+        let id = world.intern_state(block);
+        world
+            .set_block_id(position.x, position.y, position.z, id)
+            .unwrap();
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:banner".into())),
+            ("x".into(), Tag::Int(position.x)),
+            ("y".into(), Tag::Int(position.y)),
+            ("z".into(), Tag::Int(position.z)),
+            ("unknown".into(), Tag::Int(42)),
+        ]);
+        let list = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![entity.clone()],
+        };
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: list.clone(),
+        })
+        .unwrap();
+        world
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Encoded(bytes.clone().into()));
+        let mut source = draft_chunk_blocks(
+            &fixture_chunk_document(chunk),
+            native_persistence::world::ChunkPos {
+                x: chunk.x,
+                z: chunk.z,
+            },
+            &[BlockChange {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                expected: SavedState {
+                    name: "minecraft:stone".into(),
+                    properties: Vec::new(),
+                },
+                replacement: SavedState {
+                    name: "minecraft:white_banner".into(),
+                    properties: [("rotation".into(), "0".into())].into(),
+                },
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let Tag::Compound(fields) = &mut source.value else {
+            panic!()
+        };
+        fields.push(("block_entities".into(), list));
+        let original = nbt::write(&source).unwrap();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_game_mode(GameMode::Creative);
+        let before = session.snapshot();
+        session.finish_breaking(position);
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert!(matches!(
+            session.world.visible_block_entities(&chunk),
+            Some(SavedBlockEntities::Empty)
+        ));
+        assert_eq!(
+            session.removed_banners[&(position.x, position.y, position.z)],
+            entity
+        );
+        assert!(matches!(
+            before
+                .world
+                .loaded()
+                .unwrap()
+                .visible_block_entities(&chunk),
+            Some(SavedBlockEntities::Encoded(_))
+        ));
+        let mut draft = session.draft_changed_chunk(chunk, &source).unwrap();
+        session
+            .stage_banner_lifecycle(chunk, &source, &mut draft)
+            .unwrap();
+        assert!(
+            matches!(draft.document().value.get("block_entities"),Some(Tag::List{values,..}) if values.is_empty())
+        );
+        assert_eq!(nbt::write(&source).unwrap(), original);
+        let mut stale = source.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            panic!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        let Tag::Compound(fields) = &mut values[0] else {
+            panic!()
+        };
+        fields.push(("changed".into(), Tag::Byte(1)));
+        let mut stale_draft = session.draft_changed_chunk(chunk, &stale).unwrap();
+        let unchanged = stale_draft.document().clone();
+        assert!(
+            session
+                .stage_banner_lifecycle(chunk, &stale, &mut stale_draft)
+                .is_err()
+        );
+        assert_eq!(stale_draft.document(), &unchanged);
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn banner_placement_matches_java_direction_and_support_order() {
@@ -27514,12 +27874,16 @@ mod tests {
                 relative,
                 session.states[0]
             ),
-            Cell::State(actual) if actual == block
+            Cell::State(actual) if actual == session.states[0]
         ));
         let SavedBlockEntities::Encoded(after) = &session.world.saved_block_entities[&chunk] else {
             panic!()
         };
         assert_eq!(&**after, bytes);
+        assert!(matches!(
+            session.world.visible_block_entities(&chunk),
+            Some(SavedBlockEntities::Empty)
+        ));
     }
 
     #[test]

@@ -115,12 +115,11 @@ fn unique<'a>(tag: &'a Tag, key: &str) -> Result<Option<&'a Tag>> {
     Ok(value)
 }
 
-pub(crate) fn pick_item(
+pub(crate) fn find(
     payload: &SavedBlockEntities,
     chunk: ChunkPos,
     position: IVec3,
-    id: String,
-) -> Result<ItemStack> {
+) -> Result<Option<Tag>> {
     ensure!(
         position.x.div_euclid(16) == chunk.x && position.z.div_euclid(16) == chunk.z,
         "banner outside chunk"
@@ -159,13 +158,19 @@ pub(crate) fn pick_item(
             }
         }
     }
-    let mut components = Vec::new();
-    if let Some(entity) = found {
+    if let Some(entity) = &found {
         ensure!(
-            matches!(unique(&entity, "id")?, Some(Tag::String(id)) if id.matches("minecraft:banner") || id.matches("banner")),
+            matches!(unique(entity, "id")?, Some(Tag::String(id)) if id.matches("minecraft:banner") || id.matches("banner")),
             "not a banner block entity"
         );
-        if let Some(value) = unique(&entity, "components")? {
+    }
+    Ok(found)
+}
+
+pub(crate) fn collected_components(entity: Option<&Tag>) -> Result<Tag> {
+    let mut components = Vec::new();
+    if let Some(entity) = entity {
+        if let Some(value) = unique(entity, "components")? {
             let Tag::Compound(entries) = value else {
                 bail!("invalid block entity components")
             };
@@ -180,17 +185,56 @@ pub(crate) fn pick_item(
                     .cloned(),
             );
         }
-        if let Some(patterns) = unique(&entity, "patterns")? {
-            components.push(("minecraft:banner_patterns".into(), patterns.clone()));
-        }
-        if let Some(name) = unique(&entity, "CustomName")? {
+        let patterns = unique(entity, "patterns")?.cloned().unwrap_or(Tag::List {
+            element_type: TagType::Compound,
+            values: Vec::new(),
+        });
+        components.push(("minecraft:banner_patterns".into(), patterns));
+        if let Some(name) = unique(entity, "CustomName")? {
             components.push(("minecraft:custom_name".into(), name.clone()));
         }
     }
-    let components = Tag::Compound(components);
+    Ok(Tag::Compound(components))
+}
+
+pub(crate) fn pick_item(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    position: IVec3,
+    id: String,
+) -> Result<ItemStack> {
+    let entity = find(payload, chunk, position)?;
+    let components = collected_components(entity.as_ref())?;
     let max = saved_item_max(&id, &components)
         .ok_or_else(|| anyhow::anyhow!("unsupported banner item components"))?;
     ItemStack::new(id, 1, max, components).ok_or_else(|| anyhow::anyhow!("invalid banner item"))
+}
+
+pub(crate) fn remove(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    position: IVec3,
+) -> Result<(SavedBlockEntities, Tag)> {
+    let entity = find(payload, chunk, position)?
+        .ok_or_else(|| anyhow::anyhow!("banner entity is missing"))?;
+    let SavedBlockEntities::Encoded(bytes) = payload else {
+        bail!("banner entity data is unavailable")
+    };
+    let mut document = nbt::read(bytes)?;
+    let Tag::List { values, .. } = &mut document.value else {
+        bail!("invalid block entity list")
+    };
+    let index = values
+        .iter()
+        .position(|value| value == &entity)
+        .ok_or_else(|| anyhow::anyhow!("banner entity disappeared"))?;
+    values.remove(index);
+    let replacement = if values.is_empty() {
+        SavedBlockEntities::Empty
+    } else {
+        SavedBlockEntities::Encoded(nbt::write(&document)?.into())
+    };
+    Ok((replacement, entity))
 }
 
 #[cfg(test)]
@@ -271,6 +315,215 @@ mod tests {
         assert!(append(&payload(vec![invalid]), chunk, &entity).is_err());
         let visible = append(&SavedBlockEntities::Empty, chunk, &entity).unwrap();
         assert!(pick_item(&visible, chunk, pos, "minecraft:white_banner".into()).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn banner_loot_component_filters_match_java() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::BlockState;
+        use std::{collections::BTreeMap, path::PathBuf, process::Command};
+        struct Source(Vec<u8>);
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(
+                    (path == "data/minecraft/loot_table/blocks/white_banner.json")
+                        .then(|| self.0.clone()),
+                )
+            }
+        }
+        let filters = [
+            serde_json::json!({"include":["minecraft:banner_patterns","minecraft:custom_name"]}),
+            serde_json::json!({"include":["minecraft:banner_patterns","minecraft:custom_name"],"exclude":["minecraft:banner_patterns"]}),
+            serde_json::json!({"exclude":["minecraft:custom_data"]}),
+            serde_json::json!({"include":["minecraft:custom_data"]}),
+        ];
+        let tables:Vec<_>=filters.into_iter().map(|filter| {let mut modifier=filter.as_object().unwrap().clone();modifier.insert("type".into(),serde_json::json!("minecraft:copy_components"));modifier.insert("source".into(),serde_json::json!("block_entity"));serde_json::json!({"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","modifier":modifier}]}]})}).collect();
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BannerLootOracle.java");
+        let input = temp.path().join("tables.json");
+        let output = temp.path().join("items.nbt");
+        std::fs::write(&source, include_str!("../tests/java/BannerLootOracle.java")).unwrap();
+        std::fs::write(&input, serde_json::to_vec(&tables).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BannerLootOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected = nbt::read(&std::fs::read(output).unwrap()).unwrap();
+        let block = BlockState {
+            name: "minecraft:white_banner".into(),
+            properties: BTreeMap::from([("rotation".into(), "0".into())]),
+        };
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:banner_patterns".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("pattern".into(), Tag::String("minecraft:cross".into())),
+                        ("color".into(), Tag::String("blue".into())),
+                    ])],
+                },
+            ),
+            ("minecraft:custom_name".into(), Tag::String("Named".into())),
+            (
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("future".into(), Tag::Int(42))]),
+            ),
+        ]);
+        let items = crate::items::ItemEntities::default();
+        for (index, table) in tables.iter().enumerate() {
+            let loot =
+                BlockLootTables::load(&mut Source(serde_json::to_vec(table).unwrap())).unwrap();
+            let (drops, prepared, _) = items
+                .prepare_block_entity_drops(
+                    "minecraft:white_banner",
+                    &block,
+                    None,
+                    true,
+                    &components,
+                    Some(&loot),
+                )
+                .unwrap();
+            assert_eq!(drops.len(), 1);
+            let actual = &prepared[0];
+            let expected = expected
+                .value
+                .get(&format!("case{index}"))
+                .unwrap()
+                .get("components")
+                .unwrap();
+            for key in [
+                "minecraft:banner_patterns",
+                "minecraft:custom_name",
+                "minecraft:custom_data",
+            ] {
+                match (actual.get(key), expected.get(key)) {
+                    (Some(actual), Some(expected)) => assert!(
+                        crate::inventory::equal_tag(actual, expected),
+                        "case {index} {key}"
+                    ),
+                    (None, None) => {}
+                    (actual, expected) => panic!("case {index} {key}: {actual:?} vs {expected:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3 assets"]
+    fn installed_banner_loot_preserves_vanilla_name_and_patterns() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        use native_world::loaded::BlockState;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let loot = BlockLootTables::load(&mut ResourceStack::open(&game).unwrap()).unwrap();
+        let components = Tag::Compound(vec![
+            (
+                "minecraft:banner_patterns".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("pattern".into(), Tag::String("minecraft:cross".into())),
+                        ("color".into(), Tag::String("blue".into())),
+                    ])],
+                },
+            ),
+            ("minecraft:custom_name".into(), Tag::String("Named".into())),
+            (
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("future".into(), Tag::Int(42))]),
+            ),
+        ]);
+        let items = crate::items::ItemEntities::default();
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            for wall in [false, true] {
+                let item = format!("minecraft:{color}_banner");
+                let block = BlockState {
+                    name: format!(
+                        "minecraft:{color}_{}banner",
+                        if wall { "wall_" } else { "" }
+                    ),
+                    properties: if wall {
+                        [("facing".into(), "north".into())].into()
+                    } else {
+                        [("rotation".into(), "0".into())].into()
+                    },
+                };
+                let (drops, prepared, _) = items
+                    .prepare_block_entity_drops(&item, &block, None, true, &components, Some(&loot))
+                    .unwrap();
+                assert_eq!(drops.len(), 1);
+                assert_eq!(
+                    format!("{}:{}", drops[0].item.namespace, drops[0].item.path),
+                    item
+                );
+                assert_eq!(
+                    prepared[0].get("minecraft:banner_patterns"),
+                    components.get("minecraft:banner_patterns")
+                );
+                assert_eq!(
+                    prepared[0].get("minecraft:custom_name"),
+                    components.get("minecraft:custom_name")
+                );
+                assert!(prepared[0].get("minecraft:custom_data").is_none());
+            }
+        }
     }
 
     #[test]

@@ -505,6 +505,11 @@ pub fn read_saved_burning_time_attribute(player: &NamedTag) -> Result<SavedAttri
     saved_attribute(player, "burning_time", 1.0)
 }
 
+/// The persistent attribute is combined with transient equipped modifiers.
+pub fn read_saved_knockback_resistance_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "knockback_resistance", 0.0)
+}
+
 pub fn read_saved_water_movement_efficiency_attribute(player: &NamedTag) -> Result<SavedAttribute> {
     saved_attribute(player, "water_movement_efficiency", 0.0)
 }

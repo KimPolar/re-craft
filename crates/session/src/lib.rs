@@ -33,6 +33,7 @@ pub mod farmland;
 mod interaction;
 pub mod inventory;
 pub mod items;
+mod knockback;
 pub mod loaded;
 pub mod lodestone;
 pub mod mining;

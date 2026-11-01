@@ -29,6 +29,14 @@ pub(crate) fn bounciness(
     equipped_attribute(saved, inventory, enchantments, "bounciness")?.value(0.0, 1.0)
 }
 
+pub(crate) fn knockback_resistance(
+    saved: &SavedAttribute,
+    inventory: &PlayerInventory,
+    enchantments: &OxygenEnchantments,
+) -> Result<f64> {
+    equipped_attribute(saved, inventory, enchantments, "knockback_resistance")?.value(-2.0, 1.0)
+}
+
 pub(crate) fn jump_strength(
     saved: &SavedAttribute,
     inventory: &PlayerInventory,
@@ -221,6 +229,7 @@ fn default_armor_modifier(
     let amount = match attribute {
         "armor" => protection[index],
         "armor_toughness" => toughness,
+        "knockback_resistance" if material == "netherite" => f64::from(0.1_f32),
         _ => return None,
     };
     Some(AttributeModifier {
@@ -371,6 +380,58 @@ mod tests {
     }
     fn string(value: &str) -> Tag {
         Tag::String(value.into())
+    }
+
+    #[test]
+    fn knockback_resistance_combines_netherite_and_custom_equipment() {
+        let registry = OxygenEnchantments::default();
+        let mut inventory = PlayerInventory::default();
+        for (slot, name) in [
+            (0, "minecraft:netherite_helmet"),
+            (1, "minecraft:netherite_chestplate"),
+            (2, "minecraft:netherite_leggings"),
+            (3, "minecraft:netherite_boots"),
+        ] {
+            inventory.set_slot(
+                PlayerSlot::Armor(slot),
+                Some(ItemStack::unresolved(name.into(), 1, Tag::Compound(vec![])).unwrap()),
+            );
+        }
+        assert_eq!(
+            knockback_resistance(&SavedAttribute::with_base(0.0), &inventory, &registry).unwrap(),
+            f64::from(0.1_f32) * 4.0
+        );
+        assert_eq!(
+            knockback_resistance(&SavedAttribute::with_base(3.0), &inventory, &registry).unwrap(),
+            1.0
+        );
+        inventory.set_slot(
+            PlayerSlot::Armor(0),
+            Some(
+                ItemStack::unresolved(
+                    "minecraft:netherite_helmet".into(),
+                    1,
+                    Tag::Compound(vec![(
+                        "!minecraft:attribute_modifiers".into(),
+                        Tag::Compound(vec![]),
+                    )]),
+                )
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            knockback_resistance(&SavedAttribute::with_base(0.0), &inventory, &registry).unwrap(),
+            f64::from(0.1_f32) * 3.0
+        );
+        assert_eq!(
+            knockback_resistance(
+                &SavedAttribute::with_base(-10.0),
+                &PlayerInventory::default(),
+                &registry
+            )
+            .unwrap(),
+            -2.0
+        );
     }
 
     #[test]
@@ -716,11 +777,13 @@ public class EquipmentOracle {
       armor.addPermanentModifier(new AttributeModifier(Identifier.parse("example:base"), 0.5, AttributeModifier.Operation.ADD_MULTIPLIED_BASE));
       var toughness = new AttributeInstance(Attributes.ARMOR_TOUGHNESS, ignored -> {}); toughness.setBaseValue(0.5);
       toughness.addPermanentModifier(new AttributeModifier(Identifier.parse("example:total"), 0.25, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL));
+      var knockback = new AttributeInstance(Attributes.KNOCKBACK_RESISTANCE, ignored -> {}); knockback.setBaseValue(0.0);
       stack.forEachModifier(slot, (attribute, modifier) -> {
         if (attribute == Attributes.ARMOR) armor.addOrUpdateTransientModifier(modifier);
         if (attribute == Attributes.ARMOR_TOUGHNESS) toughness.addOrUpdateTransientModifier(modifier);
+        if (attribute == Attributes.KNOCKBACK_RESISTANCE) knockback.addOrUpdateTransientModifier(modifier);
       });
-      var row = new JsonArray(); row.add(name); row.add(slot.getName()); row.add(patch); row.add(armor.getValue()); row.add(toughness.getValue()); output.add(row);
+      var row = new JsonArray(); row.add(name); row.add(slot.getName()); row.add(patch); row.add(armor.getValue()); row.add(toughness.getValue()); row.add(knockback.getValue()); output.add(row);
     }
     Files.writeString(Path.of(args[2]), new Gson().toJson(output));
   }
@@ -846,6 +909,12 @@ public class EquipmentOracle {
                 actual.toughness,
                 row[4].as_f64().unwrap(),
                 "toughness {row}"
+            );
+            assert_eq!(
+                knockback_resistance(&SavedAttribute::with_base(0.0), &single, &enchantments)
+                    .unwrap(),
+                row[5].as_f64().unwrap(),
+                "knockback resistance {row}"
             );
         }
         println!(

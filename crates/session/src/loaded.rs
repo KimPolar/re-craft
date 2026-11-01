@@ -501,6 +501,9 @@ pub struct LoadedSession {
     player_visual_on_fire: bool,
     player_silent: bool,
     burning_time_attribute: crate::player_data::SavedAttribute,
+    knockback_resistance_attribute: crate::player_data::SavedAttribute,
+    knockback_resistance_revision: Option<u64>,
+    knockback_resistance: Option<f64>,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
@@ -1397,10 +1400,19 @@ impl LoadedSession {
             match self.fall.blocks_damage_knockback(source) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.stream_errors.push(format!(
-                        "player knockback from {source} is not yet simulated"
-                    ));
-                    self.unresolved_player_damage = true;
+                    if let Some(resistance) = self.knockback_resistance {
+                        self.motion.velocity = crate::knockback::from_unlocated_damage(
+                            self.motion.velocity,
+                            self.motion.on_ground,
+                            resistance,
+                            &mut self.player_random,
+                        );
+                    } else {
+                        self.stream_errors.push(format!(
+                            "player knockback resistance is unavailable for {source}"
+                        ));
+                        self.unresolved_player_damage = true;
+                    }
                 }
                 Err(error) => {
                     self.stream_errors
@@ -1649,6 +1661,7 @@ impl LoadedSession {
         self.oxygen_inventory_revision = None;
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
+        self.knockback_resistance_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
@@ -1770,6 +1783,7 @@ impl LoadedSession {
         self.oxygen_equipment = Some((attribute, enchantments));
         self.oxygen_valid = true;
         self.bounciness_inventory_revision = None;
+        self.knockback_resistance_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
@@ -1828,6 +1842,31 @@ impl LoadedSession {
                 self.bounciness = None;
                 self.stream_errors
                     .push(format!("player bounciness: {error:#}"));
+            }
+        }
+    }
+
+    fn refresh_knockback_resistance(&mut self) {
+        let revision = self.inventory.revision();
+        if self.knockback_resistance_revision == Some(revision) {
+            return;
+        }
+        self.knockback_resistance_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::knockback_resistance(
+            &self.knockback_resistance_attribute,
+            &self.inventory,
+            &registry,
+        ) {
+            Ok(value) => self.knockback_resistance = Some(value),
+            Err(error) => {
+                self.knockback_resistance = None;
+                self.stream_errors
+                    .push(format!("player knockback resistance equipment: {error:#}"));
             }
         }
     }
@@ -4272,6 +4311,7 @@ impl LoadedSession {
         self.first_person.invalidate_inventory();
         self.oxygen_inventory_revision = None;
         self.bounciness_inventory_revision = None;
+        self.knockback_resistance_revision = None;
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
@@ -4355,6 +4395,9 @@ impl LoadedSession {
         let inventory = crate::player_data::read_saved_player(source)?;
         let saved_fire = crate::player_data::read_saved_fire(source);
         let burning_time = crate::player_data::read_saved_burning_time_attribute(source)?;
+        let knockback_resistance =
+            crate::player_data::read_saved_knockback_resistance_attribute(source)?;
+        let initial_knockback_resistance = knockback_resistance.value(-2.0, 1.0)?;
         let silent = source
             .value
             .get("Silent")
@@ -4373,6 +4416,9 @@ impl LoadedSession {
         self.set_player_inventory(inventory);
         self.player_fire_ticks = i32::from(saved_fire);
         self.burning_time_attribute = burning_time;
+        self.knockback_resistance_attribute = knockback_resistance;
+        self.knockback_resistance = Some(initial_knockback_resistance);
+        self.knockback_resistance_revision = None;
         self.player_silent = silent;
         Arc::make_mut(&mut self.snapshot).last_death = last_death;
         Arc::make_mut(&mut self.snapshot).tooltip_attack_base =
@@ -4558,6 +4604,9 @@ impl LoadedSession {
             player_visual_on_fire: false,
             player_silent: false,
             burning_time_attribute: crate::player_data::SavedAttribute::with_base(1.0),
+            knockback_resistance_attribute: crate::player_data::SavedAttribute::with_base(0.0),
+            knockback_resistance_revision: None,
+            knockback_resistance: Some(0.0),
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
@@ -7213,6 +7262,9 @@ impl LoadedSession {
         self.player_fire_ticks = 0;
         self.player_visual_on_fire = false;
         self.burning_time_attribute.clear_modifiers();
+        self.knockback_resistance_attribute.clear_modifiers();
+        self.knockback_resistance_revision = None;
+        self.knockback_resistance = self.knockback_resistance_attribute.value(-2.0, 1.0).ok();
         self.ground_without_support = false;
         self.ground_support = None;
         self.bounciness_attribute.clear_modifiers();
@@ -14376,6 +14428,9 @@ impl LoadedSession {
             .effects()
             .apply_hunger(&mut self.vitals, self.game_mode);
         self.fall.tick_effects();
+        // LivingEntity updates equipped attributes after baseTick; lava and
+        // block contacts later in this tick see the refreshed equipment.
+        self.refresh_knockback_resistance();
         self.update_movement_effect_modifiers(transitions);
         self.refresh_movement_speed();
         let fluid_view = FluidView {
@@ -37734,7 +37789,7 @@ mod tests {
             }
             fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
                 let ids: &[&str] = match folder {
-                    "damage_type" => &["minecraft:lava"],
+                    "damage_type" => &["minecraft:lava", "minecraft:on_fire"],
                     "tags/damage_type" => &[
                         "minecraft:bypasses_cooldown",
                         "minecraft:bypasses_armor",
@@ -37749,6 +37804,8 @@ mod tests {
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Ok(if path == "data/minecraft/damage_type/lava.json" {
                     Some(br#"{"exhaustion":0.75,"effects":"drowning"}"#.to_vec())
+                } else if path == "data/minecraft/damage_type/on_fire.json" {
+                    Some(br#"{"exhaustion":0.0,"effects":"burning"}"#.to_vec())
                 } else if path == "data/minecraft/tags/damage_type/no_knockback.json" && self.0 {
                     Some(br#"{"values":["minecraft:lava"]}"#.to_vec())
                 } else if path.starts_with("data/minecraft/tags/damage_type/") {
@@ -37783,14 +37840,84 @@ mod tests {
             Default::default(),
             registry,
         );
-        modified.ignite_player_from_lava();
-        assert!(modified.unresolved_player_damage);
-        assert!(
-            modified
-                .stream_errors
-                .iter()
-                .any(|error| error.contains("knockback"))
+        modified.motion.velocity = DVec3::new(0.2, -0.1, -0.3);
+        modified.motion.on_ground = true;
+        modified.player_random = native_core::random::LegacyRandom::new(17);
+        let mut expected_random = modified.player_random.clone();
+        let expected_velocity = crate::knockback::from_unlocated_damage(
+            modified.motion.velocity,
+            true,
+            0.0,
+            &mut expected_random,
         );
+        let expected_burn_pitch = 2.0_f32 + expected_random.next_float() * 0.4_f32;
+        modified.ignite_player_from_lava();
+        assert!(!modified.unresolved_player_damage);
+        assert_eq!(modified.motion.velocity, expected_velocity);
+        let sounds = modified.take_consume_sounds();
+        assert_eq!(sounds.len(), 2);
+        assert_eq!(
+            sounds[1].info.pitch.to_bits(),
+            expected_burn_pitch.to_bits()
+        );
+        assert_eq!(
+            modified.player_random.next_int(),
+            expected_random.next_int()
+        );
+
+        // Entity.baseTick runs before equipment attributes are refreshed.
+        // A newly equipped item therefore applies after the first fire tick.
+        use native_persistence::nbt::{Tag, TagType};
+        let mut timing = self::session();
+        timing.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            Default::default(),
+            Arc::new(OxygenEnchantments::load(&mut Pack(false)).unwrap()),
+        );
+        let modifier = Tag::Compound(vec![
+            (
+                "type".into(),
+                Tag::String("minecraft:knockback_resistance".into()),
+            ),
+            ("id".into(), Tag::String("example:resistance".into())),
+            ("amount".into(), Tag::Double(1.0)),
+            ("operation".into(), Tag::String("add_value".into())),
+            ("slot".into(), Tag::String("mainhand".into())),
+        ]);
+        let stack = crate::inventory::ItemStack::unresolved(
+            "minecraft:stone".into(),
+            1,
+            Tag::Compound(vec![(
+                "minecraft:attribute_modifiers".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![modifier],
+                },
+            )]),
+        )
+        .unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(crate::PlayerSlot::Storage(0), Some(stack));
+        timing.set_player_inventory(inventory);
+        timing.player_fire_ticks = 20;
+        timing.player_random = native_core::random::LegacyRandom::new(17);
+        let mut expected_random = timing.player_random.clone();
+        crate::knockback::from_unlocated_damage(
+            timing.motion.velocity,
+            timing.motion.on_ground,
+            0.0,
+            &mut expected_random,
+        );
+        timing.update(TICK);
+        assert_eq!(timing.player_random.next_int(), expected_random.next_int());
+        assert_eq!(timing.knockback_resistance, Some(1.0));
+        timing.damage_cooldown = Default::default();
+        timing.player_fire_ticks = 20;
+        timing.player_random = native_core::random::LegacyRandom::new(17);
+        let mut expected_random = timing.player_random.clone();
+        timing.update(TICK);
+        assert_eq!(timing.player_random.next_int(), expected_random.next_int());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use native_resources::transforms::{
 use native_world::{Block, World};
 
 pub mod animation;
+pub mod bubble_column;
 pub mod camera;
 pub mod chest_lid;
 pub mod chest_placement;

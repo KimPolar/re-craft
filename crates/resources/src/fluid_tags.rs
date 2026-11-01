@@ -89,8 +89,20 @@ impl BubbleColumnTags {
         self.drag_down.contains(block) || self.push_up.contains(block)
     }
 
+    pub fn pushes_up(&self, block: &str) -> bool {
+        self.push_up.contains(block)
+    }
+
+    pub fn drags_down(&self, block: &str) -> bool {
+        self.drag_down.contains(block)
+    }
+
+    pub fn can_occupy_fluid(&self, fluid: &str) -> bool {
+        self.occupiable_fluids.contains(fluid)
+    }
+
     pub fn water_can_occupy(&self) -> bool {
-        self.occupiable_fluids.contains("minecraft:water")
+        self.can_occupy_fluid("minecraft:water")
     }
 }
 

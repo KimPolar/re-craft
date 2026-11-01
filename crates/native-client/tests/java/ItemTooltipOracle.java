@@ -40,6 +40,7 @@ public class ItemTooltipOracle {
         var holder=(Holder<Potion>)Potions.class.getField(input.get("potion").getAsString().toUpperCase(java.util.Locale.ROOT)).get(null);
         stack.set(DataComponents.POTION_CONTENTS,new PotionContents(holder));
       }
+      if(input.has("scale")) stack.set(DataComponents.POTION_DURATION_SCALE,input.get("scale").getAsFloat());
       if(input.has("custom")) stack.set(DataComponents.CUSTOM_NAME,Component.literal(input.get("custom").getAsString()));
       if(input.has("item_name")) stack.set(DataComponents.ITEM_NAME,Component.literal(input.get("item_name").getAsString()));
       if(input.has("rarity")) stack.set(DataComponents.RARITY,Rarity.valueOf(input.get("rarity").getAsString()));
@@ -49,6 +50,7 @@ public class ItemTooltipOracle {
         stack.set(DataComponents.LORE,new ItemLore(lore));
       }
       if(input.has("hide") && input.get("hide").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(true,new java.util.LinkedHashSet<>()));
+      if(input.has("hide_potion") && input.get("hide_potion").getAsBoolean()) stack.set(DataComponents.TOOLTIP_DISPLAY,new TooltipDisplay(false,new java.util.LinkedHashSet<>(java.util.Set.of(DataComponents.POTION_CONTENTS))));
       var lines=new JsonArray();
       for(var component:stack.getTooltipLines(Item.TooltipContext.EMPTY,null,TooltipFlag.NORMAL)) {
         lines.add(ComponentSerialization.CODEC.encodeStart(JsonOps.INSTANCE,component).getOrThrow());

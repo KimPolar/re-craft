@@ -47,6 +47,7 @@ mod orb_render;
 mod player_inventory;
 mod player_preview;
 mod player_skin;
+mod potion_tooltip;
 mod preview;
 mod preview_app;
 mod preview_lighting;

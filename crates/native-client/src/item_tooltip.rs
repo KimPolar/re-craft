@@ -143,6 +143,11 @@ pub fn lines(item: &ItemStack, assets: &MenuAssets) -> Vec<Vec<Span>> {
         }]
     };
     let mut lines = vec![title];
+    if !hidden(display, "minecraft:potion_contents")
+        && let Some(potion_lines) = crate::potion_tooltip::lines(item, assets)
+    {
+        lines.extend(potion_lines);
+    }
     if !hidden(display, "minecraft:lore")
         && let Some(Tag::List { values, .. }) = components.get("minecraft:lore")
     {
@@ -319,16 +324,81 @@ mod tests {
                 serde_json::json!({"id":format!("minecraft:{id}"),"item_name":"Prototype Name"}),
             );
         }
-        for potion in [
-            "water",
-            "swiftness",
-            "long_swiftness",
-            "strong_poison",
-            "leaping",
-            "slow_falling",
+        for id in [
+            "potion",
+            "splash_potion",
+            "lingering_potion",
+            "tipped_arrow",
+            "apple",
         ] {
-            cases.push(serde_json::json!({"id":"minecraft:potion","potion":potion}));
+            for potion in [
+                "water",
+                "mundane",
+                "thick",
+                "awkward",
+                "night_vision",
+                "long_night_vision",
+                "invisibility",
+                "long_invisibility",
+                "leaping",
+                "long_leaping",
+                "strong_leaping",
+                "fire_resistance",
+                "long_fire_resistance",
+                "swiftness",
+                "long_swiftness",
+                "strong_swiftness",
+                "slowness",
+                "long_slowness",
+                "strong_slowness",
+                "turtle_master",
+                "long_turtle_master",
+                "strong_turtle_master",
+                "water_breathing",
+                "long_water_breathing",
+                "healing",
+                "strong_healing",
+                "harming",
+                "strong_harming",
+                "poison",
+                "long_poison",
+                "strong_poison",
+                "regeneration",
+                "long_regeneration",
+                "strong_regeneration",
+                "strength",
+                "long_strength",
+                "strong_strength",
+                "weakness",
+                "long_weakness",
+                "luck",
+                "slow_falling",
+                "long_slow_falling",
+                "wind_charged",
+                "weaving",
+                "oozing",
+                "infested",
+            ] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion":potion}));
+            }
         }
+        for id in [
+            "potion",
+            "splash_potion",
+            "lingering_potion",
+            "tipped_arrow",
+        ] {
+            for scale in [0.0, 0.125, 0.5, 1.5, 2.0] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion":"strong_swiftness","scale":scale}));
+            }
+        }
+        cases.push(
+            serde_json::json!({"id":"minecraft:potion","potion":"swiftness","lore":["Lore"]}),
+        );
+        cases.push(
+            serde_json::json!({"id":"minecraft:potion","potion":"swiftness","hide_potion":true}),
+        );
+        cases.push(serde_json::json!({"id":"minecraft:potion","hide_potion":true}));
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
@@ -381,6 +451,24 @@ mod tests {
                     Tag::Compound(vec![("hide_tooltip".into(), Tag::Byte(1))]),
                 ));
             }
+            if case["hide_potion"].as_bool() == Some(true) {
+                fields.push((
+                    "minecraft:tooltip_display".into(),
+                    Tag::Compound(vec![(
+                        "hidden_components".into(),
+                        Tag::List {
+                            element_type: TagType::String,
+                            values: vec![Tag::String("minecraft:potion_contents".into())],
+                        },
+                    )]),
+                ));
+            }
+            if let Some(scale) = case["scale"].as_f64() {
+                fields.push((
+                    "minecraft:potion_duration_scale".into(),
+                    Tag::Float(scale as f32),
+                ));
+            }
             if let Some(lore) = case["lore"].as_array() {
                 fields.push((
                     "minecraft:lore".into(),
@@ -415,11 +503,24 @@ mod tests {
                 assert!(actual.is_empty() && expected_lines.is_empty(), "{case}");
                 continue;
             }
-            let count = if case["lore"].is_array() {
+            let potion_case = case["potion"].is_string()
+                || matches!(
+                    case["id"].as_str(),
+                    Some(
+                        "minecraft:potion"
+                            | "minecraft:splash_potion"
+                            | "minecraft:lingering_potion"
+                            | "minecraft:tipped_arrow"
+                    )
+                );
+            let count = if case["lore"].is_array() || potion_case {
                 actual.len()
             } else {
                 1
             };
+            if potion_case {
+                assert_eq!(actual.len(), expected_lines.len(), "{case} {expected}");
+            }
             assert!(expected_lines.len() >= count, "{case}");
             for index in 0..count {
                 let actual_chars: Vec<_> = actual[index]

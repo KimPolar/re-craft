@@ -35,6 +35,7 @@ mod interaction;
 pub mod inventory;
 pub mod items;
 mod knockback;
+mod known_movement;
 pub mod loaded;
 mod location_enchantments;
 pub mod lodestone;

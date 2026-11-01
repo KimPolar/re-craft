@@ -650,6 +650,7 @@ pub struct LoadedSession {
     honey_particles: VecDeque<HoneyParticleBurst>,
     soul_particles: VecDeque<SoulParticleSpawn>,
     player_known_movement: DVec3,
+    client_movement: crate::known_movement::ClientMovement,
     drown_particles: VecDeque<DrownParticleSpawn>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
@@ -2641,6 +2642,9 @@ impl LoadedSession {
             return Err("invalid saved player motion");
         }
         self.motion.position = position;
+        self.client_movement =
+            crate::known_movement::ClientMovement::new(self.origin.as_dvec3() + position);
+        self.player_known_movement = DVec3::ZERO;
         self.ground_support = None;
         self.ground_without_support = false;
         self.motion.velocity = saved.velocity;
@@ -5191,6 +5195,9 @@ impl LoadedSession {
             honey_particles: VecDeque::new(),
             soul_particles: VecDeque::new(),
             player_known_movement: DVec3::ZERO,
+            client_movement: crate::known_movement::ClientMovement::new(
+                origin.as_dvec3() + player.position.as_dvec3(),
+            ),
             drown_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
@@ -7726,6 +7733,8 @@ impl LoadedSession {
         self.tick_enchantment_failure = None;
         self.tick_enchantment_cache = None;
         self.player_known_movement = DVec3::ZERO;
+        self.client_movement =
+            crate::known_movement::ClientMovement::new(self.origin.as_dvec3() + position);
         self.camera = crate::camera::CameraMotion::new(position, self.player.pose.eye_height());
         self.vitals = crate::survival::PlayerVitals {
             health: max_health,
@@ -15453,7 +15462,9 @@ impl LoadedSession {
                 block_speed,
             )
         };
-        self.player_known_movement = actual;
+        self.player_known_movement = self
+            .client_movement
+            .advance(self.origin.as_dvec3() + self.motion.position);
         if let Some(result) = location_result.into_inner() {
             match result {
                 Ok((outcome, efficiency)) => {
@@ -28221,6 +28232,30 @@ mod tests {
         assert_eq!(session.movement_efficiency, Some(1.0));
         let drag = 1.0_f32 - (1.0_f32 - 0.91_f32);
         assert_eq!(session.motion.velocity.x, 0.1 * f64::from(drag));
+    }
+
+    #[test]
+    fn reported_player_movement_uses_fixed_ticks() {
+        let mut fast = session();
+        let mut slow = session();
+        for session in [&mut fast, &mut slow] {
+            session.set_random_tick_speed(0);
+            session.submit_command(PlayerCommand::Move {
+                forward: 1.0,
+                strafe: 0.0,
+                jump: false,
+            });
+        }
+        let mut moved = false;
+        for _ in 0..30 {
+            for _ in 0..5 {
+                fast.update(Duration::from_millis(10));
+            }
+            slow.update(TICK);
+            assert_eq!(fast.player_known_movement, slow.player_known_movement);
+            moved |= fast.player_known_movement != DVec3::ZERO;
+        }
+        assert!(moved);
     }
 
     #[cfg(target_os = "windows")]

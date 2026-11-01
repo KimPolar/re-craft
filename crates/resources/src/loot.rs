@@ -549,6 +549,7 @@ struct Pool {
 struct Table {
     pools: Vec<Pool>,
     modifiers: Vec<Modifier>,
+    random_sequence: Option<ResourceId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -559,6 +560,20 @@ pub struct BlockLootTables {
 }
 
 impl BlockLootTables {
+    /// Return the named stream specified by the active block loot table.
+    pub fn random_sequence_for_block(&self, block: &str) -> Result<Option<&ResourceId>> {
+        let block = ResourceId::parse(block)?;
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        Ok(self
+            .tables
+            .get(&id)
+            .context("block loot table unavailable")?
+            .random_sequence
+            .as_ref())
+    }
     /// Check all branches using the entity and original state supplied by a player break.
     pub fn fully_supported_player_block(&self, block: &str) -> bool {
         self.fully_supported_player_block_inner(block, false)
@@ -980,6 +995,10 @@ fn parse_table(
     Ok(Table {
         pools: parsed,
         modifiers: parse_modifiers(json.get("modifier"), provider, &mut visiting)?,
+        random_sequence: json
+            .get("random_sequence")
+            .map(|value| ResourceId::parse(value.as_str().context("invalid loot random sequence")?))
+            .transpose()?,
     })
 }
 

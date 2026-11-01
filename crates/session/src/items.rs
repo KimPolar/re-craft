@@ -1771,18 +1771,6 @@ impl ItemEntities {
             .is_ok()
     }
 
-    pub(crate) fn prepare_block_without_entity(
-        &self,
-        name: &str,
-        properties: &std::collections::BTreeMap<String, String>,
-        tables: Option<&BlockLootTables>,
-    ) -> anyhow::Result<(Vec<Drop>, LegacyRandom)> {
-        let tables = tables.ok_or_else(|| anyhow::anyhow!("block loot table unavailable"))?;
-        let mut random = self.random.clone();
-        let drops = tables.drops_without_entity_at(name, Some(properties), Some(&mut random))?;
-        Ok((drops, random))
-    }
-
     pub(crate) fn drop_block_without_entity(
         &mut self,
         position: IVec3,

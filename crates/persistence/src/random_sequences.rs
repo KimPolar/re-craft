@@ -40,6 +40,12 @@ pub struct RandomSequences {
     changed: BTreeMap<DimensionId, (u64, u64)>,
 }
 
+/// Captures the pending change for one stream so a failed action can roll back.
+pub struct SequenceCheckpoint {
+    name: DimensionId,
+    changed: Option<(u64, u64)>,
+}
+
 impl RandomSequences {
     /// Decode a 26.3 saved-data document, or the vanilla defaults for an absent file.
     pub fn read(source: Option<NamedTag>) -> Result<Self> {
@@ -126,6 +132,25 @@ impl RandomSequences {
             self.changed.insert(name, state);
         }
         Ok(())
+    }
+
+    pub fn checkpoint(&self, name: &str) -> Result<SequenceCheckpoint> {
+        let name = id(name)?;
+        Ok(SequenceCheckpoint {
+            changed: self.changed.get(&name).copied(),
+            name,
+        })
+    }
+
+    pub fn restore(&mut self, checkpoint: SequenceCheckpoint) {
+        match checkpoint.changed {
+            Some(state) => {
+                self.changed.insert(checkpoint.name, state);
+            }
+            None => {
+                self.changed.remove(&checkpoint.name);
+            }
+        }
     }
 
     /// Build an NBT document while retaining unrecognized data and entry fields.
@@ -229,6 +254,27 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn checkpoint_restores_absent_and_already_changed_sequences() {
+        let mut saved = RandomSequences::read(Some(document())).unwrap();
+        let checkpoint = saved.checkpoint("example:new").unwrap();
+        let mut random = saved.get("example:new", 42).unwrap();
+        random.next_long();
+        saved.set("example:new", &random).unwrap();
+        assert!(saved.is_dirty());
+        saved.restore(checkpoint);
+        assert!(!saved.is_dirty());
+
+        saved.set("example:new", &random).unwrap();
+        let checkpoint = saved.checkpoint("example:new").unwrap();
+        let prior = random.state();
+        random.next_long();
+        saved.set("example:new", &random).unwrap();
+        saved.restore(checkpoint);
+        assert_eq!(saved.get("example:new", 42).unwrap().state(), prior);
+        assert!(saved.is_dirty());
     }
 
     #[test]

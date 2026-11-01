@@ -377,6 +377,15 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (1, 0)
         }
         "minecraft:ice" if state.properties.is_empty() => (1, 0),
+        "minecraft:frosted_ice"
+            if state.properties.len() == 1
+                && matches!(
+                    state.properties.get("age").map(String::as_str),
+                    Some("0" | "1" | "2" | "3")
+                ) =>
+        {
+            (1, 0)
+        }
         "minecraft:glowstone" | "minecraft:sea_lantern" | "minecraft:shroomlight"
             if state.properties.is_empty() =>
         {
@@ -1888,6 +1897,7 @@ mod tests {
             "nether_bricks",
             "quartz_block",
             "ice",
+            "frosted_ice",
             "packed_ice",
             "blue_ice",
             "bamboo_mosaic",
@@ -2002,6 +2012,33 @@ mod tests {
                 properties(&s).unwrap_or_else(|| panic!("unsupported vanilla state {s:?}"));
             assert_eq!(row["opacity"], opacity, "{s:?}");
             assert_eq!(row["emission"], emission, "{s:?}");
+            if s.name == "minecraft:frosted_ice" {
+                assert_eq!(row["friction"].as_f64().unwrap() as f32, 0.98_f32);
+                let shape = crate::collision::block_shape(&s).unwrap();
+                assert_eq!(shape.len(), 1);
+                assert_eq!(
+                    row["collision"],
+                    serde_json::json!([shape[0].min.to_array(), shape[0].max.to_array()])
+                );
+                assert_eq!(row["outline"], row["collision"]);
+                assert_eq!(crate::collision::block_outline(&s), Some(shape));
+                for (index, direction) in [
+                    glam::IVec3::NEG_Y,
+                    glam::IVec3::Y,
+                    glam::IVec3::NEG_Z,
+                    glam::IVec3::Z,
+                    glam::IVec3::NEG_X,
+                    glam::IVec3::X,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        row["sturdy"][index].as_bool(),
+                        crate::collision::button_support_face(&s, direction)
+                    );
+                }
+            }
             let shaped = (shape_family(&s.name)
                 && s.properties.get("type").is_none_or(|v| v != "double"))
                 || matches!(

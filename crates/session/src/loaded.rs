@@ -27120,6 +27120,32 @@ mod tests {
     }
 
     #[test]
+    fn player_lands_and_slides_on_frosted_ice_at_all_ages() {
+        for age in ["0", "1", "2", "3"] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let ice = session.intern_block(state("minecraft:frosted_ice", &[("age", age)]));
+            assert!(session.set(IVec3::new(4, 1, 4), ice));
+            session.motion.position = DVec3::new(4.5, 2.2, 4.5);
+            session.motion.velocity = DVec3::new(0.0, -0.5, 0.1);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.update(TICK);
+            assert!(session.motion.on_ground, "age {age}");
+            assert_eq!(session.motion.position.y, 2.0, "age {age}");
+            assert_eq!(session.friction_below(), 0.98, "age {age}");
+            session.motion.velocity.z = 0.1;
+            session.update(TICK);
+            let expected = 0.1 * f64::from(0.98_f32 * 0.91_f32);
+            assert!(
+                (session.motion.velocity.z - expected).abs() < 1.0e-10,
+                "age {age}"
+            );
+        }
+    }
+
+    #[test]
     fn player_bounces_on_slime_unless_sneaking_or_suppressed() {
         for (name, sneaking, suppressed, bounces, start_y) in [
             ("minecraft:slime_block", false, false, true, 2.2),

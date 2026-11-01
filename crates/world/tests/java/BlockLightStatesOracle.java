@@ -34,6 +34,23 @@ public class BlockLightStatesOracle {
                 entry.addProperty("opacity", state.getLightDampening());
                 entry.addProperty("emission", state.getLightEmission());
                 entry.addProperty("shaped", state.useShapeForLightOcclusion());
+                if (name.equals("minecraft:frosted_ice")) {
+                    entry.addProperty("friction", block.getFriction());
+                    var getter = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
+                    var pos = net.minecraft.core.BlockPos.ZERO;
+                    var sturdy = new JsonArray();
+                    for (var direction : Direction.values()) sturdy.add(state.isFaceSturdy(getter, pos, direction));
+                    entry.add("sturdy", sturdy);
+                    for (var shape : new Object[][] {{"collision", state.getCollisionShape(getter, pos)}, {"outline", state.getShape(getter, pos)}}) {
+                        var boxes = ((net.minecraft.world.phys.shapes.VoxelShape)shape[1]).toAabbs();
+                        if (boxes.size() != 1) throw new AssertionError("unexpected ice shape");
+                        var box = boxes.get(0); var points = new JsonArray();
+                        for (double[] point : new double[][] {{box.minX,box.minY,box.minZ},{box.maxX,box.maxY,box.maxZ}}) {
+                            var values = new JsonArray(); for (double value : point) values.add(value); points.add(values);
+                        }
+                        entry.add((String)shape[0], points);
+                    }
+                }
                 var faces = new JsonArray();
                 for (var direction : new Direction[]{Direction.EAST, Direction.WEST, Direction.UP, Direction.DOWN, Direction.SOUTH, Direction.NORTH}) {
                     int[] mask = new int[16];

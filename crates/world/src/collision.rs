@@ -228,11 +228,44 @@ mod face_tests {
         };
         assert!(block_shape(&state).is_none());
     }
+
+    #[test]
+    fn frosted_ice_supports_valid_ages_and_rejects_unknown_states() {
+        for age in ["0", "1", "2", "3"] {
+            let state = BlockState {
+                name: "minecraft:frosted_ice".into(),
+                properties: [("age".into(), age.into())].into(),
+            };
+            assert_eq!(block_shape(&state), Some(FULL.to_vec()));
+            assert_eq!(block_outline(&state), Some(FULL.to_vec()));
+            assert!(button_support_face(&state, IVec3::Y).unwrap());
+        }
+        for age in ["-1", "4", "00", "bad"] {
+            let state = BlockState {
+                name: "minecraft:frosted_ice".into(),
+                properties: [("age".into(), age.into())].into(),
+            };
+            assert!(block_shape(&state).is_none());
+        }
+        let extra = BlockState {
+            name: "minecraft:frosted_ice".into(),
+            properties: [("age".into(), "0".into()), ("extra".into(), "true".into())].into(),
+        };
+        assert!(block_shape(&extra).is_none());
+    }
 }
 
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "frosted_ice" {
+        return (state.properties.len() == 1
+            && matches!(
+                state.properties.get("age").map(String::as_str),
+                Some("0" | "1" | "2" | "3")
+            ))
+        .then(|| FULL.to_vec());
+    }
     if banner_item_id(state).is_some() {
         return Some(EMPTY.to_vec());
     }

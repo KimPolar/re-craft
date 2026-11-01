@@ -440,11 +440,7 @@ impl MenuRenderer {
         let size = (canvas.width as u32, canvas.height as u32);
         ensure!(size.0 > 0 && size.1 > 0, "menu overlay is empty");
         if self.overlay_size != size {
-            let format = if self.config.format.is_srgb() {
-                wgpu::TextureFormat::Rgba8UnormSrgb
-            } else {
-                wgpu::TextureFormat::Rgba8Unorm
-            };
+            let format = canvas_texture_format(self.config.format.is_srgb());
             let texture = texture(
                 &self.device,
                 size,
@@ -462,22 +458,13 @@ impl MenuRenderer {
             self.overlay_texture = Some(texture);
             self.overlay_size = size;
         }
-        let mut rgba = Vec::with_capacity(canvas.pixels.len() * 4);
-        for &pixel in &canvas.pixels {
-            rgba.extend_from_slice(&[
-                (pixel >> 16) as u8,
-                (pixel >> 8) as u8,
-                pixel as u8,
-                (pixel >> 24) as u8,
-            ]);
-        }
-        write_rgba(
+        write_canvas(
             &self.queue,
             self.overlay_texture
                 .as_ref()
                 .context("menu overlay missing")?,
             size,
-            &rgba,
+            canvas,
         );
         Ok(())
     }
@@ -1267,6 +1254,45 @@ fn upload_rgba(
     Ok(texture)
 }
 
+fn canvas_texture_format(srgb: bool) -> wgpu::TextureFormat {
+    #[cfg(target_endian = "little")]
+    {
+        if srgb {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Bgra8Unorm
+        }
+    }
+    #[cfg(target_endian = "big")]
+    {
+        if srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        }
+    }
+}
+
+fn write_canvas(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), canvas: &Canvas) {
+    // Canvas stores ARGB u32 pixels. On Windows their in-memory bytes are
+    // BGRA, so a BGRA texture can read them directly without a second buffer.
+    #[cfg(target_endian = "little")]
+    write_rgba(queue, texture, size, bytemuck::cast_slice(&canvas.pixels));
+    #[cfg(target_endian = "big")]
+    {
+        let mut rgba = Vec::with_capacity(canvas.pixels.len() * 4);
+        for &pixel in &canvas.pixels {
+            rgba.extend_from_slice(&[
+                (pixel >> 16) as u8,
+                (pixel >> 8) as u8,
+                pixel as u8,
+                (pixel >> 24) as u8,
+            ]);
+        }
+        write_rgba(queue, texture, size, &rgba);
+    }
+}
+
 fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), bytes: &[u8]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -1335,6 +1361,43 @@ mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
 
+    #[cfg(target_endian = "little")]
+    #[test]
+    #[ignore = "CPU performance measurement"]
+    fn measure_menu_overlay_preparation() {
+        use std::{hint::black_box, time::Instant};
+        let mut canvas = Canvas::new(640, 360);
+        for (index, pixel) in canvas.pixels.iter_mut().enumerate() {
+            *pixel = (index as u32).wrapping_mul(0x9e37_79b9);
+        }
+        let mut old = Vec::new();
+        let mut direct = Vec::new();
+        for _ in 0..500 {
+            let start = Instant::now();
+            let mut rgba = Vec::with_capacity(canvas.pixels.len() * 4);
+            for &pixel in black_box(&canvas.pixels) {
+                rgba.extend_from_slice(&[
+                    (pixel >> 16) as u8,
+                    (pixel >> 8) as u8,
+                    pixel as u8,
+                    (pixel >> 24) as u8,
+                ]);
+            }
+            black_box(rgba);
+            old.push(start.elapsed());
+            let start = Instant::now();
+            let bytes: &[u8] = bytemuck::cast_slice(black_box(&canvas.pixels));
+            black_box(bytes);
+            direct.push(start.elapsed());
+        }
+        old.sort_unstable();
+        direct.sort_unstable();
+        println!(
+            "640x360 menu overlay preparation, 500 samples: RGBA conversion median={:?} p95={:?}; BGRA view median={:?} p95={:?}; excludes GPU upload and display",
+            old[250], old[475], direct[250], direct[475]
+        );
+    }
+
     #[test]
     #[ignore = "requires a GPU; renders offscreen without opening a window"]
     fn gpu_gui_overlay_clips_partial_logical_pixels() {
@@ -1355,123 +1418,145 @@ mod tests {
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
                 .unwrap();
-            let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("test image layout"),
-                entries: &[texture_entry(0), sampler_entry(1)],
-            });
-            let mut scale = crate::gui_gpu::GuiScaleBinding::new(&device);
-            scale.set(&queue, 3);
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("test GUI shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("menu_gui_overlay.wgsl").into()),
-            });
-            let format = wgpu::TextureFormat::Rgba8Unorm;
-            let pipeline = pipeline_entry_layouts(
-                &device,
-                &[&image_layout, &scale.layout],
-                &shader,
-                format,
-                None,
-                "fragment",
-                "test GUI pipeline",
-            );
-            let image = RgbaImage::from_fn(3, 2, |x, y| {
-                image::Rgba([(x * 60) as u8, (y * 100) as u8, 13, 255])
-            });
-            let source = upload_rgba(&device, &queue, &image, format, "test GUI source").unwrap();
-            let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
-            let binding = image_binding(
-                &device,
-                &image_layout,
-                &source.create_view(&Default::default()),
-                &sampler,
-            );
-            let target = texture(
-                &device,
-                (7, 5),
-                format,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                "test GUI output",
-            )
-            .unwrap();
-            let view = target.create_view(&Default::default());
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: 256 * 5,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut encoder = device.create_command_encoder(&Default::default());
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(color_attachment(
-                        &view,
-                        wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    ))],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
+            for srgb in [false, true] {
+                let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let image_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("test image layout"),
+                        entries: &[texture_entry(0), sampler_entry(1)],
+                    });
+                let mut scale = crate::gui_gpu::GuiScaleBinding::new(&device);
+                scale.set(&queue, 3);
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("test GUI shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("menu_gui_overlay.wgsl").into()),
                 });
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &binding, &[]);
-                pass.set_bind_group(1, &scale.bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(5),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 7,
-                    height: 5,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([encoder.finish()]);
-            let (sender, receiver) = mpsc::channel();
-            readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = sender.send(result);
+                let format = if srgb {
+                    wgpu::TextureFormat::Rgba8UnormSrgb
+                } else {
+                    wgpu::TextureFormat::Rgba8Unorm
+                };
+                let pipeline = pipeline_entry_layouts(
+                    &device,
+                    &[&image_layout, &scale.layout],
+                    &shader,
+                    format,
+                    None,
+                    "fragment",
+                    "test GUI pipeline",
+                );
+                let image = RgbaImage::from_fn(3, 2, |x, y| {
+                    image::Rgba([(x * 60) as u8, (y * 100) as u8, 13, (x * 85 + y * 31) as u8])
                 });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(15)),
-                })
-                .unwrap();
-            receiver
-                .recv_timeout(Duration::from_secs(15))
-                .unwrap()
-                .unwrap();
-            let pixels = readback.slice(..).get_mapped_range().unwrap();
-            for y in 0..5usize {
-                for x in 0..7usize {
-                    assert_eq!(
-                        &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4],
-                        &image.get_pixel((x / 3) as u32, (y / 3) as u32).0,
-                        "{x},{y}"
-                    );
+                let mut canvas = Canvas::new(3, 2);
+                for (pixel, rgba) in canvas.pixels.iter_mut().zip(image.pixels()) {
+                    *pixel = (u32::from(rgba[3]) << 24)
+                        | (u32::from(rgba[0]) << 16)
+                        | (u32::from(rgba[1]) << 8)
+                        | u32::from(rgba[2]);
                 }
-            }
-            drop(pixels);
-            readback.unmap();
-            if let Some(error) = errors.pop().await {
-                panic!("GPU validation failed: {error}");
+                let source = texture(
+                    &device,
+                    (3, 2),
+                    canvas_texture_format(srgb),
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    "test GUI source",
+                )
+                .unwrap();
+                write_canvas(&queue, &source, (3, 2), &canvas);
+                let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+                let binding = image_binding(
+                    &device,
+                    &image_layout,
+                    &source.create_view(&Default::default()),
+                    &sampler,
+                );
+                let target = texture(
+                    &device,
+                    (7, 5),
+                    format,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    "test GUI output",
+                )
+                .unwrap();
+                let view = target.create_view(&Default::default());
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 256 * 5,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(color_attachment(
+                            &view,
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        ))],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &binding, &[]);
+                    pass.set_bind_group(1, &scale.bind_group, &[]);
+                    pass.draw(0..6, 0..1);
+                }
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(5),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 7,
+                        height: 5,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+                let (sender, receiver) = mpsc::channel();
+                readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = sender.send(result);
+                    });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(Duration::from_secs(15)),
+                    })
+                    .unwrap();
+                receiver
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+                    .unwrap();
+                let pixels = readback.slice(..).get_mapped_range().unwrap();
+                for y in 0..5usize {
+                    for x in 0..7usize {
+                        assert_eq!(
+                            &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4],
+                            &image.get_pixel((x / 3) as u32, (y / 3) as u32).0,
+                            "{x},{y}"
+                        );
+                    }
+                }
+                drop(pixels);
+                readback.unmap();
+                if let Some(error) = errors.pop().await {
+                    panic!("GPU validation failed: {error}");
+                }
             }
         });
     }

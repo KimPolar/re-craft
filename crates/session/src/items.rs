@@ -154,6 +154,46 @@ pub enum DamageResistancePrototype<'a> {
     Component(&'a Tag),
 }
 
+/// Check the saved holder-set shape without assuming that referenced world
+/// damage types or tags exist; the active registry checks those on use.
+pub(crate) fn valid_damage_resistance_component(component: &Tag) -> bool {
+    let Tag::Compound(fields) = component else {
+        return false;
+    };
+    let mut found = fields.iter().filter(|(name, _)| name.matches("types"));
+    let Some((_, types)) = found.next() else {
+        return false;
+    };
+    if found.next().is_some() {
+        return false;
+    }
+    let valid_id = |text: &native_persistence::nbt::JavaString, tag: bool| {
+        let Ok(text) = String::from_utf16(&text.0) else {
+            return false;
+        };
+        let text = if tag {
+            text.strip_prefix('#').unwrap_or(&text)
+        } else {
+            &text
+        };
+        native_resources::packs::ResourceId::parse(text).is_ok()
+    };
+    match types {
+        Tag::String(text) => valid_id(text, true),
+        Tag::List {
+            element_type: native_persistence::nbt::TagType::String,
+            values,
+        } => values
+            .iter()
+            .all(|value| matches!(value, Tag::String(text) if valid_id(text, false))),
+        Tag::List {
+            element_type: native_persistence::nbt::TagType::End,
+            values,
+        } => values.is_empty(),
+        _ => false,
+    }
+}
+
 /// Resolve an item's damage-resistance component against the active world's
 /// damage-type tags. `None` means the item prototype has not been resolved.
 pub fn damage_resistant(
@@ -191,6 +231,10 @@ pub fn damage_resistant(
         "conflicting damage resistance component patch"
     );
     if removed.is_some() {
+        ensure!(
+            matches!(removed, Some(Tag::Compound(fields)) if fields.is_empty()),
+            "invalid removed damage resistance component"
+        );
         return Ok(Some(false));
     }
     let component = if let Some(value) = added {
@@ -203,7 +247,7 @@ pub fn damage_resistant(
         }
     };
     ensure!(
-        matches!(component, Tag::Compound(_)),
+        valid_damage_resistance_component(component),
         "invalid damage resistance component"
     );
     let types = component

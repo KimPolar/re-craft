@@ -532,6 +532,7 @@ impl PlayerInventory {
         source: &str,
         random: &mut LegacyRandom,
         damage_tags: Option<&OxygenEnchantments>,
+        item_registry: Option<&native_resources::item_registry::ItemRegistry>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         if amount <= 0.0 {
@@ -583,26 +584,46 @@ impl PlayerInventory {
             {
                 continue;
             }
-            ensure!(
-                item.components.get("minecraft:damage_resistant").is_none()
-                    && item.components.get("!minecraft:damage_resistant").is_none(),
-                "custom equipment damage resistance is unsupported"
-            );
-            if item.id().starts_with("minecraft:netherite_") {
-                let fire = match damage_tags {
-                    Some(tags) => tags.damage_type_has_tag("minecraft:is_fire", source)?,
-                    None => matches!(
-                        source,
-                        "minecraft:lava"
-                            | "minecraft:in_fire"
-                            | "minecraft:on_fire"
-                            | "minecraft:hot_floor"
-                            | "minecraft:campfire"
-                    ),
+            let resistance = if let (Some(items), Some(tags)) = (item_registry, damage_tags) {
+                crate::items::damage_resistant_in_world(item, items, tags, source)?
+            } else {
+                static FIRE: std::sync::LazyLock<Tag> = std::sync::LazyLock::new(|| {
+                    Tag::Compound(vec![(
+                        "types".into(),
+                        Tag::String("#minecraft:is_fire".into()),
+                    )])
+                });
+                let prototype = if item.id().starts_with("minecraft:netherite_") {
+                    crate::items::DamageResistancePrototype::Component(&FIRE)
+                } else if crate::equippable::vanilla_equipment(item.id()).is_some() {
+                    crate::items::DamageResistancePrototype::Absent
+                } else {
+                    crate::items::DamageResistancePrototype::Unknown
                 };
-                if fire {
-                    continue;
-                }
+                crate::items::damage_resistant(
+                    item,
+                    prototype,
+                    source,
+                    |tag, damage| match damage_tags {
+                        Some(tags) => tags.damage_type_has_tag(tag, damage),
+                        None if tag == "minecraft:is_fire" => Ok(matches!(
+                            damage,
+                            "minecraft:lava"
+                                | "minecraft:in_fire"
+                                | "minecraft:on_fire"
+                                | "minecraft:hot_floor"
+                                | "minecraft:campfire"
+                        )),
+                        None => anyhow::bail!("damage type tags are unavailable"),
+                    },
+                    |id| match damage_tags {
+                        Some(tags) => tags.has_damage_type(id),
+                        None => anyhow::bail!("damage type registry is unavailable"),
+                    },
+                )?
+            };
+            if resistance.context("equipment damage resistance is unavailable")? {
+                continue;
             }
             let maximum = match item.components.get("minecraft:max_damage") {
                 Some(Tag::Int(value)) if *value > 0 => *value,
@@ -3142,6 +3163,16 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             16777216
+        } else if name.matches("minecraft:damage_resistant") {
+            if !crate::items::valid_damage_resistance_component(value) {
+                return None;
+            }
+            33554432
+        } else if name.matches("!minecraft:damage_resistant") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            67108864
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072
@@ -3247,6 +3278,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & (8388608 | 16777216) == (8388608 | 16777216) {
+        return None;
+    }
+    if seen & (33554432 | 67108864) == (33554432 | 67108864) {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
@@ -4149,7 +4183,7 @@ mod tests {
             Some(item("minecraft:elytra", Tag::Compound(vec![]))),
         );
         inventory
-            .damage_equipped_armor(8.0, "minecraft:lava", &mut LegacyRandom::new(0), None)
+            .damage_equipped_armor(8.0, "minecraft:lava", &mut LegacyRandom::new(0), None, None)
             .unwrap();
         assert_eq!(
             inventory
@@ -4190,11 +4224,97 @@ mod tests {
         let mut expected = random.clone();
         assert!(
             inventory
-                .damage_equipped_armor(8.0, "minecraft:lava", &mut random, None)
+                .damage_equipped_armor(8.0, "minecraft:lava", &mut random, None, None)
                 .is_err()
         );
         assert_eq!(inventory, before);
         assert_eq!(random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn armor_damage_resistance_uses_active_replaced_tags_and_component_patches() {
+        struct Data;
+        impl native_resources::packs::ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "damage_type" => &["minecraft:lava", "minecraft:generic"],
+                    "tags/damage_type" => &["minecraft:is_fire", "example:guard"],
+                    _ => &[],
+                };
+                names.iter().map(|name| ResourceId::parse(name)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path
+                    .contains("/damage_type/")
+                    .then(|| br#"{"exhaustion":0}"#.to_vec()))
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(match path {
+                    "data/example/tags/damage_type/guard.json" => vec![
+                        br#"{"values":["minecraft:generic"]}"#.to_vec(),
+                        br#"{"replace":true,"values":["minecraft:lava"]}"#.to_vec(),
+                    ],
+                    "data/minecraft/tags/damage_type/is_fire.json" => {
+                        vec![br#"{"values":["minecraft:lava"]}"#.to_vec()]
+                    }
+                    _ => vec![],
+                })
+            }
+        }
+        let tags = OxygenEnchantments::load(&mut Data).unwrap();
+        for (id, component, source, expected) in [
+            (
+                "minecraft:iron_helmet",
+                (
+                    "minecraft:damage_resistant",
+                    Tag::Compound(vec![("types".into(), Tag::String("#example:guard".into()))]),
+                ),
+                "minecraft:lava",
+                0,
+            ),
+            (
+                "minecraft:iron_helmet",
+                (
+                    "minecraft:damage_resistant",
+                    Tag::Compound(vec![("types".into(), Tag::String("#example:guard".into()))]),
+                ),
+                "minecraft:generic",
+                1,
+            ),
+            (
+                "minecraft:netherite_helmet",
+                ("!minecraft:damage_resistant", Tag::Compound(vec![])),
+                "minecraft:lava",
+                1,
+            ),
+        ] {
+            let components = Tag::Compound(vec![(component.0.into(), component.1)]);
+            assert_eq!(
+                crate::equippable::saved_inventory_max(id, &components),
+                Some(1)
+            );
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Armor(0),
+                ItemStack::new(id.into(), 1, 1, components),
+            );
+            inventory
+                .damage_equipped_armor(4.0, source, &mut LegacyRandom::new(0), Some(&tags), None)
+                .unwrap();
+            assert_eq!(
+                inventory
+                    .slot(PlayerSlot::Armor(0))
+                    .unwrap()
+                    .components()
+                    .get("minecraft:damage")
+                    .and_then(Tag::as_java_int)
+                    .unwrap_or(0),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -4348,6 +4468,7 @@ mod tests {
                     crate::GameMode::Survival,
                     &mut crate::fall::DamageCooldown::default(),
                     &mut LegacyRandom::new(0),
+                    None,
                 )
                 .unwrap();
             assert_eq!(
@@ -4371,6 +4492,154 @@ mod tests {
                     "{row}, slot {i}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn armor_damage_resistance_matches_java_player() {
+        use native_persistence::nbt::TagType;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("EquipmentResistanceOracle.java");
+        let output = temp.path().join("resistance.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/EquipmentResistanceOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("EquipmentResistanceOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 96);
+        let mut source = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let items = source.vanilla_item_registry().unwrap();
+        let tags = Arc::new(OxygenEnchantments::load(&mut source).unwrap());
+        for row in rows {
+            let variant = row["variant"].as_u64().unwrap();
+            let (id, maximum) = if variant >= 4 {
+                ("minecraft:netherite_helmet", 407)
+            } else {
+                ("minecraft:iron_helmet", 165)
+            };
+            let mut components = vec![(
+                "minecraft:damage".into(),
+                Tag::Int((row["initial"].as_i64().unwrap() as i32).min(maximum - 1)),
+            )];
+            if variant == 5 {
+                components.push(("!minecraft:damage_resistant".into(), Tag::Compound(vec![])));
+            }
+            if [1, 2, 3, 6, 7].contains(&variant) {
+                let types = if variant == 7 {
+                    Tag::String("#minecraft:is_fire".into())
+                } else {
+                    Tag::List {
+                        element_type: TagType::String,
+                        values: match variant {
+                            1 => vec![Tag::String("minecraft:lava".into())],
+                            2 | 6 => vec![Tag::String("minecraft:cactus".into())],
+                            _ => vec![],
+                        },
+                    }
+                };
+                components.push((
+                    "minecraft:damage_resistant".into(),
+                    Tag::Compound(vec![("types".into(), types)]),
+                ));
+            }
+            let components = Tag::Compound(components);
+            assert_eq!(
+                crate::equippable::saved_inventory_max(id, &components),
+                Some(1),
+                "{row}"
+            );
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Armor(0),
+                ItemStack::new(id.into(), 1, 1, components),
+            );
+            let mut armor = crate::equipment_attributes::ArmorTracker::default();
+            armor.set_enchantments(Arc::clone(&tags));
+            armor.refresh(&inventory).unwrap();
+            let mut fall = crate::fall::FallTracker::default();
+            fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                Default::default(),
+                Arc::clone(&tags),
+            );
+            let mut vitals = crate::survival::PlayerVitals {
+                health: 100.0,
+                max_health: 100.0,
+                ..Default::default()
+            };
+            fall.damage_with_equipment(
+                row["amount"].as_f64().unwrap() as f32,
+                if row["lava"].as_bool().unwrap() {
+                    "minecraft:lava"
+                } else {
+                    "minecraft:cactus"
+                },
+                &mut inventory,
+                &mut armor,
+                &mut vitals,
+                crate::GameMode::Survival,
+                &mut crate::fall::DamageCooldown::default(),
+                &mut LegacyRandom::new(0),
+                Some(&items),
+            )
+            .unwrap();
+            let damage = inventory
+                .slot(PlayerSlot::Armor(0))
+                .map(|item| {
+                    item.components()
+                        .get("minecraft:damage")
+                        .and_then(Tag::as_java_int)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(-1);
+            assert_eq!(i64::from(damage), row["damage"].as_i64().unwrap(), "{row}");
+            assert_eq!(
+                vitals.health.to_bits(),
+                row["health_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
         }
     }
 
@@ -4522,7 +4791,7 @@ mod tests {
                 })
                 .collect();
             inventory
-                .damage_equipped_armor(8.0, "minecraft:lava", &mut random, Some(&registry))
+                .damage_equipped_armor(8.0, "minecraft:lava", &mut random, Some(&registry), None)
                 .unwrap();
             for (slot, damage) in [PlayerSlot::Armor(3), PlayerSlot::Armor(0)]
                 .into_iter()

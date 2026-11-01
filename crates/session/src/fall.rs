@@ -662,6 +662,7 @@ impl FallTracker {
         mode: GameMode,
         cooldown: &mut DamageCooldown,
         random: &mut native_core::random::LegacyRandom,
+        item_registry: Option<&native_resources::item_registry::ItemRegistry>,
     ) -> Result<DamageOutcome> {
         let mut first_vitals = *vitals;
         let mut first_cooldown = *cooldown;
@@ -694,6 +695,7 @@ impl FallTracker {
             damage,
             &mut staged_random,
             self.enchantments.as_deref(),
+            item_registry,
         )?;
         if staged_inventory.revision() == inventory.revision() {
             *random = staged_random;

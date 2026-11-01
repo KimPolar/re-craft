@@ -1433,6 +1433,7 @@ impl LoadedSession {
             self.game_mode,
             &mut self.damage_cooldown,
             &mut self.level_random,
+            self.item_registry.as_deref(),
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -15078,6 +15079,7 @@ impl LoadedSession {
                     self.game_mode,
                     &mut self.damage_cooldown,
                     &mut self.level_random,
+                    self.item_registry.as_deref(),
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -40331,6 +40333,82 @@ mod tests {
                 .map(|sound| sound.info.event.as_ref());
             assert_eq!(actual, expected);
             assert_eq!(test.take_consume_particles().len(), 5);
+        }
+    }
+
+    #[test]
+    fn player_damage_uses_data_pack_armor_resistance_before_break_feedback() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Pack(bool);
+        impl ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "damage_type" => &["minecraft:hot_floor"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                        "example:guard",
+                    ],
+                    _ => &[],
+                };
+                names.iter().map(|name| ResourceId::parse(name)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/damage_type/hot_floor.json")
+                    .then(|| br#"{"exhaustion":0.1,"effects":"burning"}"#.to_vec()))
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(
+                    if path == "data/example/tags/damage_type/guard.json" && self.0 {
+                        vec![br#"{"values":["minecraft:hot_floor"]}"#.to_vec()]
+                    } else if path == "data/minecraft/tags/damage_type/no_knockback.json" {
+                        vec![br#"{"values":["minecraft:hot_floor"]}"#.to_vec()]
+                    } else {
+                        vec![br#"{"values":[]}"#.to_vec()]
+                    },
+                )
+            }
+        }
+        for protects in [false, true] {
+            let registry = Arc::new(OxygenEnchantments::load(&mut Pack(protects)).unwrap());
+            let mut test = session();
+            test.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                Default::default(),
+                Arc::clone(&registry),
+            );
+            test.armor.set_enchantments(Arc::clone(&registry));
+            let components = Tag::Compound(vec![
+                ("minecraft:damage".into(), Tag::Int(164)),
+                (
+                    "minecraft:damage_resistant".into(),
+                    Tag::Compound(vec![("types".into(), Tag::String("#example:guard".into()))]),
+                ),
+            ]);
+            Arc::make_mut(&mut test.inventory).set_slot(
+                PlayerSlot::Armor(0),
+                ItemStack::new("minecraft:iron_helmet".into(), 1, 1, components),
+            );
+            test.armor.refresh(&test.inventory).unwrap();
+            assert!(test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+            assert_eq!(
+                test.inventory.slot(PlayerSlot::Armor(0)).is_some(),
+                protects
+            );
+            assert_eq!(
+                test.take_consume_particles().len(),
+                if protects { 0 } else { 5 }
+            );
+            assert!(!test.unresolved_player_damage, "{:?}", test.stream_errors);
         }
     }
 

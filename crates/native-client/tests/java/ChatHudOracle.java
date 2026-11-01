@@ -80,11 +80,14 @@ public class ChatHudOracle {
         GuiMessage message = new GuiMessage(0, Component.empty(), null, GuiMessageSource.SYSTEM_SERVER, GuiMessageTag.systemSinglePlayer());
         set(chat, "trimmedMessages", List.of(new GuiMessage.Line(message, FormattedCharSequence.EMPTY, true)));
         set(options, "chatHeightUnfocused", option(0.3125));
+        set(options, "chatHeightFocused", option(1.0));
+        Object focusedScreen = unsafe.allocateInstance(net.minecraft.client.gui.screens.ChatScreen.class);
         Method draw = ChatComponent.class.getDeclaredMethod("extractRenderState", ChatGraphicsAccess.class, int.class, int.class, DisplayMode.class);
         draw.setAccessible(true);
         JsonArray rows = new JsonArray();
         for (int height : new int[]{240, 360, 600})
         for (int age : new int[]{0, 100, 180, 181, 190, 199, 200})
+        for (boolean focused : new boolean[]{false, true})
         for (double scale : new double[]{0.5, 1.0})
         for (double width : new double[]{0.25, 1.0})
         for (double opacity : new double[]{0.0, 0.5, 1.0})
@@ -95,10 +98,12 @@ public class ChatHudOracle {
             set(options, "chatOpacity", option(opacity));
             set(options, "textBackgroundOpacity", option(background));
             set(options, "chatLineSpacing", option(spacing));
+            set(gui, "screen", focused ? focusedScreen : null);
             Recorder recorder = new Recorder();
-            draw.invoke(chat, recorder, height, age, DisplayMode.BACKGROUND);
+            draw.invoke(chat, recorder, height, age, focused ? DisplayMode.FOREGROUND : DisplayMode.BACKGROUND);
             JsonObject row = new JsonObject();
             row.addProperty("height", height); row.addProperty("age", age);
+            row.addProperty("focused", focused);
             row.addProperty("scale", scale); row.addProperty("width", width);
             row.addProperty("opacity", opacity); row.addProperty("backgroundOpacity", background);
             row.addProperty("spacing", spacing); row.addProperty("visible", recorder.hasMessage);

@@ -138,6 +138,7 @@ struct DrawKey {
     experience: crate::experience_hud::Display,
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
+    chat_input_tick: Option<u64>,
     action_bar: Option<(u64, u8)>,
 }
 
@@ -200,6 +201,7 @@ pub struct GameUi {
     locked_chest_message: Option<Arc<native_session::LockedChestMessage>>,
     snapshot_messages: Arc<[native_session::SystemMessage]>,
     local_messages: Vec<native_session::SystemMessage>,
+    chat_input: crate::chat_input::ChatInput,
 }
 
 impl GameUi {
@@ -294,6 +296,7 @@ impl GameUi {
             locked_chest_message: None,
             snapshot_messages: Arc::from([]),
             local_messages: Vec::new(),
+            chat_input: crate::chat_input::ChatInput::default(),
         }
     }
 
@@ -404,6 +407,10 @@ impl GameUi {
         }
     }
 
+    pub fn resize(&mut self, size: (u32, u32)) {
+        self.set_size(size);
+    }
+
     pub fn debug_focus_pause(&mut self, enabled: bool, tick: u64) {
         self.video.pause_on_lost_focus = enabled;
         self.video_dirty = true;
@@ -436,6 +443,92 @@ impl GameUi {
             self.local_messages.remove(0);
         }
         self.merge_chat_messages();
+    }
+
+    pub fn chat_open(&self) -> bool {
+        self.chat_input.is_open()
+    }
+    pub fn chat_composing(&self) -> bool {
+        self.chat_input.composing()
+    }
+
+    pub fn close_chat(&mut self) {
+        self.chat_input.close();
+        self.last_draw = None;
+    }
+
+    pub fn open_chat(&mut self, command: bool) {
+        self.chat_input.open(command);
+        self.last_draw = None;
+    }
+
+    pub fn chat_text(&mut self, text: &str) {
+        self.chat_input.insert(text);
+        self.last_draw = None;
+    }
+
+    pub fn chat_preedit(&mut self, text: String) {
+        self.chat_input.set_preedit(text);
+        self.last_draw = None;
+    }
+
+    pub fn chat_scroll(&mut self, delta: i32) {
+        self.chat_input.scroll(delta);
+        self.last_draw = None;
+    }
+
+    pub fn chat_click(&mut self, shift: bool) {
+        let (width, height) = self.logical_size();
+        if self.cursor.1 >= height - 14 && self.cursor.1 < height - 2 {
+            self.chat_input
+                .click(&self.assets, width, self.cursor.0, shift);
+            self.last_draw = None;
+        }
+    }
+
+    pub fn chat_ime_area(&self) -> (i32, i32, u32) {
+        let (width, height) = self.logical_size();
+        let scale = self.gui_scale();
+        (
+            self.chat_input.cursor_x(&self.assets, width) * scale as i32,
+            (height - 12) * scale as i32,
+            scale,
+        )
+    }
+
+    pub fn chat_key(
+        &mut self,
+        key: KeyCode,
+        control: bool,
+        shift: bool,
+        tick: u64,
+    ) -> crate::chat_input::ChatAction {
+        if matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+            let page =
+                crate::chat_hud::focused_page_lines(&self.assets.chat, self.logical_size().1);
+            self.chat_input
+                .scroll(if key == KeyCode::PageUp { page } else { -page });
+            self.last_draw = None;
+            return crate::chat_input::ChatAction::None;
+        }
+        let action = self.chat_input.key(key, control, shift);
+        if let crate::chat_input::ChatAction::Submit(text) = &action
+            && !text.is_empty()
+        {
+            let kind = if text.starts_with('/') {
+                native_session::SystemMessageKind::CommandUnavailable
+            } else {
+                native_session::SystemMessageKind::LocalChat(text.clone().into())
+            };
+            self.local_messages
+                .push(native_session::SystemMessage { kind, tick });
+            if self.local_messages.len() > 100 {
+                self.local_messages.remove(0);
+            }
+            self.merge_chat_messages();
+        }
+        self.last_draw = None;
+        action
     }
 
     #[cfg(test)]
@@ -2029,6 +2122,10 @@ impl GameUi {
             experience: self.experience,
             hud_tick: self.hud.animation_key(tick),
             chat: crate::chat_hud::display_key(&self.assets.chat, &self.system_messages, tick),
+            chat_input_tick: self
+                .chat_input
+                .is_open()
+                .then(|| self.chat_input.blink_key()),
             action_bar: crate::action_bar::display_key(self.locked_chest_message.as_deref(), tick),
         };
         if self.last_draw == Some(key) {
@@ -2096,7 +2193,9 @@ impl GameUi {
             }
             crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
             crate::experience_hud::draw(&mut canvas, assets, self.experience);
-            crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
+            if !self.chat_input.is_open() {
+                crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
+            }
             crate::action_bar::draw(
                 &mut canvas,
                 Some(assets),
@@ -2816,6 +2915,17 @@ impl GameUi {
                 canvas.text_centered(Some(assets), w / 2, h - 42, error, [255, 120, 120]);
             }
         }
+        if self.chat_input.is_open() {
+            let max_scroll = crate::chat_hud::draw_focused(
+                &mut canvas,
+                assets,
+                &self.system_messages,
+                tick,
+                self.chat_input.scroll_offset(),
+            );
+            self.chat_input.clamp_scroll(max_scroll);
+            self.chat_input.draw(&mut canvas, assets);
+        }
         self.last_draw = Some(key);
         Some(canvas)
     }
@@ -3282,6 +3392,49 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn chat_reveals_old_messages_and_sends_local_text_without_showing_hidden_hud() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = crate::chat_hud::ChatSettings::default();
+        let assets = Arc::new(assets);
+        let mut ui = GameUi::new(assets);
+        let inventory = PlayerInventory::default();
+        ui.screenshot_result(Ok("capture.png".into()), 0);
+        ui.toggle_hud();
+        let hidden = ui.compose((1280, 720), &inventory, 240).unwrap();
+        assert!(hidden.pixels.iter().all(|&pixel| pixel == 0));
+        ui.open_chat(false);
+        let opened = ui.compose((1280, 720), &inventory, 240).unwrap();
+        assert!(opened.pixels.iter().any(|&pixel| pixel != 0));
+        let mut history = Canvas::new(opened.width as u32, opened.height as u32);
+        crate::chat_hud::draw_focused(&mut history, &ui.assets, &ui.system_messages, 240, 0);
+        assert!(history.pixels.iter().any(|&pixel| pixel != 0));
+        ui.chat_preedit("한".into());
+        assert!(ui.chat_composing());
+        ui.chat_preedit(String::new());
+        ui.chat_text("한글 대화");
+        assert_eq!(
+            ui.chat_key(KeyCode::Enter, false, false, 240),
+            crate::chat_input::ChatAction::Submit("한글 대화".into())
+        );
+        assert!(!ui.chat_open());
+        assert!(
+            matches!(ui.last_system_message(), Some(native_session::SystemMessageKind::LocalChat(text)) if text.as_ref() == "한글 대화")
+        );
+        assert!(ui.hud_hidden());
+        ui.open_chat(true);
+        ui.chat_text("time set day");
+        ui.chat_key(KeyCode::Enter, false, false, 241);
+        assert!(matches!(
+            ui.last_system_message(),
+            Some(native_session::SystemMessageKind::CommandUnavailable)
+        ));
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

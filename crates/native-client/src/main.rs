@@ -6,6 +6,7 @@ mod audio;
 mod blur_ui;
 mod breaking_render;
 mod chat_hud;
+mod chat_input;
 mod chest_model;
 mod chunk_stream;
 mod compass_motion;
@@ -1571,6 +1572,48 @@ fn request_game_screenshot(ui: &Option<GameUi>, renderer: &mut Option<Renderer>)
     }
 }
 
+fn handle_chat_key(
+    ui: &mut GameUi,
+    key: PhysicalKey,
+    state: ElementState,
+    text: Option<&str>,
+    control: bool,
+    shift: bool,
+    tick: u64,
+) -> bool {
+    if state != ElementState::Pressed {
+        return false;
+    }
+    if ui.chat_composing() {
+        return false;
+    }
+    if let PhysicalKey::Code(code) = key {
+        match ui.chat_key(code, control, shift, tick) {
+            chat_input::ChatAction::Close | chat_input::ChatAction::Submit(_) => return true,
+            chat_input::ChatAction::None => {}
+        }
+    }
+    if !control
+        && !ui.chat_composing()
+        && let Some(text) = text
+    {
+        ui.chat_text(text);
+    }
+    false
+}
+
+fn update_chat_ime_area(window: &Option<Arc<Window>>, ui: &Option<GameUi>) {
+    if let (Some(window), Some(ui)) = (window, ui)
+        && ui.chat_open()
+    {
+        let (x, y, scale) = ui.chat_ime_area();
+        window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(scale, 12 * scale),
+        );
+    }
+}
+
 fn apply_fullscreen(window: &winit::window::Window, enabled: bool) {
     window.set_fullscreen(fullscreen_mode(enabled));
 }
@@ -1856,7 +1899,10 @@ impl App {
             || self.inventory_wait.is_some()
             || snapshot.inventory.is_open()
             || snapshot.death.is_some()
-            || self.ui.as_ref().is_some_and(GameUi::paused);
+            || self
+                .ui
+                .as_ref()
+                .is_some_and(|ui| ui.paused() || ui.chat_open());
         if self.focus_pause.key(code, pressed, screen_open) {
             self.video.pause_on_lost_focus = !self.video.pause_on_lost_focus;
             if let Some(ui) = &mut self.ui {
@@ -1931,6 +1977,21 @@ impl App {
                     .pause_key(code, self.inventory_shift);
                 self.pause_action(action, event_loop);
             }
+            return;
+        }
+        if pressed
+            && !repeat
+            && matches!(code, KeyCode::KeyT | KeyCode::Slash)
+            && let Some(ui) = &mut self.ui
+        {
+            ui.open_chat(code == KeyCode::Slash);
+            self.input.release_for_screen(self.video);
+            self.input.submit(&mut self.session);
+            self.capture(false);
+            if let Some(window) = &self.window {
+                window.set_ime_allowed(true);
+            }
+            update_chat_ime_area(&self.window, &self.ui);
             return;
         }
         if code == KeyCode::F1 && pressed && !repeat {
@@ -2012,6 +2073,12 @@ impl App {
             self.death_visible = snapshot.death.is_some();
             self.inventory_wait = None;
             if self.death_visible {
+                if let Some(ui) = &mut self.ui {
+                    ui.close_chat();
+                }
+                if let Some(window) = &self.window {
+                    window.set_ime_allowed(false);
+                }
                 self.input = InputState::default();
                 self.capture(false);
             } else if !snapshot.inventory.is_open() && !self.ui.as_ref().is_some_and(GameUi::paused)
@@ -2170,6 +2237,10 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
                 }
+                if let Some(ui) = &mut self.ui {
+                    ui.resize((size.width, size.height));
+                }
+                update_chat_ime_area(&self.window, &self.ui);
             }
             WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -2189,7 +2260,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let amount = mouse_scroll::scaled_axes(mouse_scroll::event_axes(delta), self.video);
-                if self.ui.as_ref().is_some_and(GameUi::paused) {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    let steps = amount.1.signum() as i32 * if self.inventory_shift { 1 } else { 7 };
+                    ui.chat_scroll(steps);
+                } else if self.ui.as_ref().is_some_and(GameUi::paused) {
                     if let Some(ui) = &mut self.ui {
                         ui.pause_scroll(amount.1);
                     }
@@ -2211,7 +2287,10 @@ impl ApplicationHandler for App {
                 if focused {
                     if self.inventory_wait.is_none()
                         && !self.session.snapshot().inventory.is_open()
-                        && !self.ui.as_ref().is_some_and(GameUi::paused)
+                        && !self
+                            .ui
+                            .as_ref()
+                            .is_some_and(|ui| ui.paused() || ui.chat_open())
                     {
                         self.input.restore_after_screen(self.video);
                         self.input.submit(&mut self.session);
@@ -2233,6 +2312,19 @@ impl ApplicationHandler for App {
                     ui.pause_cancel();
                 }
             }
+            WindowEvent::Ime(ime) => {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    match ime {
+                        winit::event::Ime::Preedit(text, _) => ui.chat_preedit(text),
+                        winit::event::Ime::Commit(text) => ui.chat_text(&text),
+                        winit::event::Ime::Disabled => ui.chat_preedit(String::new()),
+                        winit::event::Ime::Enabled => {}
+                    }
+                }
+                update_chat_ime_area(&self.window, &self.ui);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if screenshot_shortcut(event.physical_key, event.state, event.repeat) {
                     request_game_screenshot(&self.ui, &mut self.renderer);
@@ -2240,6 +2332,30 @@ impl ApplicationHandler for App {
                 }
                 if fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
                     self.toggle_fullscreen();
+                    return;
+                }
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    let closed = handle_chat_key(
+                        ui,
+                        event.physical_key,
+                        event.state,
+                        event.text.as_deref(),
+                        self.inventory_control,
+                        self.inventory_shift,
+                        self.session.snapshot().tick,
+                    );
+                    if closed {
+                        if let Some(window) = &self.window {
+                            window.set_ime_allowed(false);
+                        }
+                        self.input.restore_after_screen(self.video);
+                        self.input.submit(&mut self.session);
+                        self.capture(true);
+                    } else {
+                        update_chat_ime_area(&self.window, &self.ui);
+                    }
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -2285,6 +2401,9 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
+                if self.ui.as_ref().is_some_and(GameUi::chat_open) {
+                    return;
+                }
                 if self.session.snapshot().death.is_some() {
                     return;
                 }
@@ -2331,6 +2450,15 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    if button == MouseButton::Left {
+                        ui.chat_click(self.inventory_shift);
+                    }
+                    update_chat_ime_area(&self.window, &self.ui);
+                    return;
+                }
                 let snapshot = self.session.snapshot();
                 if snapshot.death.is_some() {
                     if button == MouseButton::Left
@@ -2481,7 +2609,10 @@ impl ApplicationHandler for App {
                 .should_pause(now, false, self.video.pause_on_lost_focus)
         {
             let snapshot = self.session.snapshot();
-            let screen_open = self.ui.as_ref().is_some_and(GameUi::paused)
+            let screen_open = self
+                .ui
+                .as_ref()
+                .is_some_and(|ui| ui.paused() || ui.chat_open())
                 || snapshot.inventory.is_open()
                 || snapshot.death.is_some()
                 || self.inventory_wait.is_some();
@@ -2752,6 +2883,115 @@ mod world_open_tests {
 mod video_window_tests {
     use super::*;
     use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]
+    fn chat_keeps_game_ticking_and_accepts_ime_commits() {
+        if !crate::window_test::isolated(
+            "video_window_tests::chat_keeps_game_ticking_and_accepts_ime_commits",
+        ) {
+            return;
+        }
+        struct Harness {
+            app: App,
+            opened: Option<Instant>,
+            tick_at_open: u64,
+            finished: bool,
+        }
+        impl ApplicationHandler for Harness {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                let redraw = matches!(event, WindowEvent::RedrawRequested);
+                self.app.window_event(event_loop, id, event);
+                if redraw && self.opened.is_none() {
+                    self.app.key(KeyCode::KeyW, true, false, event_loop);
+                    self.app.key(KeyCode::KeyT, true, false, event_loop);
+                    assert!(self.app.ui.as_ref().unwrap().chat_open());
+                    assert!(!self.app.input.forward);
+                    assert!(!self.app.captured);
+                    self.tick_at_open = self.app.session.snapshot().tick;
+                    self.app.window_event(
+                        event_loop,
+                        id,
+                        WindowEvent::Ime(winit::event::Ime::Preedit("한".into(), Some((3, 3)))),
+                    );
+                    let ui = self.app.ui.as_mut().unwrap();
+                    assert!(ui.chat_composing());
+                    assert!(!handle_chat_key(
+                        ui,
+                        PhysicalKey::Code(KeyCode::Enter),
+                        ElementState::Pressed,
+                        None,
+                        false,
+                        false,
+                        self.tick_at_open
+                    ));
+                    self.app.window_event(
+                        event_loop,
+                        id,
+                        WindowEvent::Ime(winit::event::Ime::Preedit(String::new(), None)),
+                    );
+                    self.app.window_event(
+                        event_loop,
+                        id,
+                        WindowEvent::Ime(winit::event::Ime::Commit("한글".into())),
+                    );
+                    self.opened = Some(Instant::now());
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.about_to_wait(event_loop);
+                if let Some(opened) = self.opened
+                    && opened.elapsed() >= Duration::from_millis(400)
+                {
+                    assert!(self.app.session.snapshot().tick >= self.tick_at_open + 4);
+                    let ui = self.app.ui.as_mut().unwrap();
+                    assert!(handle_chat_key(
+                        ui,
+                        PhysicalKey::Code(KeyCode::Enter),
+                        ElementState::Pressed,
+                        None,
+                        false,
+                        false,
+                        self.app.session.snapshot().tick
+                    ));
+                    assert!(!ui.chat_open());
+                    assert!(
+                        matches!(ui.last_system_message(), Some(native_session::SystemMessageKind::LocalChat(text)) if text.as_ref() == "한글")
+                    );
+                    self.finished = true;
+                    event_loop.exit();
+                }
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut harness = Harness {
+            app: App::new(
+                native_resources::load_atlas(&game).unwrap(),
+                false,
+                Some(Arc::new(MenuAssets::load(&game, &[]).unwrap())),
+                SessionContent::default(),
+                menu_settings::VideoSettings::default(),
+            ),
+            opened: None,
+            tick_at_open: 0,
+            finished: false,
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+        assert!(harness.finished);
+    }
 
     #[test]
     #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]

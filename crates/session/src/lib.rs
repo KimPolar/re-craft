@@ -408,6 +408,8 @@ pub enum SystemMessageKind {
     DebugFocusPause(bool),
     ScreenshotSaved(Arc<str>),
     ScreenshotFailed(Arc<str>),
+    LocalChat(Arc<str>),
+    CommandUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

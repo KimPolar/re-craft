@@ -781,6 +781,12 @@ impl Viewer {
                 self.death_visible = snapshot.death.is_some();
                 self.inventory_wait = None;
                 if self.death_visible {
+                    if let Some(ui) = &mut self.ui {
+                        ui.close_chat();
+                    }
+                    if let Some(window) = &self.window {
+                        window.set_ime_allowed(false);
+                    }
                     self.input = Input::default();
                     self.capture(false);
                 } else if !snapshot.inventory.is_open()
@@ -1250,6 +1256,10 @@ impl ApplicationHandler for Viewer {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
                 }
+                if let Some(ui) = &mut self.ui {
+                    ui.resize((size.width, size.height));
+                }
+                crate::update_chat_ime_area(&self.window, &self.ui);
             }
             WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1274,7 +1284,12 @@ impl ApplicationHandler for Viewer {
                     crate::mouse_scroll::event_axes(delta),
                     self.video,
                 );
-                if self.ui.as_ref().is_some_and(GameUi::paused) {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    let steps = amount.1.signum() as i32 * if self.inventory_shift { 1 } else { 7 };
+                    ui.chat_scroll(steps);
+                } else if self.ui.as_ref().is_some_and(GameUi::paused) {
                     if let Some(ui) = &mut self.ui {
                         ui.pause_scroll(amount.1);
                     }
@@ -1302,7 +1317,10 @@ impl ApplicationHandler for Viewer {
                             .play
                             .as_ref()
                             .is_some_and(|play| play.session.snapshot().inventory.is_open())
-                        && !self.ui.as_ref().is_some_and(GameUi::paused)
+                        && !self
+                            .ui
+                            .as_ref()
+                            .is_some_and(|ui| ui.paused() || ui.chat_open())
                     {
                         self.input.restore_after_screen(self.video);
                         self.submit_movement();
@@ -1326,6 +1344,19 @@ impl ApplicationHandler for Viewer {
                     ui.pause_cancel();
                 }
             }
+            WindowEvent::Ime(ime) => {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    match ime {
+                        winit::event::Ime::Preedit(text, _) => ui.chat_preedit(text),
+                        winit::event::Ime::Commit(text) => ui.chat_text(&text),
+                        winit::event::Ime::Disabled => ui.chat_preedit(String::new()),
+                        winit::event::Ime::Enabled => {}
+                    }
+                }
+                crate::update_chat_ime_area(&self.window, &self.ui);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if crate::screenshot_shortcut(event.physical_key, event.state, event.repeat) {
                     crate::request_game_screenshot(&self.ui, &mut self.renderer);
@@ -1333,6 +1364,34 @@ impl ApplicationHandler for Viewer {
                 }
                 if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
                     self.toggle_fullscreen();
+                    return;
+                }
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    let tick = self
+                        .play
+                        .as_ref()
+                        .map_or(0, |play| play.session.snapshot().tick);
+                    let closed = crate::handle_chat_key(
+                        ui,
+                        event.physical_key,
+                        event.state,
+                        event.text.as_deref(),
+                        self.inventory_control,
+                        self.inventory_shift,
+                        tick,
+                    );
+                    if closed {
+                        if let Some(window) = &self.window {
+                            window.set_ime_allowed(false);
+                        }
+                        self.input.restore_after_screen(self.video);
+                        self.submit_movement();
+                        self.capture(true);
+                    } else {
+                        crate::update_chat_ime_area(&self.window, &self.ui);
+                    }
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1343,7 +1402,10 @@ impl ApplicationHandler for Viewer {
                         || snapshot
                             .as_ref()
                             .is_some_and(|s| s.inventory.is_open() || s.death.is_some())
-                        || self.ui.as_ref().is_some_and(GameUi::paused);
+                        || self
+                            .ui
+                            .as_ref()
+                            .is_some_and(|ui| ui.paused() || ui.chat_open());
                     if self
                         .focus_pause
                         .key(code, event.state == ElementState::Pressed, screen_open)
@@ -1466,6 +1528,22 @@ impl ApplicationHandler for Viewer {
                         }
                         return;
                     }
+                    if pressed
+                        && !event.repeat
+                        && matches!(code, KeyCode::KeyT | KeyCode::Slash)
+                        && self.play.is_some()
+                        && let Some(ui) = &mut self.ui
+                    {
+                        ui.open_chat(code == KeyCode::Slash);
+                        self.input.release_for_screen(self.video);
+                        self.submit_movement();
+                        self.capture(false);
+                        if let Some(window) = &self.window {
+                            window.set_ime_allowed(true);
+                        }
+                        crate::update_chat_ime_area(&self.window, &self.ui);
+                        return;
+                    }
                     if code == KeyCode::F1 && pressed && !event.repeat {
                         if self.play.is_some()
                             && let Some(ui) = &mut self.ui
@@ -1547,6 +1625,9 @@ impl ApplicationHandler for Viewer {
                 button,
                 ..
             } => {
+                if self.ui.as_ref().is_some_and(GameUi::chat_open) {
+                    return;
+                }
                 if self
                     .play
                     .as_ref()
@@ -1605,6 +1686,15 @@ impl ApplicationHandler for Viewer {
                 button,
                 ..
             } => {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    if button == MouseButton::Left {
+                        ui.chat_click(self.inventory_shift);
+                    }
+                    crate::update_chat_ime_area(&self.window, &self.ui);
+                    return;
+                }
                 if let Some(snapshot) = self.play.as_ref().map(|play| play.session.snapshot())
                     && snapshot.death.is_some()
                 {
@@ -1774,8 +1864,12 @@ impl ApplicationHandler for Viewer {
                 .should_pause(now, false, self.video.pause_on_lost_focus)
             && let Some(play) = &self.play
         {
-            let screen_open =
-                self.ui.as_ref().is_some_and(GameUi::paused) || self.inventory_wait.is_some() || {
+            let screen_open = self
+                .ui
+                .as_ref()
+                .is_some_and(|ui| ui.paused() || ui.chat_open())
+                || self.inventory_wait.is_some()
+                || {
                     let snapshot = play.session.snapshot();
                     snapshot.inventory.is_open() || snapshot.death.is_some()
                 };

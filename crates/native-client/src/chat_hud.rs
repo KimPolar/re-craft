@@ -16,6 +16,7 @@ pub struct ChatSettings {
     width: f64,
     line_spacing: f64,
     unfocused_height: f64,
+    focused_height: f64,
 }
 
 impl Default for ChatSettings {
@@ -28,6 +29,7 @@ impl Default for ChatSettings {
             width: 1.0,
             line_spacing: 0.0,
             unfocused_height: 0.3125,
+            focused_height: 1.0,
         }
     }
 }
@@ -60,6 +62,7 @@ impl ChatSettings {
                 "chatWidth" => result.width = value,
                 "chatLineSpacing" => result.line_spacing = value,
                 "chatHeightUnfocused" => result.unfocused_height = value,
+                "chatHeightFocused" => result.focused_height = value,
                 _ => {}
             }
         }
@@ -109,11 +112,20 @@ struct LineLayout {
 }
 
 impl LineLayout {
+    #[cfg(test)]
     fn new(settings: &ChatSettings, gui_height: i32, age: u64) -> Option<Self> {
-        if !settings.visible || settings.scale <= 0.0 || age >= 200 {
+        Self::for_mode(settings, gui_height, age, false)
+    }
+
+    fn for_mode(settings: &ChatSettings, gui_height: i32, age: u64, focused: bool) -> Option<Self> {
+        if !settings.visible || settings.scale <= 0.0 || (!focused && age >= 200) {
             return None;
         }
-        let factor = ((1.0 - age as f64 / 200.0) * 10.0).clamp(0.0, 1.0).powi(2) as f32;
+        let factor = if focused {
+            1.0
+        } else {
+            ((1.0 - age as f64 / 200.0) * 10.0).clamp(0.0, 1.0).powi(2) as f32
+        };
         if factor <= 0.00001 {
             return None;
         }
@@ -127,8 +139,12 @@ impl LineLayout {
         let line_height = (9.0 * (1.0 + settings.line_spacing)) as i32;
         let text_offset =
             (8.0 * (1.0 + settings.line_spacing) - 4.0 * settings.line_spacing).round() as i32;
-        let max_lines =
-            ((settings.unfocused_height * 160.0 + 20.0).floor() as i32 / line_height) as usize;
+        let height = if focused {
+            settings.focused_height
+        } else {
+            settings.unfocused_height
+        };
+        let max_lines = ((height * 160.0 + 20.0).floor() as i32 / line_height) as usize;
         Some(Self {
             width,
             bottom,
@@ -220,15 +236,42 @@ fn wrap(
 }
 
 pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage], tick: u64) {
-    let Some(base) = LineLayout::new(&assets.chat, canvas.height, 0) else {
-        return;
+    draw_mode(canvas, assets, messages, tick, false, 0);
+}
+
+pub fn draw_focused(
+    canvas: &mut Canvas,
+    assets: &MenuAssets,
+    messages: &[SystemMessage],
+    tick: u64,
+    scroll: usize,
+) -> usize {
+    draw_mode(canvas, assets, messages, tick, true, scroll)
+}
+
+pub fn focused_page_lines(settings: &ChatSettings, height: i32) -> i32 {
+    LineLayout::for_mode(settings, height, 0, true)
+        .map_or(0, |layout| layout.max_lines.saturating_sub(1) as i32)
+}
+
+fn draw_mode(
+    canvas: &mut Canvas,
+    assets: &MenuAssets,
+    messages: &[SystemMessage],
+    tick: u64,
+    focused: bool,
+    scroll: usize,
+) -> usize {
+    let Some(base) = LineLayout::for_mode(&assets.chat, canvas.height, 0, focused) else {
+        return 0;
     };
     let mut lines = Vec::new();
     for message in messages.iter().rev() {
-        let Some(layout) = LineLayout::new(
+        let Some(layout) = LineLayout::for_mode(
             &assets.chat,
             canvas.height,
             tick.saturating_sub(message.tick),
+            focused,
         ) else {
             continue;
         };
@@ -271,20 +314,39 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
                     .replacen("%s", reason, 1),
                 None,
             ),
+            SystemMessageKind::LocalChat(text) => (
+                assets
+                    .translate("chat.type.text", "<%s> %s")
+                    .replacen("%s", "Player", 1)
+                    .replacen("%s", text, 1),
+                None,
+            ),
+            SystemMessageKind::CommandUnavailable => {
+                ("Commands are not available yet.".to_owned(), None)
+            }
         };
         let prefix_bytes = debug_prefix.map_or(0, str::len);
         for (text, prefix_len) in wrap(canvas, assets, &message, layout.width.max(1), prefix_bytes)
             .into_iter()
             .rev()
         {
-            if lines.len() >= base.max_lines {
+            if !focused && lines.len() >= base.max_lines {
                 break;
             }
             lines.push((text, layout, prefix_len));
         }
-        if lines.len() >= base.max_lines {
+        if !focused && lines.len() >= base.max_lines {
             break;
         }
+    }
+    let max_scroll = lines.len().saturating_sub(base.max_lines);
+    if focused {
+        let offset = scroll.min(max_scroll);
+        lines = lines
+            .into_iter()
+            .skip(offset)
+            .take(base.max_lines)
+            .collect();
     }
     for (index, (_, layout, _)) in lines.iter().enumerate() {
         let bottom = layout.bottom - index as i32 * layout.line_height;
@@ -336,6 +398,7 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, messages: &[SystemMessage]
             }
         }
     }
+    max_scroll
 }
 
 #[cfg(test)]
@@ -374,7 +437,7 @@ mod tests {
     #[test]
     fn settings_follow_minecraft_options_and_ignore_invalid_values() {
         let settings = ChatSettings::from_options(
-            "chatVisibility:1\nchatOpacity:0.2\nchatScale:0.5\nchatWidth:2\nchatLineSpacing:NaN\nchatHeightUnfocused:0.75\ntextBackgroundOpacity:0.25",
+            "chatVisibility:1\nchatOpacity:0.2\nchatScale:0.5\nchatWidth:2\nchatLineSpacing:NaN\nchatHeightUnfocused:0.75\nchatHeightFocused:0.25\ntextBackgroundOpacity:0.25",
         );
         assert!(settings.visible);
         assert_eq!(settings.opacity, 0.2);
@@ -382,6 +445,7 @@ mod tests {
         assert_eq!(settings.width, 1.0);
         assert_eq!(settings.line_spacing, 0.0);
         assert_eq!(settings.unfocused_height, 0.75);
+        assert_eq!(settings.focused_height, 0.25);
         assert_eq!(settings.background_opacity, 0.25);
         assert!(!ChatSettings::from_options("chatVisibility:2").visible);
     }
@@ -472,7 +536,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 3 * 7 * 2 * 2 * 3 * 3 * 3);
+        assert_eq!(rows.len(), 3 * 7 * 2 * 2 * 2 * 3 * 3 * 3);
         for row in rows {
             let settings = ChatSettings {
                 scale: row["scale"].as_f64().unwrap(),
@@ -484,7 +548,8 @@ mod tests {
             };
             let height = row["height"].as_i64().unwrap() as i32;
             let age = row["age"].as_u64().unwrap();
-            let layout = LineLayout::new(&settings, height, age);
+            let focused = row["focused"].as_bool().unwrap();
+            let layout = LineLayout::for_mode(&settings, height, age, focused);
             assert_eq!(layout.is_some(), row["visible"].as_bool().unwrap(), "{row}");
             let Some(layout) = layout else { continue };
             let array = |name: &str| -> Vec<i64> {

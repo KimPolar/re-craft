@@ -91,7 +91,7 @@ public class FluidTickOracle {
       FluidTags.WATER,List.of(Fluids.WATER.builtInRegistryHolder(),Fluids.FLOWING_WATER.builtInRegistryHolder()),
       FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder())))).apply();
     BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK,Map.of(
-      BlockTags.WASHED_AWAY_BY_FLUIDS,List.of(Blocks.AIR.builtInRegistryHolder(),Blocks.WATER.builtInRegistryHolder(),Blocks.LAVA.builtInRegistryHolder())))).apply();
+      BlockTags.WASHED_AWAY_BY_FLUIDS,List.of(Blocks.AIR.builtInRegistryHolder(),Blocks.WATER.builtInRegistryHolder(),Blocks.LAVA.builtInRegistryHolder(),Blocks.SHORT_GRASS.builtInRegistryHolder(),Blocks.FERN.builtInRegistryHolder(),Blocks.DEAD_BUSH.builtInRegistryHolder())))).apply();
     Field f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true);
     var unsafe=(sun.misc.Unsafe)f.get(null); var world=(TestLevel)unsafe.allocateInstance(TestLevel.class);
     var reaction=LiquidBlock.class.getDeclaredMethod("shouldSpreadLiquid",Level.class,BlockPos.class,BlockState.class); reaction.setAccessible(true);
@@ -117,7 +117,7 @@ public class FluidTickOracle {
           case -13 -> Blocks.COPPER_GRATE.waxed().oxidized();
           default -> null;
         };
-        BlockState state=code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -200 && code >= -247 ? chest(code) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
+        BlockState state=code == -18 ? Blocks.SHORT_GRASS.defaultBlockState() : code == -19 ? Blocks.FERN.defaultBlockState() : code == -20 ? Blocks.DEAD_BUSH.defaultBlockState() : code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -200 && code >= -247 ? chest(code) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
       }
       BlockPos p=BlockPos.ZERO; var block=world.getBlockState(p); var fluid=block.getFluidState();
@@ -532,6 +532,14 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                 .push(json!({"blocks": blocks, "lava": false, "fast": false, "convert": true}));
         }
     }
+    // Lava burns these blocks without invoking the server loot manager, so the
+    // isolated Java level can compare both downward and sideways replacement.
+    for plant in [-18, -19, -20] {
+        for fast in [false, true] {
+            scenarios.push(json!({"blocks": [[0,0,0,0],[0,-1,0,plant]], "lava": true, "fast": fast, "convert": false}));
+            scenarios.push(json!({"blocks": [[0,0,0,0],[0,-1,0,-2],[-1,0,0,-2],[0,0,-1,-2],[0,0,1,-2],[1,0,0,plant],[1,-1,0,-2]], "lava": true, "fast": fast, "convert": false}));
+        }
+    }
     let input = temp.path().join("input.json");
     let output = temp.path().join("output.json");
     std::fs::write(&input, serde_json::to_vec(&scenarios).unwrap()).unwrap();
@@ -612,7 +620,9 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             };
             blocks.insert(
                 pos,
-                if level == -2 {
+                if (-20..=-18).contains(&level) {
+                    Cell::Air
+                } else if level == -2 {
                     Cell::Solid
                 } else if (-247..=-200).contains(&level) {
                     Cell::Chest {

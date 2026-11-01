@@ -1148,6 +1148,13 @@ fn prepare_existing_world(
         match resources.vanilla_block_ids() {
             Ok(registry) => {
                 session.set_vanilla_block_ids(Arc::new(registry.clone()));
+                match native_resources::fluid_tags::load_washed_away_blocks(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tag) => session.set_washed_away_blocks(Arc::new(tag)),
+                    Err(error) => eprintln!("Fluid block tag is unavailable: {error:#}"),
+                }
                 let tags = native_resources::mining_tags::MiningTags::load(&mut resources, &registry)
                     .context("월드의 도구 채굴 태그를 읽을 수 없습니다. 활성 데이터팩과 Minecraft 26.3 설치를 확인하세요")?;
                 session.set_mining_tags(Arc::new(tags));

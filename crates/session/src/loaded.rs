@@ -396,6 +396,7 @@ pub struct LoadedSession {
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
+    washed_away_blocks: Option<Arc<BTreeSet<String>>>,
     weather: Option<crate::weather::Weather>,
     weather_tick_order: Vec<WeatherTickLevel>,
     weather_source: Option<Option<native_persistence::nbt::NamedTag>>,
@@ -3727,6 +3728,10 @@ impl LoadedSession {
         self.sand_deferred_revision = None;
     }
 
+    pub fn set_washed_away_blocks(&mut self, blocks: Arc<BTreeSet<String>>) {
+        self.washed_away_blocks = Some(blocks);
+    }
+
     pub fn set_mining_tags(&mut self, tags: Arc<native_resources::mining_tags::MiningTags>) {
         self.mining_tags = Some(tags);
     }
@@ -3955,6 +3960,7 @@ impl LoadedSession {
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
             farmland_water_tag: None,
+            washed_away_blocks: None,
             weather: None,
             weather_source: None,
             weather_tick_order: Vec::new(),
@@ -12194,6 +12200,14 @@ impl LoadedSession {
         self.set(position, id)
     }
 
+    fn fluid_washable_plant(state: &BlockState) -> bool {
+        state.properties.is_empty()
+            && matches!(
+                state.name.as_str(),
+                "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush"
+            )
+    }
+
     fn simulation_cell(&self, position: IVec3) -> fluid_sim::Cell {
         let Cell::State(id) = cell(
             &self.world,
@@ -12211,6 +12225,14 @@ impl LoadedSession {
             state.name.as_str(),
             "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
         ) {
+            return fluid_sim::Cell::Air;
+        }
+        if Self::fluid_washable_plant(state)
+            && self
+                .washed_away_blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.contains(&state.name))
+        {
             return fluid_sim::Cell::Air;
         }
         if let Some(fluid) = self.ordinary_fluid(id) {
@@ -12388,7 +12410,49 @@ impl LoadedSession {
             } else {
                 settings.delay(fluid.kind)
             };
+            let mut retry_wash = false;
             for change in changes {
+                let plant = match change.block {
+                    fluid_sim::ChangedBlock::Fluid(_) => match cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        change.position,
+                        self.states[0],
+                    ) {
+                        Cell::State(id) => self
+                            .world
+                            .state(id)
+                            .filter(|state| {
+                                Self::fluid_washable_plant(state)
+                                    && self
+                                        .washed_away_blocks
+                                        .as_ref()
+                                        .is_some_and(|blocks| blocks.contains(&state.name))
+                            })
+                            .cloned(),
+                        Cell::Missing => None,
+                    },
+                    _ => None,
+                };
+                let mut plant_drops = None;
+                if let Some(plant) = &plant
+                    && fluid.kind == FluidKind::Water
+                {
+                    match self.dropped_items.prepare_block_without_entity(
+                        &plant.name,
+                        &plant.properties,
+                        self.loot.as_deref(),
+                    ) {
+                        Ok(drops) => {
+                            plant_drops = Some(self.dropped_items.stage_player_block_drops(drops))
+                        }
+                        Err(_) => {
+                            retry_wash = true;
+                            continue;
+                        }
+                    }
+                }
                 let id = match change.block {
                     fluid_sim::ChangedBlock::Air => self.states[0],
                     fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
@@ -12434,6 +12498,17 @@ impl LoadedSession {
                     }
                 };
                 if self.set(change.position, id) {
+                    if let Some((drops, _)) = plant_drops
+                        && let Some(position) = add(self.origin, change.position)
+                    {
+                        self.dropped_items.drop_interaction(
+                            position,
+                            IVec3::ZERO,
+                            native_resources::transforms::DropStrategy::FromMiddle,
+                            drops,
+                            self.block_drops,
+                        );
+                    }
                     if change.position == relative
                         && let fluid_sim::ChangedBlock::Fluid(next) = change.block
                     {
@@ -12448,7 +12523,25 @@ impl LoadedSession {
                     {
                         self.schedule_fluid(change.position, water, settings.delay(water.kind));
                     }
+                } else if let Some((_, previous)) = plant_drops {
+                    self.dropped_items.restore_drop_random(previous);
+                    retry_wash = true;
+                } else if plant.is_some() {
+                    retry_wash = true;
                 }
+            }
+            if retry_wash
+                && let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                )
+                && let Some(current) = self.simulated_fluid(id)
+                && current.kind == fluid.kind
+            {
+                self.schedule_fluid(relative, current, settings.delay(current.kind));
             }
         }
         self.fluid_ticks.extend(unloaded);
@@ -18842,6 +18935,122 @@ mod tests {
             session.world.block(p.x, p.y, p.z).unwrap().name,
             "minecraft:water"
         );
+    }
+
+    #[test]
+    fn flowing_fluids_wash_supported_plants_using_active_tag_and_loot_rules() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(["short_grass", "fern", "dead_bush"].iter().any(|name| path.ends_with(&format!("/{name}.json"))).then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds"}]}]}"#.to_vec()))
+            }
+        }
+        for name in [
+            "minecraft:short_grass",
+            "minecraft:fern",
+            "minecraft:dead_bush",
+        ] {
+            for kind in [FluidKind::Water, FluidKind::Lava] {
+                for drops in [false, true] {
+                    let mut session = session();
+                    session.set_washed_away_blocks(Arc::new(BTreeSet::from([name.to_owned()])));
+                    session.set_block_drops(drops);
+                    session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+                    let source = IVec3::new(8, 4, 8);
+                    let plant = source + IVec3::NEG_Y;
+                    let state = session.intern_block(state(name, &[]));
+                    assert!(session.set(plant, state));
+                    let fluid = FluidState {
+                        kind,
+                        amount: 8,
+                        source: true,
+                        falling: false,
+                    };
+                    let fluid_id = session.intern_liquid(fluid);
+                    assert!(session.set(source, fluid_id));
+                    session.fluid_ticks.clear();
+                    session.fluid_pending.clear();
+                    session.schedule_fluid(source, fluid, 0);
+                    session.advance_fluid_ticks();
+                    assert!(
+                        matches!(session.simulation_cell(plant), fluid_sim::Cell::Fluid(f) if f.kind == kind && f.falling),
+                        "{name} {kind:?}"
+                    );
+                    let actual = session.dropped_items.snapshot();
+                    assert_eq!(
+                        actual.len(),
+                        usize::from(kind == FluidKind::Water && drops),
+                        "{name} {kind:?}"
+                    );
+                    if let Some(item) = actual.first() {
+                        assert_eq!(item.stack.id(), "minecraft:wheat_seeds");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fluid_washing_obeys_tag_and_retries_unavailable_loot() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/short_grass.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds"}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        let source = IVec3::new(8, 4, 8);
+        let plant = source + IVec3::NEG_Y;
+        let id = session.intern_block(state("minecraft:short_grass", &[]));
+        assert!(session.set(plant, id));
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let water_id = session.intern_liquid(water);
+        assert!(session.set(source, water_id));
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.set_washed_away_blocks(Arc::new(BTreeSet::new()));
+        session.schedule_fluid(source, water, 0);
+        session.advance_fluid_ticks();
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, plant, session.states[0]), Cell::State(found) if found == id)
+        );
+
+        session.set_washed_away_blocks(Arc::new(BTreeSet::from(["minecraft:short_grass".into()])));
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.schedule_fluid(source, water, 0);
+        session.advance_fluid_ticks();
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, plant, session.states[0]), Cell::State(found) if found == id)
+        );
+        assert!(
+            session
+                .fluid_pending
+                .iter()
+                .any(|key| key.x == session.origin.x + source.x
+                    && key.y == source.y
+                    && key.z == session.origin.z + source.z)
+        );
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        session.tick += 5;
+        session.advance_fluid_ticks();
+        assert!(
+            matches!(session.simulation_cell(plant), fluid_sim::Cell::Fluid(f) if f.kind == FluidKind::Water)
+        );
+        assert_eq!(session.dropped_items.snapshot().len(), 1);
     }
 
     #[test]

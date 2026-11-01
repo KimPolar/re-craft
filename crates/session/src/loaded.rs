@@ -685,6 +685,9 @@ pub enum BucketSoundKind {
     FillWater,
     FillLava,
     FillBottle,
+    CauldronFillBottle,
+    CauldronFillWater,
+    CauldronFillLava,
     EmptyBottle,
     Splash,
     EmptyWater,
@@ -699,6 +702,9 @@ impl BucketSoundKind {
             Self::FillWater => "item.bucket.fill",
             Self::FillLava => "item.bucket.fill_lava",
             Self::FillBottle => "item.bottle.fill",
+            Self::CauldronFillBottle => "item.bottle.fill",
+            Self::CauldronFillWater => "item.bucket.fill",
+            Self::CauldronFillLava => "item.bucket.fill_lava",
             Self::EmptyBottle => "item.bottle.empty",
             Self::Splash => "entity.generic.splash",
             Self::EmptyWater => "item.bucket.empty",
@@ -8735,6 +8741,161 @@ impl LoadedSession {
         true
     }
 
+    fn use_cauldron(&mut self, hand: crate::inventory::PlayerSlot, position: IVec3) -> bool {
+        let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            position,
+            self.states[0],
+        ) else {
+            return false;
+        };
+        let Some(block) = self.world.state(id) else {
+            return false;
+        };
+        let level = match block.name.as_str() {
+            "minecraft:cauldron" if block.properties.is_empty() => 0,
+            "minecraft:water_cauldron" if block.properties.len() == 1 => {
+                match block.properties.get("level").map(String::as_str) {
+                    Some("1") => 1,
+                    Some("2") => 2,
+                    Some("3") => 3,
+                    _ => return false,
+                }
+            }
+            "minecraft:lava_cauldron" if block.properties.is_empty() => 4,
+            "minecraft:powder_snow_cauldron"
+                if block.properties.len() == 1
+                    && matches!(
+                        block.properties.get("level").map(String::as_str),
+                        Some("1" | "2" | "3")
+                    ) =>
+            {
+                5
+            }
+            _ => return false,
+        };
+        let Some(item) = self.inventory.slot(hand) else {
+            return false;
+        };
+        if item.id() == "minecraft:lava_bucket"
+            && add(position, IVec3::Y).is_some_and(|above| {
+                matches!(cell(&self.world, self.origin, self.bounds, above, self.states[0]), Cell::State(id) if self.fluids.get(id.0 as usize).copied().flatten().is_some_and(|fluid| fluid.kind == FluidKind::Water))
+            })
+        {
+            return true;
+        }
+        let creative = self.game_mode == GameMode::Creative;
+        let mut inventory = (*self.inventory).clone();
+        let (target, sound, overflow) = match item.id() {
+            "minecraft:glass_bottle" if (1..=3).contains(&level) => {
+                let Some(overflow) = inventory.fill_bottle(hand, creative) else {
+                    return false;
+                };
+                (
+                    if level == 1 {
+                        state("minecraft:cauldron", &[])
+                    } else {
+                        state(
+                            "minecraft:water_cauldron",
+                            &[("level", if level == 2 { "1" } else { "2" })],
+                        )
+                    },
+                    BucketSoundKind::CauldronFillBottle,
+                    overflow,
+                )
+            }
+            "minecraft:potion" if level < 3 => {
+                let Some(overflow) = inventory.empty_water_bottle(hand, creative) else {
+                    return false;
+                };
+                (
+                    state(
+                        "minecraft:water_cauldron",
+                        &[(
+                            "level",
+                            match level {
+                                0 => "1",
+                                1 => "2",
+                                _ => "3",
+                            },
+                        )],
+                    ),
+                    BucketSoundKind::EmptyBottle,
+                    overflow,
+                )
+            }
+            "minecraft:bucket" if level == 3 || level == 4 => {
+                let result = if level == 3 {
+                    "minecraft:water_bucket"
+                } else {
+                    "minecraft:lava_bucket"
+                };
+                let Some(overflow) = inventory.fill_bucket(hand, result, creative) else {
+                    return false;
+                };
+                (
+                    state("minecraft:cauldron", &[]),
+                    if level == 3 {
+                        BucketSoundKind::CauldronFillWater
+                    } else {
+                        BucketSoundKind::CauldronFillLava
+                    },
+                    overflow,
+                )
+            }
+            "minecraft:water_bucket" | "minecraft:lava_bucket" => {
+                let water = item.id() == "minecraft:water_bucket";
+                let Some(overflow) = inventory.empty_bucket_into_cauldron(hand, creative) else {
+                    return false;
+                };
+                (
+                    if water {
+                        state("minecraft:water_cauldron", &[("level", "3")])
+                    } else {
+                        state("minecraft:lava_cauldron", &[])
+                    },
+                    if water {
+                        BucketSoundKind::EmptyWater
+                    } else {
+                        BucketSoundKind::EmptyLava
+                    },
+                    overflow,
+                )
+            }
+            _ => return false,
+        };
+        let target = self.intern_block(target);
+        if target != id && !self.set(position, target) {
+            return false;
+        }
+        self.inventory = Arc::new(inventory);
+        self.push_bucket_sound(
+            sound,
+            (self.origin + position).as_dvec3() + DVec3::splat(0.5),
+            1.0,
+            1.0,
+        );
+        if let Some(stack) = overflow {
+            self.dropped_items.drop_player(
+                stack,
+                self.origin,
+                self.motion.position,
+                self.player,
+                crate::items::PlayerDropOrigin::ContainerReturn,
+            );
+        }
+        let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+            crate::animation::Hand::Off
+        } else {
+            crate::animation::Hand::Main
+        };
+        self.first_person.swing.start(swing);
+        self.first_person.used(swing);
+        true
+    }
+
     fn try_make_mud(&mut self, hand: crate::inventory::PlayerSlot, hit: ShapeRayHit) -> bool {
         if hit.face == -IVec3::Y {
             return false;
@@ -12367,6 +12528,11 @@ impl LoadedSession {
                                 {
                                     self.first_person.swing.start(crate::animation::Hand::Main);
                                 }
+                            } else if self.game_mode != GameMode::Spectator
+                                && !bypass
+                                && self.use_cauldron(main_hand, hit.position)
+                            {
+                                handled = true;
                             } else if self.game_mode.allows_basic_building()
                                 && main_compass
                                 && let Some(hand) = self.use_lodestone_compass(hit.position)
@@ -12473,10 +12639,23 @@ impl LoadedSession {
                             self.game_mode,
                         )
                     {
-                        if !(self.game_mode.allows_basic_building()
+                        if !(self.game_mode != GameMode::Spectator
+                            && !(self.sneak
+                                && (self.inventory.slot(main_hand).is_some()
+                                    || self
+                                        .inventory
+                                        .slot(crate::inventory::PlayerSlot::Offhand)
+                                        .is_some()))
                             && self.ray_hit().is_some_and(|hit| {
-                                self.try_make_mud(crate::inventory::PlayerSlot::Offhand, hit)
+                                self.use_cauldron(
+                                    crate::inventory::PlayerSlot::Offhand,
+                                    hit.position,
+                                )
                             }))
+                            && !(self.game_mode.allows_basic_building()
+                                && self.ray_hit().is_some_and(|hit| {
+                                    self.try_make_mud(crate::inventory::PlayerSlot::Offhand, hit)
+                                }))
                             && !(self.game_mode != GameMode::Spectator
                                 && self.try_fill_bottle(crate::inventory::PlayerSlot::Offhand))
                             && !(self.game_mode.allows_basic_building()
@@ -16289,6 +16468,189 @@ mod tests {
                 assert_eq!(
                     session.inventory.slot(hand).unwrap().count(),
                     if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn cauldron_contents_and_inventory_match_java() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CauldronOracle.java");
+        let output = temp.path().join("cauldrons.json");
+        std::fs::write(&source, include_str!("../tests/java/CauldronOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("CauldronOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 240);
+        for row in rows {
+            let mut session = session();
+            let creative = row["creative"].as_bool().unwrap();
+            if creative {
+                session.set_game_mode(GameMode::Creative);
+            }
+            let initial = row["initial"].as_u64().unwrap();
+            let block = match initial {
+                0 => state("minecraft:cauldron", &[]),
+                1 => state("minecraft:water_cauldron", &[("level", "1")]),
+                2 => state("minecraft:water_cauldron", &[("level", "2")]),
+                3 => state("minecraft:water_cauldron", &[("level", "3")]),
+                4 => state("minecraft:lava_cauldron", &[]),
+                _ => state("minecraft:powder_snow_cauldron", &[("level", "1")]),
+            };
+            let pos = IVec3::new(8, 2, 7);
+            let id = session.intern_block(block);
+            session.set_with_notify(pos, id, false);
+            if row["above_water"].as_bool().unwrap() {
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                session.set_with_notify(pos + IVec3::Y, water, false);
+            }
+            let hand = if row["off"].as_bool().unwrap() {
+                PlayerSlot::Offhand
+            } else {
+                PlayerSlot::Storage(0)
+            };
+            let (id, max, contents) = match row["item"].as_u64().unwrap() {
+                0 => ("minecraft:glass_bottle", 64, Tag::Compound(vec![])),
+                1 => (
+                    "minecraft:potion",
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:potion_contents".into(),
+                        Tag::Compound(vec![(
+                            "potion".into(),
+                            Tag::String("minecraft:water".into()),
+                        )]),
+                    )]),
+                ),
+                2 => ("minecraft:bucket", 16, Tag::Compound(vec![])),
+                3 => ("minecraft:water_bucket", 1, Tag::Compound(vec![])),
+                _ => ("minecraft:lava_bucket", 1, Tag::Compound(vec![])),
+            };
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(hand, ItemStack::new(id.into(), 1, max, contents));
+            session.set_player_inventory(inventory);
+            assert_eq!(
+                session.use_cauldron(hand, pos),
+                row["handled"].as_bool().unwrap(),
+                "{row}"
+            );
+            let p = session.origin + pos;
+            let block = session.world.block(p.x, p.y, p.z).unwrap();
+            assert_eq!(block.name, row["block"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                block
+                    .properties
+                    .get("level")
+                    .map_or(0, |s| s.parse::<u64>().unwrap()),
+                row["level"].as_u64().unwrap(),
+                "{row}"
+            );
+            let describe = |item: Option<&ItemStack>| {
+                item.map_or_else(|| "-".to_owned(), |item| item.id().to_owned())
+            };
+            assert_eq!(
+                describe(session.inventory.slot(hand)),
+                row["hand"].as_str().unwrap(),
+                "{row}"
+            );
+            let next = PlayerSlot::Storage(if hand == PlayerSlot::Offhand { 0 } else { 1 });
+            assert_eq!(
+                describe(session.inventory.slot(next)),
+                row["slot1"].as_str().unwrap(),
+                "{row}"
+            );
+            let sounds = session.take_bucket_sounds();
+            if let Some(sound) = row["sound"].as_str() {
+                assert_eq!(sounds.len(), 1, "{row}");
+                assert_eq!(
+                    format!("minecraft:{}", sounds[0].kind.event()),
+                    sound,
+                    "{row}"
+                );
+                assert!(!sounds[0].kind.is_player_sound() && !sounds[0].kind.is_neutral_sound());
+                assert_eq!(row["category"].as_str(), Some("BLOCKS"));
+            } else {
+                assert!(sounds.is_empty(), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn cauldron_interaction_is_reached_from_player_input() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let pos = IVec3::new(8, 2, 7);
+                let cauldron =
+                    session.intern_block(state("minecraft:water_cauldron", &[("level", "3")]));
+                session.set_with_notify(pos, cauldron, false);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new(
+                        "minecraft:glass_bottle".into(),
+                        1,
+                        64,
+                        Tag::Compound(vec![]),
+                    ),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let p = session.origin + pos;
+                let block = session.world.block(p.x, p.y, p.z).unwrap();
+                assert_eq!(
+                    block.properties.get("level").map(String::as_str),
+                    Some("2"),
+                    "{hand:?} {mode:?}"
+                );
+                assert_eq!(
+                    session.take_bucket_sounds()[0].kind,
+                    BucketSoundKind::CauldronFillBottle
                 );
             }
         }

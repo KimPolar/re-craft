@@ -1478,6 +1478,26 @@ impl PlayerInventory {
         self.fill_container(hand, filled, creative)
     }
 
+    pub(crate) fn empty_bucket_into_cauldron(
+        &mut self,
+        hand: PlayerSlot,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if !matches!(
+            source.id.as_str(),
+            "minecraft:water_bucket" | "minecraft:lava_bucket"
+        ) || !ordinary_return_supported(source)
+        {
+            return None;
+        }
+        let result = ItemStack::new("minecraft:bucket".into(), 1, 16, Tag::Compound(vec![]))?;
+        self.fill_container(hand, result, creative)
+    }
+
     fn fill_container(
         &mut self,
         hand: PlayerSlot,

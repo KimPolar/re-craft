@@ -509,6 +509,7 @@ impl GameUi {
             if matches!(components.next(), Some(std::path::Component::Normal(_)))
                 && components.next().is_none()
             {
+                self.chat_input.register_click(std::time::Instant::now());
                 return Some(
                     self.assets
                         .minecraft_dir

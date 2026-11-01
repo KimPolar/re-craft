@@ -27,6 +27,7 @@ pub struct ChatInput {
     scroll: usize,
     focused_at: Option<std::time::Instant>,
     dragging: bool,
+    last_click: Option<std::time::Instant>,
 }
 
 impl ChatInput {
@@ -48,6 +49,7 @@ impl ChatInput {
     pub fn open(&mut self, command: bool) {
         self.open = true;
         self.dragging = false;
+        self.last_click = None;
         self.focused_at = Some(std::time::Instant::now());
         self.text = if command { "/".into() } else { String::new() };
         self.caret = self.text.len();
@@ -61,6 +63,7 @@ impl ChatInput {
     pub fn close(&mut self) {
         self.open = false;
         self.dragging = false;
+        self.last_click = None;
         self.focused_at = None;
         self.preedit.clear();
         self.scroll = 0;
@@ -194,26 +197,57 @@ impl ChatInput {
         let canvas = Canvas::new(1, 1);
         let start = self.visible_start(&canvas, assets, (width - 8).max(1));
         let target = (x - 4).max(0);
+        let index = self.click_position(start, target, width - 8, |glyph| {
+            canvas.text_width(Some(assets), glyph)
+        });
+        self.move_caret(index, shift);
+    }
+
+    fn click_position(
+        &self,
+        start: usize,
+        target: i32,
+        available: i32,
+        width: impl Fn(&str) -> i32,
+    ) -> usize {
         let mut index = start;
         let mut previous_width = 0;
         while index < self.text.len() {
             let next = self.next(index);
-            let next_width =
-                previous_width + canvas.text_width(Some(assets), &self.text[index..next]);
-            if target < (previous_width + next_width) / 2 {
+            let next_width = previous_width + width(&self.text[index..next]);
+            if target < next_width {
                 break;
             }
             index = next;
             previous_width = next_width;
-            if next_width >= width - 8 {
+            if next_width >= available {
                 break;
             }
         }
-        self.move_caret(index, shift);
+        index
+    }
+
+    pub fn register_click(&mut self, now: std::time::Instant) -> bool {
+        let double = self.last_click.is_some_and(|previous| {
+            now.saturating_duration_since(previous) < std::time::Duration::from_millis(250)
+        });
+        self.last_click = Some(now);
+        double
+    }
+
+    fn select_word(&mut self, index: usize) {
+        let start = self.word_position(index, false);
+        let end = self.word_position(index, true);
+        self.move_caret(start, false);
+        self.move_caret(end, true);
     }
 
     pub fn start_drag(&mut self, assets: &MenuAssets, width: i32, x: i32, shift: bool) {
+        let double = self.register_click(std::time::Instant::now());
         self.click(assets, width, x, shift);
+        if double {
+            self.select_word(self.caret);
+        }
         self.dragging = true;
     }
 
@@ -471,6 +505,21 @@ mod tests {
     }
 
     #[test]
+    fn double_click_threshold_resets_with_chat_screen() {
+        use std::time::{Duration, Instant};
+        let mut input = ChatInput::default();
+        let start = Instant::now();
+        input.open(false);
+        assert!(!input.register_click(start));
+        assert!(input.register_click(start + Duration::from_millis(249)));
+        assert!(!input.register_click(start + Duration::from_millis(499)));
+        assert!(input.register_click(start + Duration::from_millis(500)));
+        input.close();
+        input.open(false);
+        assert!(!input.register_click(start + Duration::from_millis(501)));
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn mouse_drag_extends_selection_and_release_stops_dragging() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -488,6 +537,33 @@ mod tests {
         input.end_drag();
         assert!(!input.drag(&assets, 320, 100));
         assert_eq!(input.selected_text(), "abc");
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn mouse_selection_uses_full_glyph_width_and_double_click_selects_word() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let canvas = Canvas::new(1, 1);
+        let mut input = ChatInput::default();
+        input.open(false);
+        input.insert("alpha  beta 끝");
+        let a_width = canvas.text_width(Some(&assets), "a");
+        assert!(a_width > 1);
+        input.click(&assets, 320, 4 + a_width - 1, false);
+        assert_eq!(input.caret, 0);
+        input.click(&assets, 320, 4 + a_width, false);
+        assert_eq!(input.caret, 1);
+        let inside_beta = 4 + canvas.text_width(Some(&assets), "alpha  b");
+        input.start_drag(&assets, 320, inside_beta, false);
+        input.end_drag();
+        input.start_drag(&assets, 320, inside_beta, true);
+        assert_eq!(input.selected_text(), "beta ");
+        let end = 4 + canvas.text_width(Some(&assets), "alpha  beta 끝");
+        assert!(input.drag(&assets, 320, end));
+        assert_eq!(input.selected_text(), "beta 끝");
     }
 
     #[test]
@@ -555,11 +631,31 @@ mod tests {
             assert_eq!(units, utf16);
             text.len()
         }
+        let mut clicks = 0;
         for row in rows {
             let text = row["before"].as_str().unwrap();
             let mut input = ChatInput::default();
             input.open(false);
             input.text = text.to_owned();
+            if let Some(x) = row["clickX"].as_u64() {
+                clicks += 1;
+                let index = input.click_position(0, x as i32, 256, |_| 1);
+                input.move_caret(index, false);
+                if row["double"].as_bool().unwrap() {
+                    input.select_word(index);
+                }
+                assert_eq!(
+                    input.text[..input.caret].encode_utf16().count(),
+                    row["afterCursor"].as_u64().unwrap() as usize,
+                    "{row}"
+                );
+                assert_eq!(
+                    input.text[..input.anchor].encode_utf16().count(),
+                    row["afterAnchor"].as_u64().unwrap() as usize,
+                    "{row}"
+                );
+                continue;
+            }
             input.caret = byte_offset(text, row["cursor"].as_u64().unwrap() as usize);
             input.anchor = byte_offset(text, row["anchor"].as_u64().unwrap() as usize);
             let code = match row["code"].as_i64().unwrap() {
@@ -583,5 +679,6 @@ mod tests {
                 "{row}"
             );
         }
+        assert_eq!(clicks, 98);
     }
 }

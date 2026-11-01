@@ -154,6 +154,63 @@ impl ResourceStack {
         Ok(None)
     }
 
+    /// Namespaces exposed by the client and selected resource packs. The
+    /// callers still read each asset through the normal priority stack.
+    pub fn asset_namespaces(&self) -> Result<BTreeSet<String>> {
+        let mut out = BTreeSet::new();
+        let mut collect = |name: &str| -> Result<()> {
+            if !name.is_empty() && ResourceId::parse(&format!("{name}:entry")).is_ok() {
+                out.insert(name.to_owned());
+                ensure!(out.len() <= 4096, "too many resource namespaces");
+            }
+            Ok(())
+        };
+        let mut zip_names = |archive: &ZipArchive<File>| -> Result<()> {
+            for path in archive.file_names() {
+                if let Some((namespace, _)) = path
+                    .strip_prefix("assets/")
+                    .and_then(|path| path.split_once('/'))
+                {
+                    collect(namespace)?;
+                }
+            }
+            Ok(())
+        };
+        zip_names(&self.base)?;
+        for pack in &self.packs {
+            if let Pack::Archive(archive) = pack {
+                zip_names(archive)?;
+            }
+        }
+        drop(zip_names);
+        for pack in &self.packs {
+            let Pack::Directory(root) = pack else {
+                continue;
+            };
+            let assets = match root.join("assets").canonicalize() {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("cannot inspect resource pack assets"),
+            };
+            ensure!(
+                assets.starts_with(root),
+                "resource pack assets escape their root"
+            );
+            if !assets.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(assets)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    collect(name)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// List visible PNG texture identifiers below a texture directory across
     /// all namespaces and packs. Reads still resolve the highest-priority pack.
     pub fn list_textures(&self, folder: &str) -> Result<BTreeSet<ResourceId>> {

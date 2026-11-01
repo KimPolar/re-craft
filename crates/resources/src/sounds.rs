@@ -66,13 +66,17 @@ impl SoundDefinitions {
         let vanilla = index.read(root, "minecraft/sounds.json")?;
         let mut out = Self::default();
         out.apply("minecraft", &vanilla)?;
-        for (layer_index, layer) in stack
-            .read_asset_stack("assets/minecraft/sounds.json")?
-            .into_iter()
-            .enumerate()
-        {
-            if let Err(error) = out.apply("minecraft", &layer) {
-                eprintln!("Ignoring invalid sounds.json layer {layer_index}: {error:#}");
+        for namespace in stack.asset_namespaces()? {
+            for (layer_index, layer) in stack
+                .read_asset_stack(&format!("assets/{namespace}/sounds.json"))?
+                .into_iter()
+                .enumerate()
+            {
+                if let Err(error) = out.apply(&namespace, &layer) {
+                    eprintln!(
+                        "Ignoring invalid {namespace} sounds.json layer {layer_index}: {error:#}"
+                    );
+                }
             }
         }
         Ok(out)
@@ -639,6 +643,13 @@ mod tests {
             br#"{"block.stone_button.click_on":{"replace":true,"sounds":["random/click"]}}"#,
         )
         .unwrap();
+        let custom_assets = pack.path().join("assets/example");
+        std::fs::create_dir_all(&custom_assets).unwrap();
+        std::fs::write(
+            custom_assets.join("sounds.json"),
+            br#"{"impact":{"sounds":["example:low"]},"append":{"sounds":["example:first"]}}"#,
+        )
+        .unwrap();
         stack.push_pack(pack.path()).unwrap();
         let invalid = tempfile::tempdir().unwrap();
         let invalid_assets = invalid.path().join("assets/minecraft");
@@ -653,8 +664,59 @@ mod tests {
             br#"{"test.high":{"sounds":["high"]}}"#,
         )
         .unwrap();
+        let custom_high = high.path().join("assets/example");
+        std::fs::create_dir_all(&custom_high).unwrap();
+        std::fs::write(
+            custom_high.join("sounds.json"),
+            br#"{"impact":{"replace":true,"sounds":["example:high"]},"append":{"sounds":["example:second"]}}"#,
+        )
+        .unwrap();
         stack.push_pack(high.path()).unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("custom.zip");
+        {
+            use std::io::Write;
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+            archive
+                .start_file(
+                    "assets/zipmod/sounds.json",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive
+                .write_all(br#"{"impact":{"sounds":["example:high"]}}"#)
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        stack.push_pack(&archive_path).unwrap();
         let catalog = SoundDefinitions::load_minecraft(&index, &root, &mut stack).unwrap();
+        let impact = catalog
+            .get(&ResourceId::parse("example:impact").unwrap())
+            .unwrap();
+        assert_eq!(impact.sounds.len(), 1);
+        assert_eq!(
+            impact.sounds[0].id,
+            ResourceId::parse("example:high").unwrap()
+        );
+        let append = catalog
+            .get(&ResourceId::parse("example:append").unwrap())
+            .unwrap();
+        assert_eq!(
+            append
+                .sounds
+                .iter()
+                .map(|sound| sound.id.clone())
+                .collect::<Vec<_>>(),
+            ["example:first", "example:second"].map(|id| ResourceId::parse(id).unwrap())
+        );
+        assert_eq!(
+            catalog
+                .get(&ResourceId::parse("zipmod:impact").unwrap())
+                .unwrap()
+                .sounds[0]
+                .id,
+            ResourceId::parse("example:high").unwrap()
+        );
         assert!(
             catalog
                 .get(&ResourceId::parse("test.partial").unwrap())

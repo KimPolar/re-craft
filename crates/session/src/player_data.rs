@@ -917,8 +917,7 @@ pub fn read_saved_motion(player: &NamedTag) -> Result<SavedPlayerMotion> {
     })
 }
 
-/// A burning player changes every tick. Until those transitions are simulated,
-/// reject ambiguous fire fields instead of silently preserving stale state.
+/// Reject ambiguous fire fields before writing the simulated fire counter.
 pub(crate) fn read_saved_fire_for_preservation(player: &NamedTag) -> Result<i16> {
     match unique_field(&player.value, "Fire")? {
         None => Ok(0),

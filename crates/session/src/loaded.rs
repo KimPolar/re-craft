@@ -2713,10 +2713,11 @@ impl LoadedSession {
         );
         if self.tick > 0 {
             let fire = crate::player_data::read_saved_fire_for_preservation(original)?;
-            anyhow::ensure!(
-                fire <= 0,
-                "saved player fire is not yet simulated and cannot be saved after ticking"
-            );
+            if fire > 0 || self.saved_player_inventory_source.is_some() {
+                // Burning damage and extinguishing depend on the initial fire
+                // counter, so never accept a different or uncaptured source.
+                self.validate_player_draft_source(original)?;
+            }
         }
         anyhow::ensure!(
             self.commands.is_empty(),
@@ -39979,19 +39980,138 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn saved_player_fire_draft_matches_java_base_tick() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerSavedFireOracle.java");
+        let output = temp.path().join("fire.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerSavedFireOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("PlayerSavedFireOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            for frames in [1, 5] {
+                let source = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        (
+                            "Fire".into(),
+                            Tag::Short(row["initial"].as_i64().unwrap() as i16),
+                        ),
+                    ]),
+                };
+                let mut session = session();
+                session.set_weather(Some(false), None, false);
+                session.restore_saved_player_inventory(&source).unwrap();
+                for _ in 0..frames {
+                    session.update(TICK / frames);
+                }
+                let draft = session.draft_player_state(&source).unwrap();
+                assert_eq!(
+                    draft.document().value.get("Fire"),
+                    Some(&Tag::Short(row["fire"].as_i64().unwrap() as i16)),
+                    "{row}"
+                );
+                assert_eq!(
+                    draft.document().value.get("Health"),
+                    Some(&Tag::Float(20.0 - row["hits"].as_u64().unwrap() as f32)),
+                    "{row}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn saved_player_fire_ticks_before_new_contacts() {
         use native_persistence::nbt::{NamedTag, Tag};
         let source = NamedTag {
             name: "".into(),
-            value: Tag::Compound(vec![("Fire".into(), Tag::Short(20))]),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Fire".into(), Tag::Short(20)),
+            ]),
         };
         let mut burning = session();
+        burning.set_weather(Some(false), None, false);
         burning.restore_saved_player_inventory(&source).unwrap();
         burning.update(TICK);
         assert_eq!(burning.player_fire_ticks, 19);
         assert_eq!(burning.vitals.health, 19.0);
-        assert!(burning.draft_player_state(&source).is_err());
+        let draft = burning.draft_player_state(&source).unwrap();
+        assert_eq!(draft.document().value.get("Fire"), Some(&Tag::Short(19)));
+        assert_eq!(
+            draft.document().value.get("Health"),
+            Some(&Tag::Float(19.0))
+        );
+        let changed_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Fire".into(), Tag::Short(21)),
+            ]),
+        };
+        assert!(burning.draft_player_state(&changed_source).is_err());
+        let extinguished_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Fire".into(), Tag::Short(0)),
+            ]),
+        };
+        assert!(burning.draft_player_state(&extinguished_source).is_err());
+
+        let mut unknown_weather = session();
+        unknown_weather
+            .restore_saved_player_inventory(&source)
+            .unwrap();
+        unknown_weather.update(TICK);
+        assert!(unknown_weather.draft_player_state(&source).is_err());
 
         let numeric_source = NamedTag {
             name: "".into(),

@@ -3201,6 +3201,165 @@ mod tests {
     }
 
     #[test]
+    fn fixed_loot_replay_gates_atomic_chest_and_player_save() {
+        use crate::{chest_loot::VerifiedFixedChestLoot, edit::BlockEntityChange};
+        use native_resources::{chest_loot::ChestLootTable, packs::ResourceId};
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let position = ChunkPos { x: 0, z: 0 };
+        let mut source = draft_chunk_blocks(
+            &editable_chunk(0),
+            position,
+            &[BlockChange {
+                x: 0,
+                y: 0,
+                z: 0,
+                expected: block_state("minecraft:stone"),
+                replacement: block_state("minecraft:chest"),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let chest = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(0)),
+            ("y".into(), Tag::Int(0)),
+            ("z".into(), Tag::Int(0)),
+            ("LootTable".into(), Tag::String("example:treasure".into())),
+            ("LootTableSeed".into(), Tag::Long(42)),
+            ("future".into(), Tag::Int(17)),
+        ]);
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), list(vec![chest.clone()])));
+        store_record(&mut region, 0, 2, &source, 10);
+        fs::write(&region_path, &region).unwrap();
+        let mut replacement = chest.clone();
+        let Tag::Compound(fields) = &mut replacement else {
+            unreachable!()
+        };
+        fields.retain(|(key, _)| !key.matches("LootTable") && !key.matches("LootTableSeed"));
+        fields.push(("Items".into(), list(vec![])));
+        let change = BlockEntityChange {
+            expected: chest.clone(),
+            replacement,
+        };
+        let id = ResourceId::parse("example:treasure").unwrap();
+        let table = ChestLootTable::decode(&serde_json::json!({
+            "type": "minecraft:chest", "pools": [{"rolls": 1, "entries": [
+                {"type": "minecraft:item", "name": "minecraft:diamond"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            VerifiedFixedChestLoot::replay(
+                &chest,
+                &ResourceId::parse("example:other").unwrap(),
+                &table,
+                |_| Ok(64)
+            )
+            .is_err()
+        );
+        let proof = VerifiedFixedChestLoot::replay(&chest, &id, &table, |_| Ok(64)).unwrap();
+        let mut zero_seed = chest.clone();
+        let Tag::Compound(fields) = &mut zero_seed else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("LootTableSeed"))
+            .unwrap()
+            .1 = Tag::Long(0);
+        assert!(VerifiedFixedChestLoot::replay(&zero_seed, &id, &table, |_| Ok(64)).is_err());
+        let mut unproven = draft_chunk_blocks(&source, position, &[]).unwrap();
+        assert!(
+            unproven
+                .stage_checked_chest_inventories(std::slice::from_ref(&change))
+                .is_err()
+        );
+        let mut altered = change.clone();
+        let Tag::Compound(fields) = &mut altered.replacement else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("future"))
+            .unwrap()
+            .1 = Tag::Int(18);
+        assert!(
+            unproven
+                .stage_checked_chest_inventories_with_loot(&[altered], std::slice::from_ref(&proof))
+                .is_err()
+        );
+        let make_draft = || {
+            let mut draft = draft_chunk_blocks(&source, position, &[]).unwrap();
+            draft
+                .stage_checked_chest_inventories_with_loot(
+                    std::slice::from_ref(&change),
+                    std::slice::from_ref(&proof),
+                )
+                .unwrap();
+            draft
+        };
+        let uuid = [0, 0, 0, 1];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        let stack = |count| {
+            Tag::Compound(vec![
+                ("Slot".into(), Tag::Byte(0)),
+                ("id".into(), Tag::String("minecraft:diamond".into())),
+                ("count".into(), Tag::Int(count)),
+            ])
+        };
+        let updated = |count| {
+            let mut result = player.clone();
+            let Tag::Compound(fields) = &mut result.value else {
+                unreachable!()
+            };
+            fields.push(("Inventory".into(), list(vec![stack(count)])));
+            result
+        };
+        let player_dir = world.path().join("players/data");
+        fs::create_dir_all(&player_dir).unwrap();
+        let player_path = player_dir.join(player_data_filename(uuid));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&player).unwrap()).unwrap();
+        let player_bytes = gzip.finish().unwrap();
+        fs::write(&player_path, &player_bytes).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let mut wrong = WorldSavePlan::new();
+        wrong
+            .add_chunk(dimension.clone(), make_draft(), 20)
+            .unwrap();
+        wrong
+            .add_player_data(uuid, &player, &updated(2), |_, _| Ok(()))
+            .unwrap();
+        assert!(guard.write_plan(wrong, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(fs::read(&player_path).unwrap(), player_bytes);
+        let mut valid = WorldSavePlan::new();
+        valid.add_chunk(dimension, make_draft(), 20).unwrap();
+        valid
+            .add_player_data(uuid, &player, &updated(1), |_, _| Ok(()))
+            .unwrap();
+        guard.write_plan(valid, |_, _| Ok(())).unwrap();
+        assert_ne!(fs::read(&region_path).unwrap(), region);
+        assert_ne!(fs::read(&player_path).unwrap(), player_bytes);
+    }
+
+    #[test]
     fn checked_chest_and_player_transfer_commit_together_or_not_at_all() {
         use crate::edit::BlockEntityChange;
         let world = test_world();

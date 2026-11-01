@@ -1101,6 +1101,7 @@ dependencies = [
  "glam",
  "lz4-java-wrc",
  "native-core",
+ "native-resources",
  "native-session",
  "native-world",
  "serde",

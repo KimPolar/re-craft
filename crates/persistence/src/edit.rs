@@ -32,6 +32,12 @@ pub struct BlockEntityChange {
     pub replacement: Tag,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CheckedChestInventory {
+    pub(crate) change: BlockEntityChange,
+    pub(crate) generated: Option<crate::chest_loot::VerifiedFixedChestLoot>,
+}
+
 /// A block entity added, removed, or replaced in an incomplete chunk draft.
 /// `None` asserts that the position was empty before or after the change.
 #[derive(Clone, Debug)]
@@ -62,7 +68,7 @@ pub struct ChunkDraft {
     heightmaps_rebuilt: bool,
     changed_block_states: Vec<BlockChange>,
     uncoordinated_block_entities: bool,
-    checked_chest_inventories: Vec<BlockEntityChange>,
+    checked_chest_inventories: Vec<CheckedChestInventory>,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
 }
@@ -87,7 +93,7 @@ impl ChunkDraft {
         self.checked_chest_inventories.len()
     }
 
-    pub(crate) fn checked_chest_inventories(&self) -> &[BlockEntityChange] {
+    pub(crate) fn checked_chest_inventories(&self) -> &[CheckedChestInventory] {
         &self.checked_chest_inventories
     }
 
@@ -188,7 +194,17 @@ impl ChunkDraft {
     /// still requires a coordinated player/inventory save and cannot be written
     /// through the ordinary chunk-only path.
     pub fn stage_checked_chest_inventories(&mut self, changes: &[BlockEntityChange]) -> Result<()> {
+        self.stage_checked_chest_inventories_with_loot(changes, &[])
+    }
+
+    /// Fixed-seed proofs must come from the active loot tables and item registry.
+    pub fn stage_checked_chest_inventories_with_loot(
+        &mut self,
+        changes: &[BlockEntityChange],
+        proofs: &[crate::chest_loot::VerifiedFixedChestLoot],
+    ) -> Result<()> {
         if changes.is_empty() {
+            ensure!(proofs.is_empty(), "unused chest loot proof");
             return Ok(());
         }
         ensure!(
@@ -198,12 +214,32 @@ impl ChunkDraft {
         let source = crate::nbt::read(&self.source_nbt)?;
         palette::validate_26_3_block_states(&source.value)?;
         let sections = palette::decode_sections(&source.value)?;
+        let mut used = vec![false; proofs.len()];
+        let mut checked = Vec::with_capacity(changes.len());
         for change in changes {
-            validate_chest_inventory_change(change, &sections)?;
+            let matches: Vec<_> = proofs
+                .iter()
+                .enumerate()
+                .filter(|(_, proof)| proof.source == change.expected)
+                .collect();
+            ensure!(matches.len() <= 1, "duplicate chest loot proof");
+            let generated = if let Some((index, proof)) = matches.first() {
+                ensure!(!used[*index], "chest loot proof reused");
+                used[*index] = true;
+                Some((*proof).clone())
+            } else {
+                None
+            };
+            validate_chest_inventory_change(change, &sections, generated.is_some())?;
+            checked.push(CheckedChestInventory {
+                change: change.clone(),
+                generated,
+            });
         }
+        ensure!(used.iter().all(|used| *used), "unused chest loot proof");
         self.replace_block_entities(changes)?;
         self.uncoordinated_block_entities = false;
-        self.checked_chest_inventories = changes.to_vec();
+        self.checked_chest_inventories = checked;
         Ok(())
     }
 
@@ -832,6 +868,7 @@ fn append_palette_entry(
 fn validate_chest_inventory_change(
     change: &BlockEntityChange,
     sections: &[palette::ChunkSection],
+    generated: bool,
 ) -> Result<()> {
     let coordinates = |tag: &Tag| -> Result<[i32; 3]> {
         let coordinate = |key| match unique_field(tag, key)? {
@@ -860,12 +897,23 @@ fn validate_chest_inventory_change(
         "chest entity type changed"
     );
     for entity in [&change.expected, &change.replacement] {
-        ensure!(
-            unique_field(entity, "LootTable")?.is_none(),
-            "deferred chest loot needs separate validation"
-        );
         unique_field(entity, "LootTableSeed")?;
         validate_chest_items(unique_field(entity, "Items")?)?;
+    }
+    ensure!(
+        unique_field(&change.replacement, "LootTable")?.is_none(),
+        "replacement has pending loot"
+    );
+    if generated {
+        ensure!(
+            unique_field(&change.replacement, "LootTableSeed")?.is_none(),
+            "replacement retains loot seed"
+        );
+    } else {
+        ensure!(
+            unique_field(&change.expected, "LootTable")?.is_none(),
+            "deferred chest loot needs separate validation"
+        );
     }
     let without_items = |tag: &Tag| -> Result<Vec<(JavaString, Tag)>> {
         let Tag::Compound(fields) = tag else {
@@ -873,7 +921,10 @@ fn validate_chest_inventory_change(
         };
         Ok(fields
             .iter()
-            .filter(|(name, _)| !name.matches("Items"))
+            .filter(|(name, _)| {
+                !name.matches("Items")
+                    && !(generated && (name.matches("LootTable") || name.matches("LootTableSeed")))
+            })
             .cloned()
             .collect())
     };

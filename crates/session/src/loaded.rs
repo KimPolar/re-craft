@@ -2799,6 +2799,8 @@ impl LoadedSession {
             .context("chest chunk is unavailable")?;
         let sections = native_persistence::palette::decode_sections(&original.value)?;
         let mut changes = Vec::new();
+        let mut proofs = Vec::new();
+        let mut loot_verifiable = true;
         for chest in self.chest_contents.values().filter(|chest| {
             chest.position.x.div_euclid(16) == position.x
                 && chest.position.z.div_euclid(16) == position.z
@@ -2896,6 +2898,39 @@ impl LoadedSession {
                     "source chest state differs"
                 );
             }
+            if let Some(trace) = chest.loot_trace() {
+                let proof = (|| -> anyhow::Result<_> {
+                    let crate::saved_chest::LootRandomTrace::Fixed { table, .. } = trace else {
+                        anyhow::bail!("named loot requires a coordinated random sequence");
+                    };
+                    let loot = self
+                        .chest_loot
+                        .as_ref()
+                        .and_then(|tables| tables.get(table))
+                        .context("chest loot table is unavailable")?;
+                    let registry = self
+                        .item_registry
+                        .as_ref()
+                        .context("item registry is unavailable")?;
+                    chest.verify_generated_loot(table, loot, |item| {
+                        Self::resolve_chest_loot_item(item, registry)
+                    })?;
+                    native_persistence::chest_loot::VerifiedFixedChestLoot::replay(
+                        chest.source(),
+                        table,
+                        loot,
+                        |item| {
+                            Self::resolve_chest_loot_item(item, registry)?
+                                .max_count()
+                                .context("loot item maximum is unavailable")
+                        },
+                    )
+                })();
+                match proof {
+                    Ok(proof) => proofs.push(proof),
+                    Err(_) => loot_verifiable = false,
+                }
+            }
             changes.push(BlockEntityMutation {
                 expected: Some(chest.source().clone()),
                 replacement: Some(edited),
@@ -2910,9 +2945,10 @@ impl LoadedSession {
                 })
             })
             .collect();
-        if inventory_changes.len() != changes.len()
+        if !loot_verifiable
+            || inventory_changes.len() != changes.len()
             || draft
-                .stage_checked_chest_inventories(&inventory_changes)
+                .stage_checked_chest_inventories_with_loot(&inventory_changes, &proofs)
                 .is_err()
         {
             draft.stage_block_entity_mutations(&changes)?;
@@ -22602,7 +22638,9 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn buried_treasure_open_and_saved_items_match_java() {
+        use native_persistence::edit::{BlockChange, draft_chunk_blocks};
         use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_persistence::palette::BlockState as SavedBlockState;
         use native_resources::{
             chest_loot::ChestLootTables,
             packs::{ResourceProvider, ResourceStack},
@@ -22723,6 +22761,41 @@ mod tests {
             if mode == 0 {
                 fields.push(("LootTableSeed".into(), Tag::Long(seed)));
             }
+            let state = |name: &str, properties: &[(&str, &str)]| SavedBlockState {
+                name: name.into(),
+                properties: properties
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect(),
+            };
+            let mut chunk_source = draft_chunk_blocks(
+                &fixture_chunk_document(chunk),
+                native_persistence::world::ChunkPos {
+                    x: chunk.x,
+                    z: chunk.z,
+                },
+                &[BlockChange {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    expected: state("minecraft:stone", &[]),
+                    replacement: state(
+                        "minecraft:chest",
+                        &[
+                            ("facing", "north"),
+                            ("type", "single"),
+                            ("waterlogged", "false"),
+                        ],
+                    ),
+                }],
+            )
+            .unwrap()
+            .document()
+            .clone();
+            let Tag::Compound(fields) = &mut chunk_source.value else {
+                panic!()
+            };
+            fields.push(("block_entities".into(), document.value.clone()));
             Arc::make_mut(&mut session.world)
                 .saved_block_entities
                 .insert(
@@ -22791,6 +22864,14 @@ mod tests {
             session
                 .validate_closed_chest_item_balance(&player_source)
                 .unwrap();
+            let chunk_draft = session
+                .draft_chest_inventory_chunk(chunk, &chunk_source)
+                .unwrap();
+            assert_eq!(
+                chunk_draft.checked_chest_inventory_count(),
+                usize::from(mode == 0),
+                "seed {seed}"
+            );
             let chest = session.saved_chest(position).unwrap().unwrap();
             let draft = chest.draft_inventory(&chest.slots).unwrap();
             let encoded = nbt::write(&NamedTag {

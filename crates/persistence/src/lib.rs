@@ -1,4 +1,5 @@
 pub mod anvil;
+pub mod chest_loot;
 mod chest_transfer;
 pub mod edit;
 pub mod heightmap;

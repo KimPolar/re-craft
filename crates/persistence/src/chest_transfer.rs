@@ -1,6 +1,6 @@
 //! Validate conserved player/chest items before a coordinated partial save.
 use crate::{
-    edit::BlockEntityChange,
+    edit::CheckedChestInventory,
     nbt::{self, NamedTag, Tag, TagType},
     world::DimensionId,
 };
@@ -169,7 +169,7 @@ pub(crate) fn validate(
     source: &NamedTag,
     replacement: &NamedTag,
     uuid: [i32; 4],
-    changes: &[&BlockEntityChange],
+    changes: &[&CheckedChestInventory],
 ) -> Result<()> {
     for player in [source, replacement] {
         ensure!(
@@ -189,8 +189,18 @@ pub(crate) fn validate(
     add_player(&mut totals, source, 1)?;
     add_player(&mut totals, replacement, -1)?;
     for change in changes {
-        add_list(&mut totals, unique(&change.expected, "Items")?, 27, 1)?;
-        add_list(&mut totals, unique(&change.replacement, "Items")?, 27, -1)?;
+        let original = if let Some(proof) = &change.generated {
+            Some(&proof.items)
+        } else {
+            unique(&change.change.expected, "Items")?
+        };
+        add_list(&mut totals, original, 27, 1)?;
+        add_list(
+            &mut totals,
+            unique(&change.change.replacement, "Items")?,
+            27,
+            -1,
+        )?;
     }
     ensure!(
         totals.values().all(|count| *count == 0),
@@ -202,6 +212,7 @@ pub(crate) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::BlockEntityChange;
 
     fn stack(slot: u8, count: i32, components: Tag) -> Tag {
         Tag::Compound(vec![
@@ -237,9 +248,12 @@ mod tests {
         let reordered = Tag::Compound(vec![("a".into(), Tag::Int(1)), ("b".into(), Tag::Int(2))]);
         let source = player(vec![]);
         let replacement = player(vec![stack(4, 2, reordered.clone())]);
-        let change = BlockEntityChange {
-            expected: chest(vec![stack(3, 5, components.clone())]),
-            replacement: chest(vec![stack(7, 3, reordered)]),
+        let change = CheckedChestInventory {
+            generated: None,
+            change: BlockEntityChange {
+                expected: chest(vec![stack(3, 5, components.clone())]),
+                replacement: chest(vec![stack(7, 3, reordered)]),
+            },
         };
         assert!(validate(&source, &replacement, [0, 0, 0, 1], &[&change]).is_ok());
         assert!(

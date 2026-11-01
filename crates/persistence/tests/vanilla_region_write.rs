@@ -173,6 +173,27 @@ public class RegionWriteOracle {
                 if(!(block instanceof net.minecraft.world.level.block.entity.ChestBlockEntity chest) || !chest.getItem(0).is(net.minecraft.world.item.Items.DIAMOND) || chest.getItem(0).getCount()!=3 || tag.getLongOr("future_data",0)!=123) throw new AssertionError("chest contents");
             }
             System.out.println("OK");
+        } else if (args[0].equals("seedTransferPlayer")) {
+            var player=new CompoundTag(); player.putInt("DataVersion",5023); player.putIntArray("UUID",new int[]{0,0,0,1}); player.putLong("future_player",55); player.put("Inventory",new ListTag());
+            var path=world.resolve("players/data/00000000-0000-0000-0000-000000000001.dat"); Files.createDirectories(path.getParent()); NbtIo.writeCompressed(player,path);
+            System.out.println("OK");
+        } else if (args[0].equals("verifyAndRestoreChestTransfer")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            var lookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup(); var registries=net.minecraft.data.registries.VanillaRegistries.createReloadableLookup(lookup);
+            for(var pending:net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+            CompoundTag chunk;
+            try(var region=open(dir); var in=region.getChunkDataInputStream(new ChunkPos(0,0))) { chunk=NbtIo.read((DataInput)in); }
+            var tags=chunk.getListOrEmpty("block_entities"); if(tags.size()!=1)throw new AssertionError("chest missing");
+            var oldTag=tags.getCompoundOrEmpty(0); var block=net.minecraft.world.level.block.entity.BlockEntity.loadStatic(new net.minecraft.core.BlockPos(0,0,0),net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState(),oldTag,registries);
+            if(!(block instanceof net.minecraft.world.level.block.entity.ChestBlockEntity chest) || !chest.getItem(0).isEmpty() || oldTag.getLongOr("future_data",0)!=123) throw new AssertionError("chest not empty or metadata lost");
+            var path=world.resolve("players/data/00000000-0000-0000-0000-000000000001.dat"); var player=NbtIo.readCompressed(path,NbtAccounter.unlimitedHeap()); var inventory=player.getListOrEmpty("Inventory");
+            if(inventory.size()!=1 || player.getLongOr("future_player",0)!=55)throw new AssertionError("player inventory or metadata lost");
+            var ops=net.minecraft.resources.RegistryOps.create(NbtOps.INSTANCE,registries);
+            var stack=net.minecraft.world.item.ItemStack.CODEC.parse(ops,inventory.getCompoundOrEmpty(0)).getOrThrow();
+            if(!stack.is(net.minecraft.world.item.Items.DIAMOND) || stack.getCount()!=3)throw new AssertionError("player item differs");
+            chest.setItem(0,stack); var newTag=chest.saveWithFullMetadata(registries); newTag.putLong("future_data",123); tags.set(0,newTag); player.put("Inventory",new ListTag());
+            try(var region=open(dir); var out=region.getChunkDataOutputStream(new ChunkPos(0,0))) { NbtIo.write(chunk,(DataOutput)out); }
+            NbtIo.writeCompressed(player,path); System.out.println("OK");
         } else if (args[0].equals("seedItemMerge")) {
             Files.createDirectories(dir);
             Path entities=world.resolve("dimensions/minecraft/overworld/entities"); Files.createDirectories(entities);
@@ -609,6 +630,142 @@ fn block_entity_blocks_unsafe_replacement_and_survives_neighbor_edit() {
         .write_plan(plan, |_, _| Ok(()))
         .unwrap();
     invoke("verifyBlockEntity");
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_and_rust_round_trip_chest_and_player_transfer() {
+    use native_session::{
+        inventory::{PlayerInventory, PlayerSlot},
+        player_data,
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-chest-transfer-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    invoke("seedBlockEntity");
+    invoke("seedTransferPlayer");
+    let region = world.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let player_path = world.join("players/data/00000000-0000-0000-0000-000000000001.dat");
+    let player_source = nbt::read_gzip(std::fs::File::open(&player_path).unwrap()).unwrap();
+    let source_chunk = RegionReader::open(&region)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let dimension = DimensionId::parse("overworld").unwrap();
+    let mut reader = WorldReader::open(&world, dimension.clone()).unwrap();
+    let area = reader.read_area(ChunkPos { x: 0, z: 0 }, 0).unwrap();
+    let defaults = std::collections::BTreeMap::from([(
+        "minecraft:chest".into(),
+        std::collections::BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("type".into(), "single".into()),
+            ("waterlogged".into(), "false".into()),
+        ]),
+    )]);
+    let runtime = area
+        .materialize_with_defaults(&dimension, &defaults)
+        .unwrap();
+    drop(reader);
+    let player = native_session::PlayerState {
+        position: glam::Vec3::new(0.5, 1.0, 0.5),
+        yaw: 0.0,
+        pitch: 0.0,
+        vertical_velocity: 0.0,
+        on_ground: true,
+        pose: native_session::PlayerPose::Standing,
+    };
+    let session = native_session::loaded::LoadedSession::new(
+        runtime,
+        glam::IVec3::ZERO,
+        native_session::loaded::BuildBounds {
+            min_y: 0,
+            max_y: 16,
+        },
+        player,
+    )
+    .unwrap();
+    let chest = session.saved_chest(glam::IVec3::ZERO).unwrap().unwrap();
+    let mut inventory: PlayerInventory = player_data::read_saved_player(&player_source).unwrap();
+    assert!(inventory.open_chest(glam::IVec3::ZERO, chest.slots.clone()));
+    assert!(inventory.quick_move(PlayerSlot::Chest(0)));
+    assert!(inventory.toggle());
+    let (_, _, slots) = inventory.take_closed_chest().unwrap();
+    let slots: [Option<native_session::inventory::ItemStack>; 27] = slots.try_into().unwrap();
+    let updated_chest = chest.draft_inventory(&slots).unwrap();
+    let mut draft = draft_chunk_blocks(&source_chunk, ChunkPos { x: 0, z: 0 }, &[]).unwrap();
+    draft
+        .stage_checked_chest_inventories(&[BlockEntityChange {
+            expected: chest.source().clone(),
+            replacement: updated_chest,
+        }])
+        .unwrap();
+    let player_draft = player_data::draft_player_inventory(&player_source, &inventory).unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_chunk(dimension.clone(), draft, 2).unwrap();
+    plan.add_player_data(
+        [0, 0, 0, 1],
+        &player_source,
+        player_draft.document(),
+        |source, _| {
+            anyhow::ensure!(player_draft.matches_source(source)?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+    let result = writer.write_plan(plan, |_, _| Ok(())).unwrap();
+    assert!(result.backup_directory.exists());
+    drop(writer);
+    assert!(invoke("verifyAndRestoreChestTransfer").contains("OK"));
+    let chunk = RegionReader::open(&region)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    let Some(nbt::Tag::List { values, .. }) = chunk.value.get("block_entities") else {
+        panic!()
+    };
+    assert_eq!(values[0].get("future_data"), Some(&nbt::Tag::Long(123)));
+    let Some(nbt::Tag::List { values: items, .. }) = values[0].get("Items") else {
+        panic!()
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].get("count"), Some(&nbt::Tag::Int(3)));
+    let player = nbt::read_gzip(std::fs::File::open(player_path).unwrap()).unwrap();
+    assert!(
+        player_data::read_saved_player(&player)
+            .unwrap()
+            .slot(PlayerSlot::Storage(8))
+            .is_none()
+    );
+    assert_eq!(player.value.get("future_player"), Some(&nbt::Tag::Long(55)));
 }
 
 #[test]

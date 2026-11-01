@@ -1726,6 +1726,40 @@ impl LoadedSession {
         Ok(PlayerChestDraft { player, chests })
     }
 
+    /// Verify a closed-container transfer did not create or discard item
+    /// stacks. This is one prerequisite, not authorization for a world save:
+    /// callers still need to validate every changed chunk and other world state.
+    pub fn validate_closed_chest_item_balance(
+        &self,
+        player_source: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<()> {
+        self.validate_player_draft_source(player_source)?;
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending commands have not reached a tick"
+        );
+        anyhow::ensure!(
+            self.inventory.ready_for_player_save(),
+            "an inventory or cursor is still open"
+        );
+        anyhow::ensure!(
+            self.placed_chests.is_empty() && self.removed_chests.is_empty(),
+            "chest creation or removal requires separate accounting"
+        );
+        let original = crate::player_data::read_saved_player(player_source)?;
+        let before = crate::player_data::saved_slots(&original).chain(
+            self.chest_contents
+                .values()
+                .flat_map(|chest| chest.transfer_baseline().iter().flatten()),
+        );
+        let after = crate::player_data::saved_slots(&self.inventory).chain(
+            self.chest_contents
+                .values()
+                .flat_map(|chest| chest.slots.iter().flatten()),
+        );
+        crate::inventory::validate_item_balance(before, after)
+    }
+
     /// Stage the player and every dirty terrain chunk, including known block,
     /// heightmap, scheduled tick, chest inventory and completed light changes.
     /// Entity regions, clocks and unsupported effects are still separate.
@@ -22518,6 +22552,13 @@ mod tests {
                 continue;
             }
             let (mut session, _, position, chunk) = saved_chest_fixture();
+            let player_source = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            };
+            session
+                .restore_saved_player_inventory(&player_source)
+                .unwrap();
             let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
             else {
                 panic!()
@@ -22588,8 +22629,23 @@ mod tests {
                     .unwrap();
                 assert_eq!(random.next_long(), next, "seed {seed}");
             }
+            let first = (0..27)
+                .find(|slot| {
+                    session
+                        .inventory
+                        .slot(crate::inventory::PlayerSlot::Chest(*slot))
+                        .is_some()
+                })
+                .unwrap();
+            assert!(
+                Arc::make_mut(&mut session.inventory)
+                    .quick_move(crate::inventory::PlayerSlot::Chest(first))
+            );
             assert!(Arc::make_mut(&mut session.inventory).toggle());
             session.collect_closed_chest();
+            session
+                .validate_closed_chest_item_balance(&player_source)
+                .unwrap();
             let chest = session.saved_chest(position).unwrap().unwrap();
             let draft = chest.draft_inventory(&chest.slots).unwrap();
             let encoded = nbt::write(&NamedTag {
@@ -23457,6 +23513,7 @@ mod tests {
         };
         fields.push(("block_entities".into(), entities));
         assert!(session.try_open_saved_chest(position - session.origin));
+        assert!(session.validate_closed_chest_item_balance(&player).is_err());
         session.submit_command(PlayerCommand::InventoryQuickMove {
             slot: PlayerSlot::Chest(3),
         });
@@ -23464,6 +23521,14 @@ mod tests {
         assert!(session.draft_chest_inventory_chunk(chunk, &source).is_err());
         session.submit_command(PlayerCommand::ToggleInventory);
         session.update(TICK);
+        session.validate_closed_chest_item_balance(&player).unwrap();
+        Arc::make_mut(&mut session.inventory).set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        assert!(session.validate_closed_chest_item_balance(&player).is_err());
+        Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), None);
+        session.validate_closed_chest_item_balance(&player).unwrap();
         let draft = session.draft_chest_inventory_chunk(chunk, &source).unwrap();
         assert!(draft.matches_source(&source).unwrap());
         let originals = BTreeMap::from([(chunk, source.clone())]);

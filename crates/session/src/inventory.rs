@@ -3,7 +3,10 @@
 //! Item-specific click overrides (for example bundles) and recipe result slots
 //! require their own handlers; callers must not treat this as those handlers.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use glam::IVec3;
 use native_core::random::LegacyRandom;
@@ -2925,9 +2928,78 @@ pub(crate) fn equal_tag(a: &Tag, b: &Tag) -> bool {
     }
 }
 
+/// Check conservation across inventories while allowing stacks to split, merge,
+/// and move. Unknown prototypes can only match an identical saved stack.
+pub(crate) fn validate_item_balance<'a>(
+    before: impl IntoIterator<Item = &'a ItemStack>,
+    after: impl IntoIterator<Item = &'a ItemStack>,
+) -> anyhow::Result<()> {
+    let mut groups: BTreeMap<&str, Vec<(&ItemStack, i64)>> = BTreeMap::new();
+    for (item, direction) in before
+        .into_iter()
+        .map(|item| (item, 1_i64))
+        .chain(after.into_iter().map(|item| (item, -1_i64)))
+    {
+        anyhow::ensure!(
+            (1..=99).contains(&item.count()),
+            "inventory contains an unsavable item count"
+        );
+        let groups = groups.entry(item.id()).or_default();
+        let matching = groups.iter_mut().find(|(other, _)| {
+            if item.max_count().is_none() {
+                *other == item
+            } else {
+                other.same_item_and_components(item)
+            }
+        });
+        if let Some((_, count)) = matching {
+            *count = count
+                .checked_add(direction * i64::from(item.count()))
+                .ok_or_else(|| anyhow::anyhow!("item count overflow"))?;
+        } else {
+            groups.push((item, direction * i64::from(item.count())));
+        }
+    }
+    anyhow::ensure!(
+        groups.values().flatten().all(|(_, count)| *count == 0),
+        "player and chest item totals changed"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_tracks_components_and_allows_splitting_and_merging() {
+        let stone = |count| {
+            ItemStack::new("minecraft:stone".into(), count, 64, Tag::Compound(vec![])).unwrap()
+        };
+        let named = |count| {
+            ItemStack::new(
+                "minecraft:stone".into(),
+                count,
+                64,
+                Tag::Compound(vec![(
+                    "minecraft:custom_data".into(),
+                    Tag::Compound(vec![("marker".into(), Tag::Int(1))]),
+                )]),
+            )
+            .unwrap()
+        };
+        let before = [stone(10), named(2)];
+        let after = [stone(4), stone(6), named(2)];
+        assert!(validate_item_balance(&before, &after).is_ok());
+        assert!(validate_item_balance(&before, &[stone(12)]).is_err());
+        assert!(validate_item_balance(&before, &[stone(11), named(2)]).is_err());
+        let unknown =
+            ItemStack::unresolved("example:unknown".into(), 3, Tag::Compound(vec![])).unwrap();
+        assert!(validate_item_balance([&unknown], [&unknown]).is_ok());
+        let changed =
+            ItemStack::unresolved("example:unknown".into(), 2, Tag::Compound(vec![])).unwrap();
+        assert!(validate_item_balance([&unknown], [&changed]).is_err());
+    }
 
     #[test]
     fn filling_bucket_handles_stacks_overflow_and_creative_duplicates() {

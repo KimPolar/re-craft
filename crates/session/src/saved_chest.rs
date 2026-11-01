@@ -18,6 +18,7 @@ pub struct SavedChest {
     source: Arc<Tag>,
     pending_loot: Option<(ResourceId, i64)>,
     loot_unpacked: bool,
+    generated_loot: Option<[Option<ItemStack>; 27]>,
 }
 
 /// Validate item-carried contents without recursively resolving item prototypes.
@@ -179,6 +180,7 @@ impl SavedChest {
             source: Arc::new(Tag::Compound(fields)),
             pending_loot: None,
             loot_unpacked: false,
+            generated_loot: None,
         })
     }
     pub fn source(&self) -> &Tag {
@@ -362,6 +364,12 @@ impl SavedChest {
         self.loot_unpacked || self.slots != self.original_slots
     }
 
+    /// Counts that existed before player interaction, including loot generated
+    /// when this chest was first opened during the session.
+    pub(crate) fn transfer_baseline(&self) -> &[Option<ItemStack>; 27] {
+        self.generated_loot.as_ref().unwrap_or(&self.original_slots)
+    }
+
     /// The still-unopened table and its saved seed. Zero requires a world
     /// random sequence and cannot be resolved by `unpack_seeded_loot`.
     pub(crate) fn pending_loot(&self) -> Option<(&ResourceId, i64)> {
@@ -441,6 +449,7 @@ impl SavedChest {
                     .context("invalid generated item count")?,
             );
         }
+        self.generated_loot = Some(slots.clone());
         self.slots = slots;
         self.pending_loot = None;
         self.loot_unpacked = true;
@@ -677,6 +686,7 @@ fn read_internal(
         source: Arc::new(entity),
         pending_loot,
         loot_unpacked: false,
+        generated_loot: None,
     }))
 }
 

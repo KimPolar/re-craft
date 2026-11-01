@@ -1671,7 +1671,7 @@ fn validate_original_inventory(player: &NamedTag) -> Result<()> {
     Ok(())
 }
 
-fn saved_slots(inventory: &PlayerInventory) -> impl Iterator<Item = &ItemStack> {
+pub(crate) fn saved_slots(inventory: &PlayerInventory) -> impl Iterator<Item = &ItemStack> {
     (0..36)
         .map(PlayerSlot::Storage)
         .chain((0..4).map(PlayerSlot::Armor))

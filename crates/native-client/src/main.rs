@@ -61,6 +61,7 @@ mod status_effect_ui;
 mod survival_hud;
 mod text_component;
 mod toggle_key;
+mod tooltip;
 mod video_ui;
 mod visual_look;
 #[cfg(test)]

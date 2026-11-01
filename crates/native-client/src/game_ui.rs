@@ -132,6 +132,7 @@ struct DrawKey {
     hovered_slot: Option<PlayerSlot>,
     carried_position: Option<(i32, i32)>,
     avatar_position: Option<(i32, i32)>,
+    effect_tooltip_cursor: Option<(i32, i32)>,
     avatar_tick: Option<u64>,
     book_open: bool,
     book_revision: u64,
@@ -2189,11 +2190,11 @@ impl GameUi {
             (main, off)
         };
         let player_menu = inventory.menu() == Some(InventoryMenu::Player);
-        let logical_width = gui_size(size, self.gui_scale()).0;
+        let (logical_width, logical_height) = self.logical_size();
         let avatar_visible = player_menu && !(self.recipe_book.is_open() && logical_width < 379);
         let player_shows_effects = player_menu && {
-            let (left, _) = inventory_origin(logical_width as i32, 0, self.recipe_book.is_open());
-            crate::status_effect_ui::inventory_has_room(logical_width as i32, left)
+            let (left, _) = inventory_origin(logical_width, 0, self.recipe_book.is_open());
+            crate::status_effect_ui::inventory_has_room(logical_width, left)
         };
         let right_model = avatar_visible
             .then(|| right_hand.and_then(|item| self.held_models.get_item(item)))
@@ -2210,7 +2211,6 @@ impl GameUi {
                 })
                 .flatten()
         });
-        let (_, logical_height) = self.logical_size();
         self.video_ui.resize(logical_height);
         self.accessibility_ui.resize(logical_height);
         self.sound_ui.resize(logical_height);
@@ -2230,6 +2230,21 @@ impl GameUi {
             carried_position: (inventory.is_open() && inventory.cursor().is_some())
                 .then_some(self.cursor),
             avatar_position: avatar_visible.then_some(self.cursor),
+            effect_tooltip_cursor: (player_shows_effects
+                && !self.paused
+                && !self.chat_input.is_open()
+                && {
+                    let (left, top) =
+                        inventory_origin(logical_width, logical_height, self.recipe_book.is_open());
+                    crate::status_effect_ui::inventory_hover_area(
+                        self.effects,
+                        logical_width,
+                        left,
+                        top,
+                        self.cursor,
+                    )
+                })
+            .then_some(self.cursor),
             avatar_tick: avatar_visible.then_some(tick),
             book_open: inventory.is_open() && self.recipe_book.is_open(),
             book_revision: self.recipe_book.revision(),
@@ -2352,6 +2367,7 @@ impl GameUi {
         } else {
             self.pre_blur_hud = None;
         }
+        let mut status_tooltip = None;
         if let Some(menu) = inventory.menu() {
             canvas.fill(Rect { x: 0, y: 0, w, h }, [0, 0, 0, 100]);
             let chest_menu = matches!(menu, InventoryMenu::Chest { .. });
@@ -2366,7 +2382,14 @@ impl GameUi {
                 inventory_origin(w, h, book_open)
             };
             if player_menu {
-                crate::status_effect_ui::draw_inventory(&mut canvas, assets, self.effects, x, y);
+                status_tooltip = crate::status_effect_ui::draw_inventory(
+                    &mut canvas,
+                    assets,
+                    self.effects,
+                    x,
+                    y,
+                    (!self.paused && !self.chat_input.is_open()).then_some(self.cursor),
+                );
             }
             if !(book_open && w < 379) {
                 canvas.image(
@@ -3071,6 +3094,15 @@ impl GameUi {
             );
             self.chat_input.clamp_scroll(max_scroll);
             self.chat_input.draw(&mut canvas, assets);
+        }
+        if let Some(tooltip) = status_tooltip {
+            crate::tooltip::draw_two_lines(
+                &mut canvas,
+                assets,
+                self.cursor,
+                &tooltip.name,
+                &tooltip.duration,
+            );
         }
         self.last_draw = Some(key);
         Some(canvas)
@@ -4290,6 +4322,60 @@ mod inventory_tests {
         ui.sync_hud(&snapshot);
         let canvas = ui.compose((1280, 720), &inventory, 2).unwrap();
         assert_eq!(pixel(&canvas, left + 178 + 7, top + 7), 0xffe7132f);
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn clipped_effect_tooltip_uses_pack_sprites_and_tracks_cursor_in_narrow_book() {
+        use native_session::{GameSession, survival::DisplayEffect};
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let pack = tempfile::tempdir().unwrap();
+        let tooltip = pack
+            .path()
+            .join("assets/minecraft/textures/gui/sprites/tooltip");
+        std::fs::create_dir_all(&tooltip).unwrap();
+        RgbaImage::from_pixel(16, 16, image::Rgba([241, 9, 21, 255]))
+            .save(tooltip.join("background.png"))
+            .unwrap();
+        RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 0]))
+            .save(tooltip.join("frame.png"))
+            .unwrap();
+        let assets = Arc::new(MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut snapshot = (*native_session::LocalSession::demo().snapshot()).clone();
+        snapshot.active_effects = Arc::from([DisplayEffect {
+            id: "speed",
+            duration: 3600,
+            amplifier: 0,
+            ambient: false,
+            show_icon: true,
+        }]);
+        ui.sync_hud(&snapshot);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_recipe_book_settings(true, false);
+        inventory.toggle();
+        ui.cursor_moved(0.0, 0.0);
+        let initial = ui.compose((960, 720), &inventory, 0).unwrap();
+        let red = 0xfff10915;
+        assert!(!initial.pixels.contains(&red));
+        let (left, top) = inventory_origin(initial.width, initial.height, true);
+        let scale = f64::from(ui.gui_scale());
+        ui.cursor_moved(f64::from(left + 185) * scale, f64::from(top + 7) * scale);
+        let hovered = ui
+            .compose((960, 720), &inventory, 0)
+            .expect("hover must invalidate cached screen");
+        assert!(hovered.pixels.contains(&red));
+        assert!(ui.compose((960, 720), &inventory, 0).is_none());
+        ui.cursor_moved(f64::from(left + 186) * scale, f64::from(top + 7) * scale);
+        let moved = ui
+            .compose((960, 720), &inventory, 0)
+            .expect("tooltip follows the cursor");
+        assert!(moved.pixels.contains(&red));
+        ui.cursor_moved(0.0, 0.0);
+        let left_tooltip = ui.compose((960, 720), &inventory, 0).unwrap();
+        assert!(!left_tooltip.pixels.contains(&red));
     }
 
     #[test]

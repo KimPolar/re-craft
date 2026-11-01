@@ -209,6 +209,39 @@ pub fn inventory_has_room(width: i32, left: i32) -> bool {
     width - (left + 176 + 2) >= 32
 }
 
+/// A conservative cursor region used only to invalidate the cached screen.
+pub fn inventory_hover_area(
+    frame: Frame,
+    width: i32,
+    left: i32,
+    top: i32,
+    cursor: (i32, i32),
+) -> bool {
+    let count = frame.entries.iter().flatten().count() as i32;
+    if count == 0 || !inventory_has_room(width, left) {
+        return false;
+    }
+    let spacing = if count > 5 { 132 / (count - 1) } else { 33 };
+    let x = left + 178;
+    cursor.0 >= x && cursor.0 <= width && cursor.1 >= top && cursor.1 <= top + count * spacing
+}
+
+pub struct InventoryTooltip {
+    pub name: String,
+    pub duration: String,
+}
+
+fn tooltip_requested(
+    x: i32,
+    y: i32,
+    width: i32,
+    spacing: i32,
+    cursor: (i32, i32),
+    clipped: bool,
+) -> bool {
+    clipped && cursor.0 >= x && cursor.0 <= x + width && cursor.1 >= y && cursor.1 <= y + spacing
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Placement {
     entry: Entry,
@@ -270,18 +303,26 @@ pub fn draw_hud(canvas: &mut Canvas, sprites: &HudSprites, frame: Frame) {
     }
 }
 
-pub fn draw_inventory(canvas: &mut Canvas, assets: &MenuAssets, frame: Frame, left: i32, top: i32) {
+pub fn draw_inventory(
+    canvas: &mut Canvas,
+    assets: &MenuAssets,
+    frame: Frame,
+    left: i32,
+    top: i32,
+    cursor: Option<(i32, i32)>,
+) -> Option<InventoryTooltip> {
     let x = left + 178;
     let room = canvas.width - x;
     if room < 32 {
-        return;
+        return None;
     }
     let max_width = if room >= 120 { room - 7 } else { 32 };
     let count = frame.entries.iter().flatten().count() as i32;
     if count == 0 {
-        return;
+        return None;
     }
     let spacing = if count > 5 { 132 / (count - 1) } else { 33 };
+    let mut tooltip = None;
     for (i, entry) in frame.entries.iter().flatten().enumerate() {
         let info = &EFFECTS[entry.index as usize];
         let key = format!("effect.minecraft.{}", info.id);
@@ -333,19 +374,27 @@ pub fn draw_inventory(canvas: &mut Canvas, assets: &MenuAssets, frame: Frame, le
             },
         );
         let available = width - 39;
+        let clipped = available <= 0 || canvas.text_width(Some(assets), &name) > available;
+        if tooltip.is_none()
+            && cursor.is_some_and(|cursor| tooltip_requested(x, y, width, spacing, cursor, clipped))
+        {
+            tooltip = Some(InventoryTooltip {
+                name: name.clone(),
+                duration: duration.clone(),
+            });
+        }
         if available > 0 {
-            if canvas.text_width(Some(assets), &name) > available {
+            if clipped {
                 let ellipsis = "...";
                 let prefix_width = available - canvas.text_width(Some(assets), ellipsis);
-                while !name.is_empty() && canvas.text_width(Some(assets), &name) > prefix_width {
-                    name.pop();
-                }
-                name.push_str(ellipsis);
+                let prefix = canvas.text_prefix_by_width(Some(assets), &name, prefix_width);
+                name = format!("{prefix}{ellipsis}");
             }
             canvas.text(Some(assets), x + 32, y + 7, &name, [255, 255, 255]);
             canvas.text(Some(assets), x + 32, y + 16, &duration, [128, 128, 128]);
         }
     }
+    tooltip
 }
 
 #[cfg(test)]
@@ -380,6 +429,131 @@ mod tests {
             .hud_key(),
             Frame::default()
         );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn clipped_inventory_effect_returns_localized_name_and_duration() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let effect = DisplayEffect {
+            id: "speed",
+            duration: 3600,
+            amplifier: 1,
+            ambient: false,
+            show_icon: false,
+        };
+        let frame = Frame::new(&[effect]);
+        let mut narrow = Canvas::new(320, 240);
+        let tooltip = draw_inventory(&mut narrow, &assets, frame, 72, 37, Some((250, 37))).unwrap();
+        assert_eq!(
+            tooltip.name,
+            format!(
+                "{} {}",
+                assets.translate("effect.minecraft.speed", "effect.minecraft.speed"),
+                assets.translate("enchantment.level.2", "enchantment.level.2")
+            )
+        );
+        assert_eq!(tooltip.duration, "03:00");
+        assert!(draw_inventory(&mut narrow, &assets, frame, 72, 37, Some((249, 37))).is_none());
+        let mut wide = Canvas::new(500, 240);
+        assert!(draw_inventory(&mut wide, &assets, frame, 162, 37, Some((340, 37))).is_none());
+        let infinite = Frame::new(&[DisplayEffect {
+            duration: -1,
+            ..effect
+        }]);
+        let tooltip =
+            draw_inventory(&mut narrow, &assets, infinite, 72, 37, Some((250, 37))).unwrap();
+        assert_eq!(
+            tooltip.duration,
+            assets.translate("effect.duration.infinite", "∞")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn inventory_tooltip_trigger_matches_java_extractor() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("EffectTooltipOracle.java");
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/EffectTooltipOracle.java"),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        for width in [32, 39, 40, 50, 194, 195, 200] {
+            for spacing in [5, 20, 33] {
+                for mouse_x in [99, 100, 101, 132, 139, 150, 294, 295, 300, 301, 400] {
+                    for mouse_y in [49, 50, 51, 60, 70, 80, 83, 84] {
+                        cases.push(serde_json::json!({"x":100,"y":50,"width":width,"spacing":spacing,"mouse_x":mouse_x,"mouse_y":mouse_y}));
+                    }
+                }
+            }
+        }
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("EffectTooltipOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected: Vec<bool> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), 1848);
+        for (case, expected) in cases.iter().zip(expected) {
+            let get = |name| case[name].as_i64().unwrap() as i32;
+            let width = get("width");
+            let clipped = width - 39 <= 0 || 156 > width - 39;
+            assert_eq!(
+                tooltip_requested(
+                    get("x"),
+                    get("y"),
+                    width,
+                    get("spacing"),
+                    (get("mouse_x"), get("mouse_y")),
+                    clipped
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]

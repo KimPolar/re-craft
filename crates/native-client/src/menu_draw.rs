@@ -537,6 +537,23 @@ impl Canvas {
         text.chars().map(|c| glyph_width(assets, c)).sum()
     }
 
+    /// Return the longest leading substring that fits the supplied pixel width.
+    pub fn text_prefix_by_width<'a>(
+        &self,
+        assets: Option<&MenuAssets>,
+        text: &'a str,
+        width: i32,
+    ) -> &'a str {
+        let mut used = 0;
+        for (index, ch) in text.char_indices() {
+            used += glyph_width(assets, ch);
+            if used > width {
+                return &text[..index];
+            }
+        }
+        text
+    }
+
     /// The default Minecraft bitmap glyph adds one pixel of advance when bold.
     pub fn bold_text_width(&self, assets: Option<&MenuAssets>, text: &str) -> i32 {
         text.chars().map(|c| glyph_width(assets, c) + 1).sum()

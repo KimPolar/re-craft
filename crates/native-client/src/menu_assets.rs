@@ -44,6 +44,8 @@ pub struct MenuAssets {
     pub hotbar_offhand_left: RgbaImage,
     pub hotbar_offhand_right: RgbaImage,
     pub hud: HudSprites,
+    pub tooltip_background: GuiSprite,
+    pub tooltip_frame: GuiSprite,
     pub inventory: RgbaImage,
     pub crafting_table: RgbaImage,
     pub chest: RgbaImage,
@@ -430,6 +432,14 @@ impl MenuAssets {
         let scroller = load_widget_sprite(&mut stack, "scroller")?;
         let scroller_background = load_widget_sprite(&mut stack, "scroller_background")?;
         let hud = HudSprites::load(&mut stack)?;
+        let tooltip_background = load_gui_sprite_path(
+            &mut stack,
+            "assets/minecraft/textures/gui/sprites/tooltip/background.png",
+        )?;
+        let tooltip_frame = load_gui_sprite_path(
+            &mut stack,
+            "assets/minecraft/textures/gui/sprites/tooltip/frame.png",
+        )?;
         let glint_path = "assets/minecraft/textures/misc/enchanted_glint_item.png";
         let glint_asset = stack
             .read_asset_with_metadata(glint_path)?
@@ -751,6 +761,8 @@ impl MenuAssets {
             hotbar_offhand_left,
             hotbar_offhand_right,
             hud,
+            tooltip_background,
+            tooltip_frame,
             inventory,
             crafting_table,
             chest,

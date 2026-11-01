@@ -813,6 +813,84 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft 26.3 and a GPU; does not open a window"]
+    fn gpu_uploads_banner_body_and_flag_materials() {
+        use native_persistence::nbt::{Tag, TagType};
+        use native_resources::packs::ResourceStack;
+        use native_session::inventory::ItemStack;
+        use std::{
+            sync::Mutex,
+            time::{Duration, Instant},
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let loader = crate::held_items::Loader::from_stack(ResourceStack::open(&game).unwrap());
+        let mut cache = crate::held_items::ItemModelCache::new(Arc::new(Mutex::new(loader)));
+        let item = ItemStack::new(
+            "minecraft:white_banner".into(),
+            1,
+            16,
+            Tag::Compound(vec![(
+                "minecraft:banner_patterns".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("pattern".into(), Tag::String("minecraft:cross".into())),
+                        ("color".into(), Tag::String("blue".into())),
+                    ])],
+                },
+            )]),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let model = loop {
+            cache.poll();
+            if let Some(model) = cache.get_item(&item) {
+                break model;
+            }
+            assert!(Instant::now() < deadline, "banner model worker timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .unwrap();
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let mut renderer =
+                FirstPersonRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, None);
+            renderer.cache_model(&device, &queue, model);
+            let cached = renderer.models.back().unwrap();
+            assert_eq!(cached.materials.len(), 2);
+            assert_eq!(
+                cached
+                    .materials
+                    .iter()
+                    .map(|material| material.count)
+                    .sum::<u32>(),
+                108
+            );
+            assert!(
+                errors.pop().await.is_none(),
+                "banner GPU upload validation failed"
+            );
+        });
+    }
+
+    #[test]
     #[ignore = "requires a GPU; does not open a window"]
     fn gpu_draws_both_hands_in_front_of_world_and_hides_spectator() {
         use crate::held_items::TexturedQuad;

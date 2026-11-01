@@ -3343,7 +3343,7 @@ fn stack_icon_with_cap(
             .map(|icon| (icon, model.gui_glint_uv, model.gui_glint_pixels.as_deref()))
     }) {
         canvas.image(icon, Rect { x, y, w: 16, h: 16 });
-        if item.has_glint() {
+        if cached_model.as_ref().is_some_and(|model| model.glint) {
             canvas.mark_item_glint_with_mapping(icon, Rect { x, y, w: 16, h: 16 }, uv, pixels);
         }
     } else {

@@ -135,6 +135,7 @@ struct ModelKey {
     trim_material: Option<String>,
     dye: Option<u32>,
     potion_color: Option<u32>,
+    banner_patterns: Option<Vec<crate::banner_item::Layer>>,
     glint: bool,
     lodestone_tracker: bool,
     /// Raw numeric-property bits. A missing owner yields zero in Java.
@@ -148,6 +149,7 @@ impl ModelKey {
             trim_material: None,
             dye: None,
             potion_color: None,
+            banner_patterns: Some(Vec::new()),
             glint: false,
             lodestone_tracker: false,
             compass_angle: 0.0_f32.to_bits(),
@@ -175,6 +177,7 @@ impl ModelKey {
             trim_material,
             dye,
             potion_color: native_session::survival::potion_color(item.components()),
+            banner_patterns: crate::banner_item::patterns(item.components()),
             glint: item.has_glint(),
             lodestone_tracker: item
                 .components()
@@ -192,7 +195,9 @@ impl ModelKey {
 fn selected_model<'a>(mut entry: &'a Value, key: &ModelKey) -> Result<&'a Value> {
     for _ in 0..32 {
         match entry.get("type").and_then(Value::as_str) {
-            Some("minecraft:model" | "model") => return Ok(entry),
+            Some("minecraft:model" | "model" | "minecraft:special" | "special") => {
+                return Ok(entry);
+            }
             Some("minecraft:condition" | "condition") => {
                 ensure!(
                     matches!(
@@ -509,6 +514,27 @@ impl Loader {
         Ok(image)
     }
 
+    fn banner_textures(
+        &mut self,
+        color: u32,
+        patterns: &[crate::banner_item::Layer],
+    ) -> Result<(Arc<RgbaImage>, Arc<RgbaImage>)> {
+        let body = self.texture(&ResourceId::parse("minecraft:entity/banner/banner_base")?)?;
+        let mut flag = body.as_ref().clone();
+        let base = self.texture(&ResourceId::parse("minecraft:entity/banner/base")?)?;
+        crate::banner_item::overlay(&mut flag, &base, color)?;
+        for layer in patterns {
+            let asset = crate::banner_item::asset_id(&mut self.stack, &layer.pattern)?;
+            let sprite = ResourceId {
+                namespace: asset.namespace,
+                path: format!("entity/banner/{}", asset.path),
+            };
+            let texture = self.texture(&sprite)?;
+            crate::banner_item::overlay(&mut flag, &texture, layer.color)?;
+        }
+        Ok((body, Arc::new(flag)))
+    }
+
     /// Resolve generated item sprites such as armor trims through the active
     /// atlas sources and palette textures instead of assuming a PNG exists.
     fn paletted_item_texture(&mut self, id: &ResourceId) -> Result<Option<RgbaImage>> {
@@ -609,8 +635,12 @@ impl Loader {
             .with_context(|| format!("missing {path}"))?;
         let definition: Value = serde_json::from_slice(&bytes)?;
         let entry = selected_model(definition.get("model").context("missing item model")?, key)?;
+        let special = matches!(
+            entry.get("type").and_then(Value::as_str),
+            Some("minecraft:special" | "special")
+        );
         let name = entry
-            .get("model")
+            .get(if special { "base" } else { "model" })
             .and_then(Value::as_str)
             .context("missing model name")?;
         let model = models::resolve_model(&mut self.stack, name)?;
@@ -649,8 +679,39 @@ impl Loader {
             && gui.rotation == Vec3::ZERO
             && gui.translation == Vec3::ZERO
             && gui.scale == Vec3::ONE;
-        let mut gui_glint_quads = (key.glint && !flat_gui).then(Vec::new);
-        if model.generated {
+        let mut gui_glint_quads = (key.glint && !flat_gui && !special).then(Vec::new);
+        if special {
+            let special_model = entry.get("model").context("missing special model")?;
+            ensure!(
+                matches!(
+                    special_model.get("type").and_then(Value::as_str),
+                    Some("minecraft:banner" | "banner")
+                ),
+                "unsupported special item renderer"
+            );
+            let color = crate::banner_item::color(
+                special_model
+                    .get("color")
+                    .and_then(Value::as_str)
+                    .context("missing banner color")?,
+            )
+            .context("invalid banner color")?;
+            let patterns = key
+                .banner_patterns
+                .as_ref()
+                .context("invalid banner pattern components")?;
+            let (body_texture, flag_texture) = self.banner_textures(color, patterns)?;
+            let (body, flag) = crate::banner_item::geometry(entry.get("transformation"))?;
+            for (geometry, texture) in [(body, body_texture), (flag, flag_texture)] {
+                quads.extend(geometry.into_iter().map(|quad| TexturedQuad {
+                    vertices: quad.vertices,
+                    normal: quad.normal,
+                    texture: Arc::clone(&texture),
+                    tint: [1.; 3],
+                    layer: 0,
+                }));
+            }
+        } else if model.generated {
             let textures = model
                 .fields
                 .get("textures")
@@ -743,7 +804,7 @@ impl Loader {
             quads,
             particle_texture,
             numeric_item_id,
-            glint: key.glint,
+            glint: key.glint && !special,
             glint_materials,
             right,
             left,
@@ -955,7 +1016,7 @@ impl ItemModelCache {
                         model
                     })
                     .map(|mut model| {
-                        if key.glint {
+                        if model.glint {
                             if let Some((icon, pixels)) = crate::item_gui::render_with_glint(&model)
                             {
                                 model.gui_icon = Some(Arc::new(icon));
@@ -1831,6 +1892,210 @@ public class PaletteOracle {
             assert_eq!(model.sprite_layers[0].tint, expected, "{potion}");
             assert_eq!(model.sprite_layers[1].tint, [1.0; 3]);
         }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn banner_special_models_load_patterns_and_resource_pack_overrides() {
+        use native_persistence::nbt::TagType;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut loader = open_loader(&game, &[]);
+        let plain = ItemStack::new(
+            "minecraft:white_banner".into(),
+            1,
+            16,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        let patterned = ItemStack::new(
+            "minecraft:white_banner".into(),
+            1,
+            16,
+            Tag::Compound(vec![(
+                "minecraft:banner_patterns".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("pattern".into(), Tag::String("minecraft:cross".into())),
+                        ("color".into(), Tag::String("red".into())),
+                    ])],
+                },
+            )]),
+        )
+        .unwrap();
+        let plain_key = ModelKey::from_item(&plain);
+        let patterned_key = ModelKey::from_item(&patterned);
+        assert_ne!(plain_key, patterned_key);
+        let plain_model = loader.load_visual(&plain_key).unwrap();
+        let patterned_model = loader.load_visual(&patterned_key).unwrap();
+        assert_eq!(plain_model.quads.len(), 18);
+        assert_eq!(patterned_model.quads.len(), 18);
+        assert_eq!(
+            plain_model.quads[0].texture.as_raw(),
+            patterned_model.quads[0].texture.as_raw()
+        );
+        assert_ne!(
+            plain_model.quads[12].texture.as_raw(),
+            patterned_model.quads[12].texture.as_raw()
+        );
+        let icon = crate::item_gui::render(&plain_model).unwrap();
+        let patterned_icon = crate::item_gui::render(&patterned_model).unwrap();
+        assert!(icon.pixels().any(|p| p[3] != 0));
+        assert_ne!(icon.as_raw(), patterned_icon.as_raw());
+        let worker = Arc::new(Mutex::new(Loader::from_stack(
+            ResourceStack::open(&game).unwrap(),
+        )));
+        let mut cache = ItemModelCache::new(worker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (cached_plain, cached_patterned) = loop {
+            cache.poll();
+            let first = cache.get_item(&plain);
+            let second = cache.get_item(&patterned);
+            if let (Some(first), Some(second)) = (first, second) {
+                break (first, second);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "banner model worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_ne!(
+            cached_plain.gui_icon.as_ref().unwrap().as_raw(),
+            cached_patterned.gui_icon.as_ref().unwrap().as_raw()
+        );
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            let model = loader
+                .load_visual(&ModelKey::plain(&format!("minecraft:{color}_banner")))
+                .unwrap();
+            assert_eq!(model.quads.len(), 18);
+            assert!(
+                crate::item_gui::render(&model)
+                    .unwrap()
+                    .pixels()
+                    .any(|p| p[3] != 0),
+                "{color}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let texture = dir
+            .path()
+            .join("assets/minecraft/textures/entity/banner/cross.png");
+        std::fs::create_dir_all(texture.parent().unwrap()).unwrap();
+        RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]))
+            .save(&texture)
+            .unwrap();
+        let mut packed = open_loader(&game, &[dir.path().to_path_buf()]);
+        let overridden = packed.load_visual(&patterned_key).unwrap();
+        assert_ne!(
+            overridden.quads[12].texture.as_raw(),
+            patterned_model.quads[12].texture.as_raw()
+        );
+
+        let world = tempfile::tempdir().unwrap();
+        let data = world
+            .path()
+            .join("datapacks/custom/data/example/banner_pattern");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            world.path().join("datapacks/custom/pack.mcmeta"),
+            br#"{"pack":{"description":"custom","min_format":121,"max_format":121}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("motif.json"),
+            br#"{"asset_id":"example:pattern","translation_key":"example.banner"}"#,
+        )
+        .unwrap();
+        let asset = dir
+            .path()
+            .join("assets/example/textures/entity/banner/pattern.png");
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        RgbaImage::from_pixel(64, 64, image::Rgba([180, 220, 255, 128]))
+            .save(&asset)
+            .unwrap();
+        let mut stack = ResourceStack::open(&game).unwrap();
+        stack.push_pack(dir.path()).unwrap();
+        let warnings = stack
+            .configure_world_data(
+                world.path(),
+                &native_resources::datapacks::DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/custom".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                },
+            )
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let item = |pattern: Tag| {
+            ItemStack::new(
+                "minecraft:white_banner".into(),
+                1,
+                16,
+                Tag::Compound(vec![(
+                    "minecraft:banner_patterns".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("pattern".into(), pattern),
+                            ("color".into(), Tag::String("blue".into())),
+                        ])],
+                    },
+                )]),
+            )
+            .unwrap()
+        };
+        let named = item(Tag::String("example:motif".into()));
+        let direct = item(Tag::Compound(vec![
+            ("asset_id".into(), Tag::String("example:pattern".into())),
+            (
+                "translation_key".into(),
+                Tag::String("example.banner".into()),
+            ),
+        ]));
+        let mut loader = Loader::from_stack(stack);
+        let named = loader.load_visual(&ModelKey::from_item(&named)).unwrap();
+        let direct = loader.load_visual(&ModelKey::from_item(&direct)).unwrap();
+        assert_eq!(
+            named.quads[12].texture.as_raw(),
+            direct.quads[12].texture.as_raw()
+        );
+        let enchanted = ItemStack::new(
+            patterned.id().into(),
+            1,
+            16,
+            Tag::Compound(vec![(
+                "minecraft:enchantment_glint_override".into(),
+                Tag::Byte(1),
+            )]),
+        )
+        .unwrap();
+        assert!(enchanted.has_glint());
+        assert!(
+            !loader
+                .load_visual(&ModelKey::from_item(&enchanted))
+                .unwrap()
+                .glint
+        );
     }
 
     #[test]

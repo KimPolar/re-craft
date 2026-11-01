@@ -3,6 +3,7 @@
 mod accessibility_ui;
 mod action_bar;
 mod audio;
+mod banner_item;
 mod blur_ui;
 mod breaking_render;
 mod chat_hud;

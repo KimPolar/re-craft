@@ -1,7 +1,19 @@
 //! Compare 26.3 structure terrain contributions and sampled volumes.
 use native_core::beardifier::{Beardifier, BoundingBox, Junction, RigidPiece, TerrainAdjustment};
+use native_resources::{
+    density::{DensityCompiler, DensityEvaluator},
+    noise_router::{NoiseRouter, RouterField},
+    packs::{ResourceProvider, ResourceStack},
+};
 use serde_json::{Value, json};
-use std::{path::PathBuf, process::Command};
+use std::{path::PathBuf, process::Command, sync::Arc};
+
+struct EmptyProvider;
+impl ResourceProvider for EmptyProvider {
+    fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
 fn run(command: &mut Command) -> String {
     let out = command.output().unwrap();
     assert!(
@@ -105,10 +117,21 @@ fn structure_terrain_samples_match_java_bits() {
         .arg(&cp)
         .arg("BeardifierOracle")
         .arg(&input));
-    let mut lines = output
-        .lines()
-        .filter(|s| s == &"S" || s.starts_with("P ") || s.starts_with("V "));
+    let mut lines = output.lines().filter(|s| {
+        s == &"S"
+            || ["P ", "V ", "Q ", "W "]
+                .iter()
+                .any(|prefix| s.starts_with(prefix))
+    });
     let mut sample_count = 0;
+    let mut provider = EmptyProvider;
+    let function = DensityCompiler::new(&mut provider)
+        .with_structure_terrain_context()
+        .compile(
+            &json!({"type":"minecraft:add","left":-0.25,"right":{"type":"minecraft:beardifier"}}),
+        )
+        .unwrap();
+    let mut evaluator = DensityEvaluator::default();
     for (g, case) in groups.iter().enumerate() {
         assert_eq!(lines.next(), Some("S"));
         let pieces = case["pieces"]
@@ -170,7 +193,89 @@ fn structure_terrain_samples_match_java_bits() {
             );
             sample_count += values.len();
         }
+        evaluator.replace_structure_terrain_context(Some(Arc::new(generator)));
+        for (i, p) in case["points"].as_array().unwrap().iter().enumerate() {
+            let p = vec3(p);
+            let expected = lines
+                .next()
+                .unwrap()
+                .strip_prefix("Q ")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap() as u32;
+            assert_eq!(
+                evaluator.sample(&function, p[0], p[1], p[2]).to_bits(),
+                expected,
+                "density case {g} point {i} {p:?}"
+            );
+        }
+        for (i, v) in case["volumes"].as_array().unwrap().iter().enumerate() {
+            let min = vec3(&v["min"]);
+            let size = vec3(&v["size"]).map(|n| n as u32);
+            let step = vec3(&v["step"]);
+            let expected: Vec<u32> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.parse::<i32>().unwrap() as u32)
+                .collect();
+            let actual = evaluator
+                .sample_stepped_volume(&function, min, size, step)
+                .unwrap();
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected,
+                "density case {g} volume {i} {min:?} {size:?} {step:?}"
+            );
+        }
     }
     assert!(sample_count > 15_000);
     assert!(lines.next().is_none());
+
+    // Exercise the installed, reference-heavy overworld graph, compiled only once
+    // for all structure contexts rather than once per chunk.
+    let mut resources = ResourceStack::open(&game).unwrap();
+    let settings = resources
+        .read_builtin_data("data/minecraft/worldgen/noise_settings/overworld.json")
+        .unwrap()
+        .unwrap();
+    let adjusted =
+        NoiseRouter::from_json_with_structure_context(&mut resources, &settings, 12345).unwrap();
+    let plain =
+        NoiseRouter::from_json_without_terrain_adjustments(&mut resources, &settings, 12345)
+            .unwrap();
+    let bounds = BoundingBox::new([0, 60, 0], [3, 65, 3]).unwrap();
+    let structure = Arc::new(Beardifier::new(
+        vec![RigidPiece {
+            bounds,
+            adjustment: TerrainAdjustment::Bury,
+            ground_delta: 0,
+        }],
+        vec![],
+        Some(BoundingBox::new([-24, 36, -24], [27, 89, 27]).unwrap()),
+    ));
+    let mut plain_eval = DensityEvaluator::default();
+    let mut adjusted_eval = DensityEvaluator::default();
+    let min = [0, 58, 0];
+    let size = [4, 8, 4];
+    let base = plain
+        .sample_block_volume(&mut plain_eval, RouterField::FinalDensity, min, size)
+        .unwrap();
+    let empty = adjusted
+        .sample_block_volume(&mut adjusted_eval, RouterField::FinalDensity, min, size)
+        .unwrap();
+    assert_eq!(
+        base.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        empty.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    adjusted_eval.replace_structure_terrain_context(Some(Arc::clone(&structure)));
+    let actual = adjusted
+        .sample_block_volume(&mut adjusted_eval, RouterField::FinalDensity, min, size)
+        .unwrap();
+    let contribution = structure.sample_volume(min, size, [1, 1, 1]).unwrap();
+    assert!(contribution.iter().any(|v| *v != 0.0));
+    for ((base, contribution), actual) in base.iter().zip(contribution).zip(actual) {
+        assert_eq!((*base + contribution).to_bits(), actual.to_bits());
+    }
 }

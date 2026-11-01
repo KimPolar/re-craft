@@ -151,6 +151,19 @@ impl Spline {
             } => coordinate.6 && points.iter().all(|point| point.value.bulk_safe()),
         }
     }
+    pub fn has_structure_context(&self) -> bool {
+        match self {
+            Self::Constant(_) => false,
+            Self::Multipoint {
+                coordinate, points, ..
+            } => {
+                coordinate.7
+                    || points
+                        .iter()
+                        .any(|point| point.value.has_structure_context())
+            }
+        }
+    }
     pub fn range(&self) -> Interval {
         match self {
             Self::Constant(value) => Interval::exact(*value),

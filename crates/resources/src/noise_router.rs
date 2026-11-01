@@ -1,7 +1,7 @@
 //! Compile the density router from the active 26.3 noise-settings data pack.
 //!
 //! This exposes point and unit-step block-volume sampling. It does not generate chunks, fluids,
-//! surfaces or structures, and assumes no older-chunk or structure adjustment.
+//! surfaces or structures. Older-chunk blending is not yet supported.
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -130,6 +130,25 @@ impl NoiseRouter {
         bytes: &[u8],
         seed: i64,
     ) -> Result<Self> {
+        Self::from_json_with_context(provider, bytes, seed, false)
+    }
+
+    /// Compile once and supply each chunk's structure context to the evaluator.
+    /// Older-chunk blending must still be absent.
+    pub fn from_json_with_structure_context(
+        provider: &mut impl ResourceProvider,
+        bytes: &[u8],
+        seed: i64,
+    ) -> Result<Self> {
+        Self::from_json_with_context(provider, bytes, seed, true)
+    }
+
+    fn from_json_with_context(
+        provider: &mut impl ResourceProvider,
+        bytes: &[u8],
+        seed: i64,
+        structure_context: bool,
+    ) -> Result<Self> {
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
             "noise settings are too large"
@@ -150,9 +169,13 @@ impl NoiseRouter {
         } else {
             WorldgenRandom::Xoroshiro
         };
-        let mut compiler = DensityCompiler::with_world_seed(provider, seed, random)
-            .without_old_chunk_blending()
-            .without_structure_terrain_adjustment();
+        let compiler =
+            DensityCompiler::with_world_seed(provider, seed, random).without_old_chunk_blending();
+        let mut compiler = if structure_context {
+            compiler.with_structure_terrain_context()
+        } else {
+            compiler.without_structure_terrain_adjustment()
+        };
         let functions = RouterField::ALL
             .into_iter()
             .map(|field| {

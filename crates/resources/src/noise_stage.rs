@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use native_core::aquifer::{
     AquiferBlock, AquiferGenerator, AquiferSampler, AquiferSurfaceArea, FluidStatus,
 };
+use native_core::beardifier::Beardifier;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -180,6 +181,7 @@ impl NoiseStageChunk {
 
 pub struct NoiseStageGenerator {
     router: NoiseRouter,
+    structure_context: bool,
     default_block: Value,
     default_fluid: Value,
     sea_level: i32,
@@ -406,6 +408,25 @@ impl NoiseStageGenerator {
         bytes: &[u8],
         seed: i64,
     ) -> Result<Self> {
+        Self::from_json_with_context(provider, bytes, seed, false)
+    }
+
+    /// Compile reusable graphs that accept a different structure context per chunk.
+    /// Older-chunk blending must be absent.
+    pub fn from_json_with_structure_context(
+        provider: &mut impl ResourceProvider,
+        bytes: &[u8],
+        seed: i64,
+    ) -> Result<Self> {
+        Self::from_json_with_context(provider, bytes, seed, true)
+    }
+
+    fn from_json_with_context(
+        provider: &mut impl ResourceProvider,
+        bytes: &[u8],
+        seed: i64,
+        structure_context: bool,
+    ) -> Result<Self> {
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
             "noise settings are too large"
@@ -414,7 +435,11 @@ impl NoiseStageGenerator {
             serde_json::from_slice(bytes).context("invalid noise material settings")?;
         validate_state_encoding(&materials.default_block).context("invalid default block")?;
         validate_state_encoding(&materials.default_fluid).context("invalid default fluid")?;
-        let router = NoiseRouter::from_json_without_terrain_adjustments(provider, bytes, seed)?;
+        let router = if structure_context {
+            NoiseRouter::from_json_with_structure_context(provider, bytes, seed)?
+        } else {
+            NoiseRouter::from_json_without_terrain_adjustments(provider, bytes, seed)?
+        };
         let state = &materials.default_fluid;
         let name = state
             .as_str()
@@ -460,9 +485,13 @@ impl NoiseStageGenerator {
         };
         let aquifer = if let Some(config) = materials.aquifers {
             let object = config.as_object().context("aquifers must be an object")?;
-            let mut compiler = DensityCompiler::with_world_seed(provider, seed, router.random)
-                .without_old_chunk_blending()
-                .without_structure_terrain_adjustment();
+            let compiler = DensityCompiler::with_world_seed(provider, seed, router.random)
+                .without_old_chunk_blending();
+            let mut compiler = if structure_context {
+                compiler.with_structure_terrain_context()
+            } else {
+                compiler.without_structure_terrain_adjustment()
+            };
             let mut compile = |name: &str| -> Result<Arc<DensityFunction>> {
                 let value = object
                     .get(name)
@@ -484,6 +513,7 @@ impl NoiseStageGenerator {
         };
         Ok(Self {
             router,
+            structure_context,
             default_block: materials.default_block,
             default_fluid: materials.default_fluid,
             sea_level: materials.sea_level,
@@ -584,11 +614,30 @@ impl NoiseStageGenerator {
             fluid_updates,
         })
     }
+
+    /// Generate with already collected structure pieces, restoring any prior evaluator context.
+    pub fn generate_with_structure_context(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        x: i32,
+        z: i32,
+        structure: Arc<Beardifier>,
+    ) -> Result<NoiseStageChunk> {
+        ensure!(
+            self.structure_context,
+            "generator was compiled without a structure context"
+        );
+        let previous = evaluator.replace_structure_terrain_context(Some(structure));
+        let result = self.generate(evaluator, x, z);
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use native_core::beardifier::{BoundingBox, RigidPiece, TerrainAdjustment};
     use serde_json::json;
     struct Data;
     impl ResourceProvider for Data {
@@ -600,6 +649,75 @@ mod tests {
         json!({"noise":{"min_y":0,"height":16},"legacy_random_source":true,
             "default_block":{"id":"minecraft:stone","properties":{"example":"value"}},"default_fluid":"minecraft:water","sea_level":8,
             "noise_router":{"final_density":-1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":0}})
+    }
+
+    #[test]
+    fn structure_context_changes_generated_materials_and_is_restored() {
+        let mut data = Data;
+        let mut settings = definition();
+        settings["noise_router"]["final_density"] = json!({
+            "type":"minecraft:add", "left":-0.25,
+            "right":{"type":"minecraft:beardifier"}
+        });
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let generator =
+            NoiseStageGenerator::from_json_with_structure_context(&mut data, &bytes, 0).unwrap();
+        let without =
+            NoiseStageGenerator::from_json_without_terrain_adjustments(&mut data, &bytes, 0)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let bounds = BoundingBox::new([0, 5, 0], [2, 7, 2]).unwrap();
+        let structure = Arc::new(Beardifier::new(
+            vec![RigidPiece {
+                bounds,
+                adjustment: TerrainAdjustment::Bury,
+                ground_delta: 0,
+            }],
+            vec![],
+            Some(BoundingBox::new([-24, -19, -24], [26, 31, 26]).unwrap()),
+        ));
+        assert!(
+            without
+                .generate_with_structure_context(&mut evaluator, 0, 0, Arc::clone(&structure))
+                .is_err()
+        );
+        assert_eq!(
+            generator
+                .generate(&mut evaluator, 0, 0)
+                .unwrap()
+                .get(1, 5, 1),
+            Some(NoiseMaterial::DefaultFluid)
+        );
+        assert_eq!(
+            generator
+                .generate_with_structure_context(&mut evaluator, 0, 0, structure)
+                .unwrap()
+                .get(1, 5, 1),
+            Some(NoiseMaterial::DefaultBlock)
+        );
+        assert_eq!(
+            generator
+                .generate(&mut evaluator, 0, 0)
+                .unwrap()
+                .get(1, 5, 1),
+            Some(NoiseMaterial::DefaultFluid)
+        );
+        let previous = Arc::new(Beardifier::new(vec![], vec![], None));
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
+        assert!(
+            generator
+                .generate_with_structure_context(
+                    &mut evaluator,
+                    i32::MAX,
+                    0,
+                    Arc::new(Beardifier::new(vec![], vec![], None))
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &previous,
+            &evaluator.replace_structure_terrain_context(None).unwrap()
+        ));
     }
     #[test]
     fn global_fluid_edges_and_aquifer_config_validation() {

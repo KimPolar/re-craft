@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use native_core::{
+    beardifier::Beardifier,
     blended_noise::BlendedNoise,
     normal_noise::{
         LegacyNoiseFactory, NoiseSeedFactory, NoiseSeedSource, NormalNoise, XoroshiroNoiseFactory,
@@ -31,19 +32,22 @@ const MAX_SURFACE_STEPS: f64 = 1_000_000.0;
 
 /// An immutable graph. Referenced registry entries are shared across the graph.
 #[derive(Debug)]
-pub struct DensityFunction(Node, usize, usize, bool, Interval, u8, bool);
+pub struct DensityFunction(Node, usize, usize, bool, Interval, u8, bool, bool);
 
 #[derive(Clone, Copy)]
 struct BlockVolume {
     min: [i32; 3],
     max: [i32; 3],
     step: [i32; 3],
+    size: [u32; 3],
 }
 
 #[derive(Default)]
 struct SampleMemo {
     values: HashMap<(usize, i32, i32, i32, bool), f32>,
     volume: Option<BlockVolume>,
+    structure: Option<Arc<Beardifier>>,
+    structure_volume: Option<Vec<f32>>,
 }
 impl Deref for SampleMemo {
     type Target = HashMap<(usize, i32, i32, i32, bool), f32>;
@@ -80,6 +84,15 @@ pub struct DensityEvaluator {
 }
 
 impl DensityEvaluator {
+    /// Set the chunk-specific structure context used by graphs compiled with
+    /// `with_structure_terrain_context`. `None` is Java's empty context.
+    pub fn replace_structure_terrain_context(
+        &mut self,
+        structure: Option<Arc<Beardifier>>,
+    ) -> Option<Arc<Beardifier>> {
+        std::mem::replace(&mut self.memo.structure, structure)
+    }
+
     pub fn sample(&mut self, function: &DensityFunction, x: i32, y: i32, z: i32) -> f32 {
         self.memo.clear();
         self.memo.volume = None;
@@ -174,7 +187,25 @@ impl DensityEvaluator {
                     .context("expanded interpolation volume coordinates overflow")?;
             }
         }
-        self.memo.volume = Some(BlockVolume { min, max, step });
+        self.memo.volume = Some(BlockVolume {
+            min,
+            max,
+            step,
+            size,
+        });
+        self.memo.structure_volume = if function.7 {
+            self.memo
+                .structure
+                .as_ref()
+                .map(|structure| {
+                    structure
+                        .sample_volume(min, size, step)
+                        .map_err(anyhow::Error::msg)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let mut output = Vec::with_capacity(count);
         for iz in 0..size[2] {
             let z = (i64::from(min[2]) + i64::from(iz) * i64::from(step[2])) as i32;
@@ -188,6 +219,7 @@ impl DensityEvaluator {
             }
         }
         self.memo.volume = None;
+        self.memo.structure_volume = None;
         Ok(output)
     }
 }
@@ -280,6 +312,7 @@ enum Node {
     UnblendedOffset,
     UnblendedDensity(Arc<DensityFunction>),
     NoStructures,
+    StructureContext,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -640,6 +673,23 @@ impl DensityFunction {
             Node::UnblendedOffset => 0.0,
             Node::UnblendedDensity(input) => input.evaluate_cached(x, y, z, volume, memo),
             Node::NoStructures => 0.0,
+            Node::StructureContext => {
+                if volume
+                    && let (Some(bounds), Some(values)) = (memo.volume, &memo.structure_volume)
+                {
+                    let sx = bounds.size[0] as usize;
+                    let sy = bounds.size[1] as usize;
+                    let index = |v: i32, axis: usize| {
+                        ((i64::from(v) - i64::from(bounds.min[axis]))
+                            / i64::from(bounds.step[axis])) as usize
+                    };
+                    values[(index(z, 2) * sx + index(x, 0)) * sy + index(y, 1)]
+                } else {
+                    memo.structure
+                        .as_ref()
+                        .map_or(0.0, |structure| structure.sample(x, y, z))
+                }
+            }
         }
     }
 }
@@ -771,7 +821,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         | Node::Spline(_)
         | Node::UnblendedAlpha
         | Node::UnblendedOffset => vec![],
-        Node::NoStructures => vec![],
+        Node::NoStructures | Node::StructureContext => vec![],
         Node::Reference(value)
         | Node::Cache(value)
         | Node::UnblendedDensity(value)
@@ -811,6 +861,17 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
     let mut has_interpolation =
         matches!(node, Node::Interpolated { .. }) || children.iter().any(|child| child.3);
     let mut bulk_safe = children.iter().all(|child| child.6);
+    let mut has_structure =
+        matches!(node, Node::StructureContext) || children.iter().any(|child| child.7);
+    if matches!(
+        node,
+        Node::Interpolated { .. } | Node::Slice { .. } | Node::FindTopSurface { .. }
+    ) {
+        ensure!(
+            !has_structure,
+            "structure adjustment inside coordinate-transforming density functions is not supported"
+        );
+    }
     let mut axes = children.iter().fold(0, |axes, child| axes | child.5);
     match &node {
         Node::Gradient { axis, .. } => axes = 1 << axis,
@@ -843,7 +904,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
             }
         }
         Node::UnblendedAlpha | Node::UnblendedOffset => axes = 5,
-        Node::NoStructures => axes = 7,
+        Node::NoStructures | Node::StructureContext => axes = 7,
         _ => {}
     }
     if let Node::Spline(spline) = &node {
@@ -852,6 +913,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         has_interpolation = spline.has_interpolation();
         axes = spline.domain_axes();
         bulk_safe = spline.bulk_safe();
+        has_structure = spline.has_structure_context();
     }
     ensure!(depth <= MAX_DEPTH, "density function exceeds maximum depth");
     ensure!(
@@ -927,7 +989,9 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         Node::Spline(spline) => spline.range(),
         Node::UnblendedAlpha => Interval::bounds(0.0, 1.0),
         Node::UnblendedOffset => Interval::bounds(f32::NEG_INFINITY, f32::INFINITY),
-        Node::NoStructures => Interval::bounds(f32::NEG_INFINITY, f32::INFINITY),
+        Node::NoStructures | Node::StructureContext => {
+            Interval::bounds(f32::NEG_INFINITY, f32::INFINITY)
+        }
     };
     Ok(Arc::new(DensityFunction(
         node,
@@ -937,6 +1001,7 @@ fn make(node: Node) -> Result<Arc<DensityFunction>> {
         range,
         axes,
         bulk_safe,
+        has_structure,
     )))
 }
 
@@ -953,6 +1018,7 @@ pub struct DensityCompiler<'a, P: ResourceProvider> {
     noises: BTreeMap<ResourceId, Arc<NormalNoise>>,
     unblended: bool,
     no_structure_adjustment: bool,
+    structure_context: bool,
     end_island_noise: Option<Arc<Simplex2D>>,
     blended_noises: BTreeMap<String, Arc<BlendedNoise>>,
 }
@@ -983,6 +1049,7 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             noises: BTreeMap::new(),
             unblended: false,
             no_structure_adjustment: false,
+            structure_context: false,
             end_island_noise: None,
             blended_noises: BTreeMap::new(),
         }
@@ -1012,6 +1079,14 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
     /// Use only when no structures affect the sampled terrain.
     pub fn without_structure_terrain_adjustment(mut self) -> Self {
         self.no_structure_adjustment = true;
+        self.structure_context = false;
+        self
+    }
+
+    /// Compile the structure marker as a chunk-specific evaluator input.
+    pub fn with_structure_terrain_context(mut self) -> Self {
+        self.no_structure_adjustment = false;
+        self.structure_context = true;
         self
     }
 
@@ -1154,10 +1229,14 @@ impl<'a, P: ResourceProvider> DensityCompiler<'a, P> {
             }
             "beardifier" => {
                 ensure!(
-                    self.no_structure_adjustment,
+                    self.no_structure_adjustment || self.structure_context,
                     "structure terrain adjustment context is required"
                 );
-                Node::NoStructures
+                if self.structure_context {
+                    Node::StructureContext
+                } else {
+                    Node::NoStructures
+                }
             }
             "spline" => Node::Spline(Spline::parse(self, field("spline")?, depth + 1)?),
             "old_blended_noise" => {
@@ -1810,6 +1889,23 @@ mod tests {
         let beardifier = compiler.compile(&json!({"type":"beardifier"})).unwrap();
         assert_eq!(beardifier.sample(1, 2, 3), 0.0);
         assert_eq!(beardifier.range(), (f32::NEG_INFINITY, f32::INFINITY));
+    }
+
+    #[test]
+    fn structure_context_rejects_unsupported_coordinate_transforms() {
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data).with_structure_terrain_context();
+        let marker = json!({"type":"minecraft:beardifier"});
+        let spline = json!({"type":"spline","spline":{"coordinate":marker,"points":[{"location":0,"value":0,"derivative":0}]}});
+        for input in [marker, spline] {
+            for expression in [
+                json!({"type":"slice","axis":"x","coordinate":0,"input":input}),
+                json!({"type":"interpolated","cell_size_xz":4,"cell_size_y":8,"input":input}),
+                json!({"type":"find_top_surface","density":input,"upper_bound":16,"lower_bound":0,"cell_height":4}),
+            ] {
+                assert!(compiler.compile(&expression).is_err(), "{expression}");
+            }
+        }
     }
 
     #[test]

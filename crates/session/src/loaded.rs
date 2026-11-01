@@ -8514,6 +8514,63 @@ impl LoadedSession {
         self.place_plain_solid(hit, "minecraft:lodestone")
     }
 
+    fn place_honey_block(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if held.id() != "minecraft:honey_block"
+            || !crate::inventory::ordinary_return_supported(held)
+        {
+            return None;
+        }
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let target = if button_can_replace(self.world.state(clicked)?)? {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        if button_can_replace(self.world.state(existing)?) != Some(true) {
+            return None;
+        }
+        let block = state("minecraft:honey_block", &[]);
+        let shape = block_shape(&block)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(block);
+        self.set(target, id).then_some(hand)
+    }
+
     /// Query known POI records and replay later lodestone transitions.
     fn known_lodestone_poi(&self, position: IVec3) -> Option<bool> {
         let chunk = ChunkPos {
@@ -10477,6 +10534,15 @@ impl LoadedSession {
         let stair = crate::stair_items::is_stair_item(&name);
         let slab = crate::slab_mining::material(&name).is_some();
         let lodestone = name == "minecraft:lodestone";
+        let honey = name == "minecraft:honey_block";
+        if honey
+            && !self
+                .world
+                .state(id)
+                .is_some_and(|state| state.properties.is_empty())
+        {
+            return;
+        }
         if lodestone
             && !self
                 .world
@@ -10501,14 +10567,18 @@ impl LoadedSession {
         {
             return;
         }
-        if (snow || stair || slab || lodestone)
+        if (snow || stair || slab || lodestone || honey)
             && self.game_mode != GameMode::Creative
             && properties.is_none()
         {
             return;
         }
-        let checked =
-            snow || stair || slab || lodestone || (self.loot.is_some() && properties.is_some());
+        let checked = snow
+            || stair
+            || slab
+            || lodestone
+            || honey
+            || (self.loot.is_some() && properties.is_some());
         let player_loot = checked
             && self.game_mode != GameMode::Creative
             && properties.is_some_and(|properties| properties.correct_for_drops);
@@ -10553,7 +10623,13 @@ impl LoadedSession {
             self.states[0]
         };
         if self.set(relative, replacement) {
-            let damage = properties.map_or(0, |properties| properties.damage_per_block);
+            let damage = if mining::Material::from_block_name(&name)
+                .is_some_and(|material| material.hardness() == 0.0)
+            {
+                0
+            } else {
+                properties.map_or(0, |properties| properties.damage_per_block)
+            };
             if self.game_mode != GameMode::Creative && damage != 0 {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
@@ -14039,6 +14115,7 @@ impl LoadedSession {
                                         | "minecraft:lever"
                                         | "minecraft:snow"
                                         | "minecraft:snow_block"
+                                        | "minecraft:honey_block"
                                         | "minecraft:lodestone"
                                         | "minecraft:chest"
                                         | "minecraft:trapped_chest"
@@ -14129,6 +14206,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_snow(hit))
                                     .or_else(|| self.place_snow_block(hit))
                                     .or_else(|| self.place_lodestone(hit))
+                                    .or_else(|| self.place_honey_block(hit))
                                     .or_else(|| self.place_chest(hit))
                                     .or_else(|| self.place_banner(hit))
                                     .or_else(|| self.place_slab(hit))
@@ -16168,7 +16246,10 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
     } else {
         matches!(
             block.name.as_str(),
-            "minecraft:redstone_block" | "minecraft:snow_block" | "minecraft:lodestone"
+            "minecraft:redstone_block"
+                | "minecraft:snow_block"
+                | "minecraft:lodestone"
+                | "minecraft:honey_block"
         ) && block.properties.is_empty()
     };
     if !supported {
@@ -22561,6 +22642,307 @@ mod tests {
                 }
             );
             assert_eq!(drops[0].stack.count(), if silk { 1 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn honey_block_place_uses_its_collision_shape_and_player_hand() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut test = session();
+                test.set_game_mode(mode);
+                assert!(test.set(IVec3::new(8, 1, 7), test.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:honey_block".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                test.set_player_inventory(inventory);
+                test.submit_command(PlayerCommand::Place);
+                test.update(TICK);
+                let placed = test
+                    .world
+                    .block(test.origin.x + 8, 2, test.origin.z + 7)
+                    .unwrap();
+                let allowed = matches!(mode, GameMode::Survival | GameMode::Creative);
+                assert_eq!(
+                    placed.name,
+                    if allowed {
+                        "minecraft:honey_block"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{hand:?} {mode:?}"
+                );
+                assert_eq!(
+                    test.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+                if allowed {
+                    assert_eq!(
+                        picked_loaded_block_item(placed).unwrap().id(),
+                        "minecraft:honey_block"
+                    );
+                }
+            }
+        }
+        let mut test = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:honey_block".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        test.set_player_inventory(inventory);
+        let target = IVec3::new(4, 1, 4);
+        let hit = ShapeRayHit {
+            position: target + IVec3::NEG_Y,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        test.player.position = Vec3::new(5.25, 1.0, 4.5);
+        assert_eq!(
+            test.place_honey_block(hit),
+            Some(PlayerSlot::Storage(0)),
+            "the inset edge must not collide"
+        );
+        let mut blocked = session();
+        blocked.set_player_inventory((*test.inventory).clone());
+        blocked.player.position = Vec3::new(5.2, 1.0, 4.5);
+        assert_eq!(
+            blocked.place_honey_block(hit),
+            None,
+            "the player overlaps the honey collision shape"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn honey_block_mining_uses_vanilla_loot_and_does_not_wear_tools() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for tool in [None, Some("minecraft:iron_pickaxe")] {
+            let mut test = session();
+            test.set_block_loot(Arc::clone(&loot));
+            test.set_random_sequences(
+                0,
+                native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            )
+            .unwrap();
+            let relative = IVec3::new(4, 1, 4);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:honey_block".into(), 1, 64, Tag::Compound(vec![])),
+            );
+            test.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: relative + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(test.place_honey_block(hit), Some(PlayerSlot::Storage(0)));
+            Arc::make_mut(&mut test.inventory).set_slot(
+                PlayerSlot::Storage(0),
+                tool.and_then(|id| ItemStack::new(id.into(), 1, 1, Tag::Compound(vec![]))),
+            );
+            let material = mining::Material::from_block_name("minecraft:honey_block").unwrap();
+            assert!(
+                mining::tool_progress(
+                    material,
+                    test.inventory.slot(PlayerSlot::Storage(0)),
+                    true,
+                    false
+                )
+                .unwrap()
+                .is_infinite()
+            );
+            let absolute = test.origin + relative;
+            test.finish_breaking(absolute);
+            assert_eq!(
+                test.world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air",
+                "tool={tool:?}, errors={:?}",
+                test.stream_errors
+            );
+            let drops = test.dropped_items.snapshot();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(
+                (drops[0].stack.id(), drops[0].stack.count()),
+                ("minecraft:honey_block", 1)
+            );
+            if tool.is_some() {
+                assert!(
+                    test.inventory
+                        .slot(PlayerSlot::Storage(0))
+                        .unwrap()
+                        .components()
+                        .get("minecraft:damage")
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn crafted_honey_block_can_be_placed_and_mined_in_loaded_session() {
+        use crate::inventory::{ClickButton, ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceStack};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let recipes = Arc::new(CraftingRecipes::load(&mut resources).unwrap());
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let mut test = session();
+        test.set_block_loot(loot);
+        test.set_crafting_recipes(recipes);
+        test.set_random_sequences(
+            0,
+            native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+        )
+        .unwrap();
+        assert!(test.set(IVec3::new(8, 1, 7), test.states[3]));
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        for index in 0..4 {
+            assert!(inventory.set_slot(
+                PlayerSlot::Crafting(index),
+                ItemStack::new(
+                    "minecraft:honey_bottle".into(),
+                    1,
+                    16,
+                    Tag::Compound(vec![])
+                )
+            ));
+        }
+        test.set_player_inventory(inventory);
+        test.submit_command(PlayerCommand::InventoryClick {
+            slot: PlayerSlot::CraftResult,
+            button: ClickButton::Primary,
+        });
+        test.submit_command(PlayerCommand::InventoryClick {
+            slot: PlayerSlot::Storage(0),
+            button: ClickButton::Primary,
+        });
+        test.submit_command(PlayerCommand::ToggleInventory);
+        test.submit_command(PlayerCommand::Place);
+        test.update(TICK);
+        let target = test.origin + IVec3::new(8, 2, 7);
+        assert_eq!(
+            test.world.block(target.x, target.y, target.z).unwrap().name,
+            "minecraft:honey_block"
+        );
+        test.submit_command(PlayerCommand::Break);
+        test.update(TICK);
+        assert_eq!(
+            test.world.block(target.x, target.y, target.z).unwrap().name,
+            "minecraft:air",
+            "{:?}",
+            test.stream_errors
+        );
+        assert!(
+            test.dropped_items
+                .snapshot()
+                .iter()
+                .any(|item| item.stack.id() == "minecraft:honey_block")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn honey_block_geometry_and_hardness_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("HoneyBlockOracle.java");
+        let output = temp.path().join("honey.json");
+        std::fs::write(&source, include_str!("../tests/java/HoneyBlockOracle.java")).unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("HoneyBlockOracle")
+            .arg(&output));
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(
+            mining::Material::from_block_name("minecraft:honey_block")
+                .unwrap()
+                .hardness(),
+            result["hardness"].as_f64().unwrap() as f32
+        );
+        let state = state("minecraft:honey_block", &[]);
+        for (name, boxes) in [
+            ("collision", block_shape(&state).unwrap()),
+            ("outline", block_outline(&state).unwrap()),
+        ] {
+            assert_eq!(boxes.len(), 1);
+            let bounds = boxes[0];
+            let actual = [
+                bounds.min.x,
+                bounds.min.y,
+                bounds.min.z,
+                bounds.max.x,
+                bounds.max.y,
+                bounds.max.z,
+            ];
+            for (index, value) in actual.into_iter().enumerate() {
+                assert_eq!(
+                    f64::from(value),
+                    result[name][index].as_f64().unwrap(),
+                    "{name}[{index}]"
+                );
+            }
         }
     }
 

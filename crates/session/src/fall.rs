@@ -166,6 +166,8 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Poison => self.effects.poison = None,
             crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
             crate::survival::FoodStatusKind::Regeneration => self.effects.regeneration = None,
+            crate::survival::FoodStatusKind::Speed => self.effects.speed = None,
+            crate::survival::FoodStatusKind::Slowness => self.effects.slowness = None,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
@@ -173,33 +175,34 @@ impl FallTracker {
     }
 
     pub(crate) fn add_hunger(&mut self, duration: i32, amplifier: u8) {
-        self.add_status(crate::survival::FoodStatusKind::Hunger, duration, amplifier);
-    }
-
-    pub(crate) fn add_status(
-        &mut self,
-        kind: crate::survival::FoodStatusKind,
-        duration: i32,
-        amplifier: u8,
-    ) {
-        let incoming = crate::survival::EffectDuration {
+        self.add_status(crate::survival::StatusApplication {
+            kind: crate::survival::FoodStatusKind::Hunger,
             duration,
             amplifier,
-            hidden: None,
-        };
-        let slot = match kind {
+            ambient: false,
+            visible: true,
+            show_icon: true,
+        });
+    }
+
+    pub(crate) fn add_status(&mut self, application: crate::survival::StatusApplication) -> bool {
+        let incoming = crate::survival::EffectDuration::from_application(application);
+        let slot = match application.kind {
             crate::survival::FoodStatusKind::Hunger => &mut self.effects.hunger,
             crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
             crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
             crate::survival::FoodStatusKind::Regeneration => &mut self.effects.regeneration,
+            crate::survival::FoodStatusKind::Speed => &mut self.effects.speed,
+            crate::survival::FoodStatusKind::Slowness => &mut self.effects.slowness,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
         };
         if let Some(effect) = slot {
-            effect.merge(incoming);
+            effect.merge(incoming)
         } else {
             *slot = Some(incoming);
+            true
         }
     }
 
@@ -670,11 +673,17 @@ mod tests {
         vitals.health = 20.0;
         vitals.absorption = 1.0;
         tracker.effects.jump_boost = Some(EffectDuration {
+            ambient: false,
+            visible: true,
+            show_icon: true,
             amplifier: 1,
             duration: 5,
             hidden: None,
         });
         tracker.effects.resistance = Some(EffectDuration {
+            ambient: false,
+            visible: true,
+            show_icon: true,
             amplifier: 0,
             duration: 5,
             hidden: None,

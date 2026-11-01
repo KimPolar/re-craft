@@ -569,6 +569,9 @@ fn effect_duration(tag: &Tag, depth: usize) -> Result<crate::survival::EffectDur
     // Java's UNSIGNED_BYTE codec reinterprets a signed NBT byte as 0..255.
     let amplifier = number("amplifier", 0)? as u8;
     let duration = number("duration", 0)?;
+    let ambient = number("ambient", 0)? != 0;
+    let visible = number("show_particles", 1)? != 0;
+    let show_icon = number("show_icon", i32::from(visible))? != 0;
     let hidden = tag
         .get("hidden_effect")
         .map(|hidden| effect_duration(hidden, depth + 1).map(Box::new))
@@ -576,6 +579,9 @@ fn effect_duration(tag: &Tag, depth: usize) -> Result<crate::survival::EffectDur
     Ok(crate::survival::EffectDuration {
         amplifier,
         duration,
+        ambient,
+        visible,
+        show_icon,
         hidden,
     })
 }
@@ -1595,6 +1601,8 @@ pub(crate) fn replay_saved_status_effects(
                             crate::survival::FoodStatusKind::Regeneration => {
                                 "minecraft:regeneration"
                             }
+                            crate::survival::FoodStatusKind::Speed => "minecraft:speed",
+                            crate::survival::FoodStatusKind::Slowness => "minecraft:slowness",
                             crate::survival::FoodStatusKind::NightVision => {
                                 "minecraft:night_vision"
                             }
@@ -1720,6 +1728,8 @@ pub(crate) fn replay_saved_status_effects(
                                     crate::survival::FoodStatusKind::Hunger => "hunger",
                                     crate::survival::FoodStatusKind::Poison => "poison",
                                     crate::survival::FoodStatusKind::Regeneration => "regeneration",
+                                    crate::survival::FoodStatusKind::Speed => "speed",
+                                    crate::survival::FoodStatusKind::Slowness => "slowness",
                                     crate::survival::FoodStatusKind::NightVision => "night_vision",
                                     crate::survival::FoodStatusKind::WaterBreathing => {
                                         "water_breathing"
@@ -1743,6 +1753,8 @@ pub(crate) fn replay_saved_status_effects(
                                 crate::survival::FoodStatusKind::Hunger => "hunger",
                                 crate::survival::FoodStatusKind::Poison => "poison",
                                 crate::survival::FoodStatusKind::Regeneration => "regeneration",
+                                crate::survival::FoodStatusKind::Speed => "speed",
+                                crate::survival::FoodStatusKind::Slowness => "slowness",
                                 crate::survival::FoodStatusKind::NightVision => "night_vision",
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     "water_breathing"
@@ -2790,7 +2802,7 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }

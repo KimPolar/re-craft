@@ -1050,6 +1050,12 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::Regeneration => {
                                     self.fall.effects().regeneration.is_some()
                                 }
+                                crate::survival::FoodStatusKind::Speed => {
+                                    self.fall.effects().speed.is_some()
+                                }
+                                crate::survival::FoodStatusKind::Slowness => {
+                                    self.fall.effects().slowness.is_some()
+                                }
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     self.breathing_effects.water_breathing.is_some()
                                 }
@@ -1077,6 +1083,17 @@ impl LoadedSession {
                                 self.breathing_effects.water_breathing = None;
                             } else {
                                 self.fall.remove_status(kind);
+                                if matches!(
+                                    kind,
+                                    crate::survival::FoodStatusKind::Speed
+                                        | crate::survival::FoodStatusKind::Slowness
+                                ) {
+                                    self.update_movement_effect_modifiers([
+                                        kind == crate::survival::FoodStatusKind::Speed,
+                                        kind == crate::survival::FoodStatusKind::Slowness,
+                                    ]);
+                                    self.refresh_movement_speed();
+                                }
                             }
                         }
                         continue;
@@ -1101,11 +1118,22 @@ impl LoadedSession {
                             },
                         });
                     if effect.kind == crate::survival::FoodStatusKind::WaterBreathing {
-                        self.breathing_effects
-                            .add_water_breathing(effect.duration, effect.amplifier);
+                        self.breathing_effects.add_water_breathing(effect);
                     } else {
-                        self.fall
-                            .add_status(effect.kind, effect.duration, effect.amplifier);
+                        let changed = self.fall.add_status(effect);
+                        if changed
+                            && matches!(
+                                effect.kind,
+                                crate::survival::FoodStatusKind::Speed
+                                    | crate::survival::FoodStatusKind::Slowness
+                            )
+                        {
+                            self.update_movement_effect_modifiers([
+                                effect.kind == crate::survival::FoodStatusKind::Speed,
+                                effect.kind == crate::survival::FoodStatusKind::Slowness,
+                            ]);
+                            self.refresh_movement_speed();
+                        }
                     }
                 }
             }
@@ -24847,6 +24875,308 @@ mod tests {
         assert_eq!(session.jump_strength, Some(0.3));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn applying_movement_effects_matches_java_attributes_and_flags() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use crate::survival::{EffectDuration, FoodStatusKind, StatusApplication};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("MovementEffectApplyOracle.java");
+        let output = temp.path().join("movement.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/MovementEffectApplyOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("MovementEffectApplyOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let old = [
+            (0, 0, false, true, true),
+            (100, 0, false, true, true),
+            (100, 2, true, false, false),
+            (50, 3, true, true, false),
+            (-1, 1, false, true, true),
+        ];
+        let incoming = [
+            (40, 0, false, false, false),
+            (1800, 0, false, true, true),
+            (400, 3, false, true, true),
+            (100, 2, false, true, true),
+            (-1, 1, true, false, false),
+            (0, 0, false, true, true),
+        ];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 120);
+        for row in rows {
+            let index = row["existing"].as_u64().unwrap() as usize;
+            let add = row["add"].as_u64().unwrap() as usize;
+            let is_speed = row["kind"].as_i64().unwrap() == 0;
+            let kind = if is_speed {
+                FoodStatusKind::Speed
+            } else {
+                FoodStatusKind::Slowness
+            };
+            let effect_name = if is_speed { "speed" } else { "slowness" };
+            let modifier_name = format!("minecraft:effect.{effect_name}");
+            let (duration, amplifier, ambient, visible, icon) = old[index];
+            let (new_duration, new_amplifier, new_ambient, new_visible, new_icon) = incoming[add];
+            let effect_tag = |duration, amplifier, ambient, visible, icon| {
+                Tag::Compound(vec![
+                    (
+                        "id".into(),
+                        Tag::String(format!("minecraft:{effect_name}").as_str().into()),
+                    ),
+                    ("duration".into(), Tag::Int(duration)),
+                    ("amplifier".into(), Tag::Byte(amplifier)),
+                    ("ambient".into(), Tag::Byte(i8::from(ambient))),
+                    ("show_particles".into(), Tag::Byte(i8::from(visible))),
+                    ("show_icon".into(), Tag::Byte(i8::from(icon))),
+                ])
+            };
+            let mut fields = vec![("DataVersion".into(), Tag::Int(5023))];
+            if index != 0 {
+                fields.push((
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![effect_tag(duration, amplifier, ambient, visible, icon)],
+                    },
+                ));
+            }
+            if row["modifier"].as_i64().unwrap() != 0 {
+                let base = if is_speed {
+                    f64::from(0.2_f32)
+                } else {
+                    f64::from(-0.15_f32)
+                };
+                fields.push((
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        ("id".into(), Tag::String(modifier_name.as_str().into())),
+                                        (
+                                            "amount".into(),
+                                            Tag::Double(base * (f64::from(amplifier) + 1.0)),
+                                        ),
+                                        (
+                                            "operation".into(),
+                                            Tag::String("add_multiplied_total".into()),
+                                        ),
+                                    ])],
+                                },
+                            ),
+                        ])],
+                    },
+                ));
+            }
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(fields),
+            };
+            let mut session = session();
+            session.fall.configure(
+                crate::player_data::SavedAttribute::with_base(3.0),
+                crate::player_data::SavedAttribute::with_base(1.0),
+                crate::player_data::read_saved_fall_effects(&original).unwrap(),
+                Arc::new(OxygenEnchantments::default()),
+            );
+            session
+                .set_saved_movement_speed(
+                    crate::player_data::read_loaded_movement_speed_attribute(&original).unwrap(),
+                )
+                .unwrap();
+            let application = StatusApplication {
+                kind,
+                duration: new_duration,
+                amplifier: new_amplifier as u8,
+                ambient: new_ambient,
+                visible: new_visible,
+                show_icon: new_icon,
+            };
+            let prior = if is_speed {
+                &session.fall.effects().speed
+            } else {
+                &session.fall.effects().slowness
+            };
+            let changed = prior.clone().map_or(true, |mut old| {
+                old.merge(EffectDuration::from_application(application))
+            });
+            assert_eq!(changed, row["changed"].as_bool().unwrap(), "{row}");
+            let consumable = Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                            (
+                                "effects".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![effect_tag(
+                                        new_duration,
+                                        new_amplifier,
+                                        new_ambient,
+                                        new_visible,
+                                        new_icon,
+                                    )],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:apple".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![("minecraft:consumable".into(), consumable)]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            session.vitals.food = 10;
+            session.refresh_movement_speed();
+            assert!(session.food_use.start_hand(
+                &mut session.inventory,
+                PlayerSlot::Storage(0),
+                &mut session.vitals,
+                GameMode::Survival
+            ));
+            session.process_food_events();
+            let actual = if is_speed {
+                session.fall.effects().speed.as_ref().unwrap()
+            } else {
+                session.fall.effects().slowness.as_ref().unwrap()
+            };
+            assert_eq!(
+                (
+                    actual.duration,
+                    i64::from(actual.amplifier),
+                    actual.ambient,
+                    actual.visible,
+                    actual.show_icon
+                ),
+                (
+                    row["duration"].as_i64().unwrap() as i32,
+                    row["amplifier"].as_i64().unwrap(),
+                    row["ambient"].as_bool().unwrap(),
+                    row["visible"].as_bool().unwrap(),
+                    row["icon"].as_bool().unwrap()
+                ),
+                "{row}"
+            );
+            assert_eq!(
+                actual.hidden.as_ref().map(|v| (
+                    v.duration,
+                    i64::from(v.amplifier),
+                    v.ambient,
+                    v.visible,
+                    v.show_icon
+                )),
+                row["hidden_duration"].as_i64().map(|duration| (
+                    duration as i32,
+                    row["hidden_amplifier"].as_i64().unwrap(),
+                    row["hidden_ambient"].as_bool().unwrap(),
+                    row["hidden_visible"].as_bool().unwrap(),
+                    row["hidden_icon"].as_bool().unwrap()
+                )),
+                "{row}"
+            );
+            let id = native_resources::packs::ResourceId::parse(&modifier_name).unwrap();
+            assert_eq!(
+                session
+                    .movement_speed_attribute
+                    .modifier(&id)
+                    .map(|v| v.amount.to_bits()),
+                row["amount"].as_f64().map(f64::to_bits),
+                "{row}"
+            );
+            assert_eq!(
+                session
+                    .movement_speed_attribute
+                    .value(0.0, 1024.0)
+                    .unwrap()
+                    .to_bits(),
+                row["value"].as_f64().unwrap().to_bits(),
+                "{row}"
+            );
+            let expected_speed = row["value"].as_f64().unwrap() as f32;
+            assert_eq!(
+                session.movement_speed(false).to_bits(),
+                expected_speed.to_bits(),
+                "{row}"
+            );
+            session.update(TICK);
+            let expected_fov = 1.0 + ((expected_speed / 0.1_f32 + 1.0) / 2.0 - 1.0) * 0.5;
+            assert_eq!(
+                session.snapshot().camera.fov_modifier(1.0).to_bits(),
+                expected_fov.to_bits(),
+                "{row}"
+            );
+            let draft = session.draft_player_state(&original).unwrap();
+            assert_eq!(
+                crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+                *session.fall.effects(),
+                "{row}"
+            );
+            assert_eq!(
+                crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap(),
+                session.movement_speed_attribute,
+                "{row}"
+            );
+        }
+    }
+
     #[test]
     fn movement_speed_tracks_saved_effect_modifiers_and_their_transitions() {
         use native_resources::{
@@ -24856,15 +25186,24 @@ mod tests {
         let mut session = session();
         let effects = crate::survival::FallEffects {
             speed: Some(crate::survival::EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 amplifier: 1,
                 duration: 1,
                 hidden: Some(Box::new(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: 0,
                     duration: 4,
                     hidden: None,
                 })),
             }),
             slowness: Some(crate::survival::EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 amplifier: 0,
                 duration: 2,
                 hidden: None,
@@ -24907,6 +25246,9 @@ mod tests {
             crate::player_data::SavedAttribute::with_base(1.0),
             crate::survival::FallEffects {
                 speed: Some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: 3,
                     duration: 10,
                     hidden: None,
@@ -25554,6 +25896,9 @@ mod tests {
                 crate::player_data::SavedAttribute::with_base(1.0),
                 crate::survival::FallEffects {
                     dolphins_grace: Some(crate::survival::EffectDuration {
+                        ambient: false,
+                        visible: true,
+                        show_icon: true,
                         amplifier: 0,
                         duration,
                         hidden: None,
@@ -25595,6 +25940,9 @@ mod tests {
             crate::player_data::SavedAttribute::with_base(1.0),
             crate::survival::FallEffects {
                 jump_boost: Some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: 0,
                     duration: 2,
                     hidden: None,
@@ -27102,6 +27450,9 @@ mod tests {
         session.set_player_inventory(inventory);
         let effect = |amplifier, duration| {
             Some(crate::survival::EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 amplifier,
                 duration,
                 hidden: None,
@@ -27200,6 +27551,9 @@ mod tests {
             let effect = |name: &str| {
                 let amp = row[name].as_i64().unwrap();
                 (amp >= 0).then_some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: amp as u8,
                     duration: 10,
                     hidden: None,
@@ -36478,6 +36832,9 @@ mod tests {
             let mut session = session();
             let effects = crate::survival::FallEffects {
                 poison: (cause == "poison").then_some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: 0,
                     duration: 25,
                     hidden: None,
@@ -37136,9 +37493,15 @@ mod tests {
             .set_player_breathing(
                 crate::survival::BreathingEffects {
                     water_breathing: Some(crate::survival::EffectDuration {
+                        ambient: false,
+                        visible: true,
+                        show_icon: true,
                         amplifier: 0,
                         duration: 1,
                         hidden: Some(Box::new(crate::survival::EffectDuration {
+                            ambient: false,
+                            visible: true,
+                            show_icon: true,
                             amplifier: 0,
                             duration: 3,
                             hidden: None,
@@ -37233,6 +37596,9 @@ mod tests {
                 crate::player_data::SavedAttribute::with_base(1.0),
                 crate::survival::FallEffects {
                     jump_boost: Some(crate::survival::EffectDuration {
+                        ambient: false,
+                        visible: true,
+                        show_icon: true,
                         amplifier: 1,
                         duration,
                         hidden: None,
@@ -37273,6 +37639,9 @@ mod tests {
                 crate::player_data::SavedAttribute::with_base(1.0),
                 crate::survival::FallEffects {
                     slow_falling: Some(crate::survival::EffectDuration {
+                        ambient: false,
+                        visible: true,
+                        show_icon: true,
                         amplifier: 0,
                         duration,
                         hidden: None,
@@ -37304,6 +37673,9 @@ mod tests {
             session.fall_distance = 20.0;
             let effect = |amplifier, duration| {
                 Some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier,
                     duration,
                     hidden: None,
@@ -38639,6 +39011,9 @@ mod tests {
             crate::player_data::SavedAttribute::with_base(1.0),
             crate::survival::FallEffects {
                 poison: Some(crate::survival::EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: 0,
                     duration: 25,
                     hidden: None,
@@ -38748,6 +39123,9 @@ mod tests {
     fn saved_hunger_applies_exhaustion_and_expires_in_snapshot() {
         let mut session = session();
         let effect = crate::survival::EffectDuration {
+            ambient: false,
+            visible: true,
+            show_icon: true,
             amplifier: 1,
             duration: 2,
             hidden: None,
@@ -38972,6 +39350,12 @@ mod tests {
             "regeneration",
             "long_regeneration",
             "strong_regeneration",
+            "slowness",
+            "long_slowness",
+            "strong_slowness",
+            "swiftness",
+            "long_swiftness",
+            "strong_swiftness",
         ] {
             let original = NamedTag {
                 name: "".into(),
@@ -39025,6 +39409,31 @@ mod tests {
                             _ => (450, 1),
                         }
                     );
+                }
+                "slowness" | "long_slowness" | "strong_slowness" | "swiftness"
+                | "long_swiftness" | "strong_swiftness" => {
+                    let (expected, speed) = match potion {
+                        "slowness" => ((1800, 0), false),
+                        "long_slowness" => ((4800, 0), false),
+                        "strong_slowness" => ((400, 3), false),
+                        "swiftness" => ((3600, 0), true),
+                        "long_swiftness" => ((9600, 0), true),
+                        _ => ((1800, 1), true),
+                    };
+                    let effect = if speed {
+                        session.fall.effects().speed.as_ref()
+                    } else {
+                        session.fall.effects().slowness.as_ref()
+                    }
+                    .unwrap();
+                    assert_eq!((effect.duration, effect.amplifier), expected);
+                    let id = native_resources::packs::ResourceId::parse(if speed {
+                        "minecraft:effect.speed"
+                    } else {
+                        "minecraft:effect.slowness"
+                    })
+                    .unwrap();
+                    assert!(session.movement_speed_attribute.modifier(&id).is_some());
                 }
                 _ => unreachable!(),
             }
@@ -39102,14 +39511,7 @@ mod tests {
         session.fall.configure(
             crate::player_data::SavedAttribute::with_base(3.0),
             crate::player_data::SavedAttribute::with_base(1.0),
-            crate::survival::FallEffects {
-                hunger: Some(crate::survival::EffectDuration {
-                    duration: 100,
-                    amplifier: 1,
-                    hidden: None,
-                }),
-                ..Default::default()
-            },
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
             Arc::new(native_resources::enchantments::OxygenEnchantments::default()),
         );
         let mut inventory = PlayerInventory::default();
@@ -39275,6 +39677,151 @@ mod tests {
             ]
         );
         let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+    }
+
+    #[test]
+    fn custom_remove_movement_effects_removes_only_their_modifiers() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let modifier = |id: &str, amount| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("amount".into(), Tag::Double(amount)),
+                (
+                    "operation".into(),
+                    Tag::String("add_multiplied_total".into()),
+                ),
+            ])
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: ["speed", "slowness"]
+                            .into_iter()
+                            .map(|id| {
+                                Tag::Compound(vec![
+                                    (
+                                        "id".into(),
+                                        Tag::String(format!("minecraft:{id}").as_str().into()),
+                                    ),
+                                    ("duration".into(), Tag::Int(100)),
+                                ])
+                            })
+                            .collect(),
+                    },
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                            ("base".into(), Tag::Double(f64::from(0.1_f32))),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![
+                                        modifier("minecraft:effect.speed", f64::from(0.2_f32)),
+                                        modifier("minecraft:effect.slowness", f64::from(-0.15_f32)),
+                                        modifier("example:keep", 0.2),
+                                    ],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let component = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            (
+                                "type".into(),
+                                Tag::String("minecraft:remove_effects".into()),
+                            ),
+                            (
+                                "effects".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![
+                                        Tag::String("minecraft:speed".into()),
+                                        Tag::String("minecraft:slowness".into()),
+                                    ],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        )]);
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session
+            .set_saved_movement_speed(
+                crate::player_data::read_loaded_movement_speed_attribute(&original).unwrap(),
+            )
+            .unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, component),
+        );
+        session.set_player_inventory(inventory);
+        session.vitals.food = 10;
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        assert!(
+            session.fall.effects().speed.is_none() && session.fall.effects().slowness.is_none()
+        );
+        let id = |name| native_resources::packs::ResourceId::parse(name).unwrap();
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&id("minecraft:effect.speed"))
+                .is_none()
+        );
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&id("minecraft:effect.slowness"))
+                .is_none()
+        );
+        assert!(
+            session
+                .movement_speed_attribute
+                .modifier(&id("example:keep"))
+                .is_some()
+        );
+        assert_eq!(
+            session.movement_speed(false),
+            session.movement_speed_attribute.value(0.0, 1024.0).unwrap() as f32
+        );
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap(),
+            session.movement_speed_attribute
+        );
         assert_eq!(
             crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
             *session.fall.effects()
@@ -41626,6 +42173,9 @@ mod tests {
             assert!(session.set(relative, dirt));
             session.update(TICK * 3);
             let effect = || crate::survival::EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 amplifier: 0,
                 duration: 1000,
                 hidden: None,

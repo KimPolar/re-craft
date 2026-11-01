@@ -627,6 +627,7 @@ pub struct LocalSession {
     ground_without_support: bool,
     fall: fall::FallTracker,
     breathing_effects: survival::BreathingEffects,
+    movement_effect_speed: Option<(Option<u8>, Option<u8>, [f32; 2])>,
     damage_cooldown: fall::DamageCooldown,
     player_effect_tick: i32,
     accumulated: Duration,
@@ -635,6 +636,37 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
+    fn movement_effect_speeds(&mut self) -> [f32; 2] {
+        let speed = self
+            .fall
+            .effects()
+            .speed
+            .as_ref()
+            .map(|effect| effect.amplifier);
+        let slowness = self
+            .fall
+            .effects()
+            .slowness
+            .as_ref()
+            .map(|effect| effect.amplifier);
+        if let Some((cached_speed, cached_slowness, values)) = self.movement_effect_speed
+            && (cached_speed, cached_slowness) == (speed, slowness)
+        {
+            return values;
+        }
+        let attribute = player_data::SavedAttribute::with_base(f64::from(0.1_f32));
+        let values = [
+            attribute
+                .movement_speed(speed, slowness, false)
+                .expect("vanilla movement speed"),
+            attribute
+                .movement_speed(speed, slowness, true)
+                .expect("vanilla sprint speed"),
+        ];
+        self.movement_effect_speed = Some((speed, slowness, values));
+        values
+    }
+
     fn process_food_events(&mut self) {
         for event in self.food_use.take_events() {
             let item = event.particle_item().cloned();
@@ -666,14 +698,9 @@ impl LocalSession {
                     | survival::FoodRandomEvent::PotionEffects(effects) => {
                         for effect in effects {
                             if effect.kind == survival::FoodStatusKind::WaterBreathing {
-                                self.breathing_effects
-                                    .add_water_breathing(effect.duration, effect.amplifier);
+                                self.breathing_effects.add_water_breathing(effect);
                             } else {
-                                self.fall.add_status(
-                                    effect.kind,
-                                    effect.duration,
-                                    effect.amplifier,
-                                );
+                                self.fall.add_status(effect);
                             }
                         }
                     }
@@ -821,6 +848,7 @@ impl LocalSession {
             ground_without_support: false,
             fall: fall::FallTracker::default(),
             breathing_effects: survival::BreathingEffects::default(),
+            movement_effect_speed: None,
             damage_cooldown: fall::DamageCooldown::default(),
             player_effect_tick: 0,
             accumulated: Duration::ZERO,
@@ -1158,6 +1186,7 @@ impl LocalSession {
         let camera_target_eye_height = self.player.pose.eye_height();
         let camera_sprinting = self.sprint.active;
         let camera_flying = self.flight.flying;
+        let camera_speeds = self.movement_effect_speeds();
         self.advance_soil_ticks();
         if self.death.is_some() {
             self.process_death();
@@ -1173,10 +1202,11 @@ impl LocalSession {
             self.mining.release();
             self.food_use.cancel();
             self.camera.begin_bob_tick(DVec3::ZERO, false);
-            self.camera.tick(
+            self.camera.tick_with_speed(
                 self.motion.position,
                 self.player.pose.eye_height(),
-                false,
+                camera_speeds[0],
+                0.1_f32,
                 camera_flying,
                 self.fov_effect_scale,
             );
@@ -1609,6 +1639,7 @@ impl LocalSession {
             .apply_hunger(&mut self.vitals, self.game_mode);
         self.fall.tick_effects();
         self.breathing_effects.tick();
+        let movement_speeds = self.movement_effect_speeds();
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
@@ -1655,11 +1686,13 @@ impl LocalSession {
                     .tick_spectator(input, self.sneak, self.flight_speed),
             )
         } else if flying {
-            self.motion.tick_flying(
+            self.motion.tick_flying_with_movement_speed(
                 input,
                 self.sneak,
                 self.flight_speed,
                 0.6,
+                0.0,
+                movement_speeds[usize::from(input.sprinting)],
                 |position, requested, on_ground| {
                     (
                         requested,
@@ -1674,8 +1707,15 @@ impl LocalSession {
                 },
             )
         } else {
-            self.motion
-                .tick_resolved(input, 0.6, |position, requested, on_ground| {
+            self.motion.tick_resolved_with_effects(
+                input,
+                0.6,
+                movement_speeds[usize::from(input.sprinting)],
+                0.42_f32,
+                0.08,
+                false,
+                None,
+                |position, requested, on_ground| {
                     let adjusted = movement::back_off(
                         position,
                         requested,
@@ -1693,7 +1733,8 @@ impl LocalSession {
                         block_shape,
                     );
                     (adjusted, actual)
-                })
+                },
+            )
         };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
@@ -1785,10 +1826,11 @@ impl LocalSession {
         self.player.position = self.motion.position.as_vec3();
         self.player.vertical_velocity = (self.motion.velocity.y * 20.0) as f32;
         self.player.on_ground = self.motion.on_ground;
-        self.camera.tick(
+        self.camera.tick_with_speed(
             self.motion.position,
             camera_target_eye_height,
-            camera_sprinting,
+            camera_speeds[usize::from(camera_sprinting)],
+            0.1_f32,
             camera_flying,
             self.fov_effect_scale,
         );
@@ -2516,6 +2558,51 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_movement_uses_cached_speed_and_slowness_effects() {
+        fn step(
+            kind: Option<survival::FoodStatusKind>,
+            amplifier: u8,
+        ) -> (f64, [f32; 2], [f32; 2], f32) {
+            let mut session = LocalSession::demo();
+            session.motion.on_ground = true;
+            if let Some(kind) = kind {
+                session.fall.add_status(survival::StatusApplication {
+                    kind,
+                    duration: 100,
+                    amplifier,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                });
+            }
+            let before = session.motion.position;
+            session.submit_command(PlayerCommand::Move {
+                forward: 1.0,
+                strafe: 0.0,
+                jump: false,
+            });
+            session.update(TICK);
+            let delta = session.motion.position - before;
+            let distance = (delta.x * delta.x + delta.z * delta.z).sqrt();
+            let fov = session.camera.fov_modifier(1.0);
+            let effects = session.movement_effect_speeds();
+            session.fall.clear_effects();
+            let cleared = session.movement_effect_speeds();
+            (distance, effects, cleared, fov)
+        }
+        let (normal, _, baseline, normal_fov) = step(None, 0);
+        let (slow, slow_values, after_slow, slow_fov) =
+            step(Some(survival::FoodStatusKind::Slowness), 3);
+        let (fast, fast_values, after_fast, fast_fov) =
+            step(Some(survival::FoodStatusKind::Speed), 1);
+        assert!(slow < normal && normal < fast, "{slow} {normal} {fast}");
+        assert!(slow_values[0] < baseline[0] && fast_values[0] > baseline[0]);
+        assert_eq!(after_slow, baseline);
+        assert_eq!(after_fast, baseline);
+        assert!(slow_fov < normal_fov && normal_fov < fast_fov);
+    }
 
     #[test]
     fn pickup_sounds_keep_tick_order_across_frame_cadences() {

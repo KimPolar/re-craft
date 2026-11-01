@@ -103,6 +103,8 @@ pub(crate) enum FoodStatusKind {
     NightVision,
     WaterBreathing,
     Regeneration,
+    Speed,
+    Slowness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +148,10 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::WaterBreathing)
     } else if value.matches("minecraft:regeneration") || value.matches("regeneration") {
         Some(FoodStatusKind::Regeneration)
+    } else if value.matches("minecraft:speed") || value.matches("speed") {
+        Some(FoodStatusKind::Speed)
+    } else if value.matches("minecraft:slowness") || value.matches("slowness") {
+        Some(FoodStatusKind::Slowness)
     } else {
         None
     }
@@ -185,6 +191,11 @@ pub(crate) fn inventory_potion_contents(components: &Tag) -> Option<()> {
             | "long_poison"
             | "strong_poison"
             | "slowness"
+            | "long_slowness"
+            | "strong_slowness"
+            | "swiftness"
+            | "long_swiftness"
+            | "strong_swiftness"
             | "regeneration"
             | "long_regeneration"
             | "strong_regeneration"
@@ -213,6 +224,12 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
         "regeneration" => (FoodStatusKind::Regeneration, 900, 0),
         "long_regeneration" => (FoodStatusKind::Regeneration, 1800, 0),
         "strong_regeneration" => (FoodStatusKind::Regeneration, 450, 1),
+        "slowness" => (FoodStatusKind::Slowness, 1800, 0),
+        "long_slowness" => (FoodStatusKind::Slowness, 4800, 0),
+        "strong_slowness" => (FoodStatusKind::Slowness, 400, 3),
+        "swiftness" => (FoodStatusKind::Speed, 3600, 0),
+        "long_swiftness" => (FoodStatusKind::Speed, 9600, 0),
+        "strong_swiftness" => (FoodStatusKind::Speed, 1800, 1),
         _ => return None,
     };
     Some(vec![StatusApplication {
@@ -231,7 +248,8 @@ pub fn potion_color(components: &Tag) -> Option<u32> {
         "night_vision" | "long_night_vision" => Some(0xc2ff66),
         "water_breathing" | "long_water_breathing" => Some(0x98dac0),
         "poison" | "long_poison" | "strong_poison" => Some(0x87a363),
-        "slowness" => Some(0x8bafe0),
+        "slowness" | "long_slowness" | "strong_slowness" => Some(0x8bafe0),
+        "swiftness" | "long_swiftness" | "strong_swiftness" => Some(0x33ebff),
         "regeneration" | "long_regeneration" | "strong_regeneration" => Some(0xcd5cab),
         "strength" => Some(0xffc700),
         _ => None,
@@ -1035,16 +1053,32 @@ pub struct PlayerVitals {
 pub struct EffectDuration {
     pub amplifier: u8,
     pub duration: i32,
+    pub ambient: bool,
+    pub visible: bool,
+    pub show_icon: bool,
     pub hidden: Option<Box<EffectDuration>>,
 }
 
 impl EffectDuration {
+    pub(crate) fn from_application(effect: StatusApplication) -> Self {
+        Self {
+            amplifier: effect.amplifier,
+            duration: effect.duration,
+            ambient: effect.ambient,
+            visible: effect.visible,
+            show_icon: effect.show_icon,
+            hidden: None,
+        }
+    }
     fn shorter_than(&self, other: &Self) -> bool {
         self.duration != -1 && (other.duration == -1 || self.duration < other.duration)
     }
 
     /// Merge the timing and amplifier of a matching Java effect instance.
-    pub(crate) fn merge(&mut self, incoming: Self) {
+    pub(crate) fn merge(&mut self, incoming: Self) -> bool {
+        let mut changed = false;
+        let (ambient, visible, show_icon) =
+            (incoming.ambient, incoming.visible, incoming.show_icon);
         if incoming.amplifier > self.amplifier {
             if incoming.shorter_than(self) {
                 let old = self.clone();
@@ -1052,15 +1086,30 @@ impl EffectDuration {
             }
             self.amplifier = incoming.amplifier;
             self.duration = incoming.duration;
+            changed = true;
         } else if self.shorter_than(&incoming) {
             if incoming.amplifier == self.amplifier {
                 self.duration = incoming.duration;
+                changed = true;
             } else if let Some(hidden) = &mut self.hidden {
                 hidden.merge(incoming);
             } else {
                 self.hidden = Some(Box::new(incoming));
             }
         }
+        if (!ambient && self.ambient) || changed {
+            self.ambient = ambient;
+            changed = true;
+        }
+        if self.visible != visible {
+            self.visible = visible;
+            changed = true;
+        }
+        if self.show_icon != show_icon {
+            self.show_icon = show_icon;
+            changed = true;
+        }
+        changed
     }
 
     fn has_time(&self) -> bool {
@@ -1187,12 +1236,8 @@ pub struct BreathingEffects {
 }
 
 impl BreathingEffects {
-    pub(crate) fn add_water_breathing(&mut self, duration: i32, amplifier: u8) {
-        let incoming = EffectDuration {
-            duration,
-            amplifier,
-            hidden: None,
-        };
+    pub(crate) fn add_water_breathing(&mut self, application: StatusApplication) {
+        let incoming = EffectDuration::from_application(application);
         if let Some(effect) = &mut self.water_breathing {
             effect.merge(incoming);
         } else {
@@ -1659,7 +1704,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 280);
+        assert_eq!(rows.len(), 400);
         for row in rows {
             let name = row["potion"].as_str().unwrap();
             let components = Tag::Compound(vec![(
@@ -1729,6 +1774,8 @@ mod tests {
                     FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
                     FoodStatusKind::Poison => "minecraft:poison",
                     FoodStatusKind::Regeneration => "minecraft:regeneration",
+                    FoodStatusKind::Speed => "minecraft:speed",
+                    FoodStatusKind::Slowness => "minecraft:slowness",
                     FoodStatusKind::Hunger => "minecraft:hunger",
                 };
                 assert_eq!(name, expected["id"].as_str().unwrap());
@@ -2036,11 +2083,17 @@ mod tests {
         }
         for row in rows["merges"].as_array().unwrap() {
             let mut effect = EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 duration: row["initial_duration"].as_i64().unwrap() as i32,
                 amplifier: row["initial_amplifier"].as_u64().unwrap() as u8,
                 hidden: None,
             };
             effect.merge(EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 duration: 600,
                 amplifier: 0,
                 hidden: None,
@@ -2696,11 +2749,17 @@ mod tests {
                 }
             }
             let mut active = (case >= 4).then_some(EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 duration: 50,
                 amplifier: 0,
                 hidden: None,
             });
             let mut active_poison = (case >= 4).then_some(EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
                 duration: 200,
                 amplifier: 1,
                 hidden: None,
@@ -2713,6 +2772,9 @@ mod tests {
                     FoodRandomEvent::StatusGroup { effects, .. } => {
                         for effect in effects {
                             let incoming = EffectDuration {
+                                ambient: false,
+                                visible: true,
+                                show_icon: true,
                                 duration: effect.duration,
                                 amplifier: effect.amplifier,
                                 hidden: None,
@@ -2722,7 +2784,9 @@ mod tests {
                                 FoodStatusKind::Poison => &mut active_poison,
                                 FoodStatusKind::NightVision
                                 | FoodStatusKind::WaterBreathing
-                                | FoodStatusKind::Regeneration => {
+                                | FoodStatusKind::Regeneration
+                                | FoodStatusKind::Speed
+                                | FoodStatusKind::Slowness => {
                                     unreachable!()
                                 }
                             };
@@ -2740,7 +2804,9 @@ mod tests {
                                 FoodStatusKind::Poison => active_poison = None,
                                 FoodStatusKind::NightVision
                                 | FoodStatusKind::WaterBreathing
-                                | FoodStatusKind::Regeneration => {
+                                | FoodStatusKind::Regeneration
+                                | FoodStatusKind::Speed
+                                | FoodStatusKind::Slowness => {
                                     unreachable!()
                                 }
                             }
@@ -2856,6 +2922,9 @@ mod tests {
             };
             let mut effects = FallEffects {
                 regeneration: Some(EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: row["amplifier"].as_u64().unwrap() as u8,
                     duration: row["duration"].as_i64().unwrap() as i32,
                     hidden: None,
@@ -2944,6 +3013,9 @@ mod tests {
             let mut health = row["health"].as_f64().unwrap() as f32;
             let mut effects = FallEffects {
                 poison: Some(EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: row["amplifier"].as_u64().unwrap() as u8,
                     duration: row["duration"].as_i64().unwrap() as i32,
                     hidden: None,
@@ -3042,6 +3114,9 @@ mod tests {
             };
             let mut effects = FallEffects {
                 hunger: Some(EffectDuration {
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
                     amplifier: row["amplifier"].as_u64().unwrap() as u8,
                     duration: row["duration"].as_i64().unwrap() as i32,
                     hidden: None,

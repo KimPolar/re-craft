@@ -375,6 +375,8 @@ pub enum DeathCause {
     FallHigh,
     Stalagmite,
     Drown,
+    Lava,
+    OnFire,
     Starve,
 }
 

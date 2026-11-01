@@ -499,6 +499,12 @@ pub fn read_saved_gravity_attribute(player: &NamedTag) -> Result<SavedAttribute>
     saved_attribute(player, "gravity", 0.08)
 }
 
+/// The burning-time attribute scales the duration of new fire, including
+/// persistent and equipment-provided modifiers.
+pub fn read_saved_burning_time_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "burning_time", 1.0)
+}
+
 pub fn read_saved_water_movement_efficiency_attribute(player: &NamedTag) -> Result<SavedAttribute> {
     saved_attribute(player, "water_movement_efficiency", 0.0)
 }
@@ -916,6 +922,16 @@ pub(crate) fn read_saved_fire_for_preservation(player: &NamedTag) -> Result<i16>
     }
 }
 
+/// Java accepts numeric NBT for Fire when loading, even when its on-disk type
+/// is not the short required for a lossless save draft.
+pub(crate) fn read_saved_fire(player: &NamedTag) -> i16 {
+    player
+        .value
+        .get("Fire")
+        .and_then(numeric_int)
+        .map_or(0, |value| value as i16)
+}
+
 /// ServerPlayer falls back to the world's default if this field is absent.
 pub fn saved_game_mode(player: &NamedTag) -> Option<GameMode> {
     player
@@ -1068,6 +1084,13 @@ pub struct PlayerStateDraft(PlayerInventoryDraft);
 impl PlayerStateDraft {
     pub fn document(&self) -> &NamedTag {
         self.0.document()
+    }
+
+    pub(crate) fn set_fire(&mut self, original: &NamedTag, ticks: i32) -> Result<()> {
+        read_saved_fire_for_preservation(original)?;
+        let ticks = i16::try_from(ticks).context("player Fire cannot be saved as a short")?;
+        set_field(&mut self.0.document.value, "Fire", Some(Tag::Short(ticks)))?;
+        Ok(())
     }
 
     pub(crate) fn set_last_death_location(

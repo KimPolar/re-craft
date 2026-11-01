@@ -259,6 +259,8 @@ impl DeathScreen {
                         "%1$s was impaled on a stalagmite",
                     )),
                     DeathCause::Drown => Some(("death.attack.drown", "%1$s drowned")),
+                    DeathCause::Lava => Some(("death.attack.lava", "%1$s tried to swim in lava")),
+                    DeathCause::OnFire => Some(("death.attack.onFire", "%1$s burned to death")),
                     DeathCause::Starve => Some(("death.attack.starve", "%1$s starved to death")),
                 };
                 if self.info.show_message

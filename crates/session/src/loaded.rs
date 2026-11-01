@@ -327,6 +327,19 @@ struct RainView<'a> {
     sea_level: Option<i32>,
 }
 
+fn lava_fire_ticks(current: i32, burning_time: f64, invulnerable: bool) -> i32 {
+    let duration = (300.0 * burning_time).ceil() as i32;
+    if current < duration {
+        if invulnerable {
+            duration.min(1)
+        } else {
+            duration
+        }
+    } else {
+        current
+    }
+}
+
 impl RainView<'_> {
     fn at(&self, relative: IVec3) -> Option<bool> {
         if !self.raining? {
@@ -472,6 +485,8 @@ pub struct LoadedSession {
     effect_save_invalid: bool,
     unresolved_player_damage: bool,
     unresolved_player_lava: bool,
+    player_fire_ticks: i32,
+    burning_time_attribute: crate::player_data::SavedAttribute,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
@@ -1318,6 +1333,64 @@ impl LoadedSession {
             death.score = score;
         }
         Arc::make_mut(&mut self.snapshot).death = self.death;
+    }
+
+    fn player_fire_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) {
+        if let Err(error) = self.fall.damage(
+            amount,
+            source,
+            &self.inventory,
+            self.armor.value(),
+            &mut self.vitals,
+            self.game_mode,
+            Some(&mut self.damage_cooldown),
+        ) {
+            self.stream_errors
+                .push(format!("player fire damage: {error:#}"));
+            self.unresolved_player_damage = true;
+        }
+        if self.death.is_none() && self.vitals.health <= 0.0 {
+            self.death = Some(DeathInfo {
+                cause,
+                tick: self.tick.saturating_add(1),
+                score: self.score,
+                show_message: self.death_rules.show_death_messages,
+                inventory_unresolved: false,
+                respawn_pending: false,
+                can_respawn: false,
+            });
+            self.record_last_death();
+        }
+    }
+
+    fn ignite_player_from_lava(&mut self) {
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, enchantments)| Arc::clone(enchantments))
+            .unwrap_or_default();
+        match crate::equipment_attributes::equipped_attribute(
+            &self.burning_time_attribute,
+            &self.inventory,
+            &registry,
+            "burning_time",
+        )
+        .and_then(|attribute| attribute.value(0.0, 1024.0))
+        {
+            Ok(multiplier) => {
+                self.player_fire_ticks = lava_fire_ticks(
+                    self.player_fire_ticks,
+                    multiplier,
+                    matches!(self.game_mode, GameMode::Creative | GameMode::Spectator),
+                );
+            }
+            Err(error) => {
+                self.stream_errors
+                    .push(format!("player burning time: {error:#}"));
+                self.unresolved_player_damage = true;
+            }
+        }
+        self.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava);
     }
 
     /// Restore the independent saved experience fields before play begins.
@@ -2568,6 +2641,9 @@ impl LoadedSession {
             score: self.score,
         };
         let mut draft = crate::player_data::draft_player_state(original, &state, &self.inventory)?;
+        if self.tick > 0 {
+            draft.set_fire(original, self.player_fire_ticks)?;
+        }
         if self.last_death_dirty {
             let crate::LastDeathLocation::At(target) = &self.snapshot.last_death else {
                 anyhow::bail!("last-death position is unavailable");
@@ -4166,6 +4242,8 @@ impl LoadedSession {
             "saved player inventory source was already captured"
         );
         let inventory = crate::player_data::read_saved_player(source)?;
+        let saved_fire = crate::player_data::read_saved_fire(source);
+        let burning_time = crate::player_data::read_saved_burning_time_attribute(source)?;
         let last_death = match crate::player_data::read_last_death_location(source) {
             Ok(Some(target)) => crate::LastDeathLocation::At(target),
             Ok(None) => crate::LastDeathLocation::Absent,
@@ -4177,6 +4255,8 @@ impl LoadedSession {
         };
         let encoded = native_persistence::nbt::write(source)?;
         self.set_player_inventory(inventory);
+        self.player_fire_ticks = i32::from(saved_fire);
+        self.burning_time_attribute = burning_time;
         Arc::make_mut(&mut self.snapshot).last_death = last_death;
         Arc::make_mut(&mut self.snapshot).tooltip_attack_base =
             crate::player_data::tooltip_attack_base(source);
@@ -4356,6 +4436,8 @@ impl LoadedSession {
             effect_save_invalid: false,
             unresolved_player_damage: false,
             unresolved_player_lava: false,
+            player_fire_ticks: 0,
+            burning_time_attribute: crate::player_data::SavedAttribute::with_base(1.0),
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
@@ -7007,6 +7089,8 @@ impl LoadedSession {
         self.water_vision = crate::survival::WaterVision::default();
         self.swimming = false;
         self.fall_distance = 0.0;
+        self.player_fire_ticks = 0;
+        self.burning_time_attribute.clear_modifiers();
         self.ground_without_support = false;
         self.ground_support = None;
         self.bounciness_attribute.clear_modifiers();
@@ -14027,6 +14111,22 @@ impl LoadedSession {
         if self.game_mode != GameMode::Spectator && contacts.lava.depth > 0.0 {
             self.unresolved_player_lava = true;
         }
+        // Entity.baseTick handles the existing fire before movement and before
+        // LivingEntity advances status effects. The first entity tick is not
+        // considered in lava by Java's isInLava().
+        if self.player_fire_ticks > 0 {
+            if !fluid_chunks_loaded {
+                self.unresolved_player_damage = true;
+            }
+            let in_lava = self.tick > 0 && contacts.lava.depth > 0.0;
+            if self.player_fire_ticks % 20 == 0 && !in_lava {
+                self.player_fire_damage(1.0, "minecraft:on_fire", DeathCause::OnFire);
+            }
+            self.player_fire_ticks -= 1;
+            if matches!(self.game_mode, GameMode::Creative | GameMode::Spectator) {
+                self.player_fire_ticks = self.player_fire_ticks.min(1);
+            }
+        }
         let under_water = in_water && self.previous_eye_in_water;
         self.previous_eye_in_water = contacts.water.eyes_inside;
         self.water_vision.tick(
@@ -14068,7 +14168,7 @@ impl LoadedSession {
                     .push(format!("player drowning damage: {error:#}"));
                 self.unresolved_player_damage = true;
             }
-            if self.vitals.health <= 0.0 {
+            if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
                     cause: DeathCause::Drown,
                     tick: self.tick.saturating_add(1),
@@ -14268,6 +14368,7 @@ impl LoadedSession {
         let player_height = self.player.height();
         let fall_distance = self.fall_distance;
         let sneak = self.sneak;
+        let requested_movement = std::cell::Cell::new(DVec3::ZERO);
         let resolve = |position, requested, on_ground| {
             let adjusted = crate::movement::back_off(
                 position,
@@ -14278,6 +14379,7 @@ impl LoadedSession {
                 sneak,
                 block_shape,
             );
+            requested_movement.set(adjusted);
             let actual = crate::movement::resolve_player(
                 position,
                 adjusted,
@@ -14399,6 +14501,7 @@ impl LoadedSession {
                 entity_bounce,
                 movement_speed,
                 |position, requested, on_ground| {
+                    requested_movement.set(requested);
                     (
                         requested,
                         crate::movement::resolve_player(
@@ -14454,19 +14557,13 @@ impl LoadedSession {
                 restitution,
             )
         };
-        if self.game_mode != GameMode::Spectator && actual != DVec3::ZERO {
-            // A player can cross a thin lava flow between the two contact samples.
-            // Until the inside-block effects are simulated, prevent saving such a
-            // session rather than silently retaining stale health and Fire data.
-            for requested in [actual, DVec3::new(actual.z, actual.y, actual.x)] {
-                if fluid::swept_effects(player_bounds, actual, requested, &|pos| fluid_view.at(pos))
-                    .is_some_and(|effects| effects.contains(&FluidKind::Lava))
-                {
-                    self.unresolved_player_lava = true;
-                    break;
-                }
-            }
-        }
+        let player_fluid_effects = if self.game_mode == GameMode::Spectator {
+            Some(Vec::new())
+        } else {
+            fluid::swept_effects(player_bounds, actual, requested_movement.get(), &|pos| {
+                fluid_view.at(pos)
+            })
+        };
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
         self.vitals.record_movement(
@@ -14595,6 +14692,52 @@ impl LoadedSession {
         } else {
             self.ground_without_support = false;
             self.ground_support = None;
+        }
+        let fire_before_block_effects = self.player_fire_ticks;
+        if let Some(effects) = player_fluid_effects {
+            for effect in effects {
+                if self.death.is_some() {
+                    break;
+                }
+                match effect {
+                    FluidKind::Lava => {
+                        self.unresolved_player_lava = true;
+                        self.ignite_player_from_lava();
+                    }
+                    FluidKind::Water => self.player_fire_ticks = self.player_fire_ticks.min(0),
+                }
+            }
+        } else {
+            // An unknown path could hide lava or water and cannot be preserved.
+            self.unresolved_player_lava = true;
+        }
+        if self.player_fire_ticks > 0 && self.game_mode != GameMode::Spectator {
+            let rain = RainView {
+                raining: self.global_rain(),
+                origin: self.origin,
+                world: &self.world,
+                light_current: self.sky_lighting.is_current(),
+                heightmaps: &self.spawn_heightmaps,
+                climates: self.biome_climates.as_deref(),
+                sea_level: self.generator_sea_level,
+            };
+            match crate::weather::entity_in_rain(
+                self.motion.position,
+                f64::from(player_height),
+                |pos| rain.at(pos),
+            ) {
+                Some(true) => self.player_fire_ticks = 0,
+                Some(false) => {}
+                None => self.unresolved_player_lava = true,
+            }
+        }
+        if self.game_mode != GameMode::Spectator
+            && self.player_fire_ticks <= 0
+            && self.player_fire_ticks <= fire_before_block_effects
+        {
+            // Player.getFireImmuneTicks() is 20; Entity uses its negative
+            // as the idle fire counter after processing inside-block effects.
+            self.player_fire_ticks = -20;
         }
         let block_shape = |cell_pos| match cell(
             &self.world,
@@ -37074,6 +37217,206 @@ mod tests {
     }
 
     #[test]
+    fn player_lava_and_burning_apply_damage_extinguish_and_resistance() {
+        let put_fluid = |session: &mut LoadedSession, name: &str| {
+            let fluid = session.intern_block(state(name, &[("level", "0")]));
+            for x in 7..=9 {
+                for y in 1..=3 {
+                    for z in 7..=9 {
+                        assert!(session.set(IVec3::new(x, y, z), fluid));
+                    }
+                }
+            }
+        };
+
+        let mut burning = session();
+        burning.set_survival_rules(crate::survival::SurvivalRules {
+            natural_health_regeneration: false,
+            ..Default::default()
+        });
+        put_fluid(&mut burning, "minecraft:lava");
+        burning.update(TICK);
+        assert_eq!(burning.vitals.health, 16.0);
+        assert_eq!(burning.player_fire_ticks, 300);
+        for _ in 0..9 {
+            burning.update(TICK);
+        }
+        assert_eq!(burning.vitals.health, 16.0);
+        burning.update(TICK);
+        assert_eq!(burning.vitals.health, 12.0);
+        assert_eq!(burning.player_fire_ticks, 300);
+        put_fluid(&mut burning, "minecraft:water");
+        burning.update(TICK);
+        assert_eq!(burning.player_fire_ticks, -20);
+
+        let mut protected = session();
+        protected
+            .fall
+            .add_status(crate::survival::StatusApplication {
+                kind: crate::survival::FoodStatusKind::FireResistance,
+                duration: 50,
+                amplifier: 0,
+                ambient: false,
+                visible: true,
+                show_icon: true,
+            });
+        put_fluid(&mut protected, "minecraft:lava");
+        protected.update(TICK);
+        assert_eq!(protected.vitals.health, 20.0);
+        assert_eq!(protected.player_fire_ticks, 300);
+
+        let mut scaled = session();
+        let source = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "attributes".into(),
+                native_persistence::nbt::Tag::List {
+                    element_type: native_persistence::nbt::TagType::Compound,
+                    values: vec![native_persistence::nbt::Tag::Compound(vec![
+                        (
+                            "id".into(),
+                            native_persistence::nbt::Tag::String("minecraft:burning_time".into()),
+                        ),
+                        ("base".into(), native_persistence::nbt::Tag::Double(0.5)),
+                    ])],
+                },
+            )]),
+        };
+        scaled.restore_saved_player_inventory(&source).unwrap();
+        put_fluid(&mut scaled, "minecraft:lava");
+        scaled.update(TICK);
+        assert_eq!(scaled.player_fire_ticks, 150);
+
+        let mut creative = session();
+        creative.set_game_mode(GameMode::Creative);
+        put_fluid(&mut creative, "minecraft:lava");
+        creative.update(TICK);
+        assert_eq!(creative.vitals.health, 20.0);
+        assert_eq!(creative.player_fire_ticks, 1);
+
+        let mut lethal = session();
+        lethal.set_player_vitals(crate::survival::PlayerVitals {
+            health: 4.0,
+            ..Default::default()
+        });
+        put_fluid(&mut lethal, "minecraft:lava");
+        lethal.update(TICK);
+        assert_eq!(lethal.snapshot().death.unwrap().cause, DeathCause::Lava);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_lava_ignition_duration_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(
+                    "AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon",
+                )
+            })
+            .join("bin");
+        let source = temp.path().join("PlayerLavaIgnitionOracle.java");
+        let result = temp.path().join("fire.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerLavaIgnitionOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerLavaIgnitionOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 96);
+        for row in rows {
+            let previous = row["previous"].as_i64().unwrap() as i32;
+            let multiplier = row["multiplier"].as_f64().unwrap();
+            assert_eq!(
+                lava_fire_ticks(previous, multiplier, row["invulnerable"].as_bool().unwrap()),
+                row["result"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_player_fire_ticks_before_new_contacts() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Fire".into(), Tag::Short(20))]),
+        };
+        let mut burning = session();
+        burning.restore_saved_player_inventory(&source).unwrap();
+        burning.update(TICK);
+        assert_eq!(burning.player_fire_ticks, 19);
+        assert_eq!(burning.vitals.health, 19.0);
+        assert!(burning.draft_player_state(&source).is_err());
+
+        let numeric_source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Fire".into(), Tag::Int(20))]),
+        };
+        let mut numeric = session();
+        numeric
+            .restore_saved_player_inventory(&numeric_source)
+            .unwrap();
+        numeric.update(TICK);
+        assert_eq!(numeric.vitals.health, 19.0);
+        assert!(numeric.draft_player_state(&numeric_source).is_err());
+
+        let mut dying = session();
+        dying.restore_saved_player_inventory(&source).unwrap();
+        dying.set_player_vitals(crate::survival::PlayerVitals {
+            health: 1.0,
+            ..Default::default()
+        });
+        dying.update(TICK);
+        assert_eq!(dying.snapshot().death.unwrap().cause, DeathCause::OnFire);
+    }
+
+    #[test]
     fn unsupported_player_fire_and_lava_block_save_drafts() {
         use native_persistence::nbt::{NamedTag, Tag};
         let source = |fire: Vec<Tag>| NamedTag {
@@ -37086,6 +37429,10 @@ mod tests {
         };
         let mut ordinary = session();
         ordinary.update(TICK);
+        let saved = ordinary
+            .draft_player_state(&source(vec![Tag::Short(-1)]))
+            .unwrap();
+        assert_eq!(saved.document().value.get("Fire"), Some(&Tag::Short(-20)));
         assert!(
             ordinary
                 .draft_player_state(&source(vec![Tag::Short(0)]))

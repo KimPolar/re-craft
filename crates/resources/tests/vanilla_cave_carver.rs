@@ -1,6 +1,6 @@
 //! Cave masks compared with the installed Java 26.3 implementation.
 use native_resources::{
-    carver::{CarvingMask, cave::CaveCarver},
+    carver::{CarvingMask, canyon::CanyonCarver, cave::CaveCarver},
     packs::{ResourceProvider, ResourceStack},
 };
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ fn run(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
-fn cave_masks_match_vanilla() {
+fn carver_masks_match_vanilla() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -49,7 +49,7 @@ fn cave_masks_match_vanilla() {
         .arg(&source));
     let mut resources = ResourceStack::open(&game).unwrap();
     let mut cases = Vec::new();
-    for name in ["cave", "cave_extra_underground", "nether_cave"] {
+    for name in ["cave", "cave_extra_underground", "nether_cave", "canyon"] {
         let data = resources
             .read_builtin_data(&format!("data/minecraft/worldgen/carver/{name}.json"))
             .unwrap()
@@ -60,11 +60,21 @@ fn cave_masks_match_vanilla() {
         } else {
             (-64, 384)
         };
-        for i in 0..180i32 {
+        for i in 0..if name == "canyon" { 1500i32 } else { 180i32 } {
             let source = [(i * 19) % 61 - 30, (i * 37) % 73 - 36];
             let target = [source[0] + (i % 5) - 2, source[1] + ((i * 3) % 5) - 2];
             cases.push(json!({"config":config,"source":source,"target":target,"min_y":min,"height":height,
                 "seed":i64::from(i).wrapping_mul(910_392_097_281).wrapping_sub(992_283_788_121),"index":i%4}));
+        }
+        if name == "canyon" {
+            let mut custom = config.clone();
+            custom["probability"] = json!(1.0);
+            for i in 0..100i32 {
+                cases.push(
+                    json!({"config":custom,"source":[i-50, 5-i],"target":[i-50+(i%3)-1, 5-i],
+                    "min_y":min,"height":height,"seed":i64::from(i)*891247+17,"index":i%3}),
+                );
+            }
         }
         if name == "cave" {
             for variant in 0..3 {
@@ -117,7 +127,6 @@ fn cave_masks_match_vanilla() {
     let mut populated = 0;
     for (i, v) in cases.iter().enumerate() {
         let config = serde_json::to_vec(&v["config"]).unwrap();
-        let carver = CaveCarver::decode(&config).unwrap();
         let min = v["min_y"].as_i64().unwrap() as i32;
         let height = v["height"].as_i64().unwrap() as i32;
         let mut mask = CarvingMask::new(min + 1, min + height - 8).unwrap();
@@ -127,17 +136,30 @@ fn cave_masks_match_vanilla() {
                 v[key][1].as_i64().unwrap() as i32,
             ]
         };
-        let start = carver
-            .carve_source(
-                v["seed"].as_i64().unwrap(),
-                v["index"].as_i64().unwrap() as i32,
+        let seed = v["seed"].as_i64().unwrap();
+        let index = v["index"].as_i64().unwrap() as i32;
+        let start = if v["config"]["type"] == "minecraft:canyon" {
+            CanyonCarver::decode(&config).unwrap().carve_source(
+                seed,
+                index,
                 pos("source"),
                 pos("target"),
                 min,
                 height,
                 &mut mask,
             )
-            .unwrap();
+        } else {
+            CaveCarver::decode(&config).unwrap().carve_source(
+                seed,
+                index,
+                pos("source"),
+                pos("target"),
+                min,
+                height,
+                &mut mask,
+            )
+        }
+        .unwrap();
         assert_eq!(start, groups[i].0, "start case {i}");
         assert_eq!(mask.segments(), groups[i].1, "mask case {i}");
         started += usize::from(start);

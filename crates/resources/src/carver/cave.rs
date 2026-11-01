@@ -6,21 +6,21 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::random::LegacyRandom;
 use serde_json::Value;
 
-use super::{CarvingMask, can_reach, carve_ellipsoid};
+use super::{CarvingMask, can_reach, carve_ellipsoid, source_random};
 use crate::packs::{ResourceId, ResourceProvider};
 
-fn field<'a>(v: &'a Value, name: &str) -> Result<&'a Value> {
+pub(super) fn field<'a>(v: &'a Value, name: &str) -> Result<&'a Value> {
     v.get(name).with_context(|| format!("missing {name}"))
 }
-fn int(v: &Value) -> Result<i32> {
+pub(super) fn int(v: &Value) -> Result<i32> {
     Ok(i32::try_from(v.as_i64().context("expected integer")?)?)
 }
-fn float(v: &Value) -> Result<f32> {
+pub(super) fn float(v: &Value) -> Result<f32> {
     let n = v.as_f64().context("expected number")? as f32;
     ensure!(n.is_finite(), "non-finite number");
     Ok(n)
 }
-fn kind(v: &Value) -> Result<&str> {
+pub(super) fn kind(v: &Value) -> Result<&str> {
     let name = field(v, "type")?
         .as_str()
         .context("expected provider type")?;
@@ -28,13 +28,13 @@ fn kind(v: &Value) -> Result<&str> {
 }
 
 #[derive(Clone, Debug)]
-enum FloatProvider {
+pub(super) enum FloatProvider {
     Constant(f32),
     Uniform(f32, f32),
     Trapezoid(f32, f32, f32),
 }
 impl FloatProvider {
-    fn parse(v: &Value) -> Result<Self> {
+    pub(super) fn parse(v: &Value) -> Result<Self> {
         if v.is_number() {
             return Ok(Self::Constant(float(v)?));
         }
@@ -60,7 +60,7 @@ impl FloatProvider {
             name => bail!("unsupported float provider {name}"),
         })
     }
-    fn sample(&self, r: &mut LegacyRandom) -> f32 {
+    pub(super) fn sample(&self, r: &mut LegacyRandom) -> f32 {
         match *self {
             Self::Constant(v) => v,
             Self::Uniform(a, b) => a + r.next_float() * (b - a),
@@ -125,7 +125,7 @@ impl IntProvider {
     }
 }
 #[derive(Clone, Debug)]
-enum Anchor {
+pub(super) enum Anchor {
     Absolute(i32),
     Above(i32),
     Below(i32),
@@ -152,12 +152,12 @@ impl Anchor {
     }
 }
 #[derive(Clone, Debug)]
-enum HeightProvider {
+pub(super) enum HeightProvider {
     Constant(Anchor),
     Uniform(Anchor, Anchor),
 }
 impl HeightProvider {
-    fn parse(v: &Value) -> Result<Self> {
+    pub(super) fn parse(v: &Value) -> Result<Self> {
         if v.get("type").is_none() {
             return Ok(Self::Constant(Anchor::parse(v)?));
         }
@@ -170,7 +170,7 @@ impl HeightProvider {
             name => bail!("unsupported height provider {name}"),
         })
     }
-    fn sample(&self, r: &mut LegacyRandom, min: i32, height: i32) -> Result<i32> {
+    pub(super) fn sample(&self, r: &mut LegacyRandom, min: i32, height: i32) -> Result<i32> {
         Ok(match self {
             Self::Constant(a) => a.resolve(min, height),
             Self::Uniform(a, b) => {
@@ -254,16 +254,9 @@ impl CaveCarver {
         mask: &mut CarvingMask,
     ) -> Result<bool> {
         ensure!(height > 0, "invalid generation height");
-        let seed = seed.wrapping_add(i64::from(carver_index));
-        let mut r = LegacyRandom::new(seed);
-        let a = r.next_long();
-        let b = r.next_long();
-        let seed =
-            i64::from(source[0]).wrapping_mul(a) ^ i64::from(source[1]).wrapping_mul(b) ^ seed;
-        let mut r = LegacyRandom::new(seed);
-        if r.next_float() > self.probability {
+        let Some(mut r) = source_random(seed, carver_index, source, self.probability) else {
             return Ok(false);
-        }
+        };
         let count = self.count.sample(&mut r);
         for _ in 0..count {
             let x = f64::from(
@@ -319,10 +312,10 @@ impl CaveCarver {
         Ok(true)
     }
 }
-fn sin(v: f64) -> f32 {
+pub(super) fn sin(v: f64) -> f32 {
     trig(v, 0.0)
 }
-fn cos(v: f64) -> f32 {
+pub(super) fn cos(v: f64) -> f32 {
     trig(v, 16384.0)
 }
 fn trig(v: f64, offset: f64) -> f32 {

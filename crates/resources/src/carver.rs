@@ -2,7 +2,24 @@
 //! Aquifer application and world integration are separate stages.
 use anyhow::{Context, Result, ensure};
 
+pub mod canyon;
 pub mod cave;
+
+fn source_random(
+    seed: i64,
+    index: i32,
+    source: [i32; 2],
+    probability: f32,
+) -> Option<native_core::random::LegacyRandom> {
+    use native_core::random::LegacyRandom;
+    let seed = seed.wrapping_add(i64::from(index));
+    let mut random = LegacyRandom::new(seed);
+    let a = random.next_long();
+    let b = random.next_long();
+    let mixed = i64::from(source[0]).wrapping_mul(a) ^ i64::from(source[1]).wrapping_mul(b) ^ seed;
+    let mut random = LegacyRandom::new(mixed);
+    (random.next_float() <= probability).then_some(random)
+}
 
 /// Bit order matches Java: local X, local Z, then Y.
 pub struct CarvingMask {

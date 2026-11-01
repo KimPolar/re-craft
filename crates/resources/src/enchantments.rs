@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::packs::{ResourceId, ResourceProvider};
 use crate::recipes::{TagEntry, parse_tag, resolve_tag};
 
+pub mod disk_predicate;
 pub mod location;
 pub mod tick;
 

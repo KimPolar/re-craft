@@ -405,6 +405,160 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn replace_disk_predicates_match_java() {
+        use native_resources::enchantments::disk_predicate::{DiskPredicate, PredicateWorld};
+        use serde_json::json;
+        use std::{collections::BTreeSet, path::PathBuf, process::Command};
+        struct AirTag;
+        impl ResourceProvider for AirTag {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![])
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/tags/block/air.json").then(|| {
+                    br#"{"values":["minecraft:air","minecraft:cave_air","minecraft:void_air"]}"#
+                        .to_vec()
+                }))
+            }
+        }
+        struct World {
+            state: usize,
+            above: usize,
+            clear: bool,
+            calls: Vec<serde_json::Value>,
+        }
+        impl PredicateWorld for World {
+            fn matches_block(&mut self, p: [i32; 3], ids: &BTreeSet<String>) -> Result<bool> {
+                self.calls.push(json!(["block", p[0], p[1], p[2]]));
+                let name = if p == [2, 10, 3] {
+                    [
+                        "minecraft:water",
+                        "minecraft:water",
+                        "minecraft:lava",
+                        "minecraft:stone",
+                        "minecraft:air",
+                        "minecraft:oak_slab",
+                        "minecraft:oak_slab",
+                    ][self.state]
+                } else if p == [2, 11, 3] {
+                    ["minecraft:air", "minecraft:cave_air", "minecraft:stone"][self.above]
+                } else {
+                    "minecraft:stone"
+                };
+                Ok(ids.contains(name))
+            }
+            fn matches_fluid(&mut self, p: [i32; 3], ids: &BTreeSet<String>) -> Result<bool> {
+                self.calls.push(json!(["block", p[0], p[1], p[2]]));
+                let name = if p == [2, 10, 3] {
+                    [
+                        "minecraft:water",
+                        "minecraft:flowing_water",
+                        "minecraft:lava",
+                        "minecraft:empty",
+                        "minecraft:empty",
+                        "minecraft:water",
+                        "minecraft:empty",
+                    ][self.state]
+                } else {
+                    "minecraft:empty"
+                };
+                Ok(ids.contains(name))
+            }
+            fn unobstructed(&mut self, p: [i32; 3]) -> Result<bool> {
+                self.calls.push(json!(["clear", p[0], p[1], p[2]]));
+                Ok(self.clear)
+            }
+        }
+        let block = json!({"type":"minecraft:matching_blocks","blocks":"minecraft:water"});
+        let predicate_values = [
+            json!({"type":"minecraft:all_of","predicates":[
+                {"type":"minecraft:matching_block_tag","offset":[0,1,0],"tag":"minecraft:air"}, block,
+                {"type":"minecraft:matching_fluids","fluids":"minecraft:water"},
+                {"type":"minecraft:unobstructed","offset":[7,8,9]}]}),
+            json!({"type":"minecraft:any_of","predicates":[{"type":"minecraft:not","predicate":block},
+                {"type":"minecraft:matching_fluids","offset":[0,1,0],"fluids":["minecraft:water"]}]}),
+            json!({"type":"minecraft:unobstructed","offset":[7,8,9]}),
+            json!({"type":"minecraft:all_of","predicates":[]}),
+            json!({"type":"minecraft:any_of","predicates":[]}),
+            json!({"type":"minecraft:matching_fluids","fluids":"minecraft:water"}),
+        ];
+        let predicates: Vec<_> = predicate_values
+            .iter()
+            .map(|value| DiskPredicate::parse(&mut AirTag, value).unwrap())
+            .collect();
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ReplaceDiskPredicateOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ReplaceDiskPredicateOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ReplaceDiskPredicateOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 252);
+        for row in rows {
+            let mut world = World {
+                state: row["state"].as_u64().unwrap() as usize,
+                above: row["above"].as_u64().unwrap() as usize,
+                clear: row["clear"].as_bool().unwrap(),
+                calls: Vec::new(),
+            };
+            let result = predicates[row["type"].as_u64().unwrap() as usize]
+                .test(&mut world, [2, 10, 3])
+                .unwrap();
+            assert_eq!(result, row["result"].as_bool().unwrap(), "{row}");
+            assert_eq!(
+                world.calls,
+                row["calls"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn replace_disk_candidates_match_java_effect() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")

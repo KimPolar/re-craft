@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
+use super::disk_predicate::DiskPredicate;
 use super::{AttributeModifier, AttributeOperation, EquipmentSlot, LevelValue, load_single_tag};
 use crate::packs::{ResourceId, ResourceProvider};
 
@@ -340,13 +341,14 @@ enum Effect {
         height: LevelValue,
         offset: [i32; 3],
         predicate: Option<Value>,
+        compiled_predicate: Option<DiskPredicate>,
         block_state: Value,
         trigger_game_event: Option<ResourceId>,
     },
 }
 
 impl Effect {
-    fn parse(value: &Value, depth: usize) -> Result<Self> {
+    fn parse(provider: &mut impl ResourceProvider, value: &Value, depth: usize) -> Result<Self> {
         ensure!(depth <= 32, "location effect nesting is too deep");
         let value = object(value, "location effect")?;
         let kind = id(
@@ -368,7 +370,7 @@ impl Effect {
                         .and_then(Value::as_array)
                         .context("location effects are missing")?
                         .iter()
-                        .map(|effect| Self::parse(effect, depth + 1))
+                        .map(|effect| Self::parse(provider, effect, depth + 1))
                         .collect::<Result<_>>()?,
                 ))
             }
@@ -431,6 +433,10 @@ impl Effect {
                 if let Some(predicate) = &predicate {
                     object(predicate, "disk predicate")?;
                 }
+                let compiled_predicate = predicate
+                    .as_ref()
+                    .map(|predicate| DiskPredicate::parse(provider, predicate))
+                    .transpose()?;
                 let block_state = value
                     .get("block_state")
                     .context("disk block state is missing")?
@@ -451,6 +457,7 @@ impl Effect {
                     )?,
                     offset,
                     predicate,
+                    compiled_predicate,
                     block_state,
                     trigger_game_event: value
                         .get("trigger_game_event")
@@ -518,6 +525,7 @@ impl Effect {
                 height,
                 offset,
                 predicate,
+                compiled_predicate,
                 block_state,
                 trigger_game_event,
             } => {
@@ -527,6 +535,7 @@ impl Effect {
                         height: height.calculate(level) as i32,
                         offset: *offset,
                         predicate: predicate.clone(),
+                        compiled_predicate: compiled_predicate.clone(),
                         block_state: block_state.clone(),
                         trigger_game_event: trigger_game_event.clone(),
                     }));
@@ -581,6 +590,7 @@ pub struct ReplaceDiskAction {
     pub height: i32,
     pub offset: [i32; 3],
     pub predicate: Option<Value>,
+    pub compiled_predicate: Option<DiskPredicate>,
     pub block_state: Value,
     pub trigger_game_event: Option<ResourceId>,
 }
@@ -629,6 +639,7 @@ impl LocationEnchantment {
                 check_keys(entry, &["effect", "requirements"])?;
                 effects.push(Conditional {
                     effect: Effect::parse(
+                        provider,
                         entry.get("effect").context("location effect is missing")?,
                         0,
                     )?,
@@ -1044,6 +1055,21 @@ mod tests {
                         assert_eq!(disk.height, 1);
                         assert_eq!(disk.offset, [0, -1, 0]);
                         assert!(disk.predicate.is_some());
+                        let Some(DiskPredicate::All(terms)) = &disk.compiled_predicate else {
+                            panic!("missing compiled predicate")
+                        };
+                        let DiskPredicate::Blocks { offset, ids } = &terms[0] else {
+                            panic!("missing air tag")
+                        };
+                        assert_eq!(*offset, [0, 1, 0]);
+                        assert_eq!(
+                            ids.as_ref(),
+                            &BTreeSet::from([
+                                "minecraft:air".to_string(),
+                                "minecraft:cave_air".to_string(),
+                                "minecraft:void_air".to_string()
+                            ])
+                        );
                         assert_eq!(disk.block_state["id"], "minecraft:frosted_ice");
                         assert_eq!(
                             disk.trigger_game_event.as_ref().unwrap().path,

@@ -46,6 +46,13 @@ pub(crate) struct Outcome {
     pub attributes_changed: bool,
     pub inventory_changed: bool,
     pub broken: Vec<ItemStack>,
+    pub item_changes: Vec<ItemChange>,
+    pub touched_modifiers: Vec<(ResourceId, ResourceId)>,
+}
+
+pub(crate) struct ItemChange {
+    pub before: ItemStack,
+    pub after: Option<ItemStack>,
 }
 
 fn slots(inventory: &PlayerInventory) -> [(EquipmentSlot, PlayerSlot); 6] {
@@ -62,7 +69,61 @@ fn slots(inventory: &PlayerInventory) -> [(EquipmentSlot, PlayerSlot); 6] {
     ]
 }
 
+/// Java removes an existing modifier with the same id before applying a
+/// transient one. Until those replacements are persisted, reject such saves.
+pub(crate) fn validate_save_modifiers(
+    outcome: &Outcome,
+    before: &PlayerInventory,
+    after: &PlayerInventory,
+    registry: &OxygenEnchantments,
+    speed: &SavedAttribute,
+    efficiency: &SavedAttribute,
+) -> Result<()> {
+    for (attribute, id) in &outcome.touched_modifiers {
+        let base = match (attribute.namespace.as_str(), attribute.path.as_str()) {
+            ("minecraft", "movement_speed") => speed,
+            ("minecraft", "movement_efficiency") => efficiency,
+            _ => anyhow::bail!("unsupported location attribute in save history"),
+        };
+        for inventory in [before, after] {
+            let assembled = crate::equipment_attributes::equipped_attribute(
+                base,
+                inventory,
+                registry,
+                &attribute.path,
+            )?;
+            ensure!(
+                !assembled.contains_modifier(id),
+                "location modifier replaced an existing attribute modifier"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl LocationTracker {
+    pub fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    pub fn validate_save_attributes(
+        &self,
+        inventory: &PlayerInventory,
+        registry: &OxygenEnchantments,
+        speed: &SavedAttribute,
+        efficiency: &SavedAttribute,
+    ) -> Result<()> {
+        for (name, base) in [
+            ("movement_speed", speed),
+            ("movement_efficiency", efficiency),
+        ] {
+            let assembled =
+                crate::equipment_attributes::equipped_attribute(base, inventory, registry, name)?;
+            self.apply(name, assembled)?;
+        }
+        Ok(())
+    }
+
     pub fn equipment_changed(&self, inventory: &PlayerInventory) -> bool {
         slots(inventory)
             .into_iter()
@@ -89,6 +150,12 @@ impl LocationTracker {
                 return true;
             }
             outcome.attributes_changed |= !effect.modifiers.is_empty();
+            outcome.touched_modifiers.extend(
+                effect
+                    .modifiers
+                    .iter()
+                    .map(|(attribute, modifier)| (attribute.clone(), modifier.id.clone())),
+            );
             false
         });
     }
@@ -156,6 +223,9 @@ impl LocationTracker {
                                 ),
                                 "duplicate location attribute modifier"
                             );
+                            outcome
+                                .touched_modifiers
+                                .push((attribute.clone(), modifier.id.clone()));
                             state.modifiers.push((attribute, modifier));
                             outcome.attributes_changed = true;
                         }
@@ -163,6 +233,9 @@ impl LocationTracker {
                             attribute,
                             modifier,
                         } => {
+                            outcome
+                                .touched_modifiers
+                                .push((attribute.clone(), modifier.id.clone()));
                             state.modifiers.retain(|(old, value)| {
                                 old != &attribute || value.id != modifier.id
                             });
@@ -180,6 +253,10 @@ impl LocationTracker {
                                 random,
                             )? {
                                 outcome.inventory_changed = true;
+                                outcome.item_changes.push(ItemChange {
+                                    before: before.clone(),
+                                    after: inventory.slot(slot).cloned(),
+                                });
                                 if inventory.slot(slot).is_none() {
                                     outcome.broken.push(before);
                                     outcome.attributes_changed |= !state.modifiers.is_empty();
@@ -322,6 +399,50 @@ mod tests {
             passenger: false,
             infinite_materials: false,
         }
+    }
+
+    #[test]
+    fn save_rejects_location_modifier_replacing_persistent_attribute() {
+        use native_resources::enchantments::AttributeOperation;
+        let id = ResourceId::parse("example:effect").unwrap();
+        let outcome = Outcome {
+            touched_modifiers: vec![(
+                ResourceId::parse("minecraft:movement_speed").unwrap(),
+                id.clone(),
+            )],
+            ..Default::default()
+        };
+        let mut speed = SavedAttribute::with_base(0.1);
+        let efficiency = SavedAttribute::with_base(0.0);
+        let inventory = PlayerInventory::default();
+        let registry = OxygenEnchantments::default();
+        assert!(
+            validate_save_modifiers(
+                &outcome,
+                &inventory,
+                &inventory,
+                &registry,
+                &speed,
+                &efficiency
+            )
+            .is_ok()
+        );
+        speed.apply(AttributeModifier {
+            id,
+            operation: AttributeOperation::AddValue,
+            amount: 0.5,
+        });
+        assert!(
+            validate_save_modifiers(
+                &outcome,
+                &inventory,
+                &inventory,
+                &registry,
+                &speed,
+                &efficiency
+            )
+            .is_err()
+        );
     }
 
     #[test]

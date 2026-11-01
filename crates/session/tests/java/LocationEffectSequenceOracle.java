@@ -86,6 +86,9 @@ public class LocationEffectSequenceOracle {
                 player.passenger=step.get("passenger").getAsBoolean(); player.abilities.flying=step.get("flying").getAsBoolean();
                 world.state=(step.get("block").getAsString().equals("soul_sand") ? Blocks.SOUL_SAND : Blocks.STONE).defaultBlockState();
                 soul.value().runLocationChangedEffects(world,level,item,player);
+                if (!player.attributes.getInstance(Attributes.MOVEMENT_SPEED).pack().modifiers().isEmpty()
+                    || !player.attributes.getInstance(Attributes.MOVEMENT_EFFICIENCY).pack().modifiers().isEmpty())
+                    throw new AssertionError("location enchantment modifiers must not be saved as permanent modifiers");
                 var row=new JsonObject(); row.addProperty("speed",player.attributes.getValue(Attributes.MOVEMENT_SPEED));
                 row.addProperty("efficiency",player.attributes.getValue(Attributes.MOVEMENT_EFFICIENCY));
                 row.addProperty("damage",stack.getDamageValue()); row.addProperty("next",world.random.nextInt()); rows.add(row);

@@ -529,6 +529,8 @@ pub struct LoadedSession {
     location_effects: crate::location_enchantments::LocationTracker,
     location_last_position: Option<IVec3>,
     unresolved_player_location_effects: bool,
+    location_save_changed: bool,
+    location_item_changes: Vec<crate::location_enchantments::ItemChange>,
     location_failure_revision: Option<u64>,
     tick_enchantment_failure: Option<(u64, u64)>,
     tick_enchantment_cache: Option<(
@@ -2138,6 +2140,7 @@ impl LoadedSession {
             Ok(value) => self.movement_efficiency = Some(value),
             Err(error) => {
                 self.movement_efficiency = None;
+                self.unresolved_player_location_effects |= self.location_effects.has_active();
                 self.stream_errors
                     .push(format!("player movement efficiency equipment: {error:#}"));
             }
@@ -2195,9 +2198,29 @@ impl LoadedSession {
             Ok(outcome) => {
                 self.location_failure_revision = None;
                 if outcome.attributes_changed || outcome.inventory_changed {
-                    // Location transitions and inventory changes still need coordinated save accounting.
-                    self.unresolved_player_location_effects = true;
+                    self.location_save_changed = true;
+                    if crate::location_enchantments::validate_save_modifiers(
+                        &outcome,
+                        &self.inventory,
+                        &inventory,
+                        &registry,
+                        &self.movement_speed_attribute,
+                        &self.movement_efficiency_attribute,
+                    )
+                    .and_then(|()| {
+                        self.location_effects.validate_save_attributes(
+                            &inventory,
+                            &registry,
+                            &self.movement_speed_attribute,
+                            &self.movement_efficiency_attribute,
+                        )
+                    })
+                    .is_err()
+                    {
+                        self.unresolved_player_location_effects = true;
+                    }
                 }
+                self.location_item_changes.extend(outcome.item_changes);
                 if outcome.inventory_changed {
                     self.inventory = Arc::new(inventory);
                 }
@@ -2523,6 +2546,7 @@ impl LoadedSession {
         let values = match result {
             Ok(values) => values,
             Err(error) => {
+                self.unresolved_player_location_effects |= self.location_effects.has_active();
                 self.stream_errors
                     .push(format!("player movement speed equipment: {error:#}"));
                 [
@@ -2757,16 +2781,28 @@ impl LoadedSession {
         );
         self.validate_generated_chest_loot()?;
         let original = crate::player_data::read_saved_player(player_source)?;
-        let before = crate::player_data::saved_slots(&original).chain(
-            self.chest_contents
-                .values()
-                .flat_map(|chest| chest.transfer_baseline().iter().flatten()),
-        );
-        let after = crate::player_data::saved_slots(&self.inventory).chain(
-            self.chest_contents
-                .values()
-                .flat_map(|chest| chest.slots.iter().flatten()),
-        );
+        let before = crate::player_data::saved_slots(&original)
+            .chain(
+                self.chest_contents
+                    .values()
+                    .flat_map(|chest| chest.transfer_baseline().iter().flatten()),
+            )
+            .chain(
+                self.location_item_changes
+                    .iter()
+                    .filter_map(|change| change.after.as_ref()),
+            );
+        let after = crate::player_data::saved_slots(&self.inventory)
+            .chain(
+                self.chest_contents
+                    .values()
+                    .flat_map(|chest| chest.slots.iter().flatten()),
+            )
+            .chain(
+                self.location_item_changes
+                    .iter()
+                    .map(|change| &change.before),
+            );
         crate::inventory::validate_item_balance(before, after)
     }
 
@@ -3065,6 +3101,19 @@ impl LoadedSession {
             !self.unresolved_player_location_effects,
             "location effects could not be safely preserved during this session"
         );
+        if self.location_save_changed {
+            self.validate_player_draft_source(original)?;
+            let (_, registry) = self
+                .oxygen_equipment
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("location enchantment registry is unavailable"))?;
+            self.location_effects.validate_save_attributes(
+                &self.inventory,
+                registry,
+                &self.movement_speed_attribute,
+                &self.movement_efficiency_attribute,
+            )?;
+        }
         anyhow::ensure!(
             !self.unresolved_player_fire_contact,
             "player lava and fire interactions are not yet supported for saving"
@@ -5076,6 +5125,8 @@ impl LoadedSession {
             location_effects: crate::location_enchantments::LocationTracker::default(),
             location_last_position: None,
             unresolved_player_location_effects: false,
+            location_save_changed: false,
+            location_item_changes: Vec::new(),
             location_failure_revision: None,
             tick_enchantment_failure: None,
             tick_enchantment_cache: None,
@@ -15288,6 +15339,7 @@ impl LoadedSession {
         let location_inventory = &mut self.inventory;
         let location_random = &mut self.level_random;
         let efficiency_attribute = &self.movement_efficiency_attribute;
+        let speed_attribute = &self.movement_speed_attribute;
         let infinite_materials = matches!(self.game_mode, GameMode::Creative | GameMode::Spectator);
         let eye_height = self.player.pose.eye_height();
         let block_speed = |position: DVec3, actual: DVec3, on_ground: bool| {
@@ -15336,7 +15388,11 @@ impl LoadedSession {
                             .depth
                                 > 0.0);
                     if landed_in_water {
-                        return Ok((crate::location_enchantments::Outcome::default(), efficiency));
+                        return Ok((
+                            crate::location_enchantments::Outcome::default(),
+                            efficiency,
+                            true,
+                        ));
                     }
                     let registry = location_registry.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("location enchantment registry is unavailable")
@@ -15362,6 +15418,23 @@ impl LoadedSession {
                         environment,
                         &mut random,
                     )?;
+                    let save_safe = crate::location_enchantments::validate_save_modifiers(
+                        &outcome,
+                        location_inventory,
+                        &inventory,
+                        registry,
+                        speed_attribute,
+                        efficiency_attribute,
+                    )
+                    .and_then(|()| {
+                        staged_effects.validate_save_attributes(
+                            &inventory,
+                            registry,
+                            speed_attribute,
+                            efficiency_attribute,
+                        )
+                    })
+                    .is_ok();
                     if outcome.attributes_changed || outcome.inventory_changed {
                         efficiency = crate::equipment_attributes::equipped_attribute(
                             efficiency_attribute,
@@ -15379,7 +15452,7 @@ impl LoadedSession {
                         *location_inventory = Arc::new(inventory);
                     }
                     *location_random = random;
-                    Ok((outcome, efficiency))
+                    Ok((outcome, efficiency, save_safe))
                 })();
                 *location_result.borrow_mut() = Some(outcome);
             }
@@ -15467,10 +15540,12 @@ impl LoadedSession {
             .advance(self.origin.as_dvec3() + self.motion.position);
         if let Some(result) = location_result.into_inner() {
             match result {
-                Ok((outcome, efficiency)) => {
+                Ok((outcome, efficiency, save_safe)) => {
                     if outcome.attributes_changed || outcome.inventory_changed {
-                        self.unresolved_player_location_effects = true;
+                        self.location_save_changed = true;
+                        self.unresolved_player_location_effects |= !save_safe;
                     }
+                    self.location_item_changes.extend(outcome.item_changes);
                     if outcome.attributes_changed || outcome.inventory_changed {
                         self.movement_speed_cache = None;
                         self.movement_efficiency_inventory_revision = None;
@@ -28172,7 +28247,8 @@ mod tests {
             session.movement_speed(false),
             (f64::from(0.1_f32) + f64::from(bonus)) as f32
         );
-        assert!(session.unresolved_player_location_effects);
+        assert!(!session.unresolved_player_location_effects);
+        assert!(session.location_save_changed);
         session.motion.position = DVec3::new(10.5, 1.875, 8.5);
         session.motion.velocity = DVec3::ZERO;
         session.ground_support = None;
@@ -28256,6 +28332,107 @@ mod tests {
             moved |= fast.player_known_movement != DVec3::ZERO;
         }
         assert!(moved);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the installed Minecraft 26.3 assets"]
+    fn soul_speed_drafts_damaged_and_broken_boots_with_conserved_items() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for initial_damage in [0, 194] {
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "equipment".into(),
+                        Tag::Compound(vec![(
+                            "feet".into(),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:iron_boots".into())),
+                                ("count".into(), Tag::Int(1)),
+                                (
+                                    "components".into(),
+                                    Tag::Compound(vec![
+                                        ("minecraft:damage".into(), Tag::Int(initial_damage)),
+                                        (
+                                            "minecraft:enchantments".into(),
+                                            Tag::Compound(vec![(
+                                                "minecraft:soul_speed".into(),
+                                                Tag::Int(3),
+                                            )]),
+                                        ),
+                                    ]),
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            };
+            let mut session = session();
+            session.restore_saved_player_inventory(&original).unwrap();
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&registry),
+                )
+                .unwrap();
+            let sand = session.intern_block(state("minecraft:soul_sand", &[]));
+            assert!(session.set(IVec3::new(8, 1, 8), sand));
+            session.motion.position = DVec3::new(8.5, 1.875, 8.5);
+            session.motion.on_ground = true;
+            session.level_random = native_core::random::LegacyRandom::new(0);
+            session.run_location_effects(true);
+            for _ in 0..100 {
+                if !session.location_item_changes.is_empty() {
+                    break;
+                }
+                session.run_location_effects(false);
+            }
+            assert!(!session.location_item_changes.is_empty());
+            assert!(!session.unresolved_player_location_effects);
+            let boots = session
+                .inventory
+                .slot(crate::inventory::PlayerSlot::Armor(3));
+            assert_eq!(boots.is_none(), initial_damage == 194);
+            if let Some(boots) = boots {
+                assert_eq!(
+                    boots.components().get("minecraft:damage"),
+                    Some(&Tag::Int(1))
+                );
+            }
+            session
+                .validate_closed_chest_item_balance(&original)
+                .unwrap();
+            let draft = session.draft_player_state(&original).unwrap();
+            let saved = crate::player_data::read_saved_player(draft.document()).unwrap();
+            assert_eq!(saved.slot(crate::inventory::PlayerSlot::Armor(3)), boots);
+            assert_eq!(
+                crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap(),
+                crate::player_data::read_saved_movement_speed_attribute(&original).unwrap()
+            );
+            let mut altered_source = original.clone();
+            let Tag::Compound(fields) = &mut altered_source.value else {
+                unreachable!()
+            };
+            fields.push(("other".into(), Tag::Int(1)));
+            assert!(session.draft_player_state(&altered_source).is_err());
+            Arc::make_mut(&mut session.inventory).set_slot(
+                crate::inventory::PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])),
+            );
+            assert!(
+                session
+                    .validate_closed_chest_item_balance(&original)
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]

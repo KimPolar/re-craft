@@ -11,7 +11,7 @@ use native_session::{
     SessionWorld,
     consume_particles::ConsumeParticleSpawn,
     inventory::ItemStack,
-    loaded::{HoneySlideParticles, PlantBreakParticles, TerrainParticleKind},
+    loaded::{HoneyParticleBurst, HoneyParticleKind, PlantBreakParticles, TerrainParticleKind},
 };
 use native_world::{
     collision::Aabb,
@@ -221,7 +221,7 @@ pub(crate) struct ParticleSystem {
     particles: VecDeque<Particle>,
     pending: BTreeMap<u64, Vec<ConsumeParticleSpawn>>,
     pending_plants: BTreeMap<u64, Vec<PlantBreakParticles>>,
-    pending_honey: BTreeMap<u64, Vec<HoneySlideParticles>>,
+    pending_honey: BTreeMap<u64, Vec<HoneyParticleBurst>>,
     tick: Option<u64>,
     random: LegacyRandom,
     shapes: HashMap<u32, Option<Vec<Aabb>>>,
@@ -253,7 +253,7 @@ impl ParticleSystem {
                 .push(event);
         }
     }
-    pub fn queue_honey_slides(&mut self, events: Vec<HoneySlideParticles>) {
+    pub fn queue_honey_particles(&mut self, events: Vec<HoneyParticleBurst>) {
         for event in events {
             self.pending_honey
                 .entry(event.tick)
@@ -325,7 +325,11 @@ impl ParticleSystem {
             let ready = self.pending_honey.split_off(&tick.saturating_add(1));
             let events = std::mem::replace(&mut self.pending_honey, ready);
             for event in events.into_values().flatten() {
-                for _ in 0..5 {
+                let count = match event.kind {
+                    HoneyParticleKind::Slide => 5,
+                    HoneyParticleKind::Landing => 10,
+                };
+                for _ in 0..count {
                     if self.particles.len() == MAX_PARTICLES {
                         self.particles.pop_front();
                     }
@@ -441,19 +445,20 @@ mod tests {
     #[test]
     fn honey_slide_spawns_five_terrain_particles_and_handles_frame_batches() {
         let world = SessionWorld::Demo(native_world::World::demo());
-        let event = |tick| HoneySlideParticles {
+        let event = |tick| HoneyParticleBurst {
             tick,
             position: DVec3::new(2.25, 4.5, 3.75),
+            kind: HoneyParticleKind::Slide,
         };
         let mut batched = ParticleSystem::default();
         let mut individual = ParticleSystem::default();
         batched.random = LegacyRandom::new(42);
         individual.random = LegacyRandom::new(42);
-        batched.queue_honey_slides(vec![event(2), event(6)]);
+        batched.queue_honey_particles(vec![event(2), event(6)]);
         batched.update(10, &world, vec![]);
         for tick in 1..=10 {
             if tick == 2 || tick == 6 {
-                individual.queue_honey_slides(vec![event(tick)]);
+                individual.queue_honey_particles(vec![event(tick)]);
             }
             individual.update(tick, &world, vec![]);
         }
@@ -465,13 +470,20 @@ mod tests {
         };
         assert_eq!(fields(&batched), fields(&individual));
         let mut initial = ParticleSystem::default();
-        initial.queue_honey_slides(vec![event(2)]);
+        initial.queue_honey_particles(vec![event(2)]);
         initial.update(2, &world, vec![]);
         assert_eq!(initial.particles().count(), 5);
         assert!(initial.particles().all(|p| matches!(
             p.visual,
             ParticleVisual::Terrain(TerrainParticleKind::HoneyBlock, _)
         )));
+        let mut landing = ParticleSystem::default();
+        landing.queue_honey_particles(vec![HoneyParticleBurst {
+            kind: HoneyParticleKind::Landing,
+            ..event(2)
+        }]);
+        landing.update(2, &world, vec![]);
+        assert_eq!(landing.particles().count(), 10);
     }
 
     #[cfg(target_os = "windows")]

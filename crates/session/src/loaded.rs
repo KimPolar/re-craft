@@ -630,7 +630,7 @@ pub struct LoadedSession {
     evaporation_smoke: VecDeque<EvaporationSmoke>,
     lava_fizz: VecDeque<LavaFizz>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
-    honey_slide_particles: VecDeque<HoneySlideParticles>,
+    honey_particles: VecDeque<HoneyParticleBurst>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -825,9 +825,16 @@ pub struct PlantBreakParticles {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HoneySlideParticles {
+pub struct HoneyParticleBurst {
     pub position: DVec3,
     pub tick: u64,
+    pub kind: HoneyParticleKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoneyParticleKind {
+    Slide,
+    Landing,
 }
 
 #[derive(Clone, Debug)]
@@ -4748,7 +4755,7 @@ impl LoadedSession {
             evaporation_smoke: VecDeque::new(),
             lava_fizz: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
-            honey_slide_particles: VecDeque::new(),
+            honey_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -5823,8 +5830,19 @@ impl LoadedSession {
         self.plant_break_particles.drain(..).collect()
     }
 
-    pub fn take_honey_slide_particles(&mut self) -> Vec<HoneySlideParticles> {
-        self.honey_slide_particles.drain(..).collect()
+    pub fn take_honey_particles(&mut self) -> Vec<HoneyParticleBurst> {
+        self.honey_particles.drain(..).collect()
+    }
+
+    fn push_honey_particles(&mut self, kind: HoneyParticleKind) {
+        if self.honey_particles.len() == 4096 {
+            self.honey_particles.pop_front();
+        }
+        self.honey_particles.push_back(HoneyParticleBurst {
+            position: self.origin.as_dvec3() + self.motion.position,
+            tick: self.tick.saturating_add(1),
+            kind,
+        });
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -14954,9 +14972,23 @@ impl LoadedSession {
                 self.push_entities_from_soil(legacy, absolute);
                 self.set(legacy, self.states[2]);
             }
-            let state = landing_state.and_then(|id| self.world.state(id));
-            if let Some(state) = state
-                && let Err(error) = self.fall.land_with_cooldown(
+            let honey_landing = self.fall_distance > 0.0
+                && self.game_mode != GameMode::Spectator
+                && landing_state
+                    .and_then(|id| self.world.state(id))
+                    .is_some_and(|state| {
+                        state.name == "minecraft:honey_block" && state.properties.is_empty()
+                    });
+            if honey_landing {
+                self.queue_player_sound("block.honey_block.slide", 1.0, 1.0);
+                self.push_honey_particles(HoneyParticleKind::Landing);
+            }
+            let is_stalagmite = landing_state
+                .and_then(|id| self.world.state(id))
+                .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
+            let fall_amount = if let Some(state) = landing_state.and_then(|id| self.world.state(id))
+            {
+                match self.fall.land_with_cooldown(
                     self.fall_distance,
                     Some(state),
                     &self.inventory,
@@ -14965,16 +14997,38 @@ impl LoadedSession {
                     self.game_mode,
                     self.survival_rules,
                     &mut self.damage_cooldown,
-                )
-            {
-                self.stream_errors
-                    .push(format!("player fall damage: {error:#}"));
-                self.unresolved_player_damage = true;
+                ) {
+                    Ok(amount) => amount,
+                    Err(error) => {
+                        self.stream_errors
+                            .push(format!("player fall damage: {error:#}"));
+                        self.unresolved_player_damage = true;
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+            if honey_landing && fall_amount > 0 {
+                let fall_sound = if fall_amount > 4 {
+                    "entity.player.big_fall"
+                } else {
+                    "entity.player.small_fall"
+                };
+                self.queue_player_sound(fall_sound, 1.0, 1.0);
+                let below = (self.motion.position - DVec3::Y * f64::from(0.2_f32))
+                    .floor()
+                    .as_ivec3();
+                if !self.player_silent
+                    && matches!(cell(&self.world, self.origin, self.bounds, below, self.states[0]), Cell::State(id) if self.world.state(id).is_some_and(|state| state.name == "minecraft:honey_block" && state.properties.is_empty()))
+                {
+                    self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
+                }
+                self.queue_player_sound("block.honey_block.fall", 0.5, 0.75);
             }
             if self.death.is_none() && self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
-                    cause: if state.is_some_and(|state| state.name == "minecraft:pointed_dripstone")
-                    {
+                    cause: if is_stalagmite {
                         DeathCause::Stalagmite
                     } else if self.fall_distance > 5.0 {
                         DeathCause::FallHigh
@@ -15063,13 +15117,7 @@ impl LoadedSession {
                                 self.queue_player_sound("block.honey_block.slide", 1.0, 1.0);
                             }
                             if particle_event {
-                                if self.honey_slide_particles.len() == 4096 {
-                                    self.honey_slide_particles.pop_front();
-                                }
-                                self.honey_slide_particles.push_back(HoneySlideParticles {
-                                    position: self.origin.as_dvec3() + self.motion.position,
-                                    tick: self.tick.saturating_add(1),
-                                });
+                                self.push_honey_particles(HoneyParticleKind::Slide);
                             }
                         }
                     }
@@ -22823,7 +22871,7 @@ mod tests {
             if sound {
                 assert_eq!(sounds[0].info.event, "block.honey_block.slide");
             }
-            let particles = test.take_honey_slide_particles();
+            let particles = test.take_honey_particles();
             assert_eq!(particles.len(), usize::from(particle), "seed={seed}");
             if particle {
                 assert_eq!(
@@ -22837,6 +22885,213 @@ mod tests {
                 test.client_level_random.next_int(),
                 expected_client_random.next_int()
             );
+        }
+    }
+
+    #[test]
+    fn honey_landing_sounds_particles_and_fall_rule_follow_player_state() {
+        for distance in [0.1, 3.0, 8.1, 23.1, 42.5] {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                for silent in [false, true] {
+                    for fall_damage in [false, true] {
+                        let mut test = session();
+                        test.set_random_tick_speed(0);
+                        test.set_game_mode(mode);
+                        let honey = test.intern_block(state("minecraft:honey_block", &[]));
+                        assert!(test.set(IVec3::new(8, 1, 8), honey));
+                        test.motion.position = DVec3::new(8.5, 2.0, 8.5);
+                        test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                        test.motion.on_ground = false;
+                        test.player.position = test.motion.position.as_vec3();
+                        test.player.on_ground = false;
+                        test.fall_distance = distance - f64::from(0.0625_f32);
+                        test.player_silent = silent;
+                        test.survival_rules.fall_damage = fall_damage;
+                        test.update(TICK);
+                        assert!(test.motion.on_ground, "{distance} {mode:?}");
+                        let amount = if mode == GameMode::Creative {
+                            0
+                        } else {
+                            crate::fall::calculate_fall_damage(distance, 3.0, 0.2, 1.0).max(0)
+                        };
+                        let mut expected = vec!["block.honey_block.slide"];
+                        if amount > 0 {
+                            expected.push(if amount > 4 {
+                                "entity.player.big_fall"
+                            } else {
+                                "entity.player.small_fall"
+                            });
+                            if !silent {
+                                expected.push("block.honey_block.fall");
+                            }
+                            expected.push("block.honey_block.fall");
+                        }
+                        let sounds = test.take_consume_sounds();
+                        assert_eq!(
+                            sounds
+                                .iter()
+                                .map(|sound| sound.info.event)
+                                .collect::<Vec<_>>(),
+                            expected,
+                            "{distance} {mode:?} silent={silent} rule={fall_damage}"
+                        );
+                        assert_eq!(
+                            test.vitals.health,
+                            if fall_damage {
+                                20.0 - amount as f32
+                            } else {
+                                20.0
+                            }
+                        );
+                        let particles = test.take_honey_particles();
+                        assert_eq!(particles.len(), 1);
+                        assert_eq!(particles[0].kind, HoneyParticleKind::Landing);
+                        assert_eq!(particles[0].tick, 1);
+                        test.update(TICK);
+                        assert!(test.take_honey_particles().is_empty());
+                        assert!(test.take_consume_sounds().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn honey_landing_matches_java_block_and_player() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("HoneyLandingOracle.java");
+        let output = temp.path().join("landing.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/HoneyLandingOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("HoneyLandingOracle")
+            .arg(&output));
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(result["block"].as_array().unwrap().len(), 16);
+        for row in result["block"].as_array().unwrap() {
+            assert_eq!(
+                row["factor_bits"].as_i64().unwrap() as u32,
+                0.2_f32.to_bits()
+            );
+            let mut expected = vec!["minecraft:block.honey_block.slide:1.0:1.0"];
+            if !row["client"].as_bool().unwrap() {
+                expected.push("event:54");
+            }
+            expected.push("damage");
+            if row["result"].as_bool().unwrap() {
+                expected.push("minecraft:block.honey_block.fall:0.5:0.75");
+            }
+            assert_eq!(row["order"], serde_json::json!(expected), "{row}");
+        }
+        assert_eq!(result["living"].as_array().unwrap().len(), 28);
+        for row in result["living"].as_array().unwrap() {
+            let distance = row["distance"].as_f64().unwrap();
+            let mut test = session();
+            test.set_random_tick_speed(0);
+            test.set_game_mode(if row["mayfly"].as_bool().unwrap() {
+                GameMode::Creative
+            } else {
+                GameMode::Survival
+            });
+            let honey = test.intern_block(state("minecraft:honey_block", &[]));
+            assert!(test.set(IVec3::new(8, 1, 8), honey));
+            test.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            test.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+            test.motion.on_ground = false;
+            test.player.position = test.motion.position.as_vec3();
+            test.player.on_ground = false;
+            test.fall_distance = distance - f64::from(0.0625_f32);
+            test.player_silent = row["silent"].as_bool().unwrap();
+            test.update(TICK);
+            assert!(test.motion.on_ground, "{row}");
+            let expected: Vec<_> = row["order"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_str().unwrap();
+                    if entry == "block_below" {
+                        Some("block.honey_block.fall".to_owned())
+                    } else if entry.starts_with("minecraft:") {
+                        Some(
+                            entry
+                                .trim_start_matches("minecraft:")
+                                .split(':')
+                                .next()
+                                .unwrap()
+                                .to_owned(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let sounds = test.take_consume_sounds();
+            assert_eq!(
+                sounds
+                    .iter()
+                    .map(|sound| sound.info.event)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{row}"
+            );
+            for sound in sounds {
+                if sound.info.event == "block.honey_block.fall" {
+                    assert_eq!((sound.info.volume, sound.info.pitch), (0.5, 0.75));
+                }
+            }
+            let particles = test.take_honey_particles();
+            assert_eq!(particles.len(), 1, "{row}");
+            assert_eq!(particles[0].kind, HoneyParticleKind::Landing, "{row}");
+            let damage = row["order"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.as_str().unwrap().strip_prefix("hurt:"))
+                .map(|value| value.parse::<f32>().unwrap())
+                .next()
+                .unwrap_or(0.0);
+            assert_eq!(test.vitals.health, 20.0 - damage, "{row}");
         }
     }
 

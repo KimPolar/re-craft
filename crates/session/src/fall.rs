@@ -423,6 +423,7 @@ impl FallTracker {
         rules: SurvivalRules,
     ) -> Result<()> {
         self.land_impl(distance, state, inventory, armor, vitals, mode, rules, None)
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -436,7 +437,7 @@ impl FallTracker {
         mode: GameMode,
         rules: SurvivalRules,
         cooldown: &mut DamageCooldown,
-    ) -> Result<()> {
+    ) -> Result<i32> {
         self.land_impl(
             distance,
             state,
@@ -460,17 +461,17 @@ impl FallTracker {
         mode: GameMode,
         rules: SurvivalRules,
         cooldown: Option<&mut DamageCooldown>,
-    ) -> Result<()> {
+    ) -> Result<i32> {
         if distance <= 0.0
             || vitals.health <= 0.0
             || matches!(mode, GameMode::Creative | GameMode::Spectator)
         {
-            return Ok(());
+            return Ok(0);
         }
         if let Some(registry) = &self.enchantments
             && registry.fall_damage_immune("minecraft:player")?
         {
-            return Ok(());
+            return Ok(0);
         }
         let surface = FallSurface::for_state(state);
         let safe = self.safe.clone();
@@ -493,16 +494,24 @@ impl FallTracker {
             )
         };
         let distance = distance * surface.distance_multiplier + surface.added_distance;
-        let amount =
-            calculate_fall_damage(distance, safe, surface.damage_multiplier, multiplier) as f32;
-        if amount <= 0.0 {
-            return Ok(());
+        let amount = calculate_fall_damage(distance, safe, surface.damage_multiplier, multiplier);
+        if amount <= 0 {
+            return Ok(0);
         }
         let damage = surface.damage_type;
         if !rules.fall_damage && self.damage_tag("minecraft:is_fall", damage)? {
-            return Ok(());
+            return Ok(amount);
         }
-        self.damage(amount, damage, inventory, armor, vitals, mode, cooldown)
+        self.damage(
+            amount as f32,
+            damage,
+            inventory,
+            armor,
+            vitals,
+            mode,
+            cooldown,
+        )?;
+        Ok(amount)
     }
 
     /// Apply one supported damage source; unsupported tag or enchantment data
@@ -1570,6 +1579,28 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(vitals.health, 20.0);
+        let honey = BlockState {
+            name: "minecraft:honey_block".into(),
+            properties: Default::default(),
+        };
+        let calculated = tracker
+            .land_with_cooldown(
+                30.0,
+                Some(&honey),
+                &inventory,
+                Some(ArmorValues::default()),
+                &mut vitals,
+                GameMode::Survival,
+                SurvivalRules {
+                    fall_damage: false,
+                    ..Default::default()
+                },
+                &mut DamageCooldown::default(),
+            )
+            .unwrap();
+        assert_eq!(calculated, calculate_fall_damage(30.0, 3.0, 0.2, 1.0));
+        assert!(calculated > 0);
         assert_eq!(vitals.health, 20.0);
     }
 

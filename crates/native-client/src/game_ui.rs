@@ -339,11 +339,11 @@ impl GameUi {
         self.consume_particles.queue_plant_breaks(bursts);
     }
 
-    pub fn queue_honey_slide_particles(
+    pub fn queue_honey_particles(
         &mut self,
-        bursts: Vec<native_session::loaded::HoneySlideParticles>,
+        bursts: Vec<native_session::loaded::HoneyParticleBurst>,
     ) {
-        self.consume_particles.queue_honey_slides(bursts);
+        self.consume_particles.queue_honey_particles(bursts);
     }
 
     pub fn update_evaporation_smoke(

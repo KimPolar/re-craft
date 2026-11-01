@@ -63,6 +63,7 @@ fn delay(random: &mut LegacyRandom, min: i32, max: i32) -> i32 {
 }
 
 /// Called when frosted ice is first placed, including Frost Walker placement.
+#[cfg(test)]
 pub(crate) fn placed(random: &mut LegacyRandom) -> i32 {
     delay(random, 60, 120)
 }
@@ -95,6 +96,7 @@ pub(crate) fn tick(
 }
 
 /// A neighbor update from another frosted-ice block can melt an isolated block.
+#[cfg(test)]
 pub(crate) fn neighbor_changed(
     world: &mut impl IceWorld,
     position: IVec3,

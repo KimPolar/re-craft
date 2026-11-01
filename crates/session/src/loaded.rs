@@ -639,6 +639,11 @@ pub struct LoadedSession {
     lamp_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
     lamp_deferred_revision: Option<u64>,
     lamp_pending: BTreeSet<(i32, i32, i32)>,
+    ice_ticks: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
+    ice_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
+    ice_deferred_state: Option<(u64, usize, bool)>,
+    ice_pending: BTreeSet<(i32, i32, i32)>,
+    unresolved_ice_tick: bool,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
@@ -3090,6 +3095,10 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
         anyhow::ensure!(
+            !self.unresolved_ice_tick,
+            "frosted ice tick effects are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
         );
@@ -5233,6 +5242,11 @@ impl LoadedSession {
             lamp_deferred: BTreeMap::new(),
             lamp_deferred_revision: None,
             lamp_pending: BTreeSet::new(),
+            ice_ticks: BTreeMap::new(),
+            ice_deferred: BTreeMap::new(),
+            ice_deferred_state: None,
+            ice_pending: BTreeSet::new(),
+            unresolved_ice_tick: false,
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
@@ -5278,6 +5292,7 @@ impl LoadedSession {
             session.enqueue_saved_sand(&ticks);
             session.enqueue_saved_buttons(&ticks);
             session.enqueue_saved_lamps(&ticks);
+            session.enqueue_saved_ice(&ticks);
             session.enqueue_saved_soil(&ticks);
         }
         Ok(session)
@@ -7002,6 +7017,14 @@ impl LoadedSession {
             self.fluid_chunks_seen.contains(&pos),
             "chunk ticks have not been loaded"
         );
+        ensure!(
+            !self
+                .ice_ticks
+                .values()
+                .chain(self.ice_deferred.values())
+                .any(|(x, _, z)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z),
+            "frosted ice tick storage is not yet supported"
+        );
         if let Some(original) = self.world.saved_block_ticks.get(&pos) {
             ensure!(
                 original.iter().all(|tick| {
@@ -7927,6 +7950,7 @@ impl LoadedSession {
         environment: Arc<native_resources::fluid_environment::WaterEvaporationEnvironment>,
     ) {
         self.water_evaporation = Some(environment);
+        self.ice_deferred_state = None;
     }
 
     /// Install the shared clock states before ticking the loaded world.
@@ -8146,6 +8170,7 @@ impl LoadedSession {
                     self.enqueue_saved_sand(&sand_ticks);
                     self.enqueue_saved_buttons(&sand_ticks);
                     self.enqueue_saved_lamps(&sand_ticks);
+                    self.enqueue_saved_ice(&sand_ticks);
                     self.enqueue_saved_soil(&sand_ticks);
                 }
             }
@@ -8351,6 +8376,7 @@ impl LoadedSession {
                                     self.enqueue_saved_sand(&saved_sand_ticks);
                                     self.enqueue_saved_buttons(&saved_sand_ticks);
                                     self.enqueue_saved_lamps(&saved_sand_ticks);
+                                    self.enqueue_saved_ice(&saved_sand_ticks);
                                     self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
                                 changed = true;
@@ -12407,6 +12433,58 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_ice(&mut self, ticks: &[SavedBlockTick]) {
+        for (index, tick) in ticks.iter().enumerate() {
+            if !matches!(tick.block.as_str(), "minecraft:frosted_ice" | "frosted_ice") {
+                continue;
+            }
+            let [x, y, z] = tick.position;
+            let key = (x, y, z);
+            if !self.ice_pending.insert(key) {
+                continue;
+            }
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.ice_ticks.insert(
+                (
+                    i128::from(self.tick) + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_ice(&mut self, relative: IVec3, delay: i32) {
+        let Some(absolute) = add(self.origin, relative) else {
+            return;
+        };
+        let key = (absolute.x, absolute.y, absolute.z);
+        if !self.ice_pending.insert(key) {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.0, key.2);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.ice_ticks.insert(
+            (
+                i128::from(self.tick) + i128::from(delay),
+                0,
+                i64::try_from(sequence).unwrap_or(i64::MAX),
+                sequence,
+            ),
+            key,
+        );
+    }
+
     fn schedule_lamp(&mut self, relative: IVec3) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -12650,17 +12728,17 @@ impl LoadedSession {
     }
 
     fn advance_block_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, true, true, true);
+        self.advance_scheduled_block_ticks(true, true, true, true, true);
     }
 
     #[cfg(test)]
     fn advance_sand_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, false, false, false);
+        self.advance_scheduled_block_ticks(true, false, false, false, false);
     }
 
     #[cfg(test)]
     fn advance_soil_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(false, false, true, false);
+        self.advance_scheduled_block_ticks(false, false, true, false, false);
     }
 
     fn advance_scheduled_block_ticks(
@@ -12669,8 +12747,17 @@ impl LoadedSession {
         process_buttons: bool,
         process_soil: bool,
         process_lamps: bool,
+        process_ice: bool,
     ) {
         let revision = self.revision;
+        let ice_state = (
+            revision,
+            self.pending_light.len(),
+            self.sky_lighting.settled(),
+        );
+        if process_ice && self.ice_deferred_state != Some(ice_state) {
+            self.ice_ticks.append(&mut self.ice_deferred);
+        }
         if process_sand && self.sand_deferred_revision != Some(revision) {
             self.sand_ticks.append(&mut self.sand_deferred);
         }
@@ -12687,6 +12774,7 @@ impl LoadedSession {
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
         let mut deferred_lamps = Vec::new();
+        let mut deferred_ice = Vec::new();
         let mut executed = 0;
         while executed < 65_536 {
             let sand_order = process_sand
@@ -12701,11 +12789,15 @@ impl LoadedSession {
             let lamp_order = process_lamps
                 .then(|| self.lamp_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let ice_order = process_ice
+                .then(|| self.ice_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
             let Some((order, kind)) = [
                 (sand_order, 0),
                 (button_order, 1),
                 (soil_order, 2),
                 (lamp_order, 3),
+                (ice_order, 4),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -12849,6 +12941,120 @@ impl LoadedSession {
                     let next = self.intern_block(next);
                     self.set_with_notify(relative, next, false);
                 }
+            } else if kind == 4 {
+                // Until all lighting and neighbor effects are supported,
+                // gameplay can advance only the verified cases and must not
+                // authorize a world save after a frosted-ice tick became due.
+                self.unresolved_ice_tick = true;
+                let (order, key) = self
+                    .ice_ticks
+                    .pop_first()
+                    .expect("selected ice tick remains queued");
+                let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    deferred_ice.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    deferred_ice.push((order, key));
+                    continue;
+                };
+                let Some(current) = self.world.state(id) else {
+                    deferred_ice.push((order, key));
+                    continue;
+                };
+                if current.name != "minecraft:frosted_ice" {
+                    self.ice_pending.remove(&key);
+                    self.mark_tick_chunk_dirty(key.0, key.2);
+                    executed += 1;
+                    continue;
+                }
+                let age = if current.properties.len() == 1 {
+                    current
+                        .properties
+                        .get("age")
+                        .and_then(|value| match value.as_str() {
+                            "0" => Some(0),
+                            "1" => Some(1),
+                            "2" => Some(2),
+                            "3" => Some(3),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+                let Some(age) = age else {
+                    deferred_ice.push((order, key));
+                    continue;
+                };
+                let mut random = self.level_random.clone();
+                let mut stage = IceTickStage {
+                    session: self,
+                    age,
+                    actions: Vec::new(),
+                };
+                if crate::frosted_ice::tick(&mut stage, relative, age, &mut random).is_err() {
+                    deferred_ice.push((order, key));
+                    continue;
+                }
+                let actions = stage.actions;
+                let mut replacement = None;
+                for action in &actions {
+                    let candidate = match action {
+                        IceTickAction::Age(pos, age) => Some((
+                            *pos,
+                            state("minecraft:frosted_ice", &[("age", &age.to_string())]),
+                            false,
+                        )),
+                        IceTickAction::Melt(pos, evaporates) => Some((
+                            *pos,
+                            if *evaporates {
+                                state("minecraft:air", &[])
+                            } else {
+                                state("minecraft:water", &[("level", "0")])
+                            },
+                            true,
+                        )),
+                        IceTickAction::Schedule(_, _) => None,
+                    };
+                    if let Some((pos, block, notify)) = candidate {
+                        if replacement.is_some() {
+                            replacement = Some(None);
+                            break;
+                        }
+                        let next = self.intern_block(block);
+                        if self.check_block_set(pos, next, notify, false).is_none() {
+                            replacement = Some(None);
+                            break;
+                        }
+                        replacement = Some(Some((pos, next, notify)));
+                    }
+                }
+                if matches!(replacement, Some(None)) {
+                    deferred_ice.push((order, key));
+                    continue;
+                }
+                let previous_random = std::mem::replace(&mut self.level_random, random);
+                if let Some(Some((pos, next, notify))) = replacement {
+                    if !self.set_with_notify(pos, next, notify) {
+                        self.level_random = previous_random;
+                        deferred_ice.push((order, key));
+                        continue;
+                    }
+                }
+                self.ice_pending.remove(&key);
+                self.mark_tick_chunk_dirty(key.0, key.2);
+                for action in actions {
+                    if let IceTickAction::Schedule(pos, delay) = action {
+                        self.schedule_ice(pos, delay);
+                    }
+                }
+                executed += 1;
             } else {
                 let (order, (absolute, soil)) = self
                     .soil_ticks
@@ -12925,6 +13131,10 @@ impl LoadedSession {
         if process_buttons {
             self.button_deferred.extend(deferred_buttons);
             self.button_deferred_revision = Some(revision);
+        }
+        if process_ice {
+            self.ice_deferred.extend(deferred_ice);
+            self.ice_deferred_state = Some(ice_state);
         }
     }
 
@@ -17417,6 +17627,133 @@ fn cell(
 
 /// The fluid algorithms need block tags and support faces. Until the complete
 /// registry is available, collision shapes supply a conservative approximation.
+enum IceTickAction {
+    Age(IVec3, u8),
+    Melt(IVec3, bool),
+    Schedule(IVec3, i32),
+}
+
+/// Stage a tick before mutating the session or its random source. Conditions
+/// requiring unavailable daylight or an ice-neighbor cascade stay pending.
+struct IceTickStage<'a> {
+    session: &'a LoadedSession,
+    age: u8,
+    actions: Vec<IceTickAction>,
+}
+
+impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
+    fn ice_age(&self, position: IVec3) -> anyhow::Result<Option<u8>> {
+        use anyhow::Context;
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            position,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("ice neighbor is unavailable");
+        };
+        let state = self
+            .session
+            .world
+            .state(id)
+            .context("ice neighbor state is unavailable")?;
+        if state.name != "minecraft:frosted_ice" {
+            return Ok(None);
+        }
+        anyhow::ensure!(state.properties.len() == 1, "unsupported frosted ice state");
+        let age = state
+            .properties
+            .get("age")
+            .and_then(|value| match value.as_str() {
+                "0" => Some(0),
+                "1" => Some(1),
+                "2" => Some(2),
+                "3" => Some(3),
+                _ => None,
+            })
+            .context("invalid frosted ice age")?;
+        Ok(Some(age))
+    }
+
+    fn brightness(&self, position: IVec3) -> anyhow::Result<u8> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            self.session.pending_light.is_empty() && self.session.sky_lighting.settled(),
+            "ice lighting updates are incomplete"
+        );
+        let absolute = add(self.session.origin, position).context("ice light position overflow")?;
+        let block = self
+            .session
+            .world
+            .light(absolute.x, absolute.y, absolute.z, false)
+            .context("ice block light is unavailable")?;
+        let threshold = 10 - self.age;
+        if self.session.world.dimension == "minecraft:the_end"
+            || self.session.sky_lighting.capability() == Some(false)
+            || block > threshold
+        {
+            return Ok(block);
+        }
+        let sky = self
+            .session
+            .world
+            .light(absolute.x, absolute.y, absolute.z, true)
+            .context("ice skylight is unavailable")?;
+        anyhow::ensure!(
+            sky <= threshold,
+            "ice brightness depends on time and weather"
+        );
+        Ok(block)
+    }
+
+    fn set_age(&mut self, position: IVec3, age: u8) -> anyhow::Result<()> {
+        self.actions.push(IceTickAction::Age(position, age));
+        Ok(())
+    }
+
+    fn melt(&mut self, position: IVec3) -> anyhow::Result<()> {
+        // Neighbor ice can react recursively. Defer until that notification
+        // chain can be staged together with the rest of the world changes.
+        for direction in [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ] {
+            let neighbor =
+                add(position, direction).ok_or_else(|| anyhow::anyhow!("ice neighbor overflow"))?;
+            anyhow::ensure!(
+                self.ice_age(neighbor)?.is_none(),
+                "ice melt has an unsupported neighbor cascade"
+            );
+        }
+        let environment = self
+            .session
+            .water_evaporation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("water evaporation is unavailable"))?;
+        let evaporates = environment
+            .sample(|id| {
+                self.session
+                    .world_clocks
+                    .iter()
+                    .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
+                    .map(|(_, clock)| clock.total_ticks)
+            })
+            .ok_or_else(|| anyhow::anyhow!("water evaporation clock is unavailable"))?;
+        self.actions.push(IceTickAction::Melt(position, evaporates));
+        Ok(())
+    }
+
+    fn schedule(&mut self, position: IVec3, delay: i32) -> anyhow::Result<()> {
+        self.actions.push(IceTickAction::Schedule(position, delay));
+        Ok(())
+    }
+}
+
 struct FluidView<'a> {
     world: &'a World,
     shapes: &'a [Option<Vec<Aabb>>],
@@ -27143,6 +27480,153 @@ mod tests {
                 "age {age}"
             );
         }
+    }
+
+    #[test]
+    fn saved_frosted_ice_ticks_age_melt_and_defer_atomically() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let setup = |age: &str, block_light: u8, sky_light: Option<u8>, neighbor: bool| {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_has_skylight(sky_light.is_some()).unwrap();
+            session.set_water_evaporation_environment(bucket_environment(false));
+            let ice = session.intern_block(state("minecraft:frosted_ice", &[("age", age)]));
+            assert!(session.set(IVec3::new(4, 2, 4), ice));
+            if neighbor {
+                assert!(session.set(IVec3::new(5, 2, 4), ice));
+            }
+            session.pending_light.clear();
+            session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            session.sky_lighting.set_enabled(sky_light.is_some());
+            let chunk_pos = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light = Some(Box::new(
+                [block_light * 0x11; native_world::loaded::LIGHT_BYTES],
+            ));
+            section.sky_light =
+                sky_light.map(|light| Box::new([light * 0x11; native_world::loaded::LIGHT_BYTES]));
+            let absolute = session.origin + IVec3::new(4, 2, 4);
+            session.enqueue_saved_ice(&[SavedBlockTick {
+                block: "minecraft:frosted_ice".into(),
+                position: absolute.to_array(),
+                delay: 0,
+                priority: 0,
+            }]);
+            session.level_random = native_core::random::LegacyRandom::new(0);
+            session
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        let mut aging = setup("0", 15, None, false);
+        let mut expected = aging.level_random.clone();
+        expected.next_int_bound(3).unwrap();
+        let delay = 20 + expected.next_int_bound(21).unwrap();
+        aging.advance_block_ticks();
+        let position = aging.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            aging
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .properties
+                .get("age")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            aging.ice_ticks.first_key_value().unwrap().0.0,
+            i128::from(delay)
+        );
+        assert_eq!(aging.level_random.next_int(), expected.next_int());
+        assert!(aging.draft_player_state(&original).is_err());
+        assert!(
+            aging
+                .draft_block_ticks(aging.player_chunk().unwrap())
+                .is_err()
+        );
+
+        let mut melting = setup("3", 15, None, false);
+        melting.advance_block_ticks();
+        let position = melting.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            melting
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert!(melting.ice_ticks.is_empty());
+        assert!(melting.draft_player_state(&original).is_err());
+
+        let mut evaporating = setup("3", 15, None, false);
+        evaporating.set_water_evaporation_environment(bucket_environment(true));
+        evaporating.advance_block_ticks();
+        let position = evaporating.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            evaporating
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+
+        let mut fast = setup("0", 15, None, false);
+        let mut slow = setup("0", 15, None, false);
+        for _ in 0..5 {
+            fast.update(Duration::from_millis(10));
+        }
+        slow.update(TICK);
+        let absolute = fast.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            fast.world.block(absolute.x, absolute.y, absolute.z),
+            slow.world.block(absolute.x, absolute.y, absolute.z)
+        );
+        assert_eq!(fast.ice_ticks, slow.ice_ticks);
+        assert!(fast.unresolved_ice_tick && slow.unresolved_ice_tick);
+
+        for mut deferred in [setup("0", 0, Some(15), false), setup("3", 15, None, true)] {
+            let before = deferred.level_random.clone().next_int();
+            deferred.advance_block_ticks();
+            let position = deferred.origin + IVec3::new(4, 2, 4);
+            assert_eq!(
+                deferred
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:frosted_ice"
+            );
+            assert_eq!(deferred.level_random.next_int(), before);
+            assert!(deferred.ice_ticks.is_empty());
+            assert_eq!(deferred.ice_deferred.len(), 1);
+            deferred.advance_block_ticks();
+            assert_eq!(deferred.ice_deferred.len(), 1);
+            assert!(deferred.draft_player_state(&original).is_err());
+        }
+
+        let mut retry = setup("3", 15, None, true);
+        retry.advance_block_ticks();
+        assert_eq!(retry.ice_deferred.len(), 1);
+        assert!(retry.set(IVec3::new(5, 2, 4), retry.states[0]));
+        retry.pending_light.clear();
+        retry.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        retry.sky_lighting.set_enabled(false);
+        retry.advance_block_ticks();
+        let position = retry.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            retry
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
     }
 
     #[test]

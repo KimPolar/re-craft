@@ -155,6 +155,47 @@ fn collect_consume_sounds(
     }
 }
 
+fn queue_player_sound(
+    queue: &mut VecDeque<ConsumeSound>,
+    position: DVec3,
+    event: &'static str,
+    volume: f32,
+    pitch: f32,
+) {
+    if queue.len() == 4096 {
+        queue.pop_front();
+    }
+    queue.push_back(ConsumeSound {
+        position,
+        info: ConsumeSoundInfo {
+            event,
+            volume,
+            pitch,
+            category: ConsumeSoundCategory::Player,
+        },
+    });
+}
+
+fn client_damage_pitch(random: &mut native_core::random::LegacyRandom) -> f32 {
+    1.0_f32 + (random.next_float() - random.next_float()) * 0.2_f32
+}
+
+fn fresh_session_seed() -> i64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static UNIQUE: AtomicU64 = AtomicU64::new(8_682_522_807_148_012);
+    let previous = UNIQUE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.wrapping_mul(1_181_783_497_276_652_981))
+        })
+        .unwrap_or_default();
+    let unique = previous.wrapping_mul(1_181_783_497_276_652_981);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    (unique ^ now) as i64
+}
+
 fn push_consume_particle(
     queue: &mut VecDeque<consume_particles::ConsumeParticleSpawn>,
     item: &Arc<inventory::ItemStack>,
@@ -619,6 +660,7 @@ pub struct LocalSession {
     consume_sounds: VecDeque<ConsumeSound>,
     consume_particles: VecDeque<consume_particles::ConsumeParticleSpawn>,
     player_random: native_core::random::LegacyRandom,
+    player_client_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     flight_speed: f32,
     flight: physics::FlightState,
@@ -845,6 +887,7 @@ impl LocalSession {
             consume_sounds: VecDeque::new(),
             consume_particles: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
+            player_client_random: native_core::random::LegacyRandom::new(fresh_session_seed()),
             level_random: native_core::random::LegacyRandom::new(0),
             flight_speed: 0.05,
             flight: physics::FlightState::default(),
@@ -1828,7 +1871,7 @@ impl LocalSession {
                 self.push_entities_from_soil(landed_on);
                 self.set_block(landed_on, Block::Dirt);
             }
-            if let Err(error) = self.fall.land_with_cooldown(
+            let landing = match self.fall.land_with_cooldown(
                 self.fall_distance,
                 None,
                 &self.inventory,
@@ -1838,7 +1881,74 @@ impl LocalSession {
                 self.survival_rules,
                 &mut self.damage_cooldown,
             ) {
-                eprintln!("player fall damage: {error:#}");
+                Ok(landing) => landing,
+                Err(error) => {
+                    eprintln!("player fall damage: {error:#}");
+                    Default::default()
+                }
+            };
+            if landing.amount > 0 {
+                let event = if landing.amount > 4 {
+                    "entity.player.big_fall"
+                } else {
+                    "entity.player.small_fall"
+                };
+                queue_player_sound(
+                    &mut self.consume_sounds,
+                    self.motion.position,
+                    event,
+                    1.0,
+                    1.0,
+                );
+                let below = (self.motion.position - DVec3::Y * f64::from(0.2_f32))
+                    .floor()
+                    .as_ivec3();
+                if let Some(sound) = self
+                    .world
+                    .block(below)
+                    .item_id()
+                    .and_then(fall::block_fall_sound)
+                {
+                    queue_player_sound(
+                        &mut self.consume_sounds,
+                        self.motion.position,
+                        sound,
+                        0.5,
+                        0.75,
+                    );
+                }
+            }
+            if landing.damage.accepted {
+                if let Some(source) = landing.source {
+                    match self.fall.damage_info(source) {
+                        Ok(info) => {
+                            if landing.damage.health_damage > 0.0 {
+                                self.vitals.add_exhaustion(info.exhaustion);
+                            }
+                            if landing.damage.fresh_hit {
+                                let pitch = client_damage_pitch(&mut self.player_client_random);
+                                queue_player_sound(
+                                    &mut self.consume_sounds,
+                                    self.motion.position,
+                                    info.effects.player_hurt_sound(),
+                                    1.0,
+                                    pitch,
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("player damage type: {error:#}"),
+                    }
+                }
+                if self.vitals.health <= 0.0 {
+                    let pitch = client_damage_pitch(&mut self.player_client_random);
+                    queue_player_sound(
+                        &mut self.consume_sounds,
+                        self.motion.position,
+                        "entity.player.death",
+                        1.0,
+                        pitch,
+                    );
+                }
             }
             if self.vitals.health <= 0.0 {
                 self.death = Some(DeathInfo {
@@ -2048,6 +2158,7 @@ impl LocalSession {
         self.experience = experience::Experience::default();
         self.experience_orbs.reset_player_pickup_delay();
         self.player_random = native_core::random::LegacyRandom::new(0);
+        self.player_client_random = native_core::random::LegacyRandom::new(fresh_session_seed());
         self.flight = physics::FlightState::default();
         self.flight.flying = self.game_mode == GameMode::Spectator;
         self.death = None;
@@ -2621,6 +2732,84 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_landing_sounds_and_client_random_are_frame_rate_independent() {
+        for distance in [3.0_f64, 4.0, 7.0, 8.0, 24.0] {
+            for enabled in [false, true] {
+                for absorption in [0.0_f32, 4.0] {
+                    for frames in [1_u32, 5] {
+                        let mut world = World::default();
+                        world.set_block(IVec3::ZERO, Block::Stone);
+                        let mut session = LocalSession::new(world);
+                        session.motion.position = DVec3::new(0.5, 1.0, 0.5);
+                        session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                        session.motion.on_ground = false;
+                        session.player.position = session.motion.position.as_vec3();
+                        session.player.on_ground = false;
+                        session.fall_distance = distance;
+                        session.survival_rules.fall_damage = enabled;
+                        session.vitals.absorption = absorption;
+                        session.player_client_random = native_core::random::LegacyRandom::new(42);
+                        session.player_random = native_core::random::LegacyRandom::new(19);
+                        let mut expected_client = session.player_client_random.clone();
+                        let mut expected_server = session.player_random.clone();
+                        for _ in 0..frames {
+                            session.update(TICK / frames);
+                        }
+                        assert!(session.motion.on_ground);
+                        let amount = fall::calculate_fall_damage(distance, 3.0, 1.0, 1.0).max(0);
+                        let damage = if enabled {
+                            (amount as f32 - absorption).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(session.vitals.health, (20.0 - damage).max(0.0));
+                        let mut expected = Vec::new();
+                        if amount > 0 {
+                            expected.push((
+                                if amount > 4 {
+                                    "entity.player.big_fall"
+                                } else {
+                                    "entity.player.small_fall"
+                                },
+                                1.0_f32,
+                            ));
+                            expected.push(("block.stone.fall", 0.75));
+                            if enabled {
+                                expected.push((
+                                    "entity.player.hurt",
+                                    client_damage_pitch(&mut expected_client),
+                                ));
+                                if damage >= 20.0 {
+                                    expected.push((
+                                        "entity.player.death",
+                                        client_damage_pitch(&mut expected_client),
+                                    ));
+                                }
+                            }
+                        }
+                        let sounds = session.take_consume_sounds();
+                        assert_eq!(
+                            sounds.len(),
+                            expected.len(),
+                            "distance={distance} enabled={enabled} absorption={absorption} frames={frames}"
+                        );
+                        for (sound, (event, pitch)) in sounds.iter().zip(expected) {
+                            assert_eq!(sound.info.event, event);
+                            assert_eq!(sound.info.pitch.to_bits(), pitch.to_bits());
+                            assert_eq!(sound.info.category, ConsumeSoundCategory::Player);
+                        }
+                        assert_eq!(
+                            session.player_client_random.next_int(),
+                            expected_client.next_int()
+                        );
+                        assert_eq!(session.player_random.next_int(), expected_server.next_int());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn snapshots_expose_active_effects_without_hidden_replacements() {

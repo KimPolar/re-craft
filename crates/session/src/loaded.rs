@@ -968,38 +968,6 @@ fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
     }
 }
 
-// Sound types are properties of vanilla block code, not of resource-pack
-// sounds.json. Unknown block types are left unresolved until implemented.
-fn block_fall_sound(state: &BlockState) -> Option<&'static str> {
-    match state.name.as_str() {
-        "minecraft:stone"
-        | "minecraft:cobblestone"
-        | "minecraft:stone_bricks"
-        | "minecraft:granite"
-        | "minecraft:diorite"
-        | "minecraft:andesite"
-        | "minecraft:end_stone"
-        | "minecraft:sandstone"
-        | "minecraft:red_sandstone"
-        | "minecraft:terracotta"
-        | "minecraft:blackstone"
-        | "minecraft:obsidian" => Some("block.stone.fall"),
-        "minecraft:deepslate" | "minecraft:cobbled_deepslate" => Some("block.deepslate.fall"),
-        "minecraft:netherrack" => Some("block.netherrack.fall"),
-        "minecraft:nether_bricks" => Some("block.nether_bricks.fall"),
-        "minecraft:basalt" => Some("block.basalt.fall"),
-        "minecraft:snow_block" => Some("block.snow.fall"),
-        "minecraft:ice" | "minecraft:glass" => Some("block.glass.fall"),
-        "minecraft:moss_block" => Some("block.moss.fall"),
-        "minecraft:dirt" | "minecraft:gravel" => Some("block.gravel.fall"),
-        "minecraft:grass_block" | "minecraft:hay_block" => Some("block.grass.fall"),
-        "minecraft:sand" | "minecraft:red_sand" => Some("block.sand.fall"),
-        "minecraft:oak_planks" | "minecraft:oak_log" => Some("block.wood.fall"),
-        "minecraft:honey_block" if state.properties.is_empty() => Some("block.honey_block.fall"),
-        _ => None,
-    }
-}
-
 fn stair_octants(state: &BlockState, shape: Option<&[Aabb]>) -> Option<u8> {
     if !state.name.ends_with("_stairs")
         || native_world::collision::slab_stair_solid(state) != Some(true)
@@ -1018,22 +986,6 @@ fn chest_title(
         .custom_name()
         .or_else(|| second.and_then(|chest| chest.custom_name()))
         .cloned()
-}
-
-fn fresh_breathing_seed() -> i64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static UNIQUE: AtomicU64 = AtomicU64::new(8_682_522_807_148_012);
-    let previous = UNIQUE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.wrapping_mul(1_181_783_497_276_652_981))
-        })
-        .unwrap_or_default();
-    let unique = previous.wrapping_mul(1_181_783_497_276_652_981);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    (unique ^ now) as i64
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1403,24 +1355,17 @@ impl LoadedSession {
     }
 
     fn queue_player_sound(&mut self, event: &'static str, volume: f32, pitch: f32) {
-        if self.consume_sounds.len() == 4096 {
-            self.consume_sounds.pop_front();
-        }
-        self.consume_sounds.push_back(crate::ConsumeSound {
-            position: self.origin.as_dvec3() + self.motion.position,
-            info: crate::ConsumeSoundInfo {
-                event,
-                volume,
-                pitch,
-                category: crate::ConsumeSoundCategory::Player,
-            },
-        });
+        crate::queue_player_sound(
+            &mut self.consume_sounds,
+            self.origin.as_dvec3() + self.motion.position,
+            event,
+            volume,
+            pitch,
+        );
     }
 
     fn queue_client_damage_sound(&mut self, event: &'static str) {
-        let pitch = 1.0_f32
-            + (self.player_client_random.next_float() - self.player_client_random.next_float())
-                * 0.2_f32;
+        let pitch = crate::client_damage_pitch(&mut self.player_client_random);
         self.queue_player_sound(event, 1.0, pitch);
     }
 
@@ -4191,7 +4136,7 @@ impl LoadedSession {
                     WeatherTickLevel::Current
                 } else {
                     WeatherTickLevel::Background(native_core::random::LegacyRandom::new(
-                        fresh_breathing_seed(),
+                        crate::fresh_session_seed(),
                     ))
                 }
             })
@@ -4690,13 +4635,15 @@ impl LoadedSession {
                 0.1_f32,
             )),
             movement_speed_cache: None,
-            player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
-            player_client_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
-            client_level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
-            level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            player_random: native_core::random::LegacyRandom::new(crate::fresh_session_seed()),
+            player_client_random: native_core::random::LegacyRandom::new(
+                crate::fresh_session_seed(),
+            ),
+            client_level_random: native_core::random::LegacyRandom::new(crate::fresh_session_seed()),
+            level_random: native_core::random::LegacyRandom::new(crate::fresh_session_seed()),
             random_tick_speed: 3,
             random_block_position: native_core::random::BlockRandomPosition::new(
-                fresh_breathing_seed() as i32,
+                crate::fresh_session_seed() as i32,
             ),
             random_tick_revision: None,
             random_tick_sections: BTreeMap::new(),
@@ -7031,7 +6978,8 @@ impl LoadedSession {
                     distance,
                     0,
                 )?;
-                let mut random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
+                let mut random =
+                    native_core::random::LegacyRandom::new(crate::fresh_session_seed());
                 let offset = random
                     .next_int_bound(first.candidate_count())
                     .expect("positive candidate count");
@@ -7375,8 +7323,9 @@ impl LoadedSession {
             self.oxygen_bonus = 0.0;
             self.oxygen_valid = true;
         }
-        self.player_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
-        self.player_client_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
+        self.player_random = native_core::random::LegacyRandom::new(crate::fresh_session_seed());
+        self.player_client_random =
+            native_core::random::LegacyRandom::new(crate::fresh_session_seed());
         self.flight = crate::physics::FlightState::default();
         self.walking_speed = 0.1;
         self.flight.flying = self.game_mode == GameMode::Spectator;
@@ -15061,7 +15010,9 @@ impl LoadedSession {
                 if !self.player_silent
                     && let Cell::State(id) =
                         cell(&self.world, self.origin, self.bounds, below, self.states[0])
-                    && let Some(sound) = self.world.state(id).and_then(block_fall_sound)
+                    && let Some(state) = self.world.state(id)
+                    && (state.name != "minecraft:honey_block" || state.properties.is_empty())
+                    && let Some(sound) = crate::fall::block_fall_sound(&state.name)
                 {
                     self.queue_player_sound(sound, 0.5, 0.75);
                 }
@@ -23160,6 +23111,45 @@ mod tests {
                 assert_eq!(sound.info.event, event, "{row}");
                 assert_eq!(sound.info.volume, volume.parse::<f32>().unwrap(), "{row}");
                 assert_eq!(sound.info.pitch, pitch.parse::<f32>().unwrap(), "{row}");
+            }
+            if !row["silent"].as_bool().unwrap()
+                && let Some(demo_block) = Block::from_item_id(&name)
+            {
+                let mut world = native_world::World::default();
+                world.set_block(IVec3::new(8, 1, 8), demo_block);
+                let mut demo = crate::LocalSession::new(world);
+                demo.motion.position = DVec3::new(8.5, 2.0, 8.5);
+                demo.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                demo.motion.on_ground = false;
+                demo.player.position = demo.motion.position.as_vec3();
+                demo.player.on_ground = false;
+                demo.fall_distance = row["distance"].as_f64().unwrap();
+                demo.update(TICK);
+                assert!(demo.motion.on_ground, "{row}");
+                let sounds = demo.take_consume_sounds();
+                let actual: Vec<_> = sounds
+                    .iter()
+                    .filter(|sound| {
+                        !matches!(
+                            sound.info.event,
+                            "entity.player.hurt" | "entity.player.death"
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual.len(), expected.len(), "{row}");
+                for (sound, expected) in actual.iter().zip(expected) {
+                    let (event, numbers) = expected
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("minecraft:")
+                        .unwrap()
+                        .split_once(':')
+                        .unwrap();
+                    let (volume, pitch) = numbers.split_once(':').unwrap();
+                    assert_eq!(sound.info.event, event, "{row}");
+                    assert_eq!(sound.info.volume, volume.parse::<f32>().unwrap(), "{row}");
+                    assert_eq!(sound.info.pitch, pitch.parse::<f32>().unwrap(), "{row}");
+                }
             }
         }
     }

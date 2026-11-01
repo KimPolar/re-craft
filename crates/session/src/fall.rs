@@ -18,6 +18,79 @@ use crate::{
     survival::{FallEffects, PlayerVitals, SurvivalRules},
 };
 
+// Sound types are properties of block code, while resource packs supply the
+// sound event itself. Leave unimplemented block types unresolved.
+pub(crate) fn block_fall_sound(id: &str) -> Option<&'static str> {
+    use native_core::wood::{Planks, Wood};
+    if let Some(planks) = Planks::from_id(id) {
+        return Some(match planks {
+            Planks::Cherry => "block.cherry_wood.fall",
+            Planks::Bamboo => "block.bamboo_wood.fall",
+            Planks::Crimson | Planks::Warped => "block.nether_wood.fall",
+            _ => "block.wood.fall",
+        });
+    }
+    if Wood::from_id(id).is_some() {
+        let name = id.strip_prefix("minecraft:")?;
+        let name = name.strip_prefix("stripped_").unwrap_or(name);
+        return Some(if name.starts_with("cherry_") {
+            "block.cherry_wood.fall"
+        } else if name.starts_with("bamboo_") {
+            "block.bamboo_wood.fall"
+        } else if name.starts_with("crimson_") || name.starts_with("warped_") {
+            "block.stem.fall"
+        } else {
+            "block.wood.fall"
+        });
+    }
+    if native_core::ore::Ore::from_id(id).is_some() {
+        return Some(if id.starts_with("minecraft:deepslate_") {
+            "block.deepslate.fall"
+        } else if id == "minecraft:nether_gold_ore" {
+            "block.nether_gold_ore.fall"
+        } else if id == "minecraft:nether_quartz_ore" {
+            "block.nether_ore.fall"
+        } else {
+            "block.stone.fall"
+        });
+    }
+    match id {
+        "minecraft:stone"
+        | "minecraft:cobblestone"
+        | "minecraft:stone_bricks"
+        | "minecraft:granite"
+        | "minecraft:diorite"
+        | "minecraft:andesite"
+        | "minecraft:end_stone"
+        | "minecraft:sandstone"
+        | "minecraft:red_sandstone"
+        | "minecraft:terracotta"
+        | "minecraft:blackstone"
+        | "minecraft:obsidian" => Some("block.stone.fall"),
+        "minecraft:deepslate" | "minecraft:cobbled_deepslate" => Some("block.deepslate.fall"),
+        "minecraft:netherrack" => Some("block.netherrack.fall"),
+        "minecraft:nether_bricks" => Some("block.nether_bricks.fall"),
+        "minecraft:basalt" => Some("block.basalt.fall"),
+        "minecraft:snow_block" => Some("block.snow.fall"),
+        "minecraft:ice" | "minecraft:glass" => Some("block.glass.fall"),
+        "minecraft:moss_block" => Some("block.moss.fall"),
+        "minecraft:dirt"
+        | "minecraft:coarse_dirt"
+        | "minecraft:podzol"
+        | "minecraft:farmland"
+        | "minecraft:gravel" => Some("block.gravel.fall"),
+        "minecraft:rooted_dirt" => Some("block.rooted_dirt.fall"),
+        "minecraft:grass_block"
+        | "minecraft:mycelium"
+        | "minecraft:dirt_path"
+        | "minecraft:hay_block" => Some("block.grass.fall"),
+        "minecraft:sand" | "minecraft:red_sand" => Some("block.sand.fall"),
+        "minecraft:crafting_table" => Some("block.wood.fall"),
+        "minecraft:honey_block" => Some("block.honey_block.fall"),
+        _ => None,
+    }
+}
+
 /// The `LivingEntity.calculateFallDamage` calculation before damage mitigation.
 pub fn calculate_fall_damage(
     distance: f64,
@@ -647,6 +720,107 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn demo_block_fall_sounds_match_java_registry() {
+        use native_core::{
+            ore::Ore,
+            wood::{Planks, Wood},
+        };
+        use std::{path::PathBuf, process::Command};
+        let mut ids = vec![
+            "minecraft:stone",
+            "minecraft:grass_block",
+            "minecraft:dirt",
+            "minecraft:sand",
+            "minecraft:red_sand",
+            "minecraft:gravel",
+            "minecraft:coarse_dirt",
+            "minecraft:rooted_dirt",
+            "minecraft:podzol",
+            "minecraft:mycelium",
+            "minecraft:dirt_path",
+            "minecraft:farmland",
+            "minecraft:crafting_table",
+            "minecraft:cobblestone",
+            "minecraft:stone_bricks",
+        ];
+        ids.extend(Planks::ALL.into_iter().map(Planks::id));
+        ids.extend(Wood::all().map(Wood::id));
+        ids.extend(Ore::ALL.into_iter().map(Ore::id));
+        ids.sort_unstable();
+        ids.dedup();
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("DemoBlockSoundsOracle.java");
+        let input = temp.path().join("ids.json");
+        let output = temp.path().join("sounds.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/DemoBlockSoundsOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(&input, serde_json::to_vec(&ids).unwrap()).unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("DemoBlockSoundsOracle")
+            .arg(&input)
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), ids.len());
+        for (row, id) in rows.iter().zip(ids) {
+            assert_eq!(row["id"], id);
+            assert_eq!(
+                row["event"],
+                format!("minecraft:{}", block_fall_sound(id).unwrap()),
+                "{id}"
+            );
+            assert_eq!(
+                row["volume_bits"].as_i64().unwrap() as u32,
+                0.5_f32.to_bits(),
+                "{id}"
+            );
+            assert_eq!(
+                row["pitch_bits"].as_i64().unwrap() as u32,
+                0.75_f32.to_bits(),
+                "{id}"
+            );
+        }
+    }
 
     #[test]
     fn fractional_armor_is_floored_before_damage_reduction() {

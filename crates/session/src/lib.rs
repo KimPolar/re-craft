@@ -24,6 +24,8 @@ pub mod consume_particles;
 mod custom_tool;
 mod equipment_attributes;
 mod fire_contact;
+#[cfg(test)]
+mod frosted_ice;
 mod honey;
 pub use equipment_attributes::ArmorValues;
 pub mod equippable;

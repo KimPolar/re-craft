@@ -332,9 +332,10 @@ impl GameUi {
         &mut self,
         snapshot: &native_session::WorldSnapshot,
         bursts: Vec<native_session::loaded::EvaporationSmoke>,
-    ) {
+        fizz: Vec<native_session::loaded::LavaFizz>,
+    ) -> Vec<native_session::ConsumeSound> {
         self.smoke_particles
-            .update(snapshot.tick, &snapshot.world, bursts);
+            .update(snapshot.tick, &snapshot.world, bursts, fizz)
     }
 
     pub fn set_trim_registry(&mut self, trims: Arc<crate::equipment_visual::TrimRegistry>) {

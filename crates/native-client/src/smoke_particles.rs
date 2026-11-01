@@ -1,8 +1,11 @@
-//! Large smoke produced when water evaporates.
+//! Large smoke produced when water evaporates or lava fizzes.
 
 use glam::DVec3;
 use native_core::random::LegacyRandom;
-use native_session::{SessionWorld, loaded::EvaporationSmoke};
+use native_session::{
+    SessionWorld,
+    loaded::{EvaporationSmoke, LavaFizz},
+};
 use native_world::{collision::Aabb, movement::BoundingBox};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -107,11 +110,37 @@ impl Smoke {
 
 pub(crate) struct SmokeSystem {
     particles: VecDeque<Smoke>,
-    pending: BTreeMap<u64, Vec<EvaporationSmoke>>,
+    pending: BTreeMap<u64, Vec<SmokeBurst>>,
     tick: Option<u64>,
     packet_random: LegacyRandom,
     particle_random: LegacyRandom,
     shapes: HashMap<u32, Option<Vec<Aabb>>>,
+}
+
+#[derive(Clone, Copy)]
+enum SmokeBurst {
+    Evaporation(EvaporationSmoke),
+    LavaFizz(LavaFizz),
+}
+
+fn lava_fizz(
+    position: glam::IVec3,
+    random: &mut LegacyRandom,
+) -> (native_session::ConsumeSound, [DVec3; 8]) {
+    let pitch = 2.6_f32 + (random.next_float() - random.next_float()) * 0.8_f32;
+    let sound = native_session::ConsumeSound {
+        position: position.as_dvec3() + DVec3::splat(0.5),
+        info: native_session::ConsumeSoundInfo {
+            event: "block.lava.extinguish",
+            volume: 0.5,
+            pitch,
+            category: native_session::ConsumeSoundCategory::Block,
+        },
+    };
+    let positions = std::array::from_fn(|_| {
+        position.as_dvec3() + DVec3::new(random.next_double(), 1.2, random.next_double())
+    });
+    (sound, positions)
 }
 
 impl Default for SmokeSystem {
@@ -131,9 +160,25 @@ impl Default for SmokeSystem {
 }
 
 impl SmokeSystem {
-    pub fn update(&mut self, target: u64, world: &SessionWorld, events: Vec<EvaporationSmoke>) {
+    pub fn update(
+        &mut self,
+        target: u64,
+        world: &SessionWorld,
+        events: Vec<EvaporationSmoke>,
+        fizz: Vec<LavaFizz>,
+    ) -> Vec<native_session::ConsumeSound> {
+        let mut sounds = Vec::new();
         for event in events {
-            self.pending.entry(event.tick).or_default().push(event);
+            self.pending
+                .entry(event.tick)
+                .or_default()
+                .push(SmokeBurst::Evaporation(event));
+        }
+        for event in fizz {
+            self.pending
+                .entry(event.tick)
+                .or_default()
+                .push(SmokeBurst::LavaFizz(event));
         }
         let first = self
             .pending
@@ -161,22 +206,32 @@ impl SmokeSystem {
             let ready = self.pending.split_off(&tick.saturating_add(1));
             let events = std::mem::replace(&mut self.pending, ready);
             for event in events.into_values().flatten() {
-                for _ in 0..8 {
+                let positions = match event {
+                    SmokeBurst::Evaporation(event) => std::array::from_fn(|_| {
+                        event.position.as_dvec3()
+                            + DVec3::new(
+                                self.packet_random.next_double(),
+                                self.packet_random.next_double(),
+                                self.packet_random.next_double(),
+                            )
+                    }),
+                    SmokeBurst::LavaFizz(event) => {
+                        let (sound, positions) = lava_fizz(event.position, &mut self.packet_random);
+                        sounds.push(sound);
+                        positions
+                    }
+                };
+                for position in positions {
                     if self.particles.len() == 4096 {
                         self.particles.pop_front();
                     }
-                    let position = event.position.as_dvec3()
-                        + DVec3::new(
-                            self.packet_random.next_double(),
-                            self.packet_random.next_double(),
-                            self.packet_random.next_double(),
-                        );
                     let mut random = LegacyRandom::new(self.particle_random.next_long());
                     self.particles.push_back(Smoke::new(position, &mut random));
                 }
             }
         }
         self.tick = Some(tick);
+        sounds
     }
     pub fn particles(&self) -> impl Iterator<Item = &Smoke> {
         self.particles.iter()
@@ -200,7 +255,7 @@ mod tests {
             tick,
             position: IVec3::new(2, 4, 3),
         };
-        a.update(10, &world, vec![burst(2), burst(6)]);
+        a.update(10, &world, vec![burst(2), burst(6)], vec![]);
         for tick in 1..=10 {
             b.update(
                 tick,
@@ -210,6 +265,7 @@ mod tests {
                 } else {
                     vec![]
                 },
+                vec![],
             );
         }
         let fields = |system: &SmokeSystem| {
@@ -220,6 +276,126 @@ mod tests {
         };
         assert_eq!(fields(&a), fields(&b));
         assert_eq!(a.particles().count(), 16);
+    }
+
+    #[test]
+    fn lava_fizz_batches_keep_sound_and_particles_in_tick_order() {
+        let world = SessionWorld::Demo(native_world::World::demo());
+        let mut a = SmokeSystem::default();
+        let mut b = SmokeSystem::default();
+        a.packet_random = LegacyRandom::new(1);
+        b.packet_random = LegacyRandom::new(1);
+        a.particle_random = LegacyRandom::new(2);
+        b.particle_random = LegacyRandom::new(2);
+        let event = |tick| LavaFizz {
+            tick,
+            position: IVec3::new(2, 4, 3),
+        };
+        let sounds = a.update(10, &world, vec![], vec![event(2), event(6)]);
+        let mut separate = Vec::new();
+        for tick in 1..=10 {
+            separate.extend(b.update(
+                tick,
+                &world,
+                vec![],
+                if tick == 2 || tick == 6 {
+                    vec![event(tick)]
+                } else {
+                    vec![]
+                },
+            ));
+        }
+        assert_eq!(sounds, separate);
+        assert_eq!(sounds.len(), 2);
+        assert!(
+            sounds
+                .iter()
+                .all(|sound| sound.info.event == "block.lava.extinguish"
+                    && sound.info.category == native_session::ConsumeSoundCategory::Block)
+        );
+        assert_eq!(a.particles().count(), 16);
+        assert_eq!(
+            a.particles()
+                .map(|p| (p.position, p.velocity, p.age))
+                .collect::<Vec<_>>(),
+            b.particles()
+                .map(|p| (p.position, p.velocity, p.age))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn lava_fizz_sound_and_smoke_positions_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LavaFizzOracle.java");
+        let output = temp.path().join("fizz.json");
+        std::fs::write(&source, include_str!("../tests/java/LavaFizzOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("LavaFizzOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "Java oracle failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 5);
+        for row in rows {
+            let mut random = LegacyRandom::new(row["seed"].as_i64().unwrap());
+            let (sound, positions) = lava_fizz(IVec3::new(17, -20, -43), &mut random);
+            assert_eq!(row["sound"], "minecraft:block.lava.extinguish");
+            assert_eq!(row["category"], "block");
+            assert_eq!(
+                sound.info.volume.to_bits(),
+                row["volume"].as_i64().unwrap() as i32 as u32
+            );
+            assert_eq!(
+                sound.info.pitch.to_bits(),
+                row["pitch"].as_i64().unwrap() as i32 as u32
+            );
+            for (position, expected) in positions.iter().zip(row["particles"].as_array().unwrap()) {
+                for (actual, bits) in position
+                    .to_array()
+                    .into_iter()
+                    .zip(expected.as_array().unwrap())
+                {
+                    assert_eq!(actual.to_bits(), bits.as_i64().unwrap() as u64);
+                }
+            }
+            assert_eq!(random.next_int(), row["next"].as_i64().unwrap() as i32);
+        }
     }
 
     #[cfg(target_os = "windows")]

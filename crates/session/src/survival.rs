@@ -1650,6 +1650,7 @@ mod tests {
                         crate::ConsumeSoundCategory::Player => "player",
                         crate::ConsumeSoundCategory::Neutral => "neutral",
                         crate::ConsumeSoundCategory::Ambient => "ambient",
+                        crate::ConsumeSoundCategory::Block => "block",
                     },
                     expected["category"].as_str().unwrap(),
                     "{row}"

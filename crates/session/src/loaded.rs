@@ -587,6 +587,7 @@ pub struct LoadedSession {
     bucket_sounds: VecDeque<BucketSoundEvent>,
     compass_sounds: VecDeque<CompassSoundEvent>,
     evaporation_smoke: VecDeque<EvaporationSmoke>,
+    lava_fizz: VecDeque<LavaFizz>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
@@ -743,6 +744,13 @@ pub struct CompassSoundEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvaporationSmoke {
+    pub position: IVec3,
+    pub tick: u64,
+}
+
+/// A client-side level event; its visual and sound randomness is not simulation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LavaFizz {
     pub position: IVec3,
     pub tick: u64,
 }
@@ -4137,6 +4145,7 @@ impl LoadedSession {
             bucket_sounds: VecDeque::new(),
             compass_sounds: VecDeque::new(),
             evaporation_smoke: VecDeque::new(),
+            lava_fizz: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
@@ -5162,6 +5171,24 @@ impl LoadedSession {
 
     pub fn take_evaporation_smoke(&mut self) -> Vec<EvaporationSmoke> {
         self.evaporation_smoke.drain(..).collect()
+    }
+
+    pub fn take_lava_fizz(&mut self) -> Vec<LavaFizz> {
+        self.lava_fizz.drain(..).collect()
+    }
+
+    fn push_lava_fizz(&mut self, relative: IVec3) -> Option<LavaFizz> {
+        let Some(position) = add(self.origin, relative) else {
+            return None;
+        };
+        let evicted = (self.lava_fizz.len() == 4096)
+            .then(|| self.lava_fizz.pop_front())
+            .flatten();
+        self.lava_fizz.push_back(LavaFizz {
+            position,
+            tick: self.tick.saturating_add(1),
+        });
+        evicted
     }
 
     pub fn take_plant_break_particles(&mut self) -> Vec<PlantBreakParticles> {
@@ -12197,7 +12224,12 @@ impl LoadedSession {
         );
         let Some(block) = reaction else { return false };
         let id = self.intern_solid(block);
-        self.set(position, id)
+        if self.set(position, id) {
+            let _ = self.push_lava_fizz(position);
+            true
+        } else {
+            false
+        }
     }
 
     fn fluid_washable_plant(state: &BlockState) -> bool {
@@ -12497,7 +12529,23 @@ impl LoadedSession {
                         self.intern_block(state)
                     }
                 };
+                // Lava burns a replaceable block before changing it. Its fizz
+                // must precede any reactions caused by the ensuing update.
+                let fizz_before = fluid.kind == FluidKind::Lava && plant.is_some();
+                let evicted_fizz = if fizz_before {
+                    self.push_lava_fizz(change.position)
+                } else {
+                    None
+                };
                 if self.set(change.position, id) {
+                    if fluid.kind == FluidKind::Lava
+                        && matches!(
+                            change.block,
+                            fluid_sim::ChangedBlock::Solid(fluid_sim::Solidified::Stone)
+                        )
+                    {
+                        let _ = self.push_lava_fizz(change.position);
+                    }
                     if let Some((drops, _)) = plant_drops
                         && let Some(position) = add(self.origin, change.position)
                     {
@@ -12523,11 +12571,19 @@ impl LoadedSession {
                     {
                         self.schedule_fluid(change.position, water, settings.delay(water.kind));
                     }
-                } else if let Some((_, previous)) = plant_drops {
-                    self.dropped_items.restore_drop_random(previous);
-                    retry_wash = true;
-                } else if plant.is_some() {
-                    retry_wash = true;
+                } else {
+                    if fizz_before {
+                        self.lava_fizz.pop_back();
+                        if let Some(evicted) = evicted_fizz {
+                            self.lava_fizz.push_front(evicted);
+                        }
+                    }
+                    if let Some((_, previous)) = plant_drops {
+                        self.dropped_items.restore_drop_random(previous);
+                        retry_wash = true;
+                    } else if plant.is_some() {
+                        retry_wash = true;
+                    }
                 }
             }
             if retry_wash
@@ -18989,6 +19045,18 @@ mod tests {
                     if let Some(item) = actual.first() {
                         assert_eq!(item.stack.id(), "minecraft:wheat_seeds");
                     }
+                    let fizz = session.take_lava_fizz();
+                    if kind == FluidKind::Lava {
+                        assert_eq!(
+                            fizz,
+                            vec![LavaFizz {
+                                position: session.origin + plant,
+                                tick: 1
+                            }]
+                        );
+                    } else {
+                        assert!(fizz.is_empty());
+                    }
                 }
             }
         }
@@ -19051,6 +19119,68 @@ mod tests {
             matches!(session.simulation_cell(plant), fluid_sim::Cell::Fluid(f) if f.kind == FluidKind::Water)
         );
         assert_eq!(session.dropped_items.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn lava_reactions_emit_fizz_at_the_changed_block_without_consuming_level_random() {
+        for reaction in ["water", "basalt", "downward"] {
+            let mut session = session();
+            let source = IVec3::new(8, 5, 8);
+            let lava = FluidState {
+                kind: FluidKind::Lava,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let water = FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let lava_id = session.intern_liquid(lava);
+            let water_id = session.intern_liquid(water);
+            assert!(session.set_with_notify(source, lava_id, false));
+            let affected = match reaction {
+                "water" => {
+                    assert!(session.set_with_notify(source + IVec3::X, water_id, false));
+                    source
+                }
+                "basalt" => {
+                    let soul = session.intern_block(state("minecraft:soul_soil", &[]));
+                    let ice = session.intern_block(state("minecraft:blue_ice", &[]));
+                    assert!(session.set_with_notify(source + IVec3::NEG_Y, soul, false));
+                    assert!(session.set_with_notify(source + IVec3::X, ice, false));
+                    source
+                }
+                _ => {
+                    assert!(session.set_with_notify(source + IVec3::NEG_Y, water_id, false));
+                    source + IVec3::NEG_Y
+                }
+            };
+            let mut expected_random = session.level_random.clone();
+            if reaction == "downward" {
+                session.fluid_ticks.clear();
+                session.fluid_pending.clear();
+                session.schedule_fluid(source, lava, 0);
+                session.advance_fluid_ticks();
+            } else {
+                assert!(session.react_lava(source));
+            }
+            assert_eq!(
+                session.take_lava_fizz(),
+                vec![LavaFizz {
+                    position: session.origin + affected,
+                    tick: 1
+                }],
+                "{reaction}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                expected_random.next_int(),
+                "{reaction}"
+            );
+        }
     }
 
     #[test]

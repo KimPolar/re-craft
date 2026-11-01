@@ -122,6 +122,7 @@ pub enum ConsumeSoundCategory {
     Player,
     Neutral,
     Ambient,
+    Block,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

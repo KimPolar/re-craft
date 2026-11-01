@@ -689,6 +689,7 @@ impl Catalog {
                     native_session::ConsumeSoundCategory::Ambient => {
                         voice.category_gain = Some(ambient_gain.clone())
                     }
+                    native_session::ConsumeSoundCategory::Block => {}
                 }
                 voice
             })

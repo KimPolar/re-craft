@@ -586,11 +586,14 @@ impl Viewer {
             let particles = play.session.take_consume_particles();
             let plant_breaks = play.session.take_plant_break_particles();
             let smoke = play.session.take_evaporation_smoke();
-            if let Some(ui) = &mut self.ui {
+            let fizz = play.session.take_lava_fizz();
+            let fizz_sounds = if let Some(ui) = &mut self.ui {
                 ui.queue_plant_break_particles(plant_breaks);
                 ui.update_consume_particles(&snapshot, particles);
-                ui.update_evaporation_smoke(&snapshot, smoke);
-            }
+                ui.update_evaporation_smoke(&snapshot, smoke, fizz)
+            } else {
+                Vec::new()
+            };
             self.camera.eye =
                 eye_for_scene(&snapshot, self.scene.origin, play.session.partial_tick());
             (self.camera.yaw, self.camera.pitch) = self.visual_look.angles(&snapshot);
@@ -600,6 +603,11 @@ impl Viewer {
             {
                 audio.set_listener(eye, self.camera.yaw);
                 self.audio_listener = Some((eye, self.camera.yaw));
+            }
+            if let Some(audio) = &self.audio {
+                for sound in fizz_sounds {
+                    audio.consume(sound);
+                }
             }
             let mut buttons = play.session.take_button_sounds().into_iter().peekable();
             let mut levers = play.session.take_lever_sounds().into_iter().peekable();

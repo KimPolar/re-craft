@@ -38,6 +38,7 @@ public class FrostedIceCascadeOracle {
             event.add(pos.getX()); event.add(pos.getY()); event.add(pos.getZ());
             if (state.is(Blocks.FROSTED_ICE)) event.add(state.getValue(FrostedIceBlock.AGE));
             events.add(event);
+            if ((flags & 512) == 0 && state.is(Blocks.FROSTED_ICE)) state.onPlace(this, pos, old, false);
             if ((flags & 1) != 0) updater.updateNeighborsAtExceptFromFacing(pos, old.getBlock(), null, null);
             return true;
         }

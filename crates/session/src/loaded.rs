@@ -644,6 +644,7 @@ pub struct LoadedSession {
     ice_deferred_state: Option<(u64, usize, bool)>,
     ice_pending: BTreeSet<(i32, i32, i32)>,
     unresolved_ice_tick: bool,
+    applying_ice_tick: bool,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
@@ -5247,6 +5248,7 @@ impl LoadedSession {
             ice_deferred_state: None,
             ice_pending: BTreeSet::new(),
             unresolved_ice_tick: false,
+            applying_ice_tick: false,
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
@@ -12206,6 +12208,19 @@ impl LoadedSession {
             }
         }
         self.revision += 1;
+        // LevelChunk calls the new state's onPlace for every changed state,
+        // including an age change within frosted ice. Tick replay stages the
+        // same callback in advance so that its random source is transactional.
+        if !self.applying_ice_tick
+            && self
+                .world
+                .state(id)
+                .is_some_and(|state| state.name == "minecraft:frosted_ice")
+        {
+            let delay = crate::frosted_ice::placed(&mut self.level_random);
+            self.schedule_ice(relative, delay);
+            self.unresolved_ice_tick = true;
+        }
         if notify {
             self.block_notifications.push_back((relative, old, id));
             self.notify_fluid_neighbors();
@@ -13022,7 +13037,7 @@ impl LoadedSession {
                             },
                             true,
                         )),
-                        IceTickAction::Schedule(_, _) => None,
+                        IceTickAction::Schedule(_, _) | IceTickAction::ShapeWater(_) => None,
                     };
                     if let Some((pos, block, notify)) = candidate {
                         let next = self.intern_block(block);
@@ -13044,6 +13059,7 @@ impl LoadedSession {
                 self.mark_tick_chunk_dirty(key.0, key.2);
                 let mut applied = 0;
                 let mut failed = false;
+                self.applying_ice_tick = true;
                 for (action, replacement) in actions.into_iter().zip(replacements) {
                     if let Some((pos, next, notify)) = replacement {
                         if !self.set_with_notify(pos, next, notify) {
@@ -13051,13 +13067,15 @@ impl LoadedSession {
                             break;
                         }
                         applied += 1;
-                        if matches!(action, IceTickAction::Age(..)) {
-                            self.notify_ice_shape_water(pos);
+                    } else {
+                        match action {
+                            IceTickAction::Schedule(pos, delay) => self.schedule_ice(pos, delay),
+                            IceTickAction::ShapeWater(pos) => self.notify_ice_shape_water(pos),
+                            _ => unreachable!("block changes have a replacement"),
                         }
-                    } else if let IceTickAction::Schedule(pos, delay) = action {
-                        self.schedule_ice(pos, delay);
                     }
                 }
+                self.applying_ice_tick = false;
                 if failed {
                     if applied == 0 {
                         self.level_random = previous_random;
@@ -17677,6 +17695,7 @@ enum IceTickAction {
     Age(IVec3, u8),
     Melt(IVec3, bool),
     Schedule(IVec3, i32),
+    ShapeWater(IVec3),
 }
 
 /// Stage a tick before mutating the session or its random source.
@@ -17825,7 +17844,12 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         Ok(block)
     }
 
-    fn set_age(&mut self, position: IVec3, age: u8) -> anyhow::Result<()> {
+    fn set_age(
+        &mut self,
+        position: IVec3,
+        age: u8,
+        random: &mut native_core::random::LegacyRandom,
+    ) -> anyhow::Result<()> {
         self.validate_neighbors(position)?;
         anyhow::ensure!(
             self.actions.len() < 4096,
@@ -17833,6 +17857,11 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         );
         self.ice_overrides.insert(position.to_array(), Some(age));
         self.actions.push(IceTickAction::Age(position, age));
+        self.actions.push(IceTickAction::Schedule(
+            position,
+            crate::frosted_ice::placed(random),
+        ));
+        self.actions.push(IceTickAction::ShapeWater(position));
         Ok(())
     }
 
@@ -18731,14 +18760,21 @@ pub(crate) mod tests {
             let events: Vec<_> = stage
                 .actions
                 .iter()
-                .map(|action| match action {
+                .filter_map(|action| match action {
                     IceTickAction::Age(p, age) => {
-                        serde_json::json!(["age", p.x - 8, p.y, p.z - 8, age])
+                        Some(serde_json::json!(["age", p.x - 8, p.y, p.z - 8, age]))
                     }
-                    IceTickAction::Melt(p, _) => serde_json::json!(["melt", p.x - 8, p.y, p.z - 8]),
-                    IceTickAction::Schedule(p, delay) => {
-                        serde_json::json!(["schedule", p.x - 8, p.y, p.z - 8, delay])
+                    IceTickAction::Melt(p, _) => {
+                        Some(serde_json::json!(["melt", p.x - 8, p.y, p.z - 8]))
                     }
+                    IceTickAction::Schedule(p, delay) => Some(serde_json::json!([
+                        "schedule",
+                        p.x - 8,
+                        p.y,
+                        p.z - 8,
+                        delay
+                    ])),
+                    IceTickAction::ShapeWater(_) => None,
                 })
                 .collect();
             assert_eq!(events, row["events"].as_array().unwrap().to_vec(), "{row}");
@@ -27712,6 +27748,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frosted_ice_placement_and_age_change_schedule_with_java_random_order() {
+        for seed in 0..128 {
+            for notify in [false, true] {
+                let mut session = session();
+                session.level_random = native_core::random::LegacyRandom::new(seed);
+                let mut expected = session.level_random.clone();
+                let initial_delay = crate::frosted_ice::placed(&mut expected);
+                let pos = IVec3::new(4, 2, 4);
+                let ice0 = session.intern_block(state("minecraft:frosted_ice", &[("age", "0")]));
+                let ice1 = session.intern_block(state("minecraft:frosted_ice", &[("age", "1")]));
+                assert!(session.set_with_notify(pos, ice0, notify));
+                assert_eq!(
+                    session.ice_ticks.first_key_value().unwrap().0.0,
+                    i128::from(initial_delay)
+                );
+                assert_eq!(
+                    session.level_random.clone().next_int(),
+                    expected.clone().next_int()
+                );
+                crate::frosted_ice::placed(&mut expected);
+                assert!(session.set_with_notify(pos, ice1, notify));
+                assert_eq!(session.ice_ticks.len(), 1);
+                assert_eq!(
+                    session.ice_ticks.first_key_value().unwrap().0.0,
+                    i128::from(initial_delay)
+                );
+                assert_eq!(
+                    session.level_random.clone().next_int(),
+                    expected.clone().next_int()
+                );
+                assert!(!session.set_with_notify(pos, ice1, notify));
+                assert_eq!(session.level_random.clone().next_int(), expected.next_int());
+                assert!(session.unresolved_ice_tick);
+            }
+        }
+    }
+
+    #[test]
     fn saved_frosted_ice_ticks_age_melt_and_defer_atomically() {
         use native_persistence::nbt::{NamedTag, Tag};
         let setup = |age: &str, block_light: u8, sky_light: Option<u8>, neighbor: bool| {
@@ -27724,6 +27798,9 @@ pub(crate) mod tests {
             if neighbor {
                 assert!(session.set(IVec3::new(5, 2, 4), ice));
             }
+            session.ice_ticks.clear();
+            session.ice_pending.clear();
+            session.unresolved_ice_tick = false;
             session.pending_light.clear();
             session.sky_lighting = crate::sky_lighting::SkyLighting::default();
             session.sky_lighting.set_enabled(sky_light.is_some());
@@ -27753,7 +27830,8 @@ pub(crate) mod tests {
         let mut aging = setup("0", 15, None, false);
         let mut expected = aging.level_random.clone();
         expected.next_int_bound(3).unwrap();
-        let delay = 20 + expected.next_int_bound(21).unwrap();
+        let delay = 60 + expected.next_int_bound(61).unwrap();
+        expected.next_int_bound(21).unwrap();
         aging.advance_block_ticks();
         let position = aging.origin + IVec3::new(4, 2, 4);
         assert_eq!(

@@ -31,10 +31,12 @@ public class FrostedIceTickOracle {
         @Override public EnvironmentAttributeSystem environmentAttributes() { return attributes; }
         @Override public RandomSource getRandom() { return random; }
         @Override public boolean setBlock(BlockPos pos, BlockState state, int flags, int depth) {
-            blocks.put(pos.immutable(), state);
+            var old = getBlockState(pos); blocks.put(pos.immutable(), state);
             var event = new JsonArray(); event.add(state.is(Blocks.FROSTED_ICE) ? "age" : "melt"); event.add(index(pos));
             if (state.is(Blocks.FROSTED_ICE)) event.add(state.getValue(FrostedIceBlock.AGE));
-            events.add(event); return true;
+            events.add(event);
+            if ((flags & 512) == 0 && state.is(Blocks.FROSTED_ICE)) state.onPlace(this, pos, old, false);
+            return true;
         }
         @Override public void scheduleTick(BlockPos pos, Block block, int delay) {
             var event = new JsonArray(); event.add("schedule"); event.add(index(pos)); event.add(delay); events.add(event);

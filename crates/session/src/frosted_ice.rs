@@ -26,7 +26,7 @@ pub(crate) trait IceWorld {
     fn ice_age(&self, position: IVec3) -> Result<Option<u8>>;
     /// Java's getBrightness(BLOCK) in the End, getMaxLocalRawBrightness elsewhere.
     fn brightness(&self, position: IVec3) -> Result<u8>;
-    fn set_age(&mut self, position: IVec3, age: u8) -> Result<()>;
+    fn set_age(&mut self, position: IVec3, age: u8, random: &mut LegacyRandom) -> Result<()>;
     /// Melt must apply block notifications before returning, as Java does.
     fn melt(&mut self, position: IVec3) -> Result<()>;
     fn schedule(&mut self, position: IVec3, delay: i32) -> Result<()>;
@@ -45,10 +45,15 @@ fn fewer_than(world: &impl IceWorld, position: IVec3, limit: usize) -> Result<bo
     Ok(true)
 }
 
-fn slightly_melt(world: &mut impl IceWorld, position: IVec3, age: u8) -> Result<bool> {
+fn slightly_melt(
+    world: &mut impl IceWorld,
+    position: IVec3,
+    age: u8,
+    random: &mut LegacyRandom,
+) -> Result<bool> {
     ensure!(age <= 3, "invalid frosted ice age");
     if age < 3 {
-        world.set_age(position, age + 1)?;
+        world.set_age(position, age + 1, random)?;
         Ok(false)
     } else {
         world.melt(position)?;
@@ -63,7 +68,6 @@ fn delay(random: &mut LegacyRandom, min: i32, max: i32) -> i32 {
 }
 
 /// Called when frosted ice is first placed, including Frost Walker placement.
-#[cfg(test)]
 pub(crate) fn placed(random: &mut LegacyRandom) -> i32 {
     delay(random, 60, 120)
 }
@@ -79,12 +83,12 @@ pub(crate) fn tick(
     ensure!(age <= 3, "invalid frosted ice age");
     if (random.next_int_bound(3).expect("positive bound") == 0 || fewer_than(world, position, 4)?)
         && i32::from(world.brightness(position)?) > 11 - i32::from(age) - 1
-        && slightly_melt(world, position, age)?
+        && slightly_melt(world, position, age, random)?
     {
         for direction in DIRECTIONS {
             let neighbor = offset(position, direction);
             if let Some(age) = world.ice_age(neighbor)?
-                && !slightly_melt(world, neighbor, age)?
+                && !slightly_melt(world, neighbor, age, random)?
             {
                 world.schedule(neighbor, delay(random, 20, 40))?;
             }
@@ -130,11 +134,12 @@ mod tests {
         fn brightness(&self, _: IVec3) -> Result<u8> {
             Ok(15)
         }
-        fn set_age(&mut self, position: IVec3, age: u8) -> Result<()> {
+        fn set_age(&mut self, position: IVec3, age: u8, random: &mut LegacyRandom) -> Result<()> {
             self.ice.insert(position.to_array(), age);
             self.events.push(serde_json::json!([
                 "age", position.x, position.y, position.z, age
             ]));
+            self.schedule(position, placed(random))?;
             Ok(())
         }
         fn melt(&mut self, position: IVec3) -> Result<()> {
@@ -172,10 +177,11 @@ mod tests {
         fn brightness(&self, _: IVec3) -> Result<u8> {
             Ok(self.light)
         }
-        fn set_age(&mut self, position: IVec3, age: u8) -> Result<()> {
+        fn set_age(&mut self, position: IVec3, age: u8, random: &mut LegacyRandom) -> Result<()> {
             self.ice.insert(position.to_array(), age);
             self.events
                 .push(serde_json::json!(["age", index(position), age]));
+            self.schedule(position, placed(random))?;
             Ok(())
         }
         fn melt(&mut self, position: IVec3) -> Result<()> {

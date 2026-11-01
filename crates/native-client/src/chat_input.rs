@@ -635,7 +635,36 @@ mod tests {
         let mut time_arguments = 0;
         let mut marker_cases = 0;
         let mut clock_cases = 0;
+        let mut identifier_cases = 0;
+        let mut syntax_cases = 0;
+        let mut clock_definitions = 0;
         for row in rows {
+            if let Some(json) = row["worldClockJson"].as_str() {
+                clock_definitions += 1;
+                assert_eq!(
+                    native_resources::world_clock::validate_clock_definition(json.as_bytes())
+                        .is_ok(),
+                    row["worldClockValid"].as_bool().unwrap(),
+                    "{row}"
+                );
+                continue;
+            }
+            if let Some(input) = row["timeSyntax"].as_str() {
+                syntax_cases += 1;
+                assert_eq!(
+                    native_session::time_command::parse(input).is_some(),
+                    row["timeSyntaxAccepted"].as_bool().unwrap(),
+                    "{row}"
+                );
+                continue;
+            }
+            if let Some(input) = row["identifierArgument"].as_str() {
+                identifier_cases += 1;
+                let actual = native_session::time_command::parse_identifier(input)
+                    .map(|id| format!("{}:{}", id.namespace, id.path));
+                assert_eq!(actual.as_deref(), row["identifierResult"].as_str(), "{row}");
+                continue;
+            }
             if let Some(initial) = row["clockInitial"].as_i64() {
                 clock_cases += 1;
                 let mut clock = native_persistence::world::SavedClock {
@@ -737,5 +766,8 @@ mod tests {
         assert!(time_arguments > 4000);
         assert_eq!(marker_cases, 420);
         assert_eq!(clock_cases, 72);
+        assert_eq!(identifier_cases, 48);
+        assert_eq!(syntax_cases, 14);
+        assert_eq!(clock_definitions, 7);
     }
 }

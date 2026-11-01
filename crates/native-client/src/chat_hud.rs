@@ -345,6 +345,8 @@ fn prepare_lines(
                 | SystemMessageKind::TimeNoDefaultClock(_)
                 | SystemMessageKind::TimePermissionDenied
                 | SystemMessageKind::TimeSaveUnavailable
+                | SystemMessageKind::TimeUnknownClock(_)
+                | SystemMessageKind::TimeMarkerDataUnavailable
                 | SystemMessageKind::TimePaused { already: true, .. }
                 | SystemMessageKind::TimeMarker { already: true, .. }
                 | SystemMessageKind::TimeMarker { missing: true, .. }
@@ -517,6 +519,25 @@ fn prepare_lines(
             ),
             SystemMessageKind::TimeSaveUnavailable => (
                 "Cannot change the clock because its saved data is unavailable.".to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeUnknownClock(name) => (
+                format_translation(
+                    assets.translate(
+                        "argument.resource.not_found",
+                        "Can't find element '%s' of type '%s'",
+                    ),
+                    &[name, "minecraft:world_clock"],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeMarkerDataUnavailable => (
+                "Cannot use time markers because the active timeline data could not be verified."
+                    .to_owned(),
                 None,
                 Vec::new(),
                 None,

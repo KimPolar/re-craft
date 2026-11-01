@@ -2,7 +2,27 @@
 
 use crate::packs::{ResourceId, ResourceProvider};
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Validate active world-clock definitions before exposing them as commands.
+pub fn registered_clocks(provider: &mut impl ResourceProvider) -> Result<BTreeSet<ResourceId>> {
+    let mut result = BTreeSet::new();
+    for id in provider.list_data("world_clock")? {
+        let path = format!("data/{}/world_clock/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing world clock {path}"))?;
+        validate_clock_definition(&bytes).with_context(|| format!("invalid world clock {path}"))?;
+        result.insert(id);
+    }
+    Ok(result)
+}
+
+pub fn validate_clock_definition(bytes: &[u8]) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    ensure!(value.is_object(), "world clock must be an object");
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeMarker {
@@ -204,6 +224,22 @@ mod tests {
     }
 
     #[test]
+    fn registered_clocks_follow_active_data_and_reject_invalid_definitions() {
+        let mut provider = Data(BTreeMap::from([(
+            "data/example/world_clock/clock.json".into(),
+            b"{}".to_vec(),
+        )]));
+        assert_eq!(
+            registered_clocks(&mut provider).unwrap(),
+            BTreeSet::from([ResourceId::parse("example:clock").unwrap()])
+        );
+        provider
+            .0
+            .insert("data/example/world_clock/clock.json".into(), b"[]".to_vec());
+        assert!(registered_clocks(&mut provider).is_err());
+    }
+
+    #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn installed_dimensions_use_registered_defaults() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -223,6 +259,9 @@ mod tests {
             );
         }
         let markers = time_markers(&mut provider).unwrap();
+        let clocks = registered_clocks(&mut provider).unwrap();
+        assert!(clocks.contains(&ResourceId::parse("minecraft:overworld").unwrap()));
+        assert!(clocks.contains(&ResourceId::parse("minecraft:the_end").unwrap()));
         let clock = ResourceId::parse("minecraft:overworld").unwrap();
         for (name, ticks) in [
             ("day", 1000),

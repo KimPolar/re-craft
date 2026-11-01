@@ -80,11 +80,7 @@ use glam::{DVec3, IVec3, Vec3};
 use native_persistence::nbt::{NamedTag, Tag};
 use native_persistence::world::{ChunkPos, DimensionId, WorldReader};
 use native_resources::transforms::{BlockTransformers, ToolKind};
-use native_resources::{
-    TextureAtlas,
-    packs::{ResourceProvider, ResourceStack},
-    recipes::CraftingRecipes,
-};
+use native_resources::{TextureAtlas, packs::ResourceStack, recipes::CraftingRecipes};
 #[cfg(debug_assertions)]
 use native_resources::{
     default_minecraft_dir, geometry, load_atlas_with_packs, models, sprites::SpriteAtlas,
@@ -994,24 +990,30 @@ fn prepare_existing_world(
                 .map(native_persistence::world::parse_world_clocks)
                 .transpose()?
                 .unwrap_or_default();
-            for id in resources.list_data("world_clock")? {
+            let mut registered = std::collections::BTreeSet::new();
+            for id in native_resources::world_clock::registered_clocks(&mut resources)? {
                 let id = native_persistence::world::DimensionId::parse(&format!(
                     "{}:{}",
                     id.namespace, id.path
                 ))?;
+                registered.insert(id.clone());
                 clocks.entry(id).or_default();
             }
-            Ok((clocks, source))
+            Ok((clocks, source, registered))
         });
         match clocks {
-            Ok((clocks, Some(source))) => {
+            Ok((clocks, Some(source), registered)) => {
+                session.set_registered_clocks(Arc::new(registered));
                 if let Err(error) =
                     session.restore_saved_world_clocks(&source, clocks, rules.advance_time)
                 {
                     eprintln!("World clocks are unavailable: {error:#}");
                 }
             }
-            Ok((clocks, None)) => session.set_world_clocks(clocks, rules.advance_time),
+            Ok((clocks, None, registered)) => {
+                session.set_registered_clocks(Arc::new(registered));
+                session.set_world_clocks(clocks, rules.advance_time);
+            }
             Err(error) => eprintln!("World clocks are unavailable: {error:#}"),
         }
         if let Some((dimension_type, clock)) = default_clock {

@@ -217,9 +217,9 @@ impl GameMode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum PlayerCommand {
-    WorldTime(time_command::TimeCommand),
+    WorldTime(Arc<time_command::TimeCommand>),
     /// Read the verified seed of this local world.
     QueryWorldSeed,
     /// Request respawn after a supported death transition.
@@ -435,6 +435,8 @@ pub enum SystemMessageKind {
     TimeNoDefaultClock(Arc<str>),
     TimePermissionDenied,
     TimeSaveUnavailable,
+    TimeUnknownClock(Arc<str>),
+    TimeMarkerDataUnavailable,
     TimeMarker {
         name: Arc<str>,
         marker: Arc<str>,

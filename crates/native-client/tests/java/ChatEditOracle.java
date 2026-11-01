@@ -19,10 +19,23 @@ import net.minecraft.network.chat.ComponentUtils;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.contents.TranslatableContents;
 import net.minecraft.commands.arguments.TimeArgument;
+import net.minecraft.commands.arguments.IdentifierArgument;
 import com.mojang.brigadier.StringReader;
 import net.minecraft.world.clock.ClockTimeMarker;
 import java.util.Optional;
 import net.minecraft.world.clock.ServerClockManager;
+import net.minecraft.core.MappedRegistry;
+import net.minecraft.core.Registry;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.clock.WorldClock;
+import net.minecraft.world.timeline.Timeline;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.commands.CommandBuildContext;
+import net.minecraft.server.commands.TimeCommand;
+import com.mojang.serialization.Lifecycle;
+import com.mojang.serialization.JsonOps;
+import com.google.gson.JsonParser;
 import net.minecraft.client.input.KeyEvent;
 
 // Compare the real 26.3 EditBox input state without creating a game window.
@@ -167,6 +180,49 @@ public final class ChatEditOracle {
             row.addProperty("clockAdd", add);
             row.addProperty("clockTotal", total.getLong(clock));
             row.addProperty("clockPartial", partial.getFloat(clock));
+            rows.add(row);
+        }
+        for (String prefix : new String[]{"", ":", "minecraft:", "example:", "example_pack:", "Bad:"})
+        for (String suffix : new String[]{"day", "wake", "path/to/marker", "clock_2", "my-marker", "bad?", "UPPER", ""}) {
+            String input = prefix + suffix;
+            JsonObject row = new JsonObject();
+            row.addProperty("identifierArgument", input);
+            try {
+                StringReader reader = new StringReader(input);
+                var id = IdentifierArgument.id().parse(reader);
+                if (reader.canRead()) throw new IllegalArgumentException("trailing characters");
+                row.addProperty("identifierResult", id.toString());
+            } catch (Exception ignored) {
+                row.add("identifierResult", com.google.gson.JsonNull.INSTANCE);
+            }
+            rows.add(row);
+        }
+        var clocks = new MappedRegistry<WorldClock>(Registries.WORLD_CLOCK, Lifecycle.stable());
+        Registry.register(clocks, "example:clock", new WorldClock());
+        clocks.freeze();
+        var timelines = new MappedRegistry<Timeline>(Registries.TIMELINE, Lifecycle.stable());
+        timelines.freeze();
+        var lookup = HolderLookup.Provider.create(java.util.stream.Stream.of(clocks, timelines));
+        var commandContext = CommandBuildContext.simple(lookup, FeatureFlags.DEFAULT_FLAGS);
+        var commands = new CommandDispatcher<CommandSourceStack>();
+        TimeCommand.register(commands, commandContext);
+        set(source, CommandSourceStack.class, "permissions", PermissionSet.ALL_PERMISSIONS);
+        for (String command : new String[]{"time of example:clock set example:wake", "time of example:clock set 1d", "time of example:clock set -1", "time of example:clock query time", "time of example:clock query gametime", "time of example:clock add -1.5s", "time of example:clock add nope", "time of example:clock pause", "time of example:clock resume", "time of example:clock query time extra", "time set example:wake", "time query gametime", "time set +1", "time set example:"}) {
+            var parsed = commands.parse(command, source);
+            JsonObject row = new JsonObject();
+            row.addProperty("timeSyntax", "/" + command);
+            row.addProperty("timeSyntaxAccepted", !parsed.getReader().canRead() && parsed.getContext().getCommand() != null);
+            rows.add(row);
+        }
+        var missingClock = commands.parse("time of example:missing query time", source);
+        if (!missingClock.getReader().canRead()) throw new AssertionError("unknown clock accepted");
+        set(source, CommandSourceStack.class, "permissions", PermissionSet.NO_PERMISSIONS);
+        var unauthorized = commands.parse("time of example:clock query time", source);
+        if (!unauthorized.getReader().canRead()) throw new AssertionError("unprivileged time command accepted");
+        for (String json : new String[]{"{}", "{\"ignored\":42}", "[]", "null", "42", "\"text\"", "true"}) {
+            JsonObject row = new JsonObject();
+            row.addProperty("worldClockJson", json);
+            row.addProperty("worldClockValid", WorldClock.DIRECT_CODEC.parse(JsonOps.INSTANCE, JsonParser.parseString(json)).result().isPresent());
             rows.add(row);
         }
         Files.writeString(Path.of(args[0]), rows.toString());

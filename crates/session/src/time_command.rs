@@ -1,61 +1,69 @@
 //! Supported 26.3 time commands and Brigadier's float-based time argument.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeCommand {
+use native_resources::packs::ResourceId;
+
+/// Parse command identifiers without using them as filesystem paths.
+pub fn parse_identifier(input: &str) -> Option<ResourceId> {
+    let (namespace, path) = input.split_once(':').unwrap_or(("minecraft", input));
+    let namespace = if namespace.is_empty() {
+        "minecraft"
+    } else {
+        namespace
+    };
+    if !namespace
+        .bytes()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-".contains(&c))
+        || !path
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_./-".contains(&c))
+    {
+        return None;
+    }
+    Some(ResourceId {
+        namespace: namespace.into(),
+        path: path.into(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimeCommand {
+    pub clock: Option<ResourceId>,
+    pub action: TimeAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimeAction {
     QueryGameTime,
     QueryClock,
     Set(i32),
-    SetMarker(TimeMarker),
+    SetMarker(ResourceId),
     Add(i32),
     Pause,
     Resume,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeMarker {
-    Day,
-    Noon,
-    Night,
-    Midnight,
-}
-impl TimeMarker {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Day => "day",
-            Self::Noon => "noon",
-            Self::Night => "night",
-            Self::Midnight => "midnight",
-        }
-    }
-    fn parse(name: &str) -> Option<Self> {
-        match name
-            .strip_prefix("minecraft:")
-            .or_else(|| name.strip_prefix(':'))
-            .unwrap_or(name)
-        {
-            "day" => Some(Self::Day),
-            "noon" => Some(Self::Noon),
-            "night" => Some(Self::Night),
-            "midnight" => Some(Self::Midnight),
-            _ => None,
-        }
-    }
-}
-
-/// Parse only the currently supported default-clock forms.
+/// Parse default-clock and `of <clock>` forms, retaining data-pack identifiers.
 pub fn parse(input: &str) -> Option<TimeCommand> {
     let parts: Vec<_> = input.split(' ').collect();
-    match parts.as_slice() {
-        ["/time", "query", "gametime"] => Some(TimeCommand::QueryGameTime),
-        ["/time", "query", "time"] => Some(TimeCommand::QueryClock),
-        ["/time", "set", value] => duration(value, 0)
-            .map(TimeCommand::Set)
-            .or_else(|| TimeMarker::parse(value).map(TimeCommand::SetMarker)),
-        ["/time", "add", value] => duration(value, i32::MIN).map(TimeCommand::Add),
-        ["/time", "pause"] => Some(TimeCommand::Pause),
-        ["/time", "resume"] => Some(TimeCommand::Resume),
-        _ => None,
-    }
+    let (clock, args) = match parts.as_slice() {
+        ["/time", "of", name, rest @ ..] if !name.is_empty() => {
+            (Some(parse_identifier(name)?), rest)
+        }
+        ["/time", rest @ ..] => (None, rest),
+        _ => return None,
+    };
+    let action = match args {
+        ["query", "gametime"] if clock.is_none() => TimeAction::QueryGameTime,
+        ["query", "time"] => TimeAction::QueryClock,
+        ["set", value] if !value.is_empty() => duration(value, 0)
+            .map(TimeAction::Set)
+            .or_else(|| parse_identifier(value).map(TimeAction::SetMarker))?,
+        ["add", value] => TimeAction::Add(duration(value, i32::MIN)?),
+        ["pause"] => TimeAction::Pause,
+        ["resume"] => TimeAction::Resume,
+        _ => return None,
+    };
+    Some(TimeCommand { clock, action })
 }
 
 pub fn duration(input: &str, minimum: i32) -> Option<i32> {
@@ -130,20 +138,39 @@ mod tests {
         ] {
             assert_eq!(duration(text, min), expected, "{text}");
         }
-        assert_eq!(parse("/time set 1d"), Some(TimeCommand::Set(24000)));
         assert_eq!(
-            parse("/time query gametime"),
-            Some(TimeCommand::QueryGameTime)
-        );
-        assert_eq!(parse("/time query time"), Some(TimeCommand::QueryClock));
-        assert_eq!(
-            parse("/time set day"),
-            Some(TimeCommand::SetMarker(TimeMarker::Day))
+            parse("/time set 1d").unwrap().action,
+            TimeAction::Set(24000)
         );
         assert_eq!(
-            parse("/time set minecraft:night"),
-            Some(TimeCommand::SetMarker(TimeMarker::Night))
+            parse("/time query gametime").unwrap().action,
+            TimeAction::QueryGameTime
         );
+        assert_eq!(
+            parse("/time query time").unwrap().action,
+            TimeAction::QueryClock
+        );
+        assert_eq!(
+            parse("/time set day").unwrap().action,
+            TimeAction::SetMarker(ResourceId::parse("minecraft:day").unwrap())
+        );
+        assert_eq!(
+            parse("/time set minecraft:night").unwrap().action,
+            TimeAction::SetMarker(ResourceId::parse("minecraft:night").unwrap())
+        );
+        let custom = parse("/time of example:clock set example:wake").unwrap();
+        assert_eq!(
+            custom.clock,
+            Some(ResourceId::parse("example:clock").unwrap())
+        );
+        assert_eq!(
+            custom.action,
+            TimeAction::SetMarker(ResourceId::parse("example:wake").unwrap())
+        );
+        assert_eq!(parse("/time of example:clock query gametime"), None);
+        assert_eq!(parse_identifier("example:").unwrap().path, "");
+        assert_eq!(parse_identifier("example:a/../b").unwrap().path, "a/../b");
+        assert_eq!(parse("/time set "), None);
         assert_eq!(parse("/time add 1 extra"), None);
     }
 }

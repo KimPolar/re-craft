@@ -531,7 +531,7 @@ pub struct LoadedSession {
     unresolved_player_location_effects: bool,
     location_save_changed: bool,
     location_item_changes: Vec<crate::location_enchantments::ItemChange>,
-    location_failure_revision: Option<u64>,
+    location_failure_revision: Option<(u64, u64)>,
     tick_enchantment_failure: Option<(u64, u64)>,
     tick_enchantment_cache: Option<(
         u64,
@@ -2153,6 +2153,94 @@ impl LoadedSession {
         }
     }
 
+    /// Apply the currently supported fixed frosted-ice disk only after every
+    /// candidate, entity query and neighboring block has been checked.
+    fn apply_location_disk(
+        &mut self,
+        action: &native_resources::enchantments::location::ReplaceDiskAction,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let provider = action
+            .block_state
+            .as_object()
+            .context("disk state provider is not a fixed block state")?;
+        anyhow::ensure!(
+            provider
+                .keys()
+                .all(|key| key == "id" || key == "properties"),
+            "unsupported disk state provider"
+        );
+        let name = provider
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("disk state id is missing")?;
+        let name = native_resources::packs::ResourceId::parse(name)?;
+        anyhow::ensure!(
+            name.namespace == "minecraft" && name.path == "frosted_ice",
+            "unsupported disk replacement block"
+        );
+        if let Some(properties) = provider.get("properties") {
+            let properties = properties
+                .as_object()
+                .context("disk state properties are invalid")?;
+            anyhow::ensure!(
+                properties.keys().all(|key| key == "age")
+                    && properties
+                        .get("age")
+                        .is_none_or(|age| age.as_str() == Some("0")),
+                "unsupported frosted ice state"
+            );
+        }
+        if let Some(event) = &action.trigger_game_event {
+            anyhow::ensure!(
+                event.namespace == "minecraft" && event.path == "block_place",
+                "unsupported disk game event"
+            );
+        }
+        let origin = self.origin.as_dvec3() + self.motion.position;
+        let positions = action
+            .positions(origin.to_array())
+            .context("disk region is unavailable or too large")?;
+        let mut stage = DiskWorld {
+            session: self,
+            frozen: BTreeSet::new(),
+        };
+        let mut ordered = Vec::new();
+        for absolute in positions {
+            if let Some(predicate) = &action.compiled_predicate
+                && !predicate.test(&mut stage, absolute)?
+            {
+                continue;
+            }
+            stage.validate_freeze(absolute)?;
+            stage.frozen.insert(absolute);
+            ordered.push(absolute);
+        }
+        drop(stage);
+        let ice = self.intern_block(state("minecraft:frosted_ice", &[("age", "0")]));
+        let mut relative = Vec::with_capacity(ordered.len());
+        for position in ordered {
+            let position = subtract(IVec3::from_array(position), self.origin)
+                .context("disk position overflow")?;
+            anyhow::ensure!(
+                self.check_block_set(position, ice, true, false).is_some(),
+                "disk block change is unavailable"
+            );
+            relative.push(position);
+        }
+        for position in relative.iter().copied() {
+            anyhow::ensure!(
+                self.set_with_notify(position, ice, true),
+                "disk block changed during application"
+            );
+        }
+        if !relative.is_empty() && action.trigger_game_event.is_some() {
+            // Game-event listeners are not yet simulated or saved.
+            self.unresolved_player_location_effects = true;
+        }
+        Ok(())
+    }
+
     fn run_location_effects(&mut self, equipment_changed: bool) {
         if !self.location_effects.needs_processing(&self.inventory) {
             return;
@@ -2160,7 +2248,9 @@ impl LoadedSession {
         if equipment_changed && !self.location_effects.equipment_changed(&self.inventory) {
             return;
         }
-        if equipment_changed && self.location_failure_revision == Some(self.inventory.revision()) {
+        if equipment_changed
+            && self.location_failure_revision == Some((self.inventory.revision(), self.revision))
+        {
             return;
         }
         let Some((_, registry)) = &self.oxygen_equipment else {
@@ -2185,6 +2275,9 @@ impl LoadedSession {
             infinite_materials: matches!(self.game_mode, GameMode::Creative | GameMode::Spectator),
         };
         let mut inventory = (*self.inventory).clone();
+        let previous_tracker = self.location_effects.clone();
+        let previous_random = self.level_random.clone();
+        let previous_revision = self.revision;
         let result = if equipment_changed {
             self.location_effects.sync_equipment(
                 &mut inventory,
@@ -2200,6 +2293,22 @@ impl LoadedSession {
                 &mut self.level_random,
             )
         };
+        let mut disk_attempted = false;
+        let result = result.and_then(|outcome| {
+            if !outcome.disk_actions.is_empty() {
+                disk_attempted = true;
+                anyhow::ensure!(
+                    outcome.disk_actions.len() == 1
+                        && !outcome.attributes_changed
+                        && !outcome.inventory_changed
+                        && outcome.broken.is_empty()
+                        && outcome.touched_modifiers.is_empty(),
+                    "mixed location disk effects are not yet supported"
+                );
+                self.apply_location_disk(&outcome.disk_actions[0])?;
+            }
+            Ok(outcome)
+        });
         match result {
             Ok(outcome) => {
                 self.location_failure_revision = None;
@@ -2242,8 +2351,14 @@ impl LoadedSession {
             }
             Err(error) => {
                 self.unresolved_player_location_effects = true;
-                self.location_failure_revision = Some(self.inventory.revision());
-                self.location_effects = crate::location_enchantments::LocationTracker::default();
+                self.location_failure_revision = Some((self.inventory.revision(), self.revision));
+                if disk_attempted && self.revision == previous_revision {
+                    self.location_effects = previous_tracker;
+                    self.level_random = previous_random;
+                } else {
+                    self.location_effects =
+                        crate::location_enchantments::LocationTracker::default();
+                }
                 self.movement_speed_cache = None;
                 self.movement_efficiency_inventory_revision = None;
                 self.refresh_movement_efficiency();
@@ -15843,7 +15958,8 @@ impl LoadedSession {
                 }
                 Err(error) => {
                     self.unresolved_player_location_effects = true;
-                    self.location_failure_revision = Some(self.inventory.revision());
+                    self.location_failure_revision =
+                        Some((self.inventory.revision(), self.revision));
                     self.location_effects =
                         crate::location_enchantments::LocationTracker::default();
                     self.movement_speed_cache = None;
@@ -17687,6 +17803,193 @@ fn cell(
     }
     // Full chunks may omit all-air sections or retain sections with light alone.
     Cell::State(world.block_id(pos.x, pos.y, pos.z).unwrap_or(air))
+}
+
+/// A read-only view of the disk's already staged ice changes. Positions are
+/// absolute, like Java's block predicate and game-event positions.
+struct DiskWorld<'a> {
+    session: &'a LoadedSession,
+    frozen: BTreeSet<[i32; 3]>,
+}
+
+impl DiskWorld<'_> {
+    fn relative(&self, position: [i32; 3]) -> anyhow::Result<IVec3> {
+        use anyhow::Context;
+        subtract(IVec3::from_array(position), self.session.origin).context("disk position overflow")
+    }
+
+    fn state(&self, position: [i32; 3]) -> anyhow::Result<&BlockState> {
+        use anyhow::Context;
+        let relative = self.relative(position)?;
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            relative,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("disk block chunk is unavailable");
+        };
+        self.session
+            .world
+            .state(id)
+            .context("disk block state is unavailable")
+    }
+
+    fn validate_freeze(&self, position: [i32; 3]) -> anyhow::Result<()> {
+        let state = self.state(position)?;
+        anyhow::ensure!(
+            state.name == "minecraft:water"
+                && state.properties.len() == 1
+                && state
+                    .properties
+                    .get("level")
+                    .is_some_and(|level| level == "0"),
+            "unsupported disk replacement target"
+        );
+        for direction in [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+        ] {
+            let neighbor = add(IVec3::from_array(position), direction)
+                .ok_or_else(|| anyhow::anyhow!("disk neighbor overflow"))?
+                .to_array();
+            if self.frozen.contains(&neighbor) {
+                continue;
+            }
+            let state = self.state(neighbor)?;
+            match state.name.as_str() {
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                | "minecraft:stone" | "minecraft:dirt" => {
+                    anyhow::ensure!(
+                        state.properties.is_empty(),
+                        "unsupported disk neighbor state"
+                    );
+                }
+                "minecraft:water" => {
+                    anyhow::ensure!(
+                        state.properties.len() == 1
+                            && state
+                                .properties
+                                .get("level")
+                                .is_some_and(|level| level == "0"),
+                        "unsupported water beside disk"
+                    );
+                }
+                "minecraft:frosted_ice" => {
+                    anyhow::ensure!(
+                        state.properties.len() == 1
+                            && state
+                                .properties
+                                .get("age")
+                                .is_some_and(|age| matches!(age.as_str(), "0" | "1" | "2" | "3")),
+                        "unsupported ice beside disk"
+                    );
+                }
+                _ => anyhow::bail!("unsupported block beside disk"),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl native_resources::enchantments::disk_predicate::PredicateWorld for DiskWorld<'_> {
+    fn matches_block(
+        &mut self,
+        position: [i32; 3],
+        ids: &BTreeSet<String>,
+    ) -> anyhow::Result<bool> {
+        if self.frozen.contains(&position) {
+            return Ok(ids.contains("minecraft:frosted_ice"));
+        }
+        Ok(ids.contains(&self.state(position)?.name))
+    }
+
+    fn matches_fluid(
+        &mut self,
+        position: [i32; 3],
+        ids: &BTreeSet<String>,
+    ) -> anyhow::Result<bool> {
+        if self.frozen.contains(&position) {
+            return Ok(ids.contains("minecraft:empty"));
+        }
+        let state = self.state(position)?;
+        let id = match state.name.as_str() {
+            "minecraft:water" | "minecraft:lava" => {
+                anyhow::ensure!(state.properties.len() == 1, "unsupported disk fluid state");
+                let fluid = FluidState::from_block(state)
+                    .map_err(anyhow::Error::msg)?
+                    .ok_or_else(|| anyhow::anyhow!("missing disk fluid"))?;
+                match (fluid.kind, fluid.source) {
+                    (FluidKind::Water, true) => "minecraft:water",
+                    (FluidKind::Water, false) => "minecraft:flowing_water",
+                    (FluidKind::Lava, true) => "minecraft:lava",
+                    (FluidKind::Lava, false) => "minecraft:flowing_lava",
+                }
+            }
+            "minecraft:air"
+            | "minecraft:cave_air"
+            | "minecraft:void_air"
+            | "minecraft:stone"
+            | "minecraft:dirt"
+            | "minecraft:frosted_ice" => "minecraft:empty",
+            _ => anyhow::bail!("unknown disk fluid state"),
+        };
+        Ok(ids.contains(id))
+    }
+
+    fn unobstructed(&mut self, position: [i32; 3]) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        let block = IVec3::from_array(position).as_dvec3();
+        if self.session.game_mode != GameMode::Spectator {
+            let player = crate::movement::player_bounds(
+                self.session.origin.as_dvec3() + self.session.motion.position,
+                self.session.player.pose.height(),
+            );
+            let overlap = (block + DVec3::ONE).min(player.max) - block.max(player.min);
+            if overlap.cmpgt(DVec3::splat(1.0e-7)).all() {
+                return Ok(false);
+            }
+        }
+        let relative = self.relative(position)?;
+        let full = [Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::ONE,
+        }];
+        if !self.session.falling_blocks_clear_placement(relative, &full) {
+            return Ok(false);
+        }
+        let min_x = position[0]
+            .checked_sub(2)
+            .context("disk entity bounds overflow")?
+            .div_euclid(16);
+        let max_x = position[0]
+            .checked_add(3)
+            .context("disk entity bounds overflow")?
+            .div_euclid(16);
+        let min_z = position[2]
+            .checked_sub(2)
+            .context("disk entity bounds overflow")?
+            .div_euclid(16);
+        let max_z = position[2]
+            .checked_add(3)
+            .context("disk entity bounds overflow")?
+            .div_euclid(16);
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                match self.session.entity_chunks.get(&ChunkPos { x, z }) {
+                    Some(SavedEntityData::Empty) => {}
+                    Some(SavedEntityData::Present(chunk)) if chunk.entities().is_empty() => {}
+                    _ => anyhow::bail!("disk entity collision information is incomplete"),
+                }
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// The fluid algorithms need block tags and support faces. Until the complete
@@ -27743,6 +28046,295 @@ pub(crate) mod tests {
             assert!(
                 (session.motion.velocity.z - expected).abs() < 1.0e-10,
                 "age {age}"
+            );
+        }
+    }
+
+    #[test]
+    fn frost_walker_freezes_known_water_and_defers_unknown_entities_atomically() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct DiskPack;
+        impl ResourceProvider for DiskPack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if folder == "enchantment" {
+                    vec![ResourceId::parse("example:frost")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/example/enchantment/frost.json" => Some(br#"{"slots":["feet"],"effects":{"minecraft:location_changed":[{"requirements":{"type":"minecraft:entity_properties","entity":"this","predicate":{"minecraft:flags":{"is_on_ground":true}}},"effect":{"type":"minecraft:replace_disk","radius":3.0,"height":1.0,"offset":[0,-1,0],"predicate":{"type":"minecraft:all_of","predicates":[{"type":"minecraft:matching_blocks","offset":[0,1,0],"blocks":"minecraft:air"},{"type":"minecraft:matching_blocks","blocks":"minecraft:water"},{"type":"minecraft:matching_fluids","fluids":"minecraft:water"},{"type":"minecraft:unobstructed"}]},"block_state":{"id":"minecraft:frosted_ice","properties":{"age":"0"}},"trigger_game_event":"minecraft:block_place"}}]}}"#.to_vec()),
+                    _ => None,
+                })
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut DiskPack).unwrap());
+        let setup = |entities_known: bool| {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&registry),
+                )
+                .unwrap();
+            let boots = ItemStack::new(
+                "minecraft:iron_boots".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("example:frost".into(), Tag::Int(1))]),
+                )]),
+            )
+            .unwrap();
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Armor(3), Some(boots));
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            for x in 4..=12 {
+                for z in 4..=12 {
+                    assert!(session.set_with_notify(IVec3::new(x, 1, z), water, false));
+                }
+            }
+            if entities_known {
+                session
+                    .entity_chunks
+                    .insert(session.player_chunk().unwrap(), SavedEntityData::Empty);
+            }
+            session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            session.motion.on_ground = true;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = true;
+            session.level_random = native_core::random::LegacyRandom::new(7);
+            session
+        };
+        let mut active = setup(true);
+        let mut expected_random = active.level_random.clone();
+        active.run_location_effects(true);
+        let center = active.origin + IVec3::new(8, 1, 8);
+        assert_eq!(
+            active
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:frosted_ice"
+        );
+        let under_stone = active.origin + IVec3::new(8, 1, 6);
+        assert_eq!(
+            active
+                .world
+                .block(under_stone.x, under_stone.y, under_stone.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert_eq!(active.ice_ticks.len(), 24);
+        for _ in 0..24 {
+            crate::frosted_ice::placed(&mut expected_random);
+        }
+        assert_eq!(active.level_random.next_int(), expected_random.next_int());
+        assert!(active.unresolved_player_location_effects && active.unresolved_ice_tick);
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert!(active.draft_player_state(&original).is_err());
+
+        let mut missing = setup(false);
+        let before_random = missing.level_random.clone().next_int();
+        missing.run_location_effects(true);
+        let center = missing.origin + IVec3::new(8, 1, 8);
+        assert_eq!(
+            missing
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert!(missing.ice_ticks.is_empty());
+        assert_eq!(missing.level_random.next_int(), before_random);
+        assert!(missing.unresolved_player_location_effects);
+        missing
+            .entity_chunks
+            .insert(missing.player_chunk().unwrap(), SavedEntityData::Empty);
+        missing.revision += 1;
+        missing.run_location_effects(true);
+        assert_eq!(
+            missing
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:frosted_ice"
+        );
+        assert_eq!(missing.ice_ticks.len(), 24);
+
+        let mut unknown_neighbor = setup(true);
+        let glass = unknown_neighbor.intern_block(state("minecraft:glass", &[]));
+        assert!(unknown_neighbor.set_with_notify(IVec3::new(6, 1, 8), glass, false));
+        let random_before = unknown_neighbor.level_random.clone().next_int();
+        unknown_neighbor.run_location_effects(true);
+        let center = unknown_neighbor.origin + IVec3::new(8, 1, 8);
+        assert_eq!(
+            unknown_neighbor
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert!(unknown_neighbor.ice_ticks.is_empty());
+        assert_eq!(unknown_neighbor.level_random.next_int(), random_before);
+        assert!(unknown_neighbor.unresolved_player_location_effects);
+
+        let mut intersecting = setup(true);
+        intersecting.motion.position.y = 1.5;
+        intersecting.player.position = intersecting.motion.position.as_vec3();
+        let center = intersecting.origin + IVec3::new(8, 1, 8);
+        let mut stage = DiskWorld {
+            session: &intersecting,
+            frozen: BTreeSet::new(),
+        };
+        assert!(
+            !native_resources::enchantments::disk_predicate::PredicateWorld::unobstructed(
+                &mut stage,
+                center.to_array()
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn frost_walker_loaded_placements_match_java_effect() {
+        use native_resources::enchantments::{
+            EquipmentSlot,
+            location::{LocationAction, LocationContext},
+        };
+        use native_resources::packs::ResourceId;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FrostWalkerPlacementOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrostWalkerPlacementOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FrostWalkerPlacementOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut resources).unwrap();
+        let definition = registry
+            .location_effects(&ResourceId::parse("minecraft:frost_walker").unwrap())
+            .unwrap();
+        let context = LocationContext {
+            active: false,
+            flying: false,
+            on_ground: true,
+            vehicle: false,
+            movement_block: "minecraft:water",
+            level: 1,
+            tick_count: 0,
+            known_movement: [0.0; 3],
+        };
+        let (_, actions) = definition
+            .evaluate(0, EquipmentSlot::Feet, &context, &mut || {
+                panic!("unexpected random condition")
+            })
+            .unwrap();
+        let [LocationAction::ReplaceDisk(action)] = actions.as_slice() else {
+            panic!("unexpected frost walker effect")
+        };
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32);
+        for row in rows {
+            let mut session = session();
+            session
+                .entity_chunks
+                .insert(session.player_chunk().unwrap(), SavedEntityData::Empty);
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            for x in 4..=12 {
+                for z in 4..=12 {
+                    assert!(session.set_with_notify(IVec3::new(x, 1, z), water, false));
+                }
+            }
+            session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            session.player.position = session.motion.position.as_vec3();
+            session.level_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            session.apply_location_disk(action).unwrap();
+            let mut ticks: Vec<_> = session
+                .ice_ticks
+                .iter()
+                .map(|(order, position)| (order.3, *order, *position))
+                .collect();
+            ticks.sort_by_key(|tick| tick.0);
+            let actual: Vec<_> = ticks
+                .iter()
+                .map(|(_, order, position)| {
+                    serde_json::json!([
+                        position.0 - session.origin.x,
+                        position.1 - session.origin.y,
+                        position.2 - session.origin.z,
+                        order.0
+                    ])
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                row["scheduled"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
             );
         }
     }

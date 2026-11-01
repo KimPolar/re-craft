@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use native_core::random::LegacyRandom;
 use native_resources::enchantments::{
     AttributeModifier, EquipmentSlot, OxygenEnchantments,
-    location::{LocationAction, LocationContext},
+    location::{LocationAction, LocationContext, ReplaceDiskAction},
 };
 use native_resources::packs::ResourceId;
 
@@ -48,6 +48,7 @@ pub(crate) struct Outcome {
     pub broken: Vec<ItemStack>,
     pub item_changes: Vec<ItemChange>,
     pub touched_modifiers: Vec<(ResourceId, ResourceId)>,
+    pub disk_actions: Vec<ReplaceDiskAction>,
 }
 
 pub(crate) struct ItemChange {
@@ -277,11 +278,7 @@ impl LocationTracker {
                                 }
                             }
                         }
-                        LocationAction::ReplaceDisk(_) => {
-                            anyhow::bail!(
-                                "location replace_disk world effects are not yet supported"
-                            );
-                        }
+                        LocationAction::ReplaceDisk(action) => outcome.disk_actions.push(action),
                     }
                 }
                 if active {
@@ -665,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_disk_execution_rolls_back_location_random_and_equipment() {
+    fn disk_location_effect_is_returned_for_world_processing() {
         struct DiskPack;
         impl ResourceProvider for DiskPack {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -688,25 +685,25 @@ mod tests {
         inventory.set_slot(PlayerSlot::Armor(3), Some(boots()));
         let before = inventory.slot(PlayerSlot::Armor(3)).cloned();
         let mut random = LegacyRandom::new(42);
-        let expected = random.clone().next_int();
+        let mut expected = random.clone();
+        expected.next_float();
         let mut tracker = LocationTracker::default();
-        assert!(
-            tracker
-                .sync_equipment(
-                    &mut inventory,
-                    &registry,
-                    env("minecraft:water"),
-                    &mut random
-                )
-                .is_err()
-        );
+        let outcome = tracker
+            .sync_equipment(
+                &mut inventory,
+                &registry,
+                env("minecraft:water"),
+                &mut random,
+            )
+            .unwrap();
+        assert_eq!(outcome.disk_actions.len(), 1);
         assert!(same_stack(
             before.as_ref(),
             inventory.slot(PlayerSlot::Armor(3))
         ));
-        assert_eq!(random.next_int(), expected);
-        assert!(!tracker.has_active());
-        assert!(tracker.equipment_changed(&inventory));
+        assert_eq!(random.next_int(), expected.next_int());
+        assert!(tracker.has_active());
+        assert!(!tracker.equipment_changed(&inventory));
     }
 
     #[test]

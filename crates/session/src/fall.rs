@@ -63,6 +63,13 @@ pub(crate) struct DamageCooldown {
     last_damage: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DamageOutcome {
+    pub accepted: bool,
+    pub fresh_hit: bool,
+    pub health_damage: f32,
+}
+
 impl DamageCooldown {
     pub(crate) fn tick(&mut self) {
         if self.ticks > 0 {
@@ -309,9 +316,20 @@ impl FallTracker {
                         | "minecraft:unattributed_fireball"
                         | "minecraft:fireball"
                 ),
+                "minecraft:no_knockback" => matches!(
+                    damage,
+                    "minecraft:in_fire"
+                        | "minecraft:campfire"
+                        | "minecraft:on_fire"
+                        | "minecraft:lava"
+                ),
                 _ => false,
             })
         }
+    }
+
+    pub(crate) fn blocks_damage_knockback(&self, damage: &str) -> Result<bool> {
+        self.damage_tag("minecraft:no_knockback", damage)
     }
 
     fn protection(&self, inventory: &PlayerInventory, damage: &str) -> Result<f32> {
@@ -461,17 +479,52 @@ impl FallTracker {
         mode: GameMode,
         cooldown: Option<&mut DamageCooldown>,
     ) -> Result<()> {
+        self.damage_outcome(amount, damage, inventory, armor, vitals, mode, cooldown)
+            .map(|_| ())
+    }
+
+    pub(crate) fn damage_info(
+        &self,
+        damage: &str,
+    ) -> Result<native_resources::enchantments::DamageTypeInfo> {
+        if let Some(registry) = &self.enchantments {
+            return registry.damage_type_info(damage);
+        }
+        let exhaustion = match damage {
+            "minecraft:lava" | "minecraft:in_fire" | "minecraft:campfire" => 0.1,
+            "minecraft:on_fire" => 0.0,
+            _ => anyhow::bail!("damage type definition is unavailable"),
+        };
+        Ok(native_resources::enchantments::DamageTypeInfo {
+            exhaustion,
+            effects: native_resources::enchantments::DamageEffects::Burning,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn damage_outcome(
+        &self,
+        amount: f32,
+        damage: &str,
+        inventory: &PlayerInventory,
+        armor: Option<ArmorValues>,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        cooldown: Option<&mut DamageCooldown>,
+    ) -> Result<DamageOutcome> {
         if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
-            return Ok(());
+            return Ok(DamageOutcome::default());
         }
         if self.effects.fire_resistance.is_some() && self.damage_tag("minecraft:is_fire", damage)? {
-            return Ok(());
+            return Ok(DamageOutcome::default());
         }
         let mut next_cooldown = cooldown.as_deref().copied();
+        let mut fresh_hit = true;
         let mut amount = if let Some(next) = &mut next_cooldown {
             let bypass = self.damage_tag("minecraft:bypasses_cooldown", damage)?;
+            fresh_hit = next.ticks <= 10 || bypass;
             let Some(accepted) = next.accept(amount, bypass) else {
-                return Ok(());
+                return Ok(DamageOutcome::default());
             };
             accepted
         } else {
@@ -504,8 +557,13 @@ impl FallTracker {
         }
         let absorbed = vitals.absorption.clamp(0.0, amount);
         vitals.absorption -= absorbed;
-        vitals.health = (vitals.health - (amount - absorbed)).max(0.0);
-        Ok(())
+        let health_damage = amount - absorbed;
+        vitals.health = (vitals.health - health_damage).max(0.0);
+        Ok(DamageOutcome {
+            accepted: true,
+            fresh_hit,
+            health_damage,
+        })
     }
 }
 
@@ -514,6 +572,153 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn damage_outcome_distinguishes_new_hits_cooldown_and_absorption() {
+        let tracker = FallTracker::default();
+        let inventory = PlayerInventory::default();
+        let mut vitals = PlayerVitals::default();
+        let mut cooldown = DamageCooldown::default();
+        let apply = |amount, vitals: &mut PlayerVitals, cooldown: &mut DamageCooldown| {
+            tracker
+                .damage_outcome(
+                    amount,
+                    "minecraft:lava",
+                    &inventory,
+                    Some(ArmorValues::default()),
+                    vitals,
+                    GameMode::Survival,
+                    Some(cooldown),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            apply(1.0, &mut vitals, &mut cooldown),
+            DamageOutcome {
+                accepted: true,
+                fresh_hit: true,
+                health_damage: 1.0
+            }
+        );
+        assert_eq!(
+            apply(4.0, &mut vitals, &mut cooldown),
+            DamageOutcome {
+                accepted: true,
+                fresh_hit: false,
+                health_damage: 3.0
+            }
+        );
+        assert_eq!(
+            apply(4.0, &mut vitals, &mut cooldown),
+            DamageOutcome::default()
+        );
+        cooldown = DamageCooldown::default();
+        vitals.absorption = 4.0;
+        assert_eq!(
+            apply(4.0, &mut vitals, &mut cooldown),
+            DamageOutcome {
+                accepted: true,
+                fresh_hit: true,
+                health_damage: 0.0
+            }
+        );
+        assert_eq!(vitals.health, 16.0);
+        assert_eq!(vitals.absorption, 0.0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn fire_damage_absorption_and_exhaustion_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerFireExhaustionOracle.java");
+        let result = temp.path().join("damage.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerFireExhaustionOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerFireExhaustionOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 24);
+        for row in rows {
+            let mut vitals = PlayerVitals {
+                absorption: row["initial_absorption"].as_f64().unwrap() as f32,
+                ..Default::default()
+            };
+            let outcome = FallTracker::default()
+                .damage_outcome(
+                    row["damage"].as_f64().unwrap() as f32,
+                    "minecraft:lava",
+                    &PlayerInventory::default(),
+                    Some(ArmorValues::default()),
+                    &mut vitals,
+                    GameMode::Survival,
+                    Some(&mut DamageCooldown::default()),
+                )
+                .unwrap();
+            if outcome.health_damage > 0.0 {
+                vitals.add_exhaustion(row["source_exhaustion"].as_f64().unwrap() as f32);
+            }
+            assert_eq!(
+                vitals.health.to_bits(),
+                row["health_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+            assert_eq!(
+                vitals.absorption.to_bits(),
+                row["absorption_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+            assert_eq!(
+                vitals.exhaustion.to_bits(),
+                row["exhaustion_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     fn jump_boost_updates_safe_fall_modifier_on_promotion_and_removal() {

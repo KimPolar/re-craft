@@ -888,6 +888,63 @@ fn definition(value: &Value) -> Result<Definition> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageEffects {
+    Hurt,
+    Thorns,
+    Drowning,
+    Burning,
+    Poking,
+    Freezing,
+}
+
+impl DamageEffects {
+    pub fn player_hurt_sound(self) -> &'static str {
+        match self {
+            Self::Hurt | Self::Thorns => "entity.player.hurt",
+            Self::Drowning => "entity.player.hurt_drown",
+            Self::Burning => "entity.player.hurt_on_fire",
+            Self::Poking => "entity.player.hurt_sweet_berry_bush",
+            Self::Freezing => "entity.player.hurt_freeze",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DamageTypeInfo {
+    pub exhaustion: f32,
+    pub effects: DamageEffects,
+}
+
+fn damage_type_info(bytes: &[u8]) -> Result<DamageTypeInfo> {
+    let value: Value = serde_json::from_slice(bytes).context("invalid damage type JSON")?;
+    let exhaustion = value
+        .get("exhaustion")
+        .and_then(Value::as_f64)
+        .context("damage type exhaustion is missing or invalid")? as f32;
+    ensure!(
+        exhaustion.is_finite(),
+        "damage type exhaustion is not finite"
+    );
+    let effects = match value.get("effects") {
+        None => DamageEffects::Hurt,
+        Some(Value::String(value)) => match value.as_str() {
+            "hurt" => DamageEffects::Hurt,
+            "thorns" => DamageEffects::Thorns,
+            "drowning" => DamageEffects::Drowning,
+            "burning" => DamageEffects::Burning,
+            "poking" => DamageEffects::Poking,
+            "freezing" => DamageEffects::Freezing,
+            _ => anyhow::bail!("unsupported damage effects {value}"),
+        },
+        _ => anyhow::bail!("invalid damage effects"),
+    };
+    Ok(DamageTypeInfo {
+        exhaustion,
+        effects,
+    })
+}
+
 /// Enchantments are resolved through the selected world data packs. Unknown or
 /// unsupported definitions are reported when used rather than guessed.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -900,6 +957,7 @@ pub struct OxygenEnchantments {
     item_damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_tags: BTreeMap<ResourceId, std::result::Result<BTreeSet<String>, String>>,
     damage_types: BTreeSet<ResourceId>,
+    damage_type_info: BTreeMap<ResourceId, std::result::Result<DamageTypeInfo, String>>,
     fall_immune_entities: Option<std::result::Result<BTreeSet<String>, String>>,
 }
 
@@ -958,7 +1016,19 @@ impl OxygenEnchantments {
             block_experience.insert(id.clone(), experience_effect);
             definitions.insert(id, parsed);
         }
-        let damage_types = provider.list_data("damage_type")?.into_iter().collect();
+        let damage_types: BTreeSet<_> = provider.list_data("damage_type")?.into_iter().collect();
+        let damage_type_info = damage_types
+            .iter()
+            .map(|id| {
+                let path = format!("data/{}/damage_type/{}.json", id.namespace, id.path);
+                let info = provider
+                    .read_data(&path)
+                    .and_then(|bytes| bytes.with_context(|| format!("missing damage type {path}")))
+                    .and_then(|bytes| damage_type_info(&bytes))
+                    .map_err(|error| format!("{error:#}"));
+                (id.clone(), info)
+            })
+            .collect();
         let mut raw: BTreeMap<ResourceId, Vec<TagEntry>> = BTreeMap::new();
         let mut errors = BTreeMap::new();
         for id in provider.list_data("tags/damage_type")? {
@@ -1015,6 +1085,7 @@ impl OxygenEnchantments {
             item_damage_tags,
             damage_tags,
             damage_types,
+            damage_type_info,
             fall_immune_entities,
         })
     }
@@ -1212,6 +1283,17 @@ impl OxygenEnchantments {
         Ok(self.damage_types.contains(&ResourceId::parse(damage)?))
     }
 
+    /// Resolve the active data pack's exhaustion and hurt-sound effect.
+    pub fn damage_type_info(&self, damage: &str) -> Result<DamageTypeInfo> {
+        let id = ResourceId::parse(damage)?;
+        self.damage_type_info
+            .get(&id)
+            .context("damage type definition is unavailable")?
+            .as_ref()
+            .copied()
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
     /// Resolve the entity immunity tag from the active data packs.
     pub fn fall_damage_immune(&self, entity: &str) -> Result<bool> {
         Ok(self
@@ -1270,6 +1352,66 @@ impl OxygenEnchantments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_type_exhaustion_and_effects_follow_active_data() {
+        struct DamageData;
+        impl ResourceProvider for DamageData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "damage_type" {
+                    Ok(vec![
+                        ResourceId::parse("minecraft:lava")?,
+                        ResourceId::parse("example:invalid")?,
+                    ])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/damage_type/lava.json" => {
+                        Some(br#"{"exhaustion":0.75,"effects":"drowning"}"#.to_vec())
+                    }
+                    "data/example/damage_type/invalid.json" => {
+                        Some(br#"{"exhaustion":0.1,"effects":"unknown"}"#.to_vec())
+                    }
+                    _ => None,
+                })
+            }
+        }
+        let registry = OxygenEnchantments::load(&mut DamageData).unwrap();
+        let info = registry.damage_type_info("minecraft:lava").unwrap();
+        assert_eq!(info.exhaustion, 0.75);
+        assert_eq!(info.effects.player_hurt_sound(), "entity.player.hurt_drown");
+        assert!(registry.damage_type_info("example:invalid").is_err());
+        assert!(registry.damage_type_info("example:missing").is_err());
+        let default = damage_type_info(br#"{"exhaustion":0.1}"#).unwrap();
+        assert_eq!(default.effects, DamageEffects::Hurt);
+        assert!(damage_type_info(br#"{"effects":"burning"}"#).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an installed Minecraft 26.3 client"]
+    fn installed_fire_damage_types_expose_vanilla_exhaustion_and_sound() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut stack = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = OxygenEnchantments::load(&mut stack).unwrap();
+        for (id, exhaustion) in [
+            ("minecraft:lava", 0.1),
+            ("minecraft:in_fire", 0.1),
+            ("minecraft:campfire", 0.1),
+            ("minecraft:on_fire", 0.0),
+        ] {
+            let info = registry.damage_type_info(id).unwrap();
+            assert_eq!(info.exhaustion, exhaustion, "{id}");
+            assert_eq!(info.effects, DamageEffects::Burning, "{id}");
+        }
+    }
 
     #[test]
     fn malformed_effects_do_not_look_like_absent_repair_effects() {

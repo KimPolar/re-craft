@@ -499,6 +499,7 @@ pub struct LoadedSession {
     unresolved_player_fire_contact: bool,
     player_fire_ticks: i32,
     player_visual_on_fire: bool,
+    player_silent: bool,
     burning_time_attribute: crate::player_data::SavedAttribute,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
@@ -524,6 +525,7 @@ pub struct LoadedSession {
     movement_speed_attribute: crate::player_data::SavedAttribute,
     movement_speed_cache: Option<(u64, Option<u8>, Option<u8>, [f32; 2])>,
     player_random: native_core::random::LegacyRandom,
+    player_client_random: native_core::random::LegacyRandom,
     level_random: native_core::random::LegacyRandom,
     random_tick_speed: u32,
     random_block_position: native_core::random::BlockRandomPosition,
@@ -1348,8 +1350,30 @@ impl LoadedSession {
         Arc::make_mut(&mut self.snapshot).death = self.death;
     }
 
-    fn player_fire_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) {
-        if let Err(error) = self.fall.damage(
+    fn queue_player_sound(&mut self, event: &'static str, volume: f32, pitch: f32) {
+        if self.consume_sounds.len() == 4096 {
+            self.consume_sounds.pop_front();
+        }
+        self.consume_sounds.push_back(crate::ConsumeSound {
+            position: self.origin.as_dvec3() + self.motion.position,
+            info: crate::ConsumeSoundInfo {
+                event,
+                volume,
+                pitch,
+                category: crate::ConsumeSoundCategory::Player,
+            },
+        });
+    }
+
+    fn queue_client_damage_sound(&mut self, event: &'static str) {
+        let pitch = 1.0_f32
+            + (self.player_client_random.next_float() - self.player_client_random.next_float())
+                * 0.2_f32;
+        self.queue_player_sound(event, 1.0, pitch);
+    }
+
+    fn player_fire_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
+        let outcome = match self.fall.damage_outcome(
             amount,
             source,
             &self.inventory,
@@ -1358,9 +1382,52 @@ impl LoadedSession {
             self.game_mode,
             Some(&mut self.damage_cooldown),
         ) {
-            self.stream_errors
-                .push(format!("player fire damage: {error:#}"));
-            self.unresolved_player_damage = true;
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.stream_errors
+                    .push(format!("player fire damage: {error:#}"));
+                self.unresolved_player_damage = true;
+                return false;
+            }
+        };
+        if !outcome.accepted {
+            return false;
+        }
+        if outcome.fresh_hit {
+            match self.fall.blocks_damage_knockback(source) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.stream_errors.push(format!(
+                        "player knockback from {source} is not yet simulated"
+                    ));
+                    self.unresolved_player_damage = true;
+                }
+                Err(error) => {
+                    self.stream_errors
+                        .push(format!("player damage knockback tag: {error:#}"));
+                    self.unresolved_player_damage = true;
+                }
+            }
+        }
+        if outcome.health_damage > 0.0 || outcome.fresh_hit {
+            match self.fall.damage_info(source) {
+                Ok(info) => {
+                    if outcome.health_damage > 0.0 {
+                        self.vitals.add_exhaustion(info.exhaustion);
+                    }
+                    if outcome.fresh_hit {
+                        self.queue_client_damage_sound(info.effects.player_hurt_sound());
+                    }
+                }
+                Err(error) => {
+                    self.stream_errors
+                        .push(format!("player damage type: {error:#}"));
+                    self.unresolved_player_damage = true;
+                }
+            }
+        }
+        if self.vitals.health <= 0.0 {
+            self.queue_client_damage_sound("entity.player.death");
         }
         if self.death.is_none() && self.vitals.health <= 0.0 {
             self.death = Some(DeathInfo {
@@ -1374,22 +1441,12 @@ impl LoadedSession {
             });
             self.record_last_death();
         }
+        true
     }
 
     fn play_player_extinguish_sound(&mut self) {
         let pitch = crate::extinguish_pitch(&mut self.player_random);
-        if self.consume_sounds.len() == 4096 {
-            self.consume_sounds.pop_front();
-        }
-        self.consume_sounds.push_back(crate::ConsumeSound {
-            position: self.origin.as_dvec3() + self.motion.position,
-            info: crate::ConsumeSoundInfo {
-                event: "entity.generic.extinguish_fire",
-                volume: 0.7,
-                pitch,
-                category: crate::ConsumeSoundCategory::Player,
-            },
-        });
+        self.queue_player_sound("entity.generic.extinguish_fire", 0.7, pitch);
     }
 
     fn ignite_player_for(&mut self, base_ticks: i32) {
@@ -1440,7 +1497,10 @@ impl LoadedSession {
 
     fn ignite_player_from_lava(&mut self) {
         self.ignite_player_for(300);
-        self.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava);
+        if self.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava) && !self.player_silent {
+            let pitch = 2.0_f32 + self.player_random.next_float() * 0.4_f32;
+            self.queue_player_sound("entity.generic.burn", 0.4, pitch);
+        }
     }
 
     /// Restore the independent saved experience fields before play begins.
@@ -4295,6 +4355,11 @@ impl LoadedSession {
         let inventory = crate::player_data::read_saved_player(source)?;
         let saved_fire = crate::player_data::read_saved_fire(source);
         let burning_time = crate::player_data::read_saved_burning_time_attribute(source)?;
+        let silent = source
+            .value
+            .get("Silent")
+            .and_then(crate::player_data::numeric_int)
+            .is_some_and(|value| value != 0);
         let last_death = match crate::player_data::read_last_death_location(source) {
             Ok(Some(target)) => crate::LastDeathLocation::At(target),
             Ok(None) => crate::LastDeathLocation::Absent,
@@ -4308,6 +4373,7 @@ impl LoadedSession {
         self.set_player_inventory(inventory);
         self.player_fire_ticks = i32::from(saved_fire);
         self.burning_time_attribute = burning_time;
+        self.player_silent = silent;
         Arc::make_mut(&mut self.snapshot).last_death = last_death;
         Arc::make_mut(&mut self.snapshot).tooltip_attack_base =
             crate::player_data::tooltip_attack_base(source);
@@ -4490,6 +4556,7 @@ impl LoadedSession {
             unresolved_player_fire_contact: false,
             player_fire_ticks: 0,
             player_visual_on_fire: false,
+            player_silent: false,
             burning_time_attribute: crate::player_data::SavedAttribute::with_base(1.0),
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
@@ -4519,6 +4586,7 @@ impl LoadedSession {
             )),
             movement_speed_cache: None,
             player_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
+            player_client_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             level_random: native_core::random::LegacyRandom::new(fresh_breathing_seed()),
             random_tick_speed: 3,
             random_block_position: native_core::random::BlockRandomPosition::new(
@@ -7183,6 +7251,7 @@ impl LoadedSession {
             self.oxygen_valid = true;
         }
         self.player_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
+        self.player_client_random = native_core::random::LegacyRandom::new(fresh_breathing_seed());
         self.flight = crate::physics::FlightState::default();
         self.walking_speed = 0.1;
         self.flight.flying = self.game_mode == GameMode::Spectator;
@@ -37359,6 +37428,369 @@ mod tests {
         // Drowning is processed first and suppresses the weaker starvation hit.
         assert_eq!(session.vitals.health, 14.0);
         assert_eq!(session.vitals.air, 0);
+    }
+
+    #[test]
+    fn lava_sounds_and_exhaustion_follow_damage_acceptance_and_absorption() {
+        for (silent, absorption, health) in [
+            (false, 0.0, 20.0),
+            (true, 0.0, 20.0),
+            (false, 4.0, 20.0),
+            (false, 0.0, 3.0),
+        ] {
+            let mut session = session();
+            session.player_silent = silent;
+            session.vitals.health = health;
+            session.vitals.absorption = absorption;
+            session.player_random = native_core::random::LegacyRandom::new(123);
+            session.player_client_random = native_core::random::LegacyRandom::new(456);
+            let mut expected = session.player_random.clone();
+            let mut expected_client = session.player_client_random.clone();
+            let hurt_pitch =
+                1.0_f32 + (expected_client.next_float() - expected_client.next_float()) * 0.2_f32;
+            let death_pitch = (health <= 4.0).then(|| {
+                1.0_f32 + (expected_client.next_float() - expected_client.next_float()) * 0.2_f32
+            });
+            let burn_pitch = (!silent).then(|| 2.0_f32 + expected.next_float() * 0.4_f32);
+            session.ignite_player_from_lava();
+            let sounds = session.take_consume_sounds();
+            assert_eq!(
+                sounds.len(),
+                1 + usize::from(health <= 4.0) + usize::from(!silent)
+            );
+            assert_eq!(sounds[0].info.event, "entity.player.hurt_on_fire");
+            assert_eq!(sounds[0].info.pitch.to_bits(), hurt_pitch.to_bits());
+            if let Some(death_pitch) = death_pitch {
+                assert_eq!(sounds[1].info.event, "entity.player.death");
+                assert_eq!(sounds[1].info.pitch.to_bits(), death_pitch.to_bits());
+            }
+            if !silent {
+                let burn = sounds.last().unwrap();
+                assert_eq!(burn.info.event, "entity.generic.burn");
+                assert_eq!(burn.info.pitch.to_bits(), burn_pitch.unwrap().to_bits());
+                assert_eq!(burn.info.volume.to_bits(), 0.4_f32.to_bits());
+                assert_eq!(burn.info.category, crate::ConsumeSoundCategory::Player);
+            }
+            assert_eq!(
+                session.vitals.exhaustion,
+                if absorption >= 4.0 { 0.0 } else { 0.1 }
+            );
+            assert_eq!(session.player_random.next_int(), expected.next_int());
+            assert_eq!(
+                session.player_client_random.next_int(),
+                expected_client.next_int()
+            );
+            session.ignite_player_from_lava();
+            assert!(session.take_consume_sounds().is_empty());
+        }
+
+        let mut session = session();
+        session
+            .fall
+            .damage(
+                1.0,
+                "minecraft:in_fire",
+                &session.inventory,
+                session.armor.value(),
+                &mut session.vitals,
+                session.game_mode,
+                Some(&mut session.damage_cooldown),
+            )
+            .unwrap();
+        session.ignite_player_from_lava();
+        let sounds = session.take_consume_sounds();
+        assert_eq!(
+            sounds.len(),
+            1,
+            "a stronger hit during cooldown skips the player hurt sound"
+        );
+        assert_eq!(sounds[0].info.event, "entity.generic.burn");
+        assert_eq!(session.vitals.exhaustion, 0.1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_client_damage_sounds_and_random_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerClientDamageSoundOracle.java");
+        let result = temp.path().join("sound.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerClientDamageSoundOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerClientDamageSoundOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 16);
+        for row in rows {
+            let mut test = session();
+            test.player_client_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            test.player_silent = row["silent"].as_bool().unwrap();
+            if row["dead"].as_bool().unwrap() {
+                test.vitals.health = 3.0;
+            }
+            assert!(test.player_fire_damage(4.0, "minecraft:lava", DeathCause::Lava));
+            let sounds = test.take_consume_sounds();
+            let java_sounds = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), java_sounds.len(), "{row}");
+            for (sound, expected) in sounds.iter().zip(java_sounds) {
+                assert_eq!(
+                    expected["sound"].as_str().unwrap(),
+                    format!("minecraft:{}", sound.info.event)
+                );
+                assert_eq!(expected["category"].as_str().unwrap(), "player");
+                assert_eq!(sound.info.category, crate::ConsumeSoundCategory::Player);
+                assert_eq!(
+                    sound.info.volume.to_bits(),
+                    expected["volume_bits"].as_i64().unwrap() as u32
+                );
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    expected["pitch_bits"].as_i64().unwrap() as u32
+                );
+            }
+            assert_eq!(
+                test.player_client_random.next_int(),
+                row["next"].as_i64().unwrap() as i32
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_lava_burn_sound_and_random_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerLavaSoundOracle.java");
+        let result = temp.path().join("sound.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerLavaSoundOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerLavaSoundOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 16);
+        for row in rows {
+            let mut test = session();
+            test.motion.position = DVec3::new(3.5, 7.25, -4.5) - test.origin.as_dvec3();
+            test.player_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            test.player_silent = row["silent"].as_bool().unwrap();
+            test.game_mode = if row["accepted"].as_bool().unwrap() {
+                GameMode::Survival
+            } else {
+                GameMode::Creative
+            };
+            test.ignite_player_from_lava();
+            let burn = test
+                .take_consume_sounds()
+                .into_iter()
+                .find(|sound| sound.info.event == "entity.generic.burn");
+            assert_eq!(burn.is_some(), row["called"].as_bool().unwrap(), "{row}");
+            if let Some(sound) = burn {
+                assert_eq!(
+                    row["sound"].as_str().unwrap(),
+                    format!("minecraft:{}", sound.info.event)
+                );
+                assert_eq!(row["category"].as_str().unwrap(), "player");
+                assert_eq!(sound.info.category, crate::ConsumeSoundCategory::Player);
+                assert_eq!(
+                    sound.position.to_array(),
+                    [
+                        row["x"].as_f64().unwrap(),
+                        row["y"].as_f64().unwrap(),
+                        row["z"].as_f64().unwrap()
+                    ]
+                );
+                assert_eq!(
+                    sound.info.volume.to_bits(),
+                    row["volume_bits"].as_i64().unwrap() as u32
+                );
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    row["pitch_bits"].as_i64().unwrap() as u32
+                );
+            }
+            assert_eq!(
+                test.player_random.next_int(),
+                row["next"].as_i64().unwrap() as i32
+            );
+        }
+    }
+
+    #[test]
+    fn fire_resistance_does_not_play_lava_damage_sounds_or_consume_random() {
+        let mut session = session();
+        session.fall.add_status(crate::survival::StatusApplication {
+            kind: crate::survival::FoodStatusKind::FireResistance,
+            duration: 20,
+            amplifier: 0,
+            ambient: false,
+            visible: true,
+            show_icon: true,
+        });
+        session.player_random = native_core::random::LegacyRandom::new(123);
+        let mut expected = session.player_random.clone();
+        session.ignite_player_from_lava();
+        assert!(session.take_consume_sounds().is_empty());
+        assert_eq!(session.vitals.exhaustion, 0.0);
+        assert_eq!(session.player_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn fire_damage_uses_active_data_pack_exhaustion_and_hurt_effect() {
+        use native_resources::packs::ResourceId;
+        struct Pack(bool);
+        impl native_resources::packs::ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let ids: &[&str] = match folder {
+                    "damage_type" => &["minecraft:lava"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                    ],
+                    _ => &[],
+                };
+                ids.iter().map(|id| ResourceId::parse(id)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/damage_type/lava.json" {
+                    Some(br#"{"exhaustion":0.75,"effects":"drowning"}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/no_knockback.json" && self.0 {
+                    Some(br#"{"values":["minecraft:lava"]}"#.to_vec())
+                } else if path.starts_with("data/minecraft/tags/damage_type/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack(true)).unwrap());
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            Default::default(),
+            registry,
+        );
+        session.ignite_player_from_lava();
+        assert_eq!(session.vitals.health, 16.0);
+        assert_eq!(session.vitals.exhaustion, 0.75);
+        let sounds = session.take_consume_sounds();
+        assert_eq!(sounds.len(), 2);
+        assert_eq!(sounds[0].info.event, "entity.player.hurt_drown");
+        assert_eq!(sounds[1].info.event, "entity.generic.burn");
+        assert!(!session.unresolved_player_damage);
+
+        let registry = Arc::new(OxygenEnchantments::load(&mut Pack(false)).unwrap());
+        let mut modified = self::session();
+        modified.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            Default::default(),
+            registry,
+        );
+        modified.ignite_player_from_lava();
+        assert!(modified.unresolved_player_damage);
+        assert!(
+            modified
+                .stream_errors
+                .iter()
+                .any(|error| error.contains("knockback"))
+        );
     }
 
     #[test]

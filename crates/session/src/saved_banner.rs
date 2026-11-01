@@ -8,6 +8,103 @@ use std::collections::BTreeSet;
 
 use crate::inventory::{ItemStack, saved_item_max};
 
+/// Convert a resolved banner item to the fields persisted by its block entity.
+pub(crate) fn placed(position: IVec3, item: &ItemStack) -> Result<Tag> {
+    ensure!(
+        crate::inventory::is_banner_item(item.id())
+            && item.max_count().is_some()
+            && saved_item_max(item.id(), item.components()) == item.max_count(),
+        "unsupported banner item"
+    );
+    let Tag::Compound(entries) = item.components() else {
+        bail!("invalid banner components")
+    };
+    let mut fields = vec![
+        ("id".into(), Tag::String("minecraft:banner".into())),
+        ("x".into(), Tag::Int(position.x)),
+        ("y".into(), Tag::Int(position.y)),
+        ("z".into(), Tag::Int(position.z)),
+    ];
+    let mut other = Vec::new();
+    for (name, value) in entries {
+        if name.matches("minecraft:banner_patterns") {
+            if let Tag::List { values, .. } = value
+                && !values.is_empty()
+            {
+                fields.push(("patterns".into(), value.clone()));
+            }
+        } else if name.matches("minecraft:custom_name") {
+            fields.push(("CustomName".into(), value.clone()));
+        } else if !name.0.first().is_some_and(|c| *c == u16::from(b'!')) {
+            other.push((name.clone(), value.clone()));
+        }
+    }
+    fields.push(("components".into(), Tag::Compound(other)));
+    Ok(Tag::Compound(fields))
+}
+
+/// Build a renderable session view without modifying the original chunk bytes.
+pub(crate) fn append(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    entity: &Tag,
+) -> Result<SavedBlockEntities> {
+    let coordinate = |value: &Tag, key| -> Result<i32> {
+        match unique(value, key)? {
+            Some(Tag::Int(v)) => Ok(*v),
+            _ => bail!("invalid block entity coordinate"),
+        }
+    };
+    let target = IVec3::new(
+        coordinate(entity, "x")?,
+        coordinate(entity, "y")?,
+        coordinate(entity, "z")?,
+    );
+    ensure!(
+        target.x.div_euclid(16) == chunk.x && target.z.div_euclid(16) == chunk.z,
+        "block entity outside chunk"
+    );
+    let mut values = match payload {
+        SavedBlockEntities::Unavailable => bail!("block entities unavailable"),
+        SavedBlockEntities::Empty => Vec::new(),
+        SavedBlockEntities::Encoded(bytes) => match nbt::read(bytes)?.value {
+            Tag::List {
+                element_type: TagType::Compound,
+                values,
+            } => values,
+            _ => bail!("invalid block entity list"),
+        },
+    };
+    let mut seen = BTreeSet::new();
+    for entry in &values {
+        ensure!(
+            matches!(unique(entry,"id")?, Some(Tag::String(id)) if !id.0.is_empty()),
+            "invalid block entity id"
+        );
+        let p = IVec3::new(
+            coordinate(entry, "x")?,
+            coordinate(entry, "y")?,
+            coordinate(entry, "z")?,
+        );
+        ensure!(
+            p.x.div_euclid(16) == chunk.x
+                && p.z.div_euclid(16) == chunk.z
+                && seen.insert(p.to_array())
+                && p != target,
+            "occupied or invalid block entity position"
+        );
+    }
+    values.push(entity.clone());
+    let bytes = nbt::write(&nbt::NamedTag {
+        name: "".into(),
+        value: Tag::List {
+            element_type: TagType::Compound,
+            values,
+        },
+    })?;
+    Ok(SavedBlockEntities::Encoded(bytes.into()))
+}
+
 fn unique<'a>(tag: &'a Tag, key: &str) -> Result<Option<&'a Tag>> {
     let Tag::Compound(fields) = tag else {
         bail!("block entity is not a compound")
@@ -153,6 +250,30 @@ mod tests {
     }
 
     #[test]
+    fn placement_rejects_unavailable_occupied_and_malformed_sources() {
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let pos = IVec3::ZERO;
+        let item = ItemStack::new(
+            "minecraft:white_banner".into(),
+            1,
+            16,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        let entity = placed(pos, &item).unwrap();
+        assert!(append(&SavedBlockEntities::Unavailable, chunk, &entity).is_err());
+        assert!(append(&payload(vec![entity.clone()]), chunk, &entity).is_err());
+        let invalid = Tag::Compound(vec![
+            ("x".into(), Tag::Int(1)),
+            ("y".into(), Tag::Int(0)),
+            ("z".into(), Tag::Int(0)),
+        ]);
+        assert!(append(&payload(vec![invalid]), chunk, &entity).is_err());
+        let visible = append(&SavedBlockEntities::Empty, chunk, &entity).unwrap();
+        assert!(pick_item(&visible, chunk, pos, "minecraft:white_banner".into()).is_ok());
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn saved_banner_picks_and_shapes_match_java() {
@@ -244,6 +365,10 @@ mod tests {
                 item.components().get("minecraft:custom_name"),
                 entity.get("CustomName")
             );
+            let placed = placed(IVec3::ZERO, &item).unwrap();
+            for key in ["id", "x", "y", "z", "patterns", "CustomName", "components"] {
+                assert_eq!(placed.get(key), entity.get(key), "{key}: {row}");
+            }
             let Some(Tag::List { values, .. }) = item.components().get("minecraft:banner_patterns")
             else {
                 panic!()

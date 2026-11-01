@@ -531,6 +531,7 @@ pub struct LoadedSession {
     chest_contents: BTreeMap<(i32, i32, i32), crate::saved_chest::SavedChest>,
     placed_chests: BTreeSet<(i32, i32, i32)>,
     removed_chests: BTreeSet<(i32, i32, i32)>,
+    placed_banners: BTreeMap<(i32, i32, i32), native_persistence::nbt::Tag>,
     chest_lids: crate::chest_lid::ChestLids,
     chest_dirty_chunks: BTreeSet<ChunkPos>,
     open_trapped_chests: BTreeSet<(i32, i32, i32)>,
@@ -2665,6 +2666,7 @@ impl LoadedSession {
             self.stage_chest_inventories(position, original, &mut draft)?;
         }
         self.stage_chest_lifecycle(position, original, &mut draft)?;
+        self.stage_banner_lifecycle(position, original, &mut draft)?;
         Ok(draft)
     }
 
@@ -3131,6 +3133,44 @@ impl LoadedSession {
             changes.push(BlockEntityMutation {
                 expected,
                 replacement,
+            });
+        }
+        draft.stage_block_entity_mutations(&changes)
+    }
+
+    fn stage_banner_lifecycle(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        draft: &mut native_persistence::edit::ChunkDraft,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use native_persistence::edit::BlockEntityMutation;
+        let mut changes = Vec::new();
+        for (&(x, y, z), entity) in &self.placed_banners {
+            if x.div_euclid(16) != position.x || z.div_euclid(16) != position.z {
+                continue;
+            }
+            ensure!(
+                draft.matches_source(original)?,
+                "chunk draft source differs"
+            );
+            let edit = self
+                .block_edits
+                .get(&position)
+                .and_then(|edits| edits.get(&(x, y, z)))
+                .context("banner block edit is unavailable")?;
+            let state = self
+                .world
+                .state(edit.current)
+                .context("banner state is unavailable")?;
+            ensure!(
+                native_world::collision::banner_item_id(state).is_some(),
+                "placed banner block is missing"
+            );
+            changes.push(BlockEntityMutation {
+                expected: None,
+                replacement: Some(entity.clone()),
             });
         }
         draft.stage_block_entity_mutations(&changes)
@@ -4025,6 +4065,7 @@ impl LoadedSession {
             chest_contents: BTreeMap::new(),
             placed_chests: BTreeSet::new(),
             removed_chests: BTreeSet::new(),
+            placed_banners: BTreeMap::new(),
             chest_lids: crate::chest_lid::ChestLids::default(),
             chest_dirty_chunks: BTreeSet::new(),
             open_trapped_chests: BTreeSet::new(),
@@ -6815,6 +6856,7 @@ impl LoadedSession {
                         respawn_changed = true;
                     } else {
                         world.saved_block_entities.remove(&pos);
+                        world.live_block_entities.remove(&pos);
                         self.poi_chunks.remove(&pos);
                         if !retained_entities.contains(&pos)
                             && self.entity_chunks.remove(&pos).is_some()
@@ -6888,6 +6930,9 @@ impl LoadedSession {
             self.poi_chunks.remove(&pos);
             Arc::make_mut(&mut self.world)
                 .saved_block_entities
+                .remove(&pos);
+            Arc::make_mut(&mut self.world)
+                .live_block_entities
                 .remove(&pos);
             if !self.retain_entity_chunk(pos) {
                 self.entity_chunks.remove(&pos);
@@ -8392,6 +8437,87 @@ impl LoadedSession {
                 return None;
             }
         }
+        Some(hand)
+    }
+
+    fn place_banner(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?.clone();
+        if !crate::inventory::is_banner_item(held.id()) || held.max_count().is_none() {
+            return None;
+        }
+        let Cell::State(clicked) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            hit.position,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let replace = button_can_replace(self.world.state(clicked)?)?;
+        let target = if replace {
+            hit.position
+        } else {
+            add(hit.position, hit.face)?
+        };
+        let Cell::State(old) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        if button_can_replace(self.world.state(old)?) != Some(true) {
+            return None;
+        }
+        let absolute = add(self.origin, target)?;
+        let chunk = ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        };
+        let entity = crate::saved_banner::placed(absolute, &held).ok()?;
+        let visible =
+            crate::saved_banner::append(self.world.visible_block_entities(&chunk)?, chunk, &entity)
+                .ok()?;
+        let placed = banner_placement(
+            held.id(),
+            self.player.yaw,
+            self.player.pitch,
+            hit.face,
+            replace,
+            |direction| {
+                let neighbor = add(target, direction)?;
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    neighbor,
+                    self.states[0],
+                ) else {
+                    return None;
+                };
+                let block = self.world.state(id)?;
+                known_soil_cover(&block.name).or_else(|| {
+                    self.vanilla_block_ids
+                        .as_ref()?
+                        .contains(&block.name)
+                        .then(|| native_world::collision::slab_stair_solid(block))
+                        .flatten()
+                })
+            },
+        )?;
+        let id = self.intern_block(placed);
+        if !self.set(target, id) {
+            return None;
+        }
+        self.placed_banners
+            .insert((absolute.x, absolute.y, absolute.z), entity);
+        Arc::make_mut(&mut self.world)
+            .live_block_entities
+            .insert(chunk, visible);
         Some(hand)
     }
 
@@ -10209,6 +10335,32 @@ impl LoadedSession {
         let Some(replacement_state) = self.world.state(id).cloned() else {
             return false;
         };
+        // Removing a banner or its support also requires the block entity and
+        // loot lifecycle. Until that is modeled, keep both changes atomic.
+        if original_state
+            .as_ref()
+            .and_then(native_world::collision::banner_item_id)
+            .is_some()
+        {
+            return false;
+        }
+        if original_state.as_ref().is_none_or(|state| {
+            known_soil_cover(&state.name)
+                .or_else(|| native_world::collision::slab_stair_solid(state))
+                != Some(false)
+        }) && known_soil_cover(&replacement_state.name)
+            .or_else(|| native_world::collision::slab_stair_solid(&replacement_state))
+            != Some(true)
+        {
+            for offset in [IVec3::Y, IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z] {
+                if let Some(neighbor) = add(pos, offset)
+                    && let Some(state) = self.world.block(neighbor.x, neighbor.y, neighbor.z)
+                    && banner_support_direction(state) == Some(-offset)
+                {
+                    return false;
+                }
+            }
+        }
         let poi_position = BlockPosition {
             x: pos.x,
             y: pos.y,
@@ -12493,7 +12645,7 @@ impl LoadedSession {
                                         z: position.z.div_euclid(16),
                                     };
                                     crate::saved_banner::pick_item(
-                                        self.world.saved_block_entities.get(&chunk)?,
+                                        self.world.visible_block_entities(&chunk)?,
                                         chunk,
                                         position,
                                         item_id,
@@ -12671,6 +12823,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_snow_block(hit))
                                     .or_else(|| self.place_lodestone(hit))
                                     .or_else(|| self.place_chest(hit))
+                                    .or_else(|| self.place_banner(hit))
                                     .or_else(|| self.place_slab(hit))
                                     .or_else(|| self.place_stairs(hit))
                             {
@@ -14532,6 +14685,9 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
 /// These default block behaviors were checked with a stone-button placement
 /// context. Other replaceable states can have item-specific rules.
 fn button_can_replace(block: &BlockState) -> Option<bool> {
+    if native_world::collision::banner_item_id(block).is_some() {
+        return Some(false);
+    }
     if block.name == "minecraft:snow" {
         return native_world::collision::snow_layers(block).map(|layers| layers == 1);
     }
@@ -14580,6 +14736,64 @@ fn button_can_replace(block: &BlockState) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+fn banner_placement(
+    item: &str,
+    yaw: f32,
+    pitch: f32,
+    face: IVec3,
+    replace: bool,
+    mut solid: impl FnMut(IVec3) -> Option<bool>,
+) -> Option<BlockState> {
+    if !crate::inventory::is_banner_item(item) {
+        return None;
+    }
+    let directions = button_placement_directions(yaw, pitch, face, replace)?;
+    for direction in directions {
+        if direction == IVec3::Y {
+            continue;
+        }
+        if direction == IVec3::NEG_Y {
+            if solid(IVec3::NEG_Y)? {
+                let java_rotation = (yaw.to_degrees() - 180.0) + 180.0;
+                let rotation = ((java_rotation * (16.0_f32 / 360.0) + 0.5).floor() as i32) & 15;
+                return Some(state(item, &[("rotation", &rotation.to_string())]));
+            }
+        } else {
+            for support in directions.into_iter().filter(|v| v.y == 0) {
+                if solid(support)? {
+                    let facing = -support;
+                    let facing = if facing == IVec3::X {
+                        "east"
+                    } else if facing == IVec3::NEG_X {
+                        "west"
+                    } else if facing == IVec3::Z {
+                        "south"
+                    } else {
+                        "north"
+                    };
+                    let wall = item.strip_suffix("_banner")?.to_owned() + "_wall_banner";
+                    return Some(state(&wall, &[("facing", facing)]));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn banner_support_direction(state: &BlockState) -> Option<IVec3> {
+    native_world::collision::banner_item_id(state)?;
+    if !state.name.ends_with("_wall_banner") {
+        return Some(IVec3::NEG_Y);
+    }
+    Some(match state.properties.get("facing")?.as_str() {
+        "north" => IVec3::Z,
+        "south" => IVec3::NEG_Z,
+        "east" => IVec3::NEG_X,
+        "west" => IVec3::X,
+        _ => return None,
+    })
 }
 
 fn ordinary_can_replace(block: &BlockState) -> Option<bool> {
@@ -26881,6 +27095,354 @@ mod tests {
                 .id(),
             "minecraft:stone"
         );
+    }
+
+    #[test]
+    fn banner_input_preserves_components_snapshot_and_staged_chunk() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::{self, Tag, TagType};
+        use native_world::loaded::SavedBlockEntities;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                let mut session = session();
+                let chunk = session.player_chunk().unwrap();
+                Arc::make_mut(&mut session.world)
+                    .saved_block_entities
+                    .insert(chunk, SavedBlockEntities::Empty);
+                let patterns = Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("pattern".into(), Tag::String("minecraft:cross".into())),
+                        ("color".into(), Tag::String("blue".into())),
+                    ])],
+                };
+                let components = Tag::Compound(vec![
+                    ("minecraft:banner_patterns".into(), patterns.clone()),
+                    ("minecraft:custom_name".into(), Tag::String("Named".into())),
+                    (
+                        "minecraft:custom_data".into(),
+                        Tag::Compound(vec![("future".into(), Tag::Int(42))]),
+                    ),
+                ]);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:red_banner".into(), 2, 16, components.clone()),
+                );
+                session.set_player_inventory(inventory);
+                session.set_game_mode(mode);
+                let before = session.snapshot();
+                let source = fixture_chunk_document(chunk);
+                let source_bytes = nbt::write(&source).unwrap();
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let position = session.origin + IVec3::new(8, 2, 7);
+                let state = session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap();
+                if mode == GameMode::Adventure {
+                    assert_eq!(state.name, "minecraft:air");
+                    assert_eq!(session.inventory.slot(hand).unwrap().count(), 2);
+                    continue;
+                }
+                assert_eq!(state.name, "minecraft:red_wall_banner");
+                assert_eq!(state.properties.get("facing").unwrap(), "south");
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Creative { 2 } else { 1 }
+                );
+                assert!(matches!(
+                    before.world.loaded().unwrap().saved_block_entities[&chunk],
+                    SavedBlockEntities::Empty
+                ));
+                assert!(
+                    before
+                        .world
+                        .loaded()
+                        .unwrap()
+                        .live_block_entities
+                        .is_empty()
+                );
+                assert!(matches!(
+                    session.world.saved_block_entities[&chunk],
+                    SavedBlockEntities::Empty
+                ));
+                let picked = crate::saved_banner::pick_item(
+                    session.world.visible_block_entities(&chunk).unwrap(),
+                    chunk,
+                    position,
+                    "minecraft:red_banner".into(),
+                )
+                .unwrap();
+                for key in [
+                    "minecraft:banner_patterns",
+                    "minecraft:custom_name",
+                    "minecraft:custom_data",
+                ] {
+                    assert_eq!(picked.components().get(key), components.get(key));
+                }
+                let entity = session.placed_banners[&(position.x, position.y, position.z)].clone();
+                assert_eq!(entity.get("patterns"), Some(&patterns));
+                assert_eq!(entity.get("CustomName"), Some(&Tag::String("Named".into())));
+                assert_eq!(
+                    entity
+                        .get("components")
+                        .unwrap()
+                        .get("minecraft:custom_data"),
+                    components.get("minecraft:custom_data")
+                );
+                let mut draft = session.draft_changed_chunk(chunk, &source).unwrap();
+                session
+                    .stage_banner_lifecycle(chunk, &source, &mut draft)
+                    .unwrap();
+                struct BannerTags;
+                impl native_resources::packs::ResourceProvider for BannerTags {
+                    fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                        Ok(None)
+                    }
+                    fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                        Ok(vec![br#"{"values":["minecraft:stone"]}"#.to_vec()])
+                    }
+                }
+                let tags = HeightmapTags::load(
+                    &mut BannerTags,
+                    &BTreeSet::from([
+                        "minecraft:air".into(),
+                        "minecraft:stone".into(),
+                        "minecraft:red_wall_banner".into(),
+                    ]),
+                )
+                .unwrap();
+                let combined = session
+                    .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                        chunk,
+                        &source,
+                        &tags,
+                        |state| Ok((state.name.matches("minecraft:air"), false)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    combined.document().value.get("block_entities"),
+                    draft.document().value.get("block_entities")
+                );
+                assert!(
+                    matches!(draft.document().value.get("block_entities"),Some(Tag::List { values, .. }) if values==&vec![entity.clone()])
+                );
+                assert_eq!(nbt::write(&source).unwrap(), source_bytes);
+                let support = IVec3::new(8, 2, 6);
+                assert!(!session.set(support, session.states[0]));
+                let mut stale = source.clone();
+                let Tag::Compound(fields) = &mut stale.value else {
+                    panic!()
+                };
+                fields.push((
+                    "block_entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![entity.clone()],
+                    },
+                ));
+                let mut stale_draft = session.draft_changed_chunk(chunk, &stale).unwrap();
+                let before = stale_draft.document().clone();
+                assert!(
+                    session
+                        .stage_banner_lifecycle(chunk, &stale, &mut stale_draft)
+                        .is_err()
+                );
+                assert_eq!(stale_draft.document(), &before);
+                session.queue_chunk_window(
+                    ChunkPos {
+                        x: chunk.x + 3,
+                        z: chunk.z,
+                    },
+                    0,
+                );
+                session.apply_streaming();
+                assert!(session.parked_chunks.contains_key(&chunk));
+                session.queue_chunk_window(chunk, 0);
+                session.apply_streaming();
+                let picked = crate::saved_banner::pick_item(
+                    session.world.visible_block_entities(&chunk).unwrap(),
+                    chunk,
+                    position,
+                    "minecraft:red_banner".into(),
+                )
+                .unwrap();
+                assert_eq!(
+                    picked.components().get("minecraft:banner_patterns"),
+                    Some(&patterns)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn banner_placement_on_floor_uses_rotation_and_rejects_unavailable_entities() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::SavedBlockEntities;
+        let mut session = session();
+        let chunk = session.player_chunk().unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:white_banner".into(),
+                1,
+                16,
+                Tag::Compound(vec![]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        let hit = ShapeRayHit {
+            position: IVec3::new(4, 0, 4),
+            face: IVec3::Y,
+            location: DVec3::new(4.5, 1.0, 4.5),
+            inside: false,
+        };
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Unavailable);
+        assert!(session.place_banner(hit).is_none());
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        session.player.yaw = 45.0_f32.to_radians();
+        assert_eq!(session.place_banner(hit), Some(PlayerSlot::Storage(0)));
+        let absolute = session.origin + IVec3::new(4, 1, 4);
+        let block = session
+            .world
+            .block(absolute.x, absolute.y, absolute.z)
+            .unwrap();
+        assert_eq!(block.name, "minecraft:white_banner");
+        assert_eq!(block.properties["rotation"], "2");
+        assert!(!session.set(IVec3::new(4, 0, 4), session.states[0]));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn banner_placement_matches_java_direction_and_support_order() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BannerPlacementOracle.java");
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BannerPlacementOracle.java"),
+        )
+        .unwrap();
+        let directions = [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ];
+        let name = |d: IVec3| match d {
+            IVec3::NEG_Y => "DOWN",
+            IVec3::Y => "UP",
+            IVec3::NEG_Z => "NORTH",
+            IVec3::Z => "SOUTH",
+            IVec3::NEG_X => "WEST",
+            IVec3::X => "EAST",
+            _ => unreachable!(),
+        };
+        let supports = [IVec3::NEG_Y, IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        let mut rows = Vec::new();
+        let mut cases = Vec::new();
+        for degrees in [-180.0_f32, -101.25, -90.0, -11.25, 0.0, 11.25, 45.0, 180.0] {
+            for pitch in [-60.0_f32, 0.0, 60.0] {
+                for face in directions {
+                    for replace in [false, true] {
+                        for mask in 0..32_u8 {
+                            let yaw = degrees.to_radians();
+                            let pitch = pitch.to_radians();
+                            let order =
+                                button_placement_directions(yaw, pitch, face, replace).unwrap();
+                            rows.push(serde_json::json!({"rotation":yaw.to_degrees()-180.0,"directions":order.map(name),"supports":supports.iter().enumerate().filter_map(|(i,d)|((mask&(1<<i))!=0).then_some(name(*d))).collect::<Vec<_>>()}));
+                            cases.push((yaw, pitch, face, replace, mask));
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(&input, serde_json::to_vec(&rows).unwrap()).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BannerPlacementOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), cases.len());
+        for ((yaw, pitch, face, replace, mask), expected) in cases.into_iter().zip(expected) {
+            let actual = banner_placement(
+                "minecraft:white_banner",
+                yaw,
+                pitch,
+                face,
+                replace,
+                |direction| {
+                    Some(
+                        supports
+                            .iter()
+                            .enumerate()
+                            .any(|(i, d)| *d == direction && (mask & (1 << i)) != 0),
+                    )
+                },
+            );
+            if expected.is_null() {
+                assert!(
+                    actual.is_none(),
+                    "yaw={yaw} pitch={pitch} face={face:?} replace={replace} mask={mask}"
+                );
+            } else {
+                let actual = actual.unwrap();
+                assert_eq!(actual.name, expected["id"].as_str().unwrap());
+                let properties: BTreeMap<String, String> =
+                    serde_json::from_value(expected["properties"].clone()).unwrap();
+                assert_eq!(
+                    actual.properties, properties,
+                    "yaw={yaw} pitch={pitch} face={face:?} replace={replace} mask={mask}"
+                );
+            }
+        }
     }
 
     #[test]

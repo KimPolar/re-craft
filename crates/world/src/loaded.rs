@@ -194,10 +194,18 @@ pub struct World {
     pub saved_fluid_ticks: BTreeMap<ChunkPos, Vec<SavedFluidTick>>,
     pub saved_block_ticks: BTreeMap<ChunkPos, Vec<SavedBlockTick>>,
     pub saved_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
+    /// Session changes visible to snapshots; the saved source remains unchanged
+    /// so a later draft can check it for concurrent edits.
+    pub live_block_entities: BTreeMap<ChunkPos, SavedBlockEntities>,
     block_edits: Arc<BTreeMap<BlockPosition, BlockEdit>>,
 }
 
 impl World {
+    pub fn visible_block_entities(&self, pos: &ChunkPos) -> Option<&SavedBlockEntities> {
+        self.live_block_entities
+            .get(pos)
+            .or_else(|| self.saved_block_entities.get(pos))
+    }
     pub fn new(dimension: impl Into<String>) -> Self {
         Self {
             dimension: dimension.into(),
@@ -409,6 +417,11 @@ impl World {
             self.saved_block_entities.insert(pos, entities.clone());
         } else {
             self.saved_block_entities.remove(&pos);
+        }
+        if let Some(entities) = source.live_block_entities.get(&pos) {
+            self.live_block_entities.insert(pos, entities.clone());
+        } else {
+            self.live_block_entities.remove(&pos);
         }
         Ok(true)
     }

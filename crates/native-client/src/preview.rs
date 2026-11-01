@@ -1078,7 +1078,7 @@ impl IncrementalPreview {
                 !Arc::ptr_eq(&old.chunk, chunk)
                     || !same_entity_data(
                         old.entity_data.as_ref(),
-                        world.saved_block_entities.get(&pos),
+                        world.visible_block_entities(&pos),
                     )
             }) {
                 let (states, biomes) = chunk_usage(chunk);
@@ -1096,7 +1096,7 @@ impl IncrementalPreview {
                         chunk: Arc::clone(chunk),
                         states,
                         biomes,
-                        entity_data: world.saved_block_entities.get(&pos).cloned(),
+                        entity_data: world.visible_block_entities(&pos).cloned(),
                         banners,
                     },
                 );
@@ -1861,8 +1861,9 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&repeated.chunks[&pos], &unchanged.chunks[&pos]));
         assert_eq!(repeated.material_generation, unchanged.material_generation);
+        let original = world.saved_block_entities[&pos].clone();
         world
-            .saved_block_entities
+            .live_block_entities
             .insert(pos, payload("minecraft:stripe_bottom"));
         let changed = incremental
             .prepare(&world, &mut resources, IVec3::ZERO, 1024)
@@ -1870,6 +1871,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.chunks[&pos], &changed.chunks[&pos]));
         assert_ne!(first.material_generation, changed.material_generation);
         assert_ne!(first.atlas.texture.rgba, changed.atlas.texture.rgba);
+        assert_eq!(world.saved_block_entities[&pos], original);
         let full = PreviewScene::prepare(&world, &mut resources, IVec3::ZERO, 1024).unwrap();
         assert_eq!(
             changed.opaque_len() + changed.translucent_len() * 6,

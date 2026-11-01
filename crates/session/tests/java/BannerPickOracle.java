@@ -30,6 +30,7 @@ public class BannerPickOracle {
         var entity=new BannerBlockEntity(BlockPos.ZERO,state);
         var stack=new ItemStack(BuiltInRegistries.ITEM.getValue(Identifier.parse("minecraft:"+color+"_banner")));
         stack.set(DataComponents.BANNER_PATTERNS,patterns); stack.set(DataComponents.CUSTOM_NAME,Component.literal("Named banner"));
+        if(face.equals("north")) { var data=new CompoundTag(); data.putInt("future",42); stack.set(DataComponents.CUSTOM_DATA,net.minecraft.world.item.component.CustomData.of(data)); }
         entity.applyComponentsFromItemStack(stack);
         var saved=entity.saveWithFullMetadata(lookup); entities.put(color+"_"+face,saved);
         var picked=entity.getItem(); var row=new JsonObject();

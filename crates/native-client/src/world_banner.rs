@@ -16,7 +16,7 @@ pub struct Appearance {
 }
 
 pub fn scan(world: &World, chunk: ChunkPos) -> Result<BTreeMap<[i32; 3], Appearance>> {
-    let Some(SavedBlockEntities::Encoded(bytes)) = world.saved_block_entities.get(&chunk) else {
+    let Some(SavedBlockEntities::Encoded(bytes)) = world.visible_block_entities(&chunk) else {
         return Ok(BTreeMap::new());
     };
     let document = nbt::read(bytes)?;

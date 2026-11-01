@@ -416,19 +416,27 @@ impl Loader {
     }
 
     pub(crate) fn load_large_smoke_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
+        self.load_particle_sprites("large_smoke")
+    }
+
+    pub(crate) fn load_bubble_sprites(&mut self) -> Result<Vec<Arc<RgbaImage>>> {
+        self.load_particle_sprites("bubble")
+    }
+
+    fn load_particle_sprites(&mut self, name: &str) -> Result<Vec<Arc<RgbaImage>>> {
         let bytes = self
             .stack
-            .read_asset("assets/minecraft/particles/large_smoke.json")?
-            .context("missing large smoke particle definition")?;
-        let definition: Value =
-            serde_json::from_slice(&bytes).context("invalid large smoke particle definition")?;
+            .read_asset(&format!("assets/minecraft/particles/{name}.json"))?
+            .with_context(|| format!("missing {name} particle definition"))?;
+        let definition: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid {name} particle definition"))?;
         let textures = definition
             .get("textures")
             .and_then(Value::as_array)
-            .context("missing large smoke textures")?;
+            .with_context(|| format!("missing {name} textures"))?;
         ensure!(
             !textures.is_empty() && textures.len() <= 256,
-            "invalid large smoke texture count"
+            "invalid {name} texture count"
         );
         textures
             .iter()
@@ -1376,6 +1384,34 @@ mod tests {
             [7, 11, 13, 255]
         );
         assert_eq!(selected.len(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn bubble_sprites_follow_particle_definition_and_pack() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let sprites = open_loader(&game, &[]).load_bubble_sprites().unwrap();
+        assert_eq!(sprites.len(), 1);
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("particles")).unwrap();
+        std::fs::create_dir_all(base.join("textures/particle")).unwrap();
+        std::fs::write(
+            base.join("particles/bubble.json"),
+            br#"{"textures":["minecraft:test_bubble","minecraft:test_bubble"]}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(4, 4, image::Rgba([7, 11, 13, 255]))
+            .save(base.join("textures/particle/test_bubble.png"))
+            .unwrap();
+        let sprites = open_loader(&game, &[pack.path().to_path_buf()])
+            .load_bubble_sprites()
+            .unwrap();
+        assert_eq!(sprites.len(), 2);
+        assert!(Arc::ptr_eq(&sprites[0], &sprites[1]));
+        assert_eq!(sprites[0].get_pixel(0, 0).0, [7, 11, 13, 255]);
     }
 
     #[test]

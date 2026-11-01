@@ -173,6 +173,9 @@ pub struct GameUi {
     smoke_particles: crate::smoke_particles::SmokeSystem,
     smoke_sprites: Option<Vec<Arc<image::RgbaImage>>>,
     smoke_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
+    bubble_particles: crate::bubble_particles::BubbleSystem,
+    bubble_sprites: Option<Vec<Arc<image::RgbaImage>>>,
+    bubble_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
     hud_hidden: bool,
@@ -220,6 +223,7 @@ impl GameUi {
     pub fn new(assets: Arc<MenuAssets>) -> Self {
         let skin = Arc::clone(&assets.player_skin);
         let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (bubble_sender, bubble_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (plant_sender, plant_sprite_result) = std::sync::mpsc::sync_channel(1);
         let smoke_loader = Arc::clone(&assets.item_models);
         let plant_loader = Arc::clone(&assets.item_models);
@@ -238,16 +242,25 @@ impl GameUi {
             });
         let _ = std::thread::Builder::new()
             .name("particle-sprite-loader".into())
-            .spawn(move || {
-                let result = smoke_loader
-                    .lock()
-                    .map_err(|_| "particle resource loader is unavailable".to_owned())
-                    .and_then(|mut loader| {
+            .spawn(move || match smoke_loader.lock() {
+                Ok(mut loader) => {
+                    let _ = smoke_sender.send(
                         loader
                             .load_large_smoke_sprites()
-                            .map_err(|error| format!("{error:#}"))
-                    });
-                let _ = smoke_sender.send(result);
+                            .map_err(|error| format!("{error:#}")),
+                    );
+                    let _ = bubble_sender.send(
+                        loader
+                            .load_bubble_sprites()
+                            .map_err(|error| format!("{error:#}")),
+                    );
+                }
+                Err(_) => {
+                    let _ = smoke_sender
+                        .send(Err("particle resource loader is unavailable".to_owned()));
+                    let _ = bubble_sender
+                        .send(Err("particle resource loader is unavailable".to_owned()));
+                }
             });
         let mut held_models = ItemModelCache::new(Arc::clone(&assets.item_models));
         // Falling blocks can appear immediately after a world starts. Request
@@ -271,6 +284,9 @@ impl GameUi {
             smoke_particles: crate::smoke_particles::SmokeSystem::default(),
             smoke_sprites: None,
             smoke_sprite_result,
+            bubble_particles: crate::bubble_particles::BubbleSystem::default(),
+            bubble_sprites: None,
+            bubble_sprite_result,
             armor_models,
             paused: false,
             hud_hidden: false,
@@ -344,6 +360,31 @@ impl GameUi {
         bursts: Vec<native_session::loaded::HoneyParticleBurst>,
     ) {
         self.consume_particles.queue_honey_particles(bursts);
+    }
+
+    pub fn update_drown_particles(
+        &mut self,
+        snapshot: &native_session::WorldSnapshot,
+        spawns: Vec<native_session::loaded::DrownParticleSpawn>,
+    ) {
+        self.bubble_particles.enqueue(spawns);
+        if self.bubble_sprites.is_none() {
+            match self.bubble_sprite_result.try_recv() {
+                Ok(Ok(sprites)) => self.bubble_sprites = Some(sprites),
+                Ok(Err(error)) => {
+                    eprintln!("Cannot load bubble sprites: {error}");
+                    self.bubble_sprites = Some(Vec::new());
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.bubble_sprites = Some(Vec::new())
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(sprites) = &self.bubble_sprites {
+            self.bubble_particles
+                .update(snapshot.tick, &snapshot.world, sprites.len());
+        }
     }
 
     pub fn update_evaporation_smoke(
@@ -2108,6 +2149,33 @@ impl GameUi {
                     size: particle.display_size(partial),
                     uv: [0.0, 0.0, 1.0, 1.0],
                     color: [particle.color; 3],
+                    opaque: true,
+                    texture: Arc::clone(texture),
+                    light,
+                });
+            }
+        }
+        if let Some(sprites) = &self.bubble_sprites {
+            for particle in self.bubble_particles.particles() {
+                let Some(texture) = sprites.get(particle.sprite) else {
+                    continue;
+                };
+                let light = match &snapshot.world {
+                    native_session::SessionWorld::Demo(_) => u32::MAX,
+                    native_session::SessionWorld::Loaded(world) => {
+                        let cell = particle.position.floor().as_ivec3();
+                        u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                            + 16 * u32::from(
+                                world.light(cell.x, cell.y, cell.z, true).unwrap_or(15),
+                            )
+                    }
+                };
+                particle_draws.push(crate::consume_particle_render::RenderParticle {
+                    previous: particle.previous,
+                    position: particle.position,
+                    size: particle.size,
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    color: [1.0; 3],
                     opaque: true,
                     texture: Arc::clone(texture),
                     light,

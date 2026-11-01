@@ -7,6 +7,7 @@ mod audio;
 mod banner_item;
 mod blur_ui;
 mod breaking_render;
+mod bubble_particles;
 mod chat_hud;
 mod chat_input;
 mod chest_model;

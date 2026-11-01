@@ -1812,28 +1812,9 @@ impl ItemEntities {
         Ok(())
     }
 
-    pub(crate) fn drop_prepared_block_entity_items(
-        &mut self,
-        position: IVec3,
-        drops: Vec<Drop>,
-        components: &[Tag],
-        enabled: bool,
-    ) {
-        if enabled {
-            self.spawn_drops(
-                position,
-                IVec3::ZERO,
-                DropStrategy::FromMiddle,
-                drops,
-                None,
-                Some(components),
-            );
-        }
-    }
-
     /// `Block.popResource` uses the level RNG for the three position samples,
     /// including when the block-drops rule suppresses entity creation.
-    pub(crate) fn drop_chest_block_loot(
+    pub(crate) fn drop_prepared_block_entity_items(
         &mut self,
         position: IVec3,
         drops: Vec<Drop>,
@@ -5586,7 +5567,7 @@ mod tests {
             for enabled in [false, true] {
                 let mut block_random = random.clone();
                 let mut block_items = ItemEntities::default();
-                block_items.drop_chest_block_loot(
+                block_items.drop_prepared_block_entity_items(
                     pos,
                     vec![Drop {
                         item: native_resources::packs::ResourceId::parse("minecraft:chest")

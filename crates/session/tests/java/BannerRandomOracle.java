@@ -18,6 +18,11 @@ import net.minecraft.world.level.storage.loot.*;
 import net.minecraft.world.level.storage.loot.parameters.LootContextParams;
 
 public class BannerRandomOracle {
+  static class World extends net.minecraft.client.multiplayer.ClientLevel {
+    net.minecraft.util.RandomSource seeded;
+    World() { super(null,null,null,null,0,0,null,false,0L,0); }
+    @Override public net.minecraft.util.RandomSource getRandom() { return seeded; }
+  }
   public static void main(String[] args) throws Exception {
     net.minecraft.SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var registries=VanillaRegistries.createReloadableLookup(VanillaRegistries.createWorldLookup());
@@ -25,9 +30,13 @@ public class BannerRandomOracle {
     var json=JsonParser.parseString(Files.readString(Path.of(args[0])));
     var table=LootTable.DIRECT_CODEC.parse(RegistryOps.create(JsonOps.INSTANCE,registries),json).getOrThrow();
     var ctor=LootContext.class.getDeclaredConstructors()[0]; ctor.setAccessible(true);
+    var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
+    var unsafe=(sun.misc.Unsafe)field.get(null);
     var output=new JsonArray();
     for(long seed:new long[]{0,1,42,-17}) for(int step=0;step<5;step++) {
       var random=new RandomSequence(seed,Identifier.parse("example:banner")).random();
+      var world=(World)unsafe.allocateInstance(World.class);
+      world.seeded=new net.minecraft.world.level.levelgen.LegacyRandomSource(9182);
       var items=new ArrayList<ItemStack>();
       for(int n=0;n<=step;n++) {
         var state=Blocks.BANNER.white().defaultBlockState();
@@ -37,10 +46,11 @@ public class BannerRandomOracle {
         var params=new LootParams(null,ContextMap.builder().set(LootContextParams.BLOCK_ENTITY,entity).set(LootContextParams.BLOCK_STATE,state).set(LootContextParams.TOOL,ItemStack.EMPTY).build(),Map.of(),0.0f);
         var context=(LootContext)ctor.newInstance(params,random,registries);
         items.clear(); table.getRandomItemsRaw(context,items::add);
+        for(var item:items) Block.popResource(world,BlockPos.ZERO,item);
       }
       var row=new JsonObject(); row.addProperty("seed",seed); row.addProperty("step",step); row.addProperty("drop",!items.isEmpty());
       if(!items.isEmpty()) row.addProperty("name",items.get(0).get(DataComponents.CUSTOM_NAME).getString());
-      row.addProperty("next",random.nextLong()); output.add(row);
+      row.addProperty("next",random.nextLong()); row.addProperty("levelNext",world.seeded.nextDouble()); output.add(row);
     }
     Files.writeString(Path.of(args[1]),output.toString());
   }

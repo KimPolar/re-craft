@@ -10120,7 +10120,7 @@ impl LoadedSession {
             let ((drops, prepared), _) = self
                 .stage_block_entity_loot(&block.name, &block, hand.as_ref(), true, &components)
                 .expect("preflighted chest loot remains evaluable");
-            self.dropped_items.drop_chest_block_loot(
+            self.dropped_items.drop_prepared_block_entity_items(
                 absolute,
                 drops,
                 &prepared,
@@ -10376,6 +10376,7 @@ impl LoadedSession {
                 loot,
                 &components,
                 self.block_drops,
+                &mut self.level_random,
             );
         }
         true
@@ -29335,7 +29336,7 @@ mod tests {
                 Ok(None)
             }
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
-                Ok(path.ends_with("/white_banner.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:banner","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","condition":{"type":"minecraft:random_chance","chance":0.5}}]}]}"#.to_vec()))
+                Ok(path.ends_with("/white_banner.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:banner","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
             }
         }
         let (mut world, origin, player) = fixture();
@@ -29368,7 +29369,13 @@ mod tests {
         .unwrap();
         session.set_block_drops(false);
         session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        session.level_random = native_core::random::LegacyRandom::new(9182);
         assert!(!session.set(support - origin, session.states[0]));
+        let mut expected = native_core::random::LegacyRandom::new(9182);
+        assert_eq!(
+            session.level_random.clone().next_double(),
+            expected.clone().next_double()
+        );
         assert_eq!(
             session
                 .world
@@ -29402,6 +29409,10 @@ mod tests {
         );
         assert!(session.dropped_items.snapshot().is_empty());
         assert!(session.random_sequences.as_ref().unwrap().data.is_dirty());
+        for _ in 0..3 {
+            expected.next_double();
+        }
+        assert_eq!(session.level_random.next_double(), expected.next_double());
     }
 
     #[cfg(target_os = "windows")]
@@ -29542,6 +29553,7 @@ mod tests {
                         session.set_game_mode(mode);
                         session.set_block_drops(enabled);
                         session.set_block_loot(Arc::clone(&loot));
+                        session.level_random = native_core::random::LegacyRandom::new(9182);
                         session
                             .set_random_sequences(
                                 seed,
@@ -29550,11 +29562,26 @@ mod tests {
                             )
                             .unwrap();
                         if player {
-                            for (offset, _) in entries {
+                            for ((offset, _), row) in entries.into_iter().zip(group) {
                                 session.finish_breaking(support + offset);
+                                let expected = if mode == GameMode::Creative {
+                                    native_core::random::LegacyRandom::new(9182).next_double()
+                                } else {
+                                    row["levelNext"].as_f64().unwrap()
+                                };
+                                assert_eq!(
+                                    session.level_random.clone().next_double().to_bits(),
+                                    expected.to_bits(),
+                                    "{seed} {mode:?} drops={enabled} player={player}"
+                                );
                             }
                         } else {
                             assert!(session.set(support - origin, session.states[0]));
+                            assert_eq!(
+                                session.level_random.clone().next_double().to_bits(),
+                                group[4]["levelNext"].as_f64().unwrap().to_bits(),
+                                "{seed} {mode:?} drops={enabled} player={player}"
+                            );
                         }
                         assert_eq!(
                             session.removed_banners.len(),

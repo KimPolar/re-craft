@@ -30,6 +30,7 @@ mod gui_gpu;
 mod held_items;
 mod item_gui;
 mod item_render;
+mod item_tooltip;
 mod menu;
 mod menu_assets;
 mod menu_draw;

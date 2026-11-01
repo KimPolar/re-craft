@@ -20,6 +20,7 @@ pub struct MenuAssets {
     pub minecraft_dir: std::path::PathBuf,
     pub chat: crate::chat_hud::ChatSettings,
     pub item_models: Arc<Mutex<crate::held_items::Loader>>,
+    pub item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
     pub trim_registry: Arc<crate::equipment_visual::TrimRegistry>,
     pub main_hand_left: bool,
     pub font: RgbaImage,
@@ -732,11 +733,13 @@ impl MenuAssets {
                 Default::default()
             }),
         );
+        let item_registry = stack.vanilla_item_registry().ok().map(Arc::new);
         let item_models = Arc::new(Mutex::new(crate::held_items::Loader::from_stack(stack)));
         Ok(Self {
             minecraft_dir: minecraft_dir.to_owned(),
             chat,
             item_models,
+            item_registry,
             trim_registry,
             main_hand_left,
             font,

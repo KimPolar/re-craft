@@ -59,6 +59,32 @@ pub fn draw_two_lines(
     );
 }
 
+/// Draw an item tooltip whose first line is separated from the remaining lines.
+pub fn draw_item(
+    canvas: &mut Canvas,
+    assets: &MenuAssets,
+    cursor: (i32, i32),
+    lines: &[Vec<crate::text_component::Span>],
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let width = lines
+        .iter()
+        .map(|line| canvas.component_width(Some(assets), line))
+        .max()
+        .unwrap_or(0);
+    let height = (lines.len() as i32 * 10) - if lines.len() == 1 { 2 } else { 0 };
+    let geometry = layout((canvas.width, canvas.height), cursor, (width, height));
+    for sprite in [&assets.tooltip_background, &assets.tooltip_frame] {
+        canvas.gui_sprite(&sprite.image, geometry.background, sprite.scaling);
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let y = geometry.text.1 + index as i32 * 10 + if index > 0 { 2 } else { 0 };
+        canvas.component_shadow_alpha(Some(assets), geometry.text.0, y, line, 255);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

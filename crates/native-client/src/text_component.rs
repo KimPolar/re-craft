@@ -185,6 +185,15 @@ fn unwrap(tag: &Tag) -> &Tag {
 /// Resolve literals, translation arguments, arrays and inherited styles. A
 /// failed or unsupported component returns None so the caller can fall back.
 pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Vec<Span>> {
+    resolve_with_style(tag, Style::default(), translate)
+}
+
+/// Resolve a component using the inherited style of its containing text.
+pub fn resolve_with_style(
+    tag: &Tag,
+    base: Style,
+    translate: impl Fn(&str, &str) -> String,
+) -> Option<Vec<Span>> {
     fn visit(
         tag: &Tag,
         parent: Style,
@@ -276,7 +285,7 @@ pub fn resolve(tag: &Tag, translate: impl Fn(&str, &str) -> String) -> Option<Ve
         Some(())
     }
     let mut spans = Vec::new();
-    visit(tag, Style::default(), &translate, &mut spans, 0)?;
+    visit(tag, base, &translate, &mut spans, 0)?;
     Some(spans)
 }
 

@@ -43,8 +43,18 @@ const WEATHER: [&str; 8] = [
 
 pub struct ItemRegistry {
     ids: HashMap<String, i32>,
+    block_descriptions: HashSet<String>,
+    rarity: HashMap<String, ItemRarity>,
     fire_resistant: HashSet<String>,
     other_resistance: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemRarity {
+    Common,
+    Uncommon,
+    Rare,
+    Epic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,11 +80,16 @@ impl ItemRegistry {
         let mut pending: Option<(String, String)> = None;
         let mut fire_flag = false;
         let mut other_flag = false;
+        let mut block_description_flag = false;
+        let mut rarity_constant = None;
+        let mut item_rarity = ItemRarity::Common;
         let mut fire_resistant = HashSet::new();
         let mut other_resistance = HashSet::new();
         let mut ids = HashMap::new();
+        let mut block_descriptions = HashSet::new();
+        let mut rarities = HashMap::new();
         let mut next = 0_i32;
-        let mut insert = |id: String| -> Result<()> {
+        let mut insert = |id: String, block_description: bool, rarity: ItemRarity| -> Result<()> {
             ensure!(
                 !id.is_empty()
                     && id
@@ -82,8 +97,15 @@ impl ItemRegistry {
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'),
                 "invalid item registry ID"
             );
+            let qualified = format!("minecraft:{id}");
+            if block_description {
+                block_descriptions.insert(qualified.clone());
+            }
+            if rarity != ItemRarity::Common {
+                rarities.insert(qualified.clone(), rarity);
+            }
             ensure!(
-                ids.insert(format!("minecraft:{id}"), next).is_none(),
+                ids.insert(qualified, next).is_none(),
                 "duplicate item registry ID"
             );
             next = next.checked_add(1).context("item registry overflow")?;
@@ -101,10 +123,33 @@ impl ItemRegistry {
                     );
                     fire_flag = true;
                 }
+                if owner == "net/minecraft/world/item/Item$Properties"
+                    && method == "useBlockDescriptionPrefix"
+                {
+                    ensure!(
+                        pending.is_some() && !block_description_flag,
+                        "unexpected block description initializer"
+                    );
+                    block_description_flag = true;
+                }
+                if owner == "net/minecraft/world/item/Item$Properties" && method == "rarity" {
+                    item_rarity = rarity_constant
+                        .take()
+                        .context("missing rarity initializer")?;
+                }
             }
             if ins.op == 0xb2 {
                 let (owner, name, _) =
                     items.member(ins.index.context("missing field reference")?)?;
+                if owner == "net/minecraft/world/item/Rarity" {
+                    rarity_constant = Some(match name {
+                        "COMMON" => ItemRarity::Common,
+                        "UNCOMMON" => ItemRarity::Uncommon,
+                        "RARE" => ItemRarity::Rare,
+                        "EPIC" => ItemRarity::Epic,
+                        _ => bail!("unknown item rarity"),
+                    });
+                }
                 if owner == BLOCK_IDS || owner == ITEM_IDS {
                     pending = Some((owner.to_owned(), name.to_owned()));
                 }
@@ -172,24 +217,43 @@ impl ItemRegistry {
                 other_flag = false;
             }
             if direct {
-                insert(name)?;
+                insert(
+                    name,
+                    method == "registerBlock" || block_description_flag,
+                    item_rarity,
+                )?;
             } else if color {
+                ensure!(
+                    !block_description_flag,
+                    "unsupported collection description initializer"
+                );
                 for prefix in COLORS {
-                    insert(format!("{prefix}_{name}"))?;
+                    insert(
+                        format!("{prefix}_{name}"),
+                        method == "registerBlockItems",
+                        item_rarity,
+                    )?;
                 }
             } else {
+                ensure!(
+                    !block_description_flag,
+                    "unsupported collection description initializer"
+                );
                 for prefix in WEATHER {
                     let suffix = if name == "copper_block" && !matches!(prefix, "" | "waxed_") {
                         "copper"
                     } else {
                         &name
                     };
-                    insert(format!("{prefix}{suffix}"))?;
+                    insert(format!("{prefix}{suffix}"), true, item_rarity)?;
                 }
             }
+            block_description_flag = false;
+            rarity_constant = None;
+            item_rarity = ItemRarity::Common;
         }
         ensure!(
-            pending.is_none() && !fire_flag && !other_flag,
+            pending.is_none() && !fire_flag && !other_flag && !block_description_flag,
             "unfinished item registration"
         );
         ensure!(
@@ -198,12 +262,37 @@ impl ItemRegistry {
         );
         Ok(Self {
             ids,
+            block_descriptions,
+            rarity: rarities,
             fire_resistant,
             other_resistance,
         })
     }
     pub fn id(&self, id: &str) -> Option<i32> {
         self.ids.get(id).copied()
+    }
+    /// The default translatable description key decoded from item registration.
+    pub fn description_key(&self, id: &str) -> Option<String> {
+        self.ids.contains_key(id).then(|| {
+            let prefix = if self.block_descriptions.contains(id) {
+                "block"
+            } else {
+                "item"
+            };
+            format!("{prefix}.{}", id.replace(':', "."))
+        })
+    }
+    pub fn default_rarity(&self, id: &str) -> Option<ItemRarity> {
+        self.ids.contains_key(id).then(|| {
+            self.rarity.get(id).copied().unwrap_or_else(|| {
+                // In 26.3 these two registrations set rarity in deferred property callbacks.
+                match id {
+                    "minecraft:light" => ItemRarity::Epic,
+                    "minecraft:sniffer_egg" => ItemRarity::Uncommon,
+                    _ => ItemRarity::Common,
+                }
+            })
+        })
     }
     pub fn iter(&self) -> impl Iterator<Item = (&str, i32)> {
         self.ids.iter().map(|(name, id)| (name.as_str(), *id))

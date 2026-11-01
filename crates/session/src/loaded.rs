@@ -13135,6 +13135,53 @@ impl LoadedSession {
                     continue;
                 }
                 let actions = stage.actions;
+                // The generic notifier does not yet interleave cascaded ice
+                // neighbor callbacks with fluid/falling-block updates. Defer
+                // such cascades until that ordering can be preserved.
+                if actions
+                    .iter()
+                    .filter(|action| matches!(action, IceTickAction::Melt(..)))
+                    .count()
+                    > 1
+                    && actions
+                        .iter()
+                        .filter_map(|action| match action {
+                            IceTickAction::Melt(pos, _) => Some(*pos),
+                            _ => None,
+                        })
+                        .any(|pos| {
+                            [
+                                IVec3::NEG_X,
+                                IVec3::X,
+                                IVec3::NEG_Y,
+                                IVec3::Y,
+                                IVec3::NEG_Z,
+                                IVec3::Z,
+                            ]
+                            .into_iter()
+                            .any(|direction| {
+                                let Some(neighbor) = add(pos, direction) else {
+                                    return true;
+                                };
+                                let Cell::State(id) = cell(
+                                    &self.world,
+                                    self.origin,
+                                    self.bounds,
+                                    neighbor,
+                                    self.states[0],
+                                ) else {
+                                    return true;
+                                };
+                                self.world.state(id).is_none_or(|state| {
+                                    state.name == "minecraft:water"
+                                        || FallingKind::from_id(&state.name).is_some()
+                                })
+                            })
+                        })
+                {
+                    deferred_ice.push((order, key));
+                    continue;
+                }
                 let mut replacements = Vec::with_capacity(actions.len());
                 let mut valid = true;
                 for action in &actions {
@@ -13153,7 +13200,7 @@ impl LoadedSession {
                             },
                             true,
                         )),
-                        IceTickAction::Schedule(_, _) | IceTickAction::ShapeWater(_) => None,
+                        IceTickAction::Schedule(_, _) | IceTickAction::ShapeNeighbors(_) => None,
                     };
                     if let Some((pos, block, notify)) = candidate {
                         let next = self.intern_block(block);
@@ -13178,15 +13225,34 @@ impl LoadedSession {
                 self.applying_ice_tick = true;
                 for (action, replacement) in actions.into_iter().zip(replacements) {
                     if let Some((pos, next, notify)) = replacement {
-                        if !self.set_with_notify(pos, next, notify) {
+                        let old = match cell(
+                            &self.world,
+                            self.origin,
+                            self.bounds,
+                            pos,
+                            self.states[0],
+                        ) {
+                            Cell::State(id) => id,
+                            Cell::Missing => {
+                                failed = true;
+                                break;
+                            }
+                        };
+                        let melt = matches!(action, IceTickAction::Melt(..));
+                        if !self.set_with_notify(pos, next, notify && !melt) {
                             failed = true;
                             break;
+                        }
+                        if melt {
+                            self.notify_ice_melt(pos, old, next);
                         }
                         applied += 1;
                     } else {
                         match action {
                             IceTickAction::Schedule(pos, delay) => self.schedule_ice(pos, delay),
-                            IceTickAction::ShapeWater(pos) => self.notify_ice_shape_water(pos),
+                            IceTickAction::ShapeNeighbors(pos) => {
+                                self.notify_ice_shape_neighbors(pos)
+                            }
                             _ => unreachable!("block changes have a replacement"),
                         }
                     }
@@ -13287,7 +13353,7 @@ impl LoadedSession {
         }
     }
 
-    fn notify_ice_shape_water(&mut self, position: IVec3) {
+    fn notify_ice_shape_neighbors(&mut self, position: IVec3) {
         let delay = self.fluid_settings().delay(FluidKind::Water);
         for direction in [
             IVec3::NEG_X,
@@ -13309,6 +13375,13 @@ impl LoadedSession {
             ) else {
                 continue;
             };
+            if let Some(kind) = self
+                .world
+                .state(id)
+                .and_then(|state| FallingKind::from_id(&state.name))
+            {
+                self.schedule_sand(neighbor, kind);
+            }
             if let Some(fluid) = self
                 .ordinary_fluid(id)
                 .filter(|fluid| fluid.kind == FluidKind::Water && fluid.source)
@@ -13316,6 +13389,46 @@ impl LoadedSession {
                 self.schedule_fluid(neighbor, fluid, delay);
             }
         }
+    }
+
+    /// Water's on-place and neighbor callbacks run before shape notifications.
+    fn notify_ice_melt(&mut self, position: IVec3, old: BlockStateId, new: BlockStateId) {
+        let delay = self.fluid_settings().delay(FluidKind::Water);
+        if let Some(fluid) = self
+            .ordinary_fluid(new)
+            .filter(|fluid| fluid.kind == FluidKind::Water)
+        {
+            self.schedule_fluid(position, fluid, delay);
+        }
+        for direction in [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+        ] {
+            let Some(neighbor) = add(position, direction) else {
+                continue;
+            };
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) else {
+                continue;
+            };
+            if let Some(fluid) = self
+                .ordinary_fluid(id)
+                .filter(|fluid| fluid.kind == FluidKind::Water)
+            {
+                self.schedule_fluid(neighbor, fluid, delay);
+            }
+        }
+        self.block_notifications.push_back((position, old, new));
+        self.notify_fluid_neighbors();
     }
 
     fn push_entities_from_soil(&mut self, relative: IVec3, absolute: IVec3) {
@@ -17806,6 +17919,34 @@ fn cell(
     Cell::State(world.block_id(pos.x, pos.y, pos.z).unwrap_or(air))
 }
 
+/// States whose neighbor callbacks are handled by the generic block updater.
+fn frost_supported_terrain(state: &BlockState) -> bool {
+    state.properties.is_empty()
+        && matches!(
+            state.name.as_str(),
+            "minecraft:air"
+                | "minecraft:cave_air"
+                | "minecraft:void_air"
+                | "minecraft:stone"
+                | "minecraft:dirt"
+                | "minecraft:sand"
+                | "minecraft:red_sand"
+                | "minecraft:gravel"
+                | "minecraft:glass"
+                | "minecraft:cobblestone"
+                | "minecraft:mossy_cobblestone"
+                | "minecraft:granite"
+                | "minecraft:diorite"
+                | "minecraft:andesite"
+                | "minecraft:calcite"
+                | "minecraft:tuff"
+                | "minecraft:sandstone"
+                | "minecraft:red_sandstone"
+                | "minecraft:stone_bricks"
+                | "minecraft:clay"
+        )
+}
+
 /// A read-only view of the disk's already staged ice changes. Positions are
 /// absolute, like Java's block predicate and game-event positions.
 struct DiskWorld<'a> {
@@ -17865,13 +18006,7 @@ impl DiskWorld<'_> {
             }
             let state = self.state(neighbor)?;
             match state.name.as_str() {
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-                | "minecraft:stone" | "minecraft:dirt" => {
-                    anyhow::ensure!(
-                        state.properties.is_empty(),
-                        "unsupported disk neighbor state"
-                    );
-                }
+                _ if frost_supported_terrain(state) => {}
                 "minecraft:water" => {
                     anyhow::ensure!(
                         state.properties.len() == 1
@@ -18009,7 +18144,7 @@ enum IceTickAction {
     Age(IVec3, u8),
     Melt(IVec3, bool),
     Schedule(IVec3, i32),
-    ShapeWater(IVec3),
+    ShapeNeighbors(IVec3),
 }
 
 /// Stage a tick before mutating the session or its random source.
@@ -18051,16 +18186,11 @@ impl IceTickStage<'_> {
                 .state(id)
                 .context("ice neighbor state is unavailable")?;
             anyhow::ensure!(
-                matches!(
-                    state.name.as_str(),
-                    "minecraft:air"
-                        | "minecraft:cave_air"
-                        | "minecraft:void_air"
-                        | "minecraft:stone"
-                        | "minecraft:dirt"
-                        | "minecraft:frosted_ice"
-                        | "minecraft:water"
-                ),
+                frost_supported_terrain(state)
+                    || matches!(
+                        state.name.as_str(),
+                        "minecraft:frosted_ice" | "minecraft:water"
+                    ),
                 "unsupported ice neighbor notification"
             );
             if state.name == "minecraft:water" {
@@ -18175,7 +18305,7 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
             position,
             crate::frosted_ice::placed(random),
         ));
-        self.actions.push(IceTickAction::ShapeWater(position));
+        self.actions.push(IceTickAction::ShapeNeighbors(position));
         Ok(())
     }
 
@@ -19088,7 +19218,7 @@ pub(crate) mod tests {
                         p.z - 8,
                         delay
                     ])),
-                    IceTickAction::ShapeWater(_) => None,
+                    IceTickAction::ShapeNeighbors(_) => None,
                 })
                 .collect();
             assert_eq!(events, row["events"].as_array().unwrap().to_vec(), "{row}");
@@ -28243,8 +28373,8 @@ pub(crate) mod tests {
         assert_eq!(missing.ice_ticks.len(), 24);
 
         let mut unknown_neighbor = setup(true);
-        let glass = unknown_neighbor.intern_block(state("minecraft:glass", &[]));
-        assert!(unknown_neighbor.set_with_notify(IVec3::new(6, 1, 8), glass, false));
+        let planks = unknown_neighbor.intern_block(state("minecraft:oak_planks", &[]));
+        assert!(unknown_neighbor.set_with_notify(IVec3::new(6, 1, 8), planks, false));
         let random_before = unknown_neighbor.level_random.clone().next_int();
         unknown_neighbor.run_location_effects(true);
         let center = unknown_neighbor.origin + IVec3::new(8, 1, 8);
@@ -28259,6 +28389,24 @@ pub(crate) mod tests {
         assert!(unknown_neighbor.ice_ticks.is_empty());
         assert_eq!(unknown_neighbor.level_random.next_int(), random_before);
         assert!(unknown_neighbor.unresolved_player_location_effects);
+
+        for kind in [FallingKind::Sand, FallingKind::RedSand, FallingKind::Gravel] {
+            let mut shoreline = setup(true);
+            let sand = shoreline.intern_block(state(kind.id(), &[]));
+            let neighbor = IVec3::new(6, 1, 8);
+            assert!(shoreline.set_with_notify(neighbor, sand, false));
+            shoreline.run_location_effects(true);
+            let absolute = shoreline.origin + neighbor;
+            assert_eq!(shoreline.ice_ticks.len(), 23);
+            assert!(shoreline.sand_pending.contains(&SandTickKey {
+                x: absolute.x,
+                y: absolute.y,
+                z: absolute.z,
+                kind
+            }));
+            assert_eq!(shoreline.sand_ticks.len(), 1);
+            assert_eq!(shoreline.sand_ticks.first_key_value().unwrap().0.0, 2);
+        }
 
         let mut intersecting = setup(true);
         intersecting.motion.position.y = 1.5;
@@ -28405,6 +28553,350 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn frost_walker_terrain_neighbors_match_java_updates() {
+        use native_resources::enchantments::{
+            disk_predicate::DiskPredicate, location::ReplaceDiskAction,
+        };
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FrostWalkerNeighborsOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrostWalkerNeighborsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FrostWalkerNeighborsOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 420);
+        let action = ReplaceDiskAction {
+            radius: 1,
+            height: 1,
+            offset: [0, -1, 0],
+            predicate: None,
+            compiled_predicate: Some(DiskPredicate::Blocks {
+                offset: [0; 3],
+                ids: Arc::new(BTreeSet::from(["minecraft:water".into()])),
+            }),
+            block_state: serde_json::json!({"id":"minecraft:frosted_ice","properties":{"age":"0"}}),
+            trigger_game_event: None,
+        };
+        let directions = [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ];
+        for row in rows {
+            let mut session = session();
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            assert!(session.set_with_notify(IVec3::new(8, 1, 8), water, false));
+            let sand = session.intern_block(state(
+                [
+                    "minecraft:sand",
+                    "minecraft:red_sand",
+                    "minecraft:gravel",
+                    "minecraft:glass",
+                    "minecraft:cobblestone",
+                    "minecraft:mossy_cobblestone",
+                    "minecraft:granite",
+                    "minecraft:diorite",
+                    "minecraft:andesite",
+                    "minecraft:calcite",
+                    "minecraft:tuff",
+                    "minecraft:sandstone",
+                    "minecraft:red_sandstone",
+                    "minecraft:stone_bricks",
+                    "minecraft:clay",
+                ][row["type"].as_u64().unwrap() as usize],
+                &[],
+            ));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let mask = row["mask"].as_u64().unwrap();
+            for (i, direction) in directions.iter().enumerate() {
+                let pos = IVec3::new(8, 1, 8) + *direction;
+                let block = if mask & (1 << i) != 0 { sand } else { stone };
+                if !session.set_with_notify(pos, block, false) {
+                    assert!(
+                        matches!(cell(&session.world,session.origin,session.bounds,pos,session.states[0]),Cell::State(current) if current==block)
+                    );
+                }
+            }
+            session.motion.position = DVec3::new(8.5, 2.0, 8.5);
+            session.player.position = session.motion.position.as_vec3();
+            session.level_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            session.apply_location_disk(&action).unwrap();
+            let mut events: Vec<_> = session
+                .ice_ticks
+                .iter()
+                .map(|(order, pos)| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            "ice",
+                            pos.0 - session.origin.x,
+                            pos.1 - session.origin.y,
+                            pos.2 - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            events.extend(session.sand_ticks.iter().map(|(order, pos)| {
+                (
+                    order.3,
+                    serde_json::json!([
+                        "falling",
+                        pos.x - session.origin.x,
+                        pos.y - session.origin.y,
+                        pos.z - session.origin.z,
+                        order.0
+                    ]),
+                )
+            }));
+            events.sort_by_key(|event| event.0);
+            assert_eq!(
+                events.into_iter().map(|event| event.1).collect::<Vec<_>>(),
+                row["scheduled"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn frosted_ice_terrain_neighbors_match_java_tick() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FrostedIceTerrainOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrostedIceTerrainOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FrostedIceTerrainOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1904);
+        let directions = [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ];
+        for row in rows {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_has_skylight(false).unwrap();
+            session.set_water_evaporation_environment(bucket_environment(false));
+            let ice = session.intern_block(state(
+                "minecraft:frosted_ice",
+                &[("age", &row["age"].as_i64().unwrap().to_string())],
+            ));
+            assert!(session.set_with_notify(IVec3::new(8, 2, 8), ice, false));
+            session.ice_ticks.clear();
+            session.ice_pending.clear();
+            let kind = row["type"].as_u64().unwrap() as usize;
+            let neighbor_state = if kind >= 15 {
+                state(
+                    "minecraft:water",
+                    &[("level", if kind == 15 { "0" } else { "1" })],
+                )
+            } else {
+                state(
+                    [
+                        "minecraft:sand",
+                        "minecraft:red_sand",
+                        "minecraft:gravel",
+                        "minecraft:glass",
+                        "minecraft:cobblestone",
+                        "minecraft:mossy_cobblestone",
+                        "minecraft:granite",
+                        "minecraft:diorite",
+                        "minecraft:andesite",
+                        "minecraft:calcite",
+                        "minecraft:tuff",
+                        "minecraft:sandstone",
+                        "minecraft:red_sandstone",
+                        "minecraft:stone_bricks",
+                        "minecraft:clay",
+                    ][kind],
+                    &[],
+                )
+            };
+            let sand = session.intern_block(neighbor_state);
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let mask = row["mask"].as_u64().unwrap();
+            for (i, direction) in directions.iter().enumerate() {
+                let pos = IVec3::new(8, 2, 8) + *direction;
+                let block = if mask & (1 << i) != 0 { sand } else { stone };
+                if !session.set_with_notify(pos, block, false) {
+                    assert!(
+                        matches!(cell(&session.world,session.origin,session.bounds,pos,session.states[0]),Cell::State(current) if current==block)
+                    );
+                }
+            }
+            session.pending_light.clear();
+            session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            session.sky_lighting.set_enabled(false);
+            let chunk = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light = Some(Box::new([0xff; native_world::loaded::LIGHT_BYTES]));
+            let absolute = session.origin + IVec3::new(8, 2, 8);
+            session.enqueue_saved_ice(&[SavedBlockTick {
+                block: "minecraft:frosted_ice".into(),
+                position: absolute.to_array(),
+                delay: 0,
+                priority: 0,
+            }]);
+            session.level_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            session.advance_block_ticks();
+            let mut events: Vec<_> = session
+                .ice_ticks
+                .iter()
+                .map(|(order, pos)| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            "ice",
+                            pos.0 - session.origin.x,
+                            pos.1 - session.origin.y,
+                            pos.2 - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            events.extend(session.sand_ticks.iter().map(|(order, pos)| {
+                (
+                    order.3,
+                    serde_json::json!([
+                        "falling",
+                        pos.x - session.origin.x,
+                        pos.y - session.origin.y,
+                        pos.z - session.origin.z,
+                        order.0
+                    ]),
+                )
+            }));
+            events.sort_by_key(|event| event.0);
+            assert_eq!(
+                events.into_iter().map(|event| event.1).collect::<Vec<_>>(),
+                row["scheduled"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+            let fluids: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let pos = scheduled.key;
+                    serde_json::json!([
+                        if pos.source { "water" } else { "flowing_water" },
+                        pos.x - session.origin.x,
+                        pos.y - session.origin.y,
+                        pos.z - session.origin.z,
+                        order.0
+                    ])
+                })
+                .collect();
+            assert_eq!(fluids, row["fluids"].as_array().unwrap().to_vec(), "{row}");
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
     #[test]
     fn frosted_ice_placement_and_age_change_schedule_with_java_random_order() {
         for seed in 0..128 {
@@ -28534,6 +29026,27 @@ pub(crate) mod tests {
             );
         }
 
+        for age in ["0", "3"] {
+            for kind in [FallingKind::Sand, FallingKind::RedSand, FallingKind::Gravel] {
+                let mut beside_sand = setup(age, 15, None, false);
+                let sand = beside_sand.intern_block(state(kind.id(), &[]));
+                assert!(beside_sand.set_with_notify(IVec3::new(5, 2, 4), sand, false));
+                beside_sand.pending_light.clear();
+                beside_sand.sky_lighting = crate::sky_lighting::SkyLighting::default();
+                beside_sand.sky_lighting.set_enabled(false);
+                beside_sand.advance_block_ticks();
+                let pos = beside_sand.origin + IVec3::new(5, 2, 4);
+                assert!(beside_sand.sand_pending.contains(&SandTickKey {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                    kind
+                }));
+                assert_eq!(beside_sand.sand_ticks.first_key_value().unwrap().0.0, 2);
+                assert!(beside_sand.ice_deferred.is_empty());
+            }
+        }
+
         let mut melting = setup("3", 15, None, false);
         melting.advance_block_ticks();
         let position = melting.origin + IVec3::new(4, 2, 4);
@@ -28590,10 +29103,36 @@ pub(crate) mod tests {
         }
         assert!(cascade.draft_player_state(&original).is_err());
 
+        for neighbor in [
+            state("minecraft:sand", &[]),
+            state("minecraft:water", &[("level", "0")]),
+        ] {
+            let mut deferred = setup("3", 15, None, true);
+            let id = deferred.intern_block(neighbor);
+            assert!(deferred.set_with_notify(IVec3::new(4, 2, 5), id, false));
+            deferred.pending_light.clear();
+            deferred.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            deferred.sky_lighting.set_enabled(false);
+            let random_before = deferred.level_random.clone().next_int();
+            deferred.advance_block_ticks();
+            assert_eq!(deferred.ice_deferred.len(), 1);
+            assert!(deferred.sand_ticks.is_empty() && deferred.fluid_ticks.is_empty());
+            assert_eq!(deferred.level_random.next_int(), random_before);
+            let center = deferred.origin + IVec3::new(4, 2, 4);
+            assert_eq!(
+                deferred
+                    .world
+                    .block(center.x, center.y, center.z)
+                    .unwrap()
+                    .name,
+                "minecraft:frosted_ice"
+            );
+        }
+
         let unsupported = || {
             let mut session = setup("3", 15, None, true);
-            let glass = session.intern_block(state("minecraft:glass", &[]));
-            assert!(session.set(IVec3::new(4, 3, 4), glass));
+            let planks = session.intern_block(state("minecraft:oak_planks", &[]));
+            assert!(session.set(IVec3::new(4, 3, 4), planks));
             session.pending_light.clear();
             session.sky_lighting = crate::sky_lighting::SkyLighting::default();
             session.sky_lighting.set_enabled(false);

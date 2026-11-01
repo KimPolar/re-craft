@@ -581,6 +581,20 @@ impl BlockLootTables {
 
     /// Check every possible branch against the actual tool before a block edit.
     pub fn fully_supported_player_block_for_tool(&self, block: &str, tool: BasicTool<'_>) -> bool {
+        self.fully_supported_block_for_tool_inner(block, tool, false)
+    }
+
+    /// As above, allowing supported component copies from a block entity.
+    pub fn fully_supported_block_entity_for_tool(&self, block: &str, tool: BasicTool<'_>) -> bool {
+        self.fully_supported_block_for_tool_inner(block, tool, true)
+    }
+
+    fn fully_supported_block_for_tool_inner(
+        &self,
+        block: &str,
+        tool: BasicTool<'_>,
+        components: bool,
+    ) -> bool {
         fn modifier_valid(modifier: &Modifier, tool: BasicTool<'_>) -> bool {
             match &modifier.kind {
                 ModifierKind::UniformCount(min, max, _) if min < max => max
@@ -629,7 +643,7 @@ impl BlockLootTables {
             return false;
         };
         let name = format!("{}:{}", block.namespace, block.path);
-        if !self.fully_supported_player_block(&name) {
+        if !self.fully_supported_player_block_inner(&name, components) {
             return false;
         }
         let id = ResourceId {

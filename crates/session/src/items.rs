@@ -1797,6 +1797,7 @@ impl ItemEntities {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_block_entity_drops(
         &self,
         table: &str,
@@ -1806,13 +1807,31 @@ impl ItemEntities {
         components: &Tag,
         tables: Option<&BlockLootTables>,
     ) -> anyhow::Result<(Vec<Drop>, Vec<Tag>, LegacyRandom)> {
+        let mut random = self.random.clone();
+        let (drops, prepared) = Self::prepare_block_entity_drops_with_random(
+            table,
+            block,
+            hand,
+            entity_present,
+            components,
+            tables,
+            &mut random,
+        )?;
+        Ok((drops, prepared, random))
+    }
+
+    pub(crate) fn prepare_block_entity_drops_with_random(
+        table: &str,
+        block: &native_world::loaded::BlockState,
+        hand: Option<&ItemStack>,
+        entity_present: bool,
+        components: &Tag,
+        tables: Option<&BlockLootTables>,
+        random: &mut dyn native_resources::loot::LootRandom,
+    ) -> anyhow::Result<(Vec<Drop>, Vec<Tag>)> {
         use anyhow::{Context, ensure};
         use native_resources::loot::LootBlockState;
         let tables = tables.context("block loot table unavailable")?;
-        ensure!(
-            tables.fully_supported_player_block_with_components(table),
-            "unsupported block loot table"
-        );
         let enchantments = hand
             .map(crate::inventory::item_enchantments)
             .transpose()?
@@ -1822,20 +1841,18 @@ impl ItemEntities {
             count: hand.map_or(0, ItemStack::count),
             enchantments: &enchantments,
         };
+        ensure!(
+            tables.fully_supported_block_entity_for_tool(table, tool),
+            "unsupported block loot table"
+        );
         let state = LootBlockState {
             name: &block.name,
             properties: &block.properties,
         };
-        let mut random = self.random.clone();
-        let drops = tables.drops_with_block_entity_at(
-            table,
-            &state,
-            tool,
-            entity_present,
-            Some(&mut random),
-        )?;
+        let drops =
+            tables.drops_with_block_entity_at(table, &state, tool, entity_present, Some(random))?;
         let prepared = prepare_component_copies(&drops, components)?;
-        Ok((drops, prepared, random))
+        Ok((drops, prepared))
     }
 
     pub(crate) fn validate_block_entity_drops(
@@ -1855,26 +1872,18 @@ impl ItemEntities {
         position: IVec3,
         drops: Vec<Drop>,
         components: &[Tag],
+        enabled: bool,
     ) {
-        self.spawn_drops(
-            position,
-            IVec3::ZERO,
-            DropStrategy::FromMiddle,
-            drops,
-            None,
-            Some(components),
-        );
-    }
-
-    pub(crate) fn stage_player_block_drops(
-        &mut self,
-        (drops, random): (Vec<Drop>, LegacyRandom),
-    ) -> (Vec<Drop>, LegacyRandom) {
-        (drops, std::mem::replace(&mut self.random, random))
-    }
-
-    pub(crate) fn restore_drop_random(&mut self, random: LegacyRandom) {
-        self.random = random;
+        if enabled {
+            self.spawn_drops(
+                position,
+                IVec3::ZERO,
+                DropStrategy::FromMiddle,
+                drops,
+                None,
+                Some(components),
+            );
+        }
     }
 
     /// Spawn a previously evaluated block-interaction loot table.

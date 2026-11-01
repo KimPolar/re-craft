@@ -10148,19 +10148,40 @@ impl LoadedSession {
                 return false;
             }
         }
-        if self.block_drops {
-            let Ok(components) = crate::saved_banner::collected_components(entity.as_ref()) else {
-                return false;
-            };
-            if crate::items::ItemEntities::validate_block_entity_drops(
-                &item,
-                &components,
-                self.loot.as_deref(),
-            )
-            .is_err()
-            {
-                return false;
+        let Ok(components) = crate::saved_banner::collected_components(entity.as_ref()) else {
+            return false;
+        };
+        if crate::items::ItemEntities::validate_block_entity_drops(
+            &item,
+            &components,
+            self.loot.as_deref(),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(tables) = &self.loot else {
+            return false;
+        };
+        let tool = native_resources::loot::BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        if !tables.fully_supported_block_entity_for_tool(&item, tool) {
+            return false;
+        }
+        match tables.random_sequence_for_block(&item) {
+            Ok(Some(id)) => {
+                let name = format!("{}:{}", id.namespace, id.path);
+                if self.random_sequences.as_ref().is_none_or(|sequences| {
+                    sequences.data.get(&name, sequences.world_seed).is_err()
+                }) {
+                    return false;
+                }
             }
+            Ok(None) => {}
+            Err(_) => return false,
         }
         true
     }
@@ -10257,31 +10278,43 @@ impl LoadedSession {
         if player && self.game_mode != GameMode::Creative && properties.is_none() {
             return false;
         }
-        let mut drops = None;
-        if self.block_drops
-            && (!player
-                || (self.game_mode != GameMode::Creative
-                    && properties.is_some_and(|p| p.correct_for_drops)))
-        {
-            let Ok(components) = crate::saved_banner::collected_components(entity.as_ref()) else {
+        let needs_loot = !player
+            || (self.game_mode != GameMode::Creative
+                && properties.is_some_and(|p| p.correct_for_drops));
+        let mut components = None;
+        if needs_loot {
+            let Ok(value) = crate::saved_banner::collected_components(entity.as_ref()) else {
                 return false;
             };
-            let Ok((loot, components, random)) = self.dropped_items.prepare_block_entity_drops(
+            if crate::items::ItemEntities::validate_block_entity_drops(
                 &item_id,
-                &block,
-                hand.as_ref(),
-                player,
-                &components,
+                &value,
                 self.loot.as_deref(),
-            ) else {
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let Ok((_, checkpoint)) =
+                self.stage_banner_loot(&item_id, &block, hand.as_ref(), player, &value)
+            else {
                 return false;
             };
-            let (loot, previous) = self.dropped_items.stage_player_block_drops((loot, random));
-            drops = Some((loot, components, previous));
+            self.rollback_block_loot(checkpoint);
+            components = Some(value);
         }
+        // Non-player destruction evaluates loot before its block update.
+        let mut drops = if !player && needs_loot {
+            Some(
+                self.stage_banner_loot(&item_id, &block, None, false, components.as_ref().unwrap())
+                    .expect("preflighted banner loot remains evaluable"),
+            )
+        } else {
+            None
+        };
         if !self.set_with_banner_removal(relative, self.states[0], true, true) {
-            if let Some((_, _, previous)) = drops {
-                self.dropped_items.restore_drop_random(previous);
+            if let Some((_, checkpoint)) = drops {
+                self.rollback_block_loot(checkpoint);
             }
             return false;
         }
@@ -10300,9 +10333,26 @@ impl LoadedSession {
         if player && self.game_mode != GameMode::Creative && damage != 0 {
             Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
         }
-        if let Some((loot, components, _)) = drops {
-            self.dropped_items
-                .drop_prepared_block_entity_items(position, loot, &components);
+        if player && needs_loot {
+            // Player destruction resolves the original entity after tool wear.
+            drops = Some(
+                self.stage_banner_loot(
+                    &item_id,
+                    &block,
+                    hand.as_ref(),
+                    true,
+                    components.as_ref().unwrap(),
+                )
+                .expect("preflighted banner loot remains evaluable"),
+            );
+        }
+        if let Some(((loot, components), _)) = drops {
+            self.dropped_items.drop_prepared_block_entity_items(
+                position,
+                loot,
+                &components,
+                self.block_drops,
+            );
         }
         true
     }
@@ -12238,7 +12288,6 @@ impl LoadedSession {
         hand: Option<&crate::inventory::ItemStack>,
         player: bool,
     ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, BlockLootCheckpoint)> {
-        use anyhow::Context;
         let enchantments = hand
             .map(crate::inventory::item_enchantments)
             .transpose()?
@@ -12248,21 +12297,30 @@ impl LoadedSession {
             count: hand.map_or(0, crate::inventory::ItemStack::count),
             enchantments: &enchantments,
         };
-        let tables = self.loot.as_ref().context("block loot table unavailable")?;
-        if player {
-            anyhow::ensure!(
-                tables.fully_supported_player_block_for_tool(&block.name, tool),
-                "unsupported player block loot"
-            );
-        }
-        let evaluate = |random: &mut dyn native_resources::loot::LootRandom| {
+        self.stage_loot(&block.name, |tables, random| {
             if player {
+                anyhow::ensure!(
+                    tables.fully_supported_player_block_for_tool(&block.name, tool),
+                    "unsupported player block loot"
+                );
                 tables.drops_with_entity_at(&block.name, &block.properties, tool, Some(random))
             } else {
                 tables.drops_without_entity_at(&block.name, Some(&block.properties), Some(random))
             }
-        };
-        match tables.random_sequence_for_block(&block.name)? {
+        })
+    }
+
+    fn stage_loot<T>(
+        &mut self,
+        table: &str,
+        evaluate: impl Fn(
+            &BlockLootTables,
+            &mut dyn native_resources::loot::LootRandom,
+        ) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, BlockLootCheckpoint)> {
+        use anyhow::Context;
+        let tables = self.loot.as_ref().context("block loot table unavailable")?;
+        match tables.random_sequence_for_block(table)? {
             Some(id) => {
                 let name = format!("{}:{}", id.namespace, id.path);
                 let sequences = self
@@ -12271,17 +12329,44 @@ impl LoadedSession {
                     .context("world random sequences unavailable")?;
                 let checkpoint = sequences.data.checkpoint(&name)?;
                 let mut random = sequences.data.get(&name, sequences.world_seed)?;
-                let drops = evaluate(&mut random)?;
+                let drops = evaluate(tables, &mut random)?;
                 sequences.data.set(&name, &random)?;
                 Ok((drops, BlockLootCheckpoint::Named(checkpoint)))
             }
             None => {
                 let mut random = self.level_random.clone();
-                let drops = evaluate(&mut random)?;
+                let drops = evaluate(tables, &mut random)?;
                 let previous = std::mem::replace(&mut self.level_random, random);
                 Ok((drops, BlockLootCheckpoint::Level(previous)))
             }
         }
+    }
+
+    fn stage_banner_loot(
+        &mut self,
+        table: &str,
+        block: &BlockState,
+        hand: Option<&crate::inventory::ItemStack>,
+        player: bool,
+        components: &native_persistence::nbt::Tag,
+    ) -> anyhow::Result<(
+        (
+            Vec<native_resources::loot::Drop>,
+            Vec<native_persistence::nbt::Tag>,
+        ),
+        BlockLootCheckpoint,
+    )> {
+        self.stage_loot(table, |tables, random| {
+            crate::items::ItemEntities::prepare_block_entity_drops_with_random(
+                table,
+                block,
+                hand,
+                player,
+                components,
+                Some(tables),
+                random,
+            )
+        })
     }
 
     fn rollback_block_loot(&mut self, checkpoint: BlockLootCheckpoint) {
@@ -29017,11 +29102,9 @@ mod tests {
                     &[("type", "bottom"), ("waterlogged", "false")],
                 ));
                 assert!(!session.set(support, unknown));
-                if enabled {
-                    assert!(!session.set(support, session.states[0]));
-                    assert!(session.dropped_items.snapshot().is_empty());
-                    session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
-                }
+                assert!(!session.set(support, session.states[0]));
+                assert!(session.dropped_items.snapshot().is_empty());
+                session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
                 let dirt = session.intern_block(state("minecraft:dirt", &[]));
                 assert!(session.set(support, dirt));
                 assert!(session.removed_banners.is_empty());
@@ -29104,6 +29187,286 @@ mod tests {
                                 .get("minecraft:banner_patterns")
                                 .is_some()
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn banner_support_waits_for_named_sequence_even_when_drops_are_disabled() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/white_banner.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:banner","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","condition":{"type":"minecraft:random_chance","chance":0.5}}]}]}"#.to_vec()))
+            }
+        }
+        let (mut world, origin, player) = fixture();
+        let support = origin + IVec3::new(4, 3, 4);
+        let banner = support + IVec3::X;
+        let chunk = ChunkPos {
+            x: support.x.div_euclid(16),
+            z: support.z.div_euclid(16),
+        };
+        let stone = world.intern_state(state("minecraft:stone", &[]));
+        let id = world.intern_state(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        world
+            .set_block_id(support.x, support.y, support.z, stone)
+            .unwrap();
+        world
+            .set_block_id(banner.x, banner.y, banner.z, id)
+            .unwrap();
+        world
+            .saved_block_entities
+            .insert(chunk, SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_block_drops(false);
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        assert!(!session.set(support - origin, session.states[0]));
+        assert_eq!(
+            session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name,
+            "minecraft:stone"
+        );
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:white_wall_banner"
+        );
+        session
+            .set_random_sequences(
+                42,
+                native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            )
+            .unwrap();
+        assert!(session.set(support - origin, session.states[0]));
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert!(session.random_sequences.as_ref().unwrap().data.is_dirty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn banner_removal_named_sequence_and_components_match_java() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+        use std::{path::PathBuf, process::Command};
+        const TABLE: &[u8] = br#"{"type":"minecraft:block","random_sequence":"example:banner","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","condition":{"type":"minecraft:random_chance","chance":0.5},"modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:custom_name"]}}]}]}"#;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/white_banner.json").then(|| TABLE.to_vec()))
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BannerRandomOracle.java");
+        let input = temp.path().join("table.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BannerRandomOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(&input, TABLE).unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("BannerRandomOracle")
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 20);
+        let loot = Arc::new(BlockLootTables::load(&mut Loot).unwrap());
+        let entries = [
+            (IVec3::NEG_X, "west"),
+            (IVec3::X, "east"),
+            (IVec3::NEG_Z, "north"),
+            (IVec3::Z, "south"),
+            (IVec3::Y, "up"),
+        ];
+        for group in rows.chunks_exact(5) {
+            let seed = group[0]["seed"].as_i64().unwrap();
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                for enabled in [false, true] {
+                    for player in [false, true] {
+                        let (mut world, origin, original_player) = fixture();
+                        let support = origin + IVec3::new(4, 3, 4);
+                        let chunk = ChunkPos {
+                            x: support.x.div_euclid(16),
+                            z: support.z.div_euclid(16),
+                        };
+                        let stone = world.intern_state(state("minecraft:stone", &[]));
+                        world
+                            .set_block_id(support.x, support.y, support.z, stone)
+                            .unwrap();
+                        let mut entities = Vec::new();
+                        for (offset, label) in entries {
+                            let banner = if offset == IVec3::Y {
+                                state("minecraft:white_banner", &[("rotation", "0")])
+                            } else {
+                                state("minecraft:white_wall_banner", &[("facing", label)])
+                            };
+                            let id = world.intern_state(banner);
+                            let p = support + offset;
+                            world.set_block_id(p.x, p.y, p.z, id).unwrap();
+                            entities.push(Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:banner".into())),
+                                ("x".into(), Tag::Int(p.x)),
+                                ("y".into(), Tag::Int(p.y)),
+                                ("z".into(), Tag::Int(p.z)),
+                                ("CustomName".into(), Tag::String(label.into())),
+                            ]));
+                        }
+                        let bytes = nbt::write(&NamedTag {
+                            name: "".into(),
+                            value: Tag::List {
+                                element_type: TagType::Compound,
+                                values: entities,
+                            },
+                        })
+                        .unwrap();
+                        world
+                            .saved_block_entities
+                            .insert(chunk, SavedBlockEntities::Encoded(bytes.into()));
+                        let mut session = LoadedSession::new(
+                            world,
+                            origin,
+                            BuildBounds {
+                                min_y: 0,
+                                max_y: 32,
+                            },
+                            original_player,
+                        )
+                        .unwrap();
+                        session.set_game_mode(mode);
+                        session.set_block_drops(enabled);
+                        session.set_block_loot(Arc::clone(&loot));
+                        session
+                            .set_random_sequences(
+                                seed,
+                                native_persistence::random_sequences::RandomSequences::read(None)
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        if player {
+                            for (offset, _) in entries {
+                                session.finish_breaking(support + offset);
+                            }
+                        } else {
+                            assert!(session.set(support - origin, session.states[0]));
+                        }
+                        assert_eq!(
+                            session.removed_banners.len(),
+                            5,
+                            "{seed} {mode:?} drops={enabled} player={player}"
+                        );
+                        let expected: Vec<_> = if enabled && (!player || mode == GameMode::Survival)
+                        {
+                            group
+                                .iter()
+                                .filter(|row| row["drop"].as_bool().unwrap())
+                                .map(|row| row["name"].as_str().unwrap().to_owned())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let actual: Vec<_> = session
+                            .dropped_items
+                            .snapshot()
+                            .iter()
+                            .map(|item| {
+                                let Some(Tag::String(name)) =
+                                    item.stack.components().get("minecraft:custom_name")
+                                else {
+                                    panic!("missing custom name")
+                                };
+                                String::from_utf16(&name.0).unwrap()
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "{seed} {mode:?} drops={enabled} player={player}"
+                        );
+                        let sequences = &session.random_sequences.as_ref().unwrap().data;
+                        if player && mode == GameMode::Creative {
+                            assert!(!sequences.is_dirty());
+                        } else {
+                            let mut random = sequences.get("example:banner", seed).unwrap();
+                            assert_eq!(
+                                random.next_long(),
+                                group[4]["next"].as_i64().unwrap(),
+                                "{seed} {mode:?} drops={enabled} player={player}"
+                            );
+                        }
                     }
                 }
             }
@@ -42684,8 +43047,18 @@ mod tests {
     }
 
     #[test]
-    fn falling_sand_retries_when_block_drops_are_disabled() {
+    fn falling_sand_still_requires_loot_when_block_drops_are_disabled() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
         use native_world::loaded::SavedBlockEntities;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/white_banner.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner"}]}]}"#.to_vec()))
+            }
+        }
 
         let (mut world, origin, player) = fixture();
         let home = ChunkPos {
@@ -42730,6 +43103,9 @@ mod tests {
         session.advance_sand_ticks();
         assert_eq!(session.sand_deferred.get(&order), Some(&key));
         session.set_block_drops(false);
+        session.advance_sand_ticks();
+        assert_eq!(session.sand_deferred.get(&order), Some(&key));
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
         session.advance_sand_ticks();
         assert!(session.sand_deferred.is_empty());
         assert_eq!(session.falling_sand.len(), 1);

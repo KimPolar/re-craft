@@ -874,6 +874,17 @@ struct RecordedBlockEdit {
     current: BlockStateId,
 }
 
+struct BlockSetCheck {
+    pos: IVec3,
+    chunk_pos: ChunkPos,
+    section_y: i8,
+    index: usize,
+    original: Option<BlockStateId>,
+    old: BlockStateId,
+    original_state: Option<BlockState>,
+    replacement_state: BlockState,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RecordedPoiEdit {
     position: BlockPosition,
@@ -8728,20 +8739,21 @@ impl LoadedSession {
                     return false;
                 }
                 let block = block.clone();
-                let Ok((drops, checkpoint)) = self.stage_block_loot_without_entity(&block) else {
+                let Some(checked) = self.check_block_set(target, self.states[0], true, false)
+                else {
                     return false;
                 };
-                if !self.set(target, self.states[0]) {
-                    self.rollback_block_loot(checkpoint);
+                let Ok((drops, _)) = self.stage_block_loot_without_entity(&block) else {
                     return false;
-                }
-                self.dropped_items.drop_interaction(
+                };
+                self.dropped_items.drop_block_resources(
                     absolute,
-                    IVec3::ZERO,
-                    native_resources::transforms::DropStrategy::FromMiddle,
                     drops,
+                    None,
                     self.block_drops,
+                    &mut self.level_random,
                 );
+                self.apply_block_set(target, self.states[0], true, checked);
                 self.push_bucket_sound(BucketSoundKind::PlantBreak, sound_position, 1.0, 0.8);
                 if self.plant_break_particles.len() == 4096 {
                     self.plant_break_particles.pop_front();
@@ -10607,32 +10619,26 @@ impl LoadedSession {
         self.set_with_banner_removal(relative, id, notify, false)
     }
 
-    fn set_with_banner_removal(
-        &mut self,
+    fn check_block_set(
+        &self,
         relative: IVec3,
         id: BlockStateId,
         notify: bool,
         allow_banner_removal: bool,
-    ) -> bool {
-        let Some(pos) = add(self.origin, relative) else {
-            return false;
-        };
+    ) -> Option<BlockSetCheck> {
+        let pos = add(self.origin, relative)?;
         if pos.y < self.bounds.min_y || pos.y >= self.bounds.max_y {
-            return false;
+            return None;
         }
         let chunk_pos = ChunkPos {
             x: pos.x.div_euclid(16),
             z: pos.z.div_euclid(16),
         };
-        let Some(chunk) = self.world.chunks.get(&chunk_pos) else {
-            return false;
-        };
+        let chunk = self.world.chunks.get(&chunk_pos)?;
         if chunk.status.as_deref() != Some("minecraft:full") {
-            return false;
+            return None;
         }
-        let Ok(section_y) = i8::try_from(pos.y.div_euclid(16)) else {
-            return false;
-        };
+        let section_y = i8::try_from(pos.y.div_euclid(16)).ok()?;
         let index = pos.x.rem_euclid(16) as usize
             + pos.z.rem_euclid(16) as usize * 16
             + pos.y.rem_euclid(16) as usize * 256;
@@ -10643,12 +10649,10 @@ impl LoadedSession {
             .map(|blocks| blocks[index]);
         let old = original.unwrap_or(self.states[0]);
         if old == id {
-            return false;
+            return None;
         }
         let original_state = original.and_then(|old| self.world.state(old).cloned());
-        let Some(replacement_state) = self.world.state(id).cloned() else {
-            return false;
-        };
+        let replacement_state = self.world.state(id).cloned()?;
         // Entity-bearing banners must go through their coordinated lifecycle.
         if !allow_banner_removal
             && original_state
@@ -10656,7 +10660,7 @@ impl LoadedSession {
                 .and_then(native_world::collision::banner_item_id)
                 .is_some()
         {
-            return false;
+            return None;
         }
         if original_state
             .as_ref()
@@ -10678,11 +10682,56 @@ impl LoadedSession {
                         || self.banner_support_solid(&replacement_state) != Some(false)
                         || !self.can_remove_unattached_banner(neighbor, other)
                     {
-                        return false;
+                        return None;
                     }
                 }
             }
         }
+        Some(BlockSetCheck {
+            pos,
+            chunk_pos,
+            section_y,
+            index,
+            original,
+            old,
+            original_state,
+            replacement_state,
+        })
+    }
+
+    fn set_with_banner_removal(
+        &mut self,
+        relative: IVec3,
+        id: BlockStateId,
+        notify: bool,
+        allow_banner_removal: bool,
+    ) -> bool {
+        let Some(checked) = self.check_block_set(relative, id, notify, allow_banner_removal) else {
+            return false;
+        };
+        self.apply_block_set(relative, id, notify, checked)
+    }
+
+    /// Apply a check before any intervening block or chunk mutation. Loot evaluation and
+    /// item creation may run in between so drops precede neighbor notifications.
+    fn apply_block_set(
+        &mut self,
+        relative: IVec3,
+        id: BlockStateId,
+        notify: bool,
+        checked: BlockSetCheck,
+    ) -> bool {
+        let BlockSetCheck {
+            pos,
+            chunk_pos,
+            section_y,
+            index,
+            original,
+            old,
+            original_state,
+            replacement_state,
+        } = checked;
+        let chunk = self.world.chunks.get(&chunk_pos).expect("checked chunk");
         let poi_position = BlockPosition {
             x: pos.x,
             y: pos.y,
@@ -12633,18 +12682,6 @@ impl LoadedSession {
                     },
                     _ => None,
                 };
-                let mut plant_drops = None;
-                if let Some(plant) = &plant
-                    && fluid.kind == FluidKind::Water
-                {
-                    match self.stage_block_loot_without_entity(plant) {
-                        Ok(drops) => plant_drops = Some(drops),
-                        Err(_) => {
-                            retry_wash = true;
-                            continue;
-                        }
-                    }
-                }
                 let id = match change.block {
                     fluid_sim::ChangedBlock::Air => self.states[0],
                     fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
@@ -12689,6 +12726,33 @@ impl LoadedSession {
                         self.intern_block(state)
                     }
                 };
+                let checked_plant = if let Some(plant) = &plant
+                    && fluid.kind == FluidKind::Water
+                {
+                    let Some(checked) = self.check_block_set(change.position, id, true, false)
+                    else {
+                        retry_wash = true;
+                        continue;
+                    };
+                    let Some(position) = add(self.origin, change.position) else {
+                        retry_wash = true;
+                        continue;
+                    };
+                    let Ok((drops, _)) = self.stage_block_loot_without_entity(plant) else {
+                        retry_wash = true;
+                        continue;
+                    };
+                    self.dropped_items.drop_block_resources(
+                        position,
+                        drops,
+                        None,
+                        self.block_drops,
+                        &mut self.level_random,
+                    );
+                    Some(checked)
+                } else {
+                    None
+                };
                 // Lava burns a replaceable block before changing it. Its fizz
                 // must precede any reactions caused by the ensuing update.
                 let fizz_before = fluid.kind == FluidKind::Lava && plant.is_some();
@@ -12697,7 +12761,12 @@ impl LoadedSession {
                 } else {
                     None
                 };
-                if self.set(change.position, id) {
+                let changed = if let Some(checked) = checked_plant {
+                    self.apply_block_set(change.position, id, true, checked)
+                } else {
+                    self.set(change.position, id)
+                };
+                if changed {
                     if fluid.kind == FluidKind::Lava
                         && matches!(
                             change.block,
@@ -12705,17 +12774,6 @@ impl LoadedSession {
                         )
                     {
                         let _ = self.push_lava_fizz(change.position);
-                    }
-                    if let Some((drops, _)) = plant_drops
-                        && let Some(position) = add(self.origin, change.position)
-                    {
-                        self.dropped_items.drop_interaction(
-                            position,
-                            IVec3::ZERO,
-                            native_resources::transforms::DropStrategy::FromMiddle,
-                            drops,
-                            self.block_drops,
-                        );
                     }
                     if change.position == relative
                         && let fluid_sim::ChangedBlock::Fluid(next) = change.block
@@ -12738,10 +12796,7 @@ impl LoadedSession {
                             self.lava_fizz.push_front(evicted);
                         }
                     }
-                    if let Some((_, previous)) = plant_drops {
-                        self.rollback_block_loot(previous);
-                        retry_wash = true;
-                    } else if plant.is_some() {
+                    if plant.is_some() {
                         retry_wash = true;
                     }
                 }
@@ -19497,9 +19552,14 @@ mod tests {
             };
             let water_id = session.intern_liquid(water);
             assert!(session.set(source, water_id));
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            bucket_session.level_random = native_core::random::LegacyRandom::new(9182);
             let sequence = format!("minecraft:blocks/{name}");
             for (step, row) in group.iter().enumerate() {
                 assert_eq!(row["step"].as_u64().unwrap() as usize, step);
+                let enabled = step % 2 == 0;
+                session.set_block_drops(enabled);
+                bucket_session.set_block_drops(enabled);
                 let position = session.origin + target;
                 Arc::make_mut(&mut session.world)
                     .set_block_id(position.x, position.y, position.z, plant)
@@ -19518,10 +19578,16 @@ mod tests {
                     .iter()
                     .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
                     .collect();
+                let expected = if enabled {
+                    row["drops"].as_array().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(actual, expected, "{name} {seed} step {step}");
                 assert_eq!(
-                    actual,
-                    *row["drops"].as_array().unwrap(),
-                    "{name} {seed} step {step}"
+                    session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "water {name} {seed} step {step} level random"
                 );
                 let mut random = session
                     .random_sequences
@@ -19575,10 +19641,11 @@ mod tests {
                     .iter()
                     .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
                     .collect();
+                assert_eq!(bucket_drops, expected, "bucket {name} {seed} step {step}");
                 assert_eq!(
-                    bucket_drops,
-                    *row["drops"].as_array().unwrap(),
-                    "bucket {name} {seed} step {step}"
+                    bucket_session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "bucket {name} {seed} step {step} level random"
                 );
                 let mut bucket_random = bucket_session
                     .random_sequences
@@ -19894,6 +19961,117 @@ mod tests {
         assert!(
             matches!(cell(&session.world, session.origin, session.bounds, target, session.states[0]), Cell::State(id) if id == plant)
         );
+    }
+
+    #[test]
+    fn plant_drops_precede_neighbor_drops_and_use_world_random() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let item = if path.ends_with("/short_grass.json") {
+                    "minecraft:diamond"
+                } else if path.ends_with("/white_banner.json") {
+                    "minecraft:white_banner"
+                } else {
+                    return Ok(None);
+                };
+                Ok(Some(format!(r#"{{"type":"minecraft:block","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"{item}"}}]}}]}}"#).into_bytes()))
+            }
+        }
+        for bucket in [false, true] {
+            for enabled in [false, true] {
+                let mut session = session();
+                session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+                session.set_block_drops(enabled);
+                session.set_washed_away_blocks(Arc::new(BTreeSet::from([
+                    "minecraft:short_grass".into()
+                ])));
+                let target = if bucket {
+                    IVec3::new(8, 2, 7)
+                } else {
+                    IVec3::new(8, 3, 8)
+                };
+                let plant = session.intern_block(state("minecraft:short_grass", &[]));
+                assert!(session.set_with_notify(target, plant, false));
+                let water = FluidState {
+                    kind: FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                };
+                if !bucket {
+                    let id = session.intern_liquid(water);
+                    assert!(session.set(target + IVec3::Y, id));
+                }
+                let banner = session
+                    .intern_block(state("minecraft:white_wall_banner", &[("facing", "east")]));
+                let position = session.origin + target;
+                let attached = position + IVec3::X;
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(attached.x, attached.y, attached.z, banner)
+                    .unwrap();
+                let chunk = ChunkPos {
+                    x: attached.x.div_euclid(16),
+                    z: attached.z.div_euclid(16),
+                };
+                Arc::make_mut(&mut session.world)
+                    .saved_block_entities
+                    .insert(chunk, SavedBlockEntities::Empty);
+                session.level_random = native_core::random::LegacyRandom::new(9182);
+                let mut expected = session.level_random.clone();
+                if bucket {
+                    session.set_water_evaporation_environment(bucket_environment(false));
+                    session.player.position.y = 1.3;
+                    session.motion.position.y = 1.3;
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(
+                        PlayerSlot::Storage(0),
+                        Some(
+                            ItemStack::new(
+                                "minecraft:water_bucket".into(),
+                                1,
+                                1,
+                                Tag::Compound(vec![]),
+                            )
+                            .unwrap(),
+                        ),
+                    );
+                    session.set_player_inventory(inventory);
+                    assert!(session.try_empty_bucket(PlayerSlot::Storage(0)));
+                } else {
+                    session.fluid_ticks.clear();
+                    session.fluid_pending.clear();
+                    session.schedule_fluid(target + IVec3::Y, water, 0);
+                    session.advance_fluid_ticks();
+                }
+                let items = session.dropped_items.snapshot();
+                let ids: Vec<_> = items.iter().map(|item| item.stack.id()).collect();
+                assert_eq!(
+                    ids,
+                    if enabled {
+                        vec!["minecraft:diamond", "minecraft:white_banner"]
+                    } else {
+                        vec![]
+                    },
+                    "bucket={bucket} enabled={enabled}"
+                );
+                for _ in 0..6 {
+                    expected.next_double();
+                }
+                assert_eq!(
+                    session.level_random.next_double().to_bits(),
+                    expected.next_double().to_bits(),
+                    "bucket={bucket} enabled={enabled}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -39893,6 +40071,10 @@ mod tests {
         );
         for _ in 0..80 {
             session.update(TICK);
+            if !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == sand)
+            {
+                break;
+            }
         }
         assert!(
             !matches!(cell(&session.world, session.origin, session.bounds, relative, session.states[0]), Cell::State(id) if id == sand)

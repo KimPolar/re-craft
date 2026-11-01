@@ -1969,9 +1969,9 @@ impl LoadedSession {
                 .loot_trace()
                 .context("generated chest has no random trace")?;
             let table_id = match trace {
-                LootRandomTrace::Fixed { table, .. } | LootRandomTrace::Named { table, .. } => {
-                    table
-                }
+                LootRandomTrace::Fixed { table, .. }
+                | LootRandomTrace::Named { table, .. }
+                | LootRandomTrace::Level { table, .. } => table,
             };
             let table = self
                 .chest_loot
@@ -1982,6 +1982,10 @@ impl LoadedSession {
                 .item_registry
                 .as_ref()
                 .context("item registry is unavailable")?;
+            ensure!(
+                !matches!(trace, LootRandomTrace::Level { .. }),
+                "level-random chest loot requires a complete world-random audit"
+            );
             if let LootRandomTrace::Named {
                 sequence,
                 before,
@@ -3085,7 +3089,8 @@ impl LoadedSession {
                 let proof = (|| -> anyhow::Result<_> {
                     let table = match trace {
                         crate::saved_chest::LootRandomTrace::Fixed { table, .. }
-                        | crate::saved_chest::LootRandomTrace::Named { table, .. } => table,
+                        | crate::saved_chest::LootRandomTrace::Named { table, .. }
+                        | crate::saved_chest::LootRandomTrace::Level { table, .. } => table,
                     };
                     let loot = self
                         .chest_loot
@@ -3133,6 +3138,9 @@ impl LoadedSession {
                                 None => native_persistence::chest_loot::VerifiedChestLoot::replay_named(chest.source(), table, loot, seed, *before, resolve),
                             }
                         }
+                        crate::saved_chest::LootRandomTrace::Level { .. } => anyhow::bail!(
+                            "level-random chest loot requires a complete world-random audit"
+                        ),
                     }
                 })();
                 match proof {
@@ -4961,6 +4969,7 @@ impl LoadedSession {
             native_resources::packs::ResourceId,
             native_core::random::XoroshiroRandom,
         >,
+        level_random: &mut native_core::random::LegacyRandom,
         events: &mut Vec<IVec3>,
     ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
@@ -4993,10 +5002,7 @@ impl LoadedSession {
                 Some(luck) => chest.unpack_seeded_loot_with_luck(&id, table, luck, resolve)?,
                 None => chest.unpack_seeded_loot(&id, table, resolve)?,
             }
-        } else {
-            let sequence = table
-                .random_sequence()
-                .context("loot table has no named random sequence")?;
+        } else if let Some(sequence) = table.random_sequence() {
             if !staged.contains_key(sequence) {
                 let saved = self
                     .random_sequences
@@ -5014,6 +5020,19 @@ impl LoadedSession {
                 None => chest.unpack_loot_with_random(&id, table, random, resolve)?,
             }
             chest.record_named_loot(&id, sequence, before, random.state(), luck)?;
+        } else {
+            let before = level_random.state();
+            match luck {
+                Some(luck) => chest.unpack_loot_with_random_and_luck(
+                    &id,
+                    table,
+                    level_random,
+                    luck,
+                    resolve,
+                )?,
+                None => chest.unpack_loot_with_random(&id, table, level_random, resolve)?,
+            }
+            chest.record_level_loot(&id, before, level_random.state(), luck)?;
         }
         events.push(chest.position);
         Ok(())
@@ -5100,21 +5119,22 @@ impl LoadedSession {
             return false;
         }
         let mut staged = BTreeMap::new();
+        let mut staged_level = self.level_random.clone();
         let mut events = Vec::new();
         // Java resolves the first (right) half before the second half, regardless
         // of which side was clicked. Both may consume the same named stream.
         let resolved = if kind == Some("left") {
             pair.as_mut().is_none_or(|(_, other)| {
-                self.unpack_chest_loot(other, &mut staged, &mut events)
+                self.unpack_chest_loot(other, &mut staged, &mut staged_level, &mut events)
                     .is_ok()
             }) && self
-                .unpack_chest_loot(&mut chest, &mut staged, &mut events)
+                .unpack_chest_loot(&mut chest, &mut staged, &mut staged_level, &mut events)
                 .is_ok()
         } else {
-            self.unpack_chest_loot(&mut chest, &mut staged, &mut events)
+            self.unpack_chest_loot(&mut chest, &mut staged, &mut staged_level, &mut events)
                 .is_ok()
                 && pair.as_mut().is_none_or(|(_, other)| {
-                    self.unpack_chest_loot(other, &mut staged, &mut events)
+                    self.unpack_chest_loot(other, &mut staged, &mut staged_level, &mut events)
                         .is_ok()
                 })
         };
@@ -5136,6 +5156,7 @@ impl LoadedSession {
             ) {
                 return false;
             }
+            self.level_random = staged_level;
             Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&right, Some(&left)));
             for chest in [&right, &left] {
                 if chest.inventory_changed() {
@@ -5156,6 +5177,7 @@ impl LoadedSession {
             if !Arc::make_mut(&mut self.inventory).open_chest(position, chest.slots.clone()) {
                 return false;
             }
+            self.level_random = staged_level;
             Arc::make_mut(&mut self.inventory).set_chest_title(chest_title(&chest, None));
             if chest.inventory_changed() {
                 self.chest_dirty_chunks.insert(ChunkPos {
@@ -27689,6 +27711,154 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 21);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn double_chest_unnamed_loot_uses_world_random_transactionally() {
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::{self, Tag};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceId, ResourceProvider, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+
+        struct Source;
+        impl ResourceProvider for Source {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, _: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:chests/world")?])
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(Some(br#"{"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:stone"},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]}]}"#.to_vec()))
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let tables = Arc::new(ChestLootTables::load(&mut Source).unwrap());
+        let id = ResourceId::parse("example:chests/world").unwrap();
+        let table = tables.get(&id).unwrap();
+        let mut expected_random = LegacyRandom::new(9182);
+        let right_expected = table
+            .fill_with_random(&[false; 27], &mut expected_random, |_| Ok(64))
+            .unwrap();
+        let left_expected = table
+            .fill_with_random(&[false; 27], &mut expected_random, |_| Ok(64))
+            .unwrap();
+        let expected_pitch = expected_random.next_float() * 0.1 + 0.9;
+        let expected_state = expected_random.state();
+        for (click_left, invalid_left) in [(true, false), (false, false), (true, true)] {
+            let (mut session, _, left, chunk) = saved_chest_fixture();
+            let right = left + IVec3::X;
+            for (position, kind) in [(left, "left"), (right, "right")] {
+                let block = session.intern_block(state(
+                    "minecraft:chest",
+                    &[
+                        ("facing", "north"),
+                        ("type", kind),
+                        ("waterlogged", "false"),
+                    ],
+                ));
+                assert!(session.set(position - session.origin, block));
+            }
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!()
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                panic!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String(
+                    if invalid_left {
+                        "example:missing"
+                    } else {
+                        "example:chests/world"
+                    }
+                    .into(),
+                ),
+            ));
+            values.push(Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(right.x)),
+                ("y".into(), Tag::Int(right.y)),
+                ("z".into(), Tag::Int(right.z)),
+                (
+                    "LootTable".into(),
+                    Tag::String("example:chests/world".into()),
+                ),
+            ]));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_chest_loot(Arc::clone(&tables));
+            session.set_item_registry(Arc::clone(&registry));
+            session.level_random = LegacyRandom::new(9182);
+            let original_state = session.level_random.state();
+            let clicked = if click_left { left } else { right };
+            if invalid_left {
+                assert!(!session.try_open_saved_chest(clicked - session.origin));
+                assert_eq!(session.level_random.state(), original_state);
+                assert!(session.chest_contents.is_empty());
+                assert!(session.loot_events.is_empty());
+                assert!(session.take_chest_sounds().is_empty());
+                continue;
+            }
+            assert!(session.try_open_saved_chest(clicked - session.origin));
+            for (offset, expected) in [(0, &right_expected), (27, &left_expected)] {
+                for (slot, expected) in expected.iter().enumerate() {
+                    let actual = session
+                        .inventory
+                        .slot(crate::inventory::PlayerSlot::Chest((offset + slot) as u8));
+                    assert_eq!(
+                        actual.map(|item| (item.id().to_owned(), item.count())),
+                        expected.as_ref().map(|item| (
+                            format!("{}:{}", item.id.namespace, item.id.path),
+                            item.count
+                        ))
+                    );
+                }
+            }
+            assert_eq!(
+                session.take_chest_sounds()[0].pitch.to_bits(),
+                expected_pitch.to_bits()
+            );
+            assert_eq!(session.level_random.state(), expected_state);
+            assert!(Arc::make_mut(&mut session.inventory).toggle());
+            session.collect_closed_chest();
+            for position in [right, left] {
+                session
+                    .saved_chest(position)
+                    .unwrap()
+                    .unwrap()
+                    .verify_generated_loot(&id, table, |item| {
+                        LoadedSession::resolve_chest_loot_item(item, &registry)
+                    })
+                    .unwrap();
+            }
+            assert!(
+                session
+                    .validate_generated_chest_loot()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("world-random audit")
+            );
+        }
     }
 
     #[test]

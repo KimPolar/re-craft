@@ -24,6 +24,12 @@ pub(crate) enum LootRandomTrace {
         after: (u64, u64),
         luck: Option<u32>,
     },
+    Level {
+        table: ResourceId,
+        before: u64,
+        after: u64,
+        luck: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -448,6 +454,40 @@ impl SavedChest {
         after: (u64, u64),
         luck: Option<f32>,
     ) -> Result<()> {
+        self.validate_zero_seed_trace(table)?;
+        self.loot_trace = Some(LootRandomTrace::Named {
+            table: table.clone(),
+            sequence: sequence.clone(),
+            before,
+            after,
+            luck: luck.map(f32::to_bits),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn record_level_loot(
+        &mut self,
+        table: &ResourceId,
+        before: u64,
+        after: u64,
+        luck: Option<f32>,
+    ) -> Result<()> {
+        self.validate_zero_seed_trace(table)?;
+        ensure!(
+            native_core::random::LegacyRandom::from_state(before).is_some()
+                && native_core::random::LegacyRandom::from_state(after).is_some(),
+            "invalid level random state"
+        );
+        self.loot_trace = Some(LootRandomTrace::Level {
+            table: table.clone(),
+            before,
+            after,
+            luck: luck.map(f32::to_bits),
+        });
+        Ok(())
+    }
+
+    fn validate_zero_seed_trace(&self, table: &ResourceId) -> Result<()> {
         ensure!(
             self.loot_unpacked && self.generated_loot.is_some() && self.loot_trace.is_none(),
             "loot trace cannot be recorded"
@@ -471,15 +511,8 @@ impl SavedChest {
                 unique(&self.source, "LootTableSeed")?,
                 None | Some(Tag::Long(0))
             ),
-            "named loot must have a zero seed"
+            "world-stream loot must have a zero seed"
         );
-        self.loot_trace = Some(LootRandomTrace::Named {
-            table: table.clone(),
-            sequence: sequence.clone(),
-            before,
-            after,
-            luck: luck.map(f32::to_bits),
-        });
         Ok(())
     }
 
@@ -635,7 +668,9 @@ impl SavedChest {
             .context("generated loot trace is unavailable")?;
         let (expected_id, seed) = match trace {
             LootRandomTrace::Fixed { table, seed, .. } => (table, *seed),
-            LootRandomTrace::Named { table, .. } => (table, 0),
+            LootRandomTrace::Named { table, .. } | LootRandomTrace::Level { table, .. } => {
+                (table, 0)
+            }
         };
         ensure!(
             expected_id == table_id && self.loot_unpacked,
@@ -698,6 +733,27 @@ impl SavedChest {
                     &mut resolve,
                 )?;
                 ensure!(random.state() == *after, "loot random state differs");
+            }
+            LootRandomTrace::Level {
+                before,
+                after,
+                luck,
+                ..
+            } => {
+                ensure!(
+                    table.random_sequence().is_none(),
+                    "level loot unexpectedly has a named sequence"
+                );
+                let mut random = native_core::random::LegacyRandom::from_state(*before)
+                    .context("invalid level random state")?;
+                replay.unpack_loot_with_random_inner(
+                    table_id,
+                    table,
+                    &mut random,
+                    luck.map(f32::from_bits),
+                    &mut resolve,
+                )?;
+                ensure!(random.state() == *after, "level loot random state differs");
             }
         }
         ensure!(
@@ -961,6 +1017,50 @@ mod tests {
     }
     use native_persistence::nbt::NamedTag;
     #[test]
+    fn unnamed_loot_replays_world_random_and_detects_tampering() {
+        let position = IVec3::new(-1, 64, 32);
+        let chunk = ChunkPos { x: -1, z: 2 };
+        let id = ResourceId::parse("example:chests/world").unwrap();
+        let table = ChestLootTable::decode(&serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:stone"},{"type":"minecraft:item","name":"minecraft:stick"}]}]})).unwrap();
+        let mut original = chest();
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| !name.matches("Items"));
+        fields.push((
+            "LootTable".into(),
+            Tag::String("example:chests/world".into()),
+        ));
+        let mut saved = read_with_pending_loot(&payload(vec![original]), chunk, position)
+            .unwrap()
+            .unwrap();
+        let resolve = |item: &ChestLootItem| {
+            ItemStack::new(
+                format!("{}:{}", item.id.namespace, item.id.path),
+                1,
+                64,
+                Tag::Compound(vec![]),
+            )
+            .ok_or_else(|| anyhow::anyhow!("invalid prototype"))
+        };
+        let mut random = native_core::random::LegacyRandom::new(42);
+        let before = random.state();
+        saved
+            .unpack_loot_with_random(&id, &table, &mut random, resolve)
+            .unwrap();
+        saved
+            .record_level_loot(&id, before, random.state(), None)
+            .unwrap();
+        saved.verify_generated_loot(&id, &table, resolve).unwrap();
+        if let Some(LootRandomTrace::Level { after, .. }) = saved.loot_trace.as_mut() {
+            *after ^= 1;
+        } else {
+            panic!("missing world-random trace")
+        }
+        assert!(saved.verify_generated_loot(&id, &table, resolve).is_err());
+    }
+
+    #[test]
     fn generated_loot_replays_the_luck_captured_at_opening() {
         let position = IVec3::new(-1, 64, 32);
         let chunk = ChunkPos { x: -1, z: 2 };
@@ -1021,9 +1121,9 @@ mod tests {
             );
             saved.verify_generated_loot(&id, &table, resolve).unwrap();
             match saved.loot_trace.as_mut().unwrap() {
-                LootRandomTrace::Fixed { luck, .. } | LootRandomTrace::Named { luck, .. } => {
-                    *luck = Some((-1.0_f32).to_bits())
-                }
+                LootRandomTrace::Fixed { luck, .. }
+                | LootRandomTrace::Named { luck, .. }
+                | LootRandomTrace::Level { luck, .. } => *luck = Some((-1.0_f32).to_bits()),
             }
             assert!(saved.verify_generated_loot(&id, &table, resolve).is_err());
         }

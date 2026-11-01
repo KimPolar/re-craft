@@ -56,6 +56,7 @@ pub struct MenuFrame {
     pub blur_radius: u8,
     pub vsync: bool,
     pub size: PhysicalSize<u32>,
+    pub gui_scale: u32,
     pub overlay: Option<MenuOverlay>,
 }
 
@@ -156,6 +157,7 @@ impl MenuGpuWorker {
                         while let Some(frame) = shared.receive() {
                             renderer.resize(frame.size);
                             renderer.set_vsync(frame.vsync);
+                            renderer.set_gui_scale(frame.gui_scale);
                             if let Some(overlay) = frame.overlay {
                                 renderer.set_assets(overlay.assets.as_ref())?;
                                 renderer.update_overlay(&overlay.canvas)?;
@@ -259,6 +261,7 @@ mod tests {
             blur_radius: 5,
             vsync: true,
             size: PhysicalSize::new(800 + seconds as u32, 600),
+            gui_scale: 1,
             overlay: marker.map(|marker| {
                 let mut canvas = Canvas::new(1, 1);
                 canvas.pixels[0] = marker;
@@ -485,6 +488,7 @@ mod tests {
                     blur_radius: 5,
                     vsync: !self.resized,
                     size: window.inner_size(),
+                    gui_scale: 1,
                     overlay,
                 }) {
                     self.error = Some(format!("{error:#}"));

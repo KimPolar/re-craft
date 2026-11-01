@@ -227,6 +227,22 @@ mod tests {
     }
 
     #[test]
+    fn ceil_sized_overlay_uses_partial_last_pixels() {
+        let mut overlay = Canvas::new(3, 2);
+        overlay.pixels = (0..6).map(|pixel| 0xff00_0000 | pixel).collect();
+        let mut background = Canvas::new(7, 5);
+        composite_scaled(&mut background, &overlay, 3);
+        for y in 0..5usize {
+            for x in 0..7usize {
+                assert_eq!(
+                    background.pixels[y * 7 + x],
+                    overlay.pixels[(y / 3) * 3 + x / 3]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn overlay_composition_matches_canvas_blending_including_partial_edges() {
         for alpha in [0, 1, 64, 128, 254, 255] {
             let mut overlay = Canvas::new(2, 1);

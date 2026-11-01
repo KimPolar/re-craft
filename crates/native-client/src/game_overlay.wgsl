@@ -10,6 +10,7 @@ struct GlintUniform {
     enabled: f32,
 }
 @group(0) @binding(5) var<uniform> glint: GlintUniform;
+@group(1) @binding(0) var<uniform> gui: vec4<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -34,10 +35,10 @@ fn vertex(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 @fragment
 fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
-    var color = textureSample(overlay, overlay_sampler, input.uv);
+    let overlay_dimensions = textureDimensions(overlay);
+    let pixel = min(vec2<u32>(input.position.xy / gui.x), overlay_dimensions - vec2<u32>(1u));
+    var color = textureLoad(overlay, vec2<i32>(pixel), 0);
     if glint.enabled > 0.5 {
-        let dimensions = textureDimensions(glint_mask);
-        let pixel = min(vec2<u32>(input.uv * vec2<f32>(dimensions)), dimensions - vec2<u32>(1u));
         let mask = textureLoad(glint_mask, vec2<i32>(pixel), 0);
         if mask.a > 0u {
             // Unsupported models retain the old local-coordinate approximation.

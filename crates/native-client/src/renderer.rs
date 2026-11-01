@@ -238,6 +238,7 @@ pub struct Renderer {
     first_person: FirstPersonRenderer,
     crosshair_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
+    gui_scale: crate::gui_gpu::GuiScaleBinding,
     overlay_layout: wgpu::BindGroupLayout,
     overlay_sampler: wgpu::Sampler,
     overlay_texture: Option<wgpu::Texture>,
@@ -1149,10 +1150,11 @@ impl Renderer {
             label: Some("GUI overlay shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("game_overlay.wgsl").into()),
         });
+        let gui_scale = crate::gui_gpu::GuiScaleBinding::new(&device);
         let overlay_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GUI overlay layout"),
-                bind_group_layouts: &[Some(&overlay_layout)],
+                bind_group_layouts: &[Some(&overlay_layout), Some(&gui_scale.layout)],
                 immediate_size: 0,
             });
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1256,6 +1258,7 @@ impl Renderer {
             first_person,
             crosshair_pipeline,
             overlay_pipeline,
+            gui_scale,
             overlay_layout,
             overlay_sampler,
             overlay_texture: None,
@@ -1552,6 +1555,10 @@ impl Renderer {
         }
         self.hide_crosshair = hide_crosshair;
         Ok(())
+    }
+
+    pub fn set_gui_scale(&mut self, scale: u32) {
+        self.gui_scale.set(&self.queue, scale);
     }
 
     /// Reuse the overlay upload path for the HUD that precedes screen blur.
@@ -2236,6 +2243,7 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_bind_group(0, binding, &[]);
+                pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
             self.screen_blur
@@ -2262,6 +2270,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -2665,6 +2674,7 @@ mod tests {
                 }
                 .unwrap();
                 pass.set_bind_group(0, binding, &[]);
+                pass.set_bind_group(1, &renderer.gui_scale.bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
             encoder.copy_texture_to_buffer(
@@ -2827,6 +2837,29 @@ mod tests {
                     hud_plain_on, hud_plain_off,
                     "old HUD glint mask must be cleared"
                 );
+                // A 64x16 framebuffer at scale 3 needs a 22x6 GUI texture.
+                // The final logical column and row must be clipped, not stretched.
+                let mut partial = Canvas::new(22, 6);
+                for y in 0..6 {
+                    for x in 0..22 {
+                        partial.pixel(x, y, [(x * 10) as u8, (y * 30) as u8, 0, 255]);
+                    }
+                }
+                renderer.set_gui_scale(3);
+                renderer.update_overlay(&partial, false).unwrap();
+                let pixels = render(&renderer, super::glint_uniform(0, 0.5, 0.0, false), false);
+                let pixel = |x: usize, y: usize| &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                for y in 0..16 {
+                    for x in 0..64 {
+                        assert_eq!(pixel(x, y), pixel(x / 3 * 3, y / 3 * 3), "{x},{y}");
+                        if x > 0 && x % 3 == 0 {
+                            assert_ne!(pixel(x, y), pixel(x - 1, y), "column {x}");
+                        }
+                        if y > 0 && y % 3 == 0 {
+                            assert_ne!(pixel(x, y), pixel(x, y - 1), "row {y}");
+                        }
+                    }
+                }
                 event_loop.exit();
             }
             fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}

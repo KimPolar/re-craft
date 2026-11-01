@@ -22,6 +22,7 @@ mod frame_pacer;
 mod game_ui;
 mod generated_item;
 mod ground_items;
+mod gui_gpu;
 mod held_items;
 mod item_gui;
 mod item_render;

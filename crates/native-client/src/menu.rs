@@ -1002,10 +1002,7 @@ impl<'a> Menu<'a> {
     fn update_gui_scale(&mut self) {
         self.scale = gui_scale_for(self.size.0, self.size.1, self.state.video.gui_scale);
         if let Some((x, y)) = self.cursor_raw {
-            self.cursor = (
-                (x / f64::from(self.scale)) as i32,
-                (y / f64::from(self.scale)) as i32,
-            );
+            self.cursor = gui_cursor(self.size, self.scale, (x, y));
         }
         let (_, height) = self.logical_size();
         self.video_ui.resize(height);
@@ -1231,10 +1228,8 @@ impl<'a> Menu<'a> {
     }
 
     fn logical_size(&self) -> (i32, i32) {
-        (
-            (self.size.0 / self.scale).max(1) as i32,
-            (self.size.1 / self.scale).max(1) as i32,
-        )
+        let size = gui_size(self.size, self.scale);
+        (size.0 as i32, size.1 as i32)
     }
 
     fn hover_target(
@@ -2246,6 +2241,7 @@ impl<'a> Menu<'a> {
                 blur_radius: self.state.video.menu_blur,
                 vsync: self.state.video.vsync,
                 size: winit::dpi::PhysicalSize::new(width, height),
+                gui_scale: self.scale,
                 overlay: None,
             });
         }
@@ -2759,6 +2755,7 @@ impl<'a> Menu<'a> {
                 blur_radius: self.state.video.menu_blur,
                 vsync: self.state.video.vsync,
                 size: winit::dpi::PhysicalSize::new(width, height),
+                gui_scale: self.scale,
                 overlay: Some(MenuOverlay {
                     assets: self.state.assets.clone(),
                     canvas,
@@ -2896,10 +2893,7 @@ impl ApplicationHandler for Menu<'_> {
                 let buttons = self.buttons();
                 let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor_raw = Some((position.x, position.y));
-                self.cursor = (
-                    (position.x / self.scale as f64) as i32,
-                    (position.y / self.scale as f64) as i32,
-                );
+                self.cursor = gui_cursor(self.size, self.scale, (position.x, position.y));
                 let (dragged, changed) = if self.state.screen == Screen::Controls {
                     let (w, _) = self.logical_size();
                     self.sprint_window_ui
@@ -2956,13 +2950,11 @@ impl ApplicationHandler for Menu<'_> {
                 // CursorMoved event at the same screen coordinate.
                 if (self.cursor.0 < 0 || self.cursor.1 < 0)
                     && let Some(window) = &self.window
-                    && let Some(cursor) = current_window_cursor(window, self.size, self.scale)
+                    && let Some((cursor, raw)) =
+                        current_window_cursor(window, self.size, self.scale)
                 {
                     self.cursor = cursor;
-                    self.cursor_raw = Some((
-                        f64::from(cursor.0 * self.scale as i32),
-                        f64::from(cursor.1 * self.scale as i32),
-                    ));
+                    self.cursor_raw = Some(raw);
                 }
                 let (w, h) = self.logical_size();
                 let scrollbar = self.state.screen == Screen::Video
@@ -3630,6 +3622,22 @@ pub(crate) fn next_gui_scale(width: u32, height: u32, current: u32) -> u32 {
     }
 }
 
+pub(crate) fn gui_size(size: (u32, u32), scale: u32) -> (u32, u32) {
+    debug_assert!(scale > 0);
+    (size.0.div_ceil(scale).max(1), size.1.div_ceil(scale).max(1))
+}
+
+pub(crate) fn gui_cursor(size: (u32, u32), scale: u32, cursor: (f64, f64)) -> (i32, i32) {
+    if size.0 == 0 || size.1 == 0 || scale == 0 {
+        return (-1, -1);
+    }
+    let logical = gui_size(size, scale);
+    (
+        (cursor.0 * f64::from(logical.0) / f64::from(size.0)) as i32,
+        (cursor.1 * f64::from(logical.1) / f64::from(size.1)) as i32,
+    )
+}
+
 fn logical_cursor(
     screen: (i32, i32),
     origin: (i32, i32),
@@ -3641,22 +3649,37 @@ fn logical_cursor(
     if scale == 0 || x < 0 || y < 0 || x >= i64::from(size.0) || y >= i64::from(size.1) {
         return None;
     }
-    Some(((x / i64::from(scale)) as i32, (y / i64::from(scale)) as i32))
+    Some(gui_cursor(size, scale, (x as f64, y as f64)))
 }
 
 #[cfg(windows)]
-fn current_window_cursor(window: &Window, size: (u32, u32), scale: u32) -> Option<(i32, i32)> {
+fn current_window_cursor(
+    window: &Window,
+    size: (u32, u32),
+    scale: u32,
+) -> Option<((i32, i32), (f64, f64))> {
     use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return None;
     }
     let origin = window.inner_position().ok()?;
-    logical_cursor((point.x, point.y), (origin.x, origin.y), size, scale)
+    let logical = logical_cursor((point.x, point.y), (origin.x, origin.y), size, scale)?;
+    Some((
+        logical,
+        (
+            f64::from(point.x) - f64::from(origin.x),
+            f64::from(point.y) - f64::from(origin.y),
+        ),
+    ))
 }
 
 #[cfg(not(windows))]
-fn current_window_cursor(_window: &Window, _size: (u32, u32), _scale: u32) -> Option<(i32, i32)> {
+fn current_window_cursor(
+    _window: &Window,
+    _size: (u32, u32),
+    _scale: u32,
+) -> Option<((i32, i32), (f64, f64))> {
     None
 }
 
@@ -4877,17 +4900,22 @@ mod tests {
             r#"
 import java.lang.reflect.*;
 import com.mojang.blaze3d.platform.Window;
+import net.minecraft.client.MouseHandler;
 public class GuiScaleOracle {
   public static void main(String[] args) throws Exception {
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true);
     var u=(sun.misc.Unsafe)f.get(null); var window=(Window)u.allocateInstance(Window.class);
     var w=Window.class.getDeclaredField("framebufferWidth"); w.setAccessible(true);
     var h=Window.class.getDeclaredField("framebufferHeight"); h.setAccessible(true);
+    var sw=Window.class.getDeclaredField("width"); sw.setAccessible(true);
+    var sh=Window.class.getDeclaredField("height"); sh.setAccessible(true);
     for(int width:new int[]{1,319,320,639,640,853,1279,1280,1920,2560,3840})
       for(int height:new int[]{1,239,240,479,480,719,720,1080,1440,2160})
         for(int requested:new int[]{0,1,2,3,4,5,6,8,100}) {
-          w.setInt(window,width); h.setInt(window,height);
-          System.out.println(window.calculateScale(requested,false));
+          w.setInt(window,width); h.setInt(window,height); sw.setInt(window,width); sh.setInt(window,height);
+          int scale=window.calculateScale(requested,false); window.setGuiScale(scale);
+          System.out.printf("%d,%d,%d,%d,%d%n",scale,window.getGuiScaledWidth(),window.getGuiScaledHeight(),
+             (int)MouseHandler.getScaledXPos(window,width-0.25),(int)MouseHandler.getScaledYPos(window,height*0.47));
         }
   }
 }
@@ -4931,12 +4959,22 @@ public class GuiScaleOracle {
         for width in [1, 319, 320, 639, 640, 853, 1279, 1280, 1920, 2560, 3840] {
             for height in [1, 239, 240, 479, 480, 719, 720, 1080, 1440, 2160] {
                 for requested in [0, 1, 2, 3, 4, 5, 6, 8, 100] {
-                    let expected: u32 = lines.next().unwrap().parse().unwrap();
-                    assert_eq!(
-                        gui_scale_for(width, height, requested),
-                        expected,
-                        "{width}x{height} requested {requested}"
+                    let expected: Vec<u32> = lines
+                        .next()
+                        .unwrap()
+                        .split(',')
+                        .map(|value| value.parse().unwrap())
+                        .collect();
+                    let scale = gui_scale_for(width, height, requested);
+                    assert_eq!(scale, expected[0], "{width}x{height} requested {requested}");
+                    let size = gui_size((width, height), scale);
+                    assert_eq!(size, (expected[1], expected[2]));
+                    let cursor = gui_cursor(
+                        (width, height),
+                        scale,
+                        (f64::from(width) - 0.25, f64::from(height) * 0.47),
                     );
+                    assert_eq!(cursor, (expected[3] as i32, expected[4] as i32));
                 }
             }
         }

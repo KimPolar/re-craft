@@ -101,6 +101,7 @@ pub struct MenuRenderer {
     blur_pipelines: Option<BlurPipelines>,
     blur_pipeline_task: Option<mpsc::Receiver<Result<BlurPipelines>>>,
     overlay_pipeline: wgpu::RenderPipeline,
+    gui_scale: crate::gui_gpu::GuiScaleBinding,
     panorama_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
     blur_layout: wgpu::BindGroupLayout,
@@ -266,10 +267,6 @@ impl MenuRenderer {
             label: Some("panorama shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("menu_panorama.wgsl").into()),
         });
-        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("menu image shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
-        });
         let panorama_pipeline = pipeline(
             &device,
             &panorama_layout,
@@ -278,12 +275,18 @@ impl MenuRenderer {
             None,
             "panorama pipeline",
         );
-        let overlay_pipeline = pipeline(
+        let gui_scale = crate::gui_gpu::GuiScaleBinding::new(&device);
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("menu GUI shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("menu_gui_overlay.wgsl").into()),
+        });
+        let overlay_pipeline = pipeline_entry_layouts(
             &device,
-            &image_layout,
-            &image_shader,
+            &[&image_layout, &gui_scale.layout],
+            &overlay_shader,
             config.format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
+            "fragment",
             "menu widgets pipeline",
         );
         let mut renderer = Self {
@@ -298,6 +301,7 @@ impl MenuRenderer {
             blur_pipelines: None,
             blur_pipeline_task: None,
             overlay_pipeline,
+            gui_scale,
             panorama_layout,
             image_layout,
             blur_layout,
@@ -374,6 +378,10 @@ impl MenuRenderer {
             self.config.present_mode = mode;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    pub fn set_gui_scale(&mut self, scale: u32) {
+        self.gui_scale.set(&self.queue, scale);
     }
 
     pub fn set_assets(&mut self, assets: Option<&Arc<MenuAssets>>) -> Result<()> {
@@ -787,6 +795,7 @@ impl MenuRenderer {
             if let Some(binding) = &self.overlay_binding {
                 pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_bind_group(0, binding, &[]);
+                pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
         }
@@ -1073,9 +1082,22 @@ pub(crate) fn pipeline_entry(
     fragment: &str,
     label: &str,
 ) -> wgpu::RenderPipeline {
+    pipeline_entry_layouts(device, &[layout], shader, format, blend, fragment, label)
+}
+
+fn pipeline_entry_layouts(
+    device: &wgpu::Device,
+    layouts: &[&wgpu::BindGroupLayout],
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    fragment: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    let layouts: Vec<_> = layouts.iter().map(|layout| Some(*layout)).collect();
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[Some(layout)],
+        bind_group_layouts: &layouts,
         immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1221,6 +1243,147 @@ mod panorama_reference;
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    #[ignore = "requires a GPU; renders offscreen without opening a window"]
+    fn gpu_gui_overlay_clips_partial_logical_pixels() {
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = test_backend();
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("GPU adapter unavailable");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("test image layout"),
+                entries: &[texture_entry(0), sampler_entry(1)],
+            });
+            let mut scale = crate::gui_gpu::GuiScaleBinding::new(&device);
+            scale.set(&queue, 3);
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("test GUI shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("menu_gui_overlay.wgsl").into()),
+            });
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let pipeline = pipeline_entry_layouts(
+                &device,
+                &[&image_layout, &scale.layout],
+                &shader,
+                format,
+                None,
+                "fragment",
+                "test GUI pipeline",
+            );
+            let image = RgbaImage::from_fn(3, 2, |x, y| {
+                image::Rgba([(x * 60) as u8, (y * 100) as u8, 13, 255])
+            });
+            let source = upload_rgba(&device, &queue, &image, format, "test GUI source").unwrap();
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+            let binding = image_binding(
+                &device,
+                &image_layout,
+                &source.create_view(&Default::default()),
+                &sampler,
+            );
+            let target = texture(
+                &device,
+                (7, 5),
+                format,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                "test GUI output",
+            )
+            .unwrap();
+            let view = target.create_view(&Default::default());
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 * 5,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(color_attachment(
+                        &view,
+                        wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    ))],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &binding, &[]);
+                pass.set_bind_group(1, &scale.bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(5),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 7,
+                    height: 5,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            let (sender, receiver) = mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(15)),
+                })
+                .unwrap();
+            receiver
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+                .unwrap();
+            let pixels = readback.slice(..).get_mapped_range().unwrap();
+            for y in 0..5usize {
+                for x in 0..7usize {
+                    assert_eq!(
+                        &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4],
+                        &image.get_pixel((x / 3) as u32, (y / 3) as u32).0,
+                        "{x},{y}"
+                    );
+                }
+            }
+            drop(pixels);
+            readback.unmap();
+            if let Some(error) = errors.pop().await {
+                panic!("GPU validation failed: {error}");
+            }
+        });
+    }
 
     #[test]
     fn panorama_animation_uses_the_surface_acquisition_time() {

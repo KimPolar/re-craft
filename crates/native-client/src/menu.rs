@@ -292,12 +292,13 @@ impl WorldEntry {
         let mut last_played = None;
         if let Ok((info, level)) = anvil::read_level_document(&path) {
             data_version = Some(info.data_version);
-            if let Some(Tag::Long(value)) = level
+            if let Some(value) = level
                 .value
                 .get("Data")
                 .and_then(|data| data.get("LastPlayed"))
+                .and_then(Tag::as_java_long)
             {
-                last_played = Some(*value);
+                last_played = Some(value);
             }
             if let Some(Tag::String(level_name)) = level
                 .value
@@ -328,6 +329,32 @@ impl WorldEntry {
             icon,
         }
     }
+
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .last_played
+            .unwrap_or(0)
+            .cmp(&self.last_played.unwrap_or(0))
+            .then_with(|| java_folder_name(&self.path).cmp(java_folder_name(&other.path)))
+    }
+}
+
+// LevelSummary.compareTo compares the Java strings returned by Path.getFileName,
+// which order UTF-16 code units (including unpaired surrogates on Windows).
+#[cfg(windows)]
+fn java_folder_name(path: &Path) -> impl Iterator<Item = u16> + '_ {
+    use std::os::windows::ffi::OsStrExt;
+    path.file_name().unwrap_or_default().encode_wide()
+}
+
+#[cfg(not(windows))]
+fn java_folder_name(path: &Path) -> impl Iterator<Item = u16> {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .encode_utf16()
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 impl State {
@@ -490,11 +517,7 @@ impl State {
                 .filter(|path| path.is_dir() && path.join("level.dat").is_file())
                 .map(WorldEntry::read)
                 .collect();
-            worlds.sort_by(|a, b| {
-                b.last_played
-                    .cmp(&a.last_played)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
+            worlds.sort_by(WorldEntry::compare);
             let _ = sender.send(LoadedWorlds::List(worlds));
         });
         self.worlds.clear();
@@ -5579,29 +5602,161 @@ public class GuiScaleOracle {
     }
 
     #[test]
+    fn world_list_sorts_equal_dates_by_folder_and_missing_dates_as_zero() {
+        let mut worlds: Vec<_> = [
+            ("lower", "A display name", Some(50)),
+            ("Upper", "Z display name", Some(50)),
+            ("negative", "negative", Some(-1)),
+            ("missing", "missing", None),
+            ("zero", "zero", Some(0)),
+            ("😀", "emoji", Some(50)),
+            ("\u{e000}", "private-use", Some(50)),
+        ]
+        .into_iter()
+        .map(|(folder, name, last_played)| WorldEntry {
+            path: PathBuf::from(folder),
+            name: name.into(),
+            data_version: None,
+            last_played,
+            icon: None,
+        })
+        .collect();
+        worlds.sort_by(WorldEntry::compare);
+        assert_eq!(
+            worlds
+                .iter()
+                .map(|world| world.path.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Upper", "lower", "😀", "\u{e000}", "missing", "zero", "negative"
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn world_list_order_matches_java_level_summary() {
+        use std::process::Command;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("WorldListOrderOracle.java");
+        let output = temp.path().join("order.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/WorldListOrderOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("WorldListOrderOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let ids = [
+            "Zebra", "apple", "Apple", "\u{e000}", "😀", "한글", "old", "no-date", "zero", "future",
+        ];
+        let times = [
+            Some(50),
+            Some(50),
+            Some(50),
+            Some(50),
+            Some(50),
+            Some(50),
+            Some(-10),
+            None,
+            Some(0),
+            Some(100),
+        ];
+        let worlds: Vec<_> = ids
+            .into_iter()
+            .zip(times)
+            .enumerate()
+            .map(|(i, (id, last_played))| WorldEntry {
+                path: PathBuf::from(id),
+                name: format!("display {}", 10 - i),
+                data_version: Some(5023),
+                last_played,
+                icon: None,
+            })
+            .collect();
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 100);
+        for row in rows {
+            let a = &worlds[row["left"].as_u64().unwrap() as usize];
+            let b = &worlds[row["right"].as_u64().unwrap() as usize];
+            assert_eq!(
+                a.compare(b) as i32,
+                row["order"].as_i64().unwrap() as i32,
+                "{} {}",
+                a.path.display(),
+                b.path.display()
+            );
+        }
+    }
+
+    #[test]
     fn world_list_uses_the_saved_name_and_last_played_time() {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::nbt::{self, NamedTag, Tag};
         use std::io::Write;
         let temp = tempfile::tempdir().unwrap();
-        let level = NamedTag {
-            name: "".into(),
-            value: Tag::Compound(vec![(
-                "Data".into(),
-                Tag::Compound(vec![
-                    ("DataVersion".into(), Tag::Int(5023)),
-                    ("LevelName".into(), Tag::String("한글 월드".into())),
-                    ("LastPlayed".into(), Tag::Long(123456)),
-                ]),
-            )]),
-        };
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&nbt::write(&level).unwrap()).unwrap();
-        std::fs::write(temp.path().join("level.dat"), encoder.finish().unwrap()).unwrap();
-        let world = WorldEntry::read(temp.path().to_path_buf());
-        assert_eq!(world.name, "한글 월드");
-        assert_eq!(world.data_version, Some(5023));
-        assert_eq!(world.last_played, Some(123456));
+        for (saved, expected) in [
+            (Tag::Long(123456), Some(123456)),
+            (Tag::Int(-42), Some(-42)),
+            (Tag::Double(4.9), Some(4)),
+            (Tag::String("invalid".into()), None),
+        ] {
+            let level = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "Data".into(),
+                    Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        ("LevelName".into(), Tag::String("한글 월드".into())),
+                        ("LastPlayed".into(), saved),
+                    ]),
+                )]),
+            };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(&level).unwrap()).unwrap();
+            std::fs::write(temp.path().join("level.dat"), encoder.finish().unwrap()).unwrap();
+            let world = WorldEntry::read(temp.path().to_path_buf());
+            assert_eq!(world.name, "한글 월드");
+            assert_eq!(world.data_version, Some(5023));
+            assert_eq!(world.last_played, expected);
+        }
     }
 
     #[test]

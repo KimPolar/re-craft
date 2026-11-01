@@ -103,6 +103,10 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
             "!minecraft:attribute_modifiers" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
                 {}
             "minecraft:enchantments" if valid_enchantments(value) => {}
+            "minecraft:break_sound"
+                if crate::consume_particles::break_sound_id(value).is_some() => {}
+            "!minecraft:break_sound" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
+                {}
             "minecraft:enchantment_glint_override" if matches!(value, Tag::Byte(0 | 1)) => {}
             "!minecraft:enchantment_glint_override" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
                 {}
@@ -122,6 +126,9 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
     if seen.contains("minecraft:enchantment_glint_override")
         && seen.contains("!minecraft:enchantment_glint_override")
     {
+        return None;
+    }
+    if seen.contains("minecraft:break_sound") && seen.contains("!minecraft:break_sound") {
         return None;
     }
     if default == 1 && max != 1 {

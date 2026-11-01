@@ -3134,6 +3134,14 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             4
+        } else if name.matches("minecraft:break_sound") {
+            crate::consume_particles::break_sound_id(value)?;
+            8388608
+        } else if name.matches("!minecraft:break_sound") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            16777216
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072
@@ -3236,6 +3244,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & (2097152 | 4194304) == (2097152 | 4194304) {
+        return None;
+    }
+    if seen & (8388608 | 16777216) == (8388608 | 16777216) {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
@@ -4184,6 +4195,61 @@ mod tests {
         );
         assert_eq!(inventory, before);
         assert_eq!(random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn break_sound_components_are_validated_without_losing_other_data() {
+        let components = |key: &str, value| Tag::Compound(vec![(key.into(), value)]);
+        for (value, expected) in [
+            (
+                Tag::String("block.anvil.break".into()),
+                Some("minecraft:block.anvil.break"),
+            ),
+            (
+                Tag::Compound(vec![
+                    ("sound_id".into(), Tag::String("example:impact".into())),
+                    ("range".into(), Tag::Float(8.0)),
+                ]),
+                Some("example:impact"),
+            ),
+            (Tag::String("Invalid Sound".into()), None),
+            (
+                Tag::Compound(vec![
+                    ("sound_id".into(), Tag::String("example:a".into())),
+                    ("sound_id".into(), Tag::String("example:b".into())),
+                ]),
+                None,
+            ),
+        ] {
+            let component = components("minecraft:break_sound", value.clone());
+            assert_eq!(
+                crate::consume_particles::break_sound_id(&value).as_deref(),
+                expected
+            );
+            assert_eq!(
+                saved_item_max("minecraft:stone_pickaxe", &component),
+                expected.map(|_| 1)
+            );
+            assert_eq!(
+                crate::equippable::saved_inventory_max("minecraft:iron_helmet", &component),
+                expected.map(|_| 1)
+            );
+        }
+        let conflicting = Tag::Compound(vec![
+            (
+                "minecraft:break_sound".into(),
+                Tag::String("minecraft:entity.item.break".into()),
+            ),
+            ("!minecraft:break_sound".into(), Tag::Compound(vec![])),
+        ]);
+        assert_eq!(
+            saved_item_max("minecraft:stone_pickaxe", &conflicting),
+            None
+        );
+        assert_eq!(
+            crate::equippable::saved_inventory_max("minecraft:iron_helmet", &conflicting),
+            None
+        );
     }
 
     #[test]

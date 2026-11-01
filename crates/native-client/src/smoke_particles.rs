@@ -131,7 +131,7 @@ fn lava_fizz(
     let sound = native_session::ConsumeSound {
         position: position.as_dvec3() + DVec3::splat(0.5),
         info: native_session::ConsumeSoundInfo {
-            event: "block.lava.extinguish",
+            event: "block.lava.extinguish".into(),
             volume: 0.5,
             pitch,
             category: native_session::ConsumeSoundCategory::Block,

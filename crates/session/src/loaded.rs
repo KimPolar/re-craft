@@ -22998,7 +22998,7 @@ mod tests {
                 assert_eq!(
                     test.take_consume_sounds()
                         .iter()
-                        .map(|s| s.info.event)
+                        .map(|s| s.info.event.as_ref())
                         .collect::<Vec<_>>(),
                     expected,
                     "distance={distance} silent={silent}"
@@ -23052,7 +23052,7 @@ mod tests {
                         assert_eq!(
                             sounds
                                 .iter()
-                                .map(|sound| sound.info.event)
+                                .map(|sound| sound.info.event.as_ref())
                                 .collect::<Vec<_>>(),
                             expected,
                             "{distance} {mode:?} silent={silent} rule={fall_damage}"
@@ -23172,7 +23172,7 @@ mod tests {
                 .iter()
                 .filter(|sound| {
                     !matches!(
-                        sound.info.event,
+                        sound.info.event.as_ref(),
                         "entity.player.hurt" | "entity.player.death"
                     )
                 })
@@ -23210,7 +23210,7 @@ mod tests {
                     .iter()
                     .filter(|sound| {
                         !matches!(
-                            sound.info.event,
+                            sound.info.event.as_ref(),
                             "entity.player.hurt" | "entity.player.death"
                         )
                     })
@@ -23350,7 +23350,7 @@ mod tests {
                     // The Java oracle records the synchronous landing effects;
                     // client damage packets are tested by a separate oracle.
                     .filter(|sound| sound.info.event != "entity.player.hurt")
-                    .map(|sound| sound.info.event)
+                    .map(|sound| sound.info.event.as_ref())
                     .collect::<Vec<_>>(),
                 expected,
                 "{row}"
@@ -39303,7 +39303,7 @@ mod tests {
             assert_eq!(
                 test.take_consume_sounds()
                     .iter()
-                    .map(|s| s.info.event)
+                    .map(|s| s.info.event.as_ref())
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -40263,7 +40263,7 @@ mod tests {
         assert_eq!(
             sounds
                 .iter()
-                .map(|sound| sound.info.event)
+                .map(|sound| sound.info.event.as_ref())
                 .collect::<Vec<_>>(),
             [
                 "entity.item.break",
@@ -40283,6 +40283,55 @@ mod tests {
                 .iter()
                 .all(|particle| particle.item.id() == "minecraft:iron_helmet")
         );
+    }
+
+    #[test]
+    fn broken_equipment_emits_custom_and_removed_sounds_from_saved_components() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for (component, expected) in [
+            (
+                (
+                    "minecraft:break_sound",
+                    Tag::String("block.anvil.break".into()),
+                ),
+                Some("minecraft:block.anvil.break"),
+            ),
+            (
+                (
+                    "minecraft:break_sound",
+                    Tag::Compound(vec![
+                        ("sound_id".into(), Tag::String("example:impact".into())),
+                        ("range".into(), Tag::Float(8.0)),
+                    ]),
+                ),
+                Some("example:impact"),
+            ),
+            (("!minecraft:break_sound", Tag::Compound(vec![])), None),
+        ] {
+            let components = Tag::Compound(vec![
+                ("minecraft:damage".into(), Tag::Int(164)),
+                (component.0.into(), component.1),
+            ]);
+            assert_eq!(
+                crate::equippable::saved_inventory_max("minecraft:iron_helmet", &components),
+                Some(1)
+            );
+            let mut test = session();
+            Arc::make_mut(&mut test.inventory).set_slot(
+                PlayerSlot::Armor(0),
+                ItemStack::new("minecraft:iron_helmet".into(), 1, 1, components),
+            );
+            test.armor.refresh(&test.inventory).unwrap();
+            assert!(test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+            let sounds = test.take_consume_sounds();
+            let actual = sounds
+                .iter()
+                .find(|sound| sound.info.volume == 0.8)
+                .map(|sound| sound.info.event.as_ref());
+            assert_eq!(actual, expected);
+            assert_eq!(test.take_consume_particles().len(), 5);
+        }
     }
 
     #[test]
@@ -47407,14 +47456,21 @@ mod tests {
             session.set_block_loot(Arc::clone(&loot));
             session.set_block_drops(drops_enabled);
             let mut inventory = PlayerInventory::default();
+            let mut components = vec![("minecraft:damage".into(), Tag::Int(130))];
+            if drops_enabled {
+                components.push((
+                    "minecraft:break_sound".into(),
+                    Tag::String("example:impact".into()),
+                ));
+            }
+            let components = Tag::Compound(components);
+            assert_eq!(
+                crate::inventory::saved_item_max("minecraft:stone_pickaxe", &components),
+                Some(1)
+            );
             inventory.set_slot(
                 PlayerSlot::Storage(0),
-                ItemStack::new(
-                    "minecraft:stone_pickaxe".into(),
-                    1,
-                    1,
-                    Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(130))]),
-                ),
+                ItemStack::new("minecraft:stone_pickaxe".into(), 1, 1, components),
             );
             session.set_player_inventory(inventory);
             session.update(TICK * 3);
@@ -47459,7 +47515,12 @@ mod tests {
                 session
                     .take_consume_sounds()
                     .iter()
-                    .any(|sound| sound.info.event == "entity.item.break")
+                    .any(|sound| sound.info.event
+                        == if drops_enabled {
+                            "example:impact"
+                        } else {
+                            "entity.item.break"
+                        })
             );
             assert_eq!(
                 before

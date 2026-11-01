@@ -7,7 +7,7 @@ use glam::DVec3;
 use crate::{inventory::ItemStack, physics::java_sin};
 
 /// Handle a client-side equipment-break event using the item the client saw
-/// before its equipment update. Known default sounds share the normal sound
+/// before its equipment update. The sound shares the normal sound
 /// queue; particles use the same item renderer as consumption particles.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn equipment_break(
@@ -22,36 +22,25 @@ pub(crate) fn equipment_break(
     sounds: &mut std::collections::VecDeque<crate::ConsumeSound>,
     particles: &mut std::collections::VecDeque<ConsumeParticleSpawn>,
 ) {
-    use native_persistence::nbt::Tag;
-    let sound = if item.components().get("!minecraft:break_sound").is_some() {
-        None
-    } else {
-        match item.components().get("minecraft:break_sound") {
-            None => Some(Some(if item.id() == "minecraft:shield" {
-                "item.shield.break"
-            } else {
-                "entity.item.break"
-            })),
-            Some(Tag::String(value)) => {
-                let id = String::from_utf16_lossy(&value.0);
-                Some(match id.as_str() {
-                    "minecraft:entity.item.break" | "entity.item.break" => {
-                        Some("entity.item.break")
-                    }
-                    "minecraft:item.shield.break" | "item.shield.break" => {
-                        Some("item.shield.break")
-                    }
-                    _ => None,
-                })
+    let sound: Option<std::borrow::Cow<'static, str>> =
+        if item.components().get("!minecraft:break_sound").is_some() {
+            None
+        } else {
+            match item.components().get("minecraft:break_sound") {
+                None => Some(
+                    (if item.id() == "minecraft:shield" {
+                        "item.shield.break"
+                    } else {
+                        "entity.item.break"
+                    })
+                    .into(),
+                ),
+                Some(value) => break_sound_id(value).map(std::borrow::Cow::Owned),
             }
-            Some(_) => None,
-        }
-    };
+        };
     if !silent && let Some(event) = sound {
         let pitch = 0.8_f32 + random.next_float() * 0.4_f32;
-        if let Some(event) = event {
-            crate::queue_player_sound(sounds, position, event, 0.8, pitch);
-        }
+        crate::queue_player_sound(sounds, position, event, 0.8, pitch);
     }
     for _ in 0..5 {
         let samples = [
@@ -62,6 +51,28 @@ pub(crate) fn equipment_break(
         ];
         crate::push_consume_particle(particles, item, samples, eye, yaw, pitch, tick);
     }
+}
+
+/// Decode the registered sound ID or inline SoundEvent codec representation.
+pub(crate) fn break_sound_id(value: &native_persistence::nbt::Tag) -> Option<String> {
+    use native_persistence::nbt::Tag;
+    let sound = match value {
+        Tag::String(sound) => sound,
+        Tag::Compound(fields) => {
+            let mut matching = fields.iter().filter(|(name, _)| name.matches("sound_id"));
+            let (_, Tag::String(sound)) = matching.next()? else {
+                return None;
+            };
+            if matching.next().is_some() {
+                return None;
+            }
+            sound
+        }
+        _ => return None,
+    };
+    let text = String::from_utf16(&sound.0).ok()?;
+    let id = native_resources::packs::ResourceId::parse(&text).ok()?;
+    Some(format!("{}:{}", id.namespace, id.path))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,11 +171,24 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 288);
+        assert_eq!(rows.len(), 576);
         for row in rows {
             let mut components = Vec::new();
-            if row["missing"].as_bool().unwrap() {
-                components.push(("!minecraft:break_sound".into(), Tag::Compound(vec![])));
+            match row["variant"].as_i64().unwrap() {
+                0 => {}
+                1 => components.push(("!minecraft:break_sound".into(), Tag::Compound(vec![]))),
+                2 => components.push((
+                    "minecraft:break_sound".into(),
+                    Tag::String("block.anvil.break".into()),
+                )),
+                3 => components.push((
+                    "minecraft:break_sound".into(),
+                    Tag::Compound(vec![
+                        ("sound_id".into(), Tag::String("example:hammer".into())),
+                        ("range".into(), Tag::Float(8.0)),
+                    ]),
+                )),
+                _ => panic!(),
             }
             let item = Arc::new(
                 ItemStack::new(
@@ -193,8 +217,9 @@ mod tests {
             let java_sounds = row["sounds"].as_array().unwrap();
             assert_eq!(sounds.len(), java_sounds.len(), "{row}");
             for (sound, expected) in sounds.iter().zip(java_sounds) {
+                let actual = native_resources::packs::ResourceId::parse(&sound.info.event).unwrap();
                 assert_eq!(
-                    format!("minecraft:{}", sound.info.event),
+                    format!("{}:{}", actual.namespace, actual.path),
                     expected["event"].as_str().unwrap()
                 );
                 assert_eq!(

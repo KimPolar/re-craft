@@ -255,7 +255,7 @@ fn extinguish_audio(event: native_session::ExtinguishSound) -> native_session::C
     native_session::ConsumeSound {
         position: event.position,
         info: native_session::ConsumeSoundInfo {
-            event: "entity.generic.extinguish_fire",
+            event: "entity.generic.extinguish_fire".into(),
             volume: 0.7,
             pitch: event.pitch,
             category: native_session::ConsumeSoundCategory::Ambient,
@@ -267,7 +267,7 @@ fn compass_audio(event: native_session::loaded::CompassSoundEvent) -> native_ses
     native_session::ConsumeSound {
         position: event.position,
         info: native_session::ConsumeSoundInfo {
-            event: "item.lodestone_compass.lock",
+            event: "item.lodestone_compass.lock".into(),
             volume: 1.0,
             pitch: 1.0,
             category: native_session::ConsumeSoundCategory::Player,
@@ -672,7 +672,7 @@ impl Catalog {
         ambient_gain: &Arc<AtomicU32>,
     ) -> Result<Option<Voice>> {
         self.resolve(
-            event.info.event,
+            &event.info.event,
             event.info.volume,
             event.info.pitch,
             Some(event.position),
@@ -1145,15 +1145,26 @@ mod tests {
         let event = native_session::ConsumeSound {
             position: glam::DVec3::new(1.0, 2.0, 3.0),
             info: native_session::ConsumeSoundInfo {
-                event: "entity.generic.eat",
+                event: "entity.generic.eat".into(),
                 volume: 0.5,
                 pitch: 1.1,
                 category: native_session::ConsumeSoundCategory::Neutral,
             },
         };
-        ui.consume(event);
+        ui.consume(event.clone());
         assert!(
             matches!(probe.receiver.try_recv(), Ok(Command::Consume(_, actual)) if actual == event)
+        );
+        let custom = native_session::ConsumeSound {
+            info: native_session::ConsumeSoundInfo {
+                event: String::from("example:impact").into(),
+                ..event.info.clone()
+            },
+            position: event.position,
+        };
+        ui.consume(custom.clone());
+        assert!(
+            matches!(probe.receiver.try_recv(), Ok(Command::Consume(_, actual)) if actual == custom)
         );
     }
 
@@ -1291,6 +1302,9 @@ mod tests {
         let directory = pack.path().join("assets/minecraft");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("sounds.json"), br#"{"entity.generic.eat":{"replace":true,"sounds":[{"name":"random/click_stereo","volume":0.4,"pitch":1.5}]}}"#).unwrap();
+        let custom = pack.path().join("assets/example");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("sounds.json"), br#"{"impact":{"sounds":[{"name":"minecraft:random/click_stereo","volume":0.25,"pitch":1.25}]}}"#).unwrap();
         let mut catalog = Catalog::load(Resources {
             root,
             packs: vec![pack.path().to_path_buf()],
@@ -1300,14 +1314,20 @@ mod tests {
         let event = native_session::ConsumeSound {
             position: glam::DVec3::new(2.0, 3.0, 4.0),
             info: native_session::ConsumeSoundInfo {
-                event: "entity.generic.eat",
+                event: "entity.generic.eat".into(),
                 volume: 0.5,
                 pitch: 1.0,
                 category: native_session::ConsumeSoundCategory::Neutral,
             },
         };
         let voice = catalog
-            .consume(event, &mut LegacyRandom::new(1), 48000, &gain, &gain)
+            .consume(
+                event.clone(),
+                &mut LegacyRandom::new(1),
+                48000,
+                &gain,
+                &gain,
+            )
             .unwrap()
             .unwrap();
         assert!(
@@ -1320,6 +1340,24 @@ mod tests {
         assert_eq!(voice.volume, 0.2);
         assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.5);
         assert!(voice.clip.samples.iter().any(|&sample| sample != 0));
+        let position = glam::DVec3::new(1.0, 4.0, 7.0);
+        let event = native_session::ConsumeSound {
+            position,
+            info: native_session::ConsumeSoundInfo {
+                event: String::from("example:impact").into(),
+                volume: 0.8,
+                pitch: 1.0,
+                category: native_session::ConsumeSoundCategory::Player,
+            },
+        };
+        let voice = catalog
+            .consume(event, &mut LegacyRandom::new(1), 48000, &gain, &gain)
+            .unwrap()
+            .unwrap();
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert!(voice.player_sound);
+        assert_eq!(voice.volume, 0.8_f32 * 0.25);
+        assert_eq!(voice.step, f64::from(voice.clip.rate) / 48000.0 * 1.25);
     }
 
     #[test]

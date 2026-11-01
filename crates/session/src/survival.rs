@@ -905,10 +905,10 @@ impl FoodRandomEvent {
                 }
             }
             Self::StatusGroup { probability, .. } => {
-                return (random.next_float() < *probability, [None; 3]);
+                return (random.next_float() < *probability, [const { None }; 3]);
             }
             Self::RemoveStatuses(_) | Self::PotionEffects(_) | Self::ClearAllStatuses => {
-                return (true, [None; 3]);
+                return (true, [const { None }; 3]);
             }
         };
         let volume = if random.next_bool() { 0.5 } else { 1.0 };
@@ -929,7 +929,7 @@ impl FoodRandomEvent {
         };
         let mut sounds = [
             Some(crate::ConsumeSoundInfo {
-                event,
+                event: event.into(),
                 volume,
                 pitch,
                 category: crate::ConsumeSoundCategory::Player,
@@ -944,13 +944,13 @@ impl FoodRandomEvent {
             let pitch = 1.0_f32 + 0.4_f32 * (random.next_float() - random.next_float());
             let burp_pitch = 0.9_f32 + random.next_float() * (1.0_f32 - 0.9_f32);
             sounds[1] = Some(crate::ConsumeSoundInfo {
-                event,
+                event: event.into(),
                 volume: 1.0,
                 pitch,
                 category: crate::ConsumeSoundCategory::Neutral,
             });
             sounds[2] = Some(crate::ConsumeSoundInfo {
-                event: "entity.player.burp",
+                event: "entity.player.burp".into(),
                 volume: 0.5,
                 pitch: burp_pitch,
                 category: crate::ConsumeSoundCategory::Player,

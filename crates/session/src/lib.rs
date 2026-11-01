@@ -128,15 +128,15 @@ pub enum ConsumeSoundCategory {
     Block,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConsumeSoundInfo {
-    pub event: &'static str,
+    pub event: std::borrow::Cow<'static, str>,
     pub volume: f32,
     pub pitch: f32,
     pub category: ConsumeSoundCategory,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConsumeSound {
     pub position: DVec3,
     pub info: ConsumeSoundInfo,
@@ -158,7 +158,7 @@ fn collect_consume_sounds(
 fn queue_player_sound(
     queue: &mut VecDeque<ConsumeSound>,
     position: DVec3,
-    event: &'static str,
+    event: impl Into<std::borrow::Cow<'static, str>>,
     volume: f32,
     pitch: f32,
 ) {
@@ -168,7 +168,7 @@ fn queue_player_sound(
     queue.push_back(ConsumeSound {
         position,
         info: ConsumeSoundInfo {
-            event,
+            event: event.into(),
             volume,
             pitch,
             category: ConsumeSoundCategory::Player,

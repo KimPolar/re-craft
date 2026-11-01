@@ -2632,6 +2632,8 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:diamond_block"
         | "minecraft:emerald_block"
         | "minecraft:iron_block"
+        | "minecraft:moss_block"
+        | "minecraft:tuff"
         | "minecraft:coal_ore"
         | "minecraft:deepslate_coal_ore"
         | "minecraft:iron_ore"
@@ -2718,6 +2720,8 @@ const STACKABLE_ITEMS: &[&str] = &[
     "charcoal",
     "diamond",
     "amethyst_shard",
+    "arrow",
+    "tipped_arrow",
     "emerald",
     "lapis_lazuli",
     "redstone",
@@ -2788,6 +2792,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         id,
         "minecraft:shears"
             | "minecraft:cake"
+            | "minecraft:milk_bucket"
             | "minecraft:potion"
             | "minecraft:leather_horse_armor"
             | "minecraft:wolf_armor"
@@ -2911,8 +2916,10 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             524288
-        } else if id == "minecraft:potion" && name.matches("minecraft:potion_contents") {
-            crate::survival::potion_effects(components)?;
+        } else if matches!(id, "minecraft:potion" | "minecraft:tipped_arrow")
+            && name.matches("minecraft:potion_contents")
+        {
+            crate::survival::inventory_potion_contents(components)?;
             65536
         } else if name.matches("minecraft:custom_data") {
             if !matches!(value, Tag::Compound(_)) {
@@ -4611,5 +4618,127 @@ mod tests {
             )]),
         )]);
         assert_eq!(saved_item_max("minecraft:potion", &unknown), None);
+    }
+
+    #[test]
+    fn trial_supply_potion_items_keep_components_and_supported_colors() {
+        for (potion, color) in [
+            ("poison", 0x87a363),
+            ("slowness", 0x8bafe0),
+            ("regeneration", 0xcd5cab),
+            ("strength", 0xffc700),
+        ] {
+            for (id, max) in [("minecraft:potion", 1), ("minecraft:tipped_arrow", 64)] {
+                let components = Tag::Compound(vec![(
+                    "minecraft:potion_contents".into(),
+                    Tag::Compound(vec![(
+                        "potion".into(),
+                        Tag::String(format!("minecraft:{potion}").as_str().into()),
+                    )]),
+                )]);
+                assert_eq!(saved_item_max(id, &components), Some(max));
+                assert_eq!(crate::survival::potion_color(&components), Some(color));
+                let item = ItemStack::new(id.into(), 1, max, components.clone()).unwrap();
+                assert!(basic_pickup_supported(&item));
+                if id == "minecraft:potion" && potion != "poison" {
+                    assert!(crate::survival::food_properties(&item).is_none());
+                }
+            }
+        }
+        for (id, max) in [
+            ("minecraft:arrow", 64),
+            ("minecraft:tipped_arrow", 64),
+            ("minecraft:moss_block", 64),
+            ("minecraft:tuff", 64),
+            ("minecraft:milk_bucket", 1),
+        ] {
+            assert_eq!(saved_item_max(id, &Tag::Compound(vec![])), Some(max));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn trial_supply_potion_items_match_java_prototypes() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PotionItemsOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PotionItemsOracle.java"),
+        )
+        .unwrap();
+        for (command, oracle) in [
+            (
+                Command::new(java.join("javac.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg(&source),
+                false,
+            ),
+            (
+                Command::new(java.join("java.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg("PotionItemsOracle"),
+                true,
+            ),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if oracle {
+                let output = String::from_utf8(result.stdout).unwrap();
+                for id in ["minecraft:potion", "minecraft:tipped_arrow"] {
+                    for potion in ["poison", "slowness", "regeneration", "strength"] {
+                        let components = Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![(
+                                "potion".into(),
+                                Tag::String(format!("minecraft:{potion}").as_str().into()),
+                            )]),
+                        )]);
+                        let max = saved_item_max(id, &components).unwrap();
+                        let color = crate::survival::potion_color(&components).unwrap();
+                        let expected = format!(
+                            "P {id} minecraft:{potion} {max} {color:06x} {{components:{{\"minecraft:potion_contents\":{{potion:\"minecraft:{potion}\"}}}},count:1,id:\"{id}\"}}"
+                        );
+                        assert!(output.lines().any(|line| line == expected), "{expected}");
+                    }
+                }
+                for id in [
+                    "minecraft:arrow",
+                    "minecraft:tipped_arrow",
+                    "minecraft:moss_block",
+                    "minecraft:tuff",
+                    "minecraft:milk_bucket",
+                ] {
+                    let max = ordinary_item_default_max(id).unwrap();
+                    assert!(output.lines().any(|line| line == format!("I {id} {max}")));
+                }
+            }
+        }
     }
 }

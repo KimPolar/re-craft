@@ -59,6 +59,11 @@ public class ChestLootOracle {
        if(stack.getDamageValue()==0&&encoded.contains(component))throw new AssertionError(encoded);
        if(stack.getDamageValue()>0&&!encoded.contains(component+stack.getDamageValue()))throw new AssertionError(encoded);
       }
+      else if(args.length>1&&args[1].equals("potion")){
+       var contents=stack.get(DataComponents.POTION_CONTENTS);
+       String potion=contents==null?"-":contents.potion().flatMap(Holder::unwrapKey).map(k->k.identifier().toString()).orElse("-");
+       out.printf("P %d %s %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount(),potion,stack.getDamageValue());
+      }
       else out.printf("P %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount());
      }}
      out.println("R "+random.nextLong());

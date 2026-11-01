@@ -267,6 +267,108 @@ fn bonus_roll_and_item_damage_providers_match_java() {
         cases += 1;
     }
     assert_eq!(cases, values.len() * 4 * 2 * 4);
+
+    let supply: Value = serde_json::from_slice(
+        &resources
+            .read_builtin_data("data/minecraft/loot_table/chests/trial_chambers/supply.json")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let table = ChestLootTable::decode(&supply).unwrap();
+    let resolve = |item: &ChestLootItem| -> anyhow::Result<ChestLootPrototype> {
+        let (max_stack, durability) = match item.id.path.as_str() {
+            "stone_pickaxe" => (1, ChestLootDurability::Damageable(131)),
+            "potion" | "milk_bucket" => (1, ChestLootDurability::NotDamageable),
+            "arrow" | "tipped_arrow" | "baked_potato" | "glow_berries" | "acacia_planks"
+            | "moss_block" | "bone_meal" | "tuff" | "torch" => {
+                (64, ChestLootDurability::NotDamageable)
+            }
+            id => anyhow::bail!("unknown supply item {id}"),
+        };
+        Ok(ChestLootPrototype {
+            max_stack,
+            durability,
+        })
+    };
+    std::fs::write(&input, serde_json::to_vec(&[supply]).unwrap()).unwrap();
+    let output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ChestLootOracle")
+        .arg(&input)
+        .arg("potion"));
+    let mut lines = output
+        .lines()
+        .filter(|line| line.starts_with("S ") || line.starts_with("P ") || line.starts_with("R "))
+        .peekable();
+    let mut cases = 0;
+    let mut potion_items = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        assert_eq!(fields[1], "0");
+        let luck: f32 = fields[2].parse().unwrap();
+        let mode: i32 = fields[3].parse().unwrap();
+        let seed: i64 = fields[4].parse().unwrap();
+        let mut expected = Vec::new();
+        while lines.peek().is_some_and(|line| line.starts_with("P ")) {
+            expected.push(lines.next().unwrap().to_owned());
+        }
+        let next: i64 = lines
+            .next()
+            .unwrap()
+            .strip_prefix("R ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (slots, actual_next) = if mode == 0 {
+            let mut random = LegacyRandom::new(seed);
+            let slots = table
+                .fill_with_random_and_luck(&[false; 27], &mut random, luck, resolve)
+                .unwrap();
+            (slots, random.next_long())
+        } else {
+            let mut random = XoroshiroRandom::new(seed);
+            let slots = table
+                .fill_with_random_and_luck(&[false; 27], &mut random, luck, resolve)
+                .unwrap();
+            (slots, random.next_long())
+        };
+        let actual: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, item)| {
+                item.as_ref().map(|item| {
+                    if item.potion.is_some() {
+                        potion_items += 1;
+                    }
+                    let potion = item
+                        .potion
+                        .as_ref()
+                        .map(|id| format!("{}:{}", id.namespace, id.path))
+                        .unwrap_or_else(|| "-".into());
+                    format!(
+                        "P {slot} {}:{} {} {potion} {}",
+                        item.id.namespace,
+                        item.id.path,
+                        item.count,
+                        item.damage.unwrap_or(0)
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "supply luck={luck} mode={mode} seed={seed}"
+        );
+        assert_eq!(
+            actual_next, next,
+            "supply luck={luck} mode={mode} seed={seed}"
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 32);
+    assert!(potion_items > 0);
 }
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]

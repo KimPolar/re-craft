@@ -1878,6 +1878,9 @@ public class PaletteOracle {
                 [152.0 / 255.0, 218.0 / 255.0, 192.0 / 255.0],
             ),
             ("poison", [135.0 / 255.0, 163.0 / 255.0, 99.0 / 255.0]),
+            ("slowness", [139.0 / 255.0, 175.0 / 255.0, 224.0 / 255.0]),
+            ("regeneration", [205.0 / 255.0, 92.0 / 255.0, 171.0 / 255.0]),
+            ("strength", [1.0, 199.0 / 255.0, 0.0]),
         ] {
             let components = Tag::Compound(vec![(
                 "minecraft:potion_contents".into(),
@@ -1886,11 +1889,13 @@ public class PaletteOracle {
                     Tag::String(format!("minecraft:{potion}").as_str().into()),
                 )]),
             )]);
-            let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
-            let model = loader.load_visual(&ModelKey::from_item(&item)).unwrap();
-            assert_eq!(model.sprite_layers.len(), 2);
-            assert_eq!(model.sprite_layers[0].tint, expected, "{potion}");
-            assert_eq!(model.sprite_layers[1].tint, [1.0; 3]);
+            for (id, max) in [("minecraft:potion", 1), ("minecraft:tipped_arrow", 64)] {
+                let item = ItemStack::new(id.into(), 1, max, components.clone()).unwrap();
+                let model = loader.load_visual(&ModelKey::from_item(&item)).unwrap();
+                assert_eq!(model.sprite_layers.len(), 2);
+                assert_eq!(model.sprite_layers[0].tint, expected, "{id} {potion}");
+                assert_eq!(model.sprite_layers[1].tint, [1.0; 3]);
+            }
         }
     }
 

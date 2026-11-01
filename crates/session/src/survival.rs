@@ -147,10 +147,8 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
     }
 }
 
-/// Resolve the built-in potion definitions whose effects this session simulates.
-pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>> {
+fn potion_id(components: &Tag) -> Option<ResourceId> {
     let contents = match components.get("minecraft:potion_contents") {
-        None => return Some(Vec::new()),
         Some(Tag::Compound(fields)) => fields,
         _ => return None,
     };
@@ -161,10 +159,40 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
         return None;
     }
     let id = String::from_utf16(&id.0).ok()?;
-    let id = ResourceId::parse(&id).ok()?;
-    if id.namespace != "minecraft" {
-        return None;
+    ResourceId::parse(&id)
+        .ok()
+        .filter(|id| id.namespace == "minecraft")
+}
+
+/// Recognize the built-in contents whose inventory representation is supported.
+pub(crate) fn inventory_potion_contents(components: &Tag) -> Option<()> {
+    let id = potion_id(components)?;
+    matches!(
+        id.path.as_str(),
+        "water"
+            | "mundane"
+            | "thick"
+            | "awkward"
+            | "night_vision"
+            | "long_night_vision"
+            | "water_breathing"
+            | "long_water_breathing"
+            | "poison"
+            | "long_poison"
+            | "strong_poison"
+            | "slowness"
+            | "regeneration"
+            | "strength"
+    )
+    .then_some(())
+}
+
+/// Resolve the built-in potion definitions whose effects this session simulates.
+pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>> {
+    if components.get("minecraft:potion_contents").is_none() {
+        return Some(Vec::new());
     }
+    let id = potion_id(components)?;
     if matches!(id.path.as_str(), "water" | "mundane" | "thick" | "awkward") {
         return Some(Vec::new());
     }
@@ -190,12 +218,14 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
 
 /// Color of supported built-in potion contents; absent/unsupported uses the model default.
 pub fn potion_color(components: &Tag) -> Option<u32> {
-    let effect = potion_effects(components)?.into_iter().next()?;
-    match effect.kind {
-        FoodStatusKind::NightVision => Some(0xc2ff66),
-        FoodStatusKind::WaterBreathing => Some(0x98dac0),
-        FoodStatusKind::Poison => Some(0x87a363),
-        FoodStatusKind::Hunger => None,
+    match potion_id(components)?.path.as_str() {
+        "night_vision" | "long_night_vision" => Some(0xc2ff66),
+        "water_breathing" | "long_water_breathing" => Some(0x98dac0),
+        "poison" | "long_poison" | "strong_poison" => Some(0x87a363),
+        "slowness" => Some(0x8bafe0),
+        "regeneration" => Some(0xcd5cab),
+        "strength" => Some(0xffc700),
+        _ => None,
     }
 }
 

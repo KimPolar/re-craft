@@ -4941,16 +4941,16 @@ impl LoadedSession {
         );
         let components = if let Some(potion) = &item.potion {
             ensure!(
-                id == "minecraft:potion"
-                    && potion.namespace == "minecraft"
-                    && potion.path == "water_breathing",
+                matches!(id.as_str(), "minecraft:potion" | "minecraft:tipped_arrow")
+                    && potion.namespace == "minecraft",
                 "unsupported potion loot prototype"
             );
+            let potion_id = format!("{}:{}", potion.namespace, potion.path);
             native_persistence::nbt::Tag::Compound(vec![(
                 "minecraft:potion_contents".into(),
                 native_persistence::nbt::Tag::Compound(vec![(
                     "potion".into(),
-                    native_persistence::nbt::Tag::String("minecraft:water_breathing".into()),
+                    native_persistence::nbt::Tag::String(potion_id.as_str().into()),
                 )]),
             )])
         } else {
@@ -27711,6 +27711,180 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 21);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn trial_chamber_supply_loot_preserves_potions_in_chest_draft() {
+        use native_persistence::nbt::{self, NamedTag, Tag};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceId, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let tables = Arc::new(ChestLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let id = ResourceId::parse("minecraft:chests/trial_chambers/supply").unwrap();
+        let table = tables.get(&id).unwrap();
+        let mut potion_types = BTreeSet::new();
+        let mut item_types = BTreeSet::new();
+        for seed in 1..=32_i64 {
+            let (mut session, _, position, chunk) = saved_chest_fixture();
+            let player = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            };
+            session.restore_saved_player_inventory(&player).unwrap();
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!()
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                panic!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String("minecraft:chests/trial_chambers/supply".into()),
+            ));
+            fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            let saved_state =
+                |name: &str, properties: &[(&str, &str)]| native_persistence::palette::BlockState {
+                    name: name.into(),
+                    properties: properties
+                        .iter()
+                        .map(|(k, v)| ((*k).into(), (*v).into()))
+                        .collect(),
+                };
+            let mut chunk_source = native_persistence::edit::draft_chunk_blocks(
+                &fixture_chunk_document(chunk),
+                native_persistence::world::ChunkPos {
+                    x: chunk.x,
+                    z: chunk.z,
+                },
+                &[native_persistence::edit::BlockChange {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    expected: saved_state("minecraft:stone", &[]),
+                    replacement: saved_state(
+                        "minecraft:chest",
+                        &[
+                            ("facing", "north"),
+                            ("type", "single"),
+                            ("waterlogged", "false"),
+                        ],
+                    ),
+                }],
+            )
+            .unwrap()
+            .document()
+            .clone();
+            let Tag::Compound(fields) = &mut chunk_source.value else {
+                panic!()
+            };
+            fields.push(("block_entities".into(), document.value.clone()));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_chest_loot(Arc::clone(&tables));
+            session.set_item_registry(Arc::clone(&registry));
+            let mut probe = session
+                .saved_chest_internal(position, true)
+                .unwrap()
+                .unwrap();
+            probe
+                .unpack_seeded_loot(&id, table, |item| {
+                    LoadedSession::resolve_chest_loot_item(item, &registry)
+                })
+                .unwrap();
+            assert!(
+                session.try_open_saved_chest(position - session.origin),
+                "seed {seed}"
+            );
+            for slot in 0..27 {
+                if let Some(item) = session
+                    .inventory
+                    .slot(crate::inventory::PlayerSlot::Chest(slot))
+                {
+                    if let Some(Tag::String(potion)) = item
+                        .components()
+                        .get("minecraft:potion_contents")
+                        .and_then(|v| v.get("potion"))
+                    {
+                        potion_types.insert(String::from_utf16(&potion.0).unwrap());
+                        item_types.insert(item.id().to_owned());
+                    }
+                }
+            }
+            let potion = (0..27).find_map(|slot| {
+                session
+                    .inventory
+                    .slot(crate::inventory::PlayerSlot::Chest(slot))
+                    .filter(|item| item.components().get("minecraft:potion_contents").is_some())
+                    .map(|item| (slot, item.clone()))
+            });
+            if let Some((slot, original)) = potion {
+                assert!(
+                    Arc::make_mut(&mut session.inventory)
+                        .quick_move(crate::inventory::PlayerSlot::Chest(slot))
+                );
+                assert!(
+                    (0..36)
+                        .filter_map(|slot| session
+                            .inventory
+                            .slot(crate::inventory::PlayerSlot::Storage(slot)))
+                        .any(|item| item.same_item_and_components(&original)
+                            && item.count() == original.count())
+                );
+            }
+            assert!(Arc::make_mut(&mut session.inventory).toggle());
+            session.collect_closed_chest();
+            session.validate_closed_chest_item_balance(&player).unwrap();
+            let chest = session.saved_chest(position).unwrap().unwrap();
+            chest
+                .verify_generated_loot(&id, table, |item| {
+                    LoadedSession::resolve_chest_loot_item(item, &registry)
+                })
+                .unwrap();
+            assert_eq!(
+                session
+                    .draft_chest_inventory_chunk(chunk, &chunk_source)
+                    .unwrap()
+                    .checked_chest_inventory_count(),
+                1
+            );
+        }
+        assert_eq!(
+            potion_types,
+            [
+                "minecraft:poison",
+                "minecraft:slowness",
+                "minecraft:regeneration",
+                "minecraft:strength"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(
+            item_types,
+            ["minecraft:potion", "minecraft:tipped_arrow"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
     }
 
     #[test]

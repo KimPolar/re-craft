@@ -16,6 +16,7 @@ public class HungerSaveOracle {
     @Override public GameType gameMode() { return GameType.SURVIVAL; }
     @Override public void causeFoodExhaustion(float value) { }
     @Override public float getHealth() { return 1.0f; }
+    @Override public double getAttributeValue(net.minecraft.core.Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) { return 1.0; }
   }
   public static void main(String[] args) throws Exception {
     net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -36,7 +37,11 @@ public class HungerSaveOracle {
         while(event<updates.size() && (updates.get(event).isJsonPrimitive()?updates.get(event).getAsInt():updates.get(event).getAsJsonObject().get("tick").getAsInt())==tick) {
           var entry=updates.get(event);
           var object=entry.isJsonObject()?entry.getAsJsonObject():null;
-          var kind=object!=null && object.has("kind") && object.get("kind").getAsString().equals("poison") ? MobEffects.POISON : MobEffects.HUNGER;
+          var kind=object==null || !object.has("kind") ? MobEffects.HUNGER : switch(object.get("kind").getAsString()) {
+            case "poison" -> MobEffects.POISON;
+            case "regeneration" -> MobEffects.REGENERATION;
+            default -> MobEffects.HUNGER;
+          };
           if(object!=null && object.has("remove") && object.get("remove").getAsBoolean()) {
             effects.removeIf(e->e.getEffect()==kind); event++; continue;
           }

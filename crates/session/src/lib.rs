@@ -1596,6 +1596,14 @@ impl LocalSession {
         {
             eprintln!("player poison damage: {error:#}");
         }
+        if self.vitals.health < self.vitals.max_health
+            && self
+                .fall
+                .effects()
+                .regeneration_due(self.player_effect_tick)
+        {
+            self.vitals.heal(1.0);
+        }
         self.fall
             .effects()
             .apply_hunger(&mut self.vitals, self.game_mode);

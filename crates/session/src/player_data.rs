@@ -614,6 +614,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
             ("minecraft", "mining_fatigue") => &mut effects.mining_fatigue,
             ("minecraft", "hunger") => &mut effects.hunger,
             ("minecraft", "poison") => &mut effects.poison,
+            ("minecraft", "regeneration") => &mut effects.regeneration,
             ("minecraft", "luck") => &mut effects.luck,
             ("minecraft", "unluck") => &mut effects.unluck,
             _ => continue,
@@ -1454,6 +1455,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                         | "breath_of_the_nautilus"
                         | "hunger"
                         | "poison"
+                        | "regeneration"
                         | "luck"
                         | "unluck"
                 ),
@@ -1590,6 +1592,9 @@ pub(crate) fn replay_saved_status_effects(
                         match kind {
                             crate::survival::FoodStatusKind::Hunger => "minecraft:hunger",
                             crate::survival::FoodStatusKind::Poison => "minecraft:poison",
+                            crate::survival::FoodStatusKind::Regeneration => {
+                                "minecraft:regeneration"
+                            }
                             crate::survival::FoodStatusKind::NightVision => {
                                 "minecraft:night_vision"
                             }
@@ -1714,6 +1719,7 @@ pub(crate) fn replay_saved_status_effects(
                                 == match kind {
                                     crate::survival::FoodStatusKind::Hunger => "hunger",
                                     crate::survival::FoodStatusKind::Poison => "poison",
+                                    crate::survival::FoodStatusKind::Regeneration => "regeneration",
                                     crate::survival::FoodStatusKind::NightVision => "night_vision",
                                     crate::survival::FoodStatusKind::WaterBreathing => {
                                         "water_breathing"
@@ -1736,6 +1742,7 @@ pub(crate) fn replay_saved_status_effects(
                             == match kind {
                                 crate::survival::FoodStatusKind::Hunger => "hunger",
                                 crate::survival::FoodStatusKind::Poison => "poison",
+                                crate::survival::FoodStatusKind::Regeneration => "regeneration",
                                 crate::survival::FoodStatusKind::NightVision => "night_vision",
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     "water_breathing"
@@ -2783,8 +2790,103 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
+                        input.push(serde_json::json!({"ticks":50,"events":events}));
+                    }
+                }
+            }
+        }
+        for duration in [-1, 20, 100] {
+            for amplifier in [0, 1] {
+                for hidden in [false, true] {
+                    for remove in [false, true] {
+                        let mut effect = vec![
+                            ("id".into(), Tag::String("minecraft:regeneration".into())),
+                            ("duration".into(), Tag::Int(duration)),
+                            ("amplifier".into(), Tag::Byte(amplifier)),
+                        ];
+                        if hidden {
+                            effect.push((
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(200))]),
+                            ));
+                        }
+                        let original = NamedTag {
+                            name: "".into(),
+                            value: Tag::Compound(vec![(
+                                "active_effects".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(effect)],
+                                },
+                            )]),
+                        };
+                        let mut updates = vec![
+                            StatusUpdate {
+                                kind: crate::survival::FoodStatusKind::Regeneration,
+                                remove: false,
+                                clear_all: false,
+                                update: HungerUpdate {
+                                    tick: 0,
+                                    duration: 30,
+                                    amplifier: 2,
+                                    ambient: false,
+                                    visible: true,
+                                    show_icon: true,
+                                },
+                            },
+                            StatusUpdate {
+                                kind: crate::survival::FoodStatusKind::Regeneration,
+                                remove: false,
+                                clear_all: false,
+                                update: HungerUpdate {
+                                    tick: 5,
+                                    duration: 150,
+                                    amplifier: 0,
+                                    ambient: true,
+                                    visible: false,
+                                    show_icon: false,
+                                },
+                            },
+                        ];
+                        if remove {
+                            updates.push(StatusUpdate {
+                                kind: crate::survival::FoodStatusKind::Regeneration,
+                                remove: true,
+                                clear_all: false,
+                                update: HungerUpdate {
+                                    tick: 25,
+                                    duration: 0,
+                                    amplifier: 0,
+                                    ambient: false,
+                                    visible: false,
+                                    show_icon: false,
+                                },
+                            });
+                        }
+                        let effects = replay_saved_status_effects(&original, 50, &updates).unwrap();
+                        let draft = NamedTag {
+                            name: "".into(),
+                            value: Tag::Compound(
+                                effects
+                                    .map(|value| ("active_effects".into(), value))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        };
+                        let index = input.len();
+                        std::fs::write(
+                            temp.path().join(format!("source{index}.nbt")),
+                            native_persistence::nbt::write(&original).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            temp.path().join(format!("draft{index}.nbt")),
+                            native_persistence::nbt::write(&draft).unwrap(),
+                        )
+                        .unwrap();
+                        let events: Vec<_> = updates.iter().map(|event| { let value=event.update; serde_json::json!({"kind":"regeneration", "remove":event.remove, "tick":value.tick, "duration":value.duration, "amplifier":value.amplifier, "ambient":value.ambient, "visible":value.visible, "show_icon":value.show_icon}) }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }
                 }

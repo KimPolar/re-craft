@@ -21,7 +21,7 @@ public class PotionOracle {
     var world=(FoodEffectsOracle.World)unsafe.allocateInstance(FoodEffectsOracle.World.class);
     var player=(FoodEffectsOracle.TestPlayer)unsafe.allocateInstance(FoodEffectsOracle.TestPlayer.class);
     player.world=world; var position=Entity.class.getDeclaredField("position"); position.setAccessible(true); position.set(player,Vec3.ZERO);
-    Holder<Potion>[] potions=new Holder[]{Potions.WATER,Potions.MUNDANE,Potions.THICK,Potions.AWKWARD,Potions.NIGHT_VISION,Potions.LONG_NIGHT_VISION,Potions.WATER_BREATHING,Potions.LONG_WATER_BREATHING,Potions.POISON,Potions.LONG_POISON,Potions.STRONG_POISON};
+    Holder<Potion>[] potions=new Holder[]{Potions.WATER,Potions.MUNDANE,Potions.THICK,Potions.AWKWARD,Potions.NIGHT_VISION,Potions.LONG_NIGHT_VISION,Potions.WATER_BREATHING,Potions.LONG_WATER_BREATHING,Potions.POISON,Potions.LONG_POISON,Potions.STRONG_POISON,Potions.REGENERATION,Potions.LONG_REGENERATION,Potions.STRONG_REGENERATION};
     var out=new JsonArray();
     for(var potion:potions) for(int seed=0;seed<20;seed++) {
       var stack=new ItemStack(Items.POTION); var contents=new PotionContents(potion); stack.set(DataComponents.POTION_CONTENTS,contents);

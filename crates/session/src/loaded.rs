@@ -1047,6 +1047,9 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::NightVision => {
                                     self.fall.effects().night_vision.is_some()
                                 }
+                                crate::survival::FoodStatusKind::Regeneration => {
+                                    self.fall.effects().regeneration.is_some()
+                                }
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     self.breathing_effects.water_breathing.is_some()
                                 }
@@ -13893,8 +13896,19 @@ impl LoadedSession {
                     .as_ref()
                     .is_some_and(|effect| effect.duration != -1 && effect.duration <= 1)
             });
+        let poison_due = self.fall.effects().poison_due(self.player_effect_tick);
+        let regeneration_due = self
+            .fall
+            .effects()
+            .regeneration_due(self.player_effect_tick);
+        // Java iterates a hash map of effects, whose order is not determined by
+        // the saved NBT. Until that ordering is modeled, do not authorize a save
+        // after both health-changing effects run in the same tick.
+        if poison_due && regeneration_due && self.vitals.health > 0.0 {
+            self.effect_save_invalid = true;
+        }
         if self.vitals.health > 1.0
-            && self.fall.effects().poison_due(self.player_effect_tick)
+            && poison_due
             && let Err(error) = self.fall.damage(
                 1.0,
                 "minecraft:magic",
@@ -13909,6 +13923,9 @@ impl LoadedSession {
                 .push(format!("player poison damage: {error:#}"));
             self.effect_save_invalid = true;
             self.unresolved_player_damage = true;
+        }
+        if self.vitals.health < self.vitals.max_health && regeneration_due {
+            self.vitals.heal(1.0);
         }
         self.fall
             .effects()
@@ -38838,10 +38855,124 @@ mod tests {
     }
 
     #[test]
+    fn regeneration_heals_and_promotes_hidden_effect_in_player_draft() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Health".into(), Tag::Float(8.0)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:regeneration".into())),
+                            ("duration".into(), Tag::Int(50)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![
+                                    ("duration".into(), Tag::Int(100)),
+                                    ("amplifier".into(), Tag::Byte(1)),
+                                ]),
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let mut session = session();
+        session.set_survival_rules(crate::survival::SurvivalRules {
+            natural_health_regeneration: false,
+            ..Default::default()
+        });
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            health: 8.0,
+            ..Default::default()
+        });
+        session.update(TICK);
+        assert_eq!(session.vitals.health, 9.0);
+        for _ in 0..49 {
+            session.update(TICK);
+        }
+        let effect = session.fall.effects().regeneration.as_ref().unwrap();
+        assert_eq!((effect.duration, effect.amplifier), (50, 1));
+        session.update(TICK);
+        assert_eq!(session.vitals.health, 10.0);
+        let draft = session.draft_player_state(&original).unwrap();
+        assert_eq!(
+            draft.document().value.get("Health"),
+            Some(&Tag::Float(10.0))
+        );
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+    }
+
+    #[test]
+    fn simultaneous_poison_and_regeneration_do_not_authorize_save() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Health".into(), Tag::Float(1.0)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: ["poison", "regeneration"]
+                            .into_iter()
+                            .map(|id| {
+                                Tag::Compound(vec![
+                                    (
+                                        "id".into(),
+                                        Tag::String(format!("minecraft:{id}").as_str().into()),
+                                    ),
+                                    ("duration".into(), Tag::Int(50)),
+                                ])
+                            })
+                            .collect(),
+                    },
+                ),
+            ]),
+        };
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.set_player_vitals(crate::survival::PlayerVitals {
+            health: 1.0,
+            ..Default::default()
+        });
+        session.update(TICK);
+        assert_eq!(session.vitals.health, 2.0);
+        assert!(session.effect_save_invalid);
+        assert!(session.draft_player_state(&original).is_err());
+    }
+
+    #[test]
     fn potions_update_effects_and_player_save_drafts() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::{NamedTag, Tag};
-        for potion in ["night_vision", "water_breathing", "poison"] {
+        for potion in [
+            "night_vision",
+            "water_breathing",
+            "poison",
+            "regeneration",
+            "long_regeneration",
+            "strong_regeneration",
+        ] {
             let original = NamedTag {
                 name: "".into(),
                 value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
@@ -38884,6 +39015,17 @@ mod tests {
                     session.fall.effects().poison.as_ref().unwrap().duration,
                     900
                 ),
+                "regeneration" | "long_regeneration" | "strong_regeneration" => {
+                    let effect = session.fall.effects().regeneration.as_ref().unwrap();
+                    assert_eq!(
+                        (effect.duration, effect.amplifier),
+                        match potion {
+                            "regeneration" => (900, 0),
+                            "long_regeneration" => (1800, 0),
+                            _ => (450, 1),
+                        }
+                    );
+                }
                 _ => unreachable!(),
             }
             assert!(!session.effect_save_invalid, "{potion}");
@@ -39160,6 +39302,10 @@ mod tests {
                                 ("id".into(), Tag::String("minecraft:poison".into())),
                                 ("duration".into(), Tag::Int(100)),
                             ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:regeneration".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
                         ],
                     },
                 ),
@@ -39216,6 +39362,7 @@ mod tests {
         session.submit_command(PlayerCommand::Place);
         session.update(TICK);
         assert!(!session.snapshot().hunger_effect && session.snapshot().poison_effect);
+        assert!(session.fall.effects().regeneration.is_none());
         assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 13);
         let events = &session
             .effect_save_tracking

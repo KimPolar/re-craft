@@ -4640,7 +4640,7 @@ mod tests {
                 assert_eq!(crate::survival::potion_color(&components), Some(color));
                 let item = ItemStack::new(id.into(), 1, max, components.clone()).unwrap();
                 assert!(basic_pickup_supported(&item));
-                if id == "minecraft:potion" && potion != "poison" {
+                if id == "minecraft:potion" && potion != "poison" && potion != "regeneration" {
                     assert!(crate::survival::food_properties(&item).is_none());
                 }
             }

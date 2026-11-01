@@ -165,6 +165,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Hunger => self.effects.hunger = None,
             crate::survival::FoodStatusKind::Poison => self.effects.poison = None,
             crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
+            crate::survival::FoodStatusKind::Regeneration => self.effects.regeneration = None,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
@@ -190,6 +191,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Hunger => &mut self.effects.hunger,
             crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
             crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
+            crate::survival::FoodStatusKind::Regeneration => &mut self.effects.regeneration,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }

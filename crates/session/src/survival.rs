@@ -102,6 +102,7 @@ pub(crate) enum FoodStatusKind {
     Poison,
     NightVision,
     WaterBreathing,
+    Regeneration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +144,8 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::NightVision)
     } else if value.matches("minecraft:water_breathing") || value.matches("water_breathing") {
         Some(FoodStatusKind::WaterBreathing)
+    } else if value.matches("minecraft:regeneration") || value.matches("regeneration") {
+        Some(FoodStatusKind::Regeneration)
     } else {
         None
     }
@@ -183,6 +186,8 @@ pub(crate) fn inventory_potion_contents(components: &Tag) -> Option<()> {
             | "strong_poison"
             | "slowness"
             | "regeneration"
+            | "long_regeneration"
+            | "strong_regeneration"
             | "strength"
     )
     .then_some(())
@@ -205,6 +210,9 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
         "poison" => (FoodStatusKind::Poison, 900, 0),
         "long_poison" => (FoodStatusKind::Poison, 1800, 0),
         "strong_poison" => (FoodStatusKind::Poison, 432, 1),
+        "regeneration" => (FoodStatusKind::Regeneration, 900, 0),
+        "long_regeneration" => (FoodStatusKind::Regeneration, 1800, 0),
+        "strong_regeneration" => (FoodStatusKind::Regeneration, 450, 1),
         _ => return None,
     };
     Some(vec![StatusApplication {
@@ -224,7 +232,7 @@ pub fn potion_color(components: &Tag) -> Option<u32> {
         "water_breathing" | "long_water_breathing" => Some(0x98dac0),
         "poison" | "long_poison" | "strong_poison" => Some(0x87a363),
         "slowness" => Some(0x8bafe0),
-        "regeneration" => Some(0xcd5cab),
+        "regeneration" | "long_regeneration" | "strong_regeneration" => Some(0xcd5cab),
         "strength" => Some(0xffc700),
         _ => None,
     }
@@ -1102,6 +1110,7 @@ pub struct FallEffects {
     pub mining_fatigue: Option<EffectDuration>,
     pub hunger: Option<EffectDuration>,
     pub poison: Option<EffectDuration>,
+    pub regeneration: Option<EffectDuration>,
     pub luck: Option<EffectDuration>,
     pub unluck: Option<EffectDuration>,
 }
@@ -1115,6 +1124,21 @@ impl FallEffects {
                 return false;
             }
             let interval = 25_i32 >> (u32::from(effect.amplifier) & 31);
+            let elapsed = if effect.duration == -1 {
+                entity_tick
+            } else {
+                effect.duration
+            };
+            interval <= 0 || elapsed % interval == 0
+        })
+    }
+
+    pub(crate) fn regeneration_due(&self, entity_tick: i32) -> bool {
+        self.regeneration.as_ref().is_some_and(|effect| {
+            if !effect.has_time() {
+                return false;
+            }
+            let interval = 50_i32 >> (u32::from(effect.amplifier) & 31);
             let elapsed = if effect.duration == -1 {
                 entity_tick
             } else {
@@ -1147,6 +1171,7 @@ impl FallEffects {
         EffectDuration::tick(&mut self.mining_fatigue);
         EffectDuration::tick(&mut self.hunger);
         EffectDuration::tick(&mut self.poison);
+        EffectDuration::tick(&mut self.regeneration);
         EffectDuration::tick(&mut self.luck);
         EffectDuration::tick(&mut self.unluck);
     }
@@ -1634,7 +1659,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 220);
+        assert_eq!(rows.len(), 280);
         for row in rows {
             let name = row["potion"].as_str().unwrap();
             let components = Tag::Compound(vec![(
@@ -1703,6 +1728,7 @@ mod tests {
                     FoodStatusKind::NightVision => "minecraft:night_vision",
                     FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
                     FoodStatusKind::Poison => "minecraft:poison",
+                    FoodStatusKind::Regeneration => "minecraft:regeneration",
                     FoodStatusKind::Hunger => "minecraft:hunger",
                 };
                 assert_eq!(name, expected["id"].as_str().unwrap());
@@ -2694,7 +2720,9 @@ mod tests {
                             let target = match effect.kind {
                                 FoodStatusKind::Hunger => &mut active,
                                 FoodStatusKind::Poison => &mut active_poison,
-                                FoodStatusKind::NightVision | FoodStatusKind::WaterBreathing => {
+                                FoodStatusKind::NightVision
+                                | FoodStatusKind::WaterBreathing
+                                | FoodStatusKind::Regeneration => {
                                     unreachable!()
                                 }
                             };
@@ -2710,7 +2738,9 @@ mod tests {
                             match effect {
                                 FoodStatusKind::Hunger => active = None,
                                 FoodStatusKind::Poison => active_poison = None,
-                                FoodStatusKind::NightVision | FoodStatusKind::WaterBreathing => {
+                                FoodStatusKind::NightVision
+                                | FoodStatusKind::WaterBreathing
+                                | FoodStatusKind::Regeneration => {
                                     unreachable!()
                                 }
                             }
@@ -2763,6 +2793,98 @@ mod tests {
                 row["next_bits"].as_i64().unwrap() as i32 as u32,
                 "{row}"
             );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn regeneration_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("RegenerationEffectOracle.java");
+        let output = temp.path().join("regen.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RegenerationEffectOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("RegenerationEffectOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1584);
+        for row in rows {
+            let mut vitals = PlayerVitals {
+                health: row["health"].as_f64().unwrap() as f32,
+                max_health: row["maximum"].as_f64().unwrap() as f32,
+                ..Default::default()
+            };
+            let mut effects = FallEffects {
+                regeneration: Some(EffectDuration {
+                    amplifier: row["amplifier"].as_u64().unwrap() as u8,
+                    duration: row["duration"].as_i64().unwrap() as i32,
+                    hidden: None,
+                }),
+                ..Default::default()
+            };
+            for (index, expected) in row["ticks"].as_array().unwrap().iter().enumerate() {
+                if vitals.health < vitals.max_health && effects.regeneration_due(index as i32 + 1) {
+                    vitals.heal(1.0);
+                }
+                effects.tick();
+                assert_eq!(
+                    vitals.health.to_bits(),
+                    expected["health_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                assert_eq!(
+                    effects.regeneration.is_some(),
+                    expected["active"].as_bool().unwrap(),
+                    "{row}"
+                );
+                if let Some(effect) = &effects.regeneration {
+                    assert_eq!(
+                        effect.duration,
+                        expected["duration"].as_i64().unwrap() as i32,
+                        "{row}"
+                    );
+                }
+            }
         }
     }
 

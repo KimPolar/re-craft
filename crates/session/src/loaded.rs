@@ -17988,7 +17988,7 @@ impl DiskWorld<'_> {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("bubble-column tags are unavailable"))?;
                     anyhow::ensure!(
-                        !tags.enables(support),
+                        !tags.water_can_occupy() || !tags.enables(support),
                         "bubble column scheduling is unsupported"
                     );
                 }
@@ -18269,6 +18269,9 @@ impl IceTickStage<'_> {
             .bubble_column_tags
             .as_ref()
             .context("bubble-column tags are unavailable")?;
+        if !tags.water_can_occupy() {
+            return Ok(());
+        }
         let below = add(position, IVec3::NEG_Y).context("water support position overflow")?;
         anyhow::ensure!(
             !tags.enables(self.staged_name(below)?),
@@ -18287,7 +18290,7 @@ impl IceTickStage<'_> {
                 .as_ref()
                 .context("bubble-column tags are unavailable")?;
             anyhow::ensure!(
-                !tags.enables(new_block),
+                !tags.water_can_occupy() || !tags.enables(new_block),
                 "bubble column scheduling is unsupported"
             );
         }
@@ -28458,6 +28461,17 @@ pub(crate) mod tests {
         tagged_floor.run_location_effects(true);
         assert_eq!(tagged_floor.ice_ticks.len(), 24);
 
+        let mut excluded_water = setup(true);
+        excluded_water.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                BTreeSet::from(["minecraft:stone".into()]),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
+        ));
+        excluded_water.run_location_effects(true);
+        assert_eq!(excluded_water.ice_ticks.len(), 24);
+
         let mut tagged_ice = setup(true);
         let water = tagged_ice.intern_block(state("minecraft:water", &[("level", "0")]));
         assert!(tagged_ice.set_with_notify(IVec3::new(8, 2, 8), water, false));
@@ -29036,6 +29050,141 @@ pub(crate) mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn bubble_column_data_pack_tags_match_java_ice_callbacks() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("IceBubbleTagOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/IceBubbleTagOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("IceBubbleTagOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 24);
+        for row in rows {
+            let mut session = session();
+            session.set_has_skylight(false).unwrap();
+            session.set_water_evaporation_environment(bucket_environment(false));
+            let scenario = row["scenario"].as_u64().unwrap();
+            let age = if scenario == 2 { 0 } else { 3 };
+            let center = IVec3::new(8, 10, 8);
+            let ice =
+                session.intern_block(state("minecraft:frosted_ice", &[("age", &age.to_string())]));
+            assert!(session.set_with_notify(center, ice, false));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            if scenario == 0 {
+                assert!(session.set_with_notify(center + IVec3::NEG_Y, stone, false));
+            }
+            if scenario == 1 {
+                assert!(session.set_with_notify(center + IVec3::X + IVec3::NEG_Y, stone, false));
+            }
+            if scenario != 0 {
+                let level = if row["source"].as_bool().unwrap() {
+                    "0"
+                } else {
+                    "1"
+                };
+                let water = session.intern_block(state("minecraft:water", &[("level", level)]));
+                assert!(session.set_with_notify(
+                    center + if scenario == 1 { IVec3::X } else { IVec3::Y },
+                    water,
+                    false
+                ));
+            }
+            let support = if scenario == 2 {
+                "minecraft:frosted_ice"
+            } else {
+                "minecraft:stone"
+            };
+            let blocks = if row["support"].as_bool().unwrap() {
+                BTreeSet::from([support.into()])
+            } else {
+                BTreeSet::new()
+            };
+            let fluids = if row["water"].as_bool().unwrap() {
+                BTreeSet::from(["minecraft:water".into()])
+            } else {
+                BTreeSet::new()
+            };
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                    blocks,
+                    BTreeSet::new(),
+                    fluids,
+                ),
+            ));
+            session.pending_light.clear();
+            session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            session.sky_lighting.set_enabled(false);
+            let chunk = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light = Some(Box::new([0xff; native_world::loaded::LIGHT_BYTES]));
+            let mut stage = IceTickStage {
+                session: &session,
+                age,
+                actions: Vec::new(),
+                ice_overrides: BTreeMap::new(),
+                melted_to_water: BTreeSet::new(),
+            };
+            let mut random = native_core::random::LegacyRandom::new(1);
+            let result = crate::frosted_ice::tick(&mut stage, center, age, &mut random);
+            if row["bubble"].as_bool().unwrap() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("bubble column scheduling"),
+                    "{row}"
+                );
+            } else {
+                assert!(result.is_ok(), "{row}: {result:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn frosted_ice_nested_water_and_terrain_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -29496,6 +29645,30 @@ pub(crate) mod tests {
         custom.advance_block_ticks();
         assert_eq!(custom.ice_deferred.len(), 1);
         assert_eq!(custom.level_random.clone().next_int(), random_before);
+        let mut water_excluded = setup("3", 15, None, false);
+        let stone = water_excluded.intern_block(state("minecraft:stone", &[]));
+        assert!(water_excluded.set_with_notify(IVec3::new(4, 1, 4), stone, false));
+        water_excluded.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                BTreeSet::from(["minecraft:stone".into()]),
+                BTreeSet::new(),
+                BTreeSet::from(["minecraft:lava".into()]),
+            ),
+        ));
+        water_excluded.pending_light.clear();
+        water_excluded.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        water_excluded.sky_lighting.set_enabled(false);
+        water_excluded.advance_block_ticks();
+        assert!(water_excluded.ice_deferred.is_empty());
+        let center = water_excluded.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            water_excluded
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
         custom.set_bubble_column_tags(tags(&[]));
         custom.advance_block_ticks();
         let center = custom.origin + IVec3::new(4, 2, 4);

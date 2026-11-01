@@ -26,16 +26,33 @@ pub fn load_washed_away_blocks(
     .context("cannot resolve blocks washed away by fluids")
 }
 
-/// Active block tags consulted by water when deciding to schedule a bubble column.
+/// Active tags consulted by water when deciding to schedule a bubble column.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BubbleColumnTags {
     drag_down: BTreeSet<String>,
     push_up: BTreeSet<String>,
+    occupiable_fluids: BTreeSet<String>,
 }
 
 impl BubbleColumnTags {
     pub fn new(drag_down: BTreeSet<String>, push_up: BTreeSet<String>) -> Self {
-        Self { drag_down, push_up }
+        Self::with_fluids(
+            drag_down,
+            push_up,
+            BTreeSet::from(["minecraft:water".into()]),
+        )
+    }
+
+    pub fn with_fluids(
+        drag_down: BTreeSet<String>,
+        push_up: BTreeSet<String>,
+        occupiable_fluids: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            drag_down,
+            push_up,
+            occupiable_fluids,
+        }
     }
 
     pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
@@ -64,11 +81,16 @@ impl BubbleColumnTags {
                 &mut BTreeSet::new(),
             )
             .context("cannot resolve bubble-column push-up tag")?,
+            occupiable_fluids: load_fluid_tag(provider, "minecraft:bubble_column_can_occupy")?,
         })
     }
 
     pub fn enables(&self, block: &str) -> bool {
         self.drag_down.contains(block) || self.push_up.contains(block)
+    }
+
+    pub fn water_can_occupy(&self) -> bool {
+        self.occupiable_fluids.contains("minecraft:water")
     }
 }
 
@@ -83,6 +105,10 @@ const FLUIDS: [&str; 5] = [
 ];
 
 pub fn load_water(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {
+    load_fluid_tag(provider, "minecraft:water")
+}
+
+fn load_fluid_tag(provider: &mut impl ResourceProvider, name: &str) -> Result<BTreeSet<String>> {
     fn resolve(
         provider: &mut impl ResourceProvider,
         id: &ResourceId,
@@ -143,11 +169,11 @@ pub fn load_water(provider: &mut impl ResourceProvider) -> Result<BTreeSet<Strin
     }
     resolve(
         provider,
-        &ResourceId::parse("minecraft:water")?,
+        &ResourceId::parse(name)?,
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
     )?
-    .context("required minecraft:water fluid tag is missing")
+    .with_context(|| format!("required {name} fluid tag is missing"))
 }
 
 #[cfg(test)]
@@ -212,6 +238,7 @@ mod tests {
             ("data/minecraft/tags/block/enables_bubble_column_drag_down.json".into(), vec![br#"{"values":["minecraft:magma_block"]}"#.to_vec(), br##"{"replace":true,"values":["#example:floor",{"id":"example:missing","required":false}]}"##.to_vec()]),
             ("data/minecraft/tags/block/enables_bubble_column_push_up.json".into(), vec![br#"{"values":["minecraft:soul_sand"]}"#.to_vec()]),
             ("data/example/tags/block/floor.json".into(), vec![br#"{"values":["minecraft:stone"]}"#.to_vec()]),
+            ("data/minecraft/tags/fluid/bubble_column_can_occupy.json".into(), vec![br#"{"values":["minecraft:water"]}"#.to_vec(), br#"{"replace":true,"values":["minecraft:lava"]}"#.to_vec()]),
         ]));
         let registry = BTreeSet::from([
             "minecraft:magma_block".into(),
@@ -221,6 +248,7 @@ mod tests {
         let tags = BubbleColumnTags::load(&mut data, &registry).unwrap();
         assert!(tags.enables("minecraft:stone") && tags.enables("minecraft:soul_sand"));
         assert!(!tags.enables("minecraft:magma_block"));
+        assert!(!tags.water_can_occupy());
         data.0.remove("data/example/tags/block/floor.json");
         assert!(BubbleColumnTags::load(&mut data, &registry).is_err());
     }
@@ -236,6 +264,7 @@ mod tests {
         let tags = BubbleColumnTags::load(&mut source, &registry).unwrap();
         assert!(tags.enables("minecraft:magma_block") && tags.enables("minecraft:soul_sand"));
         assert!(!tags.enables("minecraft:stone"));
+        assert!(tags.water_can_occupy());
     }
     #[test]
     #[ignore = "requires locally installed Minecraft 26.3"]

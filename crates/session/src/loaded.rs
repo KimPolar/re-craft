@@ -3713,6 +3713,7 @@ impl LoadedSession {
     pub fn set_vanilla_block_ids(&mut self, ids: Arc<BTreeSet<String>>) {
         self.vanilla_block_ids = Some(ids);
         self.soil_deferred_revision = None;
+        self.sand_deferred_revision = None;
     }
 
     pub fn set_crafting_recipes(&mut self, recipes: Arc<CraftingRecipes>) {
@@ -3723,6 +3724,7 @@ impl LoadedSession {
     }
     pub fn set_block_loot(&mut self, loot: Arc<BlockLootTables>) {
         self.loot = Some(loot);
+        self.sand_deferred_revision = None;
     }
 
     pub fn set_mining_tags(&mut self, tags: Arc<native_resources::mining_tags::MiningTags>) {
@@ -3736,6 +3738,7 @@ impl LoadedSession {
     }
     pub fn set_block_drops(&mut self, enabled: bool) {
         self.block_drops = enabled;
+        self.sand_deferred_revision = None;
     }
 
     pub fn set_entity_drops(&mut self, enabled: bool) {
@@ -9796,21 +9799,7 @@ impl LoadedSession {
             .world
             .state(id)
             .is_none_or(|state| self.banner_support_solid(state) != Some(false))
-            && [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
-                .into_iter()
-                .filter_map(|offset| add(relative, offset))
-                .any(|neighbor| {
-                    matches!(
-                        cell(
-                            &self.world,
-                            self.origin,
-                            self.bounds,
-                            neighbor,
-                            self.states[0],
-                        ),
-                        Cell::Missing
-                    )
-                })
+            && !self.banner_support_neighbors_available(relative)
         {
             return;
         }
@@ -10166,6 +10155,37 @@ impl LoadedSession {
                 .then(|| native_world::collision::slab_stair_solid(state))
                 .flatten()
         })
+    }
+
+    fn banner_support_neighbors_available(&self, relative: IVec3) -> bool {
+        let Some(position) = add(self.origin, relative) else {
+            return false;
+        };
+        let x = position.x.rem_euclid(16);
+        let z = position.z.rem_euclid(16);
+        for (edge, offset) in [
+            (x == 15, IVec3::X),
+            (x == 0, IVec3::NEG_X),
+            (z == 15, IVec3::Z),
+            (z == 0, IVec3::NEG_Z),
+        ] {
+            if edge
+                && let Some(neighbor) = add(relative, offset)
+                && matches!(
+                    cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        neighbor,
+                        self.states[0],
+                    ),
+                    Cell::Missing
+                )
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn remove_banner(&mut self, relative: IVec3, id: BlockStateId, player: bool) -> bool {
@@ -11293,30 +11313,37 @@ impl LoadedSession {
                     deferred_sand.push((order, key));
                     continue;
                 };
-                self.sand_pending.remove(&key);
-                executed += 1;
                 if free && key.y >= self.bounds.min_y {
+                    // The removed sand may support a banner in a chunk that
+                    // has not streamed in yet. Keep the original scheduled
+                    // tick until all neighboring state can be checked.
+                    if !self.banner_support_neighbors_available(relative)
+                        || !self.set(relative, self.states[0])
+                    {
+                        deferred_sand.push((order, key));
+                        continue;
+                    }
                     let motion = crate::falling_block::AirborneMotion::from_block(IVec3::new(
                         key.x, key.y, key.z,
                     ));
-                    if self.set(relative, self.states[0]) {
-                        self.falling_sand.push(FallingSand {
-                            previous: motion.position,
-                            fall_distance: 0.0,
-                            fall_distance_verified: true,
-                            motion,
-                            kind: key.kind,
-                            drop_item: true,
-                            cancel_drop: false,
-                            on_ground: false,
-                            source: None,
-                            created: Some(CreatedFallingSand::new(
-                                IVec3::new(key.x, key.y, key.z),
-                                motion.position,
-                            )),
-                        });
-                    }
+                    self.falling_sand.push(FallingSand {
+                        previous: motion.position,
+                        fall_distance: 0.0,
+                        fall_distance_verified: true,
+                        motion,
+                        kind: key.kind,
+                        drop_item: true,
+                        cancel_drop: false,
+                        on_ground: false,
+                        source: None,
+                        created: Some(CreatedFallingSand::new(
+                            IVec3::new(key.x, key.y, key.z),
+                            motion.position,
+                        )),
+                    });
                 }
+                self.sand_pending.remove(&key);
+                executed += 1;
             } else if kind == 1 {
                 let (order, key) = self
                     .button_ticks
@@ -41433,6 +41460,212 @@ mod tests {
                 .world
                 .block(key.x, key.y, key.z)
                 .is_some_and(|state| state.name == "minecraft:air")
+        );
+    }
+
+    #[test]
+    fn falling_sand_preserves_boundary_banner_and_tick_until_dependencies_load() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        use native_world::loaded::SavedBlockEntities;
+
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/white_banner.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:white_banner","modifier":{"type":"minecraft:copy_components","source":"block_entity","include":["minecraft:custom_name"]}}]}]}"#.to_vec()))
+            }
+        }
+
+        let (mut world, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let east = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut adjacent = (*world.chunks[&home]).clone();
+        adjacent.position = east;
+        world.chunks.insert(east, Arc::new(adjacent));
+        let support = origin + IVec3::new(15, 5, 4);
+        let banner = support + IVec3::X;
+        let sand = world.intern_state(state("minecraft:sand", &[]));
+        let banner_id =
+            world.intern_state(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        world
+            .set_block_id(support.x, support.y, support.z, sand)
+            .unwrap();
+        world
+            .set_block_id(banner.x, banner.y, banner.z, banner_id)
+            .unwrap();
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:banner".into())),
+            ("x".into(), Tag::Int(banner.x)),
+            ("y".into(), Tag::Int(banner.y)),
+            ("z".into(), Tag::Int(banner.z)),
+            ("CustomName".into(), Tag::String("Sand banner".into())),
+        ]);
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity.clone()],
+            },
+        })
+        .unwrap();
+        world
+            .saved_block_entities
+            .insert(east, SavedBlockEntities::Encoded(bytes.into()));
+        let incoming = world.clone();
+        world.chunks.remove(&east);
+        world.saved_block_entities.remove(&east);
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        let key = SandTickKey {
+            x: support.x,
+            y: support.y,
+            z: support.z,
+            kind: FallingKind::Sand,
+        };
+        let order = (0, 0, 0, 0);
+        session.sand_pending.insert(key);
+        session.sand_ticks.insert(order, key);
+
+        session.advance_sand_ticks();
+        assert_eq!(session.sand_deferred.get(&order), Some(&key));
+        assert!(session.falling_sand.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name,
+            "minecraft:sand"
+        );
+        assert_eq!(
+            session.draft_block_ticks(home).unwrap()[0].position,
+            support.to_array()
+        );
+
+        session.queue_chunk_window(home, 1);
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        session.advance_sand_ticks();
+        assert_eq!(session.sand_deferred.get(&order), Some(&key));
+        assert!(session.falling_sand.is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:white_wall_banner"
+        );
+
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        session.advance_sand_ticks();
+        assert!(session.sand_deferred.is_empty());
+        assert!(!session.sand_pending.contains(&key));
+        assert_eq!(session.falling_sand.len(), 1);
+        assert_eq!(
+            session
+                .world
+                .block(support.x, support.y, support.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session.removed_banners[&(banner.x, banner.y, banner.z)],
+            entity
+        );
+        let drops = session.dropped_items.snapshot();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(
+            drops[0].stack.components().get("minecraft:custom_name"),
+            Some(&Tag::String("Sand banner".into()))
+        );
+    }
+
+    #[test]
+    fn falling_sand_retries_when_block_drops_are_disabled() {
+        use native_world::loaded::SavedBlockEntities;
+
+        let (mut world, origin, player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let support = origin + IVec3::new(8, 5, 4);
+        let banner = support + IVec3::X;
+        let sand = world.intern_state(state("minecraft:sand", &[]));
+        let banner_id =
+            world.intern_state(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        world
+            .set_block_id(support.x, support.y, support.z, sand)
+            .unwrap();
+        world
+            .set_block_id(banner.x, banner.y, banner.z, banner_id)
+            .unwrap();
+        world
+            .saved_block_entities
+            .insert(home, SavedBlockEntities::Empty);
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        let key = SandTickKey {
+            x: support.x,
+            y: support.y,
+            z: support.z,
+            kind: FallingKind::Sand,
+        };
+        let order = (0, 0, 0, 0);
+        session.sand_pending.insert(key);
+        session.sand_ticks.insert(order, key);
+
+        session.advance_sand_ticks();
+        assert_eq!(session.sand_deferred.get(&order), Some(&key));
+        session.set_block_drops(false);
+        session.advance_sand_ticks();
+        assert!(session.sand_deferred.is_empty());
+        assert_eq!(session.falling_sand.len(), 1);
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert_eq!(
+            session
+                .world
+                .block(banner.x, banner.y, banner.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
         );
     }
 

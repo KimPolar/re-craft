@@ -56,6 +56,7 @@ pub enum BuriedTreasureOutcome {
     Found {
         position: [i32; 3],
         chest_placed: bool,
+        facing: Option<HorizontalDirection>,
         loot_seed: Option<i64>,
     },
 }
@@ -216,6 +217,7 @@ pub fn place_buried_treasure(
             return Ok(BuriedTreasureOutcome::Found {
                 position: p,
                 chest_placed: false,
+                facing: None,
                 loot_seed: None,
             });
         }
@@ -231,6 +233,7 @@ pub fn place_buried_treasure(
         return Ok(BuriedTreasureOutcome::Found {
             position: p,
             chest_placed: true,
+            facing: Some(facing),
             loot_seed: seed,
         });
     }
@@ -319,6 +322,7 @@ mod tests {
             BuriedTreasureOutcome::Found {
                 position: [9, 6, 9],
                 chest_placed: true,
+                facing: world.facing,
                 loot_seed: Some(expected)
             }
         );

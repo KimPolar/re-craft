@@ -26,7 +26,9 @@ use native_world::biome_zoom::{obfuscate_seed, quart_position};
 use serde_json::Value;
 
 mod carving;
+mod generated_chest;
 pub use carving::CarverBlockState;
+pub use generated_chest::GeneratedLootChest;
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {

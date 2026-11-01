@@ -2633,14 +2633,7 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
             }
             2
         } else if id == "minecraft:potion" && name.matches("minecraft:potion_contents") {
-            let Tag::Compound(fields) = value else {
-                return None;
-            };
-            if !matches!(fields.as_slice(), [(key, Tag::String(potion))]
-                if key.matches("potion") && potion.matches("minecraft:water_breathing"))
-            {
-                return None;
-            }
+            crate::survival::potion_effects(components)?;
             65536
         } else if name.matches("minecraft:custom_data") {
             if !matches!(value, Tag::Compound(_)) {

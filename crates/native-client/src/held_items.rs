@@ -134,6 +134,7 @@ struct ModelKey {
     id: String,
     trim_material: Option<String>,
     dye: Option<u32>,
+    potion_color: Option<u32>,
     glint: bool,
     lodestone_tracker: bool,
     /// Raw numeric-property bits. A missing owner yields zero in Java.
@@ -146,6 +147,7 @@ impl ModelKey {
             id: id.to_owned(),
             trim_material: None,
             dye: None,
+            potion_color: None,
             glint: false,
             lodestone_tracker: false,
             compass_angle: 0.0_f32.to_bits(),
@@ -172,6 +174,7 @@ impl ModelKey {
             id: item.id().to_owned(),
             trim_material,
             dye,
+            potion_color: native_session::survival::potion_color(item.components()),
             glint: item.has_glint(),
             lodestone_tracker: item
                 .components()
@@ -787,6 +790,12 @@ impl Loader {
                 tint.get("default")
                     .and_then(Value::as_i64)
                     .context("missing dye default")? as u32
+                    & 0xffffff,
+            )),
+            Some("minecraft:potion" | "potion") => Ok(key.potion_color.unwrap_or(
+                tint.get("default")
+                    .and_then(Value::as_i64)
+                    .context("missing potion tint default")? as u32
                     & 0xffffff,
             )),
             _ => bail!("unsupported item tint"),
@@ -1792,6 +1801,36 @@ public class PaletteOracle {
             stack.push_pack(path).unwrap();
         }
         Loader::from_stack(stack)
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn supported_potion_models_use_their_distinct_contents_colors() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut loader = open_loader(&game, &[]);
+        for (potion, expected) in [
+            ("night_vision", [194.0 / 255.0, 1.0, 102.0 / 255.0]),
+            (
+                "water_breathing",
+                [152.0 / 255.0, 218.0 / 255.0, 192.0 / 255.0],
+            ),
+            ("poison", [135.0 / 255.0, 163.0 / 255.0, 99.0 / 255.0]),
+        ] {
+            let components = Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![(
+                    "potion".into(),
+                    Tag::String(format!("minecraft:{potion}").as_str().into()),
+                )]),
+            )]);
+            let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
+            let model = loader.load_visual(&ModelKey::from_item(&item)).unwrap();
+            assert_eq!(model.sprite_layers.len(), 2);
+            assert_eq!(model.sprite_layers[0].tint, expected, "{potion}");
+            assert_eq!(model.sprite_layers[1].tint, [1.0; 3]);
+        }
     }
 
     #[test]

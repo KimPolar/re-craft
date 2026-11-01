@@ -624,6 +624,7 @@ pub struct LocalSession {
     fall_distance: f64,
     ground_without_support: bool,
     fall: fall::FallTracker,
+    breathing_effects: survival::BreathingEffects,
     damage_cooldown: fall::DamageCooldown,
     player_effect_tick: i32,
     accumulated: Duration,
@@ -659,15 +660,28 @@ impl LocalSession {
                         causes_hunger: true,
                         ..
                     } => self.fall.add_hunger(600, 0),
-                    survival::FoodRandomEvent::StatusGroup { effects, .. } => {
+                    survival::FoodRandomEvent::StatusGroup { effects, .. }
+                    | survival::FoodRandomEvent::PotionEffects(effects) => {
                         for effect in effects {
-                            self.fall
-                                .add_status(effect.kind, effect.duration, effect.amplifier);
+                            if effect.kind == survival::FoodStatusKind::WaterBreathing {
+                                self.breathing_effects
+                                    .add_water_breathing(effect.duration, effect.amplifier);
+                            } else {
+                                self.fall.add_status(
+                                    effect.kind,
+                                    effect.duration,
+                                    effect.amplifier,
+                                );
+                            }
                         }
                     }
                     survival::FoodRandomEvent::RemoveStatuses(effects) => {
                         for kind in effects {
-                            self.fall.remove_status(kind);
+                            if kind == survival::FoodStatusKind::WaterBreathing {
+                                self.breathing_effects.water_breathing = None;
+                            } else {
+                                self.fall.remove_status(kind);
+                            }
                         }
                     }
                     _ => {}
@@ -800,6 +814,7 @@ impl LocalSession {
             fall_distance: 0.0,
             ground_without_support: false,
             fall: fall::FallTracker::default(),
+            breathing_effects: survival::BreathingEffects::default(),
             damage_cooldown: fall::DamageCooldown::default(),
             player_effect_tick: 0,
             accumulated: Duration::ZERO,
@@ -1579,6 +1594,7 @@ impl LocalSession {
             .effects()
             .apply_hunger(&mut self.vitals, self.game_mode);
         self.fall.tick_effects();
+        self.breathing_effects.tick();
         let block_shape = |cell| native_world::collision::demo_shape(self.world.block(cell));
         let fits_crouching = movement::can_fit(self.motion.position, CROUCH_HEIGHT, block_shape);
         let fits_standing = movement::can_fit(self.motion.position, PLAYER_HEIGHT, block_shape);
@@ -1940,6 +1956,7 @@ impl LocalSession {
         self.player_effect_tick = 0;
         self.ground_without_support = false;
         self.fall = fall::FallTracker::default();
+        self.breathing_effects = survival::BreathingEffects::default();
         self.food_use = survival::FoodUse::default();
         self.use_repeat = interaction::UseRepeat::default();
         self.mining.release();

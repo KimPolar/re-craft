@@ -1375,6 +1375,12 @@ pub(crate) fn replay_saved_status_effects(
                         match kind {
                             crate::survival::FoodStatusKind::Hunger => "minecraft:hunger",
                             crate::survival::FoodStatusKind::Poison => "minecraft:poison",
+                            crate::survival::FoodStatusKind::NightVision => {
+                                "minecraft:night_vision"
+                            }
+                            crate::survival::FoodStatusKind::WaterBreathing => {
+                                "minecraft:water_breathing"
+                            }
                         }
                         .into(),
                     ),
@@ -1485,6 +1491,10 @@ pub(crate) fn replay_saved_status_effects(
                                 == match kind {
                                     crate::survival::FoodStatusKind::Hunger => "hunger",
                                     crate::survival::FoodStatusKind::Poison => "poison",
+                                    crate::survival::FoodStatusKind::NightVision => "night_vision",
+                                    crate::survival::FoodStatusKind::WaterBreathing => {
+                                        "water_breathing"
+                                    }
                                 }
                     })
             });
@@ -1503,6 +1513,10 @@ pub(crate) fn replay_saved_status_effects(
                             == match kind {
                                 crate::survival::FoodStatusKind::Hunger => "hunger",
                                 crate::survival::FoodStatusKind::Poison => "poison",
+                                crate::survival::FoodStatusKind::NightVision => "night_vision",
+                                crate::survival::FoodStatusKind::WaterBreathing => {
+                                    "water_breathing"
+                                }
                             }
                 })
         }) {
@@ -2472,7 +2486,7 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }

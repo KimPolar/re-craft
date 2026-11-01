@@ -22,6 +22,7 @@ pub struct FoodProperties {
 pub enum FoodSound {
     Eat,
     HoneyDrink,
+    PotionDrink,
 }
 
 pub fn ordinary_food(id: &str) -> Option<FoodProperties> {
@@ -99,6 +100,8 @@ pub(crate) fn custom_food(value: &Tag) -> Option<(i32, f32, bool)> {
 pub(crate) enum FoodStatusKind {
     Hunger,
     Poison,
+    NightVision,
+    WaterBreathing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,8 +138,61 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::Hunger)
     } else if value.matches("minecraft:poison") || value.matches("poison") {
         Some(FoodStatusKind::Poison)
+    } else if value.matches("minecraft:night_vision") || value.matches("night_vision") {
+        Some(FoodStatusKind::NightVision)
+    } else if value.matches("minecraft:water_breathing") || value.matches("water_breathing") {
+        Some(FoodStatusKind::WaterBreathing)
     } else {
         None
+    }
+}
+
+/// Resolve the built-in potion definitions whose effects this session simulates.
+pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>> {
+    let contents = match components.get("minecraft:potion_contents") {
+        None => return Some(Vec::new()),
+        Some(Tag::Compound(fields)) => fields,
+        _ => return None,
+    };
+    let [(name, Tag::String(id))] = contents.as_slice() else {
+        return None;
+    };
+    if !name.matches("potion") {
+        return None;
+    }
+    let id = String::from_utf16(&id.0).ok()?;
+    let id = ResourceId::parse(&id).ok()?;
+    if id.namespace != "minecraft" {
+        return None;
+    }
+    let (kind, duration, amplifier) = match id.path.as_str() {
+        "night_vision" => (FoodStatusKind::NightVision, 3600, 0),
+        "long_night_vision" => (FoodStatusKind::NightVision, 9600, 0),
+        "water_breathing" => (FoodStatusKind::WaterBreathing, 3600, 0),
+        "long_water_breathing" => (FoodStatusKind::WaterBreathing, 9600, 0),
+        "poison" => (FoodStatusKind::Poison, 900, 0),
+        "long_poison" => (FoodStatusKind::Poison, 1800, 0),
+        "strong_poison" => (FoodStatusKind::Poison, 432, 1),
+        _ => return None,
+    };
+    Some(vec![StatusApplication {
+        kind,
+        duration,
+        amplifier,
+        ambient: false,
+        visible: true,
+        show_icon: true,
+    }])
+}
+
+/// Color of supported built-in potion contents; absent/unsupported uses the model default.
+pub fn potion_color(components: &Tag) -> Option<u32> {
+    let effect = potion_effects(components)?.into_iter().next()?;
+    match effect.kind {
+        FoodStatusKind::NightVision => Some(0xc2ff66),
+        FoodStatusKind::WaterBreathing => Some(0x98dac0),
+        FoodStatusKind::Poison => Some(0x87a363),
+        FoodStatusKind::Hunger => None,
     }
 }
 
@@ -416,6 +472,14 @@ fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
             Tag::Compound(vec![]),
         );
     }
+    if item.id() == "minecraft:potion" {
+        return ItemStack::new(
+            "minecraft:glass_bottle".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        );
+    }
     matches!(
         item.id(),
         "minecraft:mushroom_stew" | "minecraft:rabbit_stew" | "minecraft:beetroot_soup"
@@ -426,6 +490,23 @@ fn food_remainder(item: &ItemStack) -> Option<ItemStack> {
 
 pub fn food_properties(item: &ItemStack) -> Option<FoodProperties> {
     let components = item.components();
+    if item.id() == "minecraft:potion" {
+        if components.get("!minecraft:consumable").is_some()
+            || components.get("minecraft:consumable").is_some()
+            || components.get("minecraft:food").is_some()
+        {
+            return None;
+        }
+        potion_effects(components)?;
+        return Some(FoodProperties {
+            nutrition: 0,
+            saturation: 0.0,
+            use_ticks: 32,
+            can_always_eat: true,
+            consume_particles: false,
+            sound: FoodSound::PotionDrink,
+        });
+    }
     if components.get("!minecraft:food").is_some()
         || components.get("!minecraft:consumable").is_some()
     {
@@ -497,6 +578,7 @@ pub(crate) enum FoodRandomEvent {
         probability: f32,
         effects: Vec<StatusApplication>,
     },
+    PotionEffects(Vec<StatusApplication>),
     RemoveStatuses(Vec<FoodStatusKind>),
 }
 
@@ -537,7 +619,7 @@ impl FoodRandomEvent {
             Self::StatusGroup { probability, .. } => {
                 return (random.next_float() < *probability, [None; 3]);
             }
-            Self::RemoveStatuses(_) => return (true, [None; 3]),
+            Self::RemoveStatuses(_) | Self::PotionEffects(_) => return (true, [None; 3]),
         };
         let volume = if random.next_bool() { 0.5 } else { 1.0 };
         let eat_pitch = 1.0_f32 + 0.2_f32 * (random.next_float() - random.next_float());
@@ -553,6 +635,7 @@ impl FoodRandomEvent {
         let (event, volume, pitch) = match sound {
             FoodSound::Eat => ("entity.generic.eat", volume, eat_pitch),
             FoodSound::HoneyDrink => ("item.honey_bottle.drink", 0.5, drink_pitch),
+            FoodSound::PotionDrink => ("entity.generic.drink", 0.5, drink_pitch),
         };
         let mut sounds = [
             Some(crate::ConsumeSoundInfo {
@@ -565,6 +648,9 @@ impl FoodRandomEvent {
             None,
         ];
         if let Self::Finish { causes_hunger, .. } = self {
+            if sound == FoodSound::PotionDrink {
+                return (false, sounds);
+            }
             let pitch = 1.0_f32 + 0.4_f32 * (random.next_float() - random.next_float());
             let burp_pitch = 0.9_f32 + random.next_float() * (1.0_f32 - 0.9_f32);
             sounds[1] = Some(crate::ConsumeSoundInfo {
@@ -743,6 +829,10 @@ impl FoodUse {
         food: FoodProperties,
     ) {
         let remainder = inventory.slot(hand).and_then(food_remainder);
+        let potion = inventory
+            .slot(hand)
+            .filter(|item| item.id() == "minecraft:potion")
+            .and_then(|item| potion_effects(item.components()));
         let particle_item = food
             .consume_particles
             .then(|| inventory.slot(hand).cloned().map(Arc::new))
@@ -789,6 +879,9 @@ impl FoodUse {
                 sound: food.sound,
                 item: particle_item,
             });
+            if let Some(effects) = potion {
+                self.events.push(FoodRandomEvent::PotionEffects(effects));
+            }
             self.events
                 .extend(custom_groups.into_iter().map(|action| match action {
                     ConsumeStatusAction::Apply(group) => FoodRandomEvent::StatusGroup {
@@ -804,9 +897,11 @@ impl FoodUse {
                     FoodStatusKind::Poison,
                 ]));
             }
-            vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
-            vitals.saturation =
-                (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
+            if food.sound != FoodSound::PotionDrink {
+                vitals.food = vitals.food.wrapping_add(food.nutrition).clamp(0, 20);
+                vitals.saturation =
+                    (vitals.saturation + food.saturation).clamp(0.0, vitals.food as f32);
+            }
             if mode != crate::GameMode::Creative
                 && let Some(remainder) = remainder
             {
@@ -1010,6 +1105,18 @@ pub struct BreathingEffects {
 }
 
 impl BreathingEffects {
+    pub(crate) fn add_water_breathing(&mut self, duration: i32, amplifier: u8) {
+        let incoming = EffectDuration {
+            duration,
+            amplifier,
+            hidden: None,
+        };
+        if let Some(effect) = &mut self.water_breathing {
+            effect.merge(incoming);
+        } else {
+            self.water_breathing = Some(incoming);
+        }
+    }
     pub fn tick(&mut self) {
         EffectDuration::tick(&mut self.water_breathing);
         EffectDuration::tick(&mut self.conduit_power);
@@ -1256,6 +1363,166 @@ impl PlayerVitals {
 mod tests {
     use super::*;
     use crate::{GameMode, GameSession, LocalSession, PlayerCommand};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn supported_potions_match_java_consumption_and_random_stream() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PotionOracle.java");
+        let food_source = temp.path().join("FoodEffectsOracle.java");
+        let output = temp.path().join("potions.json");
+        std::fs::write(&source, include_str!("../tests/java/PotionOracle.java")).unwrap();
+        std::fs::write(
+            &food_source,
+            include_str!("../tests/java/FoodEffectsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&food_source),
+            Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("PotionOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 140);
+        for row in rows {
+            let name = row["potion"].as_str().unwrap();
+            let components = Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![("potion".into(), Tag::String(name.into()))]),
+            )]);
+            let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
+            assert_eq!(
+                potion_color(item.components()),
+                Some(row["color"].as_i64().unwrap() as u32 & 0xffffff),
+                "{row}"
+            );
+            let food = food_properties(&item).unwrap();
+            assert_eq!(
+                food.use_ticks,
+                row["ticks"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+            assert_eq!(
+                food.consume_particles,
+                row["particles"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(row["animation"].as_str(), Some("DRINK"));
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals {
+                food: 20,
+                saturation: 5.0,
+                ..Default::default()
+            };
+            let mut usage = FoodUse::default();
+            assert_eq!(
+                usage.start_hand(
+                    &mut inventory,
+                    PlayerSlot::Storage(0),
+                    &mut vitals,
+                    GameMode::Survival
+                ),
+                row["can_consume"].as_bool().unwrap()
+            );
+            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            let mut sounds = Vec::new();
+            let mut effects = Vec::new();
+            for _ in 0..food.use_ticks {
+                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                for event in usage.take_events() {
+                    let (applied, emitted) = event.apply_with_sounds(&mut random);
+                    sounds.extend(emitted.into_iter().flatten());
+                    if let FoodRandomEvent::PotionEffects(values) = event {
+                        assert!(applied);
+                        effects.extend(values);
+                    }
+                }
+            }
+            assert_eq!(
+                inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                row["remainder"].as_str().unwrap()
+            );
+            assert_eq!((vitals.food, vitals.saturation), (20, 5.0));
+            let expected = row["effects"].as_array().unwrap();
+            assert_eq!(effects.len(), expected.len(), "{row}");
+            for (actual, expected) in effects.iter().zip(expected) {
+                let name = match actual.kind {
+                    FoodStatusKind::NightVision => "minecraft:night_vision",
+                    FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
+                    FoodStatusKind::Poison => "minecraft:poison",
+                    FoodStatusKind::Hunger => "minecraft:hunger",
+                };
+                assert_eq!(name, expected["id"].as_str().unwrap());
+                assert_eq!(
+                    i64::from(actual.duration),
+                    expected["duration"].as_i64().unwrap()
+                );
+                assert_eq!(
+                    u64::from(actual.amplifier),
+                    expected["amplifier"].as_u64().unwrap()
+                );
+            }
+            let expected = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), expected.len(), "{row}");
+            for (sound, expected) in sounds.iter().zip(expected) {
+                assert_eq!(
+                    format!("minecraft:{}", sound.event),
+                    expected["event"].as_str().unwrap()
+                );
+                assert_eq!(
+                    sound.volume.to_bits(),
+                    expected["volume_bits"].as_i64().unwrap() as i32 as u32
+                );
+                assert_eq!(
+                    sound.pitch.to_bits(),
+                    expected["pitch_bits"].as_i64().unwrap() as i32 as u32
+                );
+            }
+            assert_eq!(
+                random.next_float().to_bits(),
+                row["next_bits"].as_i64().unwrap() as i32 as u32,
+                "{row}"
+            );
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -2179,6 +2446,9 @@ mod tests {
                             let target = match effect.kind {
                                 FoodStatusKind::Hunger => &mut active,
                                 FoodStatusKind::Poison => &mut active_poison,
+                                FoodStatusKind::NightVision | FoodStatusKind::WaterBreathing => {
+                                    unreachable!()
+                                }
                             };
                             if let Some(existing) = target {
                                 existing.merge(incoming);
@@ -2192,6 +2462,9 @@ mod tests {
                             match effect {
                                 FoodStatusKind::Hunger => active = None,
                                 FoodStatusKind::Poison => active_poison = None,
+                                FoodStatusKind::NightVision | FoodStatusKind::WaterBreathing => {
+                                    unreachable!()
+                                }
                             }
                         }
                     }
@@ -2469,6 +2742,60 @@ mod tests {
             ItemStack::new("minecraft:apple".into(), 2, 64, Tag::Compound(vec![])),
         );
         inventory
+    }
+
+    #[test]
+    fn drinking_potions_works_in_both_hands_and_creative() {
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                let mut session = LocalSession::demo();
+                session.set_game_mode(mode);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new(
+                        "minecraft:potion".into(),
+                        1,
+                        1,
+                        Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![(
+                                "potion".into(),
+                                Tag::String("minecraft:night_vision".into()),
+                            )]),
+                        )]),
+                    ),
+                );
+                session.set_player_inventory(inventory);
+                session.set_player_vitals(PlayerVitals {
+                    food: 20,
+                    saturation: 5.0,
+                    ..Default::default()
+                });
+                let before = session.snapshot();
+                session.submit_command(PlayerCommand::Place);
+                for _ in 0..31 {
+                    session.update(Duration::from_millis(50));
+                }
+                assert_eq!(session.snapshot().night_vision_duration, None);
+                session.update(Duration::from_millis(50));
+                let after = session.snapshot();
+                assert_eq!(after.night_vision_duration, Some(3600));
+                assert_eq!((after.vitals.food, after.vitals.saturation), (20, 5.0));
+                assert_eq!(
+                    after.inventory.slot(hand).unwrap().id(),
+                    if mode == GameMode::Creative {
+                        "minecraft:potion"
+                    } else {
+                        "minecraft:glass_bottle"
+                    }
+                );
+                assert_eq!(
+                    before.inventory.slot(hand).unwrap().id(),
+                    "minecraft:potion"
+                );
+            }
+        }
     }
 
     #[test]

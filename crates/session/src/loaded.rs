@@ -963,7 +963,8 @@ impl LoadedSession {
                         visible: true,
                         show_icon: true,
                     }],
-                    crate::survival::FoodRandomEvent::StatusGroup { effects, .. } => effects,
+                    crate::survival::FoodRandomEvent::StatusGroup { effects, .. }
+                    | crate::survival::FoodRandomEvent::PotionEffects(effects) => effects,
                     crate::survival::FoodRandomEvent::RemoveStatuses(effects) => {
                         for kind in effects {
                             let active = match kind {
@@ -972,6 +973,12 @@ impl LoadedSession {
                                 }
                                 crate::survival::FoodStatusKind::Poison => {
                                     self.fall.effects().poison.is_some()
+                                }
+                                crate::survival::FoodStatusKind::NightVision => {
+                                    self.fall.effects().night_vision.is_some()
+                                }
+                                crate::survival::FoodStatusKind::WaterBreathing => {
+                                    self.breathing_effects.water_breathing.is_some()
                                 }
                             };
                             if !active {
@@ -992,7 +999,11 @@ impl LoadedSession {
                                     },
                                     remove: true,
                                 });
-                            self.fall.remove_status(kind);
+                            if kind == crate::survival::FoodStatusKind::WaterBreathing {
+                                self.breathing_effects.water_breathing = None;
+                            } else {
+                                self.fall.remove_status(kind);
+                            }
                         }
                         continue;
                     }
@@ -1014,8 +1025,13 @@ impl LoadedSession {
                                 show_icon: effect.show_icon,
                             },
                         });
-                    self.fall
-                        .add_status(effect.kind, effect.duration, effect.amplifier);
+                    if effect.kind == crate::survival::FoodStatusKind::WaterBreathing {
+                        self.breathing_effects
+                            .add_water_breathing(effect.duration, effect.amplifier);
+                    } else {
+                        self.fall
+                            .add_status(effect.kind, effect.duration, effect.amplifier);
+                    }
                 }
             }
         }
@@ -32869,6 +32885,80 @@ mod tests {
                 crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
                 *session.fall.effects()
             );
+        }
+    }
+
+    #[test]
+    fn potions_update_effects_and_player_save_drafts() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag};
+        for potion in ["night_vision", "water_breathing", "poison"] {
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            };
+            let bytes = native_persistence::nbt::write(&original).unwrap();
+            let mut session = session();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(
+                    "minecraft:potion".into(),
+                    1,
+                    1,
+                    Tag::Compound(vec![(
+                        "minecraft:potion_contents".into(),
+                        Tag::Compound(vec![(
+                            "potion".into(),
+                            Tag::String(format!("minecraft:{potion}").as_str().into()),
+                        )]),
+                    )]),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            for _ in 0..32 {
+                session.update(TICK);
+            }
+            match potion {
+                "night_vision" => assert_eq!(session.snapshot().night_vision_duration, Some(3600)),
+                "water_breathing" => assert_eq!(
+                    session
+                        .breathing_effects
+                        .water_breathing
+                        .as_ref()
+                        .unwrap()
+                        .duration,
+                    3600
+                ),
+                "poison" => assert_eq!(
+                    session.fall.effects().poison.as_ref().unwrap().duration,
+                    900
+                ),
+                _ => unreachable!(),
+            }
+            assert!(!session.effect_save_invalid, "{potion}");
+            let draft = session.draft_player_state(&original).unwrap();
+            assert_eq!(
+                crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+                *session.fall.effects(),
+                "{potion}"
+            );
+            assert_eq!(
+                crate::player_data::read_saved_breathing_effects(draft.document()).unwrap(),
+                session.breathing_effects,
+                "{potion}"
+            );
+            assert_eq!(
+                session
+                    .snapshot()
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .id(),
+                "minecraft:glass_bottle"
+            );
+            assert_eq!(native_persistence::nbt::write(&original).unwrap(), bytes);
         }
     }
 

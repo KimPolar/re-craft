@@ -160,6 +160,10 @@ impl FallTracker {
         match kind {
             crate::survival::FoodStatusKind::Hunger => self.effects.hunger = None,
             crate::survival::FoodStatusKind::Poison => self.effects.poison = None,
+            crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
+            crate::survival::FoodStatusKind::WaterBreathing => {
+                unreachable!("breathing effects are handled separately")
+            }
         }
     }
 
@@ -181,6 +185,10 @@ impl FallTracker {
         let slot = match kind {
             crate::survival::FoodStatusKind::Hunger => &mut self.effects.hunger,
             crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
+            crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
+            crate::survival::FoodStatusKind::WaterBreathing => {
+                unreachable!("breathing effects are handled separately")
+            }
         };
         if let Some(effect) = slot {
             effect.merge(incoming);

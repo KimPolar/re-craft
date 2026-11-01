@@ -160,7 +160,7 @@ struct SessionRandomSequences {
     data: native_persistence::random_sequences::RandomSequences,
 }
 
-enum FluidLootCheckpoint {
+enum BlockLootCheckpoint {
     Named(native_persistence::random_sequences::SequenceCheckpoint),
     Level(native_core::random::LegacyRandom),
 }
@@ -8728,23 +8728,20 @@ impl LoadedSession {
                     return false;
                 }
                 let block = block.clone();
-                if !self.dropped_items.can_drop_block_without_entity(
-                    &block.name,
-                    &block.properties,
-                    self.loot.as_deref(),
-                ) || self
-                    .dropped_items
-                    .drop_block_without_entity(
-                        absolute,
-                        &block.name,
-                        &block.properties,
-                        self.block_drops,
-                        self.loot.as_deref(),
-                    )
-                    .is_err()
-                {
+                let Ok((drops, checkpoint)) = self.stage_block_loot_without_entity(&block) else {
+                    return false;
+                };
+                if !self.set(target, self.states[0]) {
+                    self.rollback_block_loot(checkpoint);
                     return false;
                 }
+                self.dropped_items.drop_interaction(
+                    absolute,
+                    IVec3::ZERO,
+                    native_resources::transforms::DropStrategy::FromMiddle,
+                    drops,
+                    self.block_drops,
+                );
                 self.push_bucket_sound(BucketSoundKind::PlantBreak, sound_position, 1.0, 0.8);
                 if self.plant_break_particles.len() == 4096 {
                     self.plant_break_particles.pop_front();
@@ -8759,9 +8756,6 @@ impl LoadedSession {
                         _ => unreachable!("plant name was checked"),
                     },
                 });
-                if !self.set(target, self.states[0]) {
-                    return false;
-                }
             }
             let id = self.intern_block(replacement);
             if id != existing && !self.set(target, id) {
@@ -12245,10 +12239,10 @@ impl LoadedSession {
             )
     }
 
-    fn stage_fluid_plant_loot(
+    fn stage_block_loot_without_entity(
         &mut self,
         block: &BlockState,
-    ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, FluidLootCheckpoint)> {
+    ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, BlockLootCheckpoint)> {
         use anyhow::Context;
         let tables = self.loot.as_ref().context("block loot table unavailable")?;
         match tables.random_sequence_for_block(&block.name)? {
@@ -12266,7 +12260,7 @@ impl LoadedSession {
                     Some(&mut random),
                 )?;
                 sequences.data.set(&name, &random)?;
-                Ok((drops, FluidLootCheckpoint::Named(checkpoint)))
+                Ok((drops, BlockLootCheckpoint::Named(checkpoint)))
             }
             None => {
                 let mut random = self.level_random.clone();
@@ -12276,20 +12270,20 @@ impl LoadedSession {
                     Some(&mut random),
                 )?;
                 let previous = std::mem::replace(&mut self.level_random, random);
-                Ok((drops, FluidLootCheckpoint::Level(previous)))
+                Ok((drops, BlockLootCheckpoint::Level(previous)))
             }
         }
     }
 
-    fn rollback_fluid_plant_loot(&mut self, checkpoint: FluidLootCheckpoint) {
+    fn rollback_block_loot(&mut self, checkpoint: BlockLootCheckpoint) {
         match checkpoint {
-            FluidLootCheckpoint::Named(checkpoint) => self
+            BlockLootCheckpoint::Named(checkpoint) => self
                 .random_sequences
                 .as_mut()
                 .expect("staged random sequence has a source")
                 .data
                 .restore(checkpoint),
-            FluidLootCheckpoint::Level(random) => self.level_random = random,
+            BlockLootCheckpoint::Level(random) => self.level_random = random,
         }
     }
 
@@ -12524,7 +12518,7 @@ impl LoadedSession {
                 if let Some(plant) = &plant
                     && fluid.kind == FluidKind::Water
                 {
-                    match self.stage_fluid_plant_loot(plant) {
+                    match self.stage_block_loot_without_entity(plant) {
                         Ok(drops) => plant_drops = Some(drops),
                         Err(_) => {
                             retry_wash = true;
@@ -12626,7 +12620,7 @@ impl LoadedSession {
                         }
                     }
                     if let Some((_, previous)) = plant_drops {
-                        self.rollback_fluid_plant_loot(previous);
+                        self.rollback_block_loot(previous);
                         retry_wash = true;
                     } else if plant.is_some() {
                         retry_wash = true;
@@ -19183,7 +19177,7 @@ mod tests {
         let mut session = session();
         session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
         let plant = state("minecraft:short_grass", &[]);
-        assert!(session.stage_fluid_plant_loot(&plant).is_err());
+        assert!(session.stage_block_loot_without_entity(&plant).is_err());
         session
             .set_random_sequences(
                 42,
@@ -19199,7 +19193,7 @@ mod tests {
             .unwrap()
             .state();
         let mut level = session.level_random.clone();
-        let (drops, checkpoint) = session.stage_fluid_plant_loot(&plant).unwrap();
+        let (drops, checkpoint) = session.stage_block_loot_without_entity(&plant).unwrap();
         let after = session
             .random_sequences
             .as_ref()
@@ -19210,7 +19204,7 @@ mod tests {
             .state();
         assert_ne!(before, after);
         assert_eq!(session.level_random.next_int(), level.next_int());
-        session.rollback_fluid_plant_loot(checkpoint);
+        session.rollback_block_loot(checkpoint);
         assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
         assert_eq!(
             session
@@ -19223,7 +19217,7 @@ mod tests {
                 .state(),
             before
         );
-        let (repeated, _) = session.stage_fluid_plant_loot(&plant).unwrap();
+        let (repeated, _) = session.stage_block_loot_without_entity(&plant).unwrap();
         assert_eq!(repeated, drops);
         assert_eq!(
             session
@@ -19256,16 +19250,16 @@ mod tests {
         let mut expected = before.clone();
         expected.next_float();
         let (drops, checkpoint) = session
-            .stage_fluid_plant_loot(&state("minecraft:short_grass", &[]))
+            .stage_block_loot_without_entity(&state("minecraft:short_grass", &[]))
             .unwrap();
         assert_eq!(session.level_random.clone().next_int(), expected.next_int());
-        session.rollback_fluid_plant_loot(checkpoint);
+        session.rollback_block_loot(checkpoint);
         assert_eq!(
             session.level_random.clone().next_int(),
             before.clone().next_int()
         );
         let (repeated, _) = session
-            .stage_fluid_plant_loot(&state("minecraft:short_grass", &[]))
+            .stage_block_loot_without_entity(&state("minecraft:short_grass", &[]))
             .unwrap();
         assert_eq!(drops, repeated);
     }
@@ -19351,6 +19345,19 @@ mod tests {
         for group in rows.chunks_exact(16) {
             let name = group[0]["name"].as_str().unwrap();
             let seed = group[0]["seed"].as_i64().unwrap();
+            let mut bucket_session = session();
+            bucket_session.set_block_loot(Arc::clone(&tables));
+            bucket_session
+                .set_random_sequences(
+                    seed,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            bucket_session.set_water_evaporation_environment(bucket_environment(false));
+            bucket_session.player.position.y = 1.3;
+            bucket_session.motion.position.y = 1.3;
+            let bucket_plant =
+                bucket_session.intern_block(state(&format!("minecraft:{name}"), &[]));
             let mut session = session();
             session.set_block_loot(Arc::clone(&tables));
             session
@@ -19409,8 +19416,70 @@ mod tests {
                     row["next"].as_i64().unwrap(),
                     "{name} {seed} step {step}"
                 );
+                let bucket_target = bucket_session.origin + IVec3::new(8, 2, 7);
+                Arc::make_mut(&mut bucket_session.world)
+                    .set_block_id(
+                        bucket_target.x,
+                        bucket_target.y,
+                        bucket_target.z,
+                        bucket_plant,
+                    )
+                    .unwrap();
+                bucket_session.set_game_mode(if step % 4 < 2 {
+                    GameMode::Survival
+                } else {
+                    GameMode::Creative
+                });
+                let bucket_id = if step % 2 == 0 {
+                    "minecraft:water_bucket"
+                } else {
+                    "minecraft:lava_bucket"
+                };
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    crate::inventory::PlayerSlot::Storage(0),
+                    crate::inventory::ItemStack::new(
+                        bucket_id.into(),
+                        1,
+                        1,
+                        native_persistence::nbt::Tag::Compound(vec![]),
+                    ),
+                );
+                bucket_session.set_player_inventory(inventory);
+                let before = bucket_session.dropped_items.snapshot().len();
+                assert!(
+                    bucket_session.try_empty_bucket(crate::inventory::PlayerSlot::Storage(0)),
+                    "{name} {seed} step {step}"
+                );
+                let items = bucket_session.dropped_items.snapshot();
+                let bucket_drops: Vec<_> = items[before..]
+                    .iter()
+                    .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
+                    .collect();
+                assert_eq!(
+                    bucket_drops,
+                    *row["drops"].as_array().unwrap(),
+                    "bucket {name} {seed} step {step}"
+                );
+                let mut bucket_random = bucket_session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get(&sequence, seed)
+                    .unwrap();
+                assert_eq!(
+                    bucket_random.next_long(),
+                    row["next"].as_i64().unwrap(),
+                    "bucket {name} {seed} step {step}"
+                );
                 if step == 7 {
                     let sequences = &mut session.random_sequences.as_mut().unwrap().data;
+                    *sequences = native_persistence::random_sequences::RandomSequences::read(Some(
+                        sequences.draft().unwrap(),
+                    ))
+                    .unwrap();
+                    let sequences = &mut bucket_session.random_sequences.as_mut().unwrap().data;
                     *sequences = native_persistence::random_sequences::RandomSequences::read(Some(
                         sequences.draft().unwrap(),
                     ))
@@ -19652,6 +19721,60 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn bucket_plant_removal_rolls_back_loot_when_block_change_is_rejected() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/short_grass.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:plant","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        session
+            .set_random_sequences(
+                42,
+                native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+            )
+            .unwrap();
+        session.player.position.y = 1.3;
+        session.motion.position.y = 1.3;
+        let target = IVec3::new(8, 2, 7);
+        let plant = session.intern_block(state("minecraft:short_grass", &[]));
+        assert!(session.set_with_notify(target, plant, false));
+        let banner =
+            session.intern_block(state("minecraft:white_wall_banner", &[("facing", "east")]));
+        let attached = session.origin + target + IVec3::X;
+        Arc::make_mut(&mut session.world)
+            .set_block_id(attached.x, attached.y, attached.z, banner)
+            .unwrap();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        assert!(!session.try_empty_bucket(PlayerSlot::Storage(0)));
+        assert_eq!(
+            session.inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+            "minecraft:water_bucket"
+        );
+        assert!(session.dropped_items.snapshot().is_empty());
+        assert!(session.take_bucket_sounds().is_empty());
+        assert!(session.take_plant_break_particles().is_empty());
+        assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
+        assert!(
+            matches!(cell(&session.world, session.origin, session.bounds, target, session.states[0]), Cell::State(id) if id == plant)
+        );
     }
 
     #[test]

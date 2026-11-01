@@ -1,0 +1,578 @@
+//! Data-driven chest loot and Java 26.3 container-slot distribution.
+//!
+//! Only explicitly supported table forms are accepted; unsupported data-pack
+//! rules fail before an inventory or random stream is changed.
+use crate::packs::{ResourceId, ResourceProvider};
+use anyhow::{Context, Result, bail, ensure};
+use native_core::random::{LegacyRandom, XoroshiroRandom};
+use serde_json::Value;
+
+pub trait ChestLootRandom: Clone {
+    fn next_int(&mut self, bound: i32) -> Option<i32>;
+    fn next_bool(&mut self) -> bool;
+}
+impl ChestLootRandom for LegacyRandom {
+    fn next_int(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+    fn next_bool(&mut self) -> bool {
+        LegacyRandom::next_bool(self)
+    }
+}
+impl ChestLootRandom for XoroshiroRandom {
+    fn next_int(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+    fn next_bool(&mut self) -> bool {
+        XoroshiroRandom::next_bool(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChestLootItem {
+    pub id: ResourceId,
+    pub count: u32,
+    /// Potion-contents component applied by `minecraft:set_potion`.
+    pub potion: Option<ResourceId>,
+}
+#[derive(Clone, Debug)]
+enum IntProvider {
+    Constant(i32),
+    Uniform(i32, i32),
+}
+#[derive(Clone, Debug)]
+enum Modifier {
+    SetCount(IntProvider),
+    SetPotion(ResourceId),
+}
+#[derive(Clone, Debug)]
+struct Entry {
+    item: Option<ResourceId>,
+    weight: i32,
+    modifiers: Vec<Modifier>,
+}
+#[derive(Clone, Debug)]
+struct Pool {
+    rolls: IntProvider,
+    entries: Vec<Entry>,
+    modifiers: Vec<Modifier>,
+}
+#[derive(Clone, Debug)]
+pub struct ChestLootTable {
+    pools: Vec<Pool>,
+    modifiers: Vec<Modifier>,
+    random_sequence: Option<ResourceId>,
+}
+
+fn allowed_fields(value: &Value, allowed: &[&str]) -> Result<()> {
+    let object = value.as_object().context("loot value must be an object")?;
+    for key in object.keys() {
+        ensure!(
+            allowed.contains(&key.as_str()),
+            "unsupported loot field {key}"
+        );
+    }
+    Ok(())
+}
+fn int_value(value: &Value) -> Result<i32> {
+    let number = value.as_i64().context("loot integer must be integral")?;
+    i32::try_from(number).context("loot integer out of range")
+}
+fn provider(value: &Value) -> Result<IntProvider> {
+    if value.is_number() {
+        return Ok(IntProvider::Constant(int_value(value)?));
+    }
+    allowed_fields(value, &["type", "min", "max", "value"])?;
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .context("missing number provider type")?;
+    let kind = ResourceId::parse(kind)?;
+    ensure!(
+        kind.namespace == "minecraft",
+        "unsupported number provider namespace"
+    );
+    match kind.path.as_str() {
+        "constant" => {
+            ensure!(
+                value.get("min").is_none() && value.get("max").is_none(),
+                "invalid constant provider"
+            );
+            Ok(IntProvider::Constant(int_value(
+                value.get("value").context("missing constant value")?,
+            )?))
+        }
+        "uniform" => {
+            ensure!(value.get("value").is_none(), "invalid uniform provider");
+            let min = int_value(value.get("min").context("missing uniform minimum")?)?;
+            let max = int_value(value.get("max").context("missing uniform maximum")?)?;
+            ensure!(
+                min <= max && i64::from(max) - i64::from(min) < i64::from(i32::MAX),
+                "invalid uniform range"
+            );
+            Ok(IntProvider::Uniform(min, max))
+        }
+        _ => bail!("unsupported chest loot number provider {}", kind.path),
+    }
+}
+fn modifiers(value: Option<&Value>) -> Result<Vec<Modifier>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<&Value> = if let Some(list) = value.as_array() {
+        list.iter().collect()
+    } else {
+        vec![value]
+    };
+    ensure!(values.len() <= 1024, "too many loot modifiers");
+    values
+        .into_iter()
+        .map(|entry| {
+            let kind = ResourceId::parse(
+                entry
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .context("missing loot modifier type")?,
+            )?;
+            ensure!(
+                kind.namespace == "minecraft",
+                "unsupported loot modifier namespace"
+            );
+            match kind.path.as_str() {
+                "set_count" => {
+                    allowed_fields(entry, &["type", "count", "add"])?;
+                    ensure!(
+                        entry.get("add").is_none_or(|v| v == &Value::Bool(false)),
+                        "additive loot counts are unsupported"
+                    );
+                    Ok(Modifier::SetCount(provider(
+                        entry.get("count").context("missing loot count")?,
+                    )?))
+                }
+                "set_potion" => {
+                    allowed_fields(entry, &["type", "id"])?;
+                    Ok(Modifier::SetPotion(ResourceId::parse(
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .context("missing potion id")?,
+                    )?))
+                }
+                _ => bail!("unsupported chest loot modifier {}", kind.path),
+            }
+        })
+        .collect()
+}
+impl IntProvider {
+    fn sample(&self, random: &mut impl ChestLootRandom) -> Result<i32> {
+        match *self {
+            Self::Constant(value) => Ok(value),
+            Self::Uniform(min, max) if min >= max => Ok(min),
+            Self::Uniform(min, max) => Ok(min + bounded(random, max - min + 1)?),
+        }
+    }
+    fn validate_nonnegative(&self, limit: i32) -> Result<()> {
+        let (min, max) = match *self {
+            Self::Constant(v) => (v, v),
+            Self::Uniform(a, b) => (a, b),
+        };
+        ensure!(
+            min >= 0 && max <= limit,
+            "loot count or rolls out of supported range"
+        );
+        Ok(())
+    }
+}
+impl ChestLootTable {
+    pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
+        let path = format!("data/{}/loot_table/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing loot table {path}"))?;
+        ensure!(bytes.len() <= 16 * 1024 * 1024, "loot table too large");
+        Self::decode(&serde_json::from_slice(&bytes).context("invalid loot table JSON")?)
+            .with_context(|| format!("in loot table {path}"))
+    }
+    pub fn decode(value: &Value) -> Result<Self> {
+        allowed_fields(value, &["type", "random_sequence", "pools", "modifier"])?;
+        let kind = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing loot table type")?,
+        )?;
+        ensure!(
+            kind.namespace == "minecraft" && kind.path == "chest",
+            "loot table is not a chest table"
+        );
+        let random_sequence = value
+            .get("random_sequence")
+            .map(|sequence| {
+                ResourceId::parse(sequence.as_str().context("invalid random sequence")?)
+            })
+            .transpose()?;
+        let list = value
+            .get("pools")
+            .and_then(Value::as_array)
+            .context("missing chest loot pools")?;
+        ensure!(list.len() <= 1024, "too many loot pools");
+        let mut pools = Vec::with_capacity(list.len());
+        for pool in list {
+            allowed_fields(pool, &["rolls", "bonus_rolls", "entries", "modifier"])?;
+            if let Some(bonus) = pool.get("bonus_rolls") {
+                ensure!(bonus.as_f64() == Some(0.0), "bonus rolls are unsupported");
+            }
+            let rolls = provider(pool.get("rolls").context("missing pool rolls")?)?;
+            rolls.validate_nonnegative(4096)?;
+            let raw = pool
+                .get("entries")
+                .and_then(Value::as_array)
+                .context("missing pool entries")?;
+            ensure!(raw.len() <= 4096, "too many loot entries");
+            let mut entries = Vec::with_capacity(raw.len());
+            let mut total = 0i32;
+            for entry in raw {
+                allowed_fields(entry, &["type", "name", "weight", "quality", "modifier"])?;
+                let kind = ResourceId::parse(
+                    entry
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .context("missing entry type")?,
+                )?;
+                ensure!(
+                    kind.namespace == "minecraft",
+                    "unsupported loot entry namespace"
+                );
+                let item = match kind.path.as_str() {
+                    "item" => Some(ResourceId::parse(
+                        entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .context("missing item name")?,
+                    )?),
+                    "empty" => {
+                        ensure!(entry.get("name").is_none(), "empty loot entry has a name");
+                        None
+                    }
+                    _ => bail!("unsupported chest loot entry {}", kind.path),
+                };
+                if let Some(quality) = entry.get("quality") {
+                    ensure!(
+                        int_value(quality)? == 0,
+                        "loot entry quality requires luck support"
+                    );
+                }
+                let weight = entry.get("weight").map(int_value).transpose()?.unwrap_or(1);
+                ensure!(weight >= 0, "negative loot weight");
+                total = total.checked_add(weight).context("loot weight overflow")?;
+                let modifiers = modifiers(entry.get("modifier"))?;
+                if item.is_none() {
+                    ensure!(
+                        modifiers.is_empty(),
+                        "modifiers on empty entries are unsupported"
+                    );
+                }
+                for modifier in &modifiers {
+                    if let Modifier::SetCount(p) = modifier {
+                        p.validate_nonnegative(1_000_000)?;
+                    }
+                }
+                entries.push(Entry {
+                    item,
+                    weight,
+                    modifiers,
+                });
+            }
+            let modifiers = modifiers(pool.get("modifier"))?;
+            for modifier in &modifiers {
+                if let Modifier::SetCount(p) = modifier {
+                    p.validate_nonnegative(1_000_000)?;
+                }
+            }
+            pools.push(Pool {
+                rolls,
+                entries,
+                modifiers,
+            });
+        }
+        let modifiers = modifiers(value.get("modifier"))?;
+        for modifier in &modifiers {
+            if let Modifier::SetCount(p) = modifier {
+                p.validate_nonnegative(1_000_000)?;
+            }
+        }
+        Ok(Self {
+            pools,
+            modifiers,
+            random_sequence,
+        })
+    }
+    /// The table's named world random sequence, if specified by the active pack.
+    pub fn random_sequence(&self) -> Option<&ResourceId> {
+        self.random_sequence.as_ref()
+    }
+    /// Fill empty slots with luck zero. A zero saved seed uses the world's named
+    /// random sequence: pass that sequence explicitly to `fill_with_random`.
+    pub fn fill_seeded(
+        &self,
+        occupied: &[bool],
+        seed: i64,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Vec<Option<ChestLootItem>>> {
+        ensure!(
+            seed != 0,
+            "zero loot seed requires the world's random sequence"
+        );
+        self.fill_with_random(occupied, &mut LegacyRandom::new(seed), max_stack)
+    }
+    /// Returns new items by slot, leaving occupied slots as `None`. `max_stack`
+    /// must validate item and potion IDs and enabled features against the active
+    /// registries, and return the component-dependent limit. On error the
+    /// random state is unchanged.
+    pub fn fill_with_random<R: ChestLootRandom>(
+        &self,
+        occupied: &[bool],
+        random: &mut R,
+        mut max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+    ) -> Result<Vec<Option<ChestLootItem>>> {
+        ensure!(occupied.len() <= 4096, "container is too large");
+        let mut prepared = Vec::with_capacity(self.pools.len());
+        for pool in &self.pools {
+            let mut entries = Vec::with_capacity(pool.entries.len());
+            for entry in &pool.entries {
+                let maximum = if let Some(id) = &entry.item {
+                    let mut prototype = ChestLootItem {
+                        id: id.clone(),
+                        count: 1,
+                        potion: None,
+                    };
+                    for modifier in entry
+                        .modifiers
+                        .iter()
+                        .chain(pool.modifiers.iter())
+                        .chain(self.modifiers.iter())
+                    {
+                        if let Modifier::SetPotion(potion) = modifier {
+                            prototype.potion = Some(potion.clone());
+                        }
+                    }
+                    let maximum = max_stack(&prototype)?;
+                    ensure!((1..=99).contains(&maximum), "invalid item stack limit");
+                    maximum
+                } else {
+                    0
+                };
+                if entry.weight > 0 {
+                    entries.push((entry, maximum));
+                }
+            }
+            prepared.push(entries);
+        }
+        let mut rng = random.clone();
+        let mut items = Vec::new();
+        for (pool, candidates) in self.pools.iter().zip(prepared) {
+            let total = candidates
+                .iter()
+                .try_fold(0i32, |sum, (entry, _)| sum.checked_add(entry.weight))
+                .context("loot weight overflow")?;
+            let rolls = pool.rolls.sample(&mut rng)?;
+            for _ in 0..rolls {
+                if candidates.is_empty() {
+                    continue;
+                }
+                let (selected, maximum) = if candidates.len() == 1 {
+                    candidates[0]
+                } else {
+                    let mut n = bounded(&mut rng, total)?;
+                    let mut selected = candidates[0];
+                    for &(entry, maximum) in &candidates {
+                        n -= entry.weight;
+                        if n < 0 {
+                            selected = (entry, maximum);
+                            break;
+                        }
+                    }
+                    selected
+                };
+                let Some(id) = &selected.item else {
+                    continue;
+                };
+                let mut item = ChestLootItem {
+                    id: id.clone(),
+                    count: 1,
+                    potion: None,
+                };
+                for modifier in selected
+                    .modifiers
+                    .iter()
+                    .chain(pool.modifiers.iter())
+                    .chain(self.modifiers.iter())
+                {
+                    match modifier {
+                        Modifier::SetCount(value) => {
+                            item.count = u32::try_from(value.sample(&mut rng)?)?
+                        }
+                        Modifier::SetPotion(potion) => item.potion = Some(potion.clone()),
+                    }
+                }
+                if item.count == 0 {
+                    continue;
+                }
+                while item.count > maximum {
+                    let mut split = item.clone();
+                    split.count = maximum;
+                    items.push(split);
+                    item.count -= maximum;
+                    ensure!(items.len() <= 1_000_000, "too many generated stacks");
+                }
+                items.push(item);
+                ensure!(items.len() <= 1_000_000, "too many generated stacks");
+            }
+        }
+        let mut free: Vec<usize> = occupied
+            .iter()
+            .enumerate()
+            .filter_map(|(i, occupied)| (!occupied).then_some(i))
+            .collect();
+        shuffle(&mut free, &mut rng)?;
+        let mut single = Vec::new();
+        let mut split = Vec::new();
+        for item in items {
+            if item.count > 1 {
+                split.push(item)
+            } else {
+                single.push(item)
+            }
+        }
+        while free.len() > single.len() + split.len() && !split.is_empty() {
+            let index = between(&mut rng, 0, split.len() as i32 - 1)? as usize;
+            let mut item = split.remove(index);
+            let amount = between(&mut rng, 1, (item.count / 2) as i32)? as u32;
+            item.count -= amount;
+            let mut other = item.clone();
+            other.count = amount;
+            for part in [item, other] {
+                if part.count > 1 && rng.next_bool() {
+                    split.push(part)
+                } else {
+                    single.push(part)
+                }
+            }
+        }
+        single.extend(split);
+        shuffle(&mut single, &mut rng)?;
+        let mut output = vec![None; occupied.len()];
+        for item in single {
+            let Some(slot) = free.pop() else { break };
+            output[slot] = Some(item);
+        }
+        *random = rng;
+        Ok(output)
+    }
+}
+fn between(random: &mut impl ChestLootRandom, min: i32, max: i32) -> Result<i32> {
+    if min >= max {
+        Ok(min)
+    } else {
+        Ok(min + bounded(random, max - min + 1)?)
+    }
+}
+fn shuffle<T>(values: &mut [T], random: &mut impl ChestLootRandom) -> Result<()> {
+    for n in (2..=values.len()).rev() {
+        let index = bounded(random, n as i32)? as usize;
+        values.swap(n - 1, index);
+    }
+    Ok(())
+}
+fn bounded(random: &mut impl ChestLootRandom, bound: i32) -> Result<i32> {
+    ensure!(bound > 0, "invalid random bound");
+    let value = random
+        .next_int(bound)
+        .context("random source rejected bound")?;
+    ensure!(
+        (0..bound).contains(&value),
+        "random source returned an out-of-range value"
+    );
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn retains_the_named_world_random_sequence() {
+        let mut value = json!({"type":"minecraft:chest", "pools":[]});
+        assert!(
+            ChestLootTable::decode(&value)
+                .unwrap()
+                .random_sequence()
+                .is_none()
+        );
+        value["random_sequence"] = json!("custom:chests/treasure");
+        let table = ChestLootTable::decode(&value).unwrap();
+        assert_eq!(
+            table.random_sequence(),
+            Some(&ResourceId::parse("custom:chests/treasure").unwrap())
+        );
+        value["random_sequence"] = json!("invalid:id:again");
+        assert!(ChestLootTable::decode(&value).is_err());
+    }
+    #[test]
+    fn fills_only_available_slots_and_preserves_random_on_error() {
+        let table=ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:iron_ingot","modifier":{"type":"minecraft:set_count","count":7}}]}]})).unwrap();
+        let mut random = LegacyRandom::new(42);
+        let slots = table
+            .fill_with_random(
+                &[
+                    true, false, false, false, false, false, false, false, false, false,
+                ],
+                &mut random,
+                |_| Ok(64),
+            )
+            .unwrap();
+        assert!(slots[0].is_none());
+        assert_eq!(slots.iter().flatten().map(|i| i.count).sum::<u32>(), 7);
+        let mut random = LegacyRandom::new(42);
+        let expected = random.clone().next_long();
+        assert!(
+            table
+                .fill_with_random(&[false; 27], &mut random, |_| anyhow::bail!("unknown item"))
+                .is_err()
+        );
+        assert_eq!(random.next_long(), expected);
+        assert!(table.fill_seeded(&[false; 27], 0, |_| Ok(64)).is_err());
+        let mut invalid = json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","condition":{"type":"minecraft:random_chance","chance":0.5}}]}]});
+        assert!(ChestLootTable::decode(&invalid).is_err());
+        invalid["pools"][0]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("condition");
+        invalid["pools"][0]["bonus_rolls"] = json!({"type":"minecraft:uniform","min":0,"max":1});
+        assert!(ChestLootTable::decode(&invalid).is_err());
+    }
+    #[derive(Clone)]
+    struct BadRandom {
+        calls: usize,
+    }
+    impl ChestLootRandom for BadRandom {
+        fn next_int(&mut self, bound: i32) -> Option<i32> {
+            self.calls += 1;
+            Some(bound)
+        }
+        fn next_bool(&mut self) -> bool {
+            false
+        }
+    }
+    #[test]
+    fn rejects_invalid_random_source_without_committing_it() {
+        let table = ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[]})).unwrap();
+        let mut random = BadRandom { calls: 0 };
+        assert!(
+            table
+                .fill_with_random(&[false; 2], &mut random, |_| Ok(64))
+                .is_err()
+        );
+        assert_eq!(random.calls, 0);
+    }
+}

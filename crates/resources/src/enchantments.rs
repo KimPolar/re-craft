@@ -8,6 +8,8 @@ use serde_json::Value;
 use crate::packs::{ResourceId, ResourceProvider};
 use crate::recipes::{TagEntry, parse_tag, resolve_tag};
 
+pub mod location;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttributeOperation {
     AddValue,
@@ -991,6 +993,7 @@ fn damage_type_info(bytes: &[u8]) -> Result<DamageTypeInfo> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OxygenEnchantments {
     definitions: BTreeMap<ResourceId, std::result::Result<Definition, String>>,
+    location: BTreeMap<ResourceId, std::result::Result<location::LocationEnchantment, String>>,
     protection: BTreeMap<ResourceId, std::result::Result<Vec<ProtectionEffect>, String>>,
     damage_immunity: BTreeMap<ResourceId, std::result::Result<Vec<DamagePredicate>, String>>,
     repair: BTreeMap<ResourceId, std::result::Result<Option<Vec<RepairValueEffect>>, String>>,
@@ -1006,6 +1009,7 @@ pub struct OxygenEnchantments {
 impl OxygenEnchantments {
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut definitions = BTreeMap::new();
+        let mut location = BTreeMap::new();
         let mut protection = BTreeMap::new();
         let mut damage_immunity = BTreeMap::new();
         let mut repair = BTreeMap::new();
@@ -1022,6 +1026,11 @@ impl OxygenEnchantments {
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
                 .and_then(definition)
+                .map_err(|error| format!("{error:#}"));
+            let location_effect = value
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+                .and_then(|value| location::LocationEnchantment::load(provider, value))
                 .map_err(|error| format!("{error:#}"));
             let protection_effect = value
                 .as_ref()
@@ -1063,6 +1072,7 @@ impl OxygenEnchantments {
             repair.insert(id.clone(), repair_effect);
             item_damage.insert(id.clone(), damage_effect);
             block_experience.insert(id.clone(), experience_effect);
+            location.insert(id.clone(), location_effect);
             definitions.insert(id, parsed);
         }
         let damage_types: BTreeSet<_> = provider.list_data("damage_type")?.into_iter().collect();
@@ -1127,6 +1137,7 @@ impl OxygenEnchantments {
         );
         Ok(Self {
             definitions,
+            location,
             protection,
             damage_immunity,
             repair,
@@ -1147,6 +1158,15 @@ impl OxygenEnchantments {
         slot: EquipmentSlot,
     ) -> Result<Vec<AttributeModifier>> {
         self.modifiers_for(id, level, slot, "oxygen_bonus")
+    }
+
+    /// Return the active pack's location effects, or report an unsupported definition.
+    pub fn location_effects(&self, id: &ResourceId) -> Result<&location::LocationEnchantment> {
+        self.location
+            .get(id)
+            .context("enchantment is absent from the active registry")?
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("unsupported location enchantment: {error}"))
     }
 
     /// Apply the active definition's attribute effects for one equipment slot.

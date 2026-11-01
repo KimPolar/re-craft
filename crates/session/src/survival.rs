@@ -163,21 +163,55 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
     }
 }
 
-fn potion_id(components: &Tag) -> Option<ResourceId> {
-    let contents = match components.get("minecraft:potion_contents") {
-        Some(Tag::Compound(fields)) => fields,
-        _ => return None,
-    };
-    let [(name, Tag::String(id))] = contents.as_slice() else {
-        return None;
-    };
-    if !name.matches("potion") {
-        return None;
+/// The potion component codec accepts both an ID string and a full record.
+pub fn potion_contents_potion(contents: &Tag) -> Option<&native_persistence::nbt::JavaString> {
+    match contents {
+        Tag::String(id) => Some(id),
+        Tag::Compound(_) => match contents.get("potion") {
+            Some(Tag::String(id)) => Some(id),
+            _ => None,
+        },
+        _ => None,
     }
+}
+
+fn potion_id(components: &Tag) -> Option<ResourceId> {
+    let contents = components.get("minecraft:potion_contents")?;
+    if let Tag::Compound(fields) = contents {
+        let mut potion = false;
+        let mut empty_effects = false;
+        let mut color = false;
+        let mut custom_name = false;
+        for (name, value) in fields {
+            if name.matches("potion") && !potion && matches!(value, Tag::String(_)) {
+                potion = true;
+            } else if name.matches("custom_effects")
+                && !empty_effects
+                && matches!(value, Tag::List { values, .. } if values.is_empty())
+            {
+                empty_effects = true;
+            } else if name.matches("custom_color") && !color && value.as_java_int().is_some() {
+                color = true;
+            } else if name.matches("custom_name") && !custom_name && matches!(value, Tag::String(_))
+            {
+                custom_name = true;
+            } else {
+                return None;
+            }
+        }
+        if !potion {
+            return None;
+        }
+    }
+    let id = potion_contents_potion(contents)?;
     let id = String::from_utf16(&id.0).ok()?;
     ResourceId::parse(&id)
         .ok()
         .filter(|id| id.namespace == "minecraft")
+}
+
+pub(crate) fn is_plain_water_potion(components: &Tag) -> bool {
+    potion_id(components).is_some_and(|id| id.path == "water")
 }
 
 /// Recognize the built-in contents whose inventory representation is supported.
@@ -260,6 +294,11 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
 
 /// Color of supported built-in potion contents; absent/unsupported uses the model default.
 pub fn potion_color(components: &Tag) -> Option<u32> {
+    let contents = components.get("minecraft:potion_contents")?;
+    if let Some(color) = contents.get("custom_color").and_then(Tag::as_java_int) {
+        potion_id(components)?;
+        return Some(color as u32 & 0x00ff_ffff);
+    }
     match potion_id(components)?.path.as_str() {
         "night_vision" | "long_night_vision" => Some(0xc2ff66),
         "water_breathing" | "long_water_breathing" => Some(0x98dac0),
@@ -1771,111 +1810,138 @@ mod tests {
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(rows.len(), 500);
         for row in rows {
-            let name = row["potion"].as_str().unwrap();
-            let components = Tag::Compound(vec![(
-                "minecraft:potion_contents".into(),
-                Tag::Compound(vec![("potion".into(), Tag::String(name.into()))]),
-            )]);
-            let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
-            assert_eq!(
-                potion_color(item.components()).unwrap_or(0x385dc6),
-                row["color"].as_i64().unwrap() as u32 & 0xffffff,
-                "{row}"
-            );
-            let food = food_properties(&item).unwrap();
-            assert_eq!(
-                food.use_ticks,
-                row["ticks"].as_i64().unwrap() as i32,
-                "{row}"
-            );
-            assert_eq!(
-                food.consume_particles,
-                row["particles"].as_bool().unwrap(),
-                "{row}"
-            );
-            assert_eq!(row["animation"].as_str(), Some("DRINK"));
-            let mut inventory = PlayerInventory::default();
-            inventory.set_slot(PlayerSlot::Storage(0), Some(item));
-            let mut inventory = Arc::new(inventory);
-            let mut vitals = PlayerVitals {
-                food: 20,
-                saturation: 5.0,
-                ..Default::default()
-            };
-            let mut usage = FoodUse::default();
-            assert_eq!(
-                usage.start_hand(
-                    &mut inventory,
-                    PlayerSlot::Storage(0),
-                    &mut vitals,
-                    GameMode::Survival
-                ),
-                row["can_consume"].as_bool().unwrap()
-            );
-            let mut random = native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
-            let mut sounds = Vec::new();
-            let mut effects = Vec::new();
-            for _ in 0..food.use_ticks {
-                usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
-                for event in usage.take_events() {
-                    let (applied, emitted) = event.apply_with_sounds(&mut random);
-                    sounds.extend(emitted.into_iter().flatten());
-                    if let FoodRandomEvent::PotionEffects(values) = event {
-                        assert!(applied);
-                        effects.extend(values);
+            for variant in 0..4 {
+                let name = row["potion"].as_str().unwrap();
+                let components = Tag::Compound(vec![(
+                    "minecraft:potion_contents".into(),
+                    match variant {
+                        0 => Tag::Compound(vec![("potion".into(), Tag::String(name.into()))]),
+                        1 => Tag::String(name.into()),
+                        2 => Tag::Compound(vec![
+                            ("potion".into(), Tag::String(name.into())),
+                            ("custom_color".into(), Tag::Int(0x123456)),
+                            ("custom_name".into(), Tag::String("test.potion".into())),
+                        ]),
+                        _ => Tag::Compound(vec![
+                            ("potion".into(), Tag::String(name.into())),
+                            ("custom_color".into(), Tag::Int(0x123456)),
+                            ("custom_name".into(), Tag::String("test.potion".into())),
+                            (
+                                "custom_effects".into(),
+                                Tag::List {
+                                    element_type: native_persistence::nbt::TagType::End,
+                                    values: vec![],
+                                },
+                            ),
+                        ]),
+                    },
+                )]);
+                let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
+                assert_eq!(
+                    potion_color(item.components()).unwrap_or(0x385dc6),
+                    if variant >= 2 {
+                        0x123456
+                    } else {
+                        row["color"].as_i64().unwrap() as u32 & 0xffffff
+                    },
+                    "{row}"
+                );
+                let food = food_properties(&item).unwrap();
+                assert_eq!(
+                    food.use_ticks,
+                    row["ticks"].as_i64().unwrap() as i32,
+                    "{row}"
+                );
+                assert_eq!(
+                    food.consume_particles,
+                    row["particles"].as_bool().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(row["animation"].as_str(), Some("DRINK"));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(PlayerSlot::Storage(0), Some(item));
+                let mut inventory = Arc::new(inventory);
+                let mut vitals = PlayerVitals {
+                    food: 20,
+                    saturation: 5.0,
+                    ..Default::default()
+                };
+                let mut usage = FoodUse::default();
+                assert_eq!(
+                    usage.start_hand(
+                        &mut inventory,
+                        PlayerSlot::Storage(0),
+                        &mut vitals,
+                        GameMode::Survival
+                    ),
+                    row["can_consume"].as_bool().unwrap()
+                );
+                let mut random =
+                    native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+                let mut sounds = Vec::new();
+                let mut effects = Vec::new();
+                for _ in 0..food.use_ticks {
+                    usage.tick(&mut inventory, &mut vitals, GameMode::Survival);
+                    for event in usage.take_events() {
+                        let (applied, emitted) = event.apply_with_sounds(&mut random);
+                        sounds.extend(emitted.into_iter().flatten());
+                        if let FoodRandomEvent::PotionEffects(values) = event {
+                            assert!(applied);
+                            effects.extend(values);
+                        }
                     }
                 }
+                assert_eq!(
+                    inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                    row["remainder"].as_str().unwrap()
+                );
+                assert_eq!((vitals.food, vitals.saturation), (20, 5.0));
+                let expected = row["effects"].as_array().unwrap();
+                assert_eq!(effects.len(), expected.len(), "{row}");
+                for (actual, expected) in effects.iter().zip(expected) {
+                    let name = match actual.kind {
+                        FoodStatusKind::NightVision => "minecraft:night_vision",
+                        FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
+                        FoodStatusKind::Poison => "minecraft:poison",
+                        FoodStatusKind::Regeneration => "minecraft:regeneration",
+                        FoodStatusKind::JumpBoost => "minecraft:jump_boost",
+                        FoodStatusKind::SlowFalling => "minecraft:slow_falling",
+                        FoodStatusKind::Speed => "minecraft:speed",
+                        FoodStatusKind::Slowness => "minecraft:slowness",
+                        FoodStatusKind::Hunger => "minecraft:hunger",
+                    };
+                    assert_eq!(name, expected["id"].as_str().unwrap());
+                    assert_eq!(
+                        i64::from(actual.duration),
+                        expected["duration"].as_i64().unwrap()
+                    );
+                    assert_eq!(
+                        u64::from(actual.amplifier),
+                        expected["amplifier"].as_u64().unwrap()
+                    );
+                }
+                let expected = row["sounds"].as_array().unwrap();
+                assert_eq!(sounds.len(), expected.len(), "{row}");
+                for (sound, expected) in sounds.iter().zip(expected) {
+                    assert_eq!(
+                        format!("minecraft:{}", sound.event),
+                        expected["event"].as_str().unwrap()
+                    );
+                    assert_eq!(
+                        sound.volume.to_bits(),
+                        expected["volume_bits"].as_i64().unwrap() as i32 as u32
+                    );
+                    assert_eq!(
+                        sound.pitch.to_bits(),
+                        expected["pitch_bits"].as_i64().unwrap() as i32 as u32
+                    );
+                }
+                assert_eq!(
+                    random.next_float().to_bits(),
+                    row["next_bits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
             }
-            assert_eq!(
-                inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
-                row["remainder"].as_str().unwrap()
-            );
-            assert_eq!((vitals.food, vitals.saturation), (20, 5.0));
-            let expected = row["effects"].as_array().unwrap();
-            assert_eq!(effects.len(), expected.len(), "{row}");
-            for (actual, expected) in effects.iter().zip(expected) {
-                let name = match actual.kind {
-                    FoodStatusKind::NightVision => "minecraft:night_vision",
-                    FoodStatusKind::WaterBreathing => "minecraft:water_breathing",
-                    FoodStatusKind::Poison => "minecraft:poison",
-                    FoodStatusKind::Regeneration => "minecraft:regeneration",
-                    FoodStatusKind::JumpBoost => "minecraft:jump_boost",
-                    FoodStatusKind::SlowFalling => "minecraft:slow_falling",
-                    FoodStatusKind::Speed => "minecraft:speed",
-                    FoodStatusKind::Slowness => "minecraft:slowness",
-                    FoodStatusKind::Hunger => "minecraft:hunger",
-                };
-                assert_eq!(name, expected["id"].as_str().unwrap());
-                assert_eq!(
-                    i64::from(actual.duration),
-                    expected["duration"].as_i64().unwrap()
-                );
-                assert_eq!(
-                    u64::from(actual.amplifier),
-                    expected["amplifier"].as_u64().unwrap()
-                );
-            }
-            let expected = row["sounds"].as_array().unwrap();
-            assert_eq!(sounds.len(), expected.len(), "{row}");
-            for (sound, expected) in sounds.iter().zip(expected) {
-                assert_eq!(
-                    format!("minecraft:{}", sound.event),
-                    expected["event"].as_str().unwrap()
-                );
-                assert_eq!(
-                    sound.volume.to_bits(),
-                    expected["volume_bits"].as_i64().unwrap() as i32 as u32
-                );
-                assert_eq!(
-                    sound.pitch.to_bits(),
-                    expected["pitch_bits"].as_i64().unwrap() as i32 as u32
-                );
-            }
-            assert_eq!(
-                random.next_float().to_bits(),
-                row["next_bits"].as_i64().unwrap() as i32 as u32,
-                "{row}"
-            );
         }
     }
 

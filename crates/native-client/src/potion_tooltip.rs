@@ -188,7 +188,12 @@ pub fn lines(item: &ItemStack, assets: &MenuAssets) -> Option<Vec<Vec<Span>>> {
     {
         return None;
     }
-    let potion = contents.and_then(|contents| contents.get("potion"));
+    let potion = match contents {
+        Some(contents @ Tag::String(_)) => Some(contents),
+        Some(contents @ Tag::Compound(_)) => contents.get("potion"),
+        None => None,
+        Some(_) => return None,
+    };
     let mut effects = match potion {
         None => vec![],
         Some(Tag::String(id)) => {

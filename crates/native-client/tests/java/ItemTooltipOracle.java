@@ -107,6 +107,7 @@ public class ItemTooltipOracle {
         var holder=(Holder<Potion>)Potions.class.getField(input.get("potion").getAsString().toUpperCase(java.util.Locale.ROOT)).get(null);
         stack.set(DataComponents.POTION_CONTENTS,new PotionContents(holder));
       }
+      if(input.has("potion_shorthand")) stack.set(DataComponents.POTION_CONTENTS,PotionContents.CODEC.parse(tooltipRegistries.createSerializationContext(JsonOps.INSTANCE),input.get("potion_shorthand")).getOrThrow());
       if(input.has("custom_effects")) {
         var contents=stack.getOrDefault(DataComponents.POTION_CONTENTS,PotionContents.EMPTY);
         for(var value:input.getAsJsonArray("custom_effects")) {
@@ -121,6 +122,12 @@ public class ItemTooltipOracle {
           contents=contents.withEffectAdded(new MobEffectInstance(holder,duration,amplifier,ambient,visible,icon));
         }
         stack.set(DataComponents.POTION_CONTENTS,contents);
+      }
+      if(input.has("potion_custom_color") || input.has("potion_custom_name")) {
+        var contents=stack.getOrDefault(DataComponents.POTION_CONTENTS,PotionContents.EMPTY);
+        var color=input.has("potion_custom_color")?java.util.Optional.of(input.get("potion_custom_color").getAsInt()):contents.customColor();
+        var name=input.has("potion_custom_name")?java.util.Optional.of(input.get("potion_custom_name").getAsString()):contents.customName();
+        stack.set(DataComponents.POTION_CONTENTS,new PotionContents(contents.potion(),color,contents.customEffects(),name));
       }
       if(input.has("scale")) stack.set(DataComponents.POTION_DURATION_SCALE,input.get("scale").getAsFloat());
       if(input.has("attributes")) stack.set(DataComponents.ATTRIBUTE_MODIFIERS,net.minecraft.world.item.component.ItemAttributeModifiers.CODEC.parse(tooltipRegistries.createSerializationContext(JsonOps.INSTANCE),input.get("attributes")).getOrThrow());

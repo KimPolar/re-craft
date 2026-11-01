@@ -81,8 +81,8 @@ fn potion_name(item: &ItemStack) -> Option<String> {
         .and_then(text)
         .or_else(|| {
             contents
-                .and_then(|contents| contents.get("potion"))
-                .and_then(text)
+                .and_then(native_session::survival::potion_contents_potion)
+                .and_then(|id| String::from_utf16(&id.0).ok())
                 .map(|id| {
                     let path = id.rsplit(':').next().unwrap_or(&id);
                     path.strip_prefix("long_")
@@ -400,6 +400,22 @@ mod tests {
                 "infested",
             ] {
                 cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion":potion}));
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion_shorthand":format!("minecraft:{potion}")}));
+            }
+        }
+        cases.push(serde_json::json!({"id":"minecraft:potion","potion_shorthand":"swiftness"}));
+        for id in [
+            "potion",
+            "splash_potion",
+            "lingering_potion",
+            "tipped_arrow",
+            "apple",
+        ] {
+            for potion in ["water", "swiftness", "strong_poison"] {
+                cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion":potion,"explicit_empty_effects":true}));
+                for name in ["test.potion", "strong_swiftness"] {
+                    cases.push(serde_json::json!({"id":format!("minecraft:{id}"),"potion":potion,"potion_custom_name":name,"potion_custom_color":1193046}));
+                }
             }
         }
         for id in [
@@ -688,13 +704,33 @@ mod tests {
                     },
                 ));
             }
-            if case["potion"].is_string() || case["custom_effects"].is_array() {
+            if let Some(potion) = case["potion_shorthand"].as_str() {
+                fields.push((
+                    "minecraft:potion_contents".into(),
+                    Tag::String(potion.into()),
+                ));
+            } else if case["potion"].is_string() || case["custom_effects"].is_array() {
                 let mut contents = Vec::new();
                 if let Some(potion) = case["potion"].as_str() {
                     contents.push((
                         "potion".into(),
                         Tag::String(format!("minecraft:{potion}").as_str().into()),
                     ));
+                }
+                if case["explicit_empty_effects"].as_bool() == Some(true) {
+                    contents.push((
+                        "custom_effects".into(),
+                        Tag::List {
+                            element_type: TagType::End,
+                            values: vec![],
+                        },
+                    ));
+                }
+                if let Some(name) = case["potion_custom_name"].as_str() {
+                    contents.push(("custom_name".into(), Tag::String(name.into())));
+                }
+                if let Some(color) = case["potion_custom_color"].as_i64() {
+                    contents.push(("custom_color".into(), Tag::Int(color as i32)));
                 }
                 if let Some(effects) = case["custom_effects"].as_array() {
                     let values = effects
@@ -768,6 +804,7 @@ mod tests {
             }
             let potion_case = attribute_case
                 || case["potion"].is_string()
+                || case["potion_shorthand"].is_string()
                 || case["enchantments"].is_object()
                 || case["stored_enchantments"].is_object()
                 || case["custom_effects"].is_array()

@@ -274,6 +274,14 @@ impl ItemStack {
                     && max_component_consistent(self)
                     && max_component_consistent(other)
                     && banner_components_equal(&self.components, &other.components))
+                || (matches!(
+                    self.id.as_str(),
+                    "minecraft:potion" | "minecraft:tipped_arrow"
+                ) && max_component_consistent(self)
+                    && max_component_consistent(other)
+                    && ordinary_return_supported(self)
+                    && ordinary_return_supported(other)
+                    && potion_components_equal(&self.components, &other.components))
                 || (max_component_consistent(self)
                     && max_component_consistent(other)
                     && matches!((&self.components, &other.components), (Tag::Compound(a), Tag::Compound(b)) if equal_compounds(a, b, true))))
@@ -1552,11 +1560,7 @@ impl PlayerInventory {
         let source = self.slot(hand)?;
         if source.id != "minecraft:potion"
             || !ordinary_return_supported(source)
-            || source
-                .components
-                .get("minecraft:potion_contents")?
-                .get("potion")
-                != Some(&Tag::String("minecraft:water".into()))
+            || !crate::survival::is_plain_water_potion(&source.components)
         {
             return None;
         }
@@ -3184,6 +3188,45 @@ fn banner_components_equal(a: &Tag, b: &Tag) -> bool {
     equal_compounds(&canonical(a), &canonical(b), true)
 }
 
+fn potion_components_equal(a: &Tag, b: &Tag) -> bool {
+    if crate::survival::inventory_potion_contents(a).is_none()
+        || crate::survival::inventory_potion_contents(b).is_none()
+    {
+        return false;
+    }
+    let id = |components: &Tag| {
+        let value = components.get("minecraft:potion_contents")?;
+        let id = crate::survival::potion_contents_potion(value)?;
+        ResourceId::parse(&String::from_utf16(&id.0).ok()?).ok()
+    };
+    if id(a) != id(b) {
+        return false;
+    }
+    let details = |components: &Tag| {
+        let contents = components.get("minecraft:potion_contents")?;
+        let color = contents.get("custom_color").and_then(Tag::as_java_int);
+        let name = match contents.get("custom_name") {
+            Some(Tag::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        Some((color, name))
+    };
+    if details(a) != details(b) {
+        return false;
+    }
+    let (Tag::Compound(a), Tag::Compound(b)) = (a, b) else {
+        return false;
+    };
+    let remaining = |fields: &Vec<(JavaString, Tag)>| {
+        fields
+            .iter()
+            .filter(|(name, _)| !name.matches("minecraft:potion_contents"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    equal_compounds(&remaining(a), &remaining(b), true)
+}
+
 fn equal_compounds(a: &[(JavaString, Tag)], b: &[(JavaString, Tag)], ignore_max: bool) -> bool {
     fn unique(entries: &[(JavaString, Tag)]) -> impl Iterator<Item = &(JavaString, Tag)> {
         entries.iter().enumerate().filter_map(|(i, entry)| {
@@ -4621,6 +4664,152 @@ mod tests {
     }
 
     #[test]
+    fn compact_potion_contents_match_records_for_inventory_and_water_use() {
+        let compact = |id: &str| {
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::String(id.into()),
+            )])
+        };
+        let expanded = |id: &str| {
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![("potion".into(), Tag::String(id.into()))]),
+            )])
+        };
+        let compact_speed = compact("swiftness");
+        let full_speed = expanded("minecraft:swiftness");
+        assert_eq!(
+            saved_item_max("minecraft:tipped_arrow", &compact_speed),
+            Some(64)
+        );
+        assert_eq!(
+            crate::survival::potion_color(&compact_speed),
+            crate::survival::potion_color(&full_speed)
+        );
+        let short = ItemStack::new(
+            "minecraft:tipped_arrow".into(),
+            7,
+            64,
+            compact_speed.clone(),
+        )
+        .unwrap();
+        let full =
+            ItemStack::new("minecraft:tipped_arrow".into(), 8, 64, full_speed.clone()).unwrap();
+        assert!(short.same_item_and_components(&full));
+        assert!(!short.same_item_and_components(
+            &ItemStack::new("minecraft:tipped_arrow".into(), 1, 64, compact("poison")).unwrap()
+        ));
+        let mut different = full_speed.clone();
+        if let Tag::Compound(fields) = &mut different {
+            fields.push((
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("marker".into(), Tag::Int(1))]),
+            ));
+        }
+        assert!(!short.same_item_and_components(
+            &ItemStack::new("minecraft:tipped_arrow".into(), 1, 64, different).unwrap()
+        ));
+        let customized = |id: &str, empty: bool| {
+            let mut contents = vec![
+                ("potion".into(), Tag::String(id.into())),
+                ("custom_color".into(), Tag::Int(0x123456)),
+                ("custom_name".into(), Tag::String("test.potion".into())),
+            ];
+            if empty {
+                contents.push((
+                    "custom_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::End,
+                        values: vec![],
+                    },
+                ));
+            }
+            Tag::Compound(vec![(
+                "minecraft:potion_contents".into(),
+                Tag::Compound(contents),
+            )])
+        };
+        let first = customized("swiftness", false);
+        let second = customized("minecraft:swiftness", true);
+        assert_eq!(crate::survival::potion_color(&first), Some(0x123456));
+        assert!(
+            ItemStack::new("minecraft:tipped_arrow".into(), 1, 64, first)
+                .unwrap()
+                .same_item_and_components(
+                    &ItemStack::new("minecraft:tipped_arrow".into(), 1, 64, second).unwrap()
+                )
+        );
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(full.clone()));
+        let mut dropped = Some(short.clone());
+        assert!(inventory.pickup_stack(&mut dropped, false));
+        assert!(dropped.is_none());
+        let merged = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        assert_eq!(merged.count(), 15);
+        assert_eq!(merged.components(), &full_speed);
+        assert!(validate_item_balance([&short, &full], [merged]).is_ok());
+
+        for creative in [false, true] {
+            let mut inventory = PlayerInventory::default();
+            let water = compact("minecraft:water");
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                Some(ItemStack::new("minecraft:potion".into(), 1, 1, water.clone()).unwrap()),
+            );
+            assert!(
+                inventory
+                    .empty_water_bottle(PlayerSlot::Storage(0), creative)
+                    .is_some()
+            );
+            if creative {
+                assert_eq!(
+                    inventory.slot(PlayerSlot::Storage(0)).unwrap().components(),
+                    &water
+                );
+            } else {
+                assert_eq!(
+                    inventory.slot(PlayerSlot::Storage(0)).unwrap().id(),
+                    "minecraft:glass_bottle"
+                );
+            }
+        }
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            Some(
+                ItemStack::new("minecraft:potion".into(), 1, 1, customized("water", true)).unwrap(),
+            ),
+        );
+        assert!(
+            inventory
+                .empty_water_bottle(PlayerSlot::Storage(0), false)
+                .is_some()
+        );
+        let unsupported = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![
+                ("potion".into(), Tag::String("minecraft:water".into())),
+                (
+                    "custom_effects".into(),
+                    Tag::List {
+                        element_type: native_persistence::nbt::TagType::Compound,
+                        values: vec![Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:speed".into()),
+                        )])],
+                    },
+                ),
+            ]),
+        )]);
+        assert_eq!(saved_item_max("minecraft:potion", &unsupported), None);
+        assert_eq!(
+            saved_item_max("minecraft:potion", &compact("example:water")),
+            None
+        );
+    }
+
+    #[test]
     fn trial_supply_potion_items_keep_components_and_supported_colors() {
         for (potion, color) in [
             ("poison", 0x87a363),
@@ -4728,6 +4917,97 @@ mod tests {
                         let color = crate::survival::potion_color(&components).unwrap();
                         let expected = format!(
                             "P {id} minecraft:{potion} {max} {color:06x} {{components:{{\"minecraft:potion_contents\":{{potion:\"minecraft:{potion}\"}}}},count:1,id:\"{id}\"}}"
+                        );
+                        assert!(output.lines().any(|line| line == expected), "{expected}");
+                    }
+                }
+                for id in ["minecraft:potion", "minecraft:tipped_arrow"] {
+                    for potion in [
+                        "water",
+                        "swiftness",
+                        "poison",
+                        "slowness",
+                        "regeneration",
+                        "strength",
+                    ] {
+                        let short = Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::String(format!("minecraft:{potion}").as_str().into()),
+                        )]);
+                        let long = Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![(
+                                "potion".into(),
+                                Tag::String(format!("minecraft:{potion}").as_str().into()),
+                            )]),
+                        )]);
+                        let max = saved_item_max(id, &short).unwrap();
+                        let left = ItemStack::new(id.into(), 1, max, short.clone()).unwrap();
+                        let right = ItemStack::new(id.into(), 1, max, long).unwrap();
+                        let color = crate::survival::potion_color(&short).unwrap_or(0x385dc6);
+                        let expected = format!(
+                            "S {id} minecraft:{potion} {max} {color:06x} {}",
+                            left.same_item_and_components(&right)
+                        );
+                        assert!(output.lines().any(|line| line == expected), "{expected}");
+                        let empty = Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![
+                                (
+                                    "potion".into(),
+                                    Tag::String(format!("minecraft:{potion}").as_str().into()),
+                                ),
+                                (
+                                    "custom_effects".into(),
+                                    Tag::List {
+                                        element_type: native_persistence::nbt::TagType::End,
+                                        values: vec![],
+                                    },
+                                ),
+                            ]),
+                        )]);
+                        let empty = ItemStack::new(
+                            id.into(),
+                            1,
+                            saved_item_max(id, &empty).unwrap(),
+                            empty,
+                        )
+                        .unwrap();
+                        let expected = format!(
+                            "E {id} minecraft:{potion} {}",
+                            left.same_item_and_components(&empty)
+                        );
+                        assert!(output.lines().any(|line| line == expected), "{expected}");
+                        let custom = Tag::Compound(vec![(
+                            "minecraft:potion_contents".into(),
+                            Tag::Compound(vec![
+                                (
+                                    "potion".into(),
+                                    Tag::String(format!("minecraft:{potion}").as_str().into()),
+                                ),
+                                ("custom_color".into(), Tag::Int(0x123456)),
+                                ("custom_name".into(), Tag::String("test.potion".into())),
+                                (
+                                    "custom_effects".into(),
+                                    Tag::List {
+                                        element_type: native_persistence::nbt::TagType::End,
+                                        values: vec![],
+                                    },
+                                ),
+                            ]),
+                        )]);
+                        let customized = ItemStack::new(
+                            id.into(),
+                            1,
+                            saved_item_max(id, &custom).unwrap(),
+                            custom.clone(),
+                        )
+                        .unwrap();
+                        let expected = format!(
+                            "C {id} minecraft:{potion} {:06x} {} {}",
+                            crate::survival::potion_color(&custom).unwrap(),
+                            left.same_item_and_components(&customized),
+                            customized.same_item_and_components(&customized)
                         );
                         assert!(output.lines().any(|line| line == expected), "{expected}");
                     }

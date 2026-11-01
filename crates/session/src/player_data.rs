@@ -3769,6 +3769,87 @@ mod tests {
     }
 
     #[test]
+    fn compact_potions_survive_inventory_draft_and_merge_with_full_records() {
+        let short = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::String("minecraft:swiftness".into()),
+        )]);
+        let long = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![(
+                "potion".into(),
+                Tag::String("minecraft:swiftness".into()),
+            )]),
+        )]);
+        let custom = Tag::Compound(vec![(
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![
+                ("potion".into(), Tag::String("minecraft:poison".into())),
+                ("custom_color".into(), Tag::Int(0x123456)),
+                ("custom_name".into(), Tag::String("test.potion".into())),
+            ]),
+        )]);
+        let original = NamedTag {
+            name: "player".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("custom_world_data".into(), Tag::String("preserve".into())),
+                (
+                    "Inventory".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![
+                            item("minecraft:tipped_arrow", 0, 7, short.clone()),
+                            item("minecraft:tipped_arrow", 1, 8, long.clone()),
+                            item("minecraft:tipped_arrow", 2, 5, custom.clone()),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        let mut inventory = read_saved_player(&original).unwrap();
+        assert_eq!(
+            inventory.slot(PlayerSlot::Storage(0)).unwrap().max_count(),
+            Some(64)
+        );
+        let unchanged = draft_player_inventory(&original, &inventory).unwrap();
+        let reread = read_saved_player(unchanged.document()).unwrap();
+        assert_eq!(
+            reread.slot(PlayerSlot::Storage(0)).unwrap().components(),
+            &short
+        );
+        assert!(inventory.toggle());
+        assert!(inventory.click(
+            PlayerSlot::Storage(0),
+            crate::inventory::ClickButton::Primary
+        ));
+        assert!(inventory.click(
+            PlayerSlot::Storage(1),
+            crate::inventory::ClickButton::Primary
+        ));
+        assert!(inventory.toggle());
+        let draft = draft_player_inventory(&original, &inventory).unwrap();
+        let decoded = native_persistence::nbt::read(
+            &native_persistence::nbt::write(draft.document()).unwrap(),
+        )
+        .unwrap();
+        let reread = read_saved_player(&decoded).unwrap();
+        assert_eq!(reread.slot(PlayerSlot::Storage(1)).unwrap().count(), 15);
+        assert_eq!(
+            reread.slot(PlayerSlot::Storage(1)).unwrap().components(),
+            &long
+        );
+        assert_eq!(
+            reread.slot(PlayerSlot::Storage(2)).unwrap().components(),
+            &custom
+        );
+        assert_eq!(
+            decoded.value.get("custom_world_data"),
+            original.value.get("custom_world_data")
+        );
+    }
+
+    #[test]
     fn drafts_inventory_and_recipe_changes_without_losing_other_player_data() {
         let original = player_with_inventory();
         let before = original.clone();

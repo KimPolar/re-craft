@@ -42,6 +42,10 @@ pub fn brightness(light: u8, ambient: f32) -> f32 {
     curve + ambient * (1.0 - curve)
 }
 
+pub fn raw_brightness(block: u8, sky: u8, sky_darken: u8) -> u8 {
+    block.max(sky.saturating_sub(sky_darken))
+}
+
 fn uniform_state(frame: Frame) -> [f32; 4] {
     // ARGB.colorFromFloat converts each component to an 8-bit integer.
     let brightness = (frame.brightness.clamp(0.0, 1.0) * 255.0) as u8 as f32 / 255.0;
@@ -375,6 +379,13 @@ mod tests {
                 .0,
             [23, 45, 67, 255]
         );
+    }
+
+    #[test]
+    fn raw_brightness_uses_darker_sky_and_keeps_block_light() {
+        assert_eq!(raw_brightness(1, 15, 11), 4);
+        assert_eq!(raw_brightness(10, 15, 11), 10);
+        assert_eq!(raw_brightness(0, 3, 11), 0);
     }
     #[test]
     #[ignore = "requires a GPU; renders offscreen without opening a window"]

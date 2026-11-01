@@ -133,6 +133,11 @@ impl CameraMotion {
         position + DVec3::Y * f64::from(eye_height)
     }
 
+    /// Current entity eye without the camera's smoothed eye-height transition.
+    pub fn entity_eye(&self, eye_height: f32) -> DVec3 {
+        self.position + DVec3::Y * f64::from(eye_height)
+    }
+
     pub fn fov_modifier(&self, partial_tick: f32) -> f32 {
         self.previous_fov_modifier
             + partial_tick.clamp(0.0, 1.0) * (self.fov_modifier - self.previous_fov_modifier)
@@ -146,6 +151,17 @@ mod tests {
         CROUCH_EYE_HEIGHT, EYE_HEIGHT, GameSession, LocalSession, PlayerCommand, PlayerPose,
     };
     use std::time::Duration;
+
+    #[test]
+    fn entity_eye_uses_current_pose_instead_of_smoothed_camera_height() {
+        let mut camera = CameraMotion::new(DVec3::new(1.0, 2.0, 3.0), 1.62);
+        camera.tick(DVec3::new(1.0, 2.0, 3.0), 1.27, false, false, 1.0);
+        assert_eq!(
+            camera.entity_eye(1.27),
+            DVec3::new(1.0, 2.0 + f64::from(1.27_f32), 3.0)
+        );
+        assert_ne!(camera.entity_eye(1.27), camera.eye(1.0));
+    }
 
     #[test]
     fn camera_moves_between_ticks_independently_of_frame_durations() {

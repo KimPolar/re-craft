@@ -87,6 +87,151 @@ struct FogTrack {
     modifier: FloatModifier,
 }
 
+enum SkyLevelTrack {
+    Scalar(FogTrack),
+    Alpha { value: SkyTrack, alpha: SkyTrack },
+}
+
+struct SkyLevel {
+    base: f32,
+    tracks: Vec<SkyLevelTrack>,
+}
+
+fn alpha_argument(argument: &Value) -> Result<(f32, f32)> {
+    let (value, alpha) = if let Some(number) = argument.as_f64() {
+        (number as f32, 1.0)
+    } else {
+        let value = argument
+            .get("value")
+            .and_then(Value::as_f64)
+            .context("missing alpha-blend value")? as f32;
+        let alpha = match argument.get("alpha") {
+            Some(value) => value.as_f64().context("invalid alpha-blend alpha")? as f32,
+            None => 1.0,
+        };
+        (value, alpha)
+    };
+    ensure!(
+        value.is_finite() && (0.0..=1.0).contains(&alpha),
+        "invalid alpha-blend argument"
+    );
+    Ok((value, alpha))
+}
+
+impl SkyLevel {
+    fn new(attributes: Option<&Value>) -> Result<Self> {
+        let base = match named_attribute(attributes, "gameplay/sky_light_level")? {
+            None => 15.0,
+            Some(layer)
+                if layer
+                    .get("modifier")
+                    .and_then(Value::as_str)
+                    .and_then(|name| ResourceId::parse(name).ok())
+                    .is_some_and(|id| id.namespace == "minecraft" && id.path == "alpha_blend") =>
+            {
+                let (value, alpha) = alpha_argument(
+                    layer
+                        .get("argument")
+                        .context("missing alpha-blend argument")?,
+                )?;
+                15.0 + alpha * (value - 15.0)
+            }
+            Some(layer) => FloatLayer::parse(layer)?.apply(15.0),
+        };
+        Ok(Self {
+            base,
+            tracks: Vec::new(),
+        })
+    }
+
+    fn add_track(&mut self, timeline: &Value, track: &Value) -> Result<()> {
+        let modifier = track
+            .get("modifier")
+            .and_then(Value::as_str)
+            .unwrap_or("override");
+        let id = ResourceId::parse(modifier)?;
+        if id.namespace != "minecraft" || id.path != "alpha_blend" {
+            self.tracks
+                .push(SkyLevelTrack::Scalar(FogTrack::parse(0, timeline, track)?));
+            return Ok(());
+        }
+        let mut value_track = track.clone();
+        let mut alpha_track = track.clone();
+        for normalized in [&mut value_track, &mut alpha_track] {
+            normalized
+                .as_object_mut()
+                .context("invalid sky-light track")?
+                .insert("modifier".into(), Value::String("override".into()));
+        }
+        let source = track
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .context("missing sky-light keyframes")?;
+        for ((value_frame, alpha_frame), source_frame) in value_track["keyframes"]
+            .as_array_mut()
+            .context("invalid sky-light keyframes")?
+            .iter_mut()
+            .zip(
+                alpha_track["keyframes"]
+                    .as_array_mut()
+                    .context("invalid sky-light keyframes")?
+                    .iter_mut(),
+            )
+            .zip(source)
+        {
+            let (value, alpha) = alpha_argument(
+                source_frame
+                    .get("value")
+                    .context("missing sky-light value")?,
+            )?;
+            value_frame["value"] = Value::from(value);
+            alpha_frame["value"] = Value::from(alpha);
+        }
+        self.tracks.push(SkyLevelTrack::Alpha {
+            value: SkyTrack::parse(timeline, &value_track, true)?,
+            alpha: SkyTrack::parse(timeline, &alpha_track, true)?,
+        });
+        Ok(())
+    }
+
+    fn sample(
+        &self,
+        mut clock: impl FnMut(&ResourceId) -> Option<i64>,
+        weather: native_session::weather::WeatherVisual,
+    ) -> Option<f32> {
+        let mut value = self.base;
+        for track in &self.tracks {
+            value = match track {
+                SkyLevelTrack::Scalar(track) => FloatLayer {
+                    value: track.track.sample(clock(&track.track.clock)?)[0],
+                    modifier: track.modifier,
+                }
+                .apply(value),
+                SkyLevelTrack::Alpha {
+                    value: target,
+                    alpha,
+                } => {
+                    let tick = clock(&target.clock)?;
+                    let target = target.sample(tick)[0];
+                    let alpha = alpha.sample(tick)[0];
+                    value + alpha * (target - value)
+                }
+            };
+        }
+        let rain = weather.rain_at(1.0);
+        let thunder = weather.thunder_at(1.0);
+        if rain - thunder > 0.0 {
+            let rainy = value + 0.3125 * (4.0 - value);
+            value += (rain - thunder) * (rainy - value);
+        }
+        if thunder > 0.0 {
+            let stormy = value + 0.527_343_75 * (4.0 - value);
+            value += thunder * (stormy - value);
+        }
+        value.is_finite().then_some(value.clamp(0.0, 15.0))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SunsetColorLayer {
     Override([f32; 4]),
@@ -611,6 +756,7 @@ pub struct WaterFogSample {
 pub struct SkyBackground {
     base: [f32; 3],
     ambient_light: f32,
+    sky_level: Option<SkyLevel>,
     biomes: BTreeMap<String, Option<ColorLayer>>,
     tracks: Vec<SkyTrack>,
     background_is_fog: bool,
@@ -761,6 +907,7 @@ impl SkyBackground {
         };
         let mut fog_biomes = BTreeMap::new();
         let mut sunset = SunsetTimeline::new(dimension.get("attributes")).ok();
+        let mut sky_level = SkyLevel::new(dimension.get("attributes")).ok();
         let celestial_names = [
             "visual/sun_angle",
             "visual/moon_angle",
@@ -888,6 +1035,13 @@ impl SkyBackground {
             let mut found = false;
             for (name, value) in entries {
                 let id = ResourceId::parse(name)?;
+                if id.namespace == "minecraft"
+                    && id.path == "gameplay/sky_light_level"
+                    && let Some(level) = &mut sky_level
+                    && level.add_track(&timeline, value).is_err()
+                {
+                    sky_level = None;
+                }
                 for (index, attribute_name) in celestial_names.iter().enumerate() {
                     if id.namespace == "minecraft"
                         && id.path == *attribute_name
@@ -1000,6 +1154,7 @@ impl SkyBackground {
         Ok(Some(Self {
             base,
             ambient_light,
+            sky_level,
             biomes,
             tracks,
             background_is_fog: skybox == "none",
@@ -1029,6 +1184,15 @@ impl SkyBackground {
 
     pub fn ambient_light(&self) -> f32 {
         self.ambient_light
+    }
+
+    pub fn sky_darken(
+        &self,
+        clock: impl FnMut(&ResourceId) -> Option<i64>,
+        weather: Option<native_session::weather::WeatherVisual>,
+    ) -> Option<i32> {
+        let level = self.sky_level.as_ref()?.sample(clock, weather?)?;
+        Some((15.0 - level) as i32)
     }
 
     pub fn has_end_sky(&self) -> bool {
@@ -1303,6 +1467,177 @@ fn gaussian_biomes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sky_light_timeline_requires_its_clock() {
+        let mut level = SkyLevel::new(None).unwrap();
+        let timeline = serde_json::json!({"clock":"example:clock","period_ticks":20});
+        let track = serde_json::json!({"modifier":"multiply","keyframes":[{"ticks":0,"value":1.0},{"ticks":10,"value":0.5}]});
+        level.add_track(&timeline, &track).unwrap();
+        assert_eq!(
+            level.sample(|_| None, native_session::weather::WeatherVisual::default()),
+            None
+        );
+        assert_eq!(
+            level.sample(
+                |_| Some(0),
+                native_session::weather::WeatherVisual::default()
+            ),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn sky_light_level_matches_java_timeline_and_weather() {
+        use serde_json::json;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SkyLightOracle.java");
+        let input_path = temp.path().join("input.json");
+        let output_path = temp.path().join("output.json");
+        std::fs::write(&source, include_str!("../tests/java/SkyLightOracle.java")).unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let day: Value = serde_json::from_slice(
+            &native_resources::packs::ResourceProvider::read_data(
+                &mut resources,
+                "data/minecraft/timeline/day.json",
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        let tracks = [
+            None,
+            Some(day["tracks"]["minecraft:gameplay/sky_light_level"].clone()),
+            Some(
+                json!({"modifier":"add","keyframes":[{"ticks":0,"value":-8.0},{"ticks":12000,"value":4.0}]}),
+            ),
+            Some(
+                json!({"modifier":"subtract","keyframes":[{"ticks":0,"value":2.0},{"ticks":12000,"value":10.0}]}),
+            ),
+            Some(
+                json!({"modifier":"minimum","keyframes":[{"ticks":0,"value":3.0},{"ticks":12000,"value":13.0}]}),
+            ),
+            Some(
+                json!({"modifier":"maximum","keyframes":[{"ticks":0,"value":4.0},{"ticks":12000,"value":12.0}]}),
+            ),
+            Some(
+                json!({"modifier":"override","keyframes":[{"ticks":0,"value":1.0},{"ticks":12000,"value":14.0}]}),
+            ),
+            Some(
+                json!({"modifier":"alpha_blend","keyframes":[{"ticks":0,"value":{"value":2.0,"alpha":0.25}},{"ticks":12000,"value":{"value":14.0,"alpha":0.75}}]}),
+            ),
+        ];
+        let attributes = [
+            json!({}),
+            json!({"minecraft:gameplay/sky_light_level":8.5}),
+            json!({"minecraft:gameplay/sky_light_level":{"modifier":"alpha_blend","argument":{"value":3.0,"alpha":0.4}}}),
+        ];
+        let ticks = [
+            -1, 0, 133, 5000, 11867, 12500, 13670, 18000, 22330, 23999, 24000,
+        ];
+        let mut cases = Vec::new();
+        for attrs in attributes {
+            for track in &tracks {
+                for tick in ticks {
+                    for (rain, thunder) in
+                        [(0.0, 0.0), (0.25, 0.0), (1.0, 0.0), (0.5, 0.6), (1.0, 1.0)]
+                    {
+                        let mut case =
+                            json!({"attributes":attrs,"tick":tick,"rain":rain,"thunder":thunder});
+                        if let Some(track) = track {
+                            case["track"] = track.clone();
+                        }
+                        cases.push(case);
+                    }
+                }
+            }
+        }
+        std::fs::write(&input_path, serde_json::to_vec(&cases).unwrap()).unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("SkyLightOracle")
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<[f32; 2]> =
+            serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+        assert_eq!(expected.len(), cases.len());
+        let installed = SkyBackground::load(&mut resources, "minecraft:overworld", -64, 320)
+            .unwrap()
+            .unwrap();
+        let installed_track = &day["tracks"]["minecraft:gameplay/sky_light_level"];
+        let timeline = json!({"clock":"minecraft:overworld","period_ticks":24000});
+        for (case, expected) in cases.iter().zip(expected) {
+            let mut level = SkyLevel::new(Some(&case["attributes"])).unwrap();
+            if let Some(track) = case.get("track") {
+                level.add_track(&timeline, track).unwrap();
+            }
+            let rain = case["rain"].as_f64().unwrap() as f32;
+            let thunder = case["thunder"].as_f64().unwrap() as f32;
+            let weather = native_session::weather::WeatherVisual {
+                previous_rain: rain,
+                rain,
+                previous_thunder: thunder,
+                thunder,
+            };
+            let actual = level
+                .sample(|_| Some(case["tick"].as_i64().unwrap()), weather)
+                .unwrap();
+            assert!(
+                (actual - expected[0]).abs() < 0.000_01,
+                "case {case}: {actual} != {}",
+                expected[0]
+            );
+            assert_eq!((15.0 - actual) as i32, expected[1] as i32, "case {case}");
+            if case["attributes"].as_object().unwrap().is_empty()
+                && case.get("track") == Some(installed_track)
+            {
+                assert_eq!(
+                    installed.sky_darken(|_| Some(case["tick"].as_i64().unwrap()), Some(weather)),
+                    Some(expected[1] as i32),
+                    "installed case {case}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn dark_disc_visibility_tracks_horizon_and_underwater_state() {
@@ -2193,6 +2528,7 @@ mod tests {
         let mut background = SkyBackground {
             base: [0.0; 3],
             ambient_light: 0.0,
+            sky_level: None,
             background_is_fog: false,
             end_sky: false,
             fog_color_base: None,

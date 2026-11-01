@@ -346,6 +346,7 @@ pub fn run_play(
             rain_fog: crate::rain_fog::RainFog::default(),
             rain_fog_millis: None,
             sky_background_tick: None,
+            sky_darken: None,
             sky_background_revision: None,
             fog_color_previous: None,
             fog_color_current: None,
@@ -483,6 +484,7 @@ struct PlayState {
     rain_fog: crate::rain_fog::RainFog,
     rain_fog_millis: Option<u128>,
     sky_background_tick: Option<u64>,
+    sky_darken: Option<i32>,
     sky_background_revision: Option<u64>,
     fog_color_previous: Option<[f32; 3]>,
     fog_color_current: Option<[f32; 3]>,
@@ -985,6 +987,18 @@ impl Viewer {
             if play.sky_background_tick != Some(snapshot.tick)
                 || play.sky_background_revision != Some(snapshot.world_revision)
             {
+                play.sky_darken = background.sky_darken(
+                    |id| {
+                        let clock = native_persistence::world::DimensionId {
+                            namespace: id.namespace.clone(),
+                            path: id.path.clone(),
+                        };
+                        play.session
+                            .world_clock(&clock)
+                            .map(|state| state.total_ticks)
+                    },
+                    snapshot.weather,
+                );
                 let position = snapshot.origin.as_dvec3() + snapshot.camera.eye(1.0);
                 let value = snapshot.world.loaded().and_then(|world| {
                     background.sample(world, position, |id| {
@@ -1309,17 +1323,39 @@ impl Viewer {
             let frame = if snapshot.eyes_in_water
                 && snapshot.game_mode != native_session::GameMode::Spectator
             {
-                let eye = (snapshot.origin.as_dvec3() + snapshot.camera.eye(1.0))
-                    .floor()
-                    .as_ivec3();
+                let eye = (snapshot.origin.as_dvec3()
+                    + snapshot
+                        .camera
+                        .entity_eye(snapshot.player.pose.eye_height()))
+                .floor()
+                .as_ivec3();
                 let level = snapshot
                     .world
                     .loaded()
                     .map(|world| {
-                        world
-                            .light(eye.x, eye.y, eye.z, false)
-                            .unwrap_or(0)
-                            .max(world.light(eye.x, eye.y, eye.z, true).unwrap_or(0))
+                        if eye.x < -30_000_000
+                            || eye.x >= 30_000_000
+                            || eye.z < -30_000_000
+                            || eye.z >= 30_000_000
+                        {
+                            return 15;
+                        }
+                        let block = world.light(eye.x, eye.y, eye.z, false).unwrap_or(0);
+                        let sky = if snapshot
+                            .weather_terrain
+                            .as_ref()
+                            .and_then(|t| t.has_skylight)
+                            == Some(false)
+                        {
+                            0
+                        } else {
+                            world.light(eye.x, eye.y, eye.z, true).unwrap_or(0)
+                        };
+                        crate::water_overlay::raw_brightness(
+                            block,
+                            sky,
+                            play.sky_darken.unwrap_or(0) as u8,
+                        )
                     })
                     .unwrap_or(15);
                 let ambient = play

@@ -26,6 +26,52 @@ pub fn load_washed_away_blocks(
     .context("cannot resolve blocks washed away by fluids")
 }
 
+/// Active block tags consulted by water when deciding to schedule a bubble column.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BubbleColumnTags {
+    drag_down: BTreeSet<String>,
+    push_up: BTreeSet<String>,
+}
+
+impl BubbleColumnTags {
+    pub fn new(drag_down: BTreeSet<String>, push_up: BTreeSet<String>) -> Self {
+        Self { drag_down, push_up }
+    }
+
+    pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
+        let down = ResourceId::parse("minecraft:enables_bubble_column_drag_down")?;
+        let up = ResourceId::parse("minecraft:enables_bubble_column_push_up")?;
+        let mut raw = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        for id in [&down, &up] {
+            crate::transforms::read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
+        }
+        let mut cache = BTreeMap::new();
+        Ok(Self {
+            drag_down: crate::heightmap_tags::resolve(
+                &down,
+                &raw,
+                registry,
+                &mut cache,
+                &mut BTreeSet::new(),
+            )
+            .context("cannot resolve bubble-column drag-down tag")?,
+            push_up: crate::heightmap_tags::resolve(
+                &up,
+                &raw,
+                registry,
+                &mut cache,
+                &mut BTreeSet::new(),
+            )
+            .context("cannot resolve bubble-column push-up tag")?,
+        })
+    }
+
+    pub fn enables(&self, block: &str) -> bool {
+        self.drag_down.contains(block) || self.push_up.contains(block)
+    }
+}
+
 /// Fluids are a built-in registry in an unmodded 26.3 client; data packs may
 /// change their tags, but cannot register additional fluid types.
 const FLUIDS: [&str; 5] = [
@@ -158,6 +204,38 @@ mod tests {
             vec![br#"{"values":["minecraft:missing"]}"#.to_vec()],
         );
         assert!(load_washed_away_blocks(&mut data, &registry).is_err());
+    }
+
+    #[test]
+    fn bubble_column_tags_follow_replacement_and_nested_entries() {
+        let mut data = Data(BTreeMap::from([
+            ("data/minecraft/tags/block/enables_bubble_column_drag_down.json".into(), vec![br#"{"values":["minecraft:magma_block"]}"#.to_vec(), br##"{"replace":true,"values":["#example:floor",{"id":"example:missing","required":false}]}"##.to_vec()]),
+            ("data/minecraft/tags/block/enables_bubble_column_push_up.json".into(), vec![br#"{"values":["minecraft:soul_sand"]}"#.to_vec()]),
+            ("data/example/tags/block/floor.json".into(), vec![br#"{"values":["minecraft:stone"]}"#.to_vec()]),
+        ]));
+        let registry = BTreeSet::from([
+            "minecraft:magma_block".into(),
+            "minecraft:soul_sand".into(),
+            "minecraft:stone".into(),
+        ]);
+        let tags = BubbleColumnTags::load(&mut data, &registry).unwrap();
+        assert!(tags.enables("minecraft:stone") && tags.enables("minecraft:soul_sand"));
+        assert!(!tags.enables("minecraft:magma_block"));
+        data.0.remove("data/example/tags/block/floor.json");
+        assert!(BubbleColumnTags::load(&mut data, &registry).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3"]
+    fn installed_bubble_column_tags_match_vanilla_blocks() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let mut source = crate::packs::ResourceStack::open(&game).unwrap();
+        let registry = source.vanilla_block_ids().unwrap();
+        let tags = BubbleColumnTags::load(&mut source, &registry).unwrap();
+        assert!(tags.enables("minecraft:magma_block") && tags.enables("minecraft:soul_sand"));
+        assert!(!tags.enables("minecraft:stone"));
     }
     #[test]
     #[ignore = "requires locally installed Minecraft 26.3"]

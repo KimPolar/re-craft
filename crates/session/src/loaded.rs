@@ -668,6 +668,7 @@ pub struct LoadedSession {
     falling_fire_tag: Option<Arc<BTreeSet<String>>>,
     snow_support_tags: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
     snowy_tag: Option<Arc<BTreeSet<String>>>,
+    bubble_column_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
@@ -4688,6 +4689,16 @@ impl LoadedSession {
         self.snowy_tag = Some(tag);
     }
 
+    pub fn set_bubble_column_tags(
+        &mut self,
+        tags: Arc<native_resources::fluid_tags::BubbleColumnTags>,
+    ) {
+        self.bubble_column_tags = Some(tags);
+        self.ice_deferred_state = None;
+        self.location_failure_revision = None;
+        self.location_last_position = None;
+    }
+
     pub fn set_bounce_suppression_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.bounce_suppression_tag = Some(tag);
     }
@@ -5390,6 +5401,7 @@ impl LoadedSession {
             falling_fire_tag: None,
             snow_support_tags: None,
             snowy_tag: None,
+            bubble_column_tags: None,
             bounce_suppression_tag: None,
             world_clocks: BTreeMap::new(),
             saved_clock_source: None,
@@ -13129,6 +13141,7 @@ impl LoadedSession {
                     age,
                     actions: Vec::new(),
                     ice_overrides: BTreeMap::new(),
+                    melted_to_water: BTreeSet::new(),
                 };
                 if crate::frosted_ice::tick(&mut stage, relative, age, &mut random).is_err() {
                     deferred_ice.push((order, key));
@@ -17887,6 +17900,8 @@ fn frost_supported_terrain(state: &BlockState) -> bool {
                 | "minecraft:red_sandstone"
                 | "minecraft:stone_bricks"
                 | "minecraft:clay"
+                | "minecraft:magma_block"
+                | "minecraft:soul_sand"
         )
 }
 
@@ -17958,6 +17973,23 @@ impl DiskWorld<'_> {
                                 .get("level")
                                 .is_some_and(|level| level == "0"),
                         "unsupported water beside disk"
+                    );
+                    let below = add(IVec3::from_array(neighbor), IVec3::NEG_Y)
+                        .ok_or_else(|| anyhow::anyhow!("water support position overflow"))?
+                        .to_array();
+                    let support = if below == position || self.frozen.contains(&below) {
+                        "minecraft:frosted_ice"
+                    } else {
+                        &self.state(below)?.name
+                    };
+                    let tags = self
+                        .session
+                        .bubble_column_tags
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("bubble-column tags are unavailable"))?;
+                    anyhow::ensure!(
+                        !tags.enables(support),
+                        "bubble column scheduling is unsupported"
                     );
                 }
                 "minecraft:frosted_ice" => {
@@ -18097,6 +18129,7 @@ struct IceTickStage<'a> {
     age: u8,
     actions: Vec<IceTickAction>,
     ice_overrides: BTreeMap<[i32; 3], Option<u8>>,
+    melted_to_water: BTreeSet<[i32; 3]>,
 }
 
 impl IceTickStage<'_> {
@@ -18162,65 +18195,109 @@ impl IceTickStage<'_> {
 
     fn stage_melt(&mut self, position: IVec3, evaporates: bool) -> anyhow::Result<()> {
         self.validate_neighbors(position)?;
+        if !evaporates {
+            self.require_no_bubble_below(position)?;
+        }
         self.push_action(IceTickAction::Melt(position, evaporates))?;
         self.ice_overrides.insert(position.to_array(), None);
+        if !evaporates {
+            self.melted_to_water.insert(position.to_array());
+        }
         Ok(())
     }
 
-    fn is_water(&self, position: IVec3, evaporates: bool) -> anyhow::Result<bool> {
+    fn staged_name(&self, position: IVec3) -> anyhow::Result<&str> {
         use anyhow::Context;
-        let (water, source) = if let Some(ice) = self.ice_overrides.get(&position.to_array()) {
-            let water = ice.is_none() && !evaporates;
-            (water, water)
-        } else {
-            let Cell::State(id) = cell(
-                &self.session.world,
-                self.session.origin,
-                self.session.bounds,
-                position,
-                self.session.states[0],
-            ) else {
-                anyhow::bail!("ice neighbor is unavailable");
-            };
-            let state = self
-                .session
-                .world
-                .state(id)
-                .context("ice neighbor state is unavailable")?;
-            if state.name != "minecraft:water" {
-                (false, false)
+        if let Some(ice) = self.ice_overrides.get(&position.to_array()) {
+            return Ok(if ice.is_some() {
+                "minecraft:frosted_ice"
+            } else if self.melted_to_water.contains(&position.to_array()) {
+                "minecraft:water"
             } else {
-                let fluid = FluidState::from_block(state)
-                    .map_err(anyhow::Error::msg)?
-                    .context("water state is unavailable")?;
-                (true, fluid.source)
-            }
+                "minecraft:air"
+            });
+        }
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            position,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("ice neighbor is unavailable")
         };
-        if source {
-            let below = add(position, IVec3::NEG_Y).context("water support position overflow")?;
-            if !self.ice_overrides.contains_key(&below.to_array()) {
-                let Cell::State(id) = cell(
-                    &self.session.world,
-                    self.session.origin,
-                    self.session.bounds,
-                    below,
-                    self.session.states[0],
-                ) else {
-                    anyhow::bail!("water support is unavailable");
-                };
-                let state = self
-                    .session
-                    .world
-                    .state(id)
-                    .context("water support state is unavailable")?;
-                anyhow::ensure!(
-                    !matches!(
-                        state.name.as_str(),
-                        "minecraft:magma_block" | "minecraft:soul_sand"
-                    ),
-                    "bubble column scheduling is unsupported"
-                );
-            }
+        Ok(&self
+            .session
+            .world
+            .state(id)
+            .context("ice neighbor state is unavailable")?
+            .name)
+    }
+
+    fn source_water(&self, position: IVec3) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        if self.ice_overrides.contains_key(&position.to_array()) {
+            return Ok(self.melted_to_water.contains(&position.to_array()));
+        }
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            position,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("ice neighbor is unavailable")
+        };
+        let state = self
+            .session
+            .world
+            .state(id)
+            .context("ice neighbor state is unavailable")?;
+        if state.name != "minecraft:water" {
+            return Ok(false);
+        }
+        Ok(FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .context("water state is unavailable")?
+            .source)
+    }
+
+    fn require_no_bubble_below(&self, position: IVec3) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let tags = self
+            .session
+            .bubble_column_tags
+            .as_ref()
+            .context("bubble-column tags are unavailable")?;
+        let below = add(position, IVec3::NEG_Y).context("water support position overflow")?;
+        anyhow::ensure!(
+            !tags.enables(self.staged_name(below)?),
+            "bubble column scheduling is unsupported"
+        );
+        Ok(())
+    }
+
+    fn require_no_bubble_above(&self, position: IVec3, new_block: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let above = add(position, IVec3::Y).context("water position overflow")?;
+        if self.source_water(above)? {
+            let tags = self
+                .session
+                .bubble_column_tags
+                .as_ref()
+                .context("bubble-column tags are unavailable")?;
+            anyhow::ensure!(
+                !tags.enables(new_block),
+                "bubble column scheduling is unsupported"
+            );
+        }
+        Ok(())
+    }
+
+    fn is_water(&self, position: IVec3) -> anyhow::Result<bool> {
+        let water = self.staged_name(position)? == "minecraft:water";
+        if water && self.source_water(position)? {
+            self.require_no_bubble_below(position)?;
         }
         Ok(water)
     }
@@ -18302,6 +18379,7 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         random: &mut native_core::random::LegacyRandom,
     ) -> anyhow::Result<()> {
         self.validate_neighbors(position)?;
+        self.require_no_bubble_above(position, "minecraft:frosted_ice")?;
         self.push_action(IceTickAction::Age(position, age))?;
         self.ice_overrides.insert(position.to_array(), Some(age));
         self.push_action(IceTickAction::Schedule(
@@ -18340,6 +18418,14 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         while let Some((source, index)) = stack.last_mut() {
             if *index == directions.len() {
                 let (completed, _) = stack.pop().expect("stack is not empty");
+                self.require_no_bubble_above(
+                    completed,
+                    if evaporates {
+                        "minecraft:air"
+                    } else {
+                        "minecraft:water"
+                    },
+                )?;
                 self.push_action(IceTickAction::ShapeNeighbors(completed, !evaporates))?;
                 continue;
             }
@@ -18347,7 +18433,7 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
                 .ok_or_else(|| anyhow::anyhow!("ice neighbor overflow"))?;
             *index += 1;
             if self.ice_age(neighbor)?.is_none() {
-                if self.is_water(neighbor, evaporates)? {
+                if self.is_water(neighbor)? {
                     self.push_action(IceTickAction::NeighborWater(neighbor))?;
                 }
                 continue;
@@ -19147,6 +19233,12 @@ pub(crate) mod tests {
             "minecraft:water".into(),
             "minecraft:flowing_water".into(),
         ])));
+        session.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(
+                BTreeSet::from(["minecraft:magma_block".into()]),
+                BTreeSet::from(["minecraft:soul_sand".into()]),
+            ),
+        ));
         session
     }
 
@@ -19204,6 +19296,7 @@ pub(crate) mod tests {
                 age: 3,
                 actions: Vec::new(),
                 ice_overrides: BTreeMap::new(),
+                melted_to_water: BTreeSet::new(),
             };
             let mut random = native_core::random::LegacyRandom::new(seed);
             crate::frosted_ice::tick(&mut stage, center, 3, &mut random).unwrap();
@@ -28348,6 +28441,43 @@ pub(crate) mod tests {
         assert!(occupied.ice_ticks.is_empty());
         assert_eq!(occupied.level_random.next_int(), random_before);
 
+        let mut tagged_floor = setup(true);
+        tagged_floor.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(
+                BTreeSet::from(["minecraft:stone".into()]),
+                BTreeSet::new(),
+            ),
+        ));
+        let random_before = tagged_floor.level_random.clone().next_int();
+        tagged_floor.run_location_effects(true);
+        assert!(tagged_floor.ice_ticks.is_empty());
+        assert_eq!(tagged_floor.level_random.clone().next_int(), random_before);
+        tagged_floor.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(BTreeSet::new(), BTreeSet::new()),
+        ));
+        tagged_floor.run_location_effects(true);
+        assert_eq!(tagged_floor.ice_ticks.len(), 24);
+
+        let mut tagged_ice = setup(true);
+        let water = tagged_ice.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(tagged_ice.set_with_notify(IVec3::new(8, 2, 8), water, false));
+        tagged_ice.set_bubble_column_tags(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(
+                BTreeSet::from(["minecraft:frosted_ice".into()]),
+                BTreeSet::new(),
+            ),
+        ));
+        let stage = DiskWorld {
+            session: &tagged_ice,
+            frozen: BTreeSet::new(),
+            entity_cache: BTreeMap::new(),
+        };
+        assert!(
+            stage
+                .validate_freeze((tagged_ice.origin + IVec3::new(8, 1, 8)).to_array())
+                .is_err()
+        );
+
         let mut missing = setup(false);
         let before_random = missing.level_random.clone().next_int();
         missing.run_location_effects(true);
@@ -29348,6 +29478,82 @@ pub(crate) mod tests {
             assert!(deferred.fluid_ticks.is_empty() && deferred.sand_ticks.is_empty());
             assert_eq!(deferred.level_random.next_int(), before);
         }
+
+        let tags = |ids: &[&str]| {
+            Arc::new(native_resources::fluid_tags::BubbleColumnTags::new(
+                ids.iter().map(|id| (*id).to_string()).collect(),
+                BTreeSet::new(),
+            ))
+        };
+        let mut custom = setup("3", 15, None, false);
+        let stone = custom.intern_block(state("minecraft:stone", &[]));
+        assert!(custom.set_with_notify(IVec3::new(4, 1, 4), stone, false));
+        custom.set_bubble_column_tags(tags(&["minecraft:stone"]));
+        custom.pending_light.clear();
+        custom.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        custom.sky_lighting.set_enabled(false);
+        let random_before = custom.level_random.clone().next_int();
+        custom.advance_block_ticks();
+        assert_eq!(custom.ice_deferred.len(), 1);
+        assert_eq!(custom.level_random.clone().next_int(), random_before);
+        custom.set_bubble_column_tags(tags(&[]));
+        custom.advance_block_ticks();
+        let center = custom.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            custom
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+
+        let mut neighbor_tag = setup("3", 15, None, true);
+        let water = neighbor_tag.intern_block(state("minecraft:water", &[("level", "0")]));
+        let stone = neighbor_tag.intern_block(state("minecraft:stone", &[]));
+        assert!(neighbor_tag.set_with_notify(IVec3::new(4, 2, 5), water, false));
+        assert!(neighbor_tag.set_with_notify(IVec3::new(4, 1, 5), stone, false));
+        neighbor_tag.set_bubble_column_tags(tags(&["minecraft:stone"]));
+        neighbor_tag.pending_light.clear();
+        neighbor_tag.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        neighbor_tag.sky_lighting.set_enabled(false);
+        neighbor_tag.advance_block_ticks();
+        assert_eq!(neighbor_tag.ice_deferred.len(), 1);
+        assert!(neighbor_tag.fluid_ticks.is_empty());
+
+        let mut shape_tag = setup("0", 15, None, false);
+        let water = shape_tag.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(shape_tag.set_with_notify(IVec3::new(4, 3, 4), water, false));
+        shape_tag.set_bubble_column_tags(tags(&["minecraft:frosted_ice"]));
+        shape_tag.pending_light.clear();
+        shape_tag.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        shape_tag.sky_lighting.set_enabled(false);
+        shape_tag.advance_block_ticks();
+        assert_eq!(shape_tag.ice_deferred.len(), 1);
+        assert!(shape_tag.fluid_ticks.is_empty());
+
+        let mut missing_tags = setup("3", 15, None, false);
+        missing_tags.bubble_column_tags = None;
+        missing_tags.advance_block_ticks();
+        assert_eq!(missing_tags.ice_deferred.len(), 1);
+
+        let mut removed_tag = setup("3", 15, None, false);
+        let magma = removed_tag.intern_block(state("minecraft:magma_block", &[]));
+        assert!(removed_tag.set_with_notify(IVec3::new(4, 1, 4), magma, false));
+        removed_tag.set_bubble_column_tags(tags(&[]));
+        removed_tag.pending_light.clear();
+        removed_tag.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        removed_tag.sky_lighting.set_enabled(false);
+        removed_tag.advance_block_ticks();
+        let center = removed_tag.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            removed_tag
+                .world
+                .block(center.x, center.y, center.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
 
         let unsupported = || {
             let mut session = setup("3", 15, None, true);

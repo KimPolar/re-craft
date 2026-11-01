@@ -1273,6 +1273,13 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_snowy_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Snowy block tag is unavailable: {error:#}"),
                 }
+                match native_resources::fluid_tags::BubbleColumnTags::load(
+                    &mut resources,
+                    &registry,
+                ) {
+                    Ok(tags) => session.set_bubble_column_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Bubble-column block tags are unavailable: {error:#}"),
+                }
             }
             Err(error) => {
                 return Err(error.context(

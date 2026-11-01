@@ -550,16 +550,73 @@ impl FallTracker {
         rules: SurvivalRules,
         cooldown: Option<&mut DamageCooldown>,
     ) -> Result<LandingOutcome> {
+        let (mut landing, apply_damage) =
+            self.landing_target(distance, state, inventory, vitals, mode, rules)?;
+        if apply_damage {
+            landing.damage = self.damage_outcome(
+                landing.amount as f32,
+                landing.source.expect("damage has a source"),
+                inventory,
+                armor,
+                vitals,
+                mode,
+                cooldown,
+            )?;
+        }
+        Ok(landing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn land_with_equipment(
+        &self,
+        distance: f64,
+        state: Option<&BlockState>,
+        inventory: &mut Arc<PlayerInventory>,
+        armor: &mut crate::equipment_attributes::ArmorTracker,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        rules: SurvivalRules,
+        cooldown: &mut DamageCooldown,
+        random: &mut native_core::random::LegacyRandom,
+        item_registry: Option<&native_resources::item_registry::ItemRegistry>,
+    ) -> Result<LandingOutcome> {
+        let (mut landing, apply_damage) =
+            self.landing_target(distance, state, inventory, vitals, mode, rules)?;
+        if apply_damage {
+            landing.damage = self.damage_with_equipment(
+                landing.amount as f32,
+                landing.source.expect("damage has a source"),
+                Arc::make_mut(inventory),
+                armor,
+                vitals,
+                mode,
+                cooldown,
+                random,
+                item_registry,
+            )?;
+        }
+        Ok(landing)
+    }
+
+    fn landing_target(
+        &self,
+        distance: f64,
+        state: Option<&BlockState>,
+        inventory: &PlayerInventory,
+        vitals: &PlayerVitals,
+        mode: GameMode,
+        rules: SurvivalRules,
+    ) -> Result<(LandingOutcome, bool)> {
         if distance <= 0.0
             || vitals.health <= 0.0
             || matches!(mode, GameMode::Creative | GameMode::Spectator)
         {
-            return Ok(LandingOutcome::default());
+            return Ok((LandingOutcome::default(), false));
         }
         if let Some(registry) = &self.enchantments
             && registry.fall_damage_immune("minecraft:player")?
         {
-            return Ok(LandingOutcome::default());
+            return Ok((LandingOutcome::default(), false));
         }
         let surface = FallSurface::for_state(state);
         let safe = self.safe.clone();
@@ -584,30 +641,27 @@ impl FallTracker {
         let distance = distance * surface.distance_multiplier + surface.added_distance;
         let amount = calculate_fall_damage(distance, safe, surface.damage_multiplier, multiplier);
         if amount <= 0 {
-            return Ok(LandingOutcome::default());
+            return Ok((LandingOutcome::default(), false));
         }
         let damage = surface.damage_type;
         if !rules.fall_damage && self.damage_tag("minecraft:is_fall", damage)? {
-            return Ok(LandingOutcome {
+            return Ok((
+                LandingOutcome {
+                    amount,
+                    source: Some(damage),
+                    ..Default::default()
+                },
+                false,
+            ));
+        }
+        Ok((
+            LandingOutcome {
                 amount,
                 source: Some(damage),
                 ..Default::default()
-            });
-        }
-        let outcome = self.damage_outcome(
-            amount as f32,
-            damage,
-            inventory,
-            armor,
-            vitals,
-            mode,
-            cooldown,
-        )?;
-        Ok(LandingOutcome {
-            amount,
-            source: Some(damage),
-            damage: outcome,
-        })
+            },
+            true,
+        ))
     }
 
     /// Apply one supported damage source; unsupported tag or enchantment data
@@ -668,30 +722,23 @@ impl FallTracker {
         random: &mut native_core::random::LegacyRandom,
         item_registry: Option<&native_resources::item_registry::ItemRegistry>,
     ) -> Result<DamageOutcome> {
-        let mut first_vitals = *vitals;
-        let mut first_cooldown = *cooldown;
-        let initial = self.damage_outcome(
-            amount,
-            damage,
-            inventory,
-            armor.value(),
-            &mut first_vitals,
-            mode,
-            Some(&mut first_cooldown),
-        )?;
-        if !initial.accepted {
-            return Ok(initial);
-        }
+        let Some((accepted_amount, fresh_hit, next_cooldown)) =
+            self.prepare_damage(amount, damage, inventory, vitals, mode, Some(*cooldown))?
+        else {
+            return Ok(DamageOutcome::default());
+        };
         if self.damage_tag("minecraft:bypasses_armor", damage)? {
-            *vitals = first_vitals;
-            *cooldown = first_cooldown;
-            return Ok(initial);
+            let outcome = self.finish_damage(
+                accepted_amount,
+                damage,
+                inventory,
+                armor.value(),
+                vitals,
+                fresh_hit,
+            )?;
+            *cooldown = next_cooldown.expect("cooldown was provided");
+            return Ok(outcome);
         }
-        let bypass = self.damage_tag("minecraft:bypasses_cooldown", damage)?;
-        let mut accepted_cooldown = *cooldown;
-        let accepted_amount = accepted_cooldown
-            .accept(amount, bypass)
-            .context("accepted damage disappeared")?;
         let mut staged_inventory = inventory.clone();
         let mut staged_random = random.clone();
         staged_inventory.damage_equipped_armor(
@@ -701,33 +748,28 @@ impl FallTracker {
             self.enchantments.as_deref(),
             item_registry,
         )?;
-        if staged_inventory.revision() == inventory.revision() {
-            *random = staged_random;
-            *vitals = first_vitals;
-            *cooldown = first_cooldown;
-            return Ok(initial);
-        }
-        let staged_armor = armor.value_for(&staged_inventory)?;
+        let changed = staged_inventory.revision() != inventory.revision();
+        let staged_armor = if changed {
+            Some(armor.value_for(&staged_inventory)?)
+        } else {
+            armor.value()
+        };
         let mut final_vitals = *vitals;
-        let mut final_cooldown = *cooldown;
-        let result = self.damage_outcome(
-            amount,
+        let result = self.finish_damage(
+            accepted_amount,
             damage,
             &staged_inventory,
-            Some(staged_armor),
+            staged_armor,
             &mut final_vitals,
-            mode,
-            Some(&mut final_cooldown),
+            fresh_hit,
         )?;
-        ensure!(
-            result.accepted,
-            "equipment changes invalidated accepted player damage"
-        );
         *inventory = staged_inventory;
         *random = staged_random;
         *vitals = final_vitals;
-        *cooldown = final_cooldown;
-        armor.refresh(inventory)?;
+        *cooldown = next_cooldown.expect("cooldown was provided");
+        if changed {
+            armor.refresh(inventory)?;
+        }
         Ok(result)
     }
 
@@ -742,27 +784,65 @@ impl FallTracker {
         mode: GameMode,
         cooldown: Option<&mut DamageCooldown>,
     ) -> Result<DamageOutcome> {
-        if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
+        let Some((amount, fresh_hit, next_cooldown)) = self.prepare_damage(
+            amount,
+            damage,
+            inventory,
+            vitals,
+            mode,
+            cooldown.as_deref().copied(),
+        )?
+        else {
             return Ok(DamageOutcome::default());
+        };
+        let result = self.finish_damage(amount, damage, inventory, armor, vitals, fresh_hit)?;
+        if let (Some(cooldown), Some(next)) = (cooldown, next_cooldown) {
+            *cooldown = next;
+        }
+        Ok(result)
+    }
+
+    fn prepare_damage(
+        &self,
+        amount: f32,
+        damage: &str,
+        inventory: &PlayerInventory,
+        vitals: &PlayerVitals,
+        mode: GameMode,
+        mut next_cooldown: Option<DamageCooldown>,
+    ) -> Result<Option<(f32, bool, Option<DamageCooldown>)>> {
+        if vitals.health <= 0.0 || matches!(mode, GameMode::Creative | GameMode::Spectator) {
+            return Ok(None);
         }
         if self.immune_to_damage(inventory, damage)? {
-            return Ok(DamageOutcome::default());
+            return Ok(None);
         }
         if self.effects.fire_resistance.is_some() && self.damage_tag("minecraft:is_fire", damage)? {
-            return Ok(DamageOutcome::default());
+            return Ok(None);
         }
-        let mut next_cooldown = cooldown.as_deref().copied();
         let mut fresh_hit = true;
-        let mut amount = if let Some(next) = &mut next_cooldown {
+        let amount = if let Some(next) = &mut next_cooldown {
             let bypass = self.damage_tag("minecraft:bypasses_cooldown", damage)?;
             fresh_hit = next.ticks <= 10 || bypass;
             let Some(accepted) = next.accept(amount, bypass) else {
-                return Ok(DamageOutcome::default());
+                return Ok(None);
             };
             accepted
         } else {
             amount
         };
+        Ok(Some((amount, fresh_hit, next_cooldown)))
+    }
+
+    fn finish_damage(
+        &self,
+        mut amount: f32,
+        damage: &str,
+        inventory: &PlayerInventory,
+        armor: Option<ArmorValues>,
+        vitals: &mut PlayerVitals,
+        fresh_hit: bool,
+    ) -> Result<DamageOutcome> {
         if !self.damage_tag("minecraft:bypasses_armor", damage)? {
             let armor = armor.context("armor attributes are unavailable")?;
             // LivingEntity.getArmorValue floors the double attribute before
@@ -787,9 +867,6 @@ impl FallTracker {
             }
         }
         ensure!(amount.is_finite(), "player damage is not finite");
-        if let (Some(cooldown), Some(next)) = (cooldown, next_cooldown) {
-            *cooldown = next;
-        }
         let absorbed = vitals.absorption.clamp(0.0, amount);
         vitals.absorption -= absorbed;
         let health_damage = amount - absorbed;
@@ -807,6 +884,132 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn broken_armor_is_removed_before_its_protection_is_evaluated() {
+        use crate::inventory::ItemStack;
+        use native_resources::packs::ResourceProvider;
+
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "enchantment" => &["example:conditional_protection"],
+                    "damage_type" => &["minecraft:fall"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:is_fall",
+                    ],
+                    _ => &[],
+                };
+                names.iter().map(|name| ResourceId::parse(name)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(
+                    if path == "data/example/enchantment/conditional_protection.json" {
+                        Some(br#"{"slots":["head"],"effects":{"minecraft:damage_protection":[{"effect":{"type":"minecraft:add","value":1},"requirements":{"type":"example:unknown"}}]}}"#.to_vec())
+                    } else if path == "data/minecraft/damage_type/fall.json" {
+                        Some(br#"{"exhaustion":0.0}"#.to_vec())
+                    } else if path.contains("/tags/") {
+                        Some(br#"{"values":[]}"#.to_vec())
+                    } else {
+                        None
+                    },
+                )
+            }
+        }
+        let registry = Arc::new(OxygenEnchantments::load(&mut Data).unwrap());
+        for landing in [false, true] {
+            for breaks in [false, true] {
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Armor(0),
+                    ItemStack::new(
+                        "minecraft:iron_helmet".into(),
+                        1,
+                        1,
+                        Tag::Compound(vec![
+                            (
+                                "minecraft:damage".into(),
+                                Tag::Int(if breaks { 164 } else { 163 }),
+                            ),
+                            (
+                                "minecraft:enchantments".into(),
+                                Tag::Compound(vec![(
+                                    "example:conditional_protection".into(),
+                                    Tag::Int(1),
+                                )]),
+                            ),
+                        ]),
+                    ),
+                );
+                inventory.set_enchantments(Arc::clone(&registry));
+                let mut armor = crate::equipment_attributes::ArmorTracker::default();
+                armor.set_enchantments(Arc::clone(&registry));
+                armor.refresh(&inventory).unwrap();
+                let mut inventory = Arc::new(inventory);
+                let mut tracker = FallTracker::default();
+                tracker.set_enchantments(Arc::clone(&registry));
+                let mut vitals = PlayerVitals::default();
+                let mut cooldown = DamageCooldown::default();
+                let mut random = native_core::random::LegacyRandom::new(12);
+                let random_before = random.clone();
+                let result = if landing {
+                    tracker
+                        .land_with_equipment(
+                            7.0,
+                            None,
+                            &mut inventory,
+                            &mut armor,
+                            &mut vitals,
+                            GameMode::Survival,
+                            SurvivalRules::default(),
+                            &mut cooldown,
+                            &mut random,
+                            None,
+                        )
+                        .map(|x| x.damage)
+                } else {
+                    tracker.damage_with_equipment(
+                        4.0,
+                        "minecraft:fall",
+                        Arc::make_mut(&mut inventory),
+                        &mut armor,
+                        &mut vitals,
+                        GameMode::Survival,
+                        &mut cooldown,
+                        &mut random,
+                        None,
+                    )
+                };
+                if breaks {
+                    assert!(result.unwrap().accepted, "landing={landing}");
+                    assert!(inventory.slot(PlayerSlot::Armor(0)).is_none());
+                    assert_eq!(vitals.health, 16.0);
+                } else {
+                    assert!(result.is_err(), "landing={landing}");
+                    assert_eq!(vitals.health, 20.0);
+                    assert_eq!(cooldown, DamageCooldown::default());
+                    assert_eq!(
+                        inventory
+                            .slot(PlayerSlot::Armor(0))
+                            .unwrap()
+                            .components()
+                            .get("minecraft:damage")
+                            .and_then(Tag::as_java_int),
+                        Some(163)
+                    );
+                    assert_eq!(random.state(), random_before.state());
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

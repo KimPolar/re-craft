@@ -15060,20 +15060,19 @@ impl LoadedSession {
             let is_stalagmite = landing_state
                 .and_then(|id| self.world.state(id))
                 .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
-            let before_landing_vitals = self.vitals;
-            let before_landing_cooldown = self.damage_cooldown;
             let before_landing_inventory = Arc::clone(&self.inventory);
-            let mut landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id))
-            {
-                match self.fall.land_with_cooldown(
+            let landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id)) {
+                match self.fall.land_with_equipment(
                     self.fall_distance,
                     Some(state),
-                    &self.inventory,
-                    self.armor.value(),
+                    &mut self.inventory,
+                    &mut self.armor,
                     &mut self.vitals,
                     self.game_mode,
                     self.survival_rules,
                     &mut self.damage_cooldown,
+                    &mut self.level_random,
+                    self.item_registry.as_deref(),
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -15086,31 +15085,6 @@ impl LoadedSession {
             } else {
                 Default::default()
             };
-            if landing.damage.accepted {
-                self.vitals = before_landing_vitals;
-                self.damage_cooldown = before_landing_cooldown;
-                landing.damage = match self.fall.damage_with_equipment(
-                    landing.amount as f32,
-                    landing
-                        .source
-                        .expect("accepted landing has a damage source"),
-                    Arc::make_mut(&mut self.inventory),
-                    &mut self.armor,
-                    &mut self.vitals,
-                    self.game_mode,
-                    &mut self.damage_cooldown,
-                    &mut self.level_random,
-                    self.item_registry.as_deref(),
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        self.stream_errors
-                            .push(format!("player fall equipment damage: {error:#}"));
-                        self.unresolved_player_damage = true;
-                        Default::default()
-                    }
-                };
-            }
             if landing.damage.accepted {
                 self.queue_broken_equipment(&before_landing_inventory);
             }

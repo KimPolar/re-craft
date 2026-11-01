@@ -2007,17 +2007,18 @@ impl LocalSession {
                 self.push_entities_from_soil(landed_on);
                 self.set_block(landed_on, Block::Dirt);
             }
-            let before_vitals = self.vitals;
-            let before_cooldown = self.damage_cooldown;
-            let mut landing = match self.fall.land_with_cooldown(
+            let before_inventory = Arc::clone(&self.inventory);
+            let landing = match self.fall.land_with_equipment(
                 self.fall_distance,
                 None,
-                &self.inventory,
-                self.armor.value(),
+                &mut self.inventory,
+                &mut self.armor,
                 &mut self.vitals,
                 self.game_mode,
                 self.survival_rules,
                 &mut self.damage_cooldown,
+                &mut self.level_random,
+                None,
             ) {
                 Ok(landing) => landing,
                 Err(error) => {
@@ -2026,20 +2027,7 @@ impl LocalSession {
                 }
             };
             if landing.damage.accepted {
-                self.vitals = before_vitals;
-                self.damage_cooldown = before_cooldown;
-                landing.damage = match self.apply_player_damage(
-                    landing.amount as f32,
-                    landing
-                        .source
-                        .expect("accepted landing has a damage source"),
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        eprintln!("player fall equipment damage: {error:#}");
-                        Default::default()
-                    }
-                };
+                self.queue_broken_equipment(&before_inventory);
             }
             if landing.amount > 0 {
                 let event = if landing.amount > 4 {

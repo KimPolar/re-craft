@@ -1621,6 +1621,12 @@ impl LoadedSession {
         self.fall.configure(safe, multiplier, effects, registry);
         Arc::make_mut(&mut self.snapshot).hunger_effect = self.fall.effects().hunger.is_some();
         Arc::make_mut(&mut self.snapshot).poison_effect = self.fall.effects().poison.is_some();
+        Arc::make_mut(&mut self.snapshot).night_vision_duration = self
+            .fall
+            .effects()
+            .night_vision
+            .as_ref()
+            .map(|effect| effect.duration);
         self.movement_speed_cache = None;
         Ok(())
     }
@@ -3689,6 +3695,12 @@ impl LoadedSession {
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
             poison_effect: self.fall.effects().poison.is_some(),
+            night_vision_duration: self
+                .fall
+                .effects()
+                .night_vision
+                .as_ref()
+                .map(|effect| effect.duration),
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
@@ -3801,6 +3813,7 @@ impl LoadedSession {
             vitals: crate::survival::PlayerVitals::default(),
             hunger_effect: false,
             poison_effect: false,
+            night_vision_duration: None,
             experience: crate::experience::Experience::default(),
             death: None,
             armor: Some(crate::ArmorValues::default()),
@@ -13301,6 +13314,12 @@ impl GameSession for LoadedSession {
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
                 poison_effect: self.fall.effects().poison.is_some(),
+                night_vision_duration: self
+                    .fall
+                    .effects()
+                    .night_vision
+                    .as_ref()
+                    .map(|effect| effect.duration),
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),
@@ -21509,6 +21528,44 @@ mod tests {
         );
         absent.refresh_movement_speed();
         assert_eq!(absent.movement_speed(false), 0.1_f32);
+    }
+
+    #[test]
+    fn night_vision_snapshots_follow_hidden_effects_and_expiry() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "active_effects".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:night_vision".into())),
+                        ("duration".into(), Tag::Int(1)),
+                        ("amplifier".into(), Tag::Byte(1)),
+                        (
+                            "hidden_effect".into(),
+                            Tag::Compound(vec![("duration".into(), Tag::Int(3))]),
+                        ),
+                    ])],
+                },
+            )]),
+        };
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::player_data::read_saved_fall_effects(&source).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.update(TICK);
+        let promoted = session.snapshot();
+        assert_eq!(promoted.night_vision_duration, Some(2));
+        session.update(TICK);
+        assert_eq!(session.snapshot().night_vision_duration, Some(1));
+        session.update(TICK);
+        assert_eq!(session.snapshot().night_vision_duration, None);
+        assert_eq!(promoted.night_vision_duration, Some(2));
     }
 
     #[test]

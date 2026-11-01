@@ -7,6 +7,40 @@ use native_world::lighting::LightmapSettings;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Java GameRenderer.nightVisionScale, including the final 200-tick pulse.
+pub fn night_vision_scale(duration: Option<i32>, partial: f32) -> f32 {
+    let Some(duration) = duration else {
+        return 0.0;
+    };
+    if duration == -1 || duration > 200 {
+        return 1.0;
+    }
+    let angle = (duration as f32 - partial) * std::f32::consts::PI * 0.2_f32;
+    0.7_f32 + native_session::physics::java_sin(f64::from(angle), false) * 0.3_f32
+}
+
+/// Java's lightmap extractor samples once per client tick, not once per frame.
+#[derive(Default)]
+pub struct NightVisionCache {
+    key: Option<(u64, Option<i32>)>,
+    factor: f32,
+}
+
+impl NightVisionCache {
+    pub fn sample(&mut self, tick: u64, duration: Option<i32>, partial: f32) -> f32 {
+        let key = (tick, duration);
+        if self.key != Some(key) {
+            self.factor = night_vision_scale(duration, partial);
+            self.key = Some(key);
+        }
+        self.factor
+    }
+}
+
+pub fn apply_night_vision(mut settings: LightmapSettings, factor: f32) -> LightmapSettings {
+    settings.night_vision_factor = factor;
+    settings
+}
 /// Resolve the generator's sea level without substituting overworld defaults.
 pub fn generator_sea_level(
     source: &mut impl ResourceProvider,
@@ -642,6 +676,41 @@ impl PreviewLighting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn night_vision_updates_lightmap_and_preserves_dimension_settings() {
+        let base = LightmapSettings {
+            sky_factor: 0.3,
+            night_vision_color: [0.2, 0.4, 0.6],
+            ..Default::default()
+        };
+        let normal = apply_night_vision(base.clone(), night_vision_scale(None, 0.5));
+        let enhanced = apply_night_vision(base.clone(), night_vision_scale(Some(-1), 0.5));
+        assert_eq!(normal, base);
+        assert_eq!(enhanced.sky_factor, 0.3);
+        assert_eq!(enhanced.night_vision_color, [0.2, 0.4, 0.6]);
+        assert!(enhanced.sample(0, 0)[0] > normal.sample(0, 0)[0]);
+        assert!(enhanced.sample(0, 0)[2] > enhanced.sample(0, 0)[0]);
+        assert_eq!(
+            apply_night_vision(base.clone(), night_vision_scale(Some(201), 0.0))
+                .night_vision_factor,
+            1.0
+        );
+        assert_ne!(
+            apply_night_vision(base.clone(), night_vision_scale(Some(200), 0.0))
+                .night_vision_factor,
+            1.0
+        );
+        assert_eq!(
+            apply_night_vision(base, night_vision_scale(None, 0.0)).night_vision_factor,
+            0.0
+        );
+        let mut cache = NightVisionCache::default();
+        let first = cache.sample(1, Some(42), 0.1);
+        assert_eq!(cache.sample(1, Some(42), 0.9), first);
+        assert_ne!(cache.sample(2, Some(41), 0.9), first);
+        assert_eq!(cache.sample(2, None, 0.9), 0.0);
+    }
 
     #[test]
     fn sea_level_uses_active_dimension_and_noise_settings() {

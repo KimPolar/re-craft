@@ -393,6 +393,7 @@ pub fn read_saved_fall_effects(player: &NamedTag) -> Result<crate::survival::Fal
         };
         let id = ResourceId::parse(&name)?;
         let slot = match (id.namespace.as_str(), id.path.as_str()) {
+            ("minecraft", "night_vision") => &mut effects.night_vision,
             ("minecraft", "jump_boost") => &mut effects.jump_boost,
             ("minecraft", "resistance") => &mut effects.resistance,
             ("minecraft", "slow_falling") => &mut effects.slow_falling,
@@ -1230,6 +1231,7 @@ pub fn advance_saved_effects(player: &NamedTag, ticks: u64) -> Result<Option<Tag
                 && matches!(
                     resource.path.as_str(),
                     "jump_boost"
+                        | "night_vision"
                         | "resistance"
                         | "slow_falling"
                         | "levitation"
@@ -2524,6 +2526,14 @@ mod tests {
                             ("amplifier".into(), Tag::Byte(1)),
                         ]),
                         Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:night_vision".into())),
+                            ("duration".into(), Tag::Int(1)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(9))]),
+                            ),
+                        ]),
+                        Tag::Compound(vec![
                             ("id".into(), Tag::String("minecraft:dolphins_grace".into())),
                             ("duration".into(), Tag::Int(8)),
                         ]),
@@ -2558,6 +2568,7 @@ mod tests {
         assert_eq!(levitation.duration, 2);
         assert_eq!(levitation.amplifier, 1);
         assert_eq!(effects.dolphins_grace.unwrap().duration, 7);
+        assert_eq!(effects.night_vision.unwrap().duration, 8);
         let hunger = effects.hunger.unwrap();
         assert_eq!((hunger.duration, hunger.amplifier), (3, 1));
     }

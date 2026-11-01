@@ -261,6 +261,8 @@ pub fn run_play(
             sky_base: None,
             sky_lightmap: None,
             sky_settings: None,
+            night_vision_cache: crate::preview_lighting::NightVisionCache::default(),
+            applied_lightmap_settings: None,
             requested_revision: 0,
             scene_revision: 0,
             requested_blend: video.biome_blend,
@@ -385,6 +387,8 @@ struct PlayState {
     sky_base: Option<Arc<native_world::lighting::LightmapSettings>>,
     sky_lightmap: Option<Arc<[[[f32; 3]; 16]; 16]>>,
     sky_settings: Option<native_world::lighting::LightmapSettings>,
+    night_vision_cache: crate::preview_lighting::NightVisionCache,
+    applied_lightmap_settings: Option<native_world::lighting::LightmapSettings>,
     requested_revision: u64,
     scene_revision: u64,
     requested_blend: u8,
@@ -981,15 +985,16 @@ impl Viewer {
                 });
             }
         }
-        if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer)
-            && let Some(timeline) = &play.sky_timeline
-        {
-            let tick = play.session.snapshot().tick;
+        if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer) {
+            let snapshot = play.session.snapshot();
+            let tick = snapshot.tick;
             let base_changed = play
                 .sky_base
                 .as_ref()
                 .is_none_or(|base| !Arc::ptr_eq(base, &self.scene.base_lightmap));
-            if play.sky_tick != Some(tick) || base_changed {
+            if let Some(timeline) = &play.sky_timeline
+                && (play.sky_tick != Some(tick) || base_changed)
+            {
                 let sample = timeline.sample(&self.scene.base_lightmap, |id| {
                     let clock = native_persistence::world::DimensionId {
                         namespace: id.namespace.clone(),
@@ -1000,17 +1005,28 @@ impl Viewer {
                         .map(|state| state.total_ticks)
                 });
                 if let Some(settings) = sample {
-                    if play.sky_settings.as_ref() != Some(&settings) {
-                        play.sky_lightmap = Some(Arc::new(settings.table()));
-                        play.sky_settings = Some(settings);
-                    }
+                    play.sky_settings = Some(settings);
                     play.sky_tick = Some(tick);
                     play.sky_base = Some(Arc::clone(&self.scene.base_lightmap));
                 } else {
                     eprintln!("Sky light timeline clock is unavailable");
                     play.sky_timeline = None;
-                    play.sky_lightmap = None;
+                    play.sky_settings = None;
                 }
+            }
+            let settings = crate::preview_lighting::apply_night_vision(
+                play.sky_settings
+                    .clone()
+                    .unwrap_or_else(|| (*self.scene.base_lightmap).clone()),
+                play.night_vision_cache.sample(
+                    tick,
+                    snapshot.night_vision_duration,
+                    play.session.partial_tick().clamp(0.0, 1.0),
+                ),
+            );
+            if play.applied_lightmap_settings.as_ref() != Some(&settings) {
+                play.sky_lightmap = Some(Arc::new(settings.table()));
+                play.applied_lightmap_settings = Some(settings);
             }
             if let Some(table) = &play.sky_lightmap
                 && !Arc::ptr_eq(table, &self.scene.lightmap)
@@ -2680,6 +2696,7 @@ mod tests {
             vitals: previous.vitals,
             hunger_effect: previous.hunger_effect,
             poison_effect: previous.poison_effect,
+            night_vision_duration: previous.night_vision_duration,
             experience: previous.experience,
             death: previous.death,
             armor: previous.armor,

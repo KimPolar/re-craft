@@ -243,6 +243,14 @@ public final class ChatEditOracle {
             row.addProperty("rateString", Float.toString(Float.parseFloat(rate)));
             rows.add(row);
         }
+        var living = (net.minecraft.world.entity.LivingEntity)unsafe.allocateInstance(net.minecraft.world.entity.decoration.ArmorStand.class);
+        var activeEffects = new java.util.HashMap<net.minecraft.core.Holder<net.minecraft.world.effect.MobEffect>, net.minecraft.world.effect.MobEffectInstance>();
+        set(living, net.minecraft.world.entity.LivingEntity.class, "activeEffects", activeEffects);
+        for (int duration = -1; duration <= 202; duration++) for (float partial : new float[]{0f, .125f, .5f, .875f, 1f}) {
+            activeEffects.put(net.minecraft.world.effect.MobEffects.NIGHT_VISION, new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.NIGHT_VISION, duration));
+            var row = new JsonObject(); row.addProperty("nightDuration", duration); row.addProperty("nightPartial", partial);
+            row.addProperty("nightScaleBits", Float.floatToIntBits(net.minecraft.client.renderer.GameRenderer.nightVisionScale(living, partial))); rows.add(row);
+        }
         java.util.Random rateRandom = new java.util.Random(263);
         for (int i = 0; i < 500; i++) {
             float rate = (float)Math.pow(10, -5 + rateRandom.nextDouble() * 8);

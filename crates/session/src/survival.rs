@@ -942,6 +942,7 @@ impl EffectDuration {
 /// ages with the visible effect, as it does for other living-entity effects.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FallEffects {
+    pub night_vision: Option<EffectDuration>,
     pub jump_boost: Option<EffectDuration>,
     pub resistance: Option<EffectDuration>,
     pub slow_falling: Option<EffectDuration>,
@@ -984,6 +985,7 @@ impl FallEffects {
     }
 
     pub fn tick(&mut self) {
+        EffectDuration::tick(&mut self.night_vision);
         EffectDuration::tick(&mut self.jump_boost);
         EffectDuration::tick(&mut self.resistance);
         EffectDuration::tick(&mut self.slow_falling);

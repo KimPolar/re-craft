@@ -641,7 +641,19 @@ mod tests {
         let mut timeline_cases = 0;
         let mut rate_strings = 0;
         let mut weather_syntax = 0;
+        let mut night_vision_cases = 0;
         for row in rows {
+            if let Some(duration) = row["nightDuration"].as_i64() {
+                night_vision_cases += 1;
+                let partial = row["nightPartial"].as_f64().unwrap() as f32;
+                assert_eq!(
+                    crate::preview_lighting::night_vision_scale(Some(duration as i32), partial)
+                        .to_bits(),
+                    row["nightScaleBits"].as_i64().unwrap() as i32 as u32,
+                    "{row}"
+                );
+                continue;
+            }
             if let Some(input) = row["weatherSyntax"].as_str() {
                 weather_syntax += 1;
                 assert_eq!(
@@ -824,6 +836,7 @@ mod tests {
         assert_eq!(timeline_cases, 55);
         assert_eq!(rate_strings, 511);
         assert_eq!(weather_syntax, 16);
+        assert_eq!(night_vision_cases, 1020);
         assert_eq!(clock_definitions, 7);
     }
 }

@@ -525,6 +525,8 @@ pub struct WorldSnapshot {
     pub vitals: survival::PlayerVitals,
     pub hunger_effect: bool,
     pub poison_effect: bool,
+    /// Remaining night-vision ticks, or -1 for an infinite effect.
+    pub night_vision_duration: Option<i32>,
     pub experience: experience::Experience,
     pub death: Option<DeathInfo>,
     /// None means the equipped modifiers could not be resolved safely.
@@ -725,6 +727,7 @@ impl LocalSession {
             vitals: survival::PlayerVitals::default(),
             hunger_effect: false,
             poison_effect: false,
+            night_vision_duration: None,
             experience: experience::Experience::default(),
             death: None,
             armor: Some(ArmorValues::default()),
@@ -895,6 +898,12 @@ impl LocalSession {
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
             poison_effect: self.fall.effects().poison.is_some(),
+            night_vision_duration: self
+                .fall
+                .effects()
+                .night_vision
+                .as_ref()
+                .map(|effect| effect.duration),
             experience: self.experience,
             death: self.death,
             armor: self.armor.value(),
@@ -1976,6 +1985,12 @@ impl GameSession for LocalSession {
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
                 poison_effect: self.fall.effects().poison.is_some(),
+                night_vision_duration: self
+                    .fall
+                    .effects()
+                    .night_vision
+                    .as_ref()
+                    .map(|effect| effect.duration),
                 experience: self.experience,
                 death: self.death,
                 armor: self.armor.value(),

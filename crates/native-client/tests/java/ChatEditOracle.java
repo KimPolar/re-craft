@@ -46,6 +46,29 @@ public final class ChatEditOracle {
         WaterPlayer() { super(null, null, null, null, null, null, false, null, null); }
         @Override public boolean isEyeInFluid(net.minecraft.tags.TagKey<net.minecraft.world.level.material.Fluid> tag) { return underwater; }
     }
+    static final class FogProbe extends net.minecraft.world.attribute.EnvironmentAttributeProbe {
+        float start, end; org.joml.Vector3f color;
+        @Override @SuppressWarnings("unchecked") public <T> T getValue(net.minecraft.world.attribute.EnvironmentAttribute<T> key, float partial) {
+            var attrs = net.minecraft.world.attribute.EnvironmentAttributes.class;
+            if (key == net.minecraft.world.attribute.EnvironmentAttributes.WATER_FOG_START_DISTANCE) return (T) Float.valueOf(start);
+            if (key == net.minecraft.world.attribute.EnvironmentAttributes.WATER_FOG_END_DISTANCE) return (T) Float.valueOf(end);
+            if (key == net.minecraft.world.attribute.EnvironmentAttributes.WATER_FOG_COLOR) return (T) color;
+            throw new AssertionError(key);
+        }
+    }
+    static final class FogCamera extends net.minecraft.client.Camera {
+        FogProbe probe; WaterPlayer player;
+        @Override public net.minecraft.world.attribute.EnvironmentAttributeProbe attributeProbe() { return probe; }
+        @Override public net.minecraft.world.entity.Entity entity() { return player; }
+        @Override public net.minecraft.world.level.material.FogType getFluidInCamera() { return net.minecraft.world.level.material.FogType.WATER; }
+        @Override public net.minecraft.world.phys.Vec3 position() { return new net.minecraft.world.phys.Vec3(0, 100, 0); }
+    }
+    static final class FogLevel extends net.minecraft.client.multiplayer.ClientLevel {
+        net.minecraft.client.multiplayer.ClientLevel.ClientLevelData data;
+        FogLevel() { super(null, null, null, null, 0, 0, null, false, 0, 0); }
+        @Override public int getMinY() { return -64; }
+        @Override public net.minecraft.client.multiplayer.ClientLevel.ClientLevelData getLevelData() { return data; }
+    }
     static void set(Object object, Class<?> owner, String name, Object value) throws Exception {
         Field field = owner.getDeclaredField(name);
         field.setAccessible(true);
@@ -92,6 +115,36 @@ public final class ChatEditOracle {
             JsonObject row = new JsonObject();
             row.addProperty("waterVisionTime", time); row.addProperty("waterEye", underwater);
             row.addProperty("waterVisionBits", Float.floatToRawIntBits(waterPlayer.getWaterVision())); rows.add(row);
+        }
+        var fogCamera = (FogCamera) unsafe.allocateInstance(FogCamera.class);
+        fogCamera.player = waterPlayer;
+        fogCamera.probe = (FogProbe) unsafe.allocateInstance(FogProbe.class);
+        var waterEnvironment = new net.minecraft.client.renderer.fog.environment.WaterFogEnvironment();
+        for (int time : new int[]{0, 1, 25, 100, 350, 599, 600}) for (boolean underwater : new boolean[]{false, true})
+        for (float start : new float[]{-8f, 0f, 15f}) for (float end : new float[]{0f, 24f, 96f, 1024f}) {
+            set(waterPlayer, net.minecraft.client.player.LocalPlayer.class, "waterVisionTime", time); waterPlayer.underwater = underwater;
+            fogCamera.probe.start = start; fogCamera.probe.end = end;
+            var data = new net.minecraft.client.renderer.fog.FogData();
+            waterEnvironment.setupFog(data, fogCamera, null, 0f, net.minecraft.client.DeltaTracker.ZERO);
+            JsonObject row = new JsonObject(); row.addProperty("waterFogTime", time); row.addProperty("waterEye", underwater);
+            row.addProperty("waterFogStart", start); row.addProperty("waterFogEnd", end);
+            row.addProperty("waterFogStartBits", Float.floatToRawIntBits(data.environmentalStart));
+            row.addProperty("waterFogEndBits", Float.floatToRawIntBits(data.environmentalEnd)); rows.add(row);
+        }
+        var fogLevel = (FogLevel) unsafe.allocateInstance(FogLevel.class);
+        fogLevel.data = (net.minecraft.client.multiplayer.ClientLevel.ClientLevelData) unsafe.allocateInstance(net.minecraft.client.multiplayer.ClientLevel.ClientLevelData.class);
+        set(waterPlayer, net.minecraft.world.entity.LivingEntity.class, "activeEffects", new java.util.HashMap<>());
+        var fogRenderer = (net.minecraft.client.renderer.fog.FogRenderer) unsafe.allocateInstance(net.minecraft.client.renderer.fog.FogRenderer.class);
+        var computeFog = net.minecraft.client.renderer.fog.FogRenderer.class.getDeclaredMethod("computeFogColor", net.minecraft.client.Camera.class, float.class, net.minecraft.client.multiplayer.ClientLevel.class, int.class, float.class, org.joml.Vector4f.class);
+        computeFog.setAccessible(true);
+        for (int time : new int[]{0, 1, 25, 100, 350, 599, 600}) for (boolean underwater : new boolean[]{false, true})
+        for (float[] color : new float[][]{{5f/255f,5f/255f,51f/255f},{0.2f,0.4f,0.6f},{0f,0.3f,0.5f},{1f,1f,1f}}) {
+            set(waterPlayer, net.minecraft.client.player.LocalPlayer.class, "waterVisionTime", time); waterPlayer.underwater = underwater;
+            fogCamera.probe.color = new org.joml.Vector3f(color[0],color[1],color[2]);
+            var result = new org.joml.Vector4f(); computeFog.invoke(fogRenderer, fogCamera, 0f, fogLevel, 12, 0f, result);
+            JsonObject row = new JsonObject(); row.addProperty("waterFogColorTime", time); row.addProperty("waterEye", underwater);
+            row.addProperty("r",color[0]); row.addProperty("g",color[1]); row.addProperty("b",color[2]);
+            row.addProperty("rBits",Float.floatToRawIntBits(result.x)); row.addProperty("gBits",Float.floatToRawIntBits(result.y)); row.addProperty("bBits",Float.floatToRawIntBits(result.z)); rows.add(row);
         }
         for (String text : texts) {
             ArrayList<Integer> positions = new ArrayList<>();

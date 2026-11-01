@@ -47,6 +47,17 @@ pub(crate) fn atmospheric_fog_color(
     std::array::from_fn(|i| fog[i] + amount * (sky[i] - fog[i]))
 }
 
+/// Water fog uses the player's adaptation even without a status effect.
+pub(crate) fn water_fog(color: [f32; 3], range: [f32; 2], vision: f32) -> ([f32; 3], [f32; 2]) {
+    let color = if color.iter().all(|component| *component != 0.0) {
+        let scale = 1.0 / color[0].max(color[1]).max(color[2]);
+        color.map(|component| component + vision * (component * scale - component))
+    } else {
+        color
+    };
+    (color, [range[0], range[1] * vision.max(0.25)])
+}
+
 pub(crate) fn weather_darken_sky(mut color: [f32; 3], rain: f32, thunder: f32) -> [f32; 3] {
     if rain > 0.0 {
         let red_green = 1.0 - rain * 0.5;
@@ -259,6 +270,8 @@ pub fn run_play(
             sky_fog_current: None,
             sky_mix_previous: None,
             sky_mix_current: None,
+            water_fog_previous: None,
+            water_fog_current: None,
             sky_tick: None,
             sky_base: None,
             sky_lightmap: None,
@@ -385,6 +398,8 @@ struct PlayState {
     sky_background_current: Option<[f32; 3]>,
     sky_fog_previous: Option<[f32; 2]>,
     sky_fog_current: Option<[f32; 2]>,
+    water_fog_previous: Option<crate::sky_background::WaterFogSample>,
+    water_fog_current: Option<crate::sky_background::WaterFogSample>,
     sky_mix_previous: Option<([f32; 3], f32)>,
     sky_mix_current: Option<([f32; 3], f32)>,
     sky_tick: Option<u64>,
@@ -891,6 +906,7 @@ impl Viewer {
                     fog_range,
                     sky_mix,
                     sunset,
+                    water,
                 }) = value
                 {
                     if play.sky_background_tick != Some(snapshot.tick)
@@ -929,6 +945,13 @@ impl Viewer {
                         play.sky_mix_previous = play.sky_mix_current.or(sky_mix);
                     }
                     play.sky_mix_current = sky_mix;
+                    if play.sky_background_tick != Some(snapshot.tick)
+                        || play.water_fog_previous.is_none()
+                        || play.water_fog_current.is_none()
+                    {
+                        play.water_fog_previous = play.water_fog_current.or(water);
+                    }
+                    play.water_fog_current = water;
                 }
                 play.sky_background_tick = Some(snapshot.tick);
                 play.sky_background_revision = Some(snapshot.world_revision);
@@ -981,20 +1004,43 @@ impl Viewer {
                         play.streamer.radius().max(2),
                     ));
                 }
-                renderer.set_sky_color(if play.fog_is_background {
-                    fog_color.unwrap_or(color)
-                } else {
-                    color
-                });
-                renderer.set_fog_color(fog_color);
-                renderer.set_fog_range(match (play.sky_fog_previous, play.sky_fog_current) {
+                let fog_range = match (play.sky_fog_previous, play.sky_fog_current) {
                     (Some(previous), Some(current)) => {
                         Some(play.rain_fog.apply(std::array::from_fn(|i| {
                             previous[i] + partial * (current[i] - previous[i])
                         })))
                     }
                     _ => None,
-                });
+                };
+                let water = if play.session.camera_in_water(snapshot.camera.eye(partial)) {
+                    match (play.water_fog_previous, play.water_fog_current) {
+                        (Some(previous), Some(current)) => {
+                            let color = std::array::from_fn(|i| {
+                                previous.color[i] + partial * (current.color[i] - previous.color[i])
+                            });
+                            let range = std::array::from_fn(|i| {
+                                previous.range[i] + partial * (current.range[i] - previous.range[i])
+                            });
+                            Some(water_fog(color, range, snapshot.water_vision))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((color, range)) = water {
+                    renderer.set_sky_color(color);
+                    renderer.set_fog_color(Some(color));
+                    renderer.set_fog_range(Some(range));
+                } else {
+                    renderer.set_sky_color(if play.fog_is_background {
+                        fog_color.unwrap_or(color)
+                    } else {
+                        color
+                    });
+                    renderer.set_fog_color(fog_color);
+                    renderer.set_fog_range(fog_range);
+                }
             }
         }
         if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer) {

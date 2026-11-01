@@ -954,6 +954,40 @@ fn fresh_breathing_seed() -> i64 {
 }
 
 impl LoadedSession {
+    /// Test the interpolated camera position against Java's water surface rule.
+    /// The position is relative to this session's current origin.
+    pub fn camera_in_water(&self, position: DVec3) -> bool {
+        if !position.is_finite() {
+            return false;
+        }
+        let block = position.floor().as_ivec3();
+        let view = FluidView {
+            world: &self.world,
+            shapes: &self.shapes,
+            fluids: &self.fluids,
+            origin: self.origin,
+            bounds: self.bounds,
+            air: self.states[0],
+        };
+        let fluid::Cell::Fluid(state) = view.at(block) else {
+            return false;
+        };
+        if state.kind != fluid::FluidKind::Water {
+            return false;
+        }
+        let above = block
+            .y
+            .checked_add(1)
+            .map(|y| IVec3::new(block.x, y, block.z));
+        let height = if state.source && above.is_some_and(|p| view.sturdy_face(p, IVec3::NEG_Y)) {
+            1.0
+        } else {
+            fluid::height(&|p| view.at(p), block, state.kind)
+        };
+        let world_block_y = i64::from(self.origin.y) + i64::from(block.y);
+        let camera_y = position.y + f64::from(self.origin.y);
+        camera_y < f64::from(world_block_y as f32 + height)
+    }
     fn ensure_effect_save_tracking(&mut self) -> &mut EffectSaveTracking {
         self.effect_save_tracking
             .get_or_insert_with(|| EffectSaveTracking {
@@ -37576,6 +37610,14 @@ mod tests {
         };
         let mut a = prepare();
         let mut b = prepare();
+        let mut camera = prepare();
+        let surface = f64::from(3.0_f32 + 8.0_f32 / 9.0_f32);
+        assert!(camera.camera_in_water(DVec3::new(8.5, surface - 0.00001, 8.5)));
+        assert!(!camera.camera_in_water(DVec3::new(8.5, surface, 8.5)));
+        let stone = camera.intern_block(state("minecraft:stone", &[]));
+        assert!(camera.set(IVec3::new(8, 4, 8), stone));
+        assert!(camera.camera_in_water(DVec3::new(8.5, 3.99, 8.5)));
+        assert!(!camera.camera_in_water(DVec3::new(8.5, 4.0, 8.5)));
         let original = a.snapshot();
         for _ in 0..40 {
             for session in [&mut a, &mut b] {

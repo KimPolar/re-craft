@@ -516,6 +516,46 @@ fn fog_layers(attributes: Option<&Value>) -> Result<[Option<FloatLayer>; 3]> {
     Ok(result)
 }
 
+fn water_fog_layers(attributes: Option<&Value>) -> Result<[Option<FloatLayer>; 3]> {
+    let mut result = [None; 3];
+    let Some(attributes) = attributes else {
+        return Ok(result);
+    };
+    for (name, value) in attributes
+        .as_object()
+        .context("invalid environment attributes")?
+    {
+        let id = ResourceId::parse(name)?;
+        if id.namespace != "minecraft" {
+            continue;
+        }
+        let index = match id.path.as_str() {
+            "visual/water_fog_start_distance" => 0,
+            "visual/water_fog_end_distance" => 1,
+            _ => continue,
+        };
+        ensure!(result[index].is_none(), "duplicate water fog distance");
+        result[index] = Some(FloatLayer::parse(value)?);
+    }
+    Ok(result)
+}
+
+#[derive(Default)]
+struct WaterFog {
+    base: Option<[f32; 3]>,
+    biomes: BTreeMap<String, Option<[Option<FloatLayer>; 3]>>,
+    tracks: Option<Vec<FogTrack>>,
+    color_base: Option<[f32; 3]>,
+    color_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
+    color_tracks: Option<Vec<SkyTrack>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaterFogSample {
+    pub color: [f32; 3],
+    pub range: [f32; 2],
+}
+
 pub struct SkyBackground {
     base: [f32; 3],
     biomes: BTreeMap<String, Option<ColorLayer>>,
@@ -531,6 +571,7 @@ pub struct SkyBackground {
     fog_sky_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
     fog_sky_tracks: Option<Vec<SkyTrack>>,
     sunset: Option<SunsetTimeline>,
+    water: WaterFog,
     min_y: i32,
     max_y: i32,
 }
@@ -543,6 +584,7 @@ pub struct BackgroundSample {
     pub fog_range: Option<[f32; 2]>,
     pub sky_mix: Option<([f32; 3], f32)>,
     pub sunset: Option<(f32, [f32; 4])>,
+    pub water: Option<WaterFogSample>,
 }
 
 impl SkyBackground {
@@ -584,6 +626,29 @@ impl SkyBackground {
                 })
             })
         };
+        let mut water = WaterFog {
+            base: water_fog_layers(dimension.get("attributes"))
+                .ok()
+                .map(|layers| {
+                    let defaults = [-8.0, 96.0, 0.0];
+                    std::array::from_fn(|i| {
+                        layers[i].map_or(defaults[i], |layer| layer.apply(defaults[i]))
+                    })
+                }),
+            color_base: match dimension.get("attributes") {
+                None => Some([5.0 / 255.0, 5.0 / 255.0, 51.0 / 255.0]),
+                Some(attributes) => find_color_attribute(attributes, "visual/water_fog_color")
+                    .ok()
+                    .map(|layer| {
+                        layer.map_or([5.0 / 255.0, 5.0 / 255.0, 51.0 / 255.0], |layer| {
+                            layer.apply([5.0 / 255.0, 5.0 / 255.0, 51.0 / 255.0])
+                        })
+                    }),
+            },
+            tracks: Some(Vec::new()),
+            color_tracks: Some(Vec::new()),
+            ..Default::default()
+        };
         let fog_sky_base = if skybox == "none" {
             match dimension.get("attributes") {
                 None => Some([0.0; 3]),
@@ -618,6 +683,18 @@ impl SkyBackground {
                 .transpose()?
                 .flatten();
             let name = format!("{}:{}", id.namespace, id.path);
+            water
+                .biomes
+                .insert(name.clone(), water_fog_layers(biome.get("attributes")).ok());
+            water.color_biomes.insert(
+                name.clone(),
+                match biome.get("attributes") {
+                    None => Some(None),
+                    Some(attributes) => {
+                        find_color_attribute(attributes, "visual/water_fog_color").ok()
+                    }
+                },
+            );
             if let Some(sunset) = &mut sunset {
                 let attributes = biome.get("attributes");
                 sunset.biome_angles.insert(
@@ -665,6 +742,32 @@ impl SkyBackground {
             let mut found = false;
             for (name, value) in entries {
                 let id = ResourceId::parse(name)?;
+                if id.namespace == "minecraft" {
+                    if let Some(index) = match id.path.as_str() {
+                        "visual/water_fog_start_distance" => Some(0),
+                        "visual/water_fog_end_distance" => Some(1),
+                        _ => None,
+                    } {
+                        match FogTrack::parse(index, &timeline, value) {
+                            Ok(track) => {
+                                if let Some(tracks) = &mut water.tracks {
+                                    tracks.push(track);
+                                }
+                            }
+                            Err(_) => water.tracks = None,
+                        }
+                    }
+                    if id.path == "visual/water_fog_color" {
+                        match SkyTrack::parse(&timeline, value, false) {
+                            Ok(track) => {
+                                if let Some(tracks) = &mut water.color_tracks {
+                                    tracks.push(track);
+                                }
+                            }
+                            Err(_) => water.color_tracks = None,
+                        }
+                    }
+                }
                 if id.namespace == "minecraft" && id.path == "visual/sun_angle" && sunset.is_some()
                 {
                     match FogTrack::parse(0, &timeline, value) {
@@ -741,6 +844,7 @@ impl SkyBackground {
             fog_sky_biomes,
             fog_sky_tracks,
             sunset,
+            water,
             min_y,
             max_y,
         }))
@@ -816,6 +920,37 @@ impl SkyBackground {
             };
             Some((sky, fog_values?[2]))
         })();
+        let water = (|| {
+            let mut range = interpolate_fog(&grouped, &self.water.biomes, self.water.base?)?;
+            for track in self.water.tracks.as_ref()? {
+                range[track.index] = FloatLayer {
+                    value: track.track.sample(clock_ticks(&track.track.clock)?)[0],
+                    modifier: track.modifier,
+                }
+                .apply(range[track.index]);
+            }
+            range[1] = range[1].max(0.0);
+            if !range.iter().all(|n| n.is_finite()) {
+                return None;
+            }
+            let mut color = interpolate_optional_color(
+                &grouped,
+                &self.water.color_biomes,
+                self.water.color_base?,
+            )?;
+            for track in self.water.color_tracks.as_ref()? {
+                let arg = track.sample(clock_ticks(&track.clock)?);
+                color = if track.multiply {
+                    std::array::from_fn(|i| color[i] * arg[i])
+                } else {
+                    arg
+                };
+            }
+            Some(WaterFogSample {
+                color,
+                range: [range[0], range[1]],
+            })
+        })();
         Some(BackgroundSample {
             color: value,
             background_is_fog: self.background_is_fog,
@@ -826,6 +961,7 @@ impl SkyBackground {
                 .sunset
                 .as_ref()
                 .and_then(|sunset| sunset.sample(&grouped, &mut clock_ticks)),
+            water,
         })
     }
 }
@@ -1317,6 +1453,29 @@ mod tests {
         assert!(overworld.fog_tracks.is_some());
         assert!(overworld.fog_color_tracks.is_some());
         assert!(overworld.sunset.is_some());
+        assert_eq!(overworld.water.base, Some([-8.0, 96.0, 0.0]));
+        assert_eq!(
+            overworld.water.color_base,
+            Some([5.0 / 255.0, 5.0 / 255.0, 51.0 / 255.0])
+        );
+        let swamp = &[("minecraft:swamp", 1.0)];
+        assert_eq!(
+            interpolate_optional_color(
+                swamp,
+                &overworld.water.color_biomes,
+                overworld.water.color_base.unwrap()
+            ),
+            Some([35.0 / 255.0, 35.0 / 255.0, 23.0 / 255.0])
+        );
+        assert_eq!(
+            interpolate_fog(
+                swamp,
+                &overworld.water.biomes,
+                overworld.water.base.unwrap()
+            )
+            .unwrap()[1],
+            96.0 * 0.85
+        );
         let sun =
             SkyTrack::parse(&day, &day["tracks"]["minecraft:visual/sun_angle"], true).unwrap();
         let sunset = SunsetColorTrack::parse(
@@ -1390,17 +1549,20 @@ mod tests {
                 let value = match path {
                     "data/example/dimension_type/test.json" => json!({
                         "skybox":"none", "timelines":["example:day"],
-                        "attributes":{"visual/fog_color":"#ffffff","visual/sky_color":"#ff0000","visual/fog_start_distance":10.0,"visual/fog_end_distance":96.0}
+                        "attributes":{"visual/fog_color":"#ffffff","visual/sky_color":"#ff0000","visual/fog_start_distance":10.0,"visual/fog_end_distance":96.0,"visual/water_fog_color":"#102030","visual/water_fog_start_distance":-4.0,"visual/water_fog_end_distance":80.0}
                     }),
                     "data/example/worldgen/biome/test.json" => json!({"attributes":{
                         "visual/fog_color":"#204060", "visual/sky_color":"#00ff00",
-                        "visual/fog_start_distance":{"modifier":"add","argument":5.0}, "visual/fog_end_distance":64.0
+                        "visual/fog_start_distance":{"modifier":"add","argument":5.0}, "visual/fog_end_distance":64.0,
+                        "visual/water_fog_color":"#204060", "visual/water_fog_end_distance":{"modifier":"multiply","argument":0.5}
                     }}),
                     "data/example/timeline/day.json" => json!({
                         "clock":"example:clock", "period_ticks":20, "tracks":{
                             "visual/fog_color":{"modifier":"multiply","keyframes":[{"ticks":0,"value":"#ffffff"},{"ticks":10,"value":"#000000"}]},
                             "visual/fog_end_distance":{"modifier":"add","keyframes":[{"ticks":0,"value":0.0},{"ticks":10,"value":16.0}]},
-                            "visual/sky_color":{"keyframes":[{"ticks":0,"value":"#ff0000"}]}
+                            "visual/sky_color":{"keyframes":[{"ticks":0,"value":"#ff0000"}]},
+                            "visual/water_fog_start_distance":{"modifier":"add","keyframes":[{"ticks":0,"value":0.0},{"ticks":10,"value":4.0}]},
+                            "visual/water_fog_color":{"modifier":"multiply","keyframes":[{"ticks":0,"value":"#ffffff"},{"ticks":10,"value":"#808080"}]}
                         }
                     }),
                     _ => return Ok(None),
@@ -1421,6 +1583,36 @@ mod tests {
         assert_eq!(background.base, [1.0; 3]);
         assert_eq!(background.fog_base, Some([10.0, 96.0, 512.0]));
         let groups = group_biomes(DVec3::ZERO, |_, _, _| Some("example:test")).unwrap();
+        assert_eq!(background.water.base, Some([-4.0, 80.0, 0.0]));
+        assert_eq!(
+            interpolate_fog(
+                &groups,
+                &background.water.biomes,
+                background.water.base.unwrap()
+            ),
+            Some([-4.0, 40.0, 0.0])
+        );
+        assert_eq!(
+            interpolate_optional_color(
+                &groups,
+                &background.water.color_biomes,
+                background.water.color_base.unwrap()
+            ),
+            Some([32.0 / 255.0, 64.0 / 255.0, 96.0 / 255.0])
+        );
+        let water_track = &background.water.tracks.as_ref().unwrap()[0];
+        assert_eq!(
+            FloatLayer {
+                value: water_track.track.sample(10)[0],
+                modifier: water_track.modifier
+            }
+            .apply(-4.0),
+            0.0
+        );
+        assert_eq!(
+            background.water.color_tracks.as_ref().unwrap()[0].sample(10),
+            [128.0 / 255.0; 3]
+        );
         assert_eq!(
             interpolate_optional_color(
                 &groups,
@@ -1542,6 +1734,7 @@ mod tests {
             fog_sky_biomes: BTreeMap::new(),
             fog_sky_tracks: None,
             sunset: None,
+            water: WaterFog::default(),
             min_y: 0,
             max_y: 16,
         };
@@ -1553,7 +1746,8 @@ mod tests {
                 fog_color: None,
                 fog_range: None,
                 sky_mix: None,
-                sunset: None
+                sunset: None,
+                water: None
             })
         );
         assert_eq!(
@@ -1564,13 +1758,40 @@ mod tests {
                 fog_color: None,
                 fog_range: None,
                 sky_mix: None,
-                sunset: None
+                sunset: None,
+                water: None
             })
         );
         assert!(
             background
                 .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| None)
                 .is_none()
+        );
+        background.water = WaterFog {
+            base: Some([-8.0, 96.0, 0.0]),
+            biomes: BTreeMap::from([("minecraft:plains".into(), Some([None; 3]))]),
+            tracks: Some(Vec::new()),
+            color_base: Some([0.1, 0.2, 0.3]),
+            color_biomes: BTreeMap::from([("minecraft:plains".into(), Some(None))]),
+            color_tracks: Some(Vec::new()),
+        };
+        assert_eq!(
+            background
+                .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
+                .unwrap()
+                .water,
+            Some(WaterFogSample {
+                color: [0.1, 0.2, 0.3],
+                range: [-8.0, 96.0]
+            })
+        );
+        background.water.color_tracks = None;
+        assert_eq!(
+            background
+                .sample(&world, DVec3::new(0.0, 8.0, 0.0), |_| Some(0))
+                .unwrap()
+                .water,
+            None
         );
         background.fog_base = Some([10.0, 96.0, 512.0]);
         background.fog_color_base = Some([0.7, 0.8, 0.9]);

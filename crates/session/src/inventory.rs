@@ -1517,6 +1517,7 @@ impl PlayerInventory {
     }
 
     /// Damage one supported ordinary tool, preserving its other components.
+    #[cfg(test)]
     pub(crate) fn damage_selected_tool(&mut self, amount: u32, random: &mut LegacyRandom) -> bool {
         self.damage_held_tool(PlayerSlot::Storage(self.selected), amount, random)
     }

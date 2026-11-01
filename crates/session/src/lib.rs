@@ -709,26 +709,91 @@ impl LocalSession {
                 }
             })
             .collect();
-        let position = self.motion.position;
         for item in items {
-            consume_particles::equipment_break(
-                &Arc::new(item),
-                false,
-                position,
-                position + DVec3::Y * f64::from(self.player.pose.eye_height()),
-                self.player.yaw.to_degrees() - 180.0,
-                -self.player.pitch.to_degrees(),
-                self.tick.saturating_add(1),
-                &mut self.player_client_random,
-                &mut self.consume_sounds,
-                &mut self.consume_particles,
-            );
+            self.queue_broken_item(item);
         }
+    }
+
+    fn queue_broken_item(&mut self, item: inventory::ItemStack) {
+        let position = self.motion.position;
+        consume_particles::equipment_break(
+            &Arc::new(item),
+            false,
+            position,
+            position + DVec3::Y * f64::from(self.player.pose.eye_height()),
+            self.player.yaw.to_degrees() - 180.0,
+            -self.player.pitch.to_degrees(),
+            self.tick.saturating_add(1),
+            &mut self.player_client_random,
+            &mut self.consume_sounds,
+            &mut self.consume_particles,
+        );
+    }
+
+    fn damage_held_tool_with_feedback(&mut self, hand: PlayerSlot, amount: u32) {
+        let before = self.inventory.slot(hand).cloned();
+        if Arc::make_mut(&mut self.inventory).damage_held_tool(hand, amount, &mut self.level_random)
+            && self.inventory.slot(hand).is_none()
+            && let Some(item) = before
+        {
+            self.queue_broken_item(item);
+        }
+    }
+
+    fn apply_player_damage(
+        &mut self,
+        amount: f32,
+        source: &str,
+    ) -> anyhow::Result<fall::DamageOutcome> {
+        let before = Arc::clone(&self.inventory);
+        let outcome = self.fall.damage_with_equipment(
+            amount,
+            source,
+            Arc::make_mut(&mut self.inventory),
+            &mut self.armor,
+            &mut self.vitals,
+            self.game_mode,
+            &mut self.damage_cooldown,
+            &mut self.level_random,
+            None,
+        )?;
+        if outcome.accepted {
+            self.queue_broken_equipment(&before);
+        }
+        Ok(outcome)
     }
 
     fn player_damage_feedback(&mut self, source: &str, outcome: fall::DamageOutcome) {
         if !outcome.accepted {
             return;
+        }
+        if outcome.fresh_hit {
+            match self.fall.blocks_damage_knockback(source) {
+                Ok(false) => {
+                    let base = player_data::SavedAttribute::with_base(0.0);
+                    let resistance = match &self.enchantments {
+                        Some(registry) => equipment_attributes::knockback_resistance(
+                            &base,
+                            &self.inventory,
+                            registry,
+                        ),
+                        None => Ok(0.0),
+                    };
+                    match resistance {
+                        Ok(value) => {
+                            self.motion.velocity = knockback::from_unlocated_damage(
+                                self.motion.velocity,
+                                self.motion.on_ground,
+                                value,
+                                &mut self.player_random,
+                            )
+                        }
+                        Err(error) => eprintln!("player knockback resistance: {error:#}"),
+                    }
+                }
+                Ok(true) => {}
+                Err(error) => eprintln!("player damage knockback tag: {error:#}"),
+            }
         }
         if outcome.health_damage > 0.0 || outcome.fresh_hit {
             match self.fall.damage_info(source) {
@@ -1120,6 +1185,7 @@ impl LocalSession {
     ) {
         Arc::make_mut(&mut self.inventory).set_enchantments(Arc::clone(&enchantments));
         self.armor.set_enchantments(Arc::clone(&enchantments));
+        self.fall.set_enchantments(Arc::clone(&enchantments));
         self.enchantments = Some(enchantments);
     }
 
@@ -1154,8 +1220,10 @@ impl LocalSession {
                 .and_then(|material| mining::mining_properties(material, hand.as_ref()));
             let damage = properties.map_or(0, |properties| properties.damage_per_block);
             if self.game_mode != GameMode::Creative && damage != 0 {
-                Arc::make_mut(&mut self.inventory)
-                    .damage_selected_tool(damage, &mut self.level_random);
+                self.damage_held_tool_with_feedback(
+                    PlayerSlot::Storage(self.inventory.selected()),
+                    damage,
+                );
             }
             self.dropped_items.drop_block(
                 position,
@@ -1244,11 +1312,7 @@ impl LocalSession {
                     .drop_interaction(position, face, *strategy, drops, true);
             }
             if self.game_mode != GameMode::Creative && result.damage != 0 {
-                Arc::make_mut(&mut self.inventory).damage_held_tool(
-                    hand,
-                    result.damage,
-                    &mut self.level_random,
-                );
+                self.damage_held_tool_with_feedback(hand, result.damage);
             }
             let swing = if hand == PlayerSlot::Offhand {
                 animation::Hand::Off
@@ -1762,20 +1826,8 @@ impl LocalSession {
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
         self.process_food_events();
         if self.vitals.health > 1.0 && self.fall.effects().poison_due(self.player_effect_tick) {
-            let before = Arc::clone(&self.inventory);
-            match self.fall.damage_with_equipment(
-                1.0,
-                "minecraft:magic",
-                Arc::make_mut(&mut self.inventory),
-                &mut self.armor,
-                &mut self.vitals,
-                self.game_mode,
-                &mut self.damage_cooldown,
-                &mut self.level_random,
-                None,
-            ) {
+            match self.apply_player_damage(1.0, "minecraft:magic") {
                 Ok(outcome) if outcome.accepted => {
-                    self.queue_broken_equipment(&before);
                     self.player_damage_feedback("minecraft:magic", outcome);
                     if self.vitals.health <= 0.0 && self.death.is_none() {
                         self.death = Some(DeathInfo {
@@ -1955,7 +2007,9 @@ impl LocalSession {
                 self.push_entities_from_soil(landed_on);
                 self.set_block(landed_on, Block::Dirt);
             }
-            let landing = match self.fall.land_with_cooldown(
+            let before_vitals = self.vitals;
+            let before_cooldown = self.damage_cooldown;
+            let mut landing = match self.fall.land_with_cooldown(
                 self.fall_distance,
                 None,
                 &self.inventory,
@@ -1971,6 +2025,22 @@ impl LocalSession {
                     Default::default()
                 }
             };
+            if landing.damage.accepted {
+                self.vitals = before_vitals;
+                self.damage_cooldown = before_cooldown;
+                landing.damage = match self.apply_player_damage(
+                    landing.amount as f32,
+                    landing
+                        .source
+                        .expect("accepted landing has a damage source"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("player fall equipment damage: {error:#}");
+                        Default::default()
+                    }
+                };
+            }
             if landing.amount > 0 {
                 let event = if landing.amount > 4 {
                     "entity.player.big_fall"
@@ -2098,15 +2168,7 @@ impl LocalSession {
         if self.death.is_none() {
             let effect = self.vitals.tick_food(self.survival_rules);
             if effect == survival::FoodEffect::Starve {
-                match self.fall.damage_outcome(
-                    1.0,
-                    "minecraft:starve",
-                    &self.inventory,
-                    self.armor.value(),
-                    &mut self.vitals,
-                    self.game_mode,
-                    Some(&mut self.damage_cooldown),
-                ) {
+                match self.apply_player_damage(1.0, "minecraft:starve") {
                     Ok(outcome) => self.player_damage_feedback("minecraft:starve", outcome),
                     Err(error) => eprintln!("player starvation damage: {error:#}"),
                 }
@@ -2805,6 +2867,7 @@ mod tests {
                         "minecraft:bypasses_armor",
                         "minecraft:bypasses_effects",
                         "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
                     ],
                     _ => &[],
                 };
@@ -2813,7 +2876,9 @@ mod tests {
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Ok(if path == "data/minecraft/damage_type/magic.json" {
                     Some(br#"{"exhaustion":0.0}"#.to_vec())
-                } else if path == "data/minecraft/tags/damage_type/bypasses_armor.json" {
+                } else if path == "data/minecraft/tags/damage_type/bypasses_armor.json"
+                    || path == "data/minecraft/tags/damage_type/no_knockback.json"
+                {
                     Some(br#"{"values":["minecraft:magic"]}"#.to_vec())
                 } else if path.contains("tags/damage_type/") {
                     Some(br#"{"values":[]}"#.to_vec())
@@ -3001,6 +3066,107 @@ mod tests {
                         );
                         assert_eq!(session.player_random.next_int(), expected_server.next_int());
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn demo_damage_respects_data_pack_armor_tags_at_different_frame_rates() {
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data(bool);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "damage_type" => &["minecraft:fall", "minecraft:starve"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                        "minecraft:is_fall",
+                    ],
+                    _ => &[],
+                };
+                names.iter().map(|name| ResourceId::parse(name)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path.starts_with("data/minecraft/damage_type/") {
+                    Some(br#"{"exhaustion":0.0}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/bypasses_armor.json" && self.0 {
+                    Some(br#"{"values":["minecraft:fall","minecraft:starve"]}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/no_knockback.json" {
+                    Some(br#"{"values":["minecraft:fall","minecraft:starve"]}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/is_fall.json" {
+                    Some(br#"{"values":["minecraft:fall"]}"#.to_vec())
+                } else if path.contains("/tags/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        for bypass in [false, true] {
+            for fall_damage in [false, true] {
+                for frames in [1, 5] {
+                    let mut world = World::default();
+                    world.set_block(IVec3::ZERO, Block::Stone);
+                    let mut session = LocalSession::new(world);
+                    session.set_enchantments(Arc::new(
+                        native_resources::enchantments::OxygenEnchantments::load(&mut Data(bypass))
+                            .unwrap(),
+                    ));
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(
+                        PlayerSlot::Armor(0),
+                        inventory::ItemStack::new(
+                            "minecraft:iron_helmet".into(),
+                            1,
+                            1,
+                            Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(164))]),
+                        ),
+                    );
+                    session.set_player_inventory(inventory);
+                    session.survival_rules.difficulty = native_persistence::world::Difficulty::Hard;
+                    session.survival_rules.natural_health_regeneration = false;
+                    if fall_damage {
+                        session.motion.position = DVec3::new(0.5, 1.0, 0.5);
+                        session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+                        session.motion.on_ground = false;
+                        session.player.position = session.motion.position.as_vec3();
+                        session.player.on_ground = false;
+                        session.fall_distance = 7.0;
+                    } else {
+                        session.vitals.food = 0;
+                        session.vitals.saturation = 0.0;
+                        session.vitals.food_tick_timer = 79;
+                    }
+                    for _ in 0..frames {
+                        session.update(TICK / frames);
+                    }
+                    assert_eq!(
+                        session.inventory.slot(PlayerSlot::Armor(0)).is_some(),
+                        bypass,
+                        "{bypass} {fall_damage} {frames}"
+                    );
+                    assert_eq!(
+                        session.take_consume_particles().len(),
+                        if bypass { 0 } else { 5 }
+                    );
+                    let sounds = session.take_consume_sounds();
+                    assert_eq!(
+                        sounds
+                            .iter()
+                            .filter(|sound| sound.info.event == "entity.item.break")
+                            .count(),
+                        usize::from(!bypass)
+                    );
+                    assert_eq!(session.vitals.health, if fall_damage { 16.0 } else { 19.0 });
                 }
             }
         }
@@ -3921,6 +4087,14 @@ mod tests {
                 false,
                 false,
             ),
+            (
+                GameMode::Survival,
+                Some("minecraft:wooden_axe"),
+                false,
+                58,
+                true,
+                false,
+            ),
             (GameMode::Survival, None, true, 58, true, false),
         ] {
             for axis in [Axis::X, Axis::Y, Axis::Z] {
@@ -3997,6 +4171,15 @@ mod tests {
                 let current = after.inventory.slot(hand);
                 if transforms && mode == GameMode::Survival && damage == 58 {
                     assert!(current.is_none());
+                    assert_eq!(session.take_consume_particles().len(), 5);
+                    assert_eq!(
+                        session
+                            .take_consume_sounds()
+                            .iter()
+                            .filter(|sound| sound.info.event == "entity.item.break")
+                            .count(),
+                        1
+                    );
                 } else {
                     let current = current.unwrap();
                     assert_eq!(

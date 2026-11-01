@@ -239,6 +239,9 @@ impl Default for FallTracker {
 }
 
 impl FallTracker {
+    pub(crate) fn set_enchantments(&mut self, enchantments: Arc<OxygenEnchantments>) {
+        self.enchantments = Some(enchantments);
+    }
     pub(crate) fn effects(&self) -> &FallEffects {
         &self.effects
     }

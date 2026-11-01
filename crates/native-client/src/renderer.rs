@@ -220,6 +220,7 @@ pub struct Renderer {
     fog_bind_group: wgpu::BindGroup,
     fog_last: Option<FogUniform>,
     end_sky: Option<crate::end_sky::EndSky>,
+    sun: Option<crate::sun_render::Sun>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -349,6 +350,23 @@ impl Renderer {
             texture,
         )?);
         Ok(())
+    }
+
+    pub fn set_sun(&mut self, texture: crate::sun_render::Texture) -> Result<()> {
+        self.sun = Some(crate::sun_render::Sun::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            DEPTH_FORMAT,
+            texture,
+        )?);
+        Ok(())
+    }
+
+    pub fn set_sun_frame(&mut self, frame: Option<crate::sun_render::Frame>) {
+        if let Some(sun) = &mut self.sun {
+            sun.set_frame(frame);
+        }
     }
 
     pub fn set_fog_color(&mut self, color: Option<[f32; 3]>) {
@@ -1294,6 +1312,7 @@ impl Renderer {
             fog_bind_group,
             fog_last: None,
             end_sky: None,
+            sun: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2197,6 +2216,9 @@ impl Renderer {
         if let Some(sky) = &mut self.end_sky {
             sky.update(&self.queue, sky_matrix, sky_background);
         }
+        if let Some(sun) = &mut self.sun {
+            sun.update(&self.queue, sky_matrix, sky_background);
+        }
         self.consume_renderer.update(
             &self.device,
             &self.queue,
@@ -2284,6 +2306,9 @@ impl Renderer {
             });
             if let Some(sky) = &self.end_sky {
                 sky.draw(&mut pass);
+            }
+            if let Some(sun) = &self.sun {
+                sun.draw(&mut pass);
             }
             pass.set_pipeline(&self.terrain_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);

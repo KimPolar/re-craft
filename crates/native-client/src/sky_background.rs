@@ -866,6 +866,10 @@ impl SkyBackground {
         self.end_sky
     }
 
+    pub fn has_overworld_sky(&self) -> bool {
+        !self.end_sky && !self.background_is_fog
+    }
+
     pub fn void_darkness(&self, camera_y: f64) -> f32 {
         let Some(flat) = self.flat_world else {
             return 0.0;

@@ -224,6 +224,7 @@ pub fn run_play(
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
     end_sky: Option<crate::end_sky::Texture>,
+    sun: Option<crate::sun_render::Texture>,
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
     hud_hidden: bool,
@@ -270,6 +271,7 @@ pub fn run_play(
             sky_timeline,
             sky_background,
             end_sky,
+            sun,
             weather_textures,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
@@ -401,6 +403,7 @@ struct PlayState {
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
     end_sky: Option<crate::end_sky::Texture>,
+    sun: Option<crate::sun_render::Texture>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
@@ -980,6 +983,20 @@ impl Viewer {
                 (play.sky_background_previous, play.sky_background_current)
             {
                 let partial = play.session.partial_tick().clamp(0.0, 1.0);
+                let sun_frame = match (play.sunset_previous, play.sunset_current) {
+                    (Some((previous, _)), Some((current, _))) if background.has_overworld_sky() => {
+                        Some(crate::sun_render::Frame {
+                            angle_degrees: interpolate_sun_angle(previous, current, partial),
+                            rain_brightness: 1.0
+                                - snapshot
+                                    .weather
+                                    .map_or(0.0, |weather| weather.rain_at(partial)),
+                            tick: snapshot.tick,
+                        })
+                    }
+                    _ => None,
+                };
+                renderer.set_sun_frame(sun_frame);
                 let color =
                     std::array::from_fn(|i| previous[i] + partial * (current[i] - previous[i]));
                 let mut fog_color = match (play.fog_color_previous, play.fog_color_current) {
@@ -1331,6 +1348,11 @@ impl ApplicationHandler for Viewer {
             && let Err(error) = renderer.set_end_sky(texture)
         {
             eprintln!("End sky rendering is unavailable: {error:#}");
+        }
+        if let Some(texture) = self.play.as_ref().and_then(|play| play.sun.as_ref())
+            && let Err(error) = renderer.set_sun(texture.clone())
+        {
+            eprintln!("Sun rendering is unavailable: {error:#}");
         }
         if let Some(textures) = self
             .play

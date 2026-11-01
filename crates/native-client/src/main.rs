@@ -63,6 +63,7 @@ mod sky_background;
 mod smoke_particles;
 mod sound_ui;
 mod status_effect_ui;
+mod sun_render;
 mod survival_hud;
 mod text_component;
 mod toggle_key;
@@ -572,6 +573,7 @@ struct PreparedPlayWorld {
     sky_timeline: Option<preview_lighting::SkyTimeline>,
     sky_background: Option<sky_background::SkyBackground>,
     end_sky: Option<end_sky::Texture>,
+    sun: Option<sun_render::Texture>,
     video: menu_settings::VideoSettings,
 }
 
@@ -621,6 +623,7 @@ fn run_prepared_world(
                 sky_timeline,
                 sky_background,
                 end_sky,
+                sun,
                 video,
             } = *world;
             preview_app::run_play(
@@ -637,6 +640,7 @@ fn run_prepared_world(
                 sky_timeline,
                 sky_background,
                 end_sky,
+                sun,
                 video,
                 audio,
                 hud_hidden,
@@ -917,6 +921,20 @@ fn prepare_existing_world(
                 Ok(texture) => Some(texture),
                 Err(error) => {
                     eprintln!("End sky texture is unavailable: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let sun = if sky_background
+            .as_ref()
+            .is_some_and(sky_background::SkyBackground::has_overworld_sky)
+        {
+            match sun_render::Texture::load(&mut resources) {
+                Ok(texture) => Some(texture),
+                Err(error) => {
+                    eprintln!("Sun texture is unavailable: {error:#}");
                     None
                 }
             }
@@ -1516,6 +1534,7 @@ fn prepare_existing_world(
             sky_timeline,
             sky_background,
             end_sky,
+            sun,
             video,
         })));
     }

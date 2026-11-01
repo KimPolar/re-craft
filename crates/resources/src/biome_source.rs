@@ -1,5 +1,5 @@
 //! Multi-noise biome selection from the active world data packs.
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -275,12 +275,24 @@ impl ClimateVolume {
         )
     }
 }
+#[derive(Clone)]
 enum SourceKind {
     Fixed(ResourceId),
-    Multi(ClimateTree),
+    Multi(Arc<ClimateTree>),
     End([ResourceId; 5]),
 }
 impl BiomeSource {
+    /// Independent history for another Java-style search context, sharing the
+    /// immutable biome tree and preserving this source's previous lookup.
+    pub fn fresh_sampler(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            previous: None,
+        }
+    }
+    pub fn reset_search_history(&mut self) {
+        self.previous = None;
+    }
     /// Registry holders the source can return, including all parameter-list
     /// entries even when climate ranges overlap.
     pub fn possible_biomes(&self) -> BTreeSet<ResourceId> {
@@ -359,7 +371,7 @@ impl BiomeSource {
                         )
                     }
                 };
-                SourceKind::Multi(ClimateTree::new(entries)?)
+                SourceKind::Multi(Arc::new(ClimateTree::new(entries)?))
             }
             "the_end" => {
                 let ids = [
@@ -617,6 +629,15 @@ mod tests {
             source.select([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().path,
             "a"
         );
+        assert_eq!(source.select([0.0; 6]).unwrap().path, "a");
+        let mut child = source.fresh_sampler();
+        assert_eq!(
+            child.select([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap().path,
+            "b"
+        );
+        assert_eq!(child.select([0.0; 6]).unwrap().path, "b");
+        assert_eq!(source.select([0.0; 6]).unwrap().path, "a");
+        child.reset_search_history();
         assert_eq!(source.select([0.0; 6]).unwrap().path, "a");
         let settings = json!({"noise":{"min_y":-16,"height":32},"legacy_random_source":false,
             "noise_router":{"final_density":0,"temperature":{"type":"gradient","axis":"y",

@@ -161,6 +161,7 @@ impl BiomeNeighborhood {
 pub struct TerrainGenerator {
     noise: NoiseStageGenerator,
     source: BiomeSource,
+    possible_biomes: std::collections::BTreeSet<ResourceId>,
     surface: SurfaceRule,
     seed: i64,
     min_y: i32,
@@ -235,9 +236,11 @@ impl TerrainGenerator {
                 && height <= 4096,
             "dimension must fully contain the noise height range"
         );
+        let possible_biomes = source.possible_biomes();
         Ok(Self {
             noise,
             source,
+            possible_biomes,
             surface,
             seed,
             min_y,
@@ -254,8 +257,70 @@ impl TerrainGenerator {
         BiomeNeighborhood::new(self.seed, self.min_y(), self.height())
     }
     /// Complete set of biome IDs exposed by this generator's biome source.
-    pub fn possible_biomes(&self) -> std::collections::BTreeSet<ResourceId> {
-        self.source.possible_biomes()
+    pub fn possible_biomes(&self) -> &std::collections::BTreeSet<ResourceId> {
+        &self.possible_biomes
+    }
+    /// Check a set's candidate chunk after the biome-source filter, including
+    /// concentric rings and exclusion references. This does not generate starts.
+    pub fn is_structure_candidate<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+    ) -> Result<bool> {
+        cache.is_structure_chunk_for_biomes_with_rings(
+            provider,
+            biome_rules,
+            &self.possible_biomes,
+            id,
+            self.seed,
+            chunk,
+            |provider, _, placement| {
+                self.concentric_structure_positions(provider, evaluator, placement)
+            },
+        )
+    }
+    /// Resolve concentric-ring candidates against the active biome source.
+    /// Per-search history is isolated; as with Java's worker-local climate
+    /// cache, exact ties may depend on the prior history of that worker.
+    pub fn concentric_structure_positions(
+        &self,
+        provider: &mut impl ResourceProvider,
+        evaluator: &mut DensityEvaluator,
+        placement: &native_resources::structure_placement::ConcentricRingsPlacement,
+    ) -> Result<Vec<[i32; 2]>> {
+        let selector = placement.preferred_biomes();
+        let allowed = native_resources::surface_biomes::SurfaceBiomes::load(
+            provider,
+            std::slice::from_ref(selector),
+        )?;
+        let possible = &self.possible_biomes;
+        let mut preferred = std::collections::BTreeSet::new();
+        for biome in possible {
+            if allowed.matches(selector, biome)? {
+                preferred.insert(biome.clone());
+            }
+        }
+        let all_preferred = preferred.len() == possible.len();
+        let mut source = self.source.fresh_sampler();
+        placement.positions_with_search(self.seed, |initial, random| {
+            // Empty and universal holder sets do not require climate sampling;
+            // the reservoir still consumes the same random draws when universal.
+            if preferred.is_empty() {
+                return Ok(None);
+            }
+            source.reset_search_history();
+            native_resources::structure_placement::find_ring_biome(initial, random, |quart| {
+                if all_preferred {
+                    return Ok(true);
+                }
+                let biome = source.sample_quart(self.noise.router(), evaluator, quart);
+                Ok(preferred.contains(biome))
+            })
+        })
     }
     /// Call in the same chunk order as the world generator; equal-distance
     /// climate matches reuse the previous lookup, as in the Java thread.
@@ -623,6 +688,30 @@ mod tests {
             .unwrap();
         assert!(mask.is_empty());
         assert_eq!((mask.min_y(), mask.max_y()), (1, 8));
+    }
+    #[test]
+    fn ring_search_shortcuts_preserve_random_results_for_fixed_biomes() {
+        use native_resources::structure_placement::{ConcentricRingsPlacement, find_ring_biome};
+        let mut data = Data;
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        for (biome, all) in [("minecraft:plains", true), ("minecraft:the_end", false)] {
+            let placement=ConcentricRingsPlacement::decode(&json!({"type":"concentric_rings","distance":8,"spread":3,"count":5,"salt":0,"preferred_biomes":biome})).unwrap();
+            let actual = generator
+                .concentric_structure_positions(
+                    &mut data,
+                    &mut DensityEvaluator::default(),
+                    &placement,
+                )
+                .unwrap();
+            let expected = placement
+                .positions_with_search(42, |initial, rng| {
+                    find_ring_biome(initial, rng, |_| Ok(all))
+                })
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

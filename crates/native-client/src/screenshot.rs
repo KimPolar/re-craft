@@ -15,17 +15,73 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use image::ImageEncoder;
 
+/// Results from menu captures must outlive the menu window while a world opens.
+pub struct MenuScreenshots {
+    writer: Screenshots,
+    pending: std::cell::RefCell<std::collections::VecDeque<(Result<PathBuf>, std::time::Instant)>>,
+    window: Arc<std::sync::Mutex<std::sync::Weak<winit::window::Window>>>,
+}
+
+impl MenuScreenshots {
+    pub fn new() -> Result<Self> {
+        let window = Arc::new(std::sync::Mutex::new(std::sync::Weak::<
+            winit::window::Window,
+        >::new()));
+        let wake_window = Arc::clone(&window);
+        let writer = Screenshots::new_with_waker(move || {
+            if let Some(window) = wake_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade()
+            {
+                window.request_redraw();
+            }
+        })?;
+        Ok(Self {
+            writer,
+            pending: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            window,
+        })
+    }
+
+    pub fn set_window(&self, window: &Arc<winit::window::Window>) {
+        *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(window);
+    }
+
+    pub fn sender(&self) -> ScreenshotSender {
+        self.writer.sender()
+    }
+
+    pub fn collect(&self) {
+        let mut pending = self.pending.borrow_mut();
+        while let Some((result, completed)) = self.writer.take_timed_result() {
+            if pending.len() == 100 {
+                pending.pop_front();
+            }
+            pending.push_back((result, completed));
+        }
+    }
+
+    pub fn take(&self) -> Option<(Result<PathBuf>, std::time::Duration)> {
+        self.collect();
+        self.pending
+            .borrow_mut()
+            .pop_front()
+            .map(|(result, at)| (result, at.elapsed()))
+    }
+}
+
 /// Bounded queue: screenshot processing must never stall the render thread or
 /// consume an unbounded amount of GPU and CPU memory.
 pub struct Screenshots {
     sender: ScreenshotSender,
-    results: Receiver<Result<PathBuf>>,
+    results: Receiver<(Result<PathBuf>, std::time::Instant)>,
 }
 
 #[derive(Clone)]
 pub struct ScreenshotSender {
     jobs: SyncSender<Job>,
-    feedback: mpsc::Sender<Result<PathBuf>>,
+    feedback: mpsc::Sender<(Result<PathBuf>, std::time::Instant)>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -140,7 +196,8 @@ impl Screenshots {
             .name("screenshot-writer".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let _ = send_result.send(job.run());
+                    let result = job.run();
+                    let _ = send_result.send((result, std::time::Instant::now()));
                     worker_wake();
                 }
             })
@@ -171,13 +228,17 @@ impl Screenshots {
     }
 
     pub fn take_result(&self) -> Option<Result<PathBuf>> {
+        self.take_timed_result().map(|(result, _)| result)
+    }
+
+    fn take_timed_result(&self) -> Option<(Result<PathBuf>, std::time::Instant)> {
         self.results.try_recv().ok()
     }
 }
 
 impl ScreenshotSender {
     pub fn report_error(&self, error: anyhow::Error) {
-        let _ = self.feedback.send(Err(error));
+        let _ = self.feedback.send((Err(error), std::time::Instant::now()));
         (self.wake)();
     }
     pub fn submit(
@@ -371,6 +432,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn menu_results_survive_window_handoff_and_keep_completion_time() {
+        let captures = std::rc::Rc::new(MenuScreenshots::new().unwrap());
+        let old_screen = captures.clone();
+        let sender = old_screen.sender();
+        sender.report_error(anyhow::anyhow!("first"));
+        old_screen.collect();
+        drop(old_screen);
+        let dir = tempfile::tempdir().unwrap();
+        sender
+            .submit_software(dir.path(), (1, 1), vec![0x123456])
+            .unwrap();
+        let (first, age) = captures.take().unwrap();
+        assert_eq!(first.unwrap_err().to_string(), "first");
+        assert!(age < Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let saved = loop {
+            if let Some((result, _)) = captures.take() {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            saved.parent(),
+            Some(dir.path().join("screenshots").as_path())
+        );
+        assert!(saved.is_file());
+    }
+
+    #[test]
+    fn menu_capture_history_is_bounded() {
+        let captures = MenuScreenshots::new().unwrap();
+        let sender = captures.sender();
+        for index in 0..105 {
+            sender.report_error(anyhow::anyhow!("{index}"));
+        }
+        captures.collect();
+        assert_eq!(captures.pending.borrow().len(), 100);
+        assert_eq!(captures.take().unwrap().0.unwrap_err().to_string(), "5");
+    }
+
+    #[test]
     fn padding_and_channel_order_are_removed_without_flipping_rows() {
         let input = [
             1, 2, 3, 0, 4, 5, 6, 0, 99, 99, 99, 99, 7, 8, 9, 0, 10, 11, 12, 0, 99, 99, 99, 99,
@@ -422,6 +525,7 @@ mod tests {
             .results
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
+            .0
             .unwrap();
         assert_eq!(
             image::open(file).unwrap().to_rgba8().as_raw(),

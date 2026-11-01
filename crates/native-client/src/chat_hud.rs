@@ -268,7 +268,7 @@ struct ChatLine {
     layout: LineLayout,
     bold_prefix: usize,
     links: Vec<Range<usize>>,
-    screenshot: Option<Arc<str>>,
+    screenshot: Option<Arc<std::path::PathBuf>>,
 }
 
 fn screenshot_message(template: &str, name: &str) -> (String, Vec<Range<usize>>) {
@@ -340,12 +340,13 @@ fn prepare_lines(
                     None,
                 )
             }
-            SystemMessageKind::ScreenshotSaved(name) => {
+            SystemMessageKind::ScreenshotSaved(path) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
                 let (text, links) = screenshot_message(
                     assets.translate("screenshot.success", "Saved screenshot as %s"),
-                    name,
+                    &name,
                 );
-                (text, None, links, Some(Arc::clone(name)))
+                (text, None, links, Some(Arc::clone(path)))
             }
             SystemMessageKind::ScreenshotFailed(reason) => (
                 assets
@@ -432,7 +433,7 @@ pub fn screenshot_at(
     height: i32,
     scroll: usize,
     cursor: (i32, i32),
-) -> Option<Arc<str>> {
+) -> Option<Arc<std::path::PathBuf>> {
     let measure = Canvas::new(1, 1);
     let (lines, _) = prepare_lines(&measure, assets, messages, 0, true, scroll, height)?;
     for (index, line) in lines.iter().enumerate() {
@@ -594,7 +595,9 @@ mod tests {
         let messages = [
             SystemMessage {
                 tick: 0,
-                kind: SystemMessageKind::ScreenshotSaved("first-long-name.png".into()),
+                kind: SystemMessageKind::ScreenshotSaved(
+                    std::path::PathBuf::from("first-long-name.png").into(),
+                ),
             },
             SystemMessage {
                 tick: 1,
@@ -602,7 +605,9 @@ mod tests {
             },
             SystemMessage {
                 tick: 2,
-                kind: SystemMessageKind::ScreenshotSaved("second-long-name.png".into()),
+                kind: SystemMessageKind::ScreenshotSaved(
+                    std::path::PathBuf::from("second-long-name.png").into(),
+                ),
             },
         ];
         let measure = Canvas::new(1, 1);

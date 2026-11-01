@@ -406,7 +406,7 @@ pub struct DeathInfo {
 pub enum SystemMessageKind {
     MissingRespawnBlock,
     DebugFocusPause(bool),
-    ScreenshotSaved(Arc<str>),
+    ScreenshotSaved(Arc<std::path::PathBuf>),
     ScreenshotFailed(Arc<str>),
     LocalChat(Arc<str>),
     CommandUnavailable,

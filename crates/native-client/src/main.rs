@@ -436,6 +436,7 @@ fn run_cli() -> Result<()> {
         menu_settings::VideoSettings::default(),
         None,
         false,
+        None,
     )
     .map(|_| ())
 }
@@ -483,9 +484,11 @@ fn run_demo(
     video: menu_settings::VideoSettings,
     audio: Option<audio::UiAudio>,
     hud_hidden: bool,
+    menu_screenshots: Option<std::rc::Rc<screenshot::MenuScreenshots>>,
 ) -> Result<GameExit> {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(atlas, smoke_test, assets, content, video);
+    app.menu_screenshots = menu_screenshots;
     app.audio = audio.clone();
     if let Some(ui) = &mut app.ui {
         ui.set_audio(audio);
@@ -586,7 +589,7 @@ fn view_existing_world(
     assets: Option<Arc<MenuAssets>>,
 ) -> Result<GameExit> {
     let prepared = prepare_existing_world(world_dir, minecraft_dir, packs, options, assets)?;
-    run_prepared_world(event_loop, prepared, None, false)
+    run_prepared_world(event_loop, prepared, None, false, None)
 }
 
 fn run_prepared_world(
@@ -594,6 +597,7 @@ fn run_prepared_world(
     prepared: PreparedWorld,
     audio: Option<audio::UiAudio>,
     hud_hidden: bool,
+    menu_screenshots: Option<std::rc::Rc<screenshot::MenuScreenshots>>,
 ) -> Result<GameExit> {
     match prepared {
         PreparedWorld::Play(world) => {
@@ -625,6 +629,7 @@ fn run_prepared_world(
                 video,
                 audio,
                 hud_hidden,
+                menu_screenshots,
             )
         }
         #[cfg(debug_assertions)]
@@ -1574,6 +1579,18 @@ fn request_game_screenshot(ui: &Option<GameUi>, renderer: &mut Option<Renderer>)
     }
 }
 
+fn deliver_menu_screenshots(
+    ui: Option<&mut GameUi>,
+    screenshots: Option<&screenshot::MenuScreenshots>,
+    tick: u64,
+) {
+    if let (Some(ui), Some(screenshots)) = (ui, screenshots) {
+        while let Some((result, age)) = screenshots.take() {
+            ui.screenshot_result_with_age(result, tick, age);
+        }
+    }
+}
+
 fn handle_chat_key(
     ui: &mut GameUi,
     key: PhysicalKey,
@@ -1726,6 +1743,7 @@ struct App {
     hotbar_scroll: mouse_scroll::HotbarScroll,
     captured: bool,
     ui: Option<GameUi>,
+    menu_screenshots: Option<std::rc::Rc<screenshot::MenuScreenshots>>,
     audio: Option<audio::UiAudio>,
     audio_listener: Option<(glam::DVec3, f32)>,
     inventory_wait: Option<u64>,
@@ -1800,6 +1818,7 @@ impl App {
             hotbar_scroll: mouse_scroll::HotbarScroll::default(),
             captured: false,
             ui,
+            menu_screenshots: None,
             audio: None,
             audio_listener: None,
             inventory_wait: None,
@@ -2109,6 +2128,11 @@ impl App {
         #[cfg(debug_assertions)]
         let now = Instant::now();
         let snapshot = self.session.snapshot();
+        deliver_menu_screenshots(
+            self.ui.as_mut(),
+            self.menu_screenshots.as_deref(),
+            snapshot.tick,
+        );
         if let (Some(ui), Some(renderer)) = (&mut self.ui, &mut self.renderer) {
             while let Some(result) = renderer.take_screenshot_result() {
                 ui.screenshot_result(result, snapshot.tick);
@@ -2217,6 +2241,9 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        if let Some(screenshots) = &self.menu_screenshots {
+            screenshots.set_window(&window);
+        }
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
             &self.atlas,
@@ -3212,14 +3239,7 @@ mod video_window_tests {
                 } else if let Some(message) = self.app.ui.as_ref().unwrap().last_system_message() {
                     match message {
                         native_session::SystemMessageKind::ScreenshotSaved(name) => {
-                            let path = self
-                                .app
-                                .ui
-                                .as_ref()
-                                .unwrap()
-                                .minecraft_dir()
-                                .join("screenshots")
-                                .join(name.as_ref());
+                            let path = name.as_ref().clone();
                             if !self.screenshots.contains(&path) {
                                 self.screenshots.push(path);
                                 if self.screenshots.len() == 1 {

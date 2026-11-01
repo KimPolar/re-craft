@@ -30,6 +30,9 @@ use crate::{
 #[cfg(test)]
 use crate::menu::gui_scale;
 
+// Reserve enough tick history to age messages created before the world starts.
+const CHAT_AGE_OFFSET: u64 = 200;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PauseAction {
     None,
@@ -416,7 +419,7 @@ impl GameUi {
         self.video_dirty = true;
         self.local_messages.push(native_session::SystemMessage {
             kind: native_session::SystemMessageKind::DebugFocusPause(enabled),
-            tick,
+            tick: tick.saturating_add(CHAT_AGE_OFFSET),
         });
         if self.local_messages.len() > 100 {
             self.local_messages.remove(0);
@@ -425,20 +428,27 @@ impl GameUi {
     }
 
     pub fn screenshot_result(&mut self, result: Result<std::path::PathBuf>, tick: u64) {
+        self.screenshot_result_with_age(result, tick, std::time::Duration::ZERO);
+    }
+
+    pub fn screenshot_result_with_age(
+        &mut self,
+        result: Result<std::path::PathBuf>,
+        tick: u64,
+        age: std::time::Duration,
+    ) {
         let kind = match result {
-            Ok(path) => native_session::SystemMessageKind::ScreenshotSaved(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-                    .into(),
-            ),
+            Ok(path) => native_session::SystemMessageKind::ScreenshotSaved(path.into()),
             Err(error) => {
                 native_session::SystemMessageKind::ScreenshotFailed(format!("{error:#}").into())
             }
         };
-        self.local_messages
-            .push(native_session::SystemMessage { kind, tick });
+        self.local_messages.push(native_session::SystemMessage {
+            kind,
+            tick: tick
+                .saturating_add(CHAT_AGE_OFFSET)
+                .saturating_sub((age.as_millis() / 50).min(CHAT_AGE_OFFSET as u128) as u64),
+        });
         if self.local_messages.len() > 100 {
             self.local_messages.remove(0);
         }
@@ -497,7 +507,7 @@ impl GameUi {
         }
         let (width, height) = self.logical_size();
         if !shift
-            && let Some(name) = crate::chat_hud::screenshot_at(
+            && let Some(path) = crate::chat_hud::screenshot_at(
                 &self.assets,
                 &self.system_messages,
                 height,
@@ -505,17 +515,17 @@ impl GameUi {
                 self.cursor,
             )
         {
-            let mut components = std::path::Path::new(name.as_ref()).components();
-            if matches!(components.next(), Some(std::path::Component::Normal(_)))
-                && components.next().is_none()
+            if path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|name| name == "screenshots")
+                && path.file_name().is_some()
+                && !path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
             {
                 self.chat_input.register_click(std::time::Instant::now());
-                return Some(
-                    self.assets
-                        .minecraft_dir
-                        .join("screenshots")
-                        .join(name.as_ref()),
-                );
+                return Some(path.as_ref().clone());
             }
         }
         if self.cursor.0 >= 4
@@ -568,8 +578,10 @@ impl GameUi {
             } else {
                 native_session::SystemMessageKind::LocalChat(text.clone().into())
             };
-            self.local_messages
-                .push(native_session::SystemMessage { kind, tick });
+            self.local_messages.push(native_session::SystemMessage {
+                kind,
+                tick: tick.saturating_add(CHAT_AGE_OFFSET),
+            });
             if self.local_messages.len() > 100 {
                 self.local_messages.remove(0);
             }
@@ -586,6 +598,9 @@ impl GameUi {
 
     fn merge_chat_messages(&mut self) {
         let mut messages = self.snapshot_messages.to_vec();
+        for message in &mut messages {
+            message.tick = message.tick.saturating_add(CHAT_AGE_OFFSET);
+        }
         messages.extend_from_slice(&self.local_messages);
         messages.sort_by_key(|message| message.tick);
         if messages.len() > 100 {
@@ -2175,7 +2190,11 @@ impl GameUi {
             hud: self.hud,
             experience: self.experience,
             hud_tick: self.hud.animation_key(tick),
-            chat: crate::chat_hud::display_key(&self.assets.chat, &self.system_messages, tick),
+            chat: crate::chat_hud::display_key(
+                &self.assets.chat,
+                &self.system_messages,
+                tick.saturating_add(CHAT_AGE_OFFSET),
+            ),
             chat_input_tick: self
                 .chat_input
                 .is_open()
@@ -2248,7 +2267,12 @@ impl GameUi {
             crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
             crate::experience_hud::draw(&mut canvas, assets, self.experience);
             if !self.chat_input.is_open() {
-                crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
+                crate::chat_hud::draw(
+                    &mut canvas,
+                    assets,
+                    &self.system_messages,
+                    tick.saturating_add(CHAT_AGE_OFFSET),
+                );
             }
             crate::action_bar::draw(
                 &mut canvas,
@@ -2974,7 +2998,7 @@ impl GameUi {
                 &mut canvas,
                 assets,
                 &self.system_messages,
-                tick,
+                tick.saturating_add(CHAT_AGE_OFFSET),
                 self.chat_input.scroll_offset(),
             );
             self.chat_input.clamp_scroll(max_scroll);
@@ -3449,6 +3473,44 @@ mod inventory_tests {
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn menu_capture_results_arrive_in_game_before_and_after_handoff() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&game, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let captures = crate::screenshot::MenuScreenshots::new().unwrap();
+        let sender = captures.sender();
+        sender.report_error(anyhow::anyhow!("capture before transition"));
+        captures.collect();
+        crate::deliver_menu_screenshots(Some(&mut ui), Some(&captures), 0);
+        assert!(
+            matches!(ui.last_system_message(), Some(native_session::SystemMessageKind::ScreenshotFailed(error)) if error.contains("before transition"))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        sender
+            .submit_software(dir.path(), (1, 1), vec![0xff0000])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            crate::deliver_menu_screenshots(Some(&mut ui), Some(&captures), 1);
+            if let Some(native_session::SystemMessageKind::ScreenshotSaved(path)) =
+                ui.last_system_message()
+            {
+                assert_eq!(
+                    path.parent(),
+                    Some(dir.path().join("screenshots").as_path())
+                );
+                assert!(path.is_file());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
     fn screenshot_click_only_resolves_a_visible_safe_filename() {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
@@ -3473,9 +3535,32 @@ mod inventory_tests {
         );
         ui.cursor = (4, height - 40 - 8 + 1);
         assert_eq!(ui.chat_click(false), None);
+        let other = tempfile::tempdir().unwrap();
+        let original = other.path().join("screenshots/other.png");
+        ui.screenshot_result_with_age(Ok(original.clone()), 0, std::time::Duration::from_secs(15));
+        assert_eq!(ui.system_messages.first().unwrap().tick, 0);
+        assert_eq!(
+            crate::chat_hud::display_key(
+                &ui.assets.chat,
+                &ui.system_messages[..1],
+                CHAT_AGE_OFFSET
+            ),
+            None
+        );
+        assert_eq!(ui.chat_click(false), None); // still over the prefix
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        // The newest displayed message is the earlier, unexpired capture.
+        assert_eq!(
+            ui.chat_click(false),
+            Some(game.join("screenshots/test.png"))
+        );
+        ui.system_messages = Arc::from([ui.system_messages.first().unwrap().clone()]);
+        assert_eq!(ui.chat_click(false), Some(original));
         ui.system_messages = Arc::from([native_session::SystemMessage {
             tick: 0,
-            kind: native_session::SystemMessageKind::ScreenshotSaved("../outside.png".into()),
+            kind: native_session::SystemMessageKind::ScreenshotSaved(
+                std::path::PathBuf::from("../outside.png").into(),
+            ),
         }]);
         ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
         assert_eq!(ui.chat_click(false), None);

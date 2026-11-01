@@ -177,7 +177,7 @@ pub fn run(
     video: VideoSettings,
 ) -> Result<crate::GameExit> {
     run_inner(
-        event_loop, scene, camera, smoke_test, None, None, None, video, None, false,
+        event_loop, scene, camera, smoke_test, None, None, None, video, None, false, None,
     )
 }
 
@@ -197,6 +197,7 @@ pub fn run_play(
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
     hud_hidden: bool,
+    menu_screenshots: Option<std::rc::Rc<crate::screenshot::MenuScreenshots>>,
 ) -> Result<crate::GameExit> {
     let mut session = session;
     session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
@@ -268,6 +269,7 @@ pub fn run_play(
         video,
         audio,
         hud_hidden,
+        menu_screenshots,
     )
 }
 
@@ -283,6 +285,7 @@ fn run_inner(
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
     hud_hidden: bool,
+    menu_screenshots: Option<std::rc::Rc<crate::screenshot::MenuScreenshots>>,
 ) -> Result<crate::GameExit> {
     let _ = smoke_test;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -306,6 +309,7 @@ fn run_inner(
         visual_look: crate::visual_look::VisualLook::default(),
         play,
         ui,
+        menu_screenshots,
         audio,
         audio_listener: None,
         inventory_wait: None,
@@ -393,6 +397,7 @@ struct Viewer {
     visual_look: crate::visual_look::VisualLook,
     play: Option<PlayState>,
     ui: Option<GameUi>,
+    menu_screenshots: Option<std::rc::Rc<crate::screenshot::MenuScreenshots>>,
     audio: Option<crate::audio::UiAudio>,
     audio_listener: Option<(glam::DVec3, f32)>,
     inventory_wait: Option<u64>,
@@ -774,6 +779,11 @@ impl Viewer {
         let now = Instant::now();
         if let Some(play) = &self.play {
             let snapshot = play.session.snapshot();
+            crate::deliver_menu_screenshots(
+                self.ui.as_mut(),
+                self.menu_screenshots.as_deref(),
+                snapshot.tick,
+            );
             if let (Some(ui), Some(renderer)) = (&mut self.ui, &mut self.renderer) {
                 while let Some(result) = renderer.take_screenshot_result() {
                     ui.screenshot_result(result, snapshot.tick);
@@ -1184,6 +1194,9 @@ impl ApplicationHandler for Viewer {
                 return;
             }
         };
+        if let Some(screenshots) = &self.menu_screenshots {
+            screenshots.set_window(&window);
+        }
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
             &self.scene.atlas.texture,

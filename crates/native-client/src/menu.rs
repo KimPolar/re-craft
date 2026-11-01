@@ -3,6 +3,7 @@
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -207,6 +208,7 @@ fn take_scroll_steps(remainder: &mut f64, amount: f64) -> i32 {
 
 struct State {
     minecraft_dir: PathBuf,
+    menu_screenshots: Option<Rc<crate::screenshot::MenuScreenshots>>,
     audio: Option<crate::audio::Audio>,
     video: VideoSettings,
     panorama_seconds: f64,
@@ -332,6 +334,7 @@ impl State {
     fn new(minecraft_dir: PathBuf, packs: Vec<PathBuf>) -> Self {
         let mut state = Self {
             minecraft_dir,
+            menu_screenshots: None,
             audio: None,
             video: VideoSettings::default(),
             panorama_seconds: 0.0,
@@ -706,10 +709,15 @@ pub fn run() -> Result<()> {
                         video,
                         audio,
                         state.hud_hidden,
+                        state.menu_screenshots.clone(),
                     ),
-                    PreparedLaunch::World(world) => {
-                        crate::run_prepared_world(&mut event_loop, world, audio, state.hud_hidden)
-                    }
+                    PreparedLaunch::World(world) => crate::run_prepared_world(
+                        &mut event_loop,
+                        world,
+                        audio,
+                        state.hud_hidden,
+                        state.menu_screenshots.clone(),
+                    ),
                 };
                 match result {
                     Ok(crate::GameExit::Quit) => return Ok(()),
@@ -894,7 +902,7 @@ struct Menu<'a> {
     software_generation: u64,
     software_scene: Option<SoftwareScene>,
     software_frame_due: bool,
-    screenshots: Option<crate::screenshot::Screenshots>,
+    screenshots: Option<Rc<crate::screenshot::MenuScreenshots>>,
     screenshot_requests: std::collections::VecDeque<PathBuf>,
     #[cfg(test)]
     software_presented: Option<((u32, u32), u64, usize)>,
@@ -2856,11 +2864,14 @@ impl ApplicationHandler for Menu<'_> {
             .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
         let result = (|| -> Result<_> {
             let window = Arc::new(event_loop.create_window(attributes)?);
-            let screenshot_window = Arc::clone(&window);
-            let screenshots = crate::screenshot::Screenshots::new_with_waker(move || {
-                screenshot_window.request_redraw()
-            })
-            .ok();
+            let screenshots = self
+                .state
+                .menu_screenshots
+                .clone()
+                .or_else(|| crate::screenshot::MenuScreenshots::new().ok().map(Rc::new));
+            if let Some(screenshots) = &screenshots {
+                screenshots.set_window(&window);
+            }
             let gpu = match MenuGpuWorker::new(Arc::clone(&window), self.state.video.vsync) {
                 Ok(renderer) => Some(renderer),
                 Err(error) => {
@@ -2898,6 +2909,7 @@ impl ApplicationHandler for Menu<'_> {
                 self.window = Some(window);
                 self.surface = surface;
                 self.gpu = gpu;
+                self.state.menu_screenshots = screenshots.clone();
                 self.screenshots = screenshots;
             }
             Err(error) => self.fail(event_loop, error),
@@ -3573,15 +3585,8 @@ impl ApplicationHandler for Menu<'_> {
         if self.action.is_some() {
             return;
         }
-        while let Some(result) = self
-            .screenshots
-            .as_ref()
-            .and_then(|writer| writer.take_result())
-        {
-            if let Err(error) = result {
-                self.state.error = Some(format!("Couldn't save screenshot: {error:#}"));
-                self.invalidate();
-            }
+        if let Some(screenshots) = &self.screenshots {
+            screenshots.collect();
         }
         if let (Some(gpu), Some(window)) = (&self.gpu, &self.window) {
             gpu.service_surfaces(window);
@@ -3651,6 +3656,13 @@ impl ApplicationHandler for Menu<'_> {
 impl Drop for Menu<'_> {
     fn drop(&mut self) {
         self.state.panorama_seconds = self.panorama.seconds;
+        if let Some(screenshots) = &self.screenshots {
+            for _ in self.screenshot_requests.drain(..) {
+                screenshots
+                    .sender()
+                    .report_error(anyhow::anyhow!("menu closed before taking screenshot"));
+            }
+        }
         // A detached renderer can retain the window until a stalled driver
         // returns; hide it before entering another screen or quitting.
         if let Some(window) = &self.window {
@@ -3932,6 +3944,22 @@ mod tests {
             assert!(image.pixels().all(|pixel| pixel[3] == 255));
             assert!(image.pixels().any(|pixel| pixel != image.get_pixel(0, 0)));
         }
+        let captures = harness.menu.screenshots.as_ref().unwrap().clone();
+        let assets = harness.menu.state.assets.as_ref().unwrap().clone();
+        drop(harness);
+        let mut game_ui = crate::game_ui::GameUi::new(assets);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while game_ui.last_system_message().is_none() {
+            crate::deliver_menu_screenshots(Some(&mut game_ui), Some(&captures), 0);
+            assert!(
+                Instant::now() < deadline,
+                "menu capture result was lost on transition"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(game_ui.last_system_message(), Some(native_session::SystemMessageKind::ScreenshotSaved(path)) if path.is_file())
+        );
     }
 
     #[test]
@@ -4539,6 +4567,7 @@ mod tests {
                         video,
                         None,
                         false,
+                        None,
                     )
                     .unwrap();
                 }

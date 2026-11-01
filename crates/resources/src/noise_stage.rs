@@ -217,6 +217,49 @@ struct NoiseAquiferSampler<'a> {
     sea: i32,
     fluid: AquiferMaterial,
 }
+
+/// A target-chunk aquifer for the post-surface carver pass. A fresh instance
+/// uses the same seeded centers and density inputs as the noise stage.
+pub struct CarvingAquifer<'a> {
+    inner: Option<(AquiferGenerator<AquiferMaterial>, NoiseAquiferSampler<'a>)>,
+    sea_level: i32,
+    chunk: [i32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CarvingAquiferResult {
+    /// None means Java's aquifer declined to replace this block.
+    pub material: Option<NoiseMaterial>,
+    pub schedule_fluid_update: bool,
+}
+impl CarvingAquifer<'_> {
+    pub fn sample(&mut self, x: i32, y: i32, z: i32) -> Result<CarvingAquiferResult> {
+        ensure!(
+            [x.div_euclid(16), z.div_euclid(16)] == self.chunk,
+            "aquifer sample outside target chunk"
+        );
+        if let Some((aquifer, sampler)) = &mut self.inner {
+            let result = aquifer.sample(sampler, x, y, z, 0.0);
+            let material = result.block.map(|block| match block {
+                AquiferMaterial::Air => NoiseMaterial::Air,
+                AquiferMaterial::Lava => NoiseMaterial::Lava,
+                AquiferMaterial::DefaultWater
+                | AquiferMaterial::DefaultLava
+                | AquiferMaterial::DefaultAir
+                | AquiferMaterial::DefaultOther => NoiseMaterial::DefaultFluid,
+            });
+            Ok(CarvingAquiferResult {
+                material,
+                schedule_fluid_update: result.schedule_fluid_update,
+            })
+        } else {
+            Ok(CarvingAquiferResult {
+                material: Some(select_without_aquifer(0.0, y, self.sea_level)),
+                schedule_fluid_update: false,
+            })
+        }
+    }
+}
 impl AquiferSampler for NoiseAquiferSampler<'_> {
     type Block = AquiferMaterial;
     fn global(&mut self, _: i32, y: i32, _: i32) -> FluidStatus<Self::Block> {
@@ -253,6 +296,46 @@ impl AquiferSampler for NoiseAquiferSampler<'_> {
 }
 
 impl NoiseStageGenerator {
+    pub fn carving_aquifer<'a>(
+        &'a self,
+        evaluator: &'a mut DensityEvaluator,
+        chunk: [i32; 2],
+    ) -> Result<CarvingAquifer<'a>> {
+        let inner = if let Some(functions) = &self.aquifer {
+            let area = AquiferSurfaceArea::for_chunk(chunk[0], chunk[1])
+                .context("chunk aquifer surface coordinates overflow")?;
+            let surface = evaluator.sample_quart_surface(
+                &functions.surface,
+                area.min_x,
+                area.min_z,
+                area.size_x,
+                area.size_z,
+            )?;
+            let generator = AquiferGenerator::from_surface_volume(
+                self.seed,
+                self.router.random == WorldgenRandom::Legacy,
+                area,
+                &surface,
+            )
+            .map_err(anyhow::Error::msg)?;
+            Some((
+                generator,
+                NoiseAquiferSampler {
+                    functions,
+                    evaluator,
+                    sea: self.sea_level,
+                    fluid: self.default_aquifer_fluid,
+                },
+            ))
+        } else {
+            None
+        };
+        Ok(CarvingAquifer {
+            inner,
+            sea_level: self.sea_level,
+            chunk,
+        })
+    }
     pub fn router(&self) -> &NoiseRouter {
         &self.router
     }
@@ -531,6 +614,29 @@ mod tests {
         assert_eq!(chunk.get(0, 8, 0), Some(NoiseMaterial::Air));
         assert_eq!(chunk.get(16, 8, 0), None);
         assert_eq!(chunk.default_block, definition()["default_block"]);
+        let mut carving = generator.carving_aquifer(&mut evaluator, [-1, 2]).unwrap();
+        assert_eq!(
+            carving.sample(-16, -55, 32).unwrap(),
+            CarvingAquiferResult {
+                material: Some(NoiseMaterial::Lava),
+                schedule_fluid_update: false
+            }
+        );
+        assert_eq!(
+            carving.sample(-16, 7, 32).unwrap(),
+            CarvingAquiferResult {
+                material: Some(NoiseMaterial::DefaultFluid),
+                schedule_fluid_update: false
+            }
+        );
+        assert_eq!(
+            carving.sample(-16, 8, 32).unwrap(),
+            CarvingAquiferResult {
+                material: Some(NoiseMaterial::Air),
+                schedule_fluid_update: false
+            }
+        );
+        assert!(carving.sample(0, 8, 32).is_err());
         let mut aquifer = definition();
         aquifer["aquifers"] = json!({});
         assert!(

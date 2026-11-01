@@ -29,6 +29,7 @@ public class AquiferDefaultStatesOracle {
         DensitySamplerSet set=f -> new DensitySampler.Bound(compiler.getSampler(f),SamplerContext.EMPTY_UNCACHED);
         var factory=new LegacyRandomSource(12345).forkPositional().fromHashOf(Identifier.withDefaultNamespace("aquifer")).forkPositional();
         var volume=new DensityVolume(16,128,16,-16,-64,32);
+        double density=args.length==0 ? -1.0 : Double.parseDouble(args[0]);
         for(int s=0;s<states.length;s++) {
             BlockState fluid=BlockState.CODEC.parse(JsonOps.INSTANCE,JsonParser.parseString(states[s])).getOrThrow();
             var global=(Aquifer.FluidPicker)(x,y,z) -> y < -54 ? new Aquifer.FluidStatus(-54,Blocks.LAVA.defaultBlockState()) : new Aquifer.FluidStatus(32,fluid);
@@ -36,7 +37,7 @@ public class AquiferDefaultStatesOracle {
             out.printf("S %d%n",s);
             for(int n=0;n<2048;n++) {
                 int x=(n*7)%16, z=(n*11+n/128)%16, y=(n*37)%128-64;
-                BlockState state=aquifer.computeSubstance(-16+x,y,32+z,-1);
+                BlockState state=aquifer.computeSubstance(-16+x,y,32+z,density);
                 int code=state==null?0:state==Blocks.AIR.defaultBlockState()?3:state==Blocks.LAVA.defaultBlockState()?2:state==fluid?1:-1;
                 if(code<0) throw new AssertionError("unexpected state "+state);
                 out.printf("P %d %d %d %d %d%n",x,y,z,code,aquifer.shouldScheduleFluidUpdate()?1:0);

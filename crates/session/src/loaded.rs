@@ -645,6 +645,11 @@ pub struct LoadedSession {
     ice_pending: BTreeSet<(i32, i32, i32)>,
     unresolved_ice_tick: bool,
     applying_ice_tick: bool,
+    bubble_ticks: BTreeMap<(i128, i32, i64, u64), BubbleTickKey>,
+    bubble_deferred: BTreeMap<(i128, i32, i64, u64), BubbleTickKey>,
+    bubble_deferred_revision: Option<u64>,
+    bubble_pending: BTreeSet<BubbleTickKey>,
+    unresolved_bubble_tick: bool,
     block_tick_sequence: u64,
     button_sounds: VecDeque<ButtonSoundEvent>,
     lever_sounds: VecDeque<LeverSoundEvent>,
@@ -724,6 +729,20 @@ struct ButtonTickKey {
 }
 
 type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), ButtonTickKey>;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum BubbleTickKind {
+    Water,
+    Column,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BubbleTickKey {
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: BubbleTickKind,
+}
 
 /// Transient, ordered presentation events emitted by completed game ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3217,6 +3236,10 @@ impl LoadedSession {
             "frosted ice tick effects are not yet fully tracked for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_bubble_tick,
+            "bubble column effects are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
         );
@@ -4695,6 +4718,7 @@ impl LoadedSession {
     ) {
         self.bubble_column_tags = Some(tags);
         self.ice_deferred_state = None;
+        self.bubble_deferred_revision = None;
         self.location_failure_revision = None;
         self.location_last_position = None;
     }
@@ -5376,6 +5400,11 @@ impl LoadedSession {
             ice_pending: BTreeSet::new(),
             unresolved_ice_tick: false,
             applying_ice_tick: false,
+            bubble_ticks: BTreeMap::new(),
+            bubble_deferred: BTreeMap::new(),
+            bubble_deferred_revision: None,
+            bubble_pending: BTreeSet::new(),
+            unresolved_bubble_tick: false,
             block_tick_sequence: 0,
             button_sounds: VecDeque::new(),
             lever_sounds: VecDeque::new(),
@@ -5423,6 +5452,7 @@ impl LoadedSession {
             session.enqueue_saved_buttons(&ticks);
             session.enqueue_saved_lamps(&ticks);
             session.enqueue_saved_ice(&ticks);
+            session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
         }
         Ok(session)
@@ -7140,6 +7170,18 @@ impl LoadedSession {
     pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
         ensure!(
+            !self.unresolved_bubble_tick,
+            "bubble column effects are not yet fully tracked for saving"
+        );
+        ensure!(
+            !self
+                .bubble_ticks
+                .values()
+                .chain(self.bubble_deferred.values())
+                .any(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z),
+            "bubble column tick storage is not yet supported"
+        );
+        ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
         );
@@ -8301,6 +8343,7 @@ impl LoadedSession {
                     self.enqueue_saved_buttons(&sand_ticks);
                     self.enqueue_saved_lamps(&sand_ticks);
                     self.enqueue_saved_ice(&sand_ticks);
+                    self.enqueue_saved_bubble(&sand_ticks);
                     self.enqueue_saved_soil(&sand_ticks);
                 }
             }
@@ -8507,6 +8550,7 @@ impl LoadedSession {
                                     self.enqueue_saved_buttons(&saved_sand_ticks);
                                     self.enqueue_saved_lamps(&saved_sand_ticks);
                                     self.enqueue_saved_ice(&saved_sand_ticks);
+                                    self.enqueue_saved_bubble(&saved_sand_ticks);
                                     self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
                                 changed = true;
@@ -12576,6 +12620,65 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_bubble(&mut self, ticks: &[SavedBlockTick]) {
+        for (index, tick) in ticks.iter().enumerate() {
+            let kind = match tick.block.as_str() {
+                "minecraft:water" | "water" => BubbleTickKind::Water,
+                "minecraft:bubble_column" | "bubble_column" => BubbleTickKind::Column,
+                _ => continue,
+            };
+            let [x, y, z] = tick.position;
+            let key = BubbleTickKey { x, y, z, kind };
+            if !self.bubble_pending.insert(key) {
+                continue;
+            }
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.bubble_ticks.insert(
+                (
+                    i128::from(self.tick) + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_bubble(&mut self, relative: IVec3, kind: BubbleTickKind, delay: i32) {
+        let Some(absolute) = add(self.origin, relative) else {
+            return;
+        };
+        let key = BubbleTickKey {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+            kind,
+        };
+        if !self.bubble_pending.insert(key) {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.x, key.z);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.bubble_ticks.insert(
+            (
+                i128::from(self.tick) + i128::from(delay),
+                0,
+                i64::try_from(sequence).unwrap_or(i64::MAX),
+                sequence,
+            ),
+            key,
+        );
+    }
+
     fn enqueue_saved_ice(&mut self, ticks: &[SavedBlockTick]) {
         for (index, tick) in ticks.iter().enumerate() {
             if !matches!(tick.block.as_str(), "minecraft:frosted_ice" | "frosted_ice") {
@@ -12871,17 +12974,17 @@ impl LoadedSession {
     }
 
     fn advance_block_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, true, true, true, true);
+        self.advance_scheduled_block_ticks(true, true, true, true, true, true);
     }
 
     #[cfg(test)]
     fn advance_sand_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, false, false, false, false);
+        self.advance_scheduled_block_ticks(true, false, false, false, false, false);
     }
 
     #[cfg(test)]
     fn advance_soil_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(false, false, true, false, false);
+        self.advance_scheduled_block_ticks(false, false, true, false, false, false);
     }
 
     fn advance_scheduled_block_ticks(
@@ -12891,6 +12994,7 @@ impl LoadedSession {
         process_soil: bool,
         process_lamps: bool,
         process_ice: bool,
+        process_bubble: bool,
     ) {
         let revision = self.revision;
         let ice_state = (
@@ -12900,6 +13004,9 @@ impl LoadedSession {
         );
         if process_ice && self.ice_deferred_state != Some(ice_state) {
             self.ice_ticks.append(&mut self.ice_deferred);
+        }
+        if process_bubble && self.bubble_deferred_revision != Some(revision) {
+            self.bubble_ticks.append(&mut self.bubble_deferred);
         }
         if process_sand && self.sand_deferred_revision != Some(revision) {
             self.sand_ticks.append(&mut self.sand_deferred);
@@ -12918,6 +13025,7 @@ impl LoadedSession {
         let mut deferred_soil = Vec::new();
         let mut deferred_lamps = Vec::new();
         let mut deferred_ice = Vec::new();
+        let mut deferred_bubble = Vec::new();
         let mut executed = 0;
         while executed < 65_536 {
             let sand_order = process_sand
@@ -12935,12 +13043,16 @@ impl LoadedSession {
             let ice_order = process_ice
                 .then(|| self.ice_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let bubble_order = process_bubble
+                .then(|| self.bubble_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
             let Some((order, kind)) = [
                 (sand_order, 0),
                 (button_order, 1),
                 (soil_order, 2),
                 (lamp_order, 3),
                 (ice_order, 4),
+                (bubble_order, 5),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -13231,6 +13343,103 @@ impl LoadedSession {
                     continue;
                 }
                 executed += 1;
+            } else if kind == 5 {
+                self.unresolved_bubble_tick = true;
+                let (order, key) = self
+                    .bubble_ticks
+                    .pop_first()
+                    .expect("selected bubble tick remains queued");
+                let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    deferred_bubble.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    deferred_bubble.push((order, key));
+                    continue;
+                };
+                let Some(current) = self.world.state(id) else {
+                    deferred_bubble.push((order, key));
+                    continue;
+                };
+                let expected = match key.kind {
+                    BubbleTickKind::Water => "minecraft:water",
+                    BubbleTickKind::Column => "minecraft:bubble_column",
+                };
+                if current.name != expected {
+                    self.bubble_pending.remove(&key);
+                    self.mark_tick_chunk_dirty(key.x, key.z);
+                    executed += 1;
+                    continue;
+                }
+                let Some(tags) = self.bubble_column_tags.as_ref() else {
+                    deferred_bubble.push((order, key));
+                    continue;
+                };
+                let mut stage = BubbleTickStage {
+                    session: self,
+                    tags,
+                    overlay: BTreeMap::new(),
+                    actions: Vec::new(),
+                };
+                let valid_state = match key.kind {
+                    BubbleTickKind::Water => stage.water(current).map(|_| ()),
+                    BubbleTickKind::Column => stage.column(current),
+                };
+                let process = valid_state
+                    .and_then(|()| crate::bubble_column::update_column(&mut stage, relative, tags));
+                if process.is_err() {
+                    deferred_bubble.push((order, key));
+                    continue;
+                }
+                let actions = stage.actions;
+                let mut prepared = Vec::with_capacity(actions.len());
+                let mut valid = true;
+                for action in &actions {
+                    if let BubbleTickAction::Set(pos, state) = action {
+                        let id = self.intern_block(state.clone());
+                        if self.check_block_set(*pos, id, false, false).is_none() {
+                            valid = false;
+                            break;
+                        }
+                        prepared.push(Some((*pos, id)));
+                    } else {
+                        prepared.push(None);
+                    }
+                }
+                if !valid {
+                    deferred_bubble.push((order, key));
+                    continue;
+                }
+                self.bubble_pending.remove(&key);
+                self.mark_tick_chunk_dirty(key.x, key.z);
+                for (action, replacement) in actions.into_iter().zip(prepared) {
+                    if let Some((position, id)) = replacement {
+                        if !self.set_with_notify(position, id, false) {
+                            self.stream_errors
+                                .push("bubble column changed during application".into());
+                            break;
+                        }
+                    } else {
+                        match action {
+                            BubbleTickAction::Fluid(position, fluid) => self.schedule_fluid(
+                                position,
+                                fluid,
+                                self.fluid_settings().delay(fluid.kind),
+                            ),
+                            BubbleTickAction::Block(position, kind, delay) => {
+                                self.schedule_bubble(position, kind, delay)
+                            }
+                            BubbleTickAction::Set(..) => unreachable!(),
+                        }
+                    }
+                }
+                executed += 1;
             } else {
                 let (order, (absolute, soil)) = self
                     .soil_ticks
@@ -13311,6 +13520,10 @@ impl LoadedSession {
         if process_ice {
             self.ice_deferred.extend(deferred_ice);
             self.ice_deferred_state = Some(ice_state);
+        }
+        if process_bubble {
+            self.bubble_deferred.extend(deferred_bubble);
+            self.bubble_deferred_revision = Some(revision);
         }
     }
 
@@ -14397,6 +14610,18 @@ impl LoadedSession {
                 unloaded.push((order, scheduled));
                 continue;
             };
+            // Bubble columns expose source water, but their fluid-spread
+            // callbacks are not simulated yet. Retain the scheduled tick.
+            if scheduled.key.kind == FluidKind::Water
+                && scheduled.key.source
+                && self
+                    .world
+                    .state(id)
+                    .is_some_and(|state| state.name == "minecraft:bubble_column")
+            {
+                unloaded.push((order, scheduled));
+                continue;
+            }
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             self.fluid_pending.remove(&scheduled.key);
             executed += 1;
@@ -18124,6 +18349,183 @@ enum IceTickAction {
 }
 
 /// Stage a tick before mutating the session or its random source.
+enum BubbleTickAction {
+    Set(IVec3, BlockState),
+    Fluid(IVec3, FluidState),
+    Block(IVec3, BubbleTickKind, i32),
+}
+
+/// Stage the supported liquid and column shape callbacks before changing a world.
+struct BubbleTickStage<'a> {
+    session: &'a LoadedSession,
+    tags: &'a native_resources::fluid_tags::BubbleColumnTags,
+    overlay: BTreeMap<[i32; 3], BlockState>,
+    actions: Vec<BubbleTickAction>,
+}
+
+impl BubbleTickStage<'_> {
+    fn push(&mut self, action: BubbleTickAction) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.actions.len() < 65_536,
+            "bubble update exceeds staging limit"
+        );
+        self.actions.push(action);
+        Ok(())
+    }
+
+    fn read(&self, pos: IVec3) -> anyhow::Result<BlockState> {
+        use anyhow::Context;
+        if let Some(state) = self.overlay.get(&pos.to_array()) {
+            return Ok(state.clone());
+        }
+        let Cell::State(id) = cell(
+            &self.session.world,
+            self.session.origin,
+            self.session.bounds,
+            pos,
+            self.session.states[0],
+        ) else {
+            anyhow::bail!("bubble neighbor is unavailable")
+        };
+        Ok(self
+            .session
+            .world
+            .state(id)
+            .context("bubble block state is unavailable")?
+            .clone())
+    }
+
+    fn water(&self, state: &BlockState) -> anyhow::Result<FluidState> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            state.name == "minecraft:water"
+                && state.properties.len() == 1
+                && state.properties.contains_key("level"),
+            "unsupported water state"
+        );
+        FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .context("water fluid state is unavailable")
+    }
+
+    fn column(&self, state: &BlockState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            state.name == "minecraft:bubble_column"
+                && state.properties.len() == 1
+                && matches!(
+                    state.properties.get("drag").map(String::as_str),
+                    Some("true" | "false")
+                ),
+            "unsupported bubble column state"
+        );
+        Ok(())
+    }
+
+    fn below(&self, pos: IVec3) -> anyhow::Result<BlockState> {
+        use anyhow::Context;
+        self.read(add(pos, IVec3::NEG_Y).context("bubble support position overflow")?)
+    }
+
+    fn try_schedule_water(
+        &mut self,
+        pos: IVec3,
+        water: FluidState,
+        support: &BlockState,
+    ) -> anyhow::Result<()> {
+        if water.source && self.tags.water_can_occupy() && self.tags.enables(&support.name) {
+            self.push(BubbleTickAction::Block(pos, BubbleTickKind::Water, 20))?;
+        }
+        Ok(())
+    }
+}
+
+impl crate::bubble_column::ColumnWorld for BubbleTickStage<'_> {
+    fn block(&mut self, position: IVec3) -> anyhow::Result<BlockState> {
+        self.read(position)
+    }
+
+    fn set_block(&mut self, position: IVec3, next: &BlockState) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        let old = self.read(position)?;
+        if old == *next {
+            return Ok(false);
+        }
+        match old.name.as_str() {
+            "minecraft:water" => {
+                self.water(&old)?;
+            }
+            "minecraft:bubble_column" => self.column(&old)?,
+            _ => anyhow::bail!("unsupported bubble replacement {}", old.name),
+        }
+        let absolute =
+            add(self.session.origin, position).context("bubble block position overflow")?;
+        anyhow::ensure!(
+            absolute.y >= self.session.bounds.min_y && absolute.y < self.session.bounds.max_y,
+            "bubble update outside build height"
+        );
+        if next.name == "minecraft:water" {
+            self.water(next)?;
+        } else {
+            self.column(next)?;
+        }
+        self.overlay.insert(position.to_array(), next.clone());
+        self.push(BubbleTickAction::Set(position, next.clone()))?;
+        if next.name == "minecraft:water" {
+            let water = self.water(next)?;
+            self.push(BubbleTickAction::Fluid(position, water))?;
+            let support = self.below(position)?;
+            self.try_schedule_water(position, water, &support)?;
+        }
+        for direction in [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_Y,
+            IVec3::Y,
+        ] {
+            let neighbor = add(position, direction).context("bubble neighbor position overflow")?;
+            let state = self.read(neighbor)?;
+            match state.name.as_str() {
+                "minecraft:water" => {
+                    let water = self.water(&state)?;
+                    self.push(BubbleTickAction::Fluid(neighbor, water))?;
+                    if direction == IVec3::Y {
+                        self.try_schedule_water(neighbor, water, next)?;
+                    }
+                }
+                "minecraft:bubble_column" => {
+                    self.column(&state)?;
+                    let fluid = FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .context("bubble fluid is unavailable")?;
+                    self.push(BubbleTickAction::Fluid(neighbor, fluid))?;
+                    let support = self.below(neighbor)?;
+                    let survives = support.name == "minecraft:bubble_column"
+                        || self.tags.enables(&support.name);
+                    let changed_below = direction == IVec3::Y;
+                    let occupiable_above = direction == IVec3::NEG_Y
+                        && next.name != "minecraft:bubble_column"
+                        && crate::bubble_column::can_occupy(next, self.tags)?;
+                    if !survives || changed_below || occupiable_above {
+                        self.push(BubbleTickAction::Block(neighbor, BubbleTickKind::Column, 5))?;
+                    }
+                }
+                "minecraft:air"
+                | "minecraft:cave_air"
+                | "minecraft:void_air"
+                | "minecraft:stone"
+                | "minecraft:glass"
+                | "minecraft:magma_block"
+                | "minecraft:soul_sand"
+                    if state.properties.is_empty() => {}
+                _ => anyhow::bail!("unsupported bubble neighbor {}", state.name),
+            }
+        }
+        Ok(true)
+    }
+}
+
 struct IceTickStage<'a> {
     session: &'a LoadedSession,
     age: u8,
@@ -29042,6 +29444,263 @@ pub(crate) mod tests {
             assert_eq!(
                 session.level_random.next_int(),
                 row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_bubble_ticks_apply_atomically_and_keep_unhandled_fluid_ticks() {
+        let setup = |unsupported: bool| {
+            let mut session = session();
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::new(
+                    BTreeSet::from(["minecraft:stone".into()]),
+                    BTreeSet::new(),
+                ),
+            ));
+            for (pos, block) in [
+                (IVec3::new(8, 9, 8), state("minecraft:stone", &[])),
+                (
+                    IVec3::new(8, 10, 8),
+                    state("minecraft:water", &[("level", "0")]),
+                ),
+                (
+                    IVec3::new(8, 11, 8),
+                    state("minecraft:water", &[("level", "0")]),
+                ),
+            ] {
+                let id = session.intern_block(block);
+                assert!(session.set_with_notify(pos, id, false));
+            }
+            if unsupported {
+                let id = session.intern_block(state("minecraft:oak_planks", &[]));
+                assert!(session.set_with_notify(IVec3::new(9, 11, 8), id, false));
+            }
+            let position = session.origin + IVec3::new(8, 10, 8);
+            session.enqueue_saved_bubble(&[SavedBlockTick {
+                block: "minecraft:water".into(),
+                position: position.to_array(),
+                delay: 0,
+                priority: 0,
+            }]);
+            session
+        };
+        let mut session = setup(false);
+        session.advance_block_ticks();
+        let position = session.origin + IVec3::new(8, 10, 8);
+        for y in 0..2 {
+            let state = session
+                .world
+                .block(position.x, position.y + y, position.z)
+                .unwrap();
+            assert_eq!(state.name, "minecraft:bubble_column");
+            assert_eq!(
+                state.properties.get("drag").map(String::as_str),
+                Some("true")
+            );
+        }
+        assert!(session.unresolved_bubble_tick);
+        assert!(!session.fluid_ticks.is_empty());
+        assert!(
+            session
+                .draft_block_ticks(session.player_chunk().unwrap())
+                .is_err()
+        );
+        session.tick = 5;
+        session.advance_fluid_ticks();
+        assert!(
+            session
+                .fluid_ticks
+                .values()
+                .any(|scheduled| scheduled.key.y == position.y && scheduled.key.source)
+        );
+
+        let mut deferred = setup(true);
+        deferred.advance_block_ticks();
+        assert_eq!(deferred.bubble_deferred.len(), 1);
+        assert!(deferred.fluid_ticks.is_empty());
+        assert_eq!(
+            deferred
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn saved_bubble_ticks_and_neighbor_callbacks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BubbleTickCallbackOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BubbleTickCallbackOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BubbleTickCallbackOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 4320);
+        let block = |id: u64| match id {
+            0 => state("minecraft:air", &[]),
+            1 => state("minecraft:water", &[("level", "0")]),
+            2 => state("minecraft:water", &[("level", "1")]),
+            3 => state("minecraft:bubble_column", &[("drag", "true")]),
+            4 => state("minecraft:bubble_column", &[("drag", "false")]),
+            5 => state("minecraft:stone", &[]),
+            _ => unreachable!(),
+        };
+        let center = IVec3::new(8, 10, 8);
+        for row in rows {
+            let mut session = session();
+            let support = row["support"].as_u64().unwrap();
+            let mut down = BTreeSet::new();
+            let mut up = BTreeSet::new();
+            let mut fluids = BTreeSet::new();
+            if support == 1 || support == 3 {
+                down.insert("minecraft:stone".into());
+            }
+            if support == 2 || support == 3 {
+                up.insert("minecraft:stone".into());
+            }
+            if row["water"].as_bool().unwrap() {
+                fluids.insert("minecraft:water".into());
+            }
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(down, up, fluids),
+            ));
+            for (pos, id) in [
+                (center - IVec3::Y, 5),
+                (center, row["root"].as_u64().unwrap()),
+                (center + IVec3::Y, row["above"].as_u64().unwrap()),
+                (center + IVec3::Y * 2, row["top"].as_u64().unwrap()),
+            ] {
+                if id != 0 {
+                    let id = session.intern_block(block(id));
+                    assert!(session.set_with_notify(pos, id, false));
+                }
+            }
+            let side = row["side"].as_u64().unwrap();
+            if side != 0 {
+                let side_block = session.intern_block(block(side));
+                let floor = session.intern_block(block(5));
+                assert!(session.set_with_notify(center + IVec3::X, side_block, false));
+                assert!(session.set_with_notify(center + IVec3::X - IVec3::Y, floor, false));
+            }
+            let absolute = session.origin + center;
+            session.enqueue_saved_bubble(&[SavedBlockTick {
+                block: if row["root"].as_u64().unwrap() == 1 {
+                    "minecraft:water"
+                } else {
+                    "minecraft:bubble_column"
+                }
+                .into(),
+                position: absolute.to_array(),
+                delay: 0,
+                priority: 0,
+            }]);
+            session.advance_block_ticks();
+            assert!(session.bubble_deferred.is_empty(), "{row}");
+            let states: Vec<_> = (0..3)
+                .map(|i| {
+                    let pos = absolute + IVec3::Y * i;
+                    let state = session.world.block(pos.x, pos.y, pos.z).unwrap();
+                    match state.name.as_str() {
+                        "minecraft:water" => format!("water/{}", state.properties["level"]),
+                        "minecraft:bubble_column" => format!("bubble/{}", state.properties["drag"]),
+                        "minecraft:stone" => "stone".into(),
+                        _ => "air".into(),
+                    }
+                })
+                .collect();
+            assert_eq!(serde_json::json!(states), row["states"], "{row}");
+            let mut blocks: Vec<_> = session
+                .bubble_ticks
+                .iter()
+                .map(|(order, key)| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            match key.kind {
+                                BubbleTickKind::Water => "water",
+                                BubbleTickKind::Column => "bubble",
+                            },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            blocks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(blocks.into_iter().map(|x| x.1).collect::<Vec<_>>()),
+                row["blockTicks"],
+                "{row}"
+            );
+            let mut fluid: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluid.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(fluid.into_iter().map(|x| x.1).collect::<Vec<_>>()),
+                row["fluidTicks"],
                 "{row}"
             );
         }

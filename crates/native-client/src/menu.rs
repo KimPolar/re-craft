@@ -1207,10 +1207,13 @@ impl<'a> Menu<'a> {
         )
     }
 
-    fn hover_target(&self, cursor: (i32, i32)) -> (Option<ButtonId>, Option<(bool, usize)>) {
-        let button = self
-            .buttons()
-            .into_iter()
+    fn hover_target(
+        &self,
+        buttons: &[Button],
+        cursor: (i32, i32),
+    ) -> (Option<ButtonId>, Option<(bool, usize)>) {
+        let button = buttons
+            .iter()
             .find(|button| button.active && self.button_contains(button, cursor))
             .map(|button| button.id);
         if self.state.screen != Screen::Packs || cursor.1 < 43 {
@@ -2842,7 +2845,10 @@ impl ApplicationHandler for Menu<'_> {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let previous = self.hover_target(self.cursor);
+                // Both hit tests use the same layout. Rebuilding every label
+                // twice for each high-frequency pointer event is unnecessary.
+                let buttons = self.buttons();
+                let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor = (
                     (position.x / self.scale as f64) as i32,
                     (position.y / self.scale as f64) as i32,
@@ -2885,12 +2891,13 @@ impl ApplicationHandler for Menu<'_> {
                 {
                     audio.set_gain(self.state.sound.ui_gain());
                 }
-                request_redraw = dragged || previous != self.hover_target(self.cursor);
+                request_redraw = dragged || previous != self.hover_target(&buttons, self.cursor);
             }
             WindowEvent::CursorLeft { .. } => {
-                let previous = self.hover_target(self.cursor);
+                let buttons = self.buttons();
+                let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor = (-1, -1);
-                request_redraw = previous != self.hover_target(self.cursor);
+                request_redraw = previous != self.hover_target(&buttons, self.cursor);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -5128,6 +5135,56 @@ mod tests {
         )
         .unwrap();
         assert!(validate_pack(temp.path()).is_ok());
+    }
+
+    #[test]
+    #[ignore = "performance measurement using the locally installed Minecraft 26.3 assets"]
+    fn measure_menu_hover_layout_reuse() {
+        use std::hint::black_box;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut state = State::new(directory, Vec::new());
+        state.asset_load = None;
+        state.assets = Some(assets);
+        for screen in [
+            Screen::Title,
+            Screen::Options,
+            Screen::Video,
+            Screen::Sound,
+            Screen::Packs,
+        ] {
+            state.screen = screen;
+            let mut menu = Menu::new(&mut state);
+            menu.size = (1920, 1080);
+            menu.scale = gui_scale(1920, 1080);
+            let positions: Vec<_> = (0..5000)
+                .map(|i| ((i * 17 % 640) as i32, (i * 11 % 360) as i32))
+                .collect();
+            let start = Instant::now();
+            let mut old_changes = 0;
+            for pair in positions.windows(2) {
+                let old = menu.hover_target(&menu.buttons(), black_box(pair[0]));
+                let new = menu.hover_target(&menu.buttons(), black_box(pair[1]));
+                old_changes += usize::from(old != new);
+            }
+            let old_time = start.elapsed();
+            let start = Instant::now();
+            let mut new_changes = 0;
+            for pair in positions.windows(2) {
+                let buttons = menu.buttons();
+                let old = menu.hover_target(&buttons, black_box(pair[0]));
+                let new = menu.hover_target(&buttons, black_box(pair[1]));
+                new_changes += usize::from(old != new);
+            }
+            let new_time = start.elapsed();
+            assert_eq!(old_changes, new_changes, "{screen:?}");
+            println!(
+                "Menu hover hit tests: screen={screen:?} events={} separate-layouts={old_time:?} shared-layout={new_time:?}",
+                positions.len() - 1
+            );
+        }
     }
 
     #[test]

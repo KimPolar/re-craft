@@ -8807,6 +8807,23 @@ impl LoadedSession {
                     None,
                 )
             }
+            name if (1..=3).contains(&level) && crate::inventory::is_banner_item(name) => {
+                let Some(overflow) = inventory.clean_banner_held(hand, creative) else {
+                    return false;
+                };
+                (
+                    if level == 1 {
+                        state("minecraft:cauldron", &[])
+                    } else {
+                        state(
+                            "minecraft:water_cauldron",
+                            &[("level", if level == 2 { "1" } else { "2" })],
+                        )
+                    },
+                    None,
+                    overflow,
+                )
+            }
             "minecraft:glass_bottle" if (1..=3).contains(&level) => {
                 let Some(overflow) = inventory.fill_bottle(hand, creative) else {
                     return false;
@@ -16665,6 +16682,223 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn cauldron_banner_cleaning_matches_java_inventory() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CauldronBannerOracle.java");
+        let base = temp.path().join("CauldronOracle.java");
+        let output = temp.path().join("banners.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CauldronBannerOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(&base, include_str!("../tests/java/CauldronOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&base),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("CauldronBannerOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let output: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(output["max"], 16);
+        assert_eq!(output["default_patterns"], true);
+        let rows = output["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 192);
+        let layer = |pattern: &str, color: &str| {
+            Tag::Compound(vec![
+                ("pattern".into(), Tag::String(pattern.into())),
+                ("color".into(), Tag::String(color.into())),
+            ])
+        };
+        let components = |layers: u64, cleaned: bool| {
+            let direct = Tag::Compound(vec![
+                (
+                    "pattern".into(),
+                    Tag::Compound(vec![
+                        ("asset_id".into(), Tag::String("example:custom".into())),
+                        (
+                            "translation_key".into(),
+                            Tag::String("example.banner".into()),
+                        ),
+                    ]),
+                ),
+                ("color".into(), Tag::String("green".into())),
+            ]);
+            let mut values = match layers {
+                0 => vec![],
+                1 => vec![layer("minecraft:stripe_bottom", "red")],
+                2 => vec![
+                    layer("minecraft:stripe_bottom", "red"),
+                    layer("minecraft:cross", "blue"),
+                ],
+                _ => vec![
+                    layer("minecraft:stripe_bottom", "red"),
+                    direct,
+                    layer("minecraft:cross", "blue"),
+                ],
+            };
+            if cleaned && layers > 0 {
+                values.pop();
+            }
+            if values.is_empty() {
+                Tag::Compound(vec![])
+            } else {
+                Tag::Compound(vec![(
+                    "minecraft:banner_patterns".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values,
+                    },
+                )])
+            }
+        };
+        let describe = |item: Option<&ItemStack>| -> serde_json::Value {
+            let Some(item) = item else {
+                return serde_json::Value::Null;
+            };
+            let mut json = serde_json::json!({"id":item.id(),"count":item.count()});
+            if crate::inventory::is_banner_item(item.id()) {
+                let values = match item.components().get("minecraft:banner_patterns") {
+                    Some(Tag::List { values, .. }) => values.as_slice(),
+                    _ => &[],
+                };
+                let layers: Vec<_> = values
+                    .iter()
+                    .map(|layer| {
+                        let text = |key| match layer.get(key).unwrap() {
+                            Tag::String(value) => String::from_utf16(&value.0).unwrap(),
+                            _ => panic!("invalid layer"),
+                        };
+                        let pattern = match layer.get("pattern").unwrap() {
+                            Tag::String(value) => serde_json::json!(String::from_utf16(&value.0).unwrap()),
+                            Tag::Compound(_) => { let value=layer.get("pattern").unwrap(); let get=|key| match value.get(key).unwrap(){Tag::String(s)=>String::from_utf16(&s.0).unwrap(),_=>panic!("invalid pattern")}; serde_json::json!({"asset_id":get("asset_id"),"translation_key":get("translation_key")}) },
+                            _ => panic!("invalid pattern"),
+                        };
+                        serde_json::json!({"pattern":pattern,"color":text("color")})
+                    })
+                    .collect();
+                json["patterns"] = serde_json::json!(layers);
+            }
+            json
+        };
+        for row in rows {
+            let mut session = session();
+            let creative = row["creative"].as_bool().unwrap();
+            if creative {
+                session.set_game_mode(GameMode::Creative);
+            }
+            let pos = IVec3::new(8, 2, 7);
+            let state = session.intern_block(state("minecraft:water_cauldron", &[("level", "2")]));
+            session.set_with_notify(pos, state, false);
+            let hand = if row["off"].as_bool().unwrap() {
+                PlayerSlot::Offhand
+            } else {
+                PlayerSlot::Storage(0)
+            };
+            let layers = row["layers"].as_u64().unwrap();
+            let mut inventory = PlayerInventory::default();
+            if row["full"].as_bool().unwrap() {
+                for i in 0..36 {
+                    inventory.set_slot(
+                        PlayerSlot::Storage(i),
+                        ItemStack::new("minecraft:stone".into(), 64, 64, Tag::Compound(vec![])),
+                    );
+                }
+            }
+            if row["existing"].as_bool().unwrap() {
+                inventory.set_slot(
+                    PlayerSlot::Storage(5),
+                    ItemStack::new(
+                        "minecraft:white_banner".into(),
+                        1,
+                        16,
+                        components(layers, true),
+                    ),
+                );
+            }
+            inventory.set_slot(
+                hand,
+                ItemStack::new(
+                    "minecraft:white_banner".into(),
+                    row["count"].as_u64().unwrap() as u32,
+                    16,
+                    components(layers, false),
+                ),
+            );
+            session.set_player_inventory(inventory);
+            assert_eq!(
+                session.use_cauldron(hand, pos),
+                row["handled"].as_bool().unwrap(),
+                "{row}"
+            );
+            let p = session.origin + pos;
+            let block = session.world.block(p.x, p.y, p.z).unwrap();
+            assert_eq!(
+                block.properties["level"].parse::<u64>().unwrap(),
+                row["level"].as_u64().unwrap(),
+                "{row}"
+            );
+            for i in 0..36 {
+                assert_eq!(
+                    describe(session.inventory.slot(PlayerSlot::Storage(i))),
+                    row["slots"][i as usize],
+                    "slot {i}: {row}"
+                );
+            }
+            assert_eq!(
+                describe(session.inventory.slot(PlayerSlot::Offhand)),
+                row["offhand"],
+                "{row}"
+            );
+            let drops = session.dropped_items.snapshot();
+            assert_eq!(
+                describe(drops.first().map(|drop| &drop.stack)),
+                row["dropped"],
+                "{row}"
+            );
+            assert!(drops.len() <= 1);
+            assert!(session.take_bucket_sounds().is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn cauldron_dye_cleaning_matches_java_and_active_item_tag() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
@@ -16827,6 +17061,122 @@ mod tests {
                 Some(&Tag::Int(42))
             );
             assert!(session.take_bucket_sounds().is_empty());
+        }
+    }
+
+    #[test]
+    fn banner_cleaning_from_input_keeps_layers_and_player_save() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        for color in [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                let mut session = session();
+                let pos = IVec3::new(8, 2, 7);
+                let cauldron =
+                    session.intern_block(state("minecraft:water_cauldron", &[("level", "3")]));
+                session.set_with_notify(pos, cauldron, false);
+                let layer = |pattern: &str, color: &str| {
+                    Tag::Compound(vec![
+                        ("pattern".into(), Tag::String(pattern.into())),
+                        ("color".into(), Tag::String(color.into())),
+                    ])
+                };
+                let patterns = vec![
+                    Tag::Compound(vec![
+                        (
+                            "pattern".into(),
+                            Tag::Compound(vec![
+                                ("asset_id".into(), Tag::String("example:custom".into())),
+                                (
+                                    "translation_key".into(),
+                                    Tag::String("example.banner".into()),
+                                ),
+                            ]),
+                        ),
+                        ("color".into(), Tag::String("green".into())),
+                    ]),
+                    layer("minecraft:cross", "blue"),
+                ];
+                let components = Tag::Compound(vec![
+                    (
+                        "minecraft:banner_patterns".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: patterns.clone(),
+                        },
+                    ),
+                    (
+                        "minecraft:custom_data".into(),
+                        Tag::Compound(vec![("preserved".into(), Tag::Int(42))]),
+                    ),
+                ]);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new(format!("minecraft:{color}_banner"), 2, 16, components),
+                );
+                session.set_player_inventory(inventory);
+                let before = session.snapshot();
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let after = session.snapshot();
+                assert_eq!(before.inventory.slot(hand).unwrap().count(), 2);
+                assert_eq!(after.inventory.slot(hand).unwrap().count(), 1);
+                let clean_slot = if hand == PlayerSlot::Offhand {
+                    PlayerSlot::Storage(0)
+                } else {
+                    PlayerSlot::Storage(1)
+                };
+                let clean = after.inventory.slot(clean_slot).unwrap();
+                assert_eq!(clean.id(), format!("minecraft:{color}_banner"));
+                assert_eq!(
+                    clean.components().get("minecraft:banner_patterns"),
+                    Some(&Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![patterns[0].clone()]
+                    })
+                );
+                assert_eq!(
+                    clean
+                        .components()
+                        .get("minecraft:custom_data")
+                        .unwrap()
+                        .get("preserved"),
+                    Some(&Tag::Int(42))
+                );
+                let p = session.origin + pos;
+                assert_eq!(
+                    session.world.block(p.x, p.y, p.z).unwrap().properties["level"],
+                    "2"
+                );
+                assert!(session.take_bucket_sounds().is_empty());
+                let source = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+                };
+                let draft = crate::player_data::draft_player_inventory(&source, &session.inventory)
+                    .unwrap();
+                let restored = crate::player_data::read_saved_player(draft.document()).unwrap();
+                assert_eq!(restored.slot(hand), after.inventory.slot(hand));
+                assert_eq!(restored.slot(clean_slot), Some(clean));
+            }
         }
     }
 

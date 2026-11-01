@@ -25,6 +25,93 @@ pub struct ItemStack {
     components: Tag,
 }
 
+pub(crate) fn is_banner_item(id: &str) -> bool {
+    matches!(
+        id.strip_prefix("minecraft:")
+            .and_then(|v| v.strip_suffix("_banner")),
+        Some(
+            "white"
+                | "orange"
+                | "magenta"
+                | "light_blue"
+                | "yellow"
+                | "lime"
+                | "pink"
+                | "gray"
+                | "light_gray"
+                | "cyan"
+                | "purple"
+                | "blue"
+                | "brown"
+                | "green"
+                | "red"
+                | "black"
+        )
+    )
+}
+
+fn valid_banner_patterns(value: &Tag) -> bool {
+    let Tag::List {
+        element_type,
+        values,
+    } = value
+    else {
+        return false;
+    };
+    if *element_type != native_persistence::nbt::TagType::Compound
+        && !(values.is_empty() && *element_type == native_persistence::nbt::TagType::End)
+    {
+        return false;
+    }
+    values.iter().all(|layer| {
+        let Tag::Compound(fields) = layer else {
+            return false;
+        };
+        if fields.len() != 2 {
+            return false;
+        }
+        let valid_id = |value: &Tag| match value {
+            Tag::String(value) => String::from_utf16(&value.0)
+                .ok()
+                .is_some_and(|id| ResourceId::parse(&id).is_ok()),
+            _ => false,
+        };
+        let valid_pattern = match layer.get("pattern") {
+            Some(pattern @ Tag::String(_)) => valid_id(pattern),
+            Some(Tag::Compound(fields)) if fields.len() == 2 => {
+                let pattern = layer.get("pattern").unwrap();
+                pattern.get("asset_id").is_some_and(valid_id)
+                    && matches!(pattern.get("translation_key"), Some(Tag::String(_)))
+            }
+            _ => false,
+        };
+        let Some(Tag::String(color)) = layer.get("color") else {
+            return false;
+        };
+        valid_pattern
+            && [
+                "white",
+                "orange",
+                "magenta",
+                "light_blue",
+                "yellow",
+                "lime",
+                "pink",
+                "gray",
+                "light_gray",
+                "cyan",
+                "purple",
+                "blue",
+                "brown",
+                "green",
+                "red",
+                "black",
+            ]
+            .iter()
+            .any(|name| color.matches(name))
+    })
+}
+
 impl ItemStack {
     /// `components` is the effective component map, not just its saved patch.
     /// Callers must resolve the item's prototype before creating the stack.
@@ -183,6 +270,10 @@ impl ItemStack {
             && self.id == other.id
             && self.max_count == other.max_count
             && (equal_tag(&self.components, &other.components)
+                || (is_banner_item(&self.id)
+                    && max_component_consistent(self)
+                    && max_component_consistent(other)
+                    && banner_components_equal(&self.components, &other.components))
                 || (max_component_consistent(self)
                     && max_component_consistent(other)
                     && matches!((&self.components, &other.components), (Tag::Compound(a), Tag::Compound(b)) if equal_compounds(a, b, true))))
@@ -1535,6 +1626,45 @@ impl PlayerInventory {
         self.set_slot(hand, Some(result))
     }
 
+    /// Remove the last banner layer, returning a separate item for a stack.
+    pub(crate) fn clean_banner_held(
+        &mut self,
+        hand: PlayerSlot,
+        creative: bool,
+    ) -> Option<Option<ItemStack>> {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return None;
+        }
+        let source = self.slot(hand)?;
+        if !is_banner_item(source.id()) || !ordinary_return_supported(source) {
+            return None;
+        }
+        let mut cleaned = source.with_count(1)?;
+        let Tag::Compound(fields) = &mut cleaned.components else {
+            return None;
+        };
+        let (_, Tag::List { values, .. }) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("minecraft:banner_patterns"))?
+        else {
+            return None;
+        };
+        values.pop()?;
+        if values.is_empty() {
+            fields.retain(|(name, _)| !name.matches("minecraft:banner_patterns"));
+        }
+        if !creative && source.count == 1 {
+            self.set_slot(hand, Some(cleaned));
+            return Some(None);
+        }
+        if !creative && !self.consume_held(hand) {
+            return None;
+        }
+        let mut remainder = Some(cleaned);
+        self.pickup_stack(&mut remainder, creative);
+        Some(remainder)
+    }
+
     fn fill_container(
         &mut self,
         hand: PlayerSlot,
@@ -2647,6 +2777,9 @@ const STACKABLE_ITEMS: &[&str] = &[
 /// Vanilla defaults for ordinary items whose inventory behavior is implemented.
 /// This does not mean their use, placement, tools, or rendering are complete.
 pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
+    if is_banner_item(id) {
+        return Some(16);
+    }
     if matches!(
         id,
         "minecraft:shears"
@@ -2758,6 +2891,16 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             2
+        } else if is_banner_item(id) && name.matches("minecraft:banner_patterns") {
+            if !valid_banner_patterns(value) {
+                return None;
+            }
+            262144
+        } else if is_banner_item(id) && name.matches("!minecraft:banner_patterns") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            524288
         } else if id == "minecraft:potion" && name.matches("minecraft:potion_contents") {
             crate::survival::potion_effects(components)?;
             65536
@@ -2862,6 +3005,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & 768 == 768 {
+        return None;
+    }
+    if seen & (262144 | 524288) == (262144 | 524288) {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {
@@ -3004,6 +3150,23 @@ fn max_component_consistent(item: &ItemStack) -> bool {
         })
 }
 
+fn banner_components_equal(a: &Tag, b: &Tag) -> bool {
+    let (Tag::Compound(a), Tag::Compound(b)) = (a, b) else {
+        return false;
+    };
+    let canonical = |fields: &Vec<(JavaString, Tag)>| {
+        fields
+            .iter()
+            .filter(|(name, value)| {
+                !(name.matches("minecraft:banner_patterns")
+                    && matches!(value, Tag::List { values, .. } if values.is_empty()))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    equal_compounds(&canonical(a), &canonical(b), true)
+}
+
 fn equal_compounds(a: &[(JavaString, Tag)], b: &[(JavaString, Tag)], ignore_max: bool) -> bool {
     fn unique(entries: &[(JavaString, Tag)]) -> impl Iterator<Item = &(JavaString, Tag)> {
         entries.iter().enumerate().filter_map(|(i, entry)| {
@@ -3092,6 +3255,41 @@ pub(crate) fn validate_item_balance<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_patterns_require_valid_layers_and_empty_matches_the_default() {
+        use native_persistence::nbt::TagType;
+        let empty = Tag::Compound(vec![(
+            "minecraft:banner_patterns".into(),
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+        )]);
+        let plain = ItemStack::new(
+            "minecraft:white_banner".into(),
+            1,
+            16,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        let explicit =
+            ItemStack::new("minecraft:white_banner".into(), 1, 16, empty.clone()).unwrap();
+        assert_eq!(saved_item_max(plain.id(), &empty), Some(16));
+        assert!(plain.same_item_and_components(&explicit));
+        let invalid = Tag::Compound(vec![(
+            "minecraft:banner_patterns".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![
+                    ("pattern".into(), Tag::String("minecraft:cross".into())),
+                    ("color".into(), Tag::String("not_a_color".into())),
+                ])],
+            },
+        )]);
+        assert_eq!(saved_item_max(plain.id(), &invalid), None);
+        assert_eq!(ordinary_item_default_max("minecraft:unknown_banner"), None);
+    }
 
     #[test]
     fn balance_tracks_components_and_allows_splitting_and_merging() {

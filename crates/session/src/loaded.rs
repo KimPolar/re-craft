@@ -8779,7 +8779,8 @@ impl LoadedSession {
         let Some(item) = self.inventory.slot(hand) else {
             return false;
         };
-        if item.id() == "minecraft:lava_bucket"
+        let dye_handler = (1..=3).contains(&level) && self.cauldron_can_remove_dye(item.id());
+        if !dye_handler && item.id() == "minecraft:lava_bucket"
             && add(position, IVec3::Y).is_some_and(|above| {
                 matches!(cell(&self.world, self.origin, self.bounds, above, self.states[0]), Cell::State(id) if self.fluids.get(id.0 as usize).copied().flatten().is_some_and(|fluid| fluid.kind == FluidKind::Water))
             })
@@ -8789,6 +8790,23 @@ impl LoadedSession {
         let creative = self.game_mode == GameMode::Creative;
         let mut inventory = (*self.inventory).clone();
         let (target, sound, overflow) = match item.id() {
+            _ if dye_handler => {
+                if !inventory.clean_dyed_held(hand) {
+                    return false;
+                }
+                (
+                    if level == 1 {
+                        state("minecraft:cauldron", &[])
+                    } else {
+                        state(
+                            "minecraft:water_cauldron",
+                            &[("level", if level == 2 { "1" } else { "2" })],
+                        )
+                    },
+                    None,
+                    None,
+                )
+            }
             "minecraft:glass_bottle" if (1..=3).contains(&level) => {
                 let Some(overflow) = inventory.fill_bottle(hand, creative) else {
                     return false;
@@ -8802,7 +8820,7 @@ impl LoadedSession {
                             &[("level", if level == 2 { "1" } else { "2" })],
                         )
                     },
-                    BucketSoundKind::CauldronFillBottle,
+                    Some(BucketSoundKind::CauldronFillBottle),
                     overflow,
                 )
             }
@@ -8822,7 +8840,7 @@ impl LoadedSession {
                             },
                         )],
                     ),
-                    BucketSoundKind::EmptyBottle,
+                    Some(BucketSoundKind::EmptyBottle),
                     overflow,
                 )
             }
@@ -8837,11 +8855,11 @@ impl LoadedSession {
                 };
                 (
                     state("minecraft:cauldron", &[]),
-                    if level == 3 {
+                    Some(if level == 3 {
                         BucketSoundKind::CauldronFillWater
                     } else {
                         BucketSoundKind::CauldronFillLava
-                    },
+                    }),
                     overflow,
                 )
             }
@@ -8856,11 +8874,11 @@ impl LoadedSession {
                     } else {
                         state("minecraft:lava_cauldron", &[])
                     },
-                    if water {
+                    Some(if water {
                         BucketSoundKind::EmptyWater
                     } else {
                         BucketSoundKind::EmptyLava
-                    },
+                    }),
                     overflow,
                 )
             }
@@ -8871,12 +8889,14 @@ impl LoadedSession {
             return false;
         }
         self.inventory = Arc::new(inventory);
-        self.push_bucket_sound(
-            sound,
-            (self.origin + position).as_dvec3() + DVec3::splat(0.5),
-            1.0,
-            1.0,
-        );
+        if let Some(sound) = sound {
+            self.push_bucket_sound(
+                sound,
+                (self.origin + position).as_dvec3() + DVec3::splat(0.5),
+                1.0,
+                1.0,
+            );
+        }
         if let Some(stack) = overflow {
             self.dropped_items.drop_player(
                 stack,
@@ -8894,6 +8914,32 @@ impl LoadedSession {
         self.first_person.swing.start(swing);
         self.first_person.used(swing);
         true
+    }
+
+    fn cauldron_can_remove_dye(&self, item: &str) -> bool {
+        match (&self.recipes, &self.item_registry) {
+            (Some(recipes), Some(registry)) => recipes
+                .tags
+                .checked_contains(
+                    &native_resources::packs::ResourceId::parse(
+                        "minecraft:cauldron_can_remove_dye",
+                    )
+                    .expect("valid built-in tag"),
+                    item,
+                    |id| registry.id(id).is_some(),
+                )
+                .unwrap_or(false),
+            (None, _) => matches!(
+                item,
+                "minecraft:leather_helmet"
+                    | "minecraft:leather_chestplate"
+                    | "minecraft:leather_leggings"
+                    | "minecraft:leather_boots"
+                    | "minecraft:leather_horse_armor"
+                    | "minecraft:wolf_armor"
+            ),
+            _ => false,
+        }
     }
 
     fn try_make_mud(&mut self, hand: crate::inventory::PlayerSlot, hit: ShapeRayHit) -> bool {
@@ -16612,6 +16658,244 @@ mod tests {
                 assert_eq!(row["category"].as_str(), Some("BLOCKS"));
             } else {
                 assert!(sounds.is_empty(), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn cauldron_dye_cleaning_matches_java_and_active_item_tag() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider, ResourceStack};
+        use std::{path::PathBuf, process::Command};
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if folder == "tags/item" {
+                    vec![ResourceId::parse("minecraft:cauldron_can_remove_dye")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(if path.ends_with("/cauldron_can_remove_dye.json") {
+                    vec![
+                        br#"{"values":["minecraft:leather_chestplate","minecraft:leather_horse_armor","minecraft:wolf_armor","minecraft:stone","minecraft:glass_bottle","minecraft:water_bucket","minecraft:potion"]}"#
+                            .to_vec(),
+                    ]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let recipes = Arc::new(CraftingRecipes::load(&mut Tags).unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for entry in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = entry["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("CauldronDyeOracle.java");
+        let base = temp.path().join("CauldronOracle.java");
+        let output = temp.path().join("dyes.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CauldronDyeOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(&base, include_str!("../tests/java/CauldronOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&base),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("CauldronDyeOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let output: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(
+            output["defaults"].as_array().unwrap().len(),
+            0,
+            "default dyed prototypes: {}",
+            output["defaults"]
+        );
+        let rows = output["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 144);
+        for row in rows {
+            let mut session = session();
+            session.set_item_registry(registry.clone());
+            session.set_crafting_recipes(recipes.clone());
+            if row["creative"].as_bool().unwrap() {
+                session.set_game_mode(GameMode::Creative);
+            }
+            let pos = IVec3::new(8, 2, 7);
+            let level = row["level"].as_u64().unwrap().to_string();
+            let block =
+                session.intern_block(state("minecraft:water_cauldron", &[("level", &level)]));
+            session.set_with_notify(pos, block, false);
+            let id = row["item"].as_str().unwrap();
+            let dye = row["dye"].as_i64().unwrap();
+            let mut fields = Vec::new();
+            if dye >= 0 {
+                fields.push(("minecraft:dyed_color".into(), Tag::Int(dye as i32)));
+            }
+            if row["damage"].as_i64().unwrap() >= 0 {
+                fields.push(("minecraft:damage".into(), Tag::Int(5)));
+            }
+            fields.push((
+                "minecraft:custom_data".into(),
+                Tag::Compound(vec![("keep".into(), Tag::Int(42))]),
+            ));
+            let components = Tag::Compound(fields);
+            let max = crate::equippable::saved_inventory_max(id, &components).unwrap();
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new(id.into(), 1, max, components),
+            );
+            session.set_player_inventory(inventory);
+            assert_eq!(
+                session.use_cauldron(PlayerSlot::Storage(0), pos),
+                row["handled"].as_bool().unwrap(),
+                "{row}"
+            );
+            let p = session.origin + pos;
+            let block = session.world.block(p.x, p.y, p.z).unwrap();
+            assert_eq!(block.name, row["block"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                block
+                    .properties
+                    .get("level")
+                    .map_or(0, |v| v.parse::<u64>().unwrap()),
+                row["remaining"].as_u64().unwrap(),
+                "{row}"
+            );
+            let item = session.inventory.slot(PlayerSlot::Storage(0)).unwrap();
+            assert_eq!(
+                item.components().get("minecraft:dyed_color").is_some(),
+                row["has_dye"].as_bool().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                item.components()
+                    .get("minecraft:damage")
+                    .and_then(Tag::as_java_int)
+                    .unwrap_or(-1) as i64,
+                row["damage"].as_i64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                item.components()
+                    .get("minecraft:custom_data")
+                    .unwrap()
+                    .get("keep"),
+                Some(&Tag::Int(42))
+            );
+            assert!(session.take_bucket_sounds().is_empty());
+        }
+    }
+
+    #[test]
+    fn cauldron_cleans_held_armor_and_preserves_player_save_data() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag};
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [GameMode::Survival, GameMode::Creative, GameMode::Adventure] {
+                let mut session = session();
+                session.set_game_mode(mode);
+                let pos = IVec3::new(8, 2, 7);
+                let cauldron =
+                    session.intern_block(state("minecraft:water_cauldron", &[("level", "1")]));
+                session.set_with_notify(pos, cauldron, false);
+                let components = Tag::Compound(vec![
+                    ("minecraft:dyed_color".into(), Tag::Int(0x123456)),
+                    ("minecraft:damage".into(), Tag::Int(7)),
+                    (
+                        "minecraft:custom_data".into(),
+                        Tag::Compound(vec![("preserved".into(), Tag::Int(42))]),
+                    ),
+                ]);
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:leather_chestplate".into(), 1, 1, components),
+                );
+                session.set_player_inventory(inventory);
+                let before = session.snapshot();
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let after = session.snapshot();
+                assert!(
+                    before
+                        .inventory
+                        .slot(hand)
+                        .unwrap()
+                        .components()
+                        .get("minecraft:dyed_color")
+                        .is_some()
+                );
+                let item = after.inventory.slot(hand).unwrap();
+                assert!(item.components().get("minecraft:dyed_color").is_none());
+                assert_eq!(
+                    item.components().get("minecraft:damage"),
+                    Some(&Tag::Int(7))
+                );
+                assert_eq!(
+                    item.components()
+                        .get("minecraft:custom_data")
+                        .unwrap()
+                        .get("preserved"),
+                    Some(&Tag::Int(42))
+                );
+                let p = session.origin + pos;
+                assert_eq!(
+                    session.world.block(p.x, p.y, p.z).unwrap().name,
+                    "minecraft:cauldron"
+                );
+                assert!(session.take_bucket_sounds().is_empty());
+                let source = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+                };
+                let draft = crate::player_data::draft_player_inventory(&source, &session.inventory)
+                    .unwrap();
+                let restored = crate::player_data::read_saved_player(draft.document()).unwrap();
+                assert_eq!(restored.slot(hand), after.inventory.slot(hand));
             }
         }
     }

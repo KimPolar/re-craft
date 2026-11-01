@@ -1498,6 +1498,43 @@ impl PlayerInventory {
         self.fill_container(hand, result, creative)
     }
 
+    /// Cauldron cleaning changes only the dye component on the held stack.
+    pub(crate) fn clean_dyed_held(&mut self, hand: PlayerSlot) -> bool {
+        if hand != PlayerSlot::Offhand && hand != PlayerSlot::Storage(self.selected) {
+            return false;
+        }
+        let Some(source) = self.slot(hand) else {
+            return false;
+        };
+        if source.max_count.is_none()
+            || crate::equippable::saved_inventory_max(source.id(), &source.components)
+                != source.max_count
+            || !max_component_consistent(source)
+        {
+            return false;
+        }
+        let mut result = source.clone();
+        let Tag::Compound(fields) = &mut result.components else {
+            return false;
+        };
+        if fields
+            .iter()
+            .any(|(name, _)| name.matches("!minecraft:dyed_color"))
+            || fields
+                .iter()
+                .filter(|(name, _)| name.matches("minecraft:dyed_color"))
+                .count()
+                != 1
+            || !fields.iter().any(|(name, value)| {
+                name.matches("minecraft:dyed_color") && value.as_java_int().is_some()
+            })
+        {
+            return false;
+        }
+        fields.retain(|(name, _)| !name.matches("minecraft:dyed_color"));
+        self.set_slot(hand, Some(result))
+    }
+
     fn fill_container(
         &mut self,
         hand: PlayerSlot,
@@ -2614,6 +2651,8 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         id,
         "minecraft:shears"
             | "minecraft:potion"
+            | "minecraft:leather_horse_armor"
+            | "minecraft:wolf_armor"
             | "minecraft:iron_spear"
             | "minecraft:copper_nautilus_armor"
             | "minecraft:iron_nautilus_armor"
@@ -2670,6 +2709,9 @@ pub fn ordinary_item_default_durability(id: &str) -> Option<u32> {
     if id == "minecraft:shears" {
         return Some(238);
     }
+    if id == "minecraft:wolf_armor" {
+        return Some(64);
+    }
     if ordinary_item_default_max(id) != Some(1) {
         return None;
     }
@@ -2724,6 +2766,9 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             4
+        } else if name.matches("minecraft:dyed_color") {
+            value.as_java_int()?;
+            131072
         } else if name.matches("minecraft:enchantment_glint_override") {
             if !matches!(value, Tag::Byte(0 | 1)) {
                 return None;

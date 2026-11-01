@@ -2793,7 +2793,22 @@ impl LoadedSession {
                 replacement: Some(edited),
             });
         }
-        draft.stage_block_entity_mutations(&changes)?;
+        let inventory_changes: Vec<_> = changes
+            .iter()
+            .filter_map(|change| {
+                Some(native_persistence::edit::BlockEntityChange {
+                    expected: change.expected.clone()?,
+                    replacement: change.replacement.clone()?,
+                })
+            })
+            .collect();
+        if inventory_changes.len() != changes.len()
+            || draft
+                .stage_checked_chest_inventories(&inventory_changes)
+                .is_err()
+        {
+            draft.stage_block_entity_mutations(&changes)?;
+        }
         Ok(())
     }
 
@@ -23530,6 +23545,7 @@ mod tests {
         Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), None);
         session.validate_closed_chest_item_balance(&player).unwrap();
         let draft = session.draft_chest_inventory_chunk(chunk, &source).unwrap();
+        assert_eq!(draft.checked_chest_inventory_count(), 1);
         assert!(draft.matches_source(&source).unwrap());
         let originals = BTreeMap::from([(chunk, source.clone())]);
         assert!(session.draft_player_state(&player).is_err());

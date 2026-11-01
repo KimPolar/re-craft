@@ -62,6 +62,7 @@ pub struct ChunkDraft {
     heightmaps_rebuilt: bool,
     changed_block_states: Vec<BlockChange>,
     uncoordinated_block_entities: bool,
+    checked_chest_inventories: Vec<BlockEntityChange>,
     pub changed_blocks: usize,
     pub changed_sections: BTreeSet<i8>,
 }
@@ -80,6 +81,12 @@ impl ChunkDraft {
         self.position
     }
 
+    /// Inventory-only chest changes validated so far; these are not yet
+    /// authorized for an independent world write.
+    pub fn checked_chest_inventory_count(&self) -> usize {
+        self.checked_chest_inventories.len()
+    }
+
     /// Check the invariants that persistence can verify, then require the
     /// active game registry to approve every changed block state. That check
     /// must reject any light, block-entity, fluid, neighbor, tick, or POI effect
@@ -93,7 +100,7 @@ impl ChunkDraft {
             "chunk draft change count is inconsistent"
         );
         ensure!(
-            !self.uncoordinated_block_entities,
+            !self.uncoordinated_block_entities && self.checked_chest_inventories.is_empty(),
             "block entity edits require a coordinated world save"
         );
         ensure!(
@@ -162,6 +169,29 @@ impl ChunkDraft {
     /// Any eventual coordinated write must also compare the raw file bytes.
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         Ok(crate::nbt::write(current)? == self.source_nbt)
+    }
+
+    /// Stage only inventories of existing, unchanged chest blocks. The result
+    /// still requires a coordinated player/inventory save and cannot be written
+    /// through the ordinary chunk-only path.
+    pub fn stage_checked_chest_inventories(&mut self, changes: &[BlockEntityChange]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            !self.uncoordinated_block_entities && self.checked_chest_inventories.is_empty(),
+            "other block entity edits are already staged"
+        );
+        let source = crate::nbt::read(&self.source_nbt)?;
+        palette::validate_26_3_block_states(&source.value)?;
+        let sections = palette::decode_sections(&source.value)?;
+        for change in changes {
+            validate_chest_inventory_change(change, &sections)?;
+        }
+        self.replace_block_entities(changes)?;
+        self.uncoordinated_block_entities = false;
+        self.checked_chest_inventories = changes.to_vec();
+        Ok(())
     }
 
     /// Stage existing block-entity changes atomically. This does not authorize
@@ -786,6 +816,158 @@ fn append_palette_entry(
     Ok(())
 }
 
+fn validate_chest_inventory_change(
+    change: &BlockEntityChange,
+    sections: &[palette::ChunkSection],
+) -> Result<()> {
+    let coordinates = |tag: &Tag| -> Result<[i32; 3]> {
+        let coordinate = |key| match unique_field(tag, key)? {
+            Some(Tag::Int(value)) => Ok(*value),
+            _ => bail!("invalid chest {key} coordinate"),
+        };
+        Ok([coordinate("x")?, coordinate("y")?, coordinate("z")?])
+    };
+    let [x, y, z] = coordinates(&change.expected)?;
+    ensure!(
+        coordinates(&change.replacement)? == [x, y, z],
+        "chest coordinates changed"
+    );
+    let Some(Tag::String(id)) = unique_field(&change.expected, "id")? else {
+        bail!("invalid chest block entity id")
+    };
+    let expected_block = if id.matches("minecraft:chest") || id.matches("chest") {
+        "minecraft:chest"
+    } else if id.matches("minecraft:trapped_chest") || id.matches("trapped_chest") {
+        "minecraft:trapped_chest"
+    } else {
+        bail!("unsupported chest block entity id")
+    };
+    ensure!(
+        unique_field(&change.replacement, "id")? == Some(&Tag::String(id.clone())),
+        "chest entity type changed"
+    );
+    for entity in [&change.expected, &change.replacement] {
+        ensure!(
+            unique_field(entity, "LootTable")?.is_none(),
+            "deferred chest loot needs separate validation"
+        );
+        unique_field(entity, "LootTableSeed")?;
+        validate_chest_items(unique_field(entity, "Items")?)?;
+    }
+    let without_items = |tag: &Tag| -> Result<Vec<(JavaString, Tag)>> {
+        let Tag::Compound(fields) = tag else {
+            bail!("chest entity is not a compound")
+        };
+        Ok(fields
+            .iter()
+            .filter(|(name, _)| !name.matches("Items"))
+            .cloned()
+            .collect())
+    };
+    ensure!(
+        without_items(&change.expected)? == without_items(&change.replacement)?,
+        "non-inventory chest data changed"
+    );
+    let section_y = i8::try_from(y.div_euclid(16)).context("chest section is out of range")?;
+    let block = sections
+        .iter()
+        .find(|section| section.y == section_y)
+        .and_then(|section| section.blocks.as_ref())
+        .and_then(|blocks| {
+            blocks.block(
+                x.rem_euclid(16) as usize,
+                y.rem_euclid(16) as usize,
+                z.rem_euclid(16) as usize,
+            )
+        })
+        .context("source chest block is unavailable")?;
+    ensure!(
+        block.name.matches(expected_block),
+        "source block is not the matching chest"
+    );
+    if !block.properties.is_empty() {
+        ensure!(
+            block.properties.len() == 3,
+            "unsupported chest block properties"
+        );
+        let property = |key: &str| {
+            block
+                .properties
+                .iter()
+                .find(|(name, _)| name.matches(key))
+                .map(|(_, value)| value)
+        };
+        ensure!(
+            property("facing").is_some_and(|v| ["north", "south", "east", "west"]
+                .iter()
+                .any(|s| v.matches(s)))
+                && property("type")
+                    .is_some_and(|v| ["single", "left", "right"].iter().any(|s| v.matches(s)))
+                && property("waterlogged").is_some_and(|v| v.matches("true") || v.matches("false")),
+            "invalid chest block properties"
+        );
+    }
+    Ok(())
+}
+
+fn validate_chest_items(items: Option<&Tag>) -> Result<()> {
+    let Some(items) = items else { return Ok(()) };
+    let Tag::List {
+        element_type,
+        values,
+    } = items
+    else {
+        bail!("chest items are not a list")
+    };
+    ensure!(
+        *element_type == TagType::Compound || values.is_empty(),
+        "invalid chest item list"
+    );
+    let mut slots = BTreeSet::new();
+    for item in values {
+        let Tag::Compound(fields) = item else {
+            bail!("chest item is not a compound")
+        };
+        ensure!(
+            fields
+                .iter()
+                .all(|(name, _)| ["Slot", "id", "count", "components"]
+                    .iter()
+                    .any(|key| name.matches(key))),
+            "unsupported chest item field"
+        );
+        let Some(Tag::Byte(slot)) = unique_field(item, "Slot")? else {
+            bail!("invalid chest item slot")
+        };
+        let index = *slot as u8;
+        ensure!(
+            index < 27 && slots.insert(index),
+            "duplicate or out-of-range chest item slot"
+        );
+        let Some(Tag::String(id)) = unique_field(item, "id")? else {
+            bail!("missing chest item id")
+        };
+        let id = String::from_utf16(&id.0).context("invalid chest item id encoding")?;
+        let id = crate::world::DimensionId::parse(&id).context("invalid chest item id")?;
+        ensure!(
+            id.namespace != "minecraft" || id.path != "air",
+            "empty item in chest"
+        );
+        ensure!(
+            matches!(unique_field(item, "count")?, None | Some(Tag::Int(1..=99))),
+            "invalid chest item count"
+        );
+        ensure!(
+            matches!(
+                unique_field(item, "components")?,
+                None | Some(Tag::Compound(_))
+            ),
+            "invalid chest item components"
+        );
+    }
+    Ok(())
+}
+
 fn unique_field<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
     let Tag::Compound(entries) = tag else {
         bail!("{name} parent is not a compound")
@@ -867,6 +1049,7 @@ pub fn draft_chunk_blocks(
             heightmaps_rebuilt: false,
             changed_block_states,
             uncoordinated_block_entities: false,
+            checked_chest_inventories: Vec::new(),
             changed_blocks,
             changed_sections,
         });
@@ -1008,6 +1191,7 @@ pub fn draft_chunk_blocks(
         heightmaps_rebuilt: false,
         changed_block_states,
         uncoordinated_block_entities: false,
+        checked_chest_inventories: Vec::new(),
         changed_blocks,
         changed_sections,
     })
@@ -1604,6 +1788,160 @@ mod tests {
         };
         assert_eq!(values, &[replacement, other]);
         assert!(draft.validate_for_write(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn checked_chest_inventories_preserve_identity_and_non_inventory_data() {
+        let pos = ChunkPos { x: -1, z: 2 };
+        let mut original = fixture(1, false);
+        let Tag::List {
+            values: sections, ..
+        } = unique_field_mut(&mut original.value, "sections")
+            .unwrap()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let blocks = unique_field_mut(&mut sections[0], "block_states")
+            .unwrap()
+            .unwrap();
+        let Tag::List {
+            values: palette, ..
+        } = unique_field_mut(blocks, "palette").unwrap().unwrap()
+        else {
+            unreachable!()
+        };
+        *unique_field_mut(&mut palette[0], "id").unwrap().unwrap() =
+            Tag::String("minecraft:chest".into());
+        let item = Tag::Compound(vec![
+            ("Slot".into(), Tag::Byte(3)),
+            ("id".into(), Tag::String("minecraft:diamond".into())),
+            ("count".into(), Tag::Int(5)),
+        ]);
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(-16)),
+            ("y".into(), Tag::Int(-64)),
+            ("z".into(), Tag::Int(32)),
+            ("future".into(), Tag::Int(42)),
+            (
+                "Items".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![item.clone()],
+                },
+            ),
+        ]);
+        let Tag::Compound(fields) = &mut original.value else {
+            unreachable!()
+        };
+        fields.push((
+            "block_entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity.clone()],
+            },
+        ));
+        let mut replacement = entity.clone();
+        *unique_field_mut(&mut replacement, "Items")
+            .unwrap()
+            .unwrap() = Tag::List {
+            element_type: TagType::Compound,
+            values: Vec::new(),
+        };
+        let valid = BlockEntityChange {
+            expected: entity.clone(),
+            replacement: replacement.clone(),
+        };
+        let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+        draft
+            .stage_checked_chest_inventories(std::slice::from_ref(&valid))
+            .unwrap();
+        assert_eq!(draft.checked_chest_inventories.len(), 1);
+        assert!(draft.validate_for_write(|_| Ok(())).is_err());
+        let mut invalid = Vec::new();
+        let mut changed = replacement.clone();
+        *unique_field_mut(&mut changed, "future").unwrap().unwrap() = Tag::Int(0);
+        invalid.push(BlockEntityChange {
+            expected: entity.clone(),
+            replacement: changed,
+        });
+        let mut changed = replacement.clone();
+        *unique_field_mut(&mut changed, "id").unwrap().unwrap() =
+            Tag::String("minecraft:trapped_chest".into());
+        invalid.push(BlockEntityChange {
+            expected: entity.clone(),
+            replacement: changed,
+        });
+        let mut changed = replacement.clone();
+        *unique_field_mut(&mut changed, "Items").unwrap().unwrap() = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![item.clone(), item.clone()],
+        };
+        invalid.push(BlockEntityChange {
+            expected: entity.clone(),
+            replacement: changed,
+        });
+        let mut pending = entity.clone();
+        let Tag::Compound(fields) = &mut pending else {
+            unreachable!()
+        };
+        fields.push((
+            "LootTable".into(),
+            Tag::String("minecraft:chests/buried_treasure".into()),
+        ));
+        invalid.push(BlockEntityChange {
+            expected: pending,
+            replacement,
+        });
+        for change in invalid {
+            let mut draft = draft_chunk_blocks(&original, pos, &[]).unwrap();
+            let before = crate::nbt::write(draft.document()).unwrap();
+            assert!(draft.stage_checked_chest_inventories(&[change]).is_err());
+            assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+        }
+        let mut wrong_block = original.clone();
+        let Tag::List {
+            values: sections, ..
+        } = unique_field_mut(&mut wrong_block.value, "sections")
+            .unwrap()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let blocks = unique_field_mut(&mut sections[0], "block_states")
+            .unwrap()
+            .unwrap();
+        let Tag::List {
+            values: palette, ..
+        } = unique_field_mut(blocks, "palette").unwrap().unwrap()
+        else {
+            unreachable!()
+        };
+        *unique_field_mut(&mut palette[0], "id").unwrap().unwrap() =
+            Tag::String("minecraft:stone".into());
+        assert!(
+            draft_chunk_blocks(&wrong_block, pos, &[])
+                .unwrap()
+                .stage_checked_chest_inventories(&[valid])
+                .is_err()
+        );
+        let changed_block = BlockChange {
+            x: -16,
+            y: -64,
+            z: 32,
+            expected: state("minecraft:chest"),
+            replacement: state("minecraft:trapped_chest"),
+        };
+        let mut changed = draft_chunk_blocks(&original, pos, &[changed_block]).unwrap();
+        assert!(
+            changed
+                .stage_checked_chest_inventories(&[BlockEntityChange {
+                    expected: entity.clone(),
+                    replacement: entity
+                }])
+                .is_err()
+        );
     }
 
     #[test]

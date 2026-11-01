@@ -13280,7 +13280,8 @@ impl LoadedSession {
                         )),
                         IceTickAction::Schedule(_, _)
                         | IceTickAction::ShapeNeighbors(..)
-                        | IceTickAction::NeighborWater(_) => None,
+                        | IceTickAction::NeighborWater(_)
+                        | IceTickAction::ScheduleBubble(_) => None,
                     };
                     if let Some((pos, block, notify)) = candidate {
                         let next = self.intern_block(block);
@@ -13325,6 +13326,9 @@ impl LoadedSession {
                                     failed = true;
                                     break;
                                 }
+                            }
+                            IceTickAction::ScheduleBubble(pos) => {
+                                self.schedule_bubble(pos, BubbleTickKind::Water, 20)
                             }
                             _ => unreachable!("block changes have a replacement"),
                         }
@@ -18346,6 +18350,7 @@ enum IceTickAction {
     Schedule(IVec3, i32),
     NeighborWater(IVec3),
     ShapeNeighbors(IVec3, bool),
+    ScheduleBubble(IVec3),
 }
 
 /// Stage a tick before mutating the session or its random source.
@@ -18597,10 +18602,11 @@ impl IceTickStage<'_> {
 
     fn stage_melt(&mut self, position: IVec3, evaporates: bool) -> anyhow::Result<()> {
         self.validate_neighbors(position)?;
-        if !evaporates {
-            self.require_no_bubble_below(position)?;
-        }
+        let bubble = !evaporates && self.bubble_below(position)?;
         self.push_action(IceTickAction::Melt(position, evaporates))?;
+        if bubble {
+            self.push_action(IceTickAction::ScheduleBubble(position))?;
+        }
         self.ice_overrides.insert(position.to_array(), None);
         if !evaporates {
             self.melted_to_water.insert(position.to_array());
@@ -18664,7 +18670,7 @@ impl IceTickStage<'_> {
             .source)
     }
 
-    fn require_no_bubble_below(&self, position: IVec3) -> anyhow::Result<()> {
+    fn bubble_below(&self, position: IVec3) -> anyhow::Result<bool> {
         use anyhow::Context;
         let tags = self
             .session
@@ -18672,17 +18678,13 @@ impl IceTickStage<'_> {
             .as_ref()
             .context("bubble-column tags are unavailable")?;
         if !tags.water_can_occupy() {
-            return Ok(());
+            return Ok(false);
         }
         let below = add(position, IVec3::NEG_Y).context("water support position overflow")?;
-        anyhow::ensure!(
-            !tags.enables(self.staged_name(below)?),
-            "bubble column scheduling is unsupported"
-        );
-        Ok(())
+        Ok(tags.enables(self.staged_name(below)?))
     }
 
-    fn require_no_bubble_above(&self, position: IVec3, new_block: &str) -> anyhow::Result<()> {
+    fn bubble_above(&self, position: IVec3, new_block: &str) -> anyhow::Result<bool> {
         use anyhow::Context;
         let above = add(position, IVec3::Y).context("water position overflow")?;
         if self.source_water(above)? {
@@ -18691,19 +18693,13 @@ impl IceTickStage<'_> {
                 .bubble_column_tags
                 .as_ref()
                 .context("bubble-column tags are unavailable")?;
-            anyhow::ensure!(
-                !tags.water_can_occupy() || !tags.enables(new_block),
-                "bubble column scheduling is unsupported"
-            );
+            return Ok(tags.water_can_occupy() && tags.enables(new_block));
         }
-        Ok(())
+        Ok(false)
     }
 
     fn is_water(&self, position: IVec3) -> anyhow::Result<bool> {
         let water = self.staged_name(position)? == "minecraft:water";
-        if water && self.source_water(position)? {
-            self.require_no_bubble_below(position)?;
-        }
         Ok(water)
     }
 }
@@ -18784,7 +18780,7 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         random: &mut native_core::random::LegacyRandom,
     ) -> anyhow::Result<()> {
         self.validate_neighbors(position)?;
-        self.require_no_bubble_above(position, "minecraft:frosted_ice")?;
+        let bubble = self.bubble_above(position, "minecraft:frosted_ice")?;
         self.push_action(IceTickAction::Age(position, age))?;
         self.ice_overrides.insert(position.to_array(), Some(age));
         self.push_action(IceTickAction::Schedule(
@@ -18792,6 +18788,9 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
             crate::frosted_ice::placed(random),
         ))?;
         self.push_action(IceTickAction::ShapeNeighbors(position, false))?;
+        if bubble {
+            self.push_action(IceTickAction::ScheduleBubble(position + IVec3::Y))?;
+        }
         Ok(())
     }
 
@@ -18823,7 +18822,7 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
         while let Some((source, index)) = stack.last_mut() {
             if *index == directions.len() {
                 let (completed, _) = stack.pop().expect("stack is not empty");
-                self.require_no_bubble_above(
+                let bubble = self.bubble_above(
                     completed,
                     if evaporates {
                         "minecraft:air"
@@ -18832,6 +18831,11 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
                     },
                 )?;
                 self.push_action(IceTickAction::ShapeNeighbors(completed, !evaporates))?;
+                if bubble {
+                    let above = add(completed, IVec3::Y)
+                        .ok_or_else(|| anyhow::anyhow!("water position overflow"))?;
+                    self.push_action(IceTickAction::ScheduleBubble(above))?;
+                }
                 continue;
             }
             let neighbor = add(*source, directions[*index])
@@ -18839,7 +18843,11 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
             *index += 1;
             if self.ice_age(neighbor)?.is_none() {
                 if self.is_water(neighbor)? {
+                    let bubble = self.source_water(neighbor)? && self.bubble_below(neighbor)?;
                     self.push_action(IceTickAction::NeighborWater(neighbor))?;
+                    if bubble {
+                        self.push_action(IceTickAction::ScheduleBubble(neighbor))?;
+                    }
                 }
                 continue;
             }
@@ -19722,7 +19730,9 @@ pub(crate) mod tests {
                         p.z - 8,
                         delay
                     ])),
-                    IceTickAction::ShapeNeighbors(..) | IceTickAction::NeighborWater(_) => None,
+                    IceTickAction::ShapeNeighbors(..)
+                    | IceTickAction::NeighborWater(_)
+                    | IceTickAction::ScheduleBubble(_) => None,
                 })
                 .collect();
             assert_eq!(events, row["events"].as_array().unwrap().to_vec(), "{row}");
@@ -29827,17 +29837,130 @@ pub(crate) mod tests {
             };
             let mut random = native_core::random::LegacyRandom::new(1);
             let result = crate::frosted_ice::tick(&mut stage, center, age, &mut random);
-            if row["bubble"].as_bool().unwrap() {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("bubble column scheduling"),
-                    "{row}"
-                );
+            assert!(result.is_ok(), "{row}: {result:?}");
+            let scheduled: Vec<_> = stage
+                .actions
+                .iter()
+                .filter_map(|action| match action {
+                    IceTickAction::ScheduleBubble(position) => Some(*position),
+                    _ => None,
+                })
+                .collect();
+            let expected = if row["bubble"].as_bool().unwrap() {
+                vec![
+                    center
+                        + match scenario {
+                            0 => IVec3::ZERO,
+                            1 => IVec3::X,
+                            _ => IVec3::Y,
+                        },
+                ]
             } else {
-                assert!(result.is_ok(), "{row}: {result:?}");
-            }
+                Vec::new()
+            };
+            assert_eq!(scheduled, expected, "{row}");
+            drop(stage);
+            session.ice_ticks.clear();
+            session.ice_pending.clear();
+            session.level_random = native_core::random::LegacyRandom::new(1);
+            let absolute = session.origin + center;
+            session.enqueue_saved_ice(&[SavedBlockTick {
+                block: "minecraft:frosted_ice".into(),
+                position: absolute.to_array(),
+                delay: 0,
+                priority: 0,
+            }]);
+            session.advance_block_ticks();
+            assert!(session.ice_deferred.is_empty(), "{row}");
+            let final_state = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            let property = if final_state.name == "minecraft:water" {
+                "level"
+            } else {
+                "age"
+            };
+            assert_eq!(
+                format!(
+                    "Block{{{}}}[{}={}]",
+                    final_state.name, property, final_state.properties[property]
+                ),
+                row["final"].as_str().unwrap(),
+                "{row}"
+            );
+            let mut block_ticks: Vec<_> = session
+                .ice_ticks
+                .iter()
+                .map(|(order, &(x, y, z))| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            "ice",
+                            x - session.origin.x,
+                            y - session.origin.y,
+                            z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            block_ticks.extend(session.bubble_ticks.iter().map(|(order, key)| {
+                (
+                    order.3,
+                    serde_json::json!([
+                        "water",
+                        key.x - session.origin.x,
+                        key.y - session.origin.y,
+                        key.z - session.origin.z,
+                        order.0
+                    ]),
+                )
+            }));
+            block_ticks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(
+                    block_ticks
+                        .into_iter()
+                        .map(|event| event.1)
+                        .collect::<Vec<_>>()
+                ),
+                row["blockTicks"],
+                "{row}"
+            );
+            let mut fluid_ticks: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluid_ticks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(
+                    fluid_ticks
+                        .into_iter()
+                        .map(|event| event.1)
+                        .collect::<Vec<_>>()
+                ),
+                row["fluidTicks"],
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
         }
     }
 
@@ -30272,19 +30395,23 @@ pub(crate) mod tests {
         }
 
         for support in ["minecraft:magma_block", "minecraft:soul_sand"] {
-            let mut deferred = setup("3", 15, None, true);
-            let water = deferred.intern_block(state("minecraft:water", &[("level", "0")]));
-            let support = deferred.intern_block(state(support, &[]));
-            assert!(deferred.set_with_notify(IVec3::new(4, 2, 5), water, false));
-            assert!(deferred.set_with_notify(IVec3::new(4, 1, 5), support, false));
-            deferred.pending_light.clear();
-            deferred.sky_lighting = crate::sky_lighting::SkyLighting::default();
-            deferred.sky_lighting.set_enabled(false);
-            let before = deferred.level_random.clone().next_int();
-            deferred.advance_block_ticks();
-            assert_eq!(deferred.ice_deferred.len(), 1);
-            assert!(deferred.fluid_ticks.is_empty() && deferred.sand_ticks.is_empty());
-            assert_eq!(deferred.level_random.next_int(), before);
+            let mut active = setup("3", 15, None, true);
+            let water = active.intern_block(state("minecraft:water", &[("level", "0")]));
+            let support = active.intern_block(state(support, &[]));
+            assert!(active.set_with_notify(IVec3::new(4, 2, 5), water, false));
+            assert!(active.set_with_notify(IVec3::new(4, 1, 5), support, false));
+            active.pending_light.clear();
+            active.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            active.sky_lighting.set_enabled(false);
+            active.advance_block_ticks();
+            assert!(active.ice_deferred.is_empty());
+            let pos = active.origin + IVec3::new(4, 2, 5);
+            assert!(active.bubble_pending.contains(&BubbleTickKey {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+                kind: BubbleTickKind::Water
+            }));
         }
 
         let tags = |ids: &[&str]| {
@@ -30300,10 +30427,35 @@ pub(crate) mod tests {
         custom.pending_light.clear();
         custom.sky_lighting = crate::sky_lighting::SkyLighting::default();
         custom.sky_lighting.set_enabled(false);
-        let random_before = custom.level_random.clone().next_int();
         custom.advance_block_ticks();
-        assert_eq!(custom.ice_deferred.len(), 1);
-        assert_eq!(custom.level_random.clone().next_int(), random_before);
+        assert!(custom.ice_deferred.is_empty());
+        let custom_pos = custom.origin + IVec3::new(4, 2, 4);
+        assert!(custom.bubble_pending.contains(&BubbleTickKey {
+            x: custom_pos.x,
+            y: custom_pos.y,
+            z: custom_pos.z,
+            kind: BubbleTickKind::Water
+        }));
+        let mut generated = setup("3", 15, None, false);
+        let stone = generated.intern_block(state("minecraft:stone", &[]));
+        assert!(generated.set_with_notify(IVec3::new(4, 1, 4), stone, false));
+        generated.set_bubble_column_tags(tags(&["minecraft:stone"]));
+        generated.pending_light.clear();
+        generated.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        generated.sky_lighting.set_enabled(false);
+        generated.advance_block_ticks();
+        generated.tick = 20;
+        generated.advance_block_ticks();
+        let generated_pos = generated.origin + IVec3::new(4, 2, 4);
+        let generated_state = generated
+            .world
+            .block(generated_pos.x, generated_pos.y, generated_pos.z)
+            .unwrap();
+        assert_eq!(generated_state.name, "minecraft:bubble_column");
+        assert_eq!(
+            generated_state.properties.get("drag").map(String::as_str),
+            Some("true")
+        );
         let mut water_excluded = setup("3", 15, None, false);
         let stone = water_excluded.intern_block(state("minecraft:stone", &[]));
         assert!(water_excluded.set_with_notify(IVec3::new(4, 1, 4), stone, false));
@@ -30350,8 +30502,14 @@ pub(crate) mod tests {
         neighbor_tag.sky_lighting = crate::sky_lighting::SkyLighting::default();
         neighbor_tag.sky_lighting.set_enabled(false);
         neighbor_tag.advance_block_ticks();
-        assert_eq!(neighbor_tag.ice_deferred.len(), 1);
-        assert!(neighbor_tag.fluid_ticks.is_empty());
+        assert!(neighbor_tag.ice_deferred.is_empty());
+        let pos = neighbor_tag.origin + IVec3::new(4, 2, 5);
+        assert!(neighbor_tag.bubble_pending.contains(&BubbleTickKey {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            kind: BubbleTickKind::Water
+        }));
 
         let mut shape_tag = setup("0", 15, None, false);
         let water = shape_tag.intern_block(state("minecraft:water", &[("level", "0")]));
@@ -30361,8 +30519,14 @@ pub(crate) mod tests {
         shape_tag.sky_lighting = crate::sky_lighting::SkyLighting::default();
         shape_tag.sky_lighting.set_enabled(false);
         shape_tag.advance_block_ticks();
-        assert_eq!(shape_tag.ice_deferred.len(), 1);
-        assert!(shape_tag.fluid_ticks.is_empty());
+        assert!(shape_tag.ice_deferred.is_empty());
+        let pos = shape_tag.origin + IVec3::new(4, 3, 4);
+        assert!(shape_tag.bubble_pending.contains(&BubbleTickKey {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            kind: BubbleTickKind::Water
+        }));
 
         let mut missing_tags = setup("3", 15, None, false);
         missing_tags.bubble_column_tags = None;

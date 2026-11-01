@@ -23,7 +23,7 @@ import net.minecraft.world.phys.Vec3;
 public class IceBubbleTagOracle {
     static final BlockPos CENTER = new BlockPos(8, 10, 8);
     static class World extends ServerLevel {
-        Map<BlockPos, BlockState> blocks; RandomSource random; boolean bubble;
+        Map<BlockPos, BlockState> blocks; RandomSource random; boolean bubble; JsonArray blockTicks, fluidTicks; Set<String> pending;
         CollectingNeighborUpdater updater; EnvironmentAttributeSystem attributes;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public RandomSource getRandom() { return random; }
@@ -43,8 +43,17 @@ public class IceBubbleTagOracle {
             if ((flags & 16) == 0 && depth > 0) { int next = flags & -34; old.updateIndirectNeighbourShapes(this, pos, next, depth-1); state.updateNeighbourShapes(this, pos, next, depth-1); state.updateIndirectNeighbourShapes(this, pos, next, depth-1); }
             return true;
         }
-        @Override public void scheduleTick(BlockPos pos, Block block, int delay) { if (block == Blocks.WATER) bubble = true; }
-        @Override public void scheduleTick(BlockPos pos, net.minecraft.world.level.material.Fluid fluid, int delay) { }
+        @Override public void scheduleTick(BlockPos pos, Block block, int delay) {
+            if (block == Blocks.WATER) bubble = true;
+            String id=block==Blocks.WATER?"water":block==Blocks.FROSTED_ICE?"ice":"other";
+            if(!pending.add("b:"+pos.toShortString()+":"+id)) return;
+            var entry=new JsonArray(); entry.add(id); entry.add(pos.getX()); entry.add(pos.getY()); entry.add(pos.getZ()); entry.add(delay); blockTicks.add(entry);
+        }
+        @Override public void scheduleTick(BlockPos pos, net.minecraft.world.level.material.Fluid fluid, int delay) {
+            String id=fluid==Fluids.WATER?"water":"flowing_water";
+            if(!pending.add("f:"+pos.toShortString()+":"+id)) return;
+            var entry=new JsonArray(); entry.add(id); entry.add(pos.getX()); entry.add(pos.getY()); entry.add(pos.getZ()); entry.add(delay); fluidTicks.add(entry);
+        }
         @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { }
     }
     public static void main(String[] args) throws Exception {
@@ -62,7 +71,7 @@ public class IceBubbleTagOracle {
             BuiltInRegistries.FLUID.prepareTagReload(new TagLoader.LoadResult<>(Registries.FLUID, Map.of(
                 FluidTags.WATER, List.of(Fluids.WATER.builtInRegistryHolder(), Fluids.FLOWING_WATER.builtInRegistryHolder()),
                 FluidTags.BUBBLE_COLUMN_CAN_OCCUPY, waterTagged ? List.of(Fluids.WATER.builtInRegistryHolder()) : List.of()))).apply();
-            world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.bubble=false; world.updater=new CollectingNeighborUpdater(world, 100000);
+            world.blocks=new HashMap<>(); world.random=new LegacyRandomSource(1); world.bubble=false; world.updater=new CollectingNeighborUpdater(world, 100000); world.blockTicks=new JsonArray(); world.fluidTicks=new JsonArray(); world.pending=new HashSet<>();
             int age=scenario==2 ? 0 : 3;
             var ice=Blocks.FROSTED_ICE.defaultBlockState().setValue(FrostedIceBlock.AGE,age);
             world.blocks.put(CENTER,ice);
@@ -70,7 +79,7 @@ public class IceBubbleTagOracle {
             if (scenario==1) { world.blocks.put(CENTER.east().below(),Blocks.STONE.defaultBlockState()); world.blocks.put(CENTER.east(),Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,source?0:1)); }
             if (scenario==2) world.blocks.put(CENTER.above(),Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,source?0:1));
             tick.invoke(Blocks.FROSTED_ICE,ice,world,CENTER,world.random);
-            var row=new JsonObject(); row.addProperty("scenario",scenario); row.addProperty("support",supportTagged); row.addProperty("water",waterTagged); row.addProperty("source",source); row.addProperty("bubble",world.bubble); row.addProperty("final",world.getBlockState(CENTER).toString()); row.addProperty("block_tag",support.defaultBlockState().is(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN)); row.addProperty("fluid_tag",Fluids.WATER.defaultFluidState().is(FluidTags.BUBBLE_COLUMN_CAN_OCCUPY)); rows.add(row);
+            var row=new JsonObject(); row.addProperty("scenario",scenario); row.addProperty("support",supportTagged); row.addProperty("water",waterTagged); row.addProperty("source",source); row.addProperty("bubble",world.bubble); row.addProperty("final",world.getBlockState(CENTER).toString()); row.addProperty("block_tag",support.defaultBlockState().is(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN)); row.addProperty("fluid_tag",Fluids.WATER.defaultFluidState().is(FluidTags.BUBBLE_COLUMN_CAN_OCCUPY)); row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); row.addProperty("next",world.random.nextInt()); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

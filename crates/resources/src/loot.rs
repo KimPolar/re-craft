@@ -578,6 +578,77 @@ impl BlockLootTables {
     pub fn fully_supported_player_block(&self, block: &str) -> bool {
         self.fully_supported_player_block_inner(block, false)
     }
+
+    /// Check every possible branch against the actual tool before a block edit.
+    pub fn fully_supported_player_block_for_tool(&self, block: &str, tool: BasicTool<'_>) -> bool {
+        fn modifier_valid(modifier: &Modifier, tool: BasicTool<'_>) -> bool {
+            match &modifier.kind {
+                ModifierKind::UniformCount(min, max, _) if min < max => max
+                    .checked_sub(*min)
+                    .and_then(|value| value.checked_add(1))
+                    .is_some(),
+                ModifierKind::UniformBonus(enchantment, multiplier) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|level| multiplier.checked_mul(level))
+                        .and_then(|value| value.checked_add(1))
+                        .is_some_and(|bound| bound > 0)
+                }
+                ModifierKind::OreDrops(enchantment) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|level| level.checked_add(2))
+                        .is_some()
+                }
+                _ => true,
+            }
+        }
+        fn entry_valid(entry: &Entry, tool: BasicTool<'_>) -> bool {
+            entry
+                .modifiers
+                .iter()
+                .all(|modifier| modifier_valid(modifier, tool))
+                && match &entry.kind {
+                    EntryKind::Alternatives(children) => {
+                        children.iter().all(|child| entry_valid(child, tool))
+                    }
+                    _ => true,
+                }
+        }
+        let Ok(block) = ResourceId::parse(block) else {
+            return false;
+        };
+        let name = format!("{}:{}", block.namespace, block.path);
+        if !self.fully_supported_player_block(&name) {
+            return false;
+        }
+        let id = ResourceId {
+            namespace: block.namespace,
+            path: format!("blocks/{}", block.path),
+        };
+        self.tables.get(&id).is_some_and(|table| {
+            table
+                .modifiers
+                .iter()
+                .all(|modifier| modifier_valid(modifier, tool))
+                && table.pools.iter().all(|pool| {
+                    pool.modifiers
+                        .iter()
+                        .all(|modifier| modifier_valid(modifier, tool))
+                        && pool.entries.iter().all(|entry| entry_valid(entry, tool))
+                })
+        })
+    }
     pub fn fully_supported_player_block_with_components(&self, block: &str) -> bool {
         self.fully_supported_player_block_inner(block, true)
     }
@@ -1563,6 +1634,21 @@ mod tests {
                 .drops_without_entity("minecraft:short_grass", Some(&mut || 0.0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn player_loot_preflight_checks_bounds_in_unselected_branches() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/stone.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","condition":{"type":"minecraft:random_chance","chance":1.0},"name":"minecraft:stone"},{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:apply_bonus","enchantment":"minecraft:fortune","formula":"minecraft:uniform_bonus_count","parameters":{"bonusMultiplier":-2}}}]}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let enchantments = [(ResourceId::parse("minecraft:fortune").unwrap(), 1)];
+        let tool = BasicTool {
+            item: Some("minecraft:iron_pickaxe"),
+            count: 1,
+            enchantments: &enchantments,
+        };
+        assert!(tables.fully_supported_player_block("minecraft:stone"));
+        assert!(!tables.fully_supported_player_block_for_tool("minecraft:stone", tool));
     }
 
     #[cfg(target_os = "windows")]

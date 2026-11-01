@@ -9884,47 +9884,30 @@ impl LoadedSession {
         {
             return;
         }
-        let checked_drops = if (snow || stair || slab || lodestone)
+        let checked =
+            snow || stair || slab || lodestone || (self.loot.is_some() && properties.is_some());
+        let player_loot = checked
             && self.game_mode != GameMode::Creative
-            && self.block_drops
-            && properties.is_some_and(|properties| properties.correct_for_drops)
-        {
-            if (stair || slab || lodestone)
-                && !self
-                    .loot
-                    .as_ref()
-                    .is_some_and(|loot| loot.fully_supported_player_block(&name))
+            && properties.is_some_and(|properties| properties.correct_for_drops);
+        let Some(original_state) = self.world.state(id).cloned() else {
+            return;
+        };
+        if player_loot {
+            if (name == "minecraft:snow"
+                && native_world::collision::snow_layers(&original_state).is_none())
+                || (name == "minecraft:snow_block" && !original_state.properties.is_empty())
             {
                 return;
             }
-            let Some(state) = self.world.state(id) else {
-                return;
-            };
-            if (name == "minecraft:snow" && native_world::collision::snow_layers(state).is_none())
-                || (name == "minecraft:snow_block" && !state.properties.is_empty())
-            {
-                return;
-            }
-            match self.dropped_items.prepare_player_block_drops(
-                &name,
-                &state.properties,
-                hand.as_ref(),
-                self.loot.as_deref(),
-            ) {
-                Ok(drops) => Some(drops),
+            match self.stage_block_loot(&original_state, hand.as_ref(), true) {
+                Ok((_, checkpoint)) => self.rollback_block_loot(checkpoint),
                 Err(error) => {
                     self.stream_errors
                         .push(format!("block loot for {name}: {error:#}"));
                     return;
                 }
             }
-        } else {
-            None
-        };
-        // Neighbor notifications may spawn drops and consume the same RNG.
-        // Stage this loot first so they cannot be overwritten afterward.
-        let checked_drops =
-            checked_drops.map(|drops| self.dropped_items.stage_player_block_drops(drops));
+        }
         let replacement = if (slab
             && self.world.state(id).is_some_and(|state| {
                 state
@@ -9952,15 +9935,20 @@ impl LoadedSession {
                 Arc::make_mut(&mut self.inventory)
                     .damage_selected_tool(damage, &mut self.level_random);
             }
-            if let Some((drops, _)) = checked_drops {
+            if player_loot {
+                // Java resolves loot after neighbor notifications and tool wear.
+                // The preflight checks every branch before the world mutation.
+                let (drops, _) = self
+                    .stage_block_loot(&original_state, hand.as_ref(), true)
+                    .expect("preflighted block loot remains evaluable");
                 self.dropped_items.drop_interaction(
                     absolute,
                     IVec3::ZERO,
                     native_resources::transforms::DropStrategy::FromMiddle,
                     drops,
-                    true,
+                    self.block_drops,
                 );
-            } else if !snow && !stair && !slab && !lodestone {
+            } else if !checked {
                 self.dropped_items.drop_block_with_name(
                     absolute,
                     &name,
@@ -9991,8 +9979,6 @@ impl LoadedSession {
                         .push(format!("ore experience for {name}: {error:#}")),
                 }
             }
-        } else if let Some((_, random)) = checked_drops {
-            self.dropped_items.restore_drop_random(random);
         }
     }
 
@@ -12243,8 +12229,39 @@ impl LoadedSession {
         &mut self,
         block: &BlockState,
     ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, BlockLootCheckpoint)> {
+        self.stage_block_loot(block, None, false)
+    }
+
+    fn stage_block_loot(
+        &mut self,
+        block: &BlockState,
+        hand: Option<&crate::inventory::ItemStack>,
+        player: bool,
+    ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, BlockLootCheckpoint)> {
         use anyhow::Context;
+        let enchantments = hand
+            .map(crate::inventory::item_enchantments)
+            .transpose()?
+            .unwrap_or_default();
+        let tool = native_resources::loot::BasicTool {
+            item: hand.map(crate::inventory::ItemStack::id),
+            count: hand.map_or(0, crate::inventory::ItemStack::count),
+            enchantments: &enchantments,
+        };
         let tables = self.loot.as_ref().context("block loot table unavailable")?;
+        if player {
+            anyhow::ensure!(
+                tables.fully_supported_player_block_for_tool(&block.name, tool),
+                "unsupported player block loot"
+            );
+        }
+        let evaluate = |random: &mut dyn native_resources::loot::LootRandom| {
+            if player {
+                tables.drops_with_entity_at(&block.name, &block.properties, tool, Some(random))
+            } else {
+                tables.drops_without_entity_at(&block.name, Some(&block.properties), Some(random))
+            }
+        };
         match tables.random_sequence_for_block(&block.name)? {
             Some(id) => {
                 let name = format!("{}:{}", id.namespace, id.path);
@@ -12254,21 +12271,13 @@ impl LoadedSession {
                     .context("world random sequences unavailable")?;
                 let checkpoint = sequences.data.checkpoint(&name)?;
                 let mut random = sequences.data.get(&name, sequences.world_seed)?;
-                let drops = tables.drops_without_entity_at(
-                    &block.name,
-                    Some(&block.properties),
-                    Some(&mut random),
-                )?;
+                let drops = evaluate(&mut random)?;
                 sequences.data.set(&name, &random)?;
                 Ok((drops, BlockLootCheckpoint::Named(checkpoint)))
             }
             None => {
                 let mut random = self.level_random.clone();
-                let drops = tables.drops_without_entity_at(
-                    &block.name,
-                    Some(&block.properties),
-                    Some(&mut random),
-                )?;
+                let drops = evaluate(&mut random)?;
                 let previous = std::mem::replace(&mut self.level_random, random);
                 Ok((drops, BlockLootCheckpoint::Level(previous)))
             }
@@ -20494,6 +20503,12 @@ mod tests {
                 let mut session = session();
                 session.set_block_loot(Arc::clone(&loot));
                 session
+                    .set_random_sequences(
+                        0,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                session
                     .set_saved_breathing(
                         Default::default(),
                         crate::player_data::SavedAttribute::with_base(0.0),
@@ -20597,6 +20612,12 @@ mod tests {
                 let mut session = session();
                 session.set_vanilla_block_ids(Arc::clone(&ids));
                 session.set_block_loot(Arc::clone(&loot));
+                session
+                    .set_random_sequences(
+                        0,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
                 let stack = ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![])).unwrap();
                 assert!(
                     Arc::make_mut(&mut session.inventory)
@@ -20751,6 +20772,12 @@ mod tests {
                 let mut session = session();
                 session.set_vanilla_block_ids(Arc::clone(&ids));
                 session.set_block_loot(Arc::clone(&loot));
+                session
+                    .set_random_sequences(
+                        0,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
                 let stack = ItemStack::new(tool.into(), 1, 1, Tag::Compound(vec![])).unwrap();
                 assert!(
                     Arc::make_mut(&mut session.inventory)
@@ -20930,8 +20957,19 @@ mod tests {
     fn held_stair_mining_uses_fixed_ticks_and_tool_progress() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/oak_stairs.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:oak_stairs"}]}]}"#.to_vec()))
+            }
+        }
         for split_frames in [false, true] {
             let mut session = session();
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
             session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
                 "minecraft:air".into(),
                 "minecraft:stone".into(),
@@ -21265,6 +21303,12 @@ mod tests {
         for silk in [false, true] {
             let mut session = session();
             session.set_block_loot(Arc::clone(&loot));
+            session
+                .set_random_sequences(
+                    0,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
             session
                 .set_saved_breathing(
                     Default::default(),
@@ -39531,6 +39575,12 @@ mod tests {
         ] {
             let mut session = session();
             session.set_block_loot(Arc::clone(&loot));
+            session
+                .set_random_sequences(
+                    0,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
             let components = match enchantment {
                 Some((name, level)) => Tag::Compound(vec![(
                     "minecraft:enchantments".into(),
@@ -39613,6 +39663,12 @@ mod tests {
         ] {
             let mut session = session();
             session.set_block_loot(Arc::clone(&loot));
+            session
+                .set_random_sequences(
+                    0,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
             let components = Tag::Compound(vec![(
                 "minecraft:enchantments".into(),
                 Tag::Compound(vec![(
@@ -39710,6 +39766,264 @@ mod tests {
                 .iter()
                 .any(|item| item.stack.id() == "minecraft:flint")
         );
+    }
+
+    #[test]
+    fn player_mining_preflight_preserves_state_and_sequences_on_failure() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot {
+            invalid_branch: bool,
+        }
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                if !path.ends_with("/stone.json") {
+                    return Ok(None);
+                }
+                let invalid = if self.invalid_branch {
+                    r#",{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:apply_bonus","enchantment":"minecraft:fortune","formula":"minecraft:uniform_bonus_count","parameters":{"bonusMultiplier":-2}}}"#
+                } else {
+                    ""
+                };
+                Ok(Some(format!(r#"{{"type":"minecraft:block","random_sequence":"example:mining","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:alternatives","children":[{{"type":"minecraft:item","name":"minecraft:stone","condition":{{"type":"minecraft:random_chance","chance":1.0}}}}{invalid}]}}]}}]}}"#).into_bytes()))
+            }
+        }
+        for invalid_branch in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::new(
+                BlockLootTables::load(&mut Loot { invalid_branch }).unwrap(),
+            ));
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            let tool = ItemStack::new(
+                "minecraft:iron_pickaxe".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("minecraft:fortune".into(), Tag::Int(1))]),
+                )]),
+            )
+            .unwrap();
+            Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool));
+            let relative = IVec3::new(4, 3, 4);
+            let position = session.origin + relative;
+            assert!(session.set_with_notify(relative, session.states[3], false));
+            if !invalid_branch {
+                let banner = session
+                    .intern_block(state("minecraft:white_wall_banner", &[("facing", "east")]));
+                let attached = position + IVec3::X;
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(attached.x, attached.y, attached.z, banner)
+                    .unwrap();
+            }
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:stone"
+            );
+            assert!(session.dropped_items.snapshot().is_empty());
+            assert!(
+                session
+                    .inventory
+                    .slot(PlayerSlot::Storage(0))
+                    .unwrap()
+                    .components()
+                    .get("minecraft:damage")
+                    .is_none()
+            );
+            assert!(!session.random_sequences.as_ref().unwrap().data.is_dirty());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_block_loot_sequences_match_java_for_ores_and_slabs() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{
+            loot::BlockLootTables,
+            packs::{ResourceProvider, ResourceStack},
+        };
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerBlockLootOracle.java");
+        let output = temp.path().join("loot.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerBlockLootOracle.java"),
+        )
+        .unwrap();
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let paths: Vec<_> = [
+            "data/minecraft/predicate/tool/can_silk_touch.json",
+            "data/minecraft/loot_table/blocks/coal_ore.json",
+            "data/minecraft/loot_table/blocks/stone_slab.json",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let file = temp.path().join(format!("input_{index}.json"));
+            std::fs::write(&file, resources.read_builtin_data(path).unwrap().unwrap()).unwrap();
+            file
+        })
+        .collect();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("PlayerBlockLootOracle")
+            .args(&paths)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 144);
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let ids = Arc::new(resources.vanilla_block_ids().unwrap());
+        let enchantments = Arc::new(OxygenEnchantments::load(&mut resources).unwrap());
+        for group in rows.chunks_exact(8) {
+            let name = group[0]["name"].as_str().unwrap();
+            let variant = group[0]["variant"].as_u64().unwrap() as usize;
+            let seed = group[0]["seed"].as_i64().unwrap();
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session.set_vanilla_block_ids(Arc::clone(&ids));
+            session
+                .set_random_sequences(
+                    seed,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session
+                .set_saved_breathing(
+                    Default::default(),
+                    crate::player_data::SavedAttribute::with_base(0.0),
+                    Arc::clone(&enchantments),
+                )
+                .unwrap();
+            let components = if name == "coal_ore" && variant != 0 {
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![(
+                        if variant == 1 {
+                            "minecraft:fortune"
+                        } else {
+                            "minecraft:silk_touch"
+                        }
+                        .into(),
+                        Tag::Int(if variant == 1 { 3 } else { 1 }),
+                    )]),
+                )])
+            } else {
+                Tag::Compound(vec![])
+            };
+            let tool = ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, components).unwrap();
+            Arc::make_mut(&mut session.inventory).set_slot(PlayerSlot::Storage(0), Some(tool));
+            let block = if name == "coal_ore" {
+                state("minecraft:coal_ore", &[])
+            } else {
+                state(
+                    "minecraft:stone_slab",
+                    &[
+                        ("type", ["bottom", "top", "double"][variant]),
+                        ("waterlogged", "false"),
+                    ],
+                )
+            };
+            let id = session.intern_block(block);
+            let relative = IVec3::new(4, 3, 4);
+            let position = session.origin + relative;
+            let sequence = format!("minecraft:blocks/{name}");
+            for (step, row) in group.iter().enumerate() {
+                let drops_enabled = step % 2 == 0;
+                session.set_block_drops(drops_enabled);
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(position.x, position.y, position.z, id)
+                    .unwrap();
+                let before = session.dropped_items.snapshot().len();
+                session.finish_breaking(position);
+                assert_eq!(
+                    session
+                        .world
+                        .block(position.x, position.y, position.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:air",
+                    "{name} {variant} {seed} {step}"
+                );
+                let items = session.dropped_items.snapshot();
+                let actual: Vec<_> = items[before..]
+                    .iter()
+                    .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
+                    .collect();
+                let expected = if drops_enabled {
+                    row["drops"].as_array().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(actual, expected, "{name} {variant} {seed} {step}");
+                let mut random = session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get(&sequence, seed)
+                    .unwrap();
+                assert_eq!(
+                    random.next_long(),
+                    row["next"].as_i64().unwrap(),
+                    "{name} {variant} {seed} {step}"
+                );
+            }
+        }
     }
 
     #[test]

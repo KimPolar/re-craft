@@ -632,7 +632,61 @@ mod tests {
             text.len()
         }
         let mut clicks = 0;
+        let mut time_arguments = 0;
+        let mut marker_cases = 0;
+        let mut clock_cases = 0;
         for row in rows {
+            if let Some(initial) = row["clockInitial"].as_i64() {
+                clock_cases += 1;
+                let mut clock = native_persistence::world::SavedClock {
+                    total_ticks: initial,
+                    partial_tick: 0.75,
+                    ..Default::default()
+                };
+                let amount = row["clockAmount"].as_i64().unwrap() as i32;
+                if row["clockAdd"].as_bool().unwrap() {
+                    native_session::time_command::add_clock(&mut clock, amount);
+                } else {
+                    native_session::time_command::set_clock(&mut clock, amount);
+                }
+                assert_eq!(
+                    clock.total_ticks,
+                    row["clockTotal"].as_i64().unwrap(),
+                    "{row}"
+                );
+                assert_eq!(
+                    clock.partial_tick,
+                    row["clockPartial"].as_f64().unwrap() as f32,
+                    "{row}"
+                );
+                continue;
+            }
+            if let Some(ticks) = row["markerTicks"].as_i64() {
+                marker_cases += 1;
+                let period = row["markerPeriod"].as_i64().unwrap() as i32;
+                let marker = native_resources::world_clock::TimeMarker {
+                    ticks: ticks as i32,
+                    period: (period != 0).then_some(period),
+                };
+                let current = row["markerCurrent"].as_i64().unwrap();
+                assert_eq!(
+                    native_session::time_command::resolve_marker(marker, current),
+                    row["markerTarget"].as_i64(),
+                    "{row}"
+                );
+                continue;
+            }
+            if let Some(input) = row["timeArgument"].as_str() {
+                time_arguments += 1;
+                let minimum = row["minimum"].as_i64().unwrap() as i32;
+                let expected = row["ticks"].as_i64().map(|ticks| ticks as i32);
+                assert_eq!(
+                    native_session::time_command::duration(input, minimum),
+                    expected,
+                    "{row}"
+                );
+                continue;
+            }
             let text = row["before"].as_str().unwrap();
             let mut input = ChatInput::default();
             input.open(false);
@@ -680,5 +734,8 @@ mod tests {
             );
         }
         assert_eq!(clicks, 98);
+        assert!(time_arguments > 4000);
+        assert_eq!(marker_cases, 420);
+        assert_eq!(clock_cases, 72);
     }
 }

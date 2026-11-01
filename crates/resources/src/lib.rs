@@ -49,6 +49,7 @@ pub mod surface_rules;
 pub mod transforms;
 pub mod vanilla_atlas;
 pub mod vanilla_stitcher;
+pub mod world_clock;
 
 pub const TARGET_VERSION: &str = "26.3";
 pub const DEMO_PLANKS_TILE_START: u32 = 5;

@@ -18,6 +18,11 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.ComponentUtils;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.contents.TranslatableContents;
+import net.minecraft.commands.arguments.TimeArgument;
+import com.mojang.brigadier.StringReader;
+import net.minecraft.world.clock.ClockTimeMarker;
+import java.util.Optional;
+import net.minecraft.world.clock.ServerClockManager;
 import net.minecraft.client.input.KeyEvent;
 
 // Compare the real 26.3 EditBox input state without creating a game window.
@@ -109,6 +114,60 @@ public final class ChatEditOracle {
                 row.addProperty("afterAnchor", get(box, "highlightPos"));
                 rows.add(row);
             }
+        }
+        ArrayList<String> times = new ArrayList<>();
+        for (int n = -200; n <= 200; n++) times.add(Float.toString(n / 10.0f));
+        for (String special : new String[]{"", "-", ".", "+1", "1e3", "-0.5", "-0.00001", "2147483647", "2147483648", "999999999999999999999999999999999999999999", "1.2.3", "--1"}) times.add(special);
+        for (String time : times) for (String unit : new String[]{"", "t", "s", "d", "x"}) for (int minimum : new int[]{0, Integer.MIN_VALUE}) {
+            String input = time + unit;
+            JsonObject row = new JsonObject();
+            row.addProperty("timeArgument", input);
+            row.addProperty("minimum", minimum);
+            try {
+                StringReader reader = new StringReader(input);
+                int ticks = TimeArgument.time(minimum).parse(reader);
+                if (reader.canRead()) throw new IllegalArgumentException("trailing characters");
+                row.addProperty("ticks", ticks);
+            } catch (Exception ignored) {
+                row.add("ticks", com.google.gson.JsonNull.INSTANCE);
+            }
+            rows.add(row);
+        }
+        for (int period : new int[]{0, 1, 48, 24000, Integer.MAX_VALUE})
+        for (int marker : new int[]{0, 1, 5, 47, 1000, 18000, Integer.MAX_VALUE})
+        for (long current : new long[]{Long.MIN_VALUE, -24001, -1, 0, 1, 5, 47, 48, 1000, 23999, 24000, Long.MAX_VALUE}) {
+            ClockTimeMarker definition = new ClockTimeMarker(null, marker, period == 0 ? Optional.empty() : Optional.of(period), true);
+            JsonObject row = new JsonObject();
+            row.addProperty("markerTicks", marker);
+            row.addProperty("markerPeriod", period);
+            row.addProperty("markerCurrent", current);
+            if (definition.occursAt(current)) row.add("markerTarget", com.google.gson.JsonNull.INSTANCE);
+            else row.addProperty("markerTarget", definition.resolveTimeToMoveTo(current));
+            rows.add(row);
+        }
+        Class<?> instanceType = ServerClockManager.ServerClockInstance.class;
+        var addTicks = ServerClockManager.class.getDeclaredMethod("lambda$addTicks$0", int.class, instanceType);
+        var setTicks = ServerClockManager.class.getDeclaredMethod("lambda$setTotalTicks$0", long.class, instanceType);
+        addTicks.setAccessible(true);
+        setTicks.setAccessible(true);
+        for (long initial : new long[]{Long.MIN_VALUE, -1, 0, 1, 1000, Long.MAX_VALUE})
+        for (int amount : new int[]{Integer.MIN_VALUE, -1, 0, 1, 1000, Integer.MAX_VALUE})
+        for (boolean add : new boolean[]{false, true}) {
+            var clock = new ServerClockManager.ServerClockInstance();
+            set(clock, instanceType, "totalTicks", initial);
+            set(clock, instanceType, "partialTick", 0.75f);
+            if (add) addTicks.invoke(null, amount, clock);
+            else if (initial != amount) setTicks.invoke(null, (long) amount, clock);
+            Field total = instanceType.getDeclaredField("totalTicks");
+            Field partial = instanceType.getDeclaredField("partialTick");
+            total.setAccessible(true); partial.setAccessible(true);
+            JsonObject row = new JsonObject();
+            row.addProperty("clockInitial", initial);
+            row.addProperty("clockAmount", amount);
+            row.addProperty("clockAdd", add);
+            row.addProperty("clockTotal", total.getLong(clock));
+            row.addProperty("clockPartial", partial.getFloat(clock));
+            rows.add(row);
         }
         Files.writeString(Path.of(args[0]), rows.toString());
     }

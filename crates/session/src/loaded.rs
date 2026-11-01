@@ -412,6 +412,19 @@ pub struct LoadedSession {
     game_mode: GameMode,
     game_master_permission: bool,
     world_seed: Option<i64>,
+    default_clock: Option<Option<native_persistence::world::DimensionId>>,
+    clock_dimension_type: Option<Arc<str>>,
+    time_markers: Option<
+        Arc<
+            BTreeMap<
+                (
+                    native_resources::packs::ResourceId,
+                    native_resources::packs::ResourceId,
+                ),
+                native_resources::world_clock::TimeMarker,
+            >,
+        >,
+    >,
     vitals: crate::survival::PlayerVitals,
     experience: crate::experience::Experience,
     death: Option<DeathInfo>,
@@ -3153,6 +3166,146 @@ impl LoadedSession {
         self.world_seed = seed;
     }
 
+    fn execute_time_command(
+        &mut self,
+        command: crate::time_command::TimeCommand,
+    ) -> crate::SystemMessageKind {
+        use crate::{SystemMessageKind as Message, time_command::TimeCommand};
+        if !self.game_master_permission {
+            return Message::TimePermissionDenied;
+        }
+        if command == TimeCommand::QueryGameTime {
+            return Message::TimeGame(self.game_time);
+        }
+        let Some(default_clock) = &self.default_clock else {
+            return Message::CommandUnavailable;
+        };
+        let Some(id) = default_clock else {
+            return self
+                .clock_dimension_type
+                .clone()
+                .map_or(Message::CommandUnavailable, Message::TimeNoDefaultClock);
+        };
+        let name: Arc<str> = format!("{}:{}", id.namespace, id.path).into();
+        let can_save_clock = self.saved_clock_source.is_some();
+        let selected_marker = if let TimeCommand::SetMarker(marker) = command {
+            let Some(markers) = &self.time_markers else {
+                return Message::CommandUnavailable;
+            };
+            let clock_id = native_resources::packs::ResourceId {
+                namespace: id.namespace.clone(),
+                path: id.path.clone(),
+            };
+            let marker_id = native_resources::packs::ResourceId {
+                namespace: "minecraft".into(),
+                path: marker.name().into(),
+            };
+            let marker_name: Arc<str> = format!("minecraft:{}", marker.name()).into();
+            match markers.get(&(clock_id, marker_id)) {
+                Some(marker) => Some((marker_name, *marker)),
+                None => {
+                    return Message::TimeMarker {
+                        name,
+                        marker: marker_name,
+                        already: false,
+                        missing: true,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let Some(clock) = self.world_clocks.get_mut(id) else {
+            return Message::CommandUnavailable;
+        };
+        match command {
+            TimeCommand::QueryGameTime => unreachable!(),
+            TimeCommand::QueryClock => Message::TimeClock {
+                name,
+                ticks: clock.total_ticks,
+            },
+            TimeCommand::Set(ticks) if ticks < 0 => Message::CommandUnavailable,
+            TimeCommand::Set(ticks) if clock.total_ticks == i64::from(ticks) => {
+                Message::TimeAlreadySet { name, ticks }
+            }
+            TimeCommand::Set(ticks) => {
+                if !can_save_clock {
+                    return Message::TimeSaveUnavailable;
+                }
+                crate::time_command::set_clock(clock, ticks);
+                Message::TimeSet {
+                    name,
+                    ticks: clock.total_ticks,
+                }
+            }
+            TimeCommand::SetMarker(_) => {
+                let (marker_name, marker) = selected_marker.expect("marker was resolved");
+                let target = crate::time_command::resolve_marker(marker, clock.total_ticks);
+                if let Some(target) = target {
+                    if !can_save_clock {
+                        return Message::TimeSaveUnavailable;
+                    }
+                    clock.total_ticks = target;
+                    clock.partial_tick = 0.0;
+                }
+                Message::TimeMarker {
+                    name,
+                    marker: marker_name,
+                    already: target.is_none(),
+                    missing: false,
+                }
+            }
+            TimeCommand::Add(ticks) => {
+                let result = clock.total_ticks.wrapping_add(i64::from(ticks)).max(0);
+                if result != clock.total_ticks && !can_save_clock {
+                    return Message::TimeSaveUnavailable;
+                }
+                crate::time_command::add_clock(clock, ticks);
+                Message::TimeSet {
+                    name,
+                    ticks: clock.total_ticks,
+                }
+            }
+            TimeCommand::Pause | TimeCommand::Resume => {
+                let paused = command == TimeCommand::Pause;
+                let already = clock.paused == paused;
+                if !already && !can_save_clock {
+                    return Message::TimeSaveUnavailable;
+                }
+                clock.paused = paused;
+                Message::TimePaused {
+                    name,
+                    paused,
+                    already,
+                }
+            }
+        }
+    }
+
+    pub fn set_default_clock(
+        &mut self,
+        dimension_type: Arc<str>,
+        clock: Option<native_persistence::world::DimensionId>,
+    ) {
+        self.clock_dimension_type = Some(dimension_type);
+        self.default_clock = Some(clock);
+    }
+
+    pub fn set_time_markers(
+        &mut self,
+        markers: Arc<
+            BTreeMap<
+                (
+                    native_resources::packs::ResourceId,
+                    native_resources::packs::ResourceId,
+                ),
+                native_resources::world_clock::TimeMarker,
+            >,
+        >,
+    ) {
+        self.time_markers = Some(markers);
+    }
+
     pub fn set_falling_fire_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.falling_fire_tag = Some(tag);
         self.sand_deferred_revision = None;
@@ -3588,6 +3741,9 @@ impl LoadedSession {
             game_mode: GameMode::default(),
             game_master_permission: false,
             world_seed: None,
+            default_clock: None,
+            clock_dimension_type: None,
+            time_markers: None,
             vitals: crate::survival::PlayerVitals::default(),
             experience: crate::experience::Experience::default(),
             death: None,
@@ -11542,6 +11698,14 @@ impl LoadedSession {
                         self.tick.saturating_add(1),
                     );
                 }
+                PlayerCommand::WorldTime(command) => {
+                    let kind = self.execute_time_command(command);
+                    crate::push_system_message(
+                        &mut self.system_messages,
+                        kind,
+                        self.tick.saturating_add(1),
+                    );
+                }
                 PlayerCommand::Move {
                     forward,
                     strafe,
@@ -14149,6 +14313,186 @@ fn move_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_commands_respect_permissions_clocks_and_safe_save_source() {
+        use crate::time_command::TimeCommand as C;
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            world::{DimensionId, SavedClock},
+        };
+        let id = DimensionId::parse("example:clock").unwrap();
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![(
+                        "example:clock".into(),
+                        Tag::Compound(vec![
+                            ("total_ticks".into(), Tag::Long(10)),
+                            ("partial_tick".into(), Tag::Float(0.75)),
+                            ("unknown".into(), Tag::Int(42)),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        let states = native_persistence::world::parse_world_clocks(&source).unwrap();
+        let mut session = session();
+        session
+            .restore_saved_world_clocks(&source, states, false)
+            .unwrap();
+        session.set_default_clock("example:dimension_type".into(), Some(id.clone()));
+        session.submit_command(PlayerCommand::WorldTime(C::Set(120)));
+        session.update(TICK);
+        assert_eq!(session.world_clock(&id).unwrap().total_ticks, 10);
+        assert!(matches!(
+            session.snapshot().system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimePermissionDenied
+        ));
+        session.set_game_master_permission(true);
+        session.submit_command(PlayerCommand::WorldTime(C::Add(1)));
+        session.update(TICK);
+        assert_eq!(session.world_clock(&id).unwrap().total_ticks, 11);
+        assert_eq!(session.world_clock(&id).unwrap().partial_tick, 0.75);
+        session.submit_command(PlayerCommand::WorldTime(C::Set(120)));
+        session.update(TICK);
+        assert_eq!(
+            session.world_clock(&id).unwrap(),
+            SavedClock {
+                total_ticks: 120,
+                partial_tick: 0.0,
+                ..Default::default()
+            }
+        );
+        session.submit_command(PlayerCommand::WorldTime(C::Set(120)));
+        session.submit_command(PlayerCommand::WorldTime(C::Add(-200)));
+        session.submit_command(PlayerCommand::WorldTime(C::Pause));
+        session.submit_command(PlayerCommand::WorldTime(C::Pause));
+        session.update(TICK);
+        assert_eq!(session.world_clock(&id).unwrap().total_ticks, 0);
+        assert!(session.world_clock(&id).unwrap().paused);
+        let messages = &session.snapshot().system_messages;
+        assert!(messages.iter().any(|m| matches!(
+            m.kind,
+            crate::SystemMessageKind::TimeAlreadySet { ticks: 120, .. }
+        )));
+        assert!(matches!(
+            messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimePaused {
+                paused: true,
+                already: true,
+                ..
+            }
+        ));
+        let clock_id = native_resources::packs::ResourceId::parse("example:clock").unwrap();
+        let marker_id = native_resources::packs::ResourceId::parse("minecraft:day").unwrap();
+        session.set_time_markers(Arc::new(BTreeMap::from([(
+            (clock_id, marker_id),
+            native_resources::world_clock::TimeMarker {
+                ticks: 5,
+                period: Some(48),
+            },
+        )])));
+        session.submit_command(PlayerCommand::WorldTime(C::SetMarker(
+            crate::time_command::TimeMarker::Day,
+        )));
+        session.submit_command(PlayerCommand::WorldTime(C::SetMarker(
+            crate::time_command::TimeMarker::Day,
+        )));
+        session.submit_command(PlayerCommand::WorldTime(C::Add(43)));
+        session.submit_command(PlayerCommand::WorldTime(C::SetMarker(
+            crate::time_command::TimeMarker::Day,
+        )));
+        session.update(TICK);
+        assert_eq!(session.world_clock(&id).unwrap().total_ticks, 53);
+        assert!(
+            session
+                .snapshot()
+                .system_messages
+                .iter()
+                .any(|message| matches!(
+                    message.kind,
+                    crate::SystemMessageKind::TimeMarker {
+                        already: true,
+                        missing: false,
+                        ..
+                    }
+                ))
+        );
+        let draft = session.draft_world_clocks(&source).unwrap();
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        draft.add_to_save_plan(&mut plan, &source).unwrap();
+        let updated = native_persistence::world::WorldReader::update_world_clock_document(
+            &source,
+            &session.world_clocks,
+        )
+        .unwrap();
+        assert_eq!(
+            updated
+                .value
+                .get("data")
+                .unwrap()
+                .get("example:clock")
+                .unwrap()
+                .get("unknown"),
+            Some(&Tag::Int(42))
+        );
+        assert_eq!(
+            native_persistence::world::parse_world_clocks(&updated).unwrap()[&id].total_ticks,
+            53
+        );
+
+        let mut absent = self::session();
+        absent.set_game_master_permission(true);
+        absent.set_default_clock("minecraft:the_nether".into(), None);
+        absent.submit_command(PlayerCommand::WorldTime(C::QueryGameTime));
+        absent.submit_command(PlayerCommand::WorldTime(C::QueryClock));
+        absent.update(TICK);
+        assert!(
+            absent
+                .snapshot()
+                .system_messages
+                .iter()
+                .any(|message| matches!(message.kind, crate::SystemMessageKind::TimeGame(1)))
+        );
+        assert!(
+            matches!(&absent.snapshot().system_messages.last().unwrap().kind, crate::SystemMessageKind::TimeNoDefaultClock(name) if name.as_ref() == "minecraft:the_nether")
+        );
+        absent.set_default_clock("example:dimension_type".into(), Some(id.clone()));
+        absent.set_world_clocks(BTreeMap::from([(id.clone(), SavedClock::default())]), false);
+        absent.submit_command(PlayerCommand::WorldTime(C::Set(7)));
+        absent.update(TICK);
+        assert_eq!(absent.world_clock(&id).unwrap().total_ticks, 0);
+        assert!(matches!(
+            absent.snapshot().system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimeSaveUnavailable
+        ));
+        absent.submit_command(PlayerCommand::WorldTime(C::Set(0)));
+        absent.submit_command(PlayerCommand::WorldTime(C::Add(0)));
+        absent.submit_command(PlayerCommand::WorldTime(C::Resume));
+        absent.update(TICK);
+        let messages = &absent.snapshot().system_messages;
+        assert!(messages.iter().any(|m| matches!(
+            m.kind,
+            crate::SystemMessageKind::TimeAlreadySet { ticks: 0, .. }
+        )));
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m.kind, crate::SystemMessageKind::TimeSet { ticks: 0, .. }))
+        );
+        assert!(matches!(
+            messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimePaused {
+                paused: false,
+                already: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn seed_query_is_tick_ordered_and_does_not_require_cheats() {

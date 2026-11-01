@@ -599,6 +599,11 @@ impl GameUi {
                 self.last_draw = None;
                 return action;
             }
+            if let Some(command) = native_session::time_command::parse(text) {
+                self.pending_chat_command = Some(native_session::PlayerCommand::WorldTime(command));
+                self.last_draw = None;
+                return action;
+            }
             let kind = if text.starts_with('/') {
                 native_session::SystemMessageKind::CommandUnavailable
             } else {
@@ -3500,6 +3505,33 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn time_commands_leave_chat_for_the_game_session() {
+        use native_session::{
+            PlayerCommand,
+            time_command::{TimeCommand, TimeMarker},
+        };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&game, &[]).unwrap()));
+        for (input, expected) in [
+            ("time set day", TimeCommand::SetMarker(TimeMarker::Day)),
+            ("time add -1.5s", TimeCommand::Add(-30)),
+            ("time query gametime", TimeCommand::QueryGameTime),
+            ("time pause", TimeCommand::Pause),
+        ] {
+            ui.open_chat(true);
+            ui.chat_text(input);
+            ui.chat_key(KeyCode::Enter, false, false, 0);
+            assert!(
+                matches!(ui.take_chat_command(), Some(PlayerCommand::WorldTime(actual)) if actual == expected)
+            );
+        }
+        assert!(ui.last_system_message().is_none());
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

@@ -889,6 +889,24 @@ fn prepare_existing_world(
                 }
             }
         });
+        let default_clock = world.dimension_type.as_deref().and_then(|dimension_type| {
+            match native_resources::world_clock::dimension_default_clock(
+                &mut resources,
+                dimension_type,
+            ) {
+                Ok(clock) => {
+                    let clock = clock.map(|id| native_persistence::world::DimensionId {
+                        namespace: id.namespace,
+                        path: id.path,
+                    });
+                    Some((Arc::<str>::from(dimension_type), clock))
+                }
+                Err(error) => {
+                    eprintln!("Dimension clock is unavailable: {error:#}");
+                    None
+                }
+            }
+        });
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
@@ -995,6 +1013,13 @@ fn prepare_existing_world(
             }
             Ok((clocks, None)) => session.set_world_clocks(clocks, rules.advance_time),
             Err(error) => eprintln!("World clocks are unavailable: {error:#}"),
+        }
+        if let Some((dimension_type, clock)) = default_clock {
+            session.set_default_clock(dimension_type, clock);
+        }
+        match native_resources::world_clock::time_markers(&mut resources) {
+            Ok(markers) => session.set_time_markers(Arc::new(markers)),
+            Err(error) => eprintln!("Time markers are unavailable: {error:#}"),
         }
         if let Some(environment) = fast_lava
             && let Err(error) = session.set_fast_lava_environment(Arc::new(environment))

@@ -55,6 +55,7 @@ mod stair_items;
 mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
+pub mod time_command;
 pub mod weather;
 pub mod world_spawn;
 pub mod worldgen;
@@ -218,6 +219,7 @@ impl GameMode {
 
 #[derive(Clone, Copy, Debug)]
 pub enum PlayerCommand {
+    WorldTime(time_command::TimeCommand),
     /// Read the verified seed of this local world.
     QueryWorldSeed,
     /// Request respawn after a supported death transition.
@@ -412,6 +414,33 @@ pub enum SystemMessageKind {
     ScreenshotFailed(Arc<str>),
     LocalChat(Arc<str>),
     WorldSeed(i64),
+    TimeGame(i64),
+    TimeClock {
+        name: Arc<str>,
+        ticks: i64,
+    },
+    TimeSet {
+        name: Arc<str>,
+        ticks: i64,
+    },
+    TimeAlreadySet {
+        name: Arc<str>,
+        ticks: i32,
+    },
+    TimePaused {
+        name: Arc<str>,
+        paused: bool,
+        already: bool,
+    },
+    TimeNoDefaultClock(Arc<str>),
+    TimePermissionDenied,
+    TimeSaveUnavailable,
+    TimeMarker {
+        name: Arc<str>,
+        marker: Arc<str>,
+        already: bool,
+        missing: bool,
+    },
     CommandUnavailable,
 }
 
@@ -1133,6 +1162,13 @@ impl LocalSession {
             match command {
                 PlayerCommand::Respawn => {}
                 PlayerCommand::QueryWorldSeed => {
+                    push_system_message(
+                        &mut Arc::make_mut(&mut self.snapshot).system_messages,
+                        SystemMessageKind::CommandUnavailable,
+                        self.tick.saturating_add(1),
+                    );
+                }
+                PlayerCommand::WorldTime(_) => {
                     push_system_message(
                         &mut Arc::make_mut(&mut self.snapshot).system_messages,
                         SystemMessageKind::CommandUnavailable,

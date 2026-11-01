@@ -269,6 +269,7 @@ struct ChatLine {
     bold_prefix: usize,
     links: Vec<Range<usize>>,
     action: Option<ChatClick>,
+    error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +301,24 @@ fn screenshot_message(template: &str, name: &str) -> (String, Vec<Range<usize>>)
     (message, links)
 }
 
+fn format_translation(template: &str, arguments: &[&str]) -> String {
+    use crate::text_component::{Part, format_parts};
+    let Some(parts) = format_parts(template) else {
+        return template.to_owned();
+    };
+    let mut result = String::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => result.push_str(&text),
+            Part::Argument(index) => match arguments.get(index) {
+                Some(argument) => result.push_str(argument),
+                None => return template.to_owned(),
+            },
+        }
+    }
+    result
+}
+
 fn prepare_lines(
     canvas: &Canvas,
     assets: &MenuAssets,
@@ -320,6 +339,16 @@ fn prepare_lines(
         ) else {
             continue;
         };
+        let error = matches!(
+            &message.kind,
+            SystemMessageKind::TimeAlreadySet { .. }
+                | SystemMessageKind::TimeNoDefaultClock(_)
+                | SystemMessageKind::TimePermissionDenied
+                | SystemMessageKind::TimeSaveUnavailable
+                | SystemMessageKind::TimePaused { already: true, .. }
+                | SystemMessageKind::TimeMarker { already: true, .. }
+                | SystemMessageKind::TimeMarker { missing: true, .. }
+        );
         let (text, debug_prefix, links, action) = match &message.kind {
             SystemMessageKind::MissingRespawnBlock => (
                 assets
@@ -377,6 +406,133 @@ fn prepare_lines(
                     .collect();
                 (text, None, links, Some(ChatClick::CopySeed(seed)))
             }
+            SystemMessageKind::TimeGame(ticks) => (
+                format_translation(
+                    assets.translate(
+                        "commands.time.query.gametime",
+                        "The game time is %s tick(s)",
+                    ),
+                    &[&ticks.to_string()],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeClock { name, ticks } => (
+                format_translation(
+                    assets.translate("commands.time.query.absolute", "Clock %s is at %s tick(s)"),
+                    &[name, &ticks.to_string()],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeSet { name, ticks } => (
+                format_translation(
+                    assets.translate("commands.time.set.absolute", "Set %s to %s tick(s)"),
+                    &[name, &ticks.to_string()],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeAlreadySet { name, ticks } => (
+                format_translation(
+                    assets.translate(
+                        "commands.time.set.already_at_time",
+                        "Clock %s is already set to %s tick(s)",
+                    ),
+                    &[name, &ticks.to_string()],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimePaused {
+                name,
+                paused,
+                already,
+            } => {
+                let (key, fallback) = match (paused, already) {
+                    (true, false) => ("commands.time.pause", "Paused clock %s"),
+                    (false, false) => ("commands.time.resume", "Resumed clock %s"),
+                    (true, true) => (
+                        "commands.time.pause.already_paused",
+                        "Clock %s is already paused",
+                    ),
+                    (false, true) => (
+                        "commands.time.pause.already_running",
+                        "Clock %s is already running",
+                    ),
+                };
+                (
+                    format_translation(assets.translate(key, fallback), &[name]),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::TimeMarker {
+                name,
+                marker,
+                already,
+                missing,
+            } => {
+                let (key, fallback, arguments): (&str, &str, Vec<&str>) = if *missing {
+                    (
+                        "commands.time.no_time_marker_found",
+                        "Time marker %s does not exist for clock %s",
+                        vec![marker, name],
+                    )
+                } else if *already {
+                    (
+                        "commands.time.set.already_at_time_marker",
+                        "Clock %s is already at time marker %s",
+                        vec![name, marker],
+                    )
+                } else {
+                    (
+                        "commands.time.set.time_marker",
+                        "Set %s to time marker %s",
+                        vec![name, marker],
+                    )
+                };
+                (
+                    format_translation(assets.translate(key, fallback), &arguments),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::TimePermissionDenied => (
+                assets
+                    .translate(
+                        "command.unknown.command",
+                        "Unknown or incomplete command. See below for error",
+                    )
+                    .to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeSaveUnavailable => (
+                "Cannot change the clock because its saved data is unavailable.".to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::TimeNoDefaultClock(dimension) => (
+                format_translation(
+                    assets.translate(
+                        "commands.time.no_default_clock",
+                        "There is no default clock in dimension %s",
+                    ),
+                    &[dimension],
+                ),
+                None,
+                Vec::new(),
+                None,
+            ),
             SystemMessageKind::ScreenshotFailed(reason) => (
                 assets
                     .translate("screenshot.failure", "Couldn't save screenshot: %s")
@@ -425,6 +581,7 @@ fn prepare_lines(
                 bold_prefix: line.bold_prefix,
                 links: visible_links,
                 action: action.clone(),
+                error,
             });
         }
         if !focused && lines.len() >= base.max_lines {
@@ -574,7 +731,18 @@ fn draw_mode(
                     opacity,
                 );
             } else {
-                canvas.text_alpha(Some(assets), x + offset, y, rest, [255, 255, 255], opacity);
+                canvas.text_alpha(
+                    Some(assets),
+                    x + offset,
+                    y,
+                    rest,
+                    if line.error {
+                        [255, 85, 85]
+                    } else {
+                        [255, 255, 255]
+                    },
+                    opacity,
+                );
             }
             for range in line
                 .links
@@ -628,6 +796,15 @@ fn draw_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_feedback_translations_keep_argument_order_and_literals() {
+        assert_eq!(
+            format_translation("%2$s ticks: %1$s %%", &["example:clock", "123"]),
+            "123 ticks: example:clock %"
+        );
+        assert_eq!(format_translation("%3$s", &["a", "b"]), "%3$s");
+    }
 
     #[test]
     fn screenshot_translation_keeps_only_filename_clickable() {

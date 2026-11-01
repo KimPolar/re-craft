@@ -1396,6 +1396,29 @@ impl WorldReader {
         })
     }
 
+    /// Read the shared world random sequences without modifying the source file.
+    pub fn random_sequences(&self) -> Result<crate::random_sequences::RandomSequences> {
+        let path = self.root.join("data/minecraft/random_sequences.dat");
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return crate::random_sequences::RandomSequences::read(None);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot open {}", path.display()));
+            }
+        };
+        let bytes = nbt::decompress_limited(file)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let document = if bytes.starts_with(&[0x1f, 0x8b]) {
+            nbt::read_gzip(bytes.as_slice())
+        } else {
+            nbt::read(&bytes)
+        }
+        .with_context(|| format!("invalid {}", path.display()))?;
+        crate::random_sequences::RandomSequences::read(Some(document))
+    }
+
     /// Read the shared clock document without modifying the original file.
     pub fn world_clocks_document(&self) -> Result<Option<NamedTag>> {
         let path = self.root.join("data/minecraft/world_clocks.dat");
@@ -2090,6 +2113,53 @@ mod tests {
                     ),
                 ]),
             )]),
+        }
+    }
+
+    #[test]
+    fn random_sequences_are_read_from_shared_data_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let reader =
+            WorldReader::open(dir.path(), DimensionId::parse("the_nether").unwrap()).unwrap();
+        assert!(reader.random_sequences().unwrap().source().is_none());
+        let path = dir.path().join("data/minecraft/random_sequences.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![
+                        ("salt".into(), Tag::Int(0)),
+                        (
+                            "sequences".into(),
+                            Tag::Compound(vec![(
+                                "minecraft:example".into(),
+                                Tag::Compound(vec![(
+                                    "source".into(),
+                                    Tag::LongArray(vec![12, 34]),
+                                )]),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+        for compressed in [false, true] {
+            if compressed {
+                write_gzip(&path, &document)
+            } else {
+                std::fs::write(&path, nbt::write(&document).unwrap()).unwrap()
+            }
+            let original = std::fs::read(&path).unwrap();
+            let loaded = reader.random_sequences().unwrap();
+            assert_eq!(
+                loaded.get("minecraft:example", 0).unwrap().state(),
+                (12, 34)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
         }
     }
 

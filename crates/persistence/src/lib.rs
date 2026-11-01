@@ -4,6 +4,7 @@ pub mod heightmap;
 pub mod nbt;
 pub mod palette;
 pub mod poi;
+pub mod random_sequences;
 pub mod save;
 mod save_transaction;
 pub mod snbt;

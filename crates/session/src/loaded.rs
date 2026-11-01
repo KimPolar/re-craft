@@ -9941,12 +9941,12 @@ impl LoadedSession {
                 let (drops, _) = self
                     .stage_block_loot(&original_state, hand.as_ref(), true)
                     .expect("preflighted block loot remains evaluable");
-                self.dropped_items.drop_interaction(
+                self.dropped_items.drop_block_resources(
                     absolute,
-                    IVec3::ZERO,
-                    native_resources::transforms::DropStrategy::FromMiddle,
                     drops,
+                    None,
                     self.block_drops,
+                    &mut self.level_random,
                 );
             } else if !checked {
                 self.dropped_items.drop_block_with_name(
@@ -10120,10 +10120,10 @@ impl LoadedSession {
             let ((drops, prepared), _) = self
                 .stage_block_entity_loot(&block.name, &block, hand.as_ref(), true, &components)
                 .expect("preflighted chest loot remains evaluable");
-            self.dropped_items.drop_prepared_block_entity_items(
+            self.dropped_items.drop_block_resources(
                 absolute,
                 drops,
-                &prepared,
+                Some(&prepared),
                 self.block_drops,
                 &mut self.level_random,
             );
@@ -10371,10 +10371,10 @@ impl LoadedSession {
             );
         }
         if let Some(((loot, components), _)) = drops {
-            self.dropped_items.drop_prepared_block_entity_items(
+            self.dropped_items.drop_block_resources(
                 position,
                 loot,
-                &components,
+                Some(&components),
                 self.block_drops,
                 &mut self.level_random,
             );
@@ -40370,6 +40370,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn player_mining_pop_resource_advances_world_random_even_when_disabled() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/stone.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:mining","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone"}]}]}"#.to_vec()))
+            }
+        }
+        for enabled in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+            session.set_block_drops(enabled);
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            Arc::make_mut(&mut session.inventory).set_slot(
+                PlayerSlot::Storage(0),
+                Some(
+                    ItemStack::new("minecraft:iron_pickaxe".into(), 1, 1, Tag::Compound(vec![]))
+                        .unwrap(),
+                ),
+            );
+            let relative = IVec3::new(4, 3, 4);
+            let position = session.origin + relative;
+            assert!(session.set_with_notify(relative, session.states[3], false));
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            let mut expected = session.level_random.clone();
+            for _ in 0..3 {
+                expected.next_double();
+            }
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            assert_eq!(session.dropped_items.snapshot().len(), usize::from(enabled));
+            assert_eq!(
+                session.level_random.next_double().to_bits(),
+                expected.next_double().to_bits()
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -40504,6 +40560,7 @@ mod tests {
             let relative = IVec3::new(4, 3, 4);
             let position = session.origin + relative;
             let sequence = format!("minecraft:blocks/{name}");
+            session.level_random = native_core::random::LegacyRandom::new(9182);
             for (step, row) in group.iter().enumerate() {
                 let drops_enabled = step % 2 == 0;
                 session.set_block_drops(drops_enabled);
@@ -40532,6 +40589,11 @@ mod tests {
                     Vec::new()
                 };
                 assert_eq!(actual, expected, "{name} {variant} {seed} {step}");
+                assert_eq!(
+                    session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "{name} {variant} {seed} {step} level random"
+                );
                 let mut random = session
                     .random_sequences
                     .as_ref()

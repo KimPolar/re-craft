@@ -1814,22 +1814,30 @@ impl ItemEntities {
 
     /// `Block.popResource` uses the level RNG for the three position samples,
     /// including when the block-drops rule suppresses entity creation.
-    pub(crate) fn drop_prepared_block_entity_items(
+    pub(crate) fn drop_block_resources(
         &mut self,
         position: IVec3,
         drops: Vec<Drop>,
-        components: &[Tag],
+        components: Option<&[Tag]>,
         enabled: bool,
         random: &mut LegacyRandom,
     ) {
         for (index, drop) in drops.into_iter().enumerate() {
             let id = format!("{}:{}", drop.item.namespace, drop.item.path);
-            let component = &components[index];
-            let maximum =
-                crate::inventory::saved_item_max(&id, component).expect("preflighted loot item");
+            let empty = Tag::Compound(vec![]);
+            let component = components.map(|all| &all[index]).unwrap_or(&empty);
+            let maximum = if components.is_some() {
+                Some(
+                    crate::inventory::saved_item_max(&id, component)
+                        .expect("preflighted loot item"),
+                )
+            } else {
+                ordinary_item_default_max(&id)
+                    .or_else(|| native_world::Block::from_item_id(&id).map(|_| 64))
+            };
             let mut remaining = drop.count;
             while remaining > 0 {
-                let count = remaining.min(maximum);
+                let count = remaining.min(maximum.unwrap_or(99));
                 remaining -= count;
                 let location = DVec3::new(
                     f64::from(position.x) + 0.5 + (-0.25 + random.next_double() * 0.5),
@@ -1839,8 +1847,11 @@ impl ItemEntities {
                 if !enabled {
                     continue;
                 }
-                let stack = ItemStack::new(id.clone(), count, maximum, component.clone())
-                    .expect("preflighted loot item");
+                let stack = match maximum {
+                    Some(maximum) => ItemStack::new(id.clone(), count, maximum, component.clone()),
+                    None => ItemStack::unresolved(id.clone(), count, component.clone()),
+                }
+                .expect("validated loot item");
                 let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
                 let velocity = DVec3::new(
                     entity_random.next_double() * 0.2 - 0.1,
@@ -5567,7 +5578,7 @@ mod tests {
             for enabled in [false, true] {
                 let mut block_random = random.clone();
                 let mut block_items = ItemEntities::default();
-                block_items.drop_prepared_block_entity_items(
+                block_items.drop_block_resources(
                     pos,
                     vec![Drop {
                         item: native_resources::packs::ResourceId::parse("minecraft:chest")
@@ -5576,7 +5587,7 @@ mod tests {
                         copy_block_entity_custom_name: false,
                         copy_block_entity_components: vec![],
                     }],
-                    &[Tag::Compound(vec![])],
+                    Some(&[Tag::Compound(vec![])]),
                     enabled,
                     &mut block_random,
                 );

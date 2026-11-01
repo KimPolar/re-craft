@@ -906,6 +906,16 @@ pub fn read_saved_motion(player: &NamedTag) -> Result<SavedPlayerMotion> {
     })
 }
 
+/// A burning player changes every tick. Until those transitions are simulated,
+/// reject ambiguous fire fields instead of silently preserving stale state.
+pub(crate) fn read_saved_fire_for_preservation(player: &NamedTag) -> Result<i16> {
+    match unique_field(&player.value, "Fire")? {
+        None => Ok(0),
+        Some(Tag::Short(value)) => Ok(*value),
+        Some(_) => bail!("saved player Fire cannot be preserved safely"),
+    }
+}
+
 /// ServerPlayer falls back to the world's default if this field is absent.
 pub fn saved_game_mode(player: &NamedTag) -> Option<GameMode> {
     player

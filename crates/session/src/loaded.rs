@@ -471,6 +471,7 @@ pub struct LoadedSession {
     effect_save_tracking: Option<EffectSaveTracking>,
     effect_save_invalid: bool,
     unresolved_player_damage: bool,
+    unresolved_player_lava: bool,
     oxygen_bonus: f64,
     oxygen_equipment: Option<(crate::player_data::SavedAttribute, Arc<OxygenEnchantments>)>,
     oxygen_inventory_revision: Option<u64>,
@@ -2416,6 +2417,17 @@ impl LoadedSession {
             "player damage could not be resolved during this session"
         );
         anyhow::ensure!(
+            !self.unresolved_player_lava,
+            "player lava and fire interactions are not yet supported for saving"
+        );
+        if self.tick > 0 {
+            let fire = crate::player_data::read_saved_fire_for_preservation(original)?;
+            anyhow::ensure!(
+                fire <= 0,
+                "saved player fire is not yet simulated and cannot be saved after ticking"
+            );
+        }
+        anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
         );
@@ -4343,6 +4355,7 @@ impl LoadedSession {
             effect_save_tracking: None,
             effect_save_invalid: false,
             unresolved_player_damage: false,
+            unresolved_player_lava: false,
             oxygen_bonus: 0.0,
             oxygen_equipment: None,
             oxygen_inventory_revision: None,
@@ -14011,6 +14024,9 @@ impl LoadedSession {
             fluid::FluidContacts::default()
         };
         let in_water = contacts.water.depth > 0.0;
+        if self.game_mode != GameMode::Spectator && contacts.lava.depth > 0.0 {
+            self.unresolved_player_lava = true;
+        }
         let under_water = in_water && self.previous_eye_in_water;
         self.previous_eye_in_water = contacts.water.eyes_inside;
         self.water_vision.tick(
@@ -14438,6 +14454,19 @@ impl LoadedSession {
                 restitution,
             )
         };
+        if self.game_mode != GameMode::Spectator && actual != DVec3::ZERO {
+            // A player can cross a thin lava flow between the two contact samples.
+            // Until the inside-block effects are simulated, prevent saving such a
+            // session rather than silently retaining stale health and Fire data.
+            for requested in [actual, DVec3::new(actual.z, actual.y, actual.x)] {
+                if fluid::swept_effects(player_bounds, actual, requested, &|pos| fluid_view.at(pos))
+                    .is_some_and(|effects| effects.contains(&FluidKind::Lava))
+                {
+                    self.unresolved_player_lava = true;
+                    break;
+                }
+            }
+        }
         self.camera
             .finish_bob_tick(self.motion.position - before_move);
         self.vitals.record_movement(
@@ -37042,6 +37071,61 @@ mod tests {
         // Drowning is processed first and suppresses the weaker starvation hit.
         assert_eq!(session.vitals.health, 14.0);
         assert_eq!(session.vitals.air, 0);
+    }
+
+    #[test]
+    fn unsupported_player_fire_and_lava_block_save_drafts() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let source = |fire: Vec<Tag>| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(
+                std::iter::once(("DataVersion".into(), Tag::Int(5023)))
+                    .chain(fire.into_iter().map(|value| ("Fire".into(), value)))
+                    .collect(),
+            ),
+        };
+        let mut ordinary = session();
+        ordinary.update(TICK);
+        assert!(
+            ordinary
+                .draft_player_state(&source(vec![Tag::Short(0)]))
+                .is_ok()
+        );
+        assert!(
+            ordinary
+                .draft_player_state(&source(vec![Tag::Short(-1)]))
+                .is_ok()
+        );
+        for fire in [
+            vec![Tag::Short(1)],
+            vec![Tag::Int(1)],
+            vec![Tag::Short(0), Tag::Short(0)],
+        ] {
+            assert!(ordinary.draft_player_state(&source(fire)).is_err());
+        }
+
+        let mut in_lava = session();
+        let lava = in_lava.intern_block(state("minecraft:lava", &[("level", "0")]));
+        for x in 7..=9 {
+            for y in 1..=3 {
+                for z in 7..=9 {
+                    assert!(in_lava.set(IVec3::new(x, y, z), lava));
+                }
+            }
+        }
+        in_lava.update(TICK);
+        assert!(in_lava.unresolved_player_lava);
+        let error = in_lava.draft_player_state(&source(vec![])).unwrap_err();
+        assert!(error.to_string().contains("lava and fire"), "{error:#}");
+
+        let mut crossing = session();
+        let lava = crossing.intern_block(state("minecraft:lava", &[("level", "0")]));
+        assert!(crossing.set(IVec3::new(10, 1, 8), lava));
+        crossing.motion.velocity.x = 3.0;
+        crossing.update(TICK);
+        assert!(crossing.motion.position.x > 11.3);
+        assert!(crossing.unresolved_player_lava);
+        assert!(crossing.draft_player_state(&source(vec![])).is_err());
     }
 
     #[test]

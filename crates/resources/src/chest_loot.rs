@@ -42,6 +42,27 @@ pub struct ChestLootItem {
     pub count: u32,
     /// Potion-contents component applied by `minecraft:set_potion`.
     pub potion: Option<ResourceId>,
+    /// The generated damage component, when changed by a loot function.
+    pub damage: Option<u32>,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum ChestLootDurability {
+    Unknown,
+    NotDamageable,
+    Damageable(u32),
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ChestLootPrototype {
+    pub max_stack: u32,
+    pub durability: ChestLootDurability,
+}
+impl From<u32> for ChestLootPrototype {
+    fn from(max_stack: u32) -> Self {
+        Self {
+            max_stack,
+            durability: ChestLootDurability::Unknown,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 enum IntProvider {
@@ -57,6 +78,7 @@ enum FloatProvider {
 enum Modifier {
     SetCount(IntProvider),
     SetPotion(ResourceId),
+    SetDamage(FloatProvider, bool),
 }
 #[derive(Clone, Debug)]
 struct Entry {
@@ -274,6 +296,18 @@ fn modifiers(value: Option<&Value>) -> Result<Vec<Modifier>> {
                             .context("missing potion id")?,
                     )?))
                 }
+                "set_damage" => {
+                    allowed_fields(entry, &["type", "damage", "add"])?;
+                    let add = entry
+                        .get("add")
+                        .map(|v| v.as_bool().context("invalid damage add flag"))
+                        .transpose()?
+                        .unwrap_or(false);
+                    Ok(Modifier::SetDamage(
+                        float_provider(entry.get("damage").context("missing damage provider")?, 0)?,
+                        add,
+                    ))
+                }
                 _ => bail!("unsupported chest loot modifier {}", kind.path),
             }
         })
@@ -434,11 +468,11 @@ impl ChestLootTable {
     }
     /// Fill empty slots with luck zero. A zero saved seed uses the world's named
     /// random sequence: pass that sequence explicitly to `fill_with_random`.
-    pub fn fill_seeded(
+    pub fn fill_seeded<P: Into<ChestLootPrototype>>(
         &self,
         occupied: &[bool],
         seed: i64,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Vec<Option<ChestLootItem>>> {
         ensure!(
             seed != 0,
@@ -447,12 +481,12 @@ impl ChestLootTable {
         self.fill_with_random(occupied, &mut LegacyRandom::new(seed), max_stack)
     }
     /// Fill a fixed-seed chest with the verified luck of its opener.
-    pub fn fill_seeded_with_luck(
+    pub fn fill_seeded_with_luck<P: Into<ChestLootPrototype>>(
         &self,
         occupied: &[bool],
         seed: i64,
         luck: f32,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Vec<Option<ChestLootItem>>> {
         ensure!(
             seed != 0,
@@ -464,11 +498,11 @@ impl ChestLootTable {
     /// must validate item and potion IDs and enabled features against the active
     /// registries, and return the component-dependent limit. On error the
     /// random state is unchanged.
-    pub fn fill_with_random<R: ChestLootRandom>(
+    pub fn fill_with_random<R: ChestLootRandom, P: Into<ChestLootPrototype>>(
         &self,
         occupied: &[bool],
         random: &mut R,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Vec<Option<ChestLootItem>>> {
         ensure!(
             !self.requires_luck(),
@@ -477,12 +511,12 @@ impl ChestLootTable {
         self.fill_with_random_and_luck(occupied, random, 0.0, max_stack)
     }
 
-    pub fn fill_with_random_and_luck<R: ChestLootRandom>(
+    pub fn fill_with_random_and_luck<R: ChestLootRandom, P: Into<ChestLootPrototype>>(
         &self,
         occupied: &[bool],
         random: &mut R,
         luck: f32,
-        mut max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        mut max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Vec<Option<ChestLootItem>>> {
         ensure!(occupied.len() <= 4096, "container is too large");
         ensure!(
@@ -506,6 +540,7 @@ impl ChestLootTable {
                         id: id.clone(),
                         count: 1,
                         potion: None,
+                        damage: None,
                     };
                     for modifier in entry
                         .modifiers
@@ -517,11 +552,35 @@ impl ChestLootTable {
                             prototype.potion = Some(potion.clone());
                         }
                     }
-                    let maximum = max_stack(&prototype)?;
-                    ensure!((1..=99).contains(&maximum), "invalid item stack limit");
-                    maximum
+                    let info: ChestLootPrototype = max_stack(&prototype)?.into();
+                    ensure!(
+                        (1..=99).contains(&info.max_stack),
+                        "invalid item stack limit"
+                    );
+                    if entry
+                        .modifiers
+                        .iter()
+                        .chain(pool.modifiers.iter())
+                        .chain(self.modifiers.iter())
+                        .any(|m| matches!(m, Modifier::SetDamage(..)))
+                    {
+                        match info.durability {
+                            ChestLootDurability::Unknown => {
+                                bail!("loot item durability is unknown")
+                            }
+                            ChestLootDurability::Damageable(max) => ensure!(
+                                max > 0 && max <= i32::MAX as u32,
+                                "invalid maximum durability"
+                            ),
+                            ChestLootDurability::NotDamageable => (),
+                        }
+                    }
+                    info
                 } else {
-                    0
+                    ChestLootPrototype {
+                        max_stack: 0,
+                        durability: ChestLootDurability::Unknown,
+                    }
                 };
                 let weight =
                     java_floor((entry.weight as f32) + (entry.quality as f32) * luck).max(0);
@@ -549,7 +608,7 @@ impl ChestLootTable {
                 if candidates.is_empty() {
                     continue;
                 }
-                let (selected, maximum, _) = if candidates.len() == 1 {
+                let (selected, info, _) = if candidates.len() == 1 {
                     candidates[0]
                 } else {
                     let mut n = bounded(&mut rng, total)?;
@@ -570,6 +629,7 @@ impl ChestLootTable {
                     id: id.clone(),
                     count: 1,
                     potion: None,
+                    damage: None,
                 };
                 for modifier in selected
                     .modifiers
@@ -582,11 +642,30 @@ impl ChestLootTable {
                             item.count = u32::try_from(value.sample(&mut rng)?)?
                         }
                         Modifier::SetPotion(potion) => item.potion = Some(potion.clone()),
+                        Modifier::SetDamage(provider, add) => {
+                            if item.count > 0
+                                && let ChestLootDurability::Damageable(max) = info.durability
+                            {
+                                let previous = item.damage.unwrap_or(0);
+                                let current = if *add {
+                                    1.0 - previous as f32 / max as f32
+                                } else {
+                                    0.0
+                                };
+                                let sampled = provider.sample(&mut rng);
+                                let sampled = if sampled.is_finite() { sampled } else { 0.0 };
+                                let remaining = (sampled + current).clamp(0.0, 1.0);
+                                item.damage = Some(
+                                    (((1.0 - remaining) * max as f32).floor() as u32).min(max),
+                                );
+                            }
+                        }
                     }
                 }
                 if item.count == 0 {
                     continue;
                 }
+                let maximum = info.max_stack;
                 while item.count > maximum {
                     let mut split = item.clone();
                     split.count = maximum;
@@ -812,7 +891,9 @@ mod tests {
         let expected = random.clone().next_long();
         assert!(
             table
-                .fill_with_random(&[false; 27], &mut random, |_| anyhow::bail!("unknown item"))
+                .fill_with_random(&[false; 27], &mut random, |_| -> Result<u32> {
+                    anyhow::bail!("unknown item")
+                })
                 .is_err()
         );
         assert_eq!(random.next_long(), expected);
@@ -829,6 +910,30 @@ mod tests {
     #[derive(Clone)]
     struct BadRandom {
         calls: usize,
+    }
+    #[test]
+    fn damage_requires_prototype_and_keeps_random_on_failure() {
+        let table = ChestLootTable::decode(&json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_pickaxe","modifier":{"type":"minecraft:set_damage","damage":0.25}}]}]})).unwrap();
+        let mut random = LegacyRandom::new(42);
+        let before = random.state();
+        assert!(
+            table
+                .fill_with_random(&[false; 27], &mut random, |_| Ok(1_u32))
+                .is_err()
+        );
+        assert_eq!(random.state(), before);
+        let slots = table
+            .fill_with_random(&[false; 27], &mut random, |_| {
+                Ok(ChestLootPrototype {
+                    max_stack: 1,
+                    durability: ChestLootDurability::Damageable(1561),
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            slots.into_iter().flatten().next().unwrap().damage,
+            Some(1170)
+        );
     }
     #[test]
     fn nested_bonus_provider_samples_in_order_and_handles_zero_luck() {

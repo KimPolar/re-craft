@@ -31,7 +31,7 @@ fn max_stack(item: &ChestLootItem) -> anyhow::Result<u32> {
 
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
-fn bonus_roll_providers_match_java() {
+fn bonus_roll_and_item_damage_providers_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -145,6 +145,128 @@ fn bonus_roll_providers_match_java() {
         cases += 1;
     }
     assert_eq!(cases, providers.len() * 4 * 2 * 4);
+
+    use native_resources::chest_loot::{ChestLootDurability, ChestLootPrototype};
+    let mut resources = ResourceStack::open(&game).unwrap();
+    let intersection: Value = serde_json::from_slice(
+        &resources
+            .read_builtin_data("data/minecraft/loot_table/chests/trial_chambers/intersection.json")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let values = vec![
+        intersection,
+        serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_axe","modifier":{"type":"minecraft:set_damage","damage":{"type":"minecraft:uniform","min":0.1,"max":0.5}}}]}]}),
+        serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:stone_pickaxe","modifier":[{"type":"minecraft:set_damage","damage":0.25},{"type":"minecraft:set_damage","damage":{"type":"minecraft:uniform","min":-0.5,"max":0.5},"add":true}]}]}]}),
+        serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:set_damage","damage":{"type":"minecraft:uniform","min":0.1,"max":0.9}}}]}]}),
+        serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_pickaxe","modifier":{"type":"minecraft:set_damage","damage":2.0}}]}]}),
+        serde_json::json!({"type":"minecraft:chest","pools":[{"rolls":2,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_pickaxe","modifier":[{"type":"minecraft:set_count","count":0},{"type":"minecraft:set_damage","damage":{"type":"minecraft:uniform","min":0.1,"max":0.9}},{"type":"minecraft:set_count","count":1}]}]}]}),
+    ];
+    let tables: Vec<_> = values
+        .iter()
+        .map(|value| ChestLootTable::decode(value).unwrap())
+        .collect();
+    let prototype = |item: &ChestLootItem| -> anyhow::Result<ChestLootPrototype> {
+        let (max_stack, durability) = match item.id.path.as_str() {
+            "diamond_axe" | "diamond_pickaxe" => (1, ChestLootDurability::Damageable(1561)),
+            "stone_pickaxe" => (1, ChestLootDurability::Damageable(131)),
+            "cake" => (1, ChestLootDurability::NotDamageable),
+            "diamond_block" | "emerald_block" | "iron_block" | "amethyst_shard" | "diamond"
+            | "stone" => (64, ChestLootDurability::NotDamageable),
+            name => anyhow::bail!("unknown test item {name}"),
+        };
+        Ok(ChestLootPrototype {
+            max_stack,
+            durability,
+        })
+    };
+    std::fs::write(&input, serde_json::to_vec(&values).unwrap()).unwrap();
+    let output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("ChestLootOracle")
+        .arg(&input)
+        .arg("damage"));
+    let prototypes: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("V "))
+        .collect();
+    assert_eq!(
+        prototypes,
+        [
+            "V minecraft:diamond_block 64 0",
+            "V minecraft:emerald_block 64 0",
+            "V minecraft:iron_block 64 0",
+            "V minecraft:amethyst_shard 64 0",
+            "V minecraft:cake 1 0",
+            "V minecraft:diamond_axe 1 1561",
+            "V minecraft:diamond_pickaxe 1 1561",
+            "V minecraft:stone_pickaxe 1 131",
+            "V minecraft:stone 64 0"
+        ]
+    );
+    let mut lines = output
+        .lines()
+        .filter(|line| line.starts_with("S ") || line.starts_with("P ") || line.starts_with("R "))
+        .peekable();
+    let mut cases = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let index: usize = fields[1].parse().unwrap();
+        let luck: f32 = fields[2].parse().unwrap();
+        let mode: i32 = fields[3].parse().unwrap();
+        let seed: i64 = fields[4].parse().unwrap();
+        let mut expected = Vec::new();
+        while lines.peek().is_some_and(|line| line.starts_with("P ")) {
+            expected.push(lines.next().unwrap().to_owned());
+        }
+        let next: i64 = lines
+            .next()
+            .unwrap()
+            .strip_prefix("R ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (slots, actual_next) = if mode == 0 {
+            let mut random = LegacyRandom::new(seed);
+            let slots = tables[index]
+                .fill_with_random_and_luck(&[false; 27], &mut random, luck, prototype)
+                .unwrap();
+            (slots, random.next_long())
+        } else {
+            let mut random = XoroshiroRandom::new(seed);
+            let slots = tables[index]
+                .fill_with_random_and_luck(&[false; 27], &mut random, luck, prototype)
+                .unwrap();
+            (slots, random.next_long())
+        };
+        let actual: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, item)| {
+                item.as_ref().map(|item| {
+                    format!(
+                        "P {slot} {}:{} {} {}",
+                        item.id.namespace,
+                        item.id.path,
+                        item.count,
+                        item.damage.unwrap_or(0)
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "damage table={index} luck={luck} mode={mode} seed={seed}"
+        );
+        assert_eq!(
+            actual_next, next,
+            "damage table={index} luck={luck} mode={mode} seed={seed}"
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, values.len() * 4 * 2 * 4);
 }
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]

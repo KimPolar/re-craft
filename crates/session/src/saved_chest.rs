@@ -10,6 +10,40 @@ use native_resources::packs::ResourceId;
 use native_world::loaded::{ChunkPos, SavedBlockEntities};
 use std::{collections::BTreeSet, sync::Arc};
 
+pub(crate) fn loot_prototype(
+    stack: &ItemStack,
+) -> Result<native_resources::chest_loot::ChestLootPrototype> {
+    use native_resources::chest_loot::{ChestLootDurability, ChestLootPrototype};
+    let maximum = stack
+        .max_count()
+        .context("unresolved loot item prototype")?;
+    let modified = [
+        "minecraft:max_damage",
+        "!minecraft:max_damage",
+        "minecraft:unbreakable",
+        "minecraft:damage",
+    ]
+    .iter()
+    .any(|key| stack.components().get(key).is_some());
+    let durability = if modified {
+        ChestLootDurability::Unknown
+    } else if let Some(max) = crate::inventory::ordinary_item_default_durability(stack.id())
+        .or_else(|| crate::equippable::vanilla_equipment(stack.id()).and_then(|item| item.2))
+    {
+        ChestLootDurability::Damageable(max)
+    } else if crate::inventory::ordinary_item_default_max(stack.id()).is_some()
+        || crate::equippable::vanilla_equipment(stack.id()).is_some()
+    {
+        ChestLootDurability::NotDamageable
+    } else {
+        ChestLootDurability::Unknown
+    };
+    Ok(ChestLootPrototype {
+        max_stack: maximum,
+        durability,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LootRandomTrace {
     Fixed {
@@ -616,6 +650,7 @@ impl SavedChest {
                     == Some(maximum),
                 "loot item prototype cannot be safely saved"
             );
+            let info = loot_prototype(&stack)?;
             if let Some((_, _, previous)) = prototypes
                 .iter()
                 .find(|(id, potion, _)| *id == item.id && *potion == item.potion)
@@ -624,7 +659,7 @@ impl SavedChest {
             } else {
                 prototypes.push((item.id.clone(), item.potion.clone(), stack));
             }
-            Ok(maximum)
+            Ok(info)
         };
         let generated = match luck {
             Some(luck) => {
@@ -639,10 +674,30 @@ impl SavedChest {
                 .iter()
                 .find(|(id, potion, _)| *id == item.id && *potion == item.potion)
                 .context("missing generated item prototype")?;
+            let mut components = prototype.2.components().clone();
+            if let Some(damage) = item.damage.filter(|damage| *damage != 0) {
+                let Tag::Compound(fields) = &mut components else {
+                    bail!("invalid item components")
+                };
+                ensure!(
+                    !fields
+                        .iter()
+                        .any(|(name, _)| name.matches("minecraft:damage")),
+                    "damage already present on loot prototype"
+                );
+                fields.push(("minecraft:damage".into(), Tag::Int(i32::try_from(damage)?)));
+            }
+            let maximum = prototype
+                .2
+                .max_count()
+                .context("missing generated item maximum")?;
+            ensure!(
+                crate::equippable::saved_inventory_max(prototype.2.id(), &components)
+                    == Some(maximum),
+                "generated components cannot be safely saved"
+            );
             slots[index] = Some(
-                prototype
-                    .2
-                    .with_count(item.count)
+                ItemStack::new(prototype.2.id().to_owned(), item.count, maximum, components)
                     .context("invalid generated item count")?,
             );
         }

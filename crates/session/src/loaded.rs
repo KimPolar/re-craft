@@ -3105,9 +3105,9 @@ impl LoadedSession {
                         Self::resolve_chest_loot_item(item, registry)
                     })?;
                     let resolve = |item: &native_resources::chest_loot::ChestLootItem| {
-                        Self::resolve_chest_loot_item(item, registry)?
-                            .max_count()
-                            .context("loot item maximum is unavailable")
+                        crate::saved_chest::loot_prototype(&Self::resolve_chest_loot_item(
+                            item, registry,
+                        )?)
                     };
                     match trace {
                         crate::saved_chest::LootRandomTrace::Fixed { luck, .. } => match luck {
@@ -27711,6 +27711,155 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 21);
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn trial_chamber_intersection_loot_opens_and_replays_damaged_tools() {
+        use native_persistence::nbt::{self, NamedTag, Tag};
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            packs::{ResourceId, ResourceStack},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let tables = Arc::new(ChestLootTables::load(&mut resources).unwrap());
+        let registry = Arc::new(resources.vanilla_item_registry().unwrap());
+        let id = ResourceId::parse("minecraft:chests/trial_chambers/intersection").unwrap();
+        let table = tables.get(&id).unwrap();
+        let mut damaged = 0;
+        for seed in 1..=32_i64 {
+            let (mut session, _, position, chunk) = saved_chest_fixture();
+            let player = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            };
+            session.restore_saved_player_inventory(&player).unwrap();
+            let SavedBlockEntities::Encoded(bytes) = &session.world.saved_block_entities[&chunk]
+            else {
+                panic!()
+            };
+            let mut document = nbt::read(bytes).unwrap();
+            let Tag::List { values, .. } = &mut document.value else {
+                panic!()
+            };
+            let Tag::Compound(fields) = &mut values[0] else {
+                panic!()
+            };
+            fields.retain(|(name, _)| !name.matches("Items"));
+            fields.push((
+                "LootTable".into(),
+                Tag::String("minecraft:chests/trial_chambers/intersection".into()),
+            ));
+            fields.push(("LootTableSeed".into(), Tag::Long(seed)));
+            let source = values[0].clone();
+            let saved_state =
+                |name: &str, properties: &[(&str, &str)]| native_persistence::palette::BlockState {
+                    name: name.into(),
+                    properties: properties
+                        .iter()
+                        .map(|(k, v)| ((*k).into(), (*v).into()))
+                        .collect(),
+                };
+            let mut chunk_source = native_persistence::edit::draft_chunk_blocks(
+                &fixture_chunk_document(chunk),
+                native_persistence::world::ChunkPos {
+                    x: chunk.x,
+                    z: chunk.z,
+                },
+                &[native_persistence::edit::BlockChange {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    expected: saved_state("minecraft:stone", &[]),
+                    replacement: saved_state(
+                        "minecraft:chest",
+                        &[
+                            ("facing", "north"),
+                            ("type", "single"),
+                            ("waterlogged", "false"),
+                        ],
+                    ),
+                }],
+            )
+            .unwrap()
+            .document()
+            .clone();
+            let Tag::Compound(fields) = &mut chunk_source.value else {
+                panic!()
+            };
+            fields.push(("block_entities".into(), document.value.clone()));
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+                );
+            session.set_chest_loot(Arc::clone(&tables));
+            session.set_item_registry(Arc::clone(&registry));
+            table
+                .fill_seeded(&[false; 27], seed, |item| {
+                    let stack = LoadedSession::resolve_chest_loot_item(item, &registry)
+                        .map_err(|error| anyhow::anyhow!("{}: {error:#}", item.id.path))?;
+                    crate::saved_chest::loot_prototype(&stack)
+                })
+                .unwrap();
+            let mut probe = session
+                .saved_chest_internal(position, true)
+                .unwrap()
+                .unwrap();
+            probe
+                .unpack_seeded_loot(&id, table, |item| {
+                    LoadedSession::resolve_chest_loot_item(item, &registry)
+                })
+                .unwrap();
+            assert!(
+                session.try_open_saved_chest(position - session.origin),
+                "seed {seed}"
+            );
+            for slot in 0..27 {
+                if let Some(item) = session
+                    .inventory
+                    .slot(crate::inventory::PlayerSlot::Chest(slot))
+                {
+                    if let Some(Tag::Int(value)) = item.components().get("minecraft:damage") {
+                        assert!(*value > 0 && *value < 1561);
+                        damaged += 1;
+                    }
+                }
+            }
+            assert!(Arc::make_mut(&mut session.inventory).toggle());
+            session.collect_closed_chest();
+            session.validate_closed_chest_item_balance(&player).unwrap();
+            let chest = session.saved_chest(position).unwrap().unwrap();
+            chest
+                .verify_generated_loot(&id, table, |item| {
+                    LoadedSession::resolve_chest_loot_item(item, &registry)
+                })
+                .unwrap();
+            native_persistence::chest_loot::VerifiedChestLoot::replay(
+                &source,
+                &id,
+                table,
+                |item| {
+                    crate::saved_chest::loot_prototype(&LoadedSession::resolve_chest_loot_item(
+                        item, &registry,
+                    )?)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                session
+                    .draft_chest_inventory_chunk(chunk, &chunk_source)
+                    .unwrap()
+                    .checked_chest_inventory_count(),
+                1
+            );
+        }
+        assert!(damaged > 0);
     }
 
     #[test]

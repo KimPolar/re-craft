@@ -2629,6 +2629,9 @@ pub fn basic_item_max(id: &str) -> Option<u32> {
         | "minecraft:redstone_block"
         | "minecraft:lodestone"
         | "minecraft:redstone_lamp"
+        | "minecraft:diamond_block"
+        | "minecraft:emerald_block"
+        | "minecraft:iron_block"
         | "minecraft:coal_ore"
         | "minecraft:deepslate_coal_ore"
         | "minecraft:iron_ore"
@@ -2714,6 +2717,7 @@ const STACKABLE_ITEMS: &[&str] = &[
     "coal",
     "charcoal",
     "diamond",
+    "amethyst_shard",
     "emerald",
     "lapis_lazuli",
     "redstone",
@@ -2783,6 +2787,7 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
     if matches!(
         id,
         "minecraft:shears"
+            | "minecraft:cake"
             | "minecraft:potion"
             | "minecraft:leather_horse_armor"
             | "minecraft:wolf_armor"

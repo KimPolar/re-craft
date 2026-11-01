@@ -27,30 +27,47 @@ public class ChestLootOracle {
   var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
   var lookup=VanillaRegistries.createWorldLookup();var registries=VanillaRegistries.createReloadableLookup(lookup);
   for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries))pending.apply();
-  var json=JsonParser.parseString(Files.readString(Path.of(args[0])));var ops=RegistryOps.create(JsonOps.INSTANCE,registries);
+  var json=JsonParser.parseString(Files.readString(Path.of(args[0])));var ops=RegistryOps.create(JsonOps.INSTANCE,registries);var nbtops=RegistryOps.create(NbtOps.INSTANCE,registries);
   var ctor=LootContext.class.getDeclaredConstructors()[0];ctor.setAccessible(true);
   var slots=LootTable.class.getDeclaredMethod("getAvailableSlots",net.minecraft.world.Container.class,RandomSource.class);slots.setAccessible(true);
   var split=LootTable.class.getDeclaredMethod("shuffleAndSplitItems",ObjectArrayList.class,int.class,RandomSource.class);split.setAccessible(true);
   if(json.isJsonArray()){
+   if(args.length>1&&args[1].equals("damage"))for(var item:List.of(Items.DIAMOND_BLOCK,Items.EMERALD_BLOCK,Items.IRON_BLOCK,Items.AMETHYST_SHARD,Items.CAKE,Items.DIAMOND_AXE,Items.DIAMOND_PICKAXE,Items.STONE_PICKAXE,Items.STONE)){
+    var stack=new ItemStack(item);out.printf("V %s %d %d%n",BuiltInRegistries.ITEM.getKey(item),stack.getMaxStackSize(),stack.getMaxDamage());
+   }
    int index=0;
    for(var entry:json.getAsJsonArray()){
     var table=LootTable.DIRECT_CODEC.parse(ops,entry).getOrThrow();
     for(float luck:new float[]{-2.5f,0.0f,1.5f,4.0f})for(int mode=0;mode<2;mode++)for(long seed:new long[]{1,42,-1,Long.MIN_VALUE}){
      RandomSource random=mode==0?new LegacyRandomSource(seed):new XoroshiroRandomSource(seed);
      var params=new LootParams(null,ContextMap.EMPTY,Map.of(),luck);var context=(LootContext)ctor.newInstance(params,random,registries);
-     var items=new ObjectArrayList<ItemStack>();table.getRandomItemsRaw(context,items::add);
+     var items=new ObjectArrayList<ItemStack>();
+     table.getRandomItemsRaw(context,stack->{
+      int remaining=stack.getCount(), max=stack.getMaxStackSize();
+      if(remaining<max)items.add(stack);
+      else while(remaining>0){int count=Math.min(max,remaining);items.add(stack.copyWithCount(count));remaining-=count;}
+     });
      var container=new SimpleContainer(27);@SuppressWarnings("unchecked") var available=(List<Integer>)slots.invoke(table,container,random);
      split.invoke(table,items,available.size(),random);
      for(var stack:items){if(available.isEmpty())break;container.setItem(available.remove(available.size()-1),stack);}
      out.printf("S %d %s %d %d%n",index,Float.toString(luck),mode,seed);
-     for(int slot=0;slot<27;slot++){var stack=container.getItem(slot);if(!stack.isEmpty())out.printf("P %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount());}
+     for(int slot=0;slot<27;slot++){var stack=container.getItem(slot);if(!stack.isEmpty()){
+      if(args.length>1&&args[1].equals("damage")){
+       out.printf("P %d %s %d %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount(),stack.getDamageValue());
+       String encoded=ItemStack.CODEC.encodeStart(nbtops,stack).getOrThrow().toString();
+       String component="\"minecraft:damage\":";
+       if(stack.getDamageValue()==0&&encoded.contains(component))throw new AssertionError(encoded);
+       if(stack.getDamageValue()>0&&!encoded.contains(component+stack.getDamageValue()))throw new AssertionError(encoded);
+      }
+      else out.printf("P %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount());
+     }}
      out.println("R "+random.nextLong());
     }
     index++;
    }
    return;
   }
-  var table=LootTable.DIRECT_CODEC.parse(ops,json).getOrThrow();var nbtops=RegistryOps.create(NbtOps.INSTANCE,registries);
+  var table=LootTable.DIRECT_CODEC.parse(ops,json).getOrThrow();
   for(var item:List.of(Items.HEART_OF_THE_SEA,Items.TNT,Items.PRISMARINE_CRYSTALS,Items.POTION,Items.IRON_SPEAR,Items.COPPER_NAUTILUS_ARMOR,Items.IRON_NAUTILUS_ARMOR,Items.GOLDEN_NAUTILUS_ARMOR,Items.DIAMOND_NAUTILUS_ARMOR)){
    var stack=new ItemStack(item);out.printf("V %s %d %d %s%n",BuiltInRegistries.ITEM.getKey(item),stack.getMaxStackSize(),stack.getMaxDamage(),item.getClass().getName());
   }

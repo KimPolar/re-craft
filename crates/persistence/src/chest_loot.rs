@@ -3,7 +3,7 @@ use crate::nbt::{Tag, TagType};
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::XoroshiroRandom;
 use native_resources::{
-    chest_loot::{ChestLootItem, ChestLootTable},
+    chest_loot::{ChestLootItem, ChestLootPrototype, ChestLootTable},
     packs::ResourceId,
 };
 
@@ -29,32 +29,32 @@ pub type VerifiedFixedChestLoot = VerifiedChestLoot;
 impl VerifiedChestLoot {
     /// `table` must be the active data-pack table for `table_id`; `max_stack`
     /// must validate the prototype against the active item and feature registries.
-    pub fn replay(
+    pub fn replay<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         Self::replay_inner(source, table_id, table, None, max_stack)
     }
 
     /// Replay a chest opened with a previously verified player luck value.
-    pub fn replay_with_luck(
+    pub fn replay_with_luck<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
         luck: f32,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         Self::replay_inner(source, table_id, table, Some(luck), max_stack)
     }
 
-    fn replay_inner(
+    fn replay_inner<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
         luck: Option<f32>,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         let seed = validate_source(source, table_id)?;
         ensure!(seed != 0, "zero seed requires the world random sequence");
@@ -71,26 +71,26 @@ impl VerifiedChestLoot {
 
     /// Replay a zero-seed table using the captured named sequence. The save
     /// transaction must connect these states to the saved sequence and seed.
-    pub fn replay_named(
+    pub fn replay_named<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
         world_seed: i64,
         before: (u64, u64),
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         Self::replay_named_inner(source, table_id, table, world_seed, before, None, max_stack)
     }
 
     /// Replay a named sequence with the verified luck captured at chest opening.
-    pub fn replay_named_with_luck(
+    pub fn replay_named_with_luck<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
         world_seed: i64,
         before: (u64, u64),
         luck: f32,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         Self::replay_named_inner(
             source,
@@ -103,14 +103,14 @@ impl VerifiedChestLoot {
         )
     }
 
-    fn replay_named_inner(
+    fn replay_named_inner<P: Into<ChestLootPrototype>>(
         source: &Tag,
         table_id: &ResourceId,
         table: &ChestLootTable,
         world_seed: i64,
         before: (u64, u64),
         luck: Option<f32>,
-        max_stack: impl FnMut(&ChestLootItem) -> Result<u32>,
+        max_stack: impl FnMut(&ChestLootItem) -> Result<P>,
     ) -> Result<Self> {
         ensure!(
             validate_source(source, table_id)? == 0,
@@ -177,15 +177,19 @@ fn encode_slots(slots: Vec<Option<ChestLootItem>>) -> Result<Tag> {
             ("id".into(), Tag::String(id.as_str().into())),
             ("count".into(), Tag::Int(i32::try_from(item.count)?)),
         ];
+        let mut components = Vec::new();
         if let Some(potion) = item.potion {
             let id = format!("{}:{}", potion.namespace, potion.path);
-            fields.push((
-                "components".into(),
-                Tag::Compound(vec![(
-                    "minecraft:potion_contents".into(),
-                    Tag::Compound(vec![("potion".into(), Tag::String(id.as_str().into()))]),
-                )]),
+            components.push((
+                "minecraft:potion_contents".into(),
+                Tag::Compound(vec![("potion".into(), Tag::String(id.as_str().into()))]),
             ));
+        }
+        if let Some(damage) = item.damage.filter(|damage| *damage != 0) {
+            components.push(("minecraft:damage".into(), Tag::Int(i32::try_from(damage)?)));
+        }
+        if !components.is_empty() {
+            fields.push(("components".into(), Tag::Compound(components)));
         }
         items.push(Tag::Compound(fields));
     }

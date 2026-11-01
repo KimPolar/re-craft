@@ -75,6 +75,7 @@ mod toggle_key;
 mod tooltip;
 mod video_ui;
 mod visual_look;
+mod water_overlay;
 #[cfg(test)]
 mod weather_column_tests;
 mod weather_gpu;

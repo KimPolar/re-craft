@@ -312,6 +312,13 @@ pub fn run_play(
             }
         }
     });
+    let water_overlay = match crate::water_overlay::Texture::load(&mut resources) {
+        Ok(texture) => Some(texture),
+        Err(error) => {
+            eprintln!("Underwater overlay is unavailable: {error:#}");
+            None
+        }
+    };
     let mesher = MeshWorker::start(resources)?;
     run_inner(
         event_loop,
@@ -332,6 +339,7 @@ pub fn run_play(
             sun,
             moon,
             weather_textures,
+            water_overlay,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
             weather_frame: None,
@@ -468,6 +476,7 @@ struct PlayState {
     sun: Option<crate::sun_render::Texture>,
     moon: Option<crate::sun_render::Texture>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
+    water_overlay: Option<crate::water_overlay::Texture>,
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
     weather_frame: Option<(u64, u64, u32, [u64; 3], glam::IVec3, u8)>,
@@ -1297,6 +1306,35 @@ impl Viewer {
         }
         if let (Some(play), Some(renderer)) = (&mut self.play, &mut self.renderer) {
             let snapshot = play.session.snapshot();
+            let frame = if snapshot.eyes_in_water
+                && snapshot.game_mode != native_session::GameMode::Spectator
+            {
+                let eye = (snapshot.origin.as_dvec3() + snapshot.camera.eye(1.0))
+                    .floor()
+                    .as_ivec3();
+                let level = snapshot
+                    .world
+                    .loaded()
+                    .map(|world| {
+                        world
+                            .light(eye.x, eye.y, eye.z, false)
+                            .unwrap_or(0)
+                            .max(world.light(eye.x, eye.y, eye.z, true).unwrap_or(0))
+                    })
+                    .unwrap_or(15);
+                let ambient = play
+                    .sky_background
+                    .as_ref()
+                    .map_or(0.0, |background| background.ambient_light());
+                Some(crate::water_overlay::Frame {
+                    yaw_degrees: snapshot.player.yaw.to_degrees() - 180.0,
+                    pitch_degrees: -snapshot.player.pitch.to_degrees(),
+                    brightness: crate::water_overlay::brightness(level, ambient),
+                })
+            } else {
+                None
+            };
+            renderer.set_water_overlay_frame(frame);
             let tick = snapshot.tick;
             let base_changed = play
                 .sky_base
@@ -1576,6 +1614,14 @@ impl ApplicationHandler for Viewer {
             && let Err(error) = renderer.set_weather_textures(textures)
         {
             eprintln!("Weather rendering is unavailable: {error:#}");
+        }
+        if let Some(texture) = self
+            .play
+            .as_ref()
+            .and_then(|play| play.water_overlay.as_ref())
+            && let Err(error) = renderer.set_water_overlay_texture(texture)
+        {
+            eprintln!("Underwater overlay rendering is unavailable: {error:#}");
         }
         #[cfg(debug_assertions)]
         println!("World viewer graphics backend: {}", renderer.backend_name);

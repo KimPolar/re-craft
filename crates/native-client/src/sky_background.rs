@@ -610,6 +610,7 @@ pub struct WaterFogSample {
 
 pub struct SkyBackground {
     base: [f32; 3],
+    ambient_light: f32,
     biomes: BTreeMap<String, Option<ColorLayer>>,
     tracks: Vec<SkyTrack>,
     background_is_fog: bool,
@@ -694,6 +695,14 @@ impl SkyBackground {
             .with_context(|| format!("missing {path}"))?;
         let dimension: Value =
             serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
+        let ambient_light = match dimension.get("ambient_light") {
+            None => 0.0,
+            Some(value) => value.as_f64().context("invalid dimension ambient_light")? as f32,
+        };
+        ensure!(
+            (0.0..=1.0).contains(&ambient_light),
+            "dimension ambient_light is out of range"
+        );
         let skybox = match dimension.get("skybox") {
             None => "overworld",
             Some(value) => value.as_str().context("invalid skybox")?,
@@ -990,6 +999,7 @@ impl SkyBackground {
         }
         Ok(Some(Self {
             base,
+            ambient_light,
             biomes,
             tracks,
             background_is_fog: skybox == "none",
@@ -1015,6 +1025,10 @@ impl SkyBackground {
 
     pub fn set_flat_world(&mut self, flat: Option<bool>) {
         self.flat_world = flat;
+    }
+
+    pub fn ambient_light(&self) -> f32 {
+        self.ambient_light
     }
 
     pub fn has_end_sky(&self) -> bool {
@@ -2178,6 +2192,7 @@ mod tests {
         let track = json!({"modifier":"multiply","keyframes":[{"ticks":0,"value":"#ffffff"},{"ticks":10,"value":"#000000"}]});
         let mut background = SkyBackground {
             base: [0.0; 3],
+            ambient_light: 0.0,
             background_is_fog: false,
             end_sky: false,
             fog_color_base: None,

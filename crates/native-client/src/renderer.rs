@@ -223,6 +223,7 @@ pub struct Renderer {
     sun: Option<crate::sun_render::Sun>,
     moon: Option<crate::sun_render::Sun>,
     celestial_sky: Option<crate::star_render::Sky>,
+    water_overlay: Option<crate::water_overlay::Overlay>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -405,6 +406,25 @@ impl Renderer {
     pub fn set_dark_sky_disc(&mut self, visible: bool) {
         if let Some(sky) = &mut self.celestial_sky {
             sky.set_dark_disc(visible);
+        }
+    }
+
+    pub fn set_water_overlay_texture(
+        &mut self,
+        texture: &crate::water_overlay::Texture,
+    ) -> Result<()> {
+        self.water_overlay = Some(crate::water_overlay::Overlay::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            texture,
+        )?);
+        Ok(())
+    }
+
+    pub fn set_water_overlay_frame(&mut self, frame: Option<crate::water_overlay::Frame>) {
+        if let Some(overlay) = &mut self.water_overlay {
+            overlay.set_frame(frame);
         }
     }
 
@@ -1374,6 +1394,7 @@ impl Renderer {
             sun: None,
             moon: None,
             celestial_sky: None,
+            water_overlay: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2461,6 +2482,9 @@ impl Renderer {
                 &self.depth,
                 hand_projection * self.effective_bob(),
             );
+        }
+        if let Some(overlay) = &mut self.water_overlay {
+            overlay.draw(&self.queue, &mut encoder, view);
         }
         if !self.hide_crosshair && !self.hud_hidden {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

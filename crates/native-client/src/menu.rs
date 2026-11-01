@@ -80,6 +80,7 @@ enum ButtonId {
     VideoSettings,
     VideoFps,
     VideoVsync,
+    VideoFullscreen,
     VideoInactivity,
     VideoBlur,
     VideoDistance,
@@ -983,6 +984,15 @@ impl<'a> Menu<'a> {
         }
     }
 
+    fn toggle_fullscreen(&mut self) {
+        self.state.video.fullscreen = !self.state.video.fullscreen;
+        self.state.video_dirty = true;
+        if let Some(window) = &self.window {
+            crate::apply_fullscreen(window, self.state.video.fullscreen);
+        }
+        self.invalidate();
+    }
+
     fn begin_launch(&mut self, request: LaunchRequest) -> Result<()> {
         if self.pending_launch.is_some() {
             return Ok(());
@@ -1251,6 +1261,7 @@ impl<'a> Menu<'a> {
         let expected = match button.id {
             ButtonId::VideoFps => Some(VideoControl::Framerate),
             ButtonId::VideoVsync => Some(VideoControl::Vsync),
+            ButtonId::VideoFullscreen => Some(VideoControl::Fullscreen),
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
@@ -1610,6 +1621,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoFps, VideoControl::Framerate),
                     (ButtonId::VideoVsync, VideoControl::Vsync),
                     (ButtonId::VideoInactivity, VideoControl::Inactivity),
+                    (ButtonId::VideoFullscreen, VideoControl::Fullscreen),
                     (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
                     (ButtonId::VideoBlur, VideoControl::MenuBlur),
@@ -1864,6 +1876,7 @@ impl<'a> Menu<'a> {
                 self.state.video.vsync = !self.state.video.vsync;
                 self.state.video_dirty = true;
             }
+            ButtonId::VideoFullscreen => self.toggle_fullscreen(),
             ButtonId::VideoInactivity => {
                 self.state.video.inactivity_fps_limit =
                     self.state.video.inactivity_fps_limit.next();
@@ -2050,6 +2063,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoBlend
                     | ButtonId::VideoWeather
                     | ButtonId::VideoVsync
+                    | ButtonId::VideoFullscreen
                     | ButtonId::VideoInactivity
                     | ButtonId::OptionsFov
                     | ButtonId::ViewBobbing
@@ -2497,6 +2511,7 @@ impl<'a> Menu<'a> {
                     let focused = match self.focused {
                         Some(ButtonId::VideoFps) => Some(VideoControl::Framerate),
                         Some(ButtonId::VideoVsync) => Some(VideoControl::Vsync),
+                        Some(ButtonId::VideoFullscreen) => Some(VideoControl::Fullscreen),
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -2654,6 +2669,7 @@ impl<'a> Menu<'a> {
                     button.id,
                     ButtonId::VideoFps
                         | ButtonId::VideoVsync
+                        | ButtonId::VideoFullscreen
                         | ButtonId::VideoInactivity
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
@@ -2751,6 +2767,7 @@ impl ApplicationHandler for Menu<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
             .with_title("Minecraft 26.3")
+            .with_fullscreen(crate::fullscreen_mode(self.state.video.fullscreen))
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
         let result = (|| -> Result<_> {
@@ -2964,6 +2981,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoBlend
                                 | ButtonId::VideoWeather
                                 | ButtonId::VideoVsync
+                                | ButtonId::VideoFullscreen
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
                                 | ButtonId::ViewBobbing
@@ -3119,6 +3137,12 @@ impl ApplicationHandler for Menu<'_> {
                         .saturating_add(steps.unsigned_abs() as usize)
                         .min(max);
                 }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) =>
+            {
+                self.toggle_fullscreen();
+                self.state.save_settings();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && self.state.asset_load.is_none() =>
@@ -4588,6 +4612,12 @@ mod tests {
                 assert_eq!(self.menu.state.screen, Screen::Video);
                 self.menu.redraw().unwrap();
                 click(&mut self.menu, event_loop, ButtonId::VideoVsync, false);
+                click(&mut self.menu, event_loop, ButtonId::VideoFullscreen, false);
+                assert!(self.menu.state.video.fullscreen);
+                assert!(self.menu.window.as_ref().unwrap().fullscreen().is_some());
+                click(&mut self.menu, event_loop, ButtonId::VideoFullscreen, false);
+                assert!(!self.menu.state.video.fullscreen);
+                assert!(self.menu.window.as_ref().unwrap().fullscreen().is_none());
                 click(&mut self.menu, event_loop, ButtonId::VideoInactivity, false);
                 click(&mut self.menu, event_loop, ButtonId::VideoFps, true);
                 assert_eq!(
@@ -4932,6 +4962,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn video_fullscreen_button_follows_the_visible_video_controls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::new(tmp.path().to_path_buf(), Vec::new());
+        state.asset_load = None;
+        state.screen = Screen::Video;
+        let mut menu = Menu::new(&mut state);
+        menu.size = (1280, 720);
+        menu.scale = gui_scale(1280, 720);
+        let buttons = menu.buttons();
+        let first: Vec<_> = buttons.iter().take(4).map(|button| button.id).collect();
+        assert_eq!(
+            first,
+            [
+                ButtonId::VideoFps,
+                ButtonId::VideoVsync,
+                ButtonId::VideoInactivity,
+                ButtonId::VideoFullscreen
+            ]
+        );
+        let fullscreen = buttons
+            .iter()
+            .find(|button| button.id == ButtonId::VideoFullscreen)
+            .unwrap();
+        assert!(
+            fullscreen.active
+                && menu.button_contains(fullscreen, (fullscreen.rect.x + 1, fullscreen.rect.y + 1))
+        );
     }
 
     #[test]

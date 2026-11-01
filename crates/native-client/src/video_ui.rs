@@ -14,6 +14,7 @@ const CONTENT_HEIGHT: i32 = 519;
 pub enum VideoControl {
     Framerate,
     Vsync,
+    Fullscreen,
     Inactivity,
     MenuBlur,
     RenderDistance,
@@ -227,6 +228,7 @@ impl VideoUi {
                 },
             y: match control {
                 VideoControl::Inactivity => 105,
+                VideoControl::Fullscreen => 130,
                 VideoControl::MenuBlur => 366,
                 VideoControl::WeatherRadius => 441,
                 VideoControl::RenderDistance | VideoControl::BiomeBlend => 241,
@@ -246,6 +248,7 @@ impl VideoUi {
         [
             VideoControl::Framerate,
             VideoControl::Vsync,
+            VideoControl::Fullscreen,
             VideoControl::Inactivity,
             VideoControl::MenuBlur,
             VideoControl::RenderDistance,
@@ -665,20 +668,33 @@ impl VideoUi {
                                 &format!("{}: {value}", tr(label)),
                                 [255, 255, 255],
                             );
-                        } else if label.key == "options.vsync" {
-                            let key = if video.vsync {
+                        } else if label.key == "options.vsync" || label.key == "options.fullscreen"
+                        {
+                            let fullscreen = label.key == "options.fullscreen";
+                            let enabled = if fullscreen {
+                                video.fullscreen
+                            } else {
+                                video.vsync
+                            };
+                            let key = if enabled {
                                 "options.on.composed"
                             } else {
                                 "options.off.composed"
                             };
-                            let fallback = if video.vsync { "%s: ON" } else { "%s: OFF" };
+                            let fallback = if enabled { "%s: ON" } else { "%s: OFF" };
                             let value =
                                 assets.translate(key, fallback).replacen("%s", tr(label), 1);
                             list.button(
                                 Some(assets),
                                 rect,
                                 true,
-                                hovered || focused == Some(VideoControl::Vsync),
+                                hovered
+                                    || focused
+                                        == Some(if fullscreen {
+                                            VideoControl::Fullscreen
+                                        } else {
+                                            VideoControl::Vsync
+                                        }),
                                 &value,
                             );
                         } else if label.key == "options.inactivityFpsLimit" {
@@ -888,6 +904,16 @@ mod tests {
             }
         );
         assert_eq!(ui.hit(426, 240, (60, 110)), Some(VideoControl::Inactivity));
+        assert_eq!(
+            ui.control_rect(426, VideoControl::Fullscreen),
+            Rect {
+                x: 58,
+                y: 130,
+                w: 150,
+                h: 20
+            }
+        );
+        assert_eq!(ui.hit(426, 240, (60, 135)), Some(VideoControl::Fullscreen));
         assert!(ui.scroll_by(-10.0, 240));
         assert_eq!(ui.hit(426, 240, (220, 33)), None);
         ui.resize(1000);

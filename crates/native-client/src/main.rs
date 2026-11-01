@@ -1546,6 +1546,18 @@ fn apply_game_video(
     *current = next;
 }
 
+fn fullscreen_mode(enabled: bool) -> Option<winit::window::Fullscreen> {
+    enabled.then_some(winit::window::Fullscreen::Borderless(None))
+}
+
+fn fullscreen_shortcut(key: PhysicalKey, state: ElementState, repeat: bool) -> bool {
+    key == PhysicalKey::Code(KeyCode::F11) && state == ElementState::Pressed && !repeat
+}
+
+fn apply_fullscreen(window: &winit::window::Window, enabled: bool) {
+    window.set_fullscreen(fullscreen_mode(enabled));
+}
+
 fn save_game_video(ui: Option<&mut GameUi>) -> bool {
     let Some(ui) = ui else { return true };
     if !ui.video_needs_save() {
@@ -1746,18 +1758,40 @@ impl App {
     fn apply_video(&mut self) {
         let old_fov_effect = self.video.fov_effect_scale;
         let old_sprint_window = self.video.sprint_window;
+        let old_fullscreen = self.video.fullscreen;
         apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
             &mut self.frame_pacer,
             self.renderer.as_mut(),
         );
+        if self.video.fullscreen != old_fullscreen
+            && let Some(window) = &self.window
+        {
+            apply_fullscreen(window, self.video.fullscreen);
+        }
         if self.video.fov_effect_scale != old_fov_effect {
             self.session
                 .set_fov_effect_scale(self.video.fov_effect_scale.value() as f32);
         }
         if self.video.sprint_window != old_sprint_window {
             self.session.set_sprint_window(self.video.sprint_window);
+        }
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        if let Some(ui) = &mut self.ui {
+            ui.toggle_fullscreen();
+            self.apply_video();
+            save_game_video(self.ui.as_mut());
+        } else {
+            self.video.fullscreen = !self.video.fullscreen;
+            if let Some(window) = &self.window {
+                apply_fullscreen(window, self.video.fullscreen);
+            }
+            if let Err(error) = menu_settings::save_video(self.video) {
+                eprintln!("Could not save video settings: {error:#}");
+            }
         }
     }
 
@@ -2032,6 +2066,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attributes = Window::default_attributes()
+            .with_fullscreen(fullscreen_mode(self.video.fullscreen))
             .with_title("Minecraft 26.3")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
@@ -2171,6 +2206,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
+                    self.toggle_fullscreen();
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if self.session.snapshot().death.is_none()
                         && self.session.snapshot().inventory.is_open()
@@ -2479,6 +2518,39 @@ impl ApplicationHandler for App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    use super::*;
+    #[test]
+    fn fullscreen_key_toggles_once_per_press() {
+        assert!(fullscreen_shortcut(
+            PhysicalKey::Code(KeyCode::F11),
+            ElementState::Pressed,
+            false
+        ));
+        assert!(!fullscreen_shortcut(
+            PhysicalKey::Code(KeyCode::F11),
+            ElementState::Pressed,
+            true
+        ));
+        assert!(!fullscreen_shortcut(
+            PhysicalKey::Code(KeyCode::F11),
+            ElementState::Released,
+            false
+        ));
+        assert!(!fullscreen_shortcut(
+            PhysicalKey::Code(KeyCode::F10),
+            ElementState::Pressed,
+            false
+        ));
+        assert!(fullscreen_mode(false).is_none());
+        assert!(matches!(
+            fullscreen_mode(true),
+            Some(winit::window::Fullscreen::Borderless(None))
+        ));
     }
 }
 
@@ -2793,6 +2865,14 @@ mod video_window_tests {
                     );
                     assert_eq!(self.app.renderer.as_ref().unwrap().configured_fov(), 71.0);
                     assert!(self.app.ui.as_ref().unwrap().paused());
+                    self.app.ui.as_mut().unwrap().toggle_fullscreen();
+                    self.app.apply_video();
+                    assert!(self.app.video.fullscreen);
+                    assert!(self.app.window.as_ref().unwrap().fullscreen().is_some());
+                    self.app.ui.as_mut().unwrap().toggle_fullscreen();
+                    self.app.apply_video();
+                    assert!(!self.app.video.fullscreen);
+                    assert!(self.app.window.as_ref().unwrap().fullscreen().is_none());
                     // Exercise the menu without writing the user's settings during this test.
                     assert_eq!(
                         self.app
@@ -2803,6 +2883,7 @@ mod video_window_tests {
                         crate::game_ui::PauseAction::SaveVideo
                     );
                     for key in [
+                        KeyCode::Tab,
                         KeyCode::Tab,
                         KeyCode::Tab,
                         KeyCode::Tab,

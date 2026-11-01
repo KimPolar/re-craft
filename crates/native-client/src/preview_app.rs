@@ -440,12 +440,18 @@ impl Viewer {
         let old_distance = self.video.render_distance;
         let old_fov_effect = self.video.fov_effect_scale;
         let old_sprint_window = self.video.sprint_window;
+        let old_fullscreen = self.video.fullscreen;
         crate::apply_game_video(
             self.ui.as_ref(),
             &mut self.video,
             &mut self.frame_pacer,
             self.renderer.as_mut(),
         );
+        if old_fullscreen != self.video.fullscreen
+            && let Some(window) = &self.window
+        {
+            crate::apply_fullscreen(window, self.video.fullscreen);
+        }
         if old_fov_effect != self.video.fov_effect_scale
             && let Some(play) = &mut self.play
         {
@@ -462,6 +468,22 @@ impl Viewer {
             && let Some(play) = &mut self.play
         {
             play.session.set_sprint_window(self.video.sprint_window);
+        }
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        if let Some(ui) = &mut self.ui {
+            ui.toggle_fullscreen();
+            self.apply_video();
+            crate::save_game_video(self.ui.as_mut());
+        } else {
+            self.video.fullscreen = !self.video.fullscreen;
+            if let Some(window) = &self.window {
+                crate::apply_fullscreen(window, self.video.fullscreen);
+            }
+            if let Err(error) = crate::menu_settings::save_video(self.video) {
+                eprintln!("Could not save video settings: {error:#}");
+            }
         }
     }
 
@@ -1134,6 +1156,7 @@ impl ApplicationHandler for Viewer {
             return;
         }
         let attributes = Window::default_attributes()
+            .with_fullscreen(crate::fullscreen_mode(self.video.fullscreen))
             .with_title("Minecraft 26.3")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
@@ -1295,6 +1318,10 @@ impl ApplicationHandler for Viewer {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
+                    self.toggle_fullscreen();
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let snapshot = self.play.as_ref().map(|play| play.session.snapshot());
                     let screen_open = self.ui.is_none()

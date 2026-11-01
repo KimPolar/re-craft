@@ -71,6 +71,7 @@ enum PauseButton {
     Done,
     Framerate,
     Vsync,
+    Fullscreen,
     Inactivity,
     Accessibility,
     ViewBobbing,
@@ -376,6 +377,12 @@ impl GameUi {
 
     pub fn video_settings(&self) -> VideoSettings {
         self.video
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        self.video.fullscreen = !self.video.fullscreen;
+        self.video_dirty = true;
+        self.last_draw = None;
     }
 
     pub fn debug_focus_pause(&mut self, enabled: bool, tick: u64) {
@@ -745,6 +752,7 @@ impl GameUi {
                         .map(|control| match control {
                             VideoControl::Framerate => PauseButton::Framerate,
                             VideoControl::Vsync => PauseButton::Vsync,
+                            VideoControl::Fullscreen => PauseButton::Fullscreen,
                             VideoControl::Inactivity => PauseButton::Inactivity,
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
                             VideoControl::RenderDistance => PauseButton::VideoDistance,
@@ -928,6 +936,10 @@ impl GameUi {
             PauseButton::Vsync => {
                 self.video.vsync = !self.video.vsync;
                 self.video_dirty = true;
+                PauseAction::None
+            }
+            PauseButton::Fullscreen => {
+                self.toggle_fullscreen();
                 PauseAction::None
             }
             PauseButton::Inactivity => {
@@ -1116,6 +1128,7 @@ impl GameUi {
                 let focused_control = match self.pause_focus {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
+                    Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -1257,6 +1270,12 @@ impl GameUi {
                         .visible(h, self.video_ui.control_rect(w, VideoControl::Inactivity))
                     {
                         buttons.push(PauseButton::Inactivity);
+                    }
+                    if self
+                        .video_ui
+                        .visible(h, self.video_ui.control_rect(w, VideoControl::Fullscreen))
+                    {
+                        buttons.push(PauseButton::Fullscreen);
                     }
                     buttons.push(PauseButton::VideoBlend);
                     buttons.push(PauseButton::VideoDistance);
@@ -2695,6 +2714,7 @@ impl GameUi {
                 let focused = match self.pause_focus {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
+                    Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -4004,6 +4024,12 @@ mod inventory_tests {
         assert_eq!(ui.click(), PauseAction::None);
         assert_eq!(ui.pause_page, PausePage::Video);
         ui.compose(size, &inventory, 0).unwrap();
+
+        ui.cursor_moved(f64::from(w / 2 - 145) * scale, 140.0 * scale);
+        assert_eq!(ui.click(), PauseAction::None);
+        assert!(ui.video_settings().fullscreen);
+        ui.pause_key(KeyCode::Enter, false);
+        assert!(!ui.video_settings().fullscreen);
 
         ui.cursor_moved(f64::from(w / 2 + 15) * scale, 90.0 * scale);
         assert_eq!(ui.click(), PauseAction::None);

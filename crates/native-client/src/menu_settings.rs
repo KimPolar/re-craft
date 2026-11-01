@@ -232,6 +232,8 @@ pub struct VideoSettings {
     /// Java 26.3 precipitation effect radius, in blocks.
     pub weather_radius: u8,
     pub vsync: bool,
+    /// Borderless fullscreen on the window's current monitor.
+    pub fullscreen: bool,
     /// 260 is the vanilla unlimited setting; lower values are frames per second.
     pub max_fps: u16,
     /// Vertical field of view in degrees, 30 through 110 in Java 26.3.
@@ -284,6 +286,7 @@ impl Default for VideoSettings {
             biome_blend: 2,
             weather_radius: 10,
             vsync: true,
+            fullscreen: false,
             max_fps: 120,
             fov: 70,
             view_bobbing: true,
@@ -468,6 +471,25 @@ mod tests {
         save_to(&path, &loaded).unwrap();
         let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(!loaded.video.pause_on_lost_focus);
+    }
+
+    #[test]
+    fn fullscreen_defaults_off_and_survives_video_and_sound_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.json");
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.video.fullscreen);
+        let video = VideoSettings {
+            fullscreen: true,
+            ..defaults.video
+        };
+        save_video_to(&path, video).unwrap();
+        save_sound_to(&path, SoundSettings::default()).unwrap();
+        let loaded: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(loaded.video.fullscreen);
+        save_to(&path, &loaded).unwrap();
+        let loaded: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(loaded.video.fullscreen);
     }
 
     #[test]

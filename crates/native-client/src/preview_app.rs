@@ -313,6 +313,7 @@ fn run_inner(
         death_visible: false,
         inventory_shift: false,
         inventory_control: false,
+        inventory_alt: false,
         #[cfg(debug_assertions)]
         smoke_test,
         window: None,
@@ -399,6 +400,7 @@ struct Viewer {
     death_visible: bool,
     inventory_shift: bool,
     inventory_control: bool,
+    inventory_alt: bool,
     #[cfg(debug_assertions)]
     smoke_test: bool,
     window: Option<Arc<Window>>,
@@ -1265,6 +1267,7 @@ impl ApplicationHandler for Viewer {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.inventory_shift = modifiers.state().shift_key();
                 self.inventory_control = modifiers.state().control_key();
+                self.inventory_alt = modifiers.state().alt_key();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(ui) = &mut self.ui {
@@ -1277,6 +1280,7 @@ impl ApplicationHandler for Viewer {
                         ));
                     }
                 }
+                crate::update_chat_ime_area(&self.window, &self.ui);
                 self.apply_video();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1329,10 +1333,12 @@ impl ApplicationHandler for Viewer {
                 }
                 self.inventory_shift = false;
                 self.inventory_control = false;
+                self.inventory_alt = false;
                 self.input.release_for_screen(self.video);
                 self.submit_movement();
                 self.capture(false);
                 if let Some(ui) = &mut self.ui {
+                    ui.chat_release();
                     if ui.inventory_pointer_cancel()
                         && let Some(play) = &mut self.play
                     {
@@ -1350,7 +1356,11 @@ impl ApplicationHandler for Viewer {
                 {
                     match ime {
                         winit::event::Ime::Preedit(text, _) => ui.chat_preedit(text),
-                        winit::event::Ime::Commit(text) => ui.chat_text(&text),
+                        winit::event::Ime::Commit(text) => {
+                            if !text.is_empty() {
+                                ui.chat_text(&text);
+                            }
+                        }
                         winit::event::Ime::Disabled => ui.chat_preedit(String::new()),
                         winit::event::Ime::Enabled => {}
                     }
@@ -1369,6 +1379,20 @@ impl ApplicationHandler for Viewer {
                 if let Some(ui) = &mut self.ui
                     && ui.chat_open()
                 {
+                    let mut clipboard =
+                        crate::clipboard::SystemClipboard::new(self.window.as_deref());
+                    if crate::handle_chat_clipboard_shortcut(
+                        ui,
+                        &event.logical_key,
+                        event.state,
+                        self.inventory_control,
+                        self.inventory_shift,
+                        self.inventory_alt,
+                        &mut clipboard,
+                    ) {
+                        crate::update_chat_ime_area(&self.window, &self.ui);
+                        return;
+                    }
                     let tick = self
                         .play
                         .as_ref()
@@ -1380,6 +1404,7 @@ impl ApplicationHandler for Viewer {
                         event.text.as_deref(),
                         self.inventory_control,
                         self.inventory_shift,
+                        self.inventory_alt,
                         tick,
                     );
                     if closed {
@@ -1625,7 +1650,12 @@ impl ApplicationHandler for Viewer {
                 button,
                 ..
             } => {
-                if self.ui.as_ref().is_some_and(GameUi::chat_open) {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    if button == MouseButton::Left {
+                        ui.chat_release();
+                    }
                     return;
                 }
                 if self

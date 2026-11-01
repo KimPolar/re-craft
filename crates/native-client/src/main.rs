@@ -9,6 +9,7 @@ mod chat_hud;
 mod chat_input;
 mod chest_model;
 mod chunk_stream;
+mod clipboard;
 mod compass_motion;
 mod consume_particle_render;
 mod consume_particles;
@@ -1579,6 +1580,7 @@ fn handle_chat_key(
     text: Option<&str>,
     control: bool,
     shift: bool,
+    alt: bool,
     tick: u64,
 ) -> bool {
     if state != ElementState::Pressed {
@@ -1588,18 +1590,58 @@ fn handle_chat_key(
         return false;
     }
     if let PhysicalKey::Code(code) = key {
-        match ui.chat_key(code, control, shift, tick) {
+        // Select-all is dispatched using the keyboard layout's logical key.
+        if control && !alt && code == KeyCode::KeyA {
+            return false;
+        }
+        let edit_control = control && !(alt && code == KeyCode::KeyA);
+        match ui.chat_key(code, edit_control, shift, tick) {
             chat_input::ChatAction::Close | chat_input::ChatAction::Submit(_) => return true,
             chat_input::ChatAction::None => {}
         }
     }
-    if !control
+    if (!control || alt)
         && !ui.chat_composing()
         && let Some(text) = text
+        && chat_input::ChatInput::accepts_text(text)
     {
         ui.chat_text(text);
     }
     false
+}
+
+fn handle_chat_clipboard_shortcut(
+    ui: &mut GameUi,
+    key: &winit::keyboard::Key,
+    state: ElementState,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    clipboard: &mut dyn clipboard::Clipboard,
+) -> bool {
+    if state != ElementState::Pressed || !control || shift || alt || ui.chat_composing() {
+        return false;
+    }
+    let winit::keyboard::Key::Character(character) = key else {
+        return false;
+    };
+    if character.eq_ignore_ascii_case("a") {
+        ui.chat_select_all();
+    } else if character.eq_ignore_ascii_case("c") || character.eq_ignore_ascii_case("x") {
+        match clipboard.write(ui.chat_selected_text()) {
+            Ok(()) if character.eq_ignore_ascii_case("x") => ui.chat_delete_selection(),
+            Ok(()) => {}
+            Err(error) => eprintln!("Cannot copy chat text: {error:#}"),
+        }
+    } else if character.eq_ignore_ascii_case("v") {
+        match clipboard.read() {
+            Ok(text) => ui.chat_text(&text),
+            Err(error) => eprintln!("Cannot paste chat text: {error:#}"),
+        }
+    } else {
+        return false;
+    }
+    true
 }
 
 fn update_chat_ime_area(window: &Option<Arc<Window>>, ui: &Option<GameUi>) {
@@ -1690,6 +1732,7 @@ struct App {
     death_visible: bool,
     inventory_shift: bool,
     inventory_control: bool,
+    inventory_alt: bool,
     last_update: Instant,
     occluded: bool,
     video: menu_settings::VideoSettings,
@@ -1763,6 +1806,7 @@ impl App {
             death_visible: false,
             inventory_shift: false,
             inventory_control: false,
+            inventory_alt: false,
             last_update: now,
             occluded: false,
             video,
@@ -2246,6 +2290,7 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.inventory_shift = modifiers.state().shift_key();
                 self.inventory_control = modifiers.state().control_key();
+                self.inventory_alt = modifiers.state().alt_key();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(ui) = &mut self.ui {
@@ -2256,6 +2301,7 @@ impl ApplicationHandler for App {
                         ));
                     }
                 }
+                update_chat_ime_area(&self.window, &self.ui);
                 self.apply_video();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2299,10 +2345,12 @@ impl ApplicationHandler for App {
                 }
                 self.inventory_shift = false;
                 self.inventory_control = false;
+                self.inventory_alt = false;
                 self.input.release_for_screen(self.video);
                 self.input.submit(&mut self.session);
                 self.capture(false);
                 if let Some(ui) = &mut self.ui {
+                    ui.chat_release();
                     if ui.inventory_pointer_cancel() {
                         self.session.submit_command(PlayerCommand::InventoryPointer(
                             InventoryPointerEvent::Cancel,
@@ -2318,7 +2366,11 @@ impl ApplicationHandler for App {
                 {
                     match ime {
                         winit::event::Ime::Preedit(text, _) => ui.chat_preedit(text),
-                        winit::event::Ime::Commit(text) => ui.chat_text(&text),
+                        winit::event::Ime::Commit(text) => {
+                            if !text.is_empty() {
+                                ui.chat_text(&text);
+                            }
+                        }
                         winit::event::Ime::Disabled => ui.chat_preedit(String::new()),
                         winit::event::Ime::Enabled => {}
                     }
@@ -2337,6 +2389,19 @@ impl ApplicationHandler for App {
                 if let Some(ui) = &mut self.ui
                     && ui.chat_open()
                 {
+                    let mut clipboard = clipboard::SystemClipboard::new(self.window.as_deref());
+                    if handle_chat_clipboard_shortcut(
+                        ui,
+                        &event.logical_key,
+                        event.state,
+                        self.inventory_control,
+                        self.inventory_shift,
+                        self.inventory_alt,
+                        &mut clipboard,
+                    ) {
+                        update_chat_ime_area(&self.window, &self.ui);
+                        return;
+                    }
                     let closed = handle_chat_key(
                         ui,
                         event.physical_key,
@@ -2344,6 +2409,7 @@ impl ApplicationHandler for App {
                         event.text.as_deref(),
                         self.inventory_control,
                         self.inventory_shift,
+                        self.inventory_alt,
                         self.session.snapshot().tick,
                     );
                     if closed {
@@ -2401,7 +2467,12 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
-                if self.ui.as_ref().is_some_and(GameUi::chat_open) {
+                if let Some(ui) = &mut self.ui
+                    && ui.chat_open()
+                {
+                    if button == MouseButton::Left {
+                        ui.chat_release();
+                    }
                     return;
                 }
                 if self.session.snapshot().death.is_some() {
@@ -2718,6 +2789,97 @@ mod fullscreen_tests {
 }
 
 #[cfg(test)]
+mod chat_shortcut_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MockClipboard {
+        value: String,
+        fail_write: bool,
+        fail_read: bool,
+    }
+    impl crate::clipboard::Clipboard for MockClipboard {
+        fn read(&mut self) -> anyhow::Result<String> {
+            if self.fail_read {
+                anyhow::bail!("unavailable");
+            }
+            Ok(self.value.clone())
+        }
+        fn write(&mut self, text: &str) -> anyhow::Result<()> {
+            if self.fail_write {
+                anyhow::bail!("unavailable");
+            }
+            self.value = text.into();
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn clipboard_shortcuts_use_logical_keys_and_preserve_selection_on_failure() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut ui = GameUi::new(Arc::new(MenuAssets::load(&game, &[]).unwrap()));
+        let mut clipboard = MockClipboard::default();
+        let shortcut = |ui: &mut GameUi,
+                        clipboard: &mut MockClipboard,
+                        letter: &str,
+                        shift: bool,
+                        alt: bool| {
+            handle_chat_clipboard_shortcut(
+                ui,
+                &winit::keyboard::Key::Character(letter.into()),
+                ElementState::Pressed,
+                true,
+                shift,
+                alt,
+                clipboard,
+            )
+        };
+        ui.open_chat(false);
+        ui.chat_text("한글 😀");
+        assert!(shortcut(&mut ui, &mut clipboard, "a", false, false));
+        assert_eq!(ui.chat_selected_text(), "한글 😀");
+        assert!(!shortcut(&mut ui, &mut clipboard, "c", true, false));
+        assert!(!shortcut(&mut ui, &mut clipboard, "c", false, true));
+        assert!(shortcut(&mut ui, &mut clipboard, "c", false, false));
+        assert_eq!(clipboard.value, "한글 😀");
+        clipboard.fail_write = true;
+        assert!(shortcut(&mut ui, &mut clipboard, "x", false, false));
+        assert_eq!(ui.chat_selected_text(), "한글 😀");
+        clipboard.fail_write = false;
+        assert!(shortcut(&mut ui, &mut clipboard, "x", false, false));
+        assert_eq!(ui.chat_selected_text(), "");
+        assert!(shortcut(&mut ui, &mut clipboard, "v", false, false));
+        assert!(shortcut(&mut ui, &mut clipboard, "a", false, false));
+        assert_eq!(ui.chat_selected_text(), "한글 😀");
+        clipboard.fail_read = true;
+        assert!(shortcut(&mut ui, &mut clipboard, "v", false, false));
+        assert_eq!(ui.chat_selected_text(), "한글 😀");
+        clipboard.fail_read = false;
+        clipboard.value.clear();
+        assert!(shortcut(&mut ui, &mut clipboard, "v", false, false));
+        assert_eq!(ui.chat_selected_text(), "");
+        ui.chat_text("after");
+        assert!(shortcut(&mut ui, &mut clipboard, "a", false, false));
+        assert_eq!(ui.chat_selected_text(), "after");
+        assert!(!handle_chat_key(
+            &mut ui,
+            PhysicalKey::Code(KeyCode::KeyQ),
+            ElementState::Pressed,
+            Some("@"),
+            true,
+            false,
+            true,
+            0,
+        ));
+        assert!(shortcut(&mut ui, &mut clipboard, "a", false, false));
+        assert_eq!(ui.chat_selected_text(), "@");
+    }
+}
+
+#[cfg(test)]
 mod world_open_tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
@@ -2931,6 +3093,7 @@ mod video_window_tests {
                         None,
                         false,
                         false,
+                        false,
                         self.tick_at_open
                     ));
                     self.app.window_event(
@@ -2958,6 +3121,7 @@ mod video_window_tests {
                         PhysicalKey::Code(KeyCode::Enter),
                         ElementState::Pressed,
                         None,
+                        false,
                         false,
                         false,
                         self.app.session.snapshot().tick

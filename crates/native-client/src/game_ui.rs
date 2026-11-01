@@ -467,6 +467,20 @@ impl GameUi {
         self.last_draw = None;
     }
 
+    pub fn chat_selected_text(&self) -> &str {
+        self.chat_input.selected_text()
+    }
+
+    pub fn chat_delete_selection(&mut self) {
+        self.chat_input.delete_selection();
+        self.last_draw = None;
+    }
+
+    pub fn chat_select_all(&mut self) {
+        self.chat_input.key(KeyCode::KeyA, true, false);
+        self.last_draw = None;
+    }
+
     pub fn chat_preedit(&mut self, text: String) {
         self.chat_input.set_preedit(text);
         self.last_draw = None;
@@ -479,11 +493,19 @@ impl GameUi {
 
     pub fn chat_click(&mut self, shift: bool) {
         let (width, height) = self.logical_size();
-        if self.cursor.1 >= height - 14 && self.cursor.1 < height - 2 {
+        if self.cursor.0 >= 4
+            && self.cursor.0 < width
+            && self.cursor.1 >= height - 12
+            && self.cursor.1 < height
+        {
             self.chat_input
-                .click(&self.assets, width, self.cursor.0, shift);
+                .start_drag(&self.assets, width, self.cursor.0, shift);
             self.last_draw = None;
         }
+    }
+
+    pub fn chat_release(&mut self) {
+        self.chat_input.end_drag();
     }
 
     pub fn chat_ime_area(&self) -> (i32, i32, u32) {
@@ -702,6 +724,12 @@ impl GameUi {
     pub fn cursor_moved(&mut self, x: f64, y: f64) {
         self.cursor_raw = Some((x, y));
         self.cursor = gui_cursor(self.size, self.gui_scale(), (x, y));
+        if self.chat_input.is_open() {
+            let width = self.logical_size().0;
+            if self.chat_input.drag(&self.assets, width, self.cursor.0) {
+                self.last_draw = None;
+            }
+        }
         if self.paused && self.pause_page == PausePage::Sound {
             let (w, h) = self.logical_size();
             let (dragged, changed) = self

@@ -26,6 +26,7 @@ pub struct ChatInput {
     history_draft: String,
     scroll: usize,
     focused_at: Option<std::time::Instant>,
+    dragging: bool,
 }
 
 impl ChatInput {
@@ -46,6 +47,7 @@ impl ChatInput {
 
     pub fn open(&mut self, command: bool) {
         self.open = true;
+        self.dragging = false;
         self.focused_at = Some(std::time::Instant::now());
         self.text = if command { "/".into() } else { String::new() };
         self.caret = self.text.len();
@@ -58,6 +60,7 @@ impl ChatInput {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.dragging = false;
         self.focused_at = None;
         self.preedit.clear();
         self.scroll = 0;
@@ -67,11 +70,34 @@ impl ChatInput {
         self.preedit = text;
     }
 
+    pub fn accepts_text(text: &str) -> bool {
+        text.chars()
+            .any(|ch| ch != '\u{a7}' && ch >= ' ' && ch != '\u{7f}')
+    }
+
+    pub fn selected_text(&self) -> &str {
+        let (start, end) = self.selection();
+        &self.text[start..end]
+    }
+
+    pub fn delete_selection(&mut self) {
+        let (start, end) = self.selection();
+        if start != end {
+            self.text.replace_range(start..end, "");
+            self.caret = start;
+            self.anchor = start;
+            self.preedit.clear();
+        }
+    }
+
     pub fn insert(&mut self, text: &str) {
         let (start, end) = self.selection();
         let available = 256usize.saturating_sub(
             self.text[..start].encode_utf16().count() + self.text[end..].encode_utf16().count(),
         );
+        if available == 0 {
+            return;
+        }
         let mut addition = String::new();
         let mut used = 0;
         for ch in text
@@ -85,7 +111,7 @@ impl ChatInput {
             addition.push(ch);
             used += len;
         }
-        if addition.is_empty() {
+        if addition.is_empty() && start == end {
             return;
         }
         self.text.replace_range(start..end, &addition);
@@ -122,6 +148,29 @@ impl ChatInput {
             .chars()
             .next()
             .map_or(index, |ch| index + ch.len_utf8())
+    }
+
+    fn word_position(&self, index: usize, forward: bool) -> usize {
+        let bytes = self.text.as_bytes();
+        if forward {
+            let Some(offset) = self.text[index..].find(' ') else {
+                return bytes.len();
+            };
+            let mut pos = index + offset;
+            while pos < bytes.len() && bytes[pos] == b' ' {
+                pos += 1;
+            }
+            pos
+        } else {
+            let mut pos = index;
+            while pos > 0 && bytes[pos - 1] == b' ' {
+                pos -= 1;
+            }
+            while pos > 0 && bytes[pos - 1] != b' ' {
+                pos -= 1;
+            }
+            pos
+        }
     }
 
     fn visible_start(&self, canvas: &Canvas, assets: &MenuAssets, available: i32) -> usize {
@@ -161,6 +210,23 @@ impl ChatInput {
             }
         }
         self.move_caret(index, shift);
+    }
+
+    pub fn start_drag(&mut self, assets: &MenuAssets, width: i32, x: i32, shift: bool) {
+        self.click(assets, width, x, shift);
+        self.dragging = true;
+    }
+
+    pub fn drag(&mut self, assets: &MenuAssets, width: i32, x: i32) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        self.click(assets, width, x, true);
+        true
+    }
+
+    pub fn end_drag(&mut self) {
+        self.dragging = false;
     }
 
     fn move_caret(&mut self, index: usize, shift: bool) {
@@ -217,18 +283,16 @@ impl ChatInput {
             KeyCode::Home => self.move_caret(0, shift),
             KeyCode::End => self.move_caret(self.text.len(), shift),
             KeyCode::ArrowLeft => {
-                let (start, end) = self.selection();
-                let index = if !shift && start != end {
-                    start
+                let index = if control {
+                    self.word_position(self.caret, false)
                 } else {
                     self.previous(self.caret)
                 };
                 self.move_caret(index, shift);
             }
             KeyCode::ArrowRight => {
-                let (start, end) = self.selection();
-                let index = if !shift && start != end {
-                    end
+                let index = if control {
+                    self.word_position(self.caret, true)
                 } else {
                     self.next(self.caret)
                 };
@@ -238,9 +302,17 @@ impl ChatInput {
                 let (mut start, mut end) = self.selection();
                 if start == end {
                     if key == KeyCode::Backspace {
-                        start = self.previous(start);
+                        start = if control {
+                            self.word_position(start, false)
+                        } else {
+                            self.previous(start)
+                        };
                     } else {
-                        end = self.next(end);
+                        end = if control {
+                            self.word_position(end, true)
+                        } else {
+                            self.next(end)
+                        };
                     }
                 }
                 self.text.replace_range(start..end, "");
@@ -379,5 +451,137 @@ mod tests {
         input.key(KeyCode::ArrowDown, false, false);
         input.key(KeyCode::ArrowDown, false, false);
         assert_eq!(input.text, "draft");
+    }
+
+    #[test]
+    fn word_edits_use_ascii_spaces_and_move_from_the_caret_with_selection() {
+        let mut input = ChatInput::default();
+        input.open(false);
+        input.insert("한글  😀-two\u{a0}three  four");
+        input.key(KeyCode::ArrowLeft, true, false);
+        assert_eq!(&input.text[input.caret..], "four");
+        input.key(KeyCode::ArrowLeft, true, true);
+        assert_eq!(&input.text[input.caret..], "😀-two\u{a0}three  four");
+        input.key(KeyCode::ArrowRight, false, false);
+        assert_eq!(&input.text[input.caret..], "-two\u{a0}three  four");
+        input.key(KeyCode::Backspace, true, false);
+        assert_eq!(input.text, "한글  -two\u{a0}three  four");
+        input.key(KeyCode::Delete, true, false);
+        assert_eq!(input.text, "한글  four");
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn mouse_drag_extends_selection_and_release_stops_dragging() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let canvas = Canvas::new(1, 1);
+        let mut input = ChatInput::default();
+        input.open(false);
+        input.insert("abc한글");
+        input.start_drag(&assets, 320, 4, false);
+        let end = 4 + canvas.text_width(Some(&assets), "abc");
+        assert!(input.drag(&assets, 320, end));
+        assert_eq!(input.selected_text(), "abc");
+        input.end_drag();
+        assert!(!input.drag(&assets, 320, 100));
+        assert_eq!(input.selected_text(), "abc");
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 and Java 25 JDK"]
+    fn navigation_and_deletion_match_java_edit_box() {
+        use std::{ffi::OsString, path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath: OsString = std::env::join_paths(paths).unwrap();
+        let bin = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ChatEditOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(&source, include_str!("../tests/java/ChatEditOracle.java")).unwrap();
+        for command in [
+            Command::new(bin.join("javac"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&source)
+                .output()
+                .unwrap(),
+            Command::new(bin.join("java"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ChatEditOracle")
+                .arg(&output)
+                .output()
+                .unwrap(),
+        ] {
+            assert!(
+                command.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&command.stdout),
+                String::from_utf8_lossy(&command.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert!(rows.len() > 5000);
+        fn byte_offset(text: &str, utf16: usize) -> usize {
+            let mut units = 0;
+            for (byte, ch) in text.char_indices() {
+                if units == utf16 {
+                    return byte;
+                }
+                units += ch.len_utf16();
+            }
+            assert_eq!(units, utf16);
+            text.len()
+        }
+        for row in rows {
+            let text = row["before"].as_str().unwrap();
+            let mut input = ChatInput::default();
+            input.open(false);
+            input.text = text.to_owned();
+            input.caret = byte_offset(text, row["cursor"].as_u64().unwrap() as usize);
+            input.anchor = byte_offset(text, row["anchor"].as_u64().unwrap() as usize);
+            let code = match row["code"].as_i64().unwrap() {
+                1073741904 => KeyCode::ArrowLeft,
+                1073741903 => KeyCode::ArrowRight,
+                8 => KeyCode::Backspace,
+                127 => KeyCode::Delete,
+                _ => unreachable!(),
+            };
+            let modifiers = row["modifiers"].as_u64().unwrap();
+            input.key(code, modifiers & 64 != 0, modifiers & 1 != 0);
+            assert_eq!(input.text, row["after"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                input.text[..input.caret].encode_utf16().count(),
+                row["afterCursor"].as_u64().unwrap() as usize,
+                "{row}"
+            );
+            assert_eq!(
+                input.text[..input.anchor].encode_utf16().count(),
+                row["afterAnchor"].as_u64().unwrap() as usize,
+                "{row}"
+            );
+        }
     }
 }

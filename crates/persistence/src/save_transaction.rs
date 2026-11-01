@@ -317,6 +317,16 @@ fn valid_created_target(value: &str, version: u32) -> bool {
         || (version >= 4 && valid_created_poi_region(value))
         || (version >= 5 && valid_created_weather(value))
         || (version >= 6 && value == "level.dat_old")
+        || (version >= 7 && valid_created_random_sequences(value))
+}
+
+fn valid_created_random_sequences(value: &str) -> bool {
+    Path::new(value).components().collect::<Vec<_>>()
+        == [
+            Component::Normal("data".as_ref()),
+            Component::Normal("minecraft".as_ref()),
+            Component::Normal("random_sequences.dat".as_ref()),
+        ]
 }
 
 fn valid_created_weather(value: &str) -> bool {
@@ -335,7 +345,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7),
         "unsupported transaction version"
     );
     ensure!(
@@ -579,7 +589,11 @@ fn prepare(
         }
     }
     let manifest = Manifest {
-        version: if records
+        version: if records.iter().any(|record| {
+            record.original.is_none() && valid_created_random_sequences(&record.target)
+        }) {
+            7
+        } else if records
             .iter()
             .any(|record| record.original.is_none() && record.target == "level.dat_old")
         {
@@ -1127,6 +1141,46 @@ mod tests {
         assert!(recover(&root).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"outside writer");
         fs::write(&target, b"new weather").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn created_random_sequences_recovery_is_versioned_and_safe() {
+        let target_path = "data/minecraft/random_sequences.dat";
+        assert!(!valid_created_target(target_path, 6));
+        assert!(valid_created_target(target_path, 7));
+        for invalid in [
+            "data/minecraft/random_sequences.dat_old",
+            "data/example/random_sequences.dat",
+            "data/minecraft/../random_sequences.dat",
+        ] {
+            assert!(!valid_created_target(invalid, 7));
+        }
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join(target_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new sequences").unwrap();
+        let file = Replacement {
+            target: target.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        };
+        let mut prepared = prepare(&root, &backup, vec![file], vec![]).unwrap();
+        assert_eq!(prepared.manifest.version, 7);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        fs::write(&target, b"new sequences").unwrap();
         assert!(recover(&root).unwrap());
         assert!(!target.exists());
     }

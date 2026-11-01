@@ -70,7 +70,8 @@ pub struct WorldSavePlan {
     poi_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedWorldClocks>,
-    weather: Option<PlannedWeather>,
+    weather: Option<PlannedSharedData>,
+    random_sequences: Option<PlannedSharedData>,
     level_time: Option<PlannedLevelTime>,
 }
 
@@ -113,7 +114,7 @@ struct PlannedWorldClocks {
     document: crate::nbt::NamedTag,
 }
 
-struct PlannedWeather {
+struct PlannedSharedData {
     source_nbt: Option<Vec<u8>>,
     document: crate::nbt::NamedTag,
 }
@@ -159,6 +160,10 @@ impl WorldSavePlan {
 
     pub fn has_weather(&self) -> bool {
         self.weather.is_some()
+    }
+
+    pub fn has_random_sequences(&self) -> bool {
+        self.random_sequences.is_some()
     }
 
     pub fn has_level_time(&self) -> bool {
@@ -336,8 +341,27 @@ impl WorldSavePlan {
             "world save plan contains duplicate weather data"
         );
         let document = crate::world::WorldReader::update_weather_document(source, weather)?;
-        self.weather = Some(PlannedWeather {
+        self.weather = Some(PlannedSharedData {
             source_nbt: source.map(nbt::write).transpose()?,
+            document,
+        });
+        Ok(())
+    }
+
+    /// Stage a changed shared random stream in the same transaction as its consumers.
+    pub fn add_random_sequences(
+        &mut self,
+        sequences: &crate::random_sequences::RandomSequences,
+    ) -> Result<()> {
+        ensure!(
+            self.random_sequences.is_none(),
+            "duplicate random sequence data"
+        );
+        ensure!(sequences.is_dirty(), "random sequences have not changed");
+        let document = sequences.draft()?;
+        crate::random_sequences::RandomSequences::read(Some(document.clone()))?;
+        self.random_sequences = Some(PlannedSharedData {
+            source_nbt: sequences.source().map(nbt::write).transpose()?,
             document,
         });
         Ok(())
@@ -366,8 +390,19 @@ pub struct WorldSaveResult {
     pub player_paths: Vec<PathBuf>,
     pub world_clocks_path: Option<PathBuf>,
     pub weather_path: Option<PathBuf>,
+    pub random_sequences_path: Option<PathBuf>,
     pub level_path: Option<PathBuf>,
     pub backup_directory: PathBuf,
+}
+
+fn validate_weather_document(document: &nbt::NamedTag) -> Result<()> {
+    crate::world::parse_weather_data(document)?;
+    Ok(())
+}
+
+fn validate_random_sequences_document(document: &nbt::NamedTag) -> Result<()> {
+    crate::random_sequences::RandomSequences::read(Some(document.clone()))?;
+    Ok(())
 }
 
 fn validate_poi_preservation(
@@ -680,6 +715,7 @@ impl WorldWriteGuard {
                 || !plan.players.is_empty()
                 || plan.world_clocks.is_some()
                 || plan.weather.is_some()
+                || plan.random_sequences.is_some()
                 || plan.level_time.is_some(),
             "world save plan is empty"
         );
@@ -764,6 +800,7 @@ impl WorldWriteGuard {
                 + plan.players.len()
                 + plan.world_clocks.is_some() as usize
                 + plan.weather.is_some() as usize
+                + plan.random_sequences.is_some() as usize
                 + 2 * plan.level_time.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
@@ -811,6 +848,7 @@ impl WorldWriteGuard {
         let mut player_paths = Vec::with_capacity(plan.players.len());
         let mut world_clocks_path = None;
         let mut weather_path = None;
+        let mut random_sequences_path = None;
         let mut level_path = None;
 
         for (group_index, ((kind, dimension, region_x, region_z), chunks)) in
@@ -1140,7 +1178,21 @@ impl WorldWriteGuard {
             world_clocks_path = Some(canonical);
         }
 
-        if let Some(planned) = &plan.weather {
+        for (planned, filename, label, validate) in [
+            (
+                &plan.weather,
+                "weather.dat",
+                "weather",
+                validate_weather_document as fn(&nbt::NamedTag) -> Result<()>,
+            ),
+            (
+                &plan.random_sequences,
+                "random_sequences.dat",
+                "random sequences",
+                validate_random_sequences_document,
+            ),
+        ] {
+            let Some(planned) = planned else { continue };
             let mut directory = self.root.clone();
             for component in ["data", "minecraft"] {
                 directory.push(component);
@@ -1149,31 +1201,31 @@ impl WorldWriteGuard {
                 if !exists {
                     ensure!(
                         planned.source_nbt.is_none(),
-                        "weather data directory changed after its draft was created"
+                        "{label} data directory changed after its draft was created"
                     );
                     fs::create_dir(&directory)?;
                     ensure!(
                         crate::save_transaction::checked_directory(&self.root, &directory)?.1,
-                        "weather data directory disappeared"
+                        "{label} data directory disappeared"
                     );
                 }
             }
             let directory = directory.canonicalize()?;
             ensure!(
                 directory.starts_with(&self.root),
-                "weather data directory is outside the world"
+                "{label} data directory is outside the world"
             );
-            let path = directory.join("weather.dat");
+            let path = directory.join(filename);
             let current = match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     ensure!(
                         metadata.is_file() && ordinary(&metadata),
-                        "weather data must be an ordinary file"
+                        "{label} data must be an ordinary file"
                     );
                     let canonical = path.canonicalize()?;
                     ensure!(
                         canonical.parent() == Some(directory.as_path()),
-                        "weather data resolves outside its directory"
+                        "{label} data resolves outside its directory"
                     );
                     let bytes = nbt::decompress_limited(File::open(&canonical)?)?;
                     let compressed = bytes.starts_with(&[0x1f, 0x8b]);
@@ -1182,30 +1234,32 @@ impl WorldWriteGuard {
                     } else {
                         nbt::read(&bytes)?
                     };
-                    crate::world::parse_weather_data(&document)?;
+                    validate(&document)?;
                     ensure!(
                         planned
                             .source_nbt
                             .as_ref()
                             .is_some_and(|expected| nbt::write(&document)
                                 .is_ok_and(|actual| &actual == expected)),
-                        "weather data changed after its draft was created"
+                        "{label} data changed after its draft was created"
                     );
                     let original_hash: [u8; 32] = Sha256::digest(&bytes).into();
                     let backup_dir = backup.path().join("world-data");
                     fs::create_dir_all(&backup_dir)?;
-                    let weather_backup = backup_dir.join("weather.dat");
-                    copy_sync(&canonical, &weather_backup)?;
-                    Some((canonical, weather_backup, original_hash, compressed))
+                    let shared_backup = backup_dir.join(filename);
+                    copy_sync(&canonical, &shared_backup)?;
+                    Some((canonical, shared_backup, original_hash, compressed))
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     ensure!(
                         planned.source_nbt.is_none(),
-                        "weather data disappeared after its draft was created"
+                        "{label} data disappeared after its draft was created"
                     );
                     None
                 }
-                Err(error) => return Err(error).context("cannot inspect weather data"),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("cannot inspect {label} data"));
+                }
             };
             let replacement = nbt::write(&planned.document)?;
             let compressed = current
@@ -1231,9 +1285,9 @@ impl WorldWriteGuard {
             };
             ensure!(
                 nbt::write(&staged)? == replacement,
-                "staged weather data failed the NBT round-trip check"
+                "staged {label} data failed the NBT round-trip check"
             );
-            crate::world::parse_weather_data(&staged)?;
+            validate(&staged)?;
             let (target, backup, original_hash) = match current {
                 Some((target, backup, hash, _)) => (target, Some(backup), Some(hash)),
                 None => (path, None, None),
@@ -1244,7 +1298,11 @@ impl WorldWriteGuard {
                 stage,
                 original_hash,
             });
-            weather_path = Some(target);
+            if filename == "weather.dat" {
+                weather_path = Some(target);
+            } else {
+                random_sequences_path = Some(target);
+            }
         }
 
         if let Some(planned) = &plan.level_time {
@@ -1337,7 +1395,7 @@ impl WorldWriteGuard {
         let mut note = File::create(backup.path().join("backup.txt"))?;
         writeln!(
             note,
-            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}\nlevel={}",
+            "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}\nrandom_sequences={}\nlevel={}",
             region_paths.len(),
             plan.chunks.len(),
             entity_region_paths.len(),
@@ -1348,6 +1406,7 @@ impl WorldWriteGuard {
             plan.players.len(),
             plan.world_clocks.is_some() as usize,
             plan.weather.is_some() as usize,
+            plan.random_sequences.is_some() as usize,
             plan.level_time.is_some() as usize
         )?;
         note.sync_all()?;
@@ -1372,6 +1431,7 @@ impl WorldWriteGuard {
             player_paths,
             world_clocks_path,
             weather_path,
+            random_sequences_path,
             level_path,
             backup_directory,
         })
@@ -1999,6 +2059,160 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), after);
             assert_eq!(fs::read(&old).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn random_sequences_are_saved_with_backup_and_stale_files_abort_the_transaction() {
+        use crate::random_sequences::RandomSequences;
+        use crate::world::SavedWeather;
+        for compressed in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let path = world.path().join("data/minecraft/random_sequences.dat");
+            let weather_path = path.parent().unwrap().join("weather.dat");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut source = RandomSequences::read(None).unwrap().draft().unwrap();
+            let Tag::Compound(root) = &mut source.value else {
+                unreachable!()
+            };
+            root.push(("future".into(), Tag::Int(42)));
+            let bytes = nbt::write(&source).unwrap();
+            let original = if compressed {
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&bytes).unwrap();
+                gzip.finish().unwrap()
+            } else {
+                bytes
+            };
+            fs::write(&path, &original).unwrap();
+            let weather =
+                crate::world::WorldReader::update_weather_document(None, SavedWeather::default())
+                    .unwrap();
+            let weather_bytes = nbt::write(&weather).unwrap();
+            fs::write(&weather_path, &weather_bytes).unwrap();
+            let mut sequences = RandomSequences::read(Some(source.clone())).unwrap();
+            let mut random = sequences
+                .get("minecraft:chests/buried_treasure", 99)
+                .unwrap();
+            random.next_long();
+            sequences
+                .set("minecraft:chests/buried_treasure", &random)
+                .unwrap();
+            let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+            let mut plan = WorldSavePlan::new();
+            plan.add_random_sequences(&sequences).unwrap();
+            assert!(plan.has_random_sequences());
+            assert!(plan.add_random_sequences(&sequences).is_err());
+            plan.add_weather(
+                Some(&weather),
+                SavedWeather {
+                    raining: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut changed = source.clone();
+            let Tag::Compound(root) = &mut changed.value else {
+                unreachable!()
+            };
+            root.push(("other".into(), Tag::Int(1)));
+            let stale_bytes = nbt::write(&changed).unwrap();
+            fs::write(&path, &stale_bytes).unwrap();
+            assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), stale_bytes);
+            assert_eq!(fs::read(&weather_path).unwrap(), weather_bytes);
+            fs::write(&path, &original).unwrap();
+            let mut plan = WorldSavePlan::new();
+            plan.add_random_sequences(&sequences).unwrap();
+            plan.add_weather(
+                Some(&weather),
+                SavedWeather {
+                    raining: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+            assert_eq!(
+                result.random_sequences_path.as_deref(),
+                Some(path.canonicalize().unwrap().as_path())
+            );
+            let output = fs::read(&path).unwrap();
+            assert_eq!(output.starts_with(&[0x1f, 0x8b]), compressed);
+            let document = if compressed {
+                nbt::read_gzip(output.as_slice()).unwrap()
+            } else {
+                nbt::read(&output).unwrap()
+            };
+            assert_eq!(document.value.get("future"), Some(&Tag::Int(42)));
+            let restored = RandomSequences::read(Some(document)).unwrap();
+            assert_eq!(
+                restored
+                    .get("minecraft:chests/buried_treasure", 99)
+                    .unwrap()
+                    .state(),
+                random.state()
+            );
+            assert_eq!(
+                fs::read(
+                    result
+                        .backup_directory
+                        .join("world-data/random_sequences.dat")
+                )
+                .unwrap(),
+                original
+            );
+            assert_eq!(
+                crate::world::parse_weather_data(
+                    &nbt::read(&fs::read(&weather_path).unwrap()).unwrap()
+                )
+                .unwrap()
+                .raining,
+                true
+            );
+        }
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let terrain = editable_chunk(0);
+        store_record(&mut region, 0, 2, &terrain, 10);
+        fs::write(&region_path, &region).unwrap();
+        let path = world.path().join("data/minecraft/random_sequences.dat");
+        let mut sequences = RandomSequences::read(None).unwrap();
+        let mut random = sequences.get("minecraft:test", 1).unwrap();
+        random.next_long();
+        sequences.set("minecraft:test", &random).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_random_sequences(&sequences).unwrap();
+        plan.add_chunk(
+            DimensionId::parse("overworld").unwrap(),
+            block_draft(
+                &terrain,
+                ChunkPos { x: 0, z: 0 },
+                "minecraft:stone",
+                "minecraft:dirt",
+            ),
+            11,
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_ne!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(
+            result.region_paths,
+            vec![region_path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            result.random_sequences_path.as_deref(),
+            Some(path.canonicalize().unwrap().as_path())
+        );
+        let data = fs::read(&path).unwrap();
+        assert!(data.starts_with(&[0x1f, 0x8b]));
+        let restored =
+            RandomSequences::read(Some(nbt::read_gzip(data.as_slice()).unwrap())).unwrap();
+        assert_eq!(
+            restored.get("minecraft:test", 1).unwrap().state(),
+            random.state()
+        );
     }
 
     #[test]
@@ -3028,6 +3242,15 @@ mod tests {
         let mut plan = WorldSavePlan::new();
         plan.add_chunk(dimension.clone(), good, 2).unwrap();
         plan.add_chunk(dimension, chest, 2).unwrap();
+        let mut sequences = crate::random_sequences::RandomSequences::read(None).unwrap();
+        let mut random = sequences
+            .get("minecraft:chests/buried_treasure", 7)
+            .unwrap();
+        random.next_long();
+        sequences
+            .set("minecraft:chests/buried_treasure", &random)
+            .unwrap();
+        plan.add_random_sequences(&sequences).unwrap();
         let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
         let error = guard.write_plan(plan, |_, _| Ok(())).unwrap_err();
         assert!(
@@ -3038,6 +3261,12 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), region);
         assert_eq!(fs::read(path.with_file_name("c.2.0.mcc")).unwrap(), outside);
         assert_eq!(fs::read(world.path().join("level.dat")).unwrap(), level);
+        assert!(
+            !world
+                .path()
+                .join("data/minecraft/random_sequences.dat")
+                .exists()
+        );
         assert!(!world.path().join(".minecraft-native-backups").exists());
         assert!(!world.path().join(".minecraft-native-pending").exists());
     }

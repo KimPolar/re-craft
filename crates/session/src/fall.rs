@@ -577,7 +577,9 @@ impl FallTracker {
         };
         if !self.damage_tag("minecraft:bypasses_armor", damage)? {
             let armor = armor.context("armor attributes are unavailable")?;
-            let value = armor.armor as f32;
+            // LivingEntity.getArmorValue floors the double attribute before
+            // passing it to CombatRules, even for custom fractional values.
+            let value = armor.display_value() as f32;
             let toughness = armor.toughness as f32;
             let effective = (value - amount / (2.0 + toughness / 4.0)).clamp(value * 0.2, 20.0);
             amount *= 1.0 - effective / 25.0;
@@ -617,6 +619,107 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn fractional_armor_is_floored_before_damage_reduction() {
+        let mut vitals = PlayerVitals::default();
+        FallTracker::default()
+            .damage_outcome(
+                4.0,
+                "minecraft:lava",
+                &PlayerInventory::default(),
+                Some(ArmorValues {
+                    armor: 1.99,
+                    toughness: 0.0,
+                }),
+                &mut vitals,
+                GameMode::Survival,
+                None,
+            )
+            .unwrap();
+        // One armor point at four damage reduces it by 0.8 percent.
+        assert_eq!(
+            vitals.health.to_bits(),
+            (20.0_f32 - 4.0_f32 * (1.0 - 0.2 / 25.0)).to_bits()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn fractional_armor_damage_matches_java_player() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerArmorDamageOracle.java");
+        let result = temp.path().join("armor.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerArmorDamageOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerArmorDamageOracle")
+            .arg(&result));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 275);
+        for row in rows {
+            let armor = ArmorValues {
+                armor: row["armor"].as_f64().unwrap(),
+                toughness: row["toughness"].as_f64().unwrap(),
+            };
+            let mut vitals = PlayerVitals::default();
+            FallTracker::default()
+                .damage_outcome(
+                    row["amount"].as_f64().unwrap() as f32,
+                    "minecraft:lava",
+                    &PlayerInventory::default(),
+                    Some(armor),
+                    &mut vitals,
+                    GameMode::Survival,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                vitals.health.to_bits(),
+                row["health_bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     fn damage_outcome_distinguishes_new_hits_cooldown_and_absorption() {

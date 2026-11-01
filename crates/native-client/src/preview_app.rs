@@ -223,6 +223,7 @@ pub fn run_play(
     enchantments: Arc<crate::enchantment_tooltip::Registry>,
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
+    end_sky: Option<crate::end_sky::Texture>,
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
     hud_hidden: bool,
@@ -268,6 +269,7 @@ pub fn run_play(
             enchantments,
             sky_timeline,
             sky_background,
+            end_sky,
             weather_textures,
             weather_mesh: crate::weather_render::WeatherMesh::default(),
             weather_columns: crate::weather_render::WeatherColumnCache::default(),
@@ -398,6 +400,7 @@ struct PlayState {
     enchantments: Arc<crate::enchantment_tooltip::Registry>,
     sky_timeline: Option<crate::preview_lighting::SkyTimeline>,
     sky_background: Option<crate::sky_background::SkyBackground>,
+    end_sky: Option<crate::end_sky::Texture>,
     weather_textures: Option<crate::weather_render::WeatherTextures>,
     weather_mesh: crate::weather_render::WeatherMesh,
     weather_columns: crate::weather_render::WeatherColumnCache,
@@ -1324,6 +1327,11 @@ impl ApplicationHandler for Viewer {
         };
         renderer.set_fov(self.video.fov);
         renderer.set_view_bobbing(self.video.view_bobbing);
+        if let Some(texture) = self.play.as_ref().and_then(|play| play.end_sky.as_ref())
+            && let Err(error) = renderer.set_end_sky(texture)
+        {
+            eprintln!("End sky rendering is unavailable: {error:#}");
+        }
         if let Some(textures) = self
             .play
             .as_ref()

@@ -219,6 +219,7 @@ pub struct Renderer {
     fog_buffer: wgpu::Buffer,
     fog_bind_group: wgpu::BindGroup,
     fog_last: Option<FogUniform>,
+    end_sky: Option<crate::end_sky::EndSky>,
     camera_buffer: wgpu::Buffer,
     lightmap_buffer: wgpu::Buffer,
     lightmap_bind_group: wgpu::BindGroup,
@@ -337,6 +338,17 @@ impl Renderer {
 
     pub fn set_fog_range(&mut self, range: Option<[f32; 2]>) {
         self.fog_range = range;
+    }
+
+    pub fn set_end_sky(&mut self, texture: &crate::end_sky::Texture) -> Result<()> {
+        self.end_sky = Some(crate::end_sky::EndSky::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            DEPTH_FORMAT,
+            texture,
+        )?);
+        Ok(())
     }
 
     pub fn set_fog_color(&mut self, color: Option<[f32; 3]>) {
@@ -1281,6 +1293,7 @@ impl Renderer {
             fog_buffer,
             fog_bind_group,
             fog_last: None,
+            end_sky: None,
             camera_buffer,
             lightmap_buffer,
             lightmap_bind_group,
@@ -2160,6 +2173,30 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
+        let sky_matrix = projection
+            * self.effective_bob()
+            * Mat4::look_to_rh(Vec3::ZERO, direction, camera_up(direction, self.view_yaw));
+        let sky_background = self.sky_rgb.unwrap_or_else(|| {
+            let convert = |component: f64| {
+                if self.config.format.is_srgb() {
+                    if component <= 0.003_130_8 {
+                        (component * 12.92) as f32
+                    } else {
+                        (1.055 * component.powf(1.0 / 2.4) - 0.055) as f32
+                    }
+                } else {
+                    component as f32
+                }
+            };
+            [
+                convert(self.sky_clear.r),
+                convert(self.sky_clear.g),
+                convert(self.sky_clear.b),
+            ]
+        });
+        if let Some(sky) = &mut self.end_sky {
+            sky.update(&self.queue, sky_matrix, sky_background);
+        }
         self.consume_renderer.update(
             &self.device,
             &self.queue,
@@ -2245,6 +2282,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(sky) = &self.end_sky {
+                sky.draw(&mut pass);
+            }
             pass.set_pipeline(&self.terrain_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &self.lightmap_bind_group, &[]);

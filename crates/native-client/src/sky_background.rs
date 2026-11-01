@@ -561,6 +561,7 @@ pub struct SkyBackground {
     biomes: BTreeMap<String, Option<ColorLayer>>,
     tracks: Vec<SkyTrack>,
     background_is_fog: bool,
+    end_sky: bool,
     fog_color_base: Option<[f32; 3]>,
     fog_color_biomes: BTreeMap<String, Option<Option<ColorLayer>>>,
     fog_color_tracks: Option<Vec<SkyTrack>>,
@@ -613,10 +614,9 @@ impl SkyBackground {
             Some(value) => value.as_str().context("invalid skybox")?,
         };
         let attribute = match skybox {
-            "overworld" => "visual/sky_color",
+            "overworld" | "end" => "visual/sky_color",
             // Without a skybox, atmospheric fog is the background.
             "none" => "visual/fog_color",
-            "end" => return Ok(None),
             _ => bail!("unsupported skybox"),
         };
         let base = match dimension.get("attributes") {
@@ -840,6 +840,7 @@ impl SkyBackground {
             biomes,
             tracks,
             background_is_fog: skybox == "none",
+            end_sky: skybox == "end",
             fog_color_base,
             fog_color_biomes,
             fog_color_tracks,
@@ -859,6 +860,10 @@ impl SkyBackground {
 
     pub fn set_flat_world(&mut self, flat: Option<bool>) {
         self.flat_world = flat;
+    }
+
+    pub fn has_end_sky(&self) -> bool {
+        self.end_sky
     }
 
     pub fn void_darkness(&self, camera_y: f64) -> f32 {
@@ -1523,11 +1528,16 @@ mod tests {
             assert!(!layer.multiply);
             assert_eq!(layer.value, expected.map(|channel| channel as f32 / 255.0));
         }
-        assert!(
-            SkyBackground::load(&mut resources, "minecraft:the_end", 0, 256)
-                .unwrap()
-                .is_none()
+        let end = SkyBackground::load(&mut resources, "minecraft:the_end", 0, 256)
+            .unwrap()
+            .unwrap();
+        assert!(end.has_end_sky());
+        assert_eq!(end.base, [0.0; 3]);
+        assert_eq!(
+            end.fog_color_base,
+            Some([24.0 / 255.0, 19.0 / 255.0, 24.0 / 255.0])
         );
+        assert_eq!(end.water.base, Some([-8.0, 96.0, 0.0]));
     }
     #[test]
     fn gaussian_preserves_uniform_biome_and_requires_loaded_samples() {
@@ -1734,6 +1744,7 @@ mod tests {
         let mut background = SkyBackground {
             base: [0.0; 3],
             background_is_fog: false,
+            end_sky: false,
             fog_color_base: None,
             fog_color_biomes: BTreeMap::new(),
             fog_color_tracks: None,

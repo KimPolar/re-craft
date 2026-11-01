@@ -17,6 +17,7 @@ mod consume_particle_render;
 mod consume_particles;
 mod death_ui;
 mod enchantment_tooltip;
+mod end_sky;
 mod equipment_visual;
 mod experience_hud;
 mod file_open;
@@ -570,6 +571,7 @@ struct PreparedPlayWorld {
     enchantments: Arc<enchantment_tooltip::Registry>,
     sky_timeline: Option<preview_lighting::SkyTimeline>,
     sky_background: Option<sky_background::SkyBackground>,
+    end_sky: Option<end_sky::Texture>,
     video: menu_settings::VideoSettings,
 }
 
@@ -618,6 +620,7 @@ fn run_prepared_world(
                 enchantments,
                 sky_timeline,
                 sky_background,
+                end_sky,
                 video,
             } = *world;
             preview_app::run_play(
@@ -633,6 +636,7 @@ fn run_prepared_world(
                 enchantments,
                 sky_timeline,
                 sky_background,
+                end_sky,
                 video,
                 audio,
                 hud_hidden,
@@ -905,6 +909,20 @@ fn prepare_existing_world(
                 Err(error) => eprintln!("World generator for fog is unavailable: {error:#}"),
             }
         }
+        let end_sky = if sky_background
+            .as_ref()
+            .is_some_and(sky_background::SkyBackground::has_end_sky)
+        {
+            match end_sky::Texture::load(&mut resources) {
+                Ok(texture) => Some(texture),
+                Err(error) => {
+                    eprintln!("End sky texture is unavailable: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let default_clock = world.dimension_type.as_deref().and_then(|dimension_type| {
             match native_resources::world_clock::dimension_default_clock(
                 &mut resources,
@@ -1497,6 +1515,7 @@ fn prepare_existing_world(
             enchantments,
             sky_timeline,
             sky_background,
+            end_sky,
             video,
         })));
     }

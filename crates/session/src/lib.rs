@@ -23,6 +23,7 @@ pub mod chest_placement;
 pub mod consume_particles;
 mod custom_tool;
 mod equipment_attributes;
+mod fire_contact;
 pub use equipment_attributes::ArmorValues;
 pub mod equippable;
 pub mod experience;
@@ -377,6 +378,8 @@ pub enum DeathCause {
     Drown,
     Lava,
     OnFire,
+    InFire,
+    Campfire,
     Starve,
 }
 

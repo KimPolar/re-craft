@@ -303,6 +303,15 @@ pub struct FluidContacts {
     pub lava: FluidContact,
 }
 
+/// A fluid encountered on one axis of the clipped entity movement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SweptFluidEffect {
+    pub kind: FluidKind,
+    pub axis_step: u8,
+    pub contact_time: f64,
+    pub position: IVec3,
+}
+
 /// Fluid cells touched by an entity along Java's axis-ordered clipped path.
 /// Returns None for unavailable cells or an excessive search volume.
 pub fn swept_effects(
@@ -311,6 +320,37 @@ pub fn swept_effects(
     requested: DVec3,
     world: &impl Fn(IVec3) -> Cell,
 ) -> Option<Vec<FluidKind>> {
+    swept_effects_inner(bounds, actual, requested, world, |kind, _, _, _| kind)
+}
+
+/// As `swept_effects`, retaining movement order for other inside-block effects.
+pub fn swept_effects_detailed(
+    bounds: BoundingBox,
+    actual: DVec3,
+    requested: DVec3,
+    world: &impl Fn(IVec3) -> Cell,
+) -> Option<Vec<SweptFluidEffect>> {
+    swept_effects_inner(
+        bounds,
+        actual,
+        requested,
+        world,
+        |kind, axis_step, contact_time, position| SweptFluidEffect {
+            kind,
+            axis_step,
+            contact_time,
+            position,
+        },
+    )
+}
+
+fn swept_effects_inner<T>(
+    bounds: BoundingBox,
+    actual: DVec3,
+    requested: DVec3,
+    world: &impl Fn(IVec3) -> Cell,
+    make_effect: impl Fn(FluidKind, u8, f64, IVec3) -> T,
+) -> Option<Vec<T>> {
     use std::collections::HashSet;
     if !actual.is_finite()
         || !requested.is_finite()
@@ -329,7 +369,7 @@ pub fn swept_effects(
     let mut visited = HashSet::new();
     let mut effects = Vec::new();
     let mut work = 0_u64;
-    for axis in axes {
+    for (axis_step, axis) in axes.into_iter().enumerate() {
         let mut delta = DVec3::ZERO;
         delta[axis] = actual[axis];
         if delta == DVec3::ZERO && actual != DVec3::ZERO {
@@ -415,9 +455,9 @@ pub fn swept_effects(
                 _ => a.2.to_array().cmp(&b.2.to_array()),
             })
         });
-        for (_, kind, pos) in hits {
+        for (contact_time, kind, pos) in hits {
             if visited.insert(pos) {
-                effects.push(kind);
+                effects.push(make_effect(kind, axis_step as u8, contact_time, pos));
             }
         }
         position = position.moved(delta);

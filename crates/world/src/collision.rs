@@ -183,6 +183,27 @@ mod face_tests {
     }
 
     #[test]
+    fn campfire_collision_and_outline_are_seven_pixels_high() {
+        for name in ["minecraft:campfire", "minecraft:soul_campfire"] {
+            let state = BlockState {
+                name: name.into(),
+                properties: [
+                    ("facing".into(), "north".into()),
+                    ("lit".into(), "true".into()),
+                    ("signal_fire".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into(),
+            };
+            let shape = block_shape(&state).unwrap();
+            assert_eq!(shape.len(), 1);
+            assert_eq!(shape[0].min, glam::Vec3::ZERO);
+            assert_eq!(shape[0].max, glam::Vec3::new(1.0, 7.0 / 16.0, 1.0));
+            assert_eq!(block_outline(&state), Some(shape));
+        }
+    }
+
+    #[test]
     fn snow_shapes_reject_invalid_layer_properties() {
         for value in ["0", "9", "01", "-1", "x"] {
             let state = BlockState {
@@ -269,6 +290,23 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     if matches!(id, "dirt_path" | "farmland") {
         return Some(INDENTED.to_vec());
+    }
+    if matches!(id, "campfire" | "soul_campfire") {
+        if state.properties.len() != 4
+            || !matches!(
+                state.properties.get("facing").map(String::as_str),
+                Some("north" | "south" | "east" | "west")
+            )
+            || ["lit", "signal_fire", "waterlogged"].iter().any(|name| {
+                !matches!(
+                    state.properties.get(*name).map(String::as_str),
+                    Some("true" | "false")
+                )
+            })
+        {
+            return None;
+        }
+        return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, 7.0 / 16.0, 1.0)]);
     }
     if id == "honey_block" {
         return Some(HONEY.to_vec());

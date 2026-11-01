@@ -219,7 +219,7 @@ pub fn apply_surface<P: ResourceProvider>(
     let mut kinds = Vec::with_capacity(chunk.materials().len());
     let mut states = Vec::with_capacity(chunk.materials().len());
     let mut fluid_updates = chunk.fluid_updates().to_vec();
-    for material in chunk.materials() {
+    for (index, material) in chunk.materials().iter().enumerate() {
         let state = match material {
             NoiseMaterial::DefaultBlock => &default_block,
             NoiseMaterial::DefaultFluid => &default_fluid,
@@ -233,6 +233,9 @@ pub fn apply_surface<P: ResourceProvider>(
             cache.insert((**state).clone(), kind);
             kind
         };
+        // Aquifer scheduling is only recorded by Java when the selected state
+        // actually contains fluid; an air result may still carry its raw flag.
+        fluid_updates[index] &= kind == SurfaceBlockKind::Fluid;
         states.push(Arc::clone(state));
         kinds.push(kind);
     }
@@ -303,8 +306,8 @@ pub fn apply_surface<P: ResourceProvider>(
                     x: world_x,
                     y: step.y,
                     z: world_z,
-                    min_y,
-                    height,
+                    min_y: chunk.generation_min_y(),
+                    height: chunk.generation_height(),
                     sea_level,
                     stone_above: step.above,
                     stone_below: step.below,

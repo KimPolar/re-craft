@@ -70,6 +70,8 @@ pub struct NoiseStageChunk {
     chunk_z: i32,
     min_y: i32,
     height: i32,
+    generation_min_y: i32,
+    generation_height: i32,
     default_block: Value,
     default_fluid: Value,
     materials: Vec<NoiseMaterial>,
@@ -123,6 +125,8 @@ impl NoiseStageChunk {
             chunk_z: self.chunk_z,
             min_y,
             height,
+            generation_min_y: self.generation_min_y,
+            generation_height: self.generation_height,
             default_block: self.default_block,
             default_fluid: self.default_fluid,
             materials,
@@ -137,6 +141,14 @@ impl NoiseStageChunk {
     }
     pub fn height(&self) -> i32 {
         self.height
+    }
+    /// Bounds of the generator's WorldGenerationContext. These remain the
+    /// noise bounds when the chunk is expanded to a taller dimension.
+    pub fn generation_min_y(&self) -> i32 {
+        self.generation_min_y
+    }
+    pub fn generation_height(&self) -> i32 {
+        self.generation_height
     }
     /// Original data-pack encoding; resolve against the block registry before use.
     pub fn default_block(&self) -> &Value {
@@ -564,6 +576,8 @@ impl NoiseStageGenerator {
             chunk_z: z,
             min_y,
             height,
+            generation_min_y: min_y,
+            generation_height: height,
             default_block: self.default_block.clone(),
             default_fluid: self.default_fluid.clone(),
             materials,
@@ -707,6 +721,10 @@ mod tests {
             .expand_to_dimension(-16, 48)
             .unwrap();
         assert_eq!(expanded.chunk_position(), [-1, 2]);
+        assert_eq!(
+            (expanded.generation_min_y(), expanded.generation_height()),
+            (0, 16)
+        );
         assert_eq!(expanded.get(0, -1, 0), Some(NoiseMaterial::Air));
         assert_eq!(expanded.get(0, 7, 0), Some(NoiseMaterial::DefaultFluid));
         assert_eq!(expanded.get(0, 16, 0), Some(NoiseMaterial::Air));

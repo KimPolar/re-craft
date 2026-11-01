@@ -167,17 +167,27 @@ impl CarverCache {
                 serde_json::from_slice(&bytes).with_context(|| format!("invalid biome {path}"))?;
             let list = biome.get("carvers").context("biome missing carvers")?;
             let mut carvers = Vec::new();
-            if let Some(tag) = list.as_str().and_then(|s| s.strip_prefix('#')) {
-                let id = ResourceId::parse(tag)?;
-                let ids = self
-                    .resolve_tag(provider, &id, &mut BTreeSet::new())?
-                    .context("missing carver tag")?;
-                for id in ids {
+            if let Some(name) = list.as_str() {
+                if let Some(tag) = name.strip_prefix('#') {
+                    let id = ResourceId::parse(tag)?;
+                    let ids = self
+                        .resolve_tag(provider, &id, &mut BTreeSet::new())?
+                        .context("missing carver tag")?;
+                    for id in ids {
+                        carvers.push(
+                            self.load_named(provider, &id)?
+                                .context("missing tagged carver")?,
+                        );
+                    }
+                } else {
+                    let id = ResourceId::parse(name)?;
                     carvers.push(
                         self.load_named(provider, &id)?
-                            .context("missing tagged carver")?,
+                            .with_context(|| format!("missing carver {name}"))?,
                     );
                 }
+            } else if list.is_object() {
+                carvers.push(Arc::new(Carver::decode(list)?));
             } else {
                 for entry in list.as_array().context("carvers must be a list or tag")? {
                     if let Some(name) = entry.as_str() {
@@ -268,6 +278,18 @@ mod tests {
             vec![serde_json::to_vec(&json!({"carvers":[config]})).unwrap()],
         );
         data.0.insert(
+            "data/test/worldgen/biome/single.json".into(),
+            vec![br#"{"carvers":"test:cave"}"#.to_vec()],
+        );
+        data.0.insert(
+            "data/test/worldgen/carver/cave.json".into(),
+            vec![serde_json::to_vec(&config).unwrap()],
+        );
+        data.0.insert(
+            "data/test/worldgen/biome/direct.json".into(),
+            vec![serde_json::to_vec(&json!({"carvers":config})).unwrap()],
+        );
+        data.0.insert(
             "data/test/worldgen/biome/cycle.json".into(),
             vec![br##"{"carvers":"#test:cycle"}"##.to_vec()],
         );
@@ -282,6 +304,14 @@ mod tests {
             })
             .unwrap();
         assert!(mask.is_empty());
+        for name in ["test:single", "test:direct"] {
+            assert!(
+                cache
+                    .generate(&mut data, 0, [0, 0], 0, 16, |_| ResourceId::parse(name))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         assert!(
             cache
                 .generate(&mut data, 0, [0, 0], 0, 16, |_| ResourceId::parse(

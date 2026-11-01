@@ -1,6 +1,6 @@
-//! Intermediate noise, biome and surface generation for fresh terrain.
-//! Carvers, structures, features, lighting, persistence and playable world
-//! integration are not implemented by this module.
+//! Intermediate noise, biome, surface and carver generation for fresh terrain.
+//! Structures, features, lighting, persistence and playable world integration
+//! are not implemented by this module.
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
@@ -355,8 +355,8 @@ impl TerrainGenerator {
             &self.surface,
             self.seed,
             self.noise.random_algorithm(),
-            [x, self.min_y(), z],
-            [16, self.height() as u32, 16],
+            [x, self.noise.router().min_y, z],
+            [16, self.noise.router().height as u32, 16],
         )?;
         apply_surface(
             &blocks,

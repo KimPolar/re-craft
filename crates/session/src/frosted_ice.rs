@@ -118,6 +118,53 @@ mod tests {
         light: u8,
         events: Vec<serde_json::Value>,
     }
+
+    struct CascadeWorld {
+        ice: BTreeMap<[i32; 3], u8>,
+        events: Vec<serde_json::Value>,
+    }
+    impl IceWorld for CascadeWorld {
+        fn ice_age(&self, position: IVec3) -> Result<Option<u8>> {
+            Ok(self.ice.get(&position.to_array()).copied())
+        }
+        fn brightness(&self, _: IVec3) -> Result<u8> {
+            Ok(15)
+        }
+        fn set_age(&mut self, position: IVec3, age: u8) -> Result<()> {
+            self.ice.insert(position.to_array(), age);
+            self.events.push(serde_json::json!([
+                "age", position.x, position.y, position.z, age
+            ]));
+            Ok(())
+        }
+        fn melt(&mut self, position: IVec3) -> Result<()> {
+            self.ice.remove(&position.to_array());
+            self.events.push(serde_json::json!([
+                "melt", position.x, position.y, position.z
+            ]));
+            // Level.updateNeighborsAt uses WEST, EAST, DOWN, UP, NORTH, SOUTH.
+            for direction in [
+                IVec3::NEG_X,
+                IVec3::X,
+                IVec3::NEG_Y,
+                IVec3::Y,
+                IVec3::NEG_Z,
+                IVec3::Z,
+            ] {
+                let neighbor = offset(position, direction);
+                if self.ice_age(neighbor)?.is_some() {
+                    neighbor_changed(self, neighbor, true)?;
+                }
+            }
+            Ok(())
+        }
+        fn schedule(&mut self, position: IVec3, delay: i32) -> Result<()> {
+            self.events.push(serde_json::json!([
+                "schedule", position.x, position.y, position.z, delay
+            ]));
+            Ok(())
+        }
+    }
     impl IceWorld for World {
         fn ice_age(&self, position: IVec3) -> Result<Option<u8>> {
             Ok(self.ice.get(&position.to_array()).copied())
@@ -295,6 +342,97 @@ mod tests {
             assert_eq!(
                 world.events,
                 row["events"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn ice_neighbor_cascades_match_java_updater() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("FrostedIceCascadeOracle.java");
+        let output = temp.path().join("cascade.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FrostedIceCascadeOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FrostedIceCascadeOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 32 * 64 * 2);
+        crate::loaded::tests::compare_ice_stage_with_java(&rows);
+        let center = IVec3::new(0, 10, 0);
+        for row in rows {
+            let seed = row["seed"].as_i64().unwrap();
+            let mask = row["mask"].as_u64().unwrap();
+            let outer = row["outer"].as_i64().unwrap() != 0;
+            let mut world = CascadeWorld {
+                ice: BTreeMap::from([(center.to_array(), 3)]),
+                events: Vec::new(),
+            };
+            for (i, direction) in DIRECTIONS.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    let pos = offset(center, *direction);
+                    world
+                        .ice
+                        .insert(pos.to_array(), ((seed + i as i64) % 4) as u8);
+                    if outer {
+                        world.ice.insert(
+                            offset(pos, *direction).to_array(),
+                            ((seed + i as i64 + 1) % 4) as u8,
+                        );
+                    }
+                }
+            }
+            let mut random = LegacyRandom::new(seed);
+            tick(&mut world, center, 3, &mut random).unwrap();
+            assert_eq!(
+                world.events,
+                row["events"].as_array().unwrap().to_vec(),
+                "{row}"
+            );
+            assert_eq!(
+                random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
                 "{row}"
             );
         }

@@ -12997,13 +12997,15 @@ impl LoadedSession {
                     session: self,
                     age,
                     actions: Vec::new(),
+                    ice_overrides: BTreeMap::new(),
                 };
                 if crate::frosted_ice::tick(&mut stage, relative, age, &mut random).is_err() {
                     deferred_ice.push((order, key));
                     continue;
                 }
                 let actions = stage.actions;
-                let mut replacement = None;
+                let mut replacements = Vec::with_capacity(actions.len());
+                let mut valid = true;
                 for action in &actions {
                     let candidate = match action {
                         IceTickAction::Age(pos, age) => Some((
@@ -13023,36 +13025,49 @@ impl LoadedSession {
                         IceTickAction::Schedule(_, _) => None,
                     };
                     if let Some((pos, block, notify)) = candidate {
-                        if replacement.is_some() {
-                            replacement = Some(None);
-                            break;
-                        }
                         let next = self.intern_block(block);
                         if self.check_block_set(pos, next, notify, false).is_none() {
-                            replacement = Some(None);
+                            valid = false;
                             break;
                         }
-                        replacement = Some(Some((pos, next, notify)));
+                        replacements.push(Some((pos, next, notify)));
+                    } else {
+                        replacements.push(None);
                     }
                 }
-                if matches!(replacement, Some(None)) {
+                if !valid {
                     deferred_ice.push((order, key));
                     continue;
                 }
                 let previous_random = std::mem::replace(&mut self.level_random, random);
-                if let Some(Some((pos, next, notify))) = replacement {
-                    if !self.set_with_notify(pos, next, notify) {
-                        self.level_random = previous_random;
-                        deferred_ice.push((order, key));
-                        continue;
-                    }
-                }
                 self.ice_pending.remove(&key);
                 self.mark_tick_chunk_dirty(key.0, key.2);
-                for action in actions {
-                    if let IceTickAction::Schedule(pos, delay) = action {
+                let mut applied = 0;
+                let mut failed = false;
+                for (action, replacement) in actions.into_iter().zip(replacements) {
+                    if let Some((pos, next, notify)) = replacement {
+                        if !self.set_with_notify(pos, next, notify) {
+                            failed = true;
+                            break;
+                        }
+                        applied += 1;
+                        if matches!(action, IceTickAction::Age(..)) {
+                            self.notify_ice_shape_water(pos);
+                        }
+                    } else if let IceTickAction::Schedule(pos, delay) = action {
                         self.schedule_ice(pos, delay);
                     }
+                }
+                if failed {
+                    if applied == 0 {
+                        self.level_random = previous_random;
+                        self.ice_pending.insert(key);
+                        deferred_ice.push((order, key));
+                    } else {
+                        self.stream_errors
+                            .push("frosted ice cascade changed during application".into());
+                    }
+                    continue;
                 }
                 executed += 1;
             } else {
@@ -13135,6 +13150,37 @@ impl LoadedSession {
         if process_ice {
             self.ice_deferred.extend(deferred_ice);
             self.ice_deferred_state = Some(ice_state);
+        }
+    }
+
+    fn notify_ice_shape_water(&mut self, position: IVec3) {
+        let delay = self.fluid_settings().delay(FluidKind::Water);
+        for direction in [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_Y,
+            IVec3::Y,
+        ] {
+            let Some(neighbor) = add(position, direction) else {
+                continue;
+            };
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) else {
+                continue;
+            };
+            if let Some(fluid) = self
+                .ordinary_fluid(id)
+                .filter(|fluid| fluid.kind == FluidKind::Water && fluid.source)
+            {
+                self.schedule_fluid(neighbor, fluid, delay);
+            }
         }
     }
 
@@ -17633,17 +17679,89 @@ enum IceTickAction {
     Schedule(IVec3, i32),
 }
 
-/// Stage a tick before mutating the session or its random source. Conditions
-/// requiring unavailable daylight or an ice-neighbor cascade stay pending.
+/// Stage a tick before mutating the session or its random source.
 struct IceTickStage<'a> {
     session: &'a LoadedSession,
     age: u8,
     actions: Vec<IceTickAction>,
+    ice_overrides: BTreeMap<[i32; 3], Option<u8>>,
+}
+
+impl IceTickStage<'_> {
+    fn validate_neighbors(&self, position: IVec3) -> anyhow::Result<()> {
+        use crate::frosted_ice::IceWorld;
+        use anyhow::Context;
+        for direction in [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+        ] {
+            let neighbor = add(position, direction).context("ice neighbor overflow")?;
+            if self.ice_overrides.contains_key(&neighbor.to_array()) {
+                continue;
+            }
+            let Cell::State(id) = cell(
+                &self.session.world,
+                self.session.origin,
+                self.session.bounds,
+                neighbor,
+                self.session.states[0],
+            ) else {
+                anyhow::bail!("ice neighbor is unavailable");
+            };
+            let state = self
+                .session
+                .world
+                .state(id)
+                .context("ice neighbor state is unavailable")?;
+            anyhow::ensure!(
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:air"
+                        | "minecraft:cave_air"
+                        | "minecraft:void_air"
+                        | "minecraft:stone"
+                        | "minecraft:dirt"
+                        | "minecraft:frosted_ice"
+                        | "minecraft:water"
+                ),
+                "unsupported ice neighbor notification"
+            );
+            if state.name == "minecraft:water" {
+                anyhow::ensure!(
+                    state.properties.len() == 1
+                        && FluidState::from_block(state).ok().flatten().is_some(),
+                    "unsupported water state beside ice"
+                );
+            }
+            if state.name == "minecraft:frosted_ice" {
+                self.ice_age(neighbor)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_melt(&mut self, position: IVec3, evaporates: bool) -> anyhow::Result<()> {
+        self.validate_neighbors(position)?;
+        anyhow::ensure!(
+            self.actions.len() < 4096,
+            "ice cascade exceeds staging limit"
+        );
+        self.ice_overrides.insert(position.to_array(), None);
+        self.actions.push(IceTickAction::Melt(position, evaporates));
+        Ok(())
+    }
 }
 
 impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
     fn ice_age(&self, position: IVec3) -> anyhow::Result<Option<u8>> {
         use anyhow::Context;
+        if let Some(value) = self.ice_overrides.get(&position.to_array()) {
+            return Ok(*value);
+        }
         let Cell::State(id) = cell(
             &self.session.world,
             self.session.origin,
@@ -17708,28 +17826,17 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
     }
 
     fn set_age(&mut self, position: IVec3, age: u8) -> anyhow::Result<()> {
+        self.validate_neighbors(position)?;
+        anyhow::ensure!(
+            self.actions.len() < 4096,
+            "ice cascade exceeds staging limit"
+        );
+        self.ice_overrides.insert(position.to_array(), Some(age));
         self.actions.push(IceTickAction::Age(position, age));
         Ok(())
     }
 
     fn melt(&mut self, position: IVec3) -> anyhow::Result<()> {
-        // Neighbor ice can react recursively. Defer until that notification
-        // chain can be staged together with the rest of the world changes.
-        for direction in [
-            IVec3::NEG_Y,
-            IVec3::Y,
-            IVec3::NEG_Z,
-            IVec3::Z,
-            IVec3::NEG_X,
-            IVec3::X,
-        ] {
-            let neighbor =
-                add(position, direction).ok_or_else(|| anyhow::anyhow!("ice neighbor overflow"))?;
-            anyhow::ensure!(
-                self.ice_age(neighbor)?.is_none(),
-                "ice melt has an unsupported neighbor cascade"
-            );
-        }
         let environment = self
             .session
             .water_evaporation
@@ -17744,7 +17851,50 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
                     .map(|(_, clock)| clock.total_ticks)
             })
             .ok_or_else(|| anyhow::anyhow!("water evaporation clock is unavailable"))?;
-        self.actions.push(IceTickAction::Melt(position, evaporates));
+        self.stage_melt(position, evaporates)?;
+        let directions = [
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+        ];
+        let mut stack = vec![(position, 0_usize)];
+        while let Some((source, index)) = stack.last_mut() {
+            if *index == directions.len() {
+                stack.pop();
+                continue;
+            }
+            let neighbor = add(*source, directions[*index])
+                .ok_or_else(|| anyhow::anyhow!("ice neighbor overflow"))?;
+            *index += 1;
+            if self.ice_age(neighbor)?.is_none() {
+                continue;
+            }
+            let mut count = 0;
+            for direction in [
+                IVec3::NEG_Y,
+                IVec3::Y,
+                IVec3::NEG_Z,
+                IVec3::Z,
+                IVec3::NEG_X,
+                IVec3::X,
+            ] {
+                let next = add(neighbor, direction)
+                    .ok_or_else(|| anyhow::anyhow!("ice neighbor overflow"))?;
+                if self.ice_age(next)?.is_some() {
+                    count += 1;
+                    if count >= 2 {
+                        break;
+                    }
+                }
+            }
+            if count < 2 {
+                self.stage_melt(neighbor, evaporates)?;
+                stack.push((neighbor, 0));
+            }
+        }
         Ok(())
     }
 
@@ -17925,7 +18075,7 @@ fn move_axis(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -18519,6 +18669,85 @@ mod tests {
             "minecraft:flowing_water".into(),
         ])));
         session
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_ice_stage_with_java(rows: &[serde_json::Value]) {
+        let mut session = session();
+        session.set_has_skylight(false).unwrap();
+        session.set_water_evaporation_environment(bucket_environment(false));
+        session.pending_light.clear();
+        session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        session.sky_lighting.set_enabled(false);
+        let ids: Vec<_> = (0..4)
+            .map(|age| {
+                session.intern_block(state("minecraft:frosted_ice", &[("age", &age.to_string())]))
+            })
+            .collect();
+        let air = session.states[0];
+        let chunk_pos = session.player_chunk().unwrap();
+        let center = IVec3::new(8, 10, 8);
+        let directions = [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ];
+        for row in rows {
+            let seed = row["seed"].as_i64().unwrap();
+            let mask = row["mask"].as_u64().unwrap();
+            let outer = row["outer"].as_i64().unwrap() != 0;
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.block_light = Some(Box::new([0xff; native_world::loaded::LIGHT_BYTES]));
+            let blocks = section.blocks.as_mut().unwrap();
+            blocks.fill(air);
+            let mut put = |p: IVec3, id| {
+                blocks[(p.x + p.z * 16 + p.y * 256) as usize] = id;
+            };
+            put(center, ids[3]);
+            for (i, direction) in directions.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    put(center + *direction, ids[((seed + i as i64) % 4) as usize]);
+                    if outer {
+                        put(
+                            center + *direction * 2,
+                            ids[((seed + i as i64 + 1) % 4) as usize],
+                        );
+                    }
+                }
+            }
+            let mut stage = IceTickStage {
+                session: &session,
+                age: 3,
+                actions: Vec::new(),
+                ice_overrides: BTreeMap::new(),
+            };
+            let mut random = native_core::random::LegacyRandom::new(seed);
+            crate::frosted_ice::tick(&mut stage, center, 3, &mut random).unwrap();
+            let events: Vec<_> = stage
+                .actions
+                .iter()
+                .map(|action| match action {
+                    IceTickAction::Age(p, age) => {
+                        serde_json::json!(["age", p.x - 8, p.y, p.z - 8, age])
+                    }
+                    IceTickAction::Melt(p, _) => serde_json::json!(["melt", p.x - 8, p.y, p.z - 8]),
+                    IceTickAction::Schedule(p, delay) => {
+                        serde_json::json!(["schedule", p.x - 8, p.y, p.z - 8, delay])
+                    }
+                })
+                .collect();
+            assert_eq!(events, row["events"].as_array().unwrap().to_vec(), "{row}");
+            assert_eq!(
+                random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
+                "{row}"
+            );
+        }
     }
 
     #[test]
@@ -27549,6 +27778,26 @@ mod tests {
                 .is_err()
         );
 
+        for (level, should_schedule) in [("0", true), ("1", false)] {
+            let mut next_to_water = setup("0", 15, None, false);
+            let water = next_to_water.intern_block(state("minecraft:water", &[("level", level)]));
+            assert!(next_to_water.set(IVec3::new(5, 2, 4), water));
+            next_to_water.pending_light.clear();
+            next_to_water.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            next_to_water.sky_lighting.set_enabled(false);
+            next_to_water.fluid_ticks.clear();
+            next_to_water.fluid_pending.clear();
+            next_to_water.advance_block_ticks();
+            let position = next_to_water.origin + IVec3::new(5, 2, 4);
+            assert_eq!(
+                next_to_water
+                    .fluid_pending
+                    .iter()
+                    .any(|key| key.x == position.x && key.y == position.y && key.z == position.z),
+                should_schedule
+            );
+        }
+
         let mut melting = setup("3", 15, None, false);
         melting.advance_block_ticks();
         let position = melting.origin + IVec3::new(4, 2, 4);
@@ -27590,7 +27839,31 @@ mod tests {
         assert_eq!(fast.ice_ticks, slow.ice_ticks);
         assert!(fast.unresolved_ice_tick && slow.unresolved_ice_tick);
 
-        for mut deferred in [setup("0", 0, Some(15), false), setup("3", 15, None, true)] {
+        let mut cascade = setup("3", 15, None, true);
+        cascade.advance_block_ticks();
+        for relative in [IVec3::new(4, 2, 4), IVec3::new(5, 2, 4)] {
+            let position = cascade.origin + relative;
+            assert_eq!(
+                cascade
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:water"
+            );
+        }
+        assert!(cascade.draft_player_state(&original).is_err());
+
+        let unsupported = || {
+            let mut session = setup("3", 15, None, true);
+            let glass = session.intern_block(state("minecraft:glass", &[]));
+            assert!(session.set(IVec3::new(4, 3, 4), glass));
+            session.pending_light.clear();
+            session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+            session.sky_lighting.set_enabled(false);
+            session
+        };
+        for mut deferred in [setup("0", 0, Some(15), false), unsupported()] {
             let before = deferred.level_random.clone().next_int();
             deferred.advance_block_ticks();
             let position = deferred.origin + IVec3::new(4, 2, 4);
@@ -27610,10 +27883,10 @@ mod tests {
             assert!(deferred.draft_player_state(&original).is_err());
         }
 
-        let mut retry = setup("3", 15, None, true);
+        let mut retry = unsupported();
         retry.advance_block_ticks();
         assert_eq!(retry.ice_deferred.len(), 1);
-        assert!(retry.set(IVec3::new(5, 2, 4), retry.states[0]));
+        assert!(retry.set(IVec3::new(4, 3, 4), retry.states[0]));
         retry.pending_light.clear();
         retry.sky_lighting = crate::sky_lighting::SkyLighting::default();
         retry.sky_lighting.set_enabled(false);

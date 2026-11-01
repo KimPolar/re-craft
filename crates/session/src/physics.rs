@@ -1,5 +1,5 @@
 //! Default player movement in air, on ordinary solid blocks, and in fluids.
-//! Status effects, block speed factors and custom attributes are separate work.
+//! Some status effects and custom attributes are handled by the session.
 
 use glam::DVec3;
 use native_world::fluid::FluidKind;
@@ -76,6 +76,27 @@ pub fn block_jump_factor(block: &str) -> f32 {
     } else {
         1.0
     }
+}
+
+/// Vanilla's horizontal movement multiplier before movement efficiency.
+pub fn block_speed_factor(block: &str) -> f32 {
+    match block {
+        "minecraft:honey_block" | "minecraft:soul_sand" => 0.4,
+        _ => 1.0,
+    }
+}
+
+/// Water and bubble columns prevent the block underneath from slowing the entity.
+pub fn effective_block_speed_factor(at_feet: &str, below: &str, efficiency: f64) -> f32 {
+    let at_feet_factor = block_speed_factor(at_feet);
+    let factor = if at_feet_factor == 1.0
+        && !matches!(at_feet, "minecraft:water" | "minecraft:bubble_column")
+    {
+        block_speed_factor(below)
+    } else {
+        at_feet_factor
+    };
+    factor + (efficiency as f32) * (1.0 - factor)
 }
 
 fn default_movement_speed(sprinting: bool) -> f32 {
@@ -359,6 +380,7 @@ impl MotionState {
             levitation,
             collide,
             |_, _, _| (0.0, 0.0),
+            |_, _, _| 1.0,
         )
     }
 
@@ -373,6 +395,7 @@ impl MotionState {
         levitation: Option<u8>,
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
+        block_speed: impl FnOnce(DVec3, DVec3, bool) -> f32,
     ) -> (bool, DVec3) {
         let radians = input.yaw_degrees * 0.017453292_f32;
         let sine = f64::from(java_sin(f64::from(radians), false));
@@ -443,6 +466,9 @@ impl MotionState {
         if vertical_collision {
             self.velocity.y = vertical_velocity;
         }
+        let block_speed = f64::from(block_speed(self.position, actual, self.on_ground));
+        self.velocity.x *= block_speed;
+        self.velocity.z *= block_speed;
         let horizontal_drag = friction * modified_friction(0.91, 1.0);
         let vertical_drag = modified_friction(0.98, 1.0);
         self.velocity.x *= f64::from(horizontal_drag);
@@ -479,6 +505,7 @@ impl MotionState {
             collide,
             can_jump_out,
             |_, _, _| (0.0, 0.0),
+            |_, _, _| 1.0,
         )
     }
 
@@ -493,6 +520,7 @@ impl MotionState {
         collide: impl FnOnce(DVec3, DVec3, bool) -> (DVec3, DVec3),
         can_jump_out: impl FnOnce(DVec3, DVec3) -> bool,
         restitution: impl FnOnce(DVec3, DVec3, DVec3) -> (f64, f64),
+        block_speed: impl FnOnce(DVec3, DVec3, bool) -> f32,
     ) -> (bool, DVec3) {
         if fluid.kind == FluidKind::Water && fluid.descend {
             self.velocity.y -= f64::from(0.04_f32);
@@ -575,6 +603,9 @@ impl MotionState {
         if vertical_collision {
             self.velocity.y = vertical_velocity;
         }
+        let block_speed = f64::from(block_speed(self.position, actual, self.on_ground));
+        self.velocity.x *= block_speed;
+        self.velocity.z *= block_speed;
         match fluid.kind {
             FluidKind::Water => {
                 self.velocity *= DVec3::new(
@@ -762,6 +793,145 @@ pub fn java_sin(radians: f64, cosine: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_speed_respects_feet_water_and_efficiency() {
+        assert_eq!(
+            effective_block_speed_factor("minecraft:air", "minecraft:soul_sand", 0.0),
+            0.4
+        );
+        assert_eq!(
+            effective_block_speed_factor("minecraft:honey_block", "minecraft:stone", 0.0),
+            0.4
+        );
+        assert_eq!(
+            effective_block_speed_factor("minecraft:water", "minecraft:soul_sand", 0.0),
+            1.0
+        );
+        assert_eq!(
+            effective_block_speed_factor("minecraft:bubble_column", "minecraft:soul_sand", 0.0),
+            1.0
+        );
+        assert_eq!(
+            effective_block_speed_factor("minecraft:air", "minecraft:soul_sand", 1.0),
+            1.0
+        );
+        assert_eq!(
+            effective_block_speed_factor("minecraft:air", "minecraft:soul_soil", 0.0),
+            1.0
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn block_speed_matches_java_player() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerBlockSpeedOracle.java");
+        let result = temp.path().join("speeds.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerBlockSpeedOracle.java"),
+        )
+        .unwrap();
+        for output in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .output()
+                .unwrap(),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("PlayerBlockSpeedOracle")
+                .arg(&result)
+                .output()
+                .unwrap(),
+        ] {
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 256);
+        for row in rows {
+            let feet = format!("minecraft:{}", row["feet"].as_str().unwrap());
+            let below = format!("minecraft:{}", row["below"].as_str().unwrap());
+            let factor =
+                effective_block_speed_factor(&feet, &below, row["efficiency"].as_f64().unwrap());
+            assert_eq!(
+                factor.to_bits(),
+                row["bits"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+            if feet == "minecraft:soul_sand" {
+                let state = native_world::loaded::BlockState {
+                    name: feet.clone(),
+                    properties: Default::default(),
+                };
+                let shapes = [
+                    native_world::collision::block_shape(&state).unwrap(),
+                    native_world::collision::block_outline(&state).unwrap(),
+                ];
+                for (actual, expected) in shapes.iter().zip(row["boxes"].as_array().unwrap()) {
+                    let shape = actual[0];
+                    let coords = [
+                        shape.min.x,
+                        shape.min.y,
+                        shape.min.z,
+                        shape.max.x,
+                        shape.max.y,
+                        shape.max.z,
+                    ];
+                    for (actual, expected) in coords.iter().zip(expected.as_array().unwrap()) {
+                        assert_eq!(*actual, expected.as_f64().unwrap() as f32, "{row}");
+                    }
+                }
+                for (direction, expected) in [
+                    glam::IVec3::NEG_Y,
+                    glam::IVec3::Y,
+                    glam::IVec3::NEG_Z,
+                    glam::IVec3::Z,
+                    glam::IVec3::NEG_X,
+                    glam::IVec3::X,
+                ]
+                .into_iter()
+                .zip(row["sturdy"].as_array().unwrap())
+                {
+                    assert_eq!(
+                        native_world::collision::button_support_face(&state, direction),
+                        expected.as_bool(),
+                        "{row}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn slow_falling_gravity_uses_velocity_after_air_collision() {

@@ -73,6 +73,9 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
     if matches!(id, "air" | "cave_air" | "void_air") {
         return Some(false);
     }
+    if id == "soul_sand" {
+        return state.properties.is_empty().then_some(true);
+    }
     let shape = block_shape(state)?;
     if shape.is_empty() {
         return Some(false);
@@ -311,6 +314,12 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if id == "honey_block" {
         return Some(HONEY.to_vec());
     }
+    if id == "soul_sand" {
+        return state
+            .properties
+            .is_empty()
+            .then(|| vec![cuboid(0.0, 0.0, 0.0, 1.0, 14.0 / 16.0, 1.0)]);
+    }
     if matches!(id, "lodestone" | "magma_block") {
         return state.properties.is_empty().then(|| FULL.to_vec());
     }
@@ -542,7 +551,7 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     if id.ends_with("_button") {
         return button_outline(state);
     }
-    if id == "honey_block" {
+    if id == "honey_block" || (id == "soul_sand" && state.properties.is_empty()) {
         return Some(FULL.to_vec());
     }
     if matches!(id, "air" | "cave_air" | "void_air" | "water" | "lava") {

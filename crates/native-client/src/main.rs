@@ -1361,6 +1361,14 @@ fn prepare_existing_world(
                 )
                 .context("cannot restore saved water movement efficiency")?;
             session
+                .restore_saved_movement_efficiency(
+                    native_session::player_data::read_saved_movement_efficiency_attribute(
+                        player_data,
+                    )
+                    .context("cannot read saved movement efficiency")?,
+                )
+                .context("cannot restore saved movement efficiency")?;
+            session
                 .restore_saved_mining_attributes(
                     native_session::player_data::read_saved_mining_attributes(player_data)
                         .context("cannot read saved mining attributes")?,

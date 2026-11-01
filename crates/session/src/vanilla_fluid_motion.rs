@@ -361,6 +361,7 @@ fn water_and_lava_motion_match_vanilla_player() {
                     };
                     (entity_bounce, y)
                 },
+                |_, _, _| 1.0,
             );
             if ((state.position - vec3(&result["position"]))
                 .abs()

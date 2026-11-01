@@ -522,6 +522,10 @@ pub struct LoadedSession {
     water_efficiency_attribute: crate::player_data::SavedAttribute,
     water_efficiency_inventory_revision: Option<u64>,
     water_efficiency: Option<f64>,
+    movement_efficiency_attribute: crate::player_data::SavedAttribute,
+    movement_efficiency_inventory_revision: Option<u64>,
+    movement_efficiency: Option<f64>,
+    unresolved_player_movement_efficiency: bool,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     mining_attribute_revision: Option<u64>,
     mining_attribute_values: [f64; 3],
@@ -663,6 +667,7 @@ struct EffectSaveTracking {
     movement_speed: crate::player_data::SavedAttribute,
     gravity: crate::player_data::SavedAttribute,
     water_efficiency: crate::player_data::SavedAttribute,
+    movement_efficiency: crate::player_data::SavedAttribute,
     mining_attributes: crate::player_data::SavedMiningAttributes,
     ticks: u64,
     status_updates: Vec<crate::player_data::StatusUpdate>,
@@ -1100,6 +1105,7 @@ impl LoadedSession {
                 movement_speed: self.movement_speed_attribute.clone(),
                 gravity: self.gravity_attribute.clone(),
                 water_efficiency: self.water_efficiency_attribute.clone(),
+                movement_efficiency: self.movement_efficiency_attribute.clone(),
                 mining_attributes: self.mining_attributes.clone(),
                 ticks: 0,
                 status_updates: Vec::new(),
@@ -1734,6 +1740,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.movement_efficiency_inventory_revision = None;
         self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         Ok(())
@@ -1856,6 +1863,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.movement_efficiency_inventory_revision = None;
         self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         Ok(())
@@ -2053,6 +2061,48 @@ impl LoadedSession {
                 self.stream_errors.push(format!(
                     "player water movement efficiency equipment: {error:#}"
                 ));
+            }
+        }
+    }
+
+    pub fn restore_saved_movement_efficiency(
+        &mut self,
+        attribute: crate::player_data::SavedAttribute,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "movement efficiency must be restored before the first tick"
+        );
+        self.movement_efficiency = Some(attribute.value(0.0, 1.0)?);
+        self.movement_efficiency_attribute = attribute;
+        self.movement_efficiency_inventory_revision = None;
+        Ok(())
+    }
+
+    fn refresh_movement_efficiency(&mut self) {
+        let revision = self.inventory.revision();
+        if self.movement_efficiency_inventory_revision == Some(revision) {
+            return;
+        }
+        self.movement_efficiency_inventory_revision = Some(revision);
+        let registry = self
+            .oxygen_equipment
+            .as_ref()
+            .map(|(_, registry)| Arc::clone(registry))
+            .unwrap_or_default();
+        match crate::equipment_attributes::equipped_attribute(
+            &self.movement_efficiency_attribute,
+            &self.inventory,
+            &registry,
+            "movement_efficiency",
+        )
+        .and_then(|attribute| attribute.value(0.0, 1.0))
+        {
+            Ok(value) => self.movement_efficiency = Some(value),
+            Err(error) => {
+                self.movement_efficiency = None;
+                self.stream_errors
+                    .push(format!("player movement efficiency equipment: {error:#}"));
             }
         }
     }
@@ -2708,6 +2758,10 @@ impl LoadedSession {
             "player damage could not be resolved during this session"
         );
         anyhow::ensure!(
+            !self.unresolved_player_movement_efficiency,
+            "player movement efficiency could not be resolved during this session"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_fire_contact,
             "player lava and fire interactions are not yet supported for saving"
         );
@@ -2768,6 +2822,17 @@ impl LoadedSession {
             crate::player_data::read_saved_water_movement_efficiency_attribute(original)?
                 == *initial_water_efficiency,
             "saved water movement efficiency does not match the initial session state"
+        );
+        let initial_movement_efficiency = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(&self.movement_efficiency_attribute, |tracking| {
+                &tracking.movement_efficiency
+            });
+        anyhow::ensure!(
+            crate::player_data::read_saved_movement_efficiency_attribute(original)?
+                == *initial_movement_efficiency,
+            "saved movement efficiency does not match the initial session state"
         );
         let initial_mining = self
             .effect_save_tracking
@@ -4385,6 +4450,7 @@ impl LoadedSession {
         self.jump_strength_inventory_revision = None;
         self.gravity_inventory_revision = None;
         self.water_efficiency_inventory_revision = None;
+        self.movement_efficiency_inventory_revision = None;
         self.mining_attribute_revision = None;
         self.movement_speed_cache = None;
         self.armor.invalidate();
@@ -4697,6 +4763,10 @@ impl LoadedSession {
             water_efficiency_attribute: crate::player_data::SavedAttribute::with_base(0.0),
             water_efficiency_inventory_revision: None,
             water_efficiency: Some(0.0),
+            movement_efficiency_attribute: crate::player_data::SavedAttribute::with_base(0.0),
+            movement_efficiency_inventory_revision: None,
+            movement_efficiency: Some(0.0),
+            unresolved_player_movement_efficiency: false,
             mining_attributes: crate::player_data::SavedMiningAttributes::default(),
             mining_attribute_revision: None,
             mining_attribute_values: [0.0, 1.0, 0.2],
@@ -7396,6 +7466,9 @@ impl LoadedSession {
         self.water_efficiency_attribute.clear_modifiers();
         self.water_efficiency_inventory_revision = None;
         self.water_efficiency = self.water_efficiency_attribute.value(0.0, 1.0).ok();
+        self.movement_efficiency_attribute.clear_modifiers();
+        self.movement_efficiency_inventory_revision = None;
+        self.movement_efficiency = self.movement_efficiency_attribute.value(0.0, 1.0).ok();
         self.mining_attributes.clear_modifiers();
         self.mining_attribute_revision = None;
         self.mining_attribute_values = self.mining_attributes.values().unwrap_or([0.0, 1.0, 0.2]);
@@ -14467,6 +14540,7 @@ impl LoadedSession {
         self.refresh_jump_strength();
         self.refresh_gravity();
         self.refresh_water_movement_efficiency();
+        self.refresh_movement_efficiency();
         self.refresh_mining_attributes();
         let friction = self.friction_below();
         let fluid_view = FluidView {
@@ -14864,6 +14938,42 @@ impl LoadedSession {
                 ),
             )
         };
+        let movement_efficiency = self.movement_efficiency.unwrap_or(0.0);
+        let block_speed = |position: DVec3, actual: DVec3, on_ground: bool| {
+            let support = if on_ground {
+                let support = collision_support.get().unwrap_or_else(|| {
+                    crate::movement::supporting_block(
+                        position,
+                        actual,
+                        no_previous_support,
+                        block_shape,
+                    )
+                });
+                collision_support.set(Some(support));
+                support
+            } else {
+                None
+            };
+            let below = crate::movement::movement_on_block(position, support, |pos| {
+                match cell(world, origin, bounds, pos, air) {
+                    Cell::State(id) => world.state(id).is_some_and(|state| {
+                        state.name.ends_with("_wall") || state.name.ends_with("_fence_gate")
+                    }),
+                    Cell::Missing => false,
+                }
+            });
+            let name = |pos| match cell(world, origin, bounds, pos, air) {
+                Cell::State(id) => world
+                    .state(id)
+                    .map_or("minecraft:air", |state| state.name.as_str()),
+                Cell::Missing => "minecraft:air",
+            };
+            crate::physics::effective_block_speed_factor(
+                name(position.floor().as_ivec3()),
+                name(below),
+                movement_efficiency,
+            )
+        };
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
             (
                 false,
@@ -14921,6 +15031,7 @@ impl LoadedSession {
                             .contains_liquid(crate::movement::player_bounds(target, player_height))
                 },
                 restitution,
+                block_speed,
             )
         } else {
             self.motion.tick_resolved_with_restitution(
@@ -14933,8 +15044,12 @@ impl LoadedSession {
                 levitation,
                 resolve,
                 restitution,
+                block_speed,
             )
         };
+        if !flying && self.game_mode != GameMode::Spectator && self.movement_efficiency.is_none() {
+            self.unresolved_player_movement_efficiency = true;
+        }
         let player_fluid_effects = if self.game_mode == GameMode::Spectator {
             Some(Vec::new())
         } else {
@@ -27517,6 +27632,50 @@ mod tests {
         assert_eq!(session.block_jump_factor(), 1.0);
         assert!(session.set(IVec3::new(8, 1, 8), honey));
         assert_eq!(session.block_jump_factor(), 0.5);
+    }
+
+    #[test]
+    fn soul_sand_slows_player_after_collision_and_respects_saved_efficiency() {
+        for efficiency in [0.0, 0.5, 1.0] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session
+                .restore_saved_movement_efficiency(crate::player_data::SavedAttribute::with_base(
+                    efficiency,
+                ))
+                .unwrap();
+            let sand = session.intern_block(state("minecraft:soul_sand", &[]));
+            assert!(session.set(IVec3::new(8, 1, 8), sand));
+            session.motion.position = DVec3::new(8.5, 1.875, 8.5);
+            session.motion.velocity = DVec3::new(0.2, -0.05, 0.0);
+            session.motion.on_ground = true;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = true;
+            session.update(TICK);
+            let factor = crate::physics::effective_block_speed_factor(
+                "minecraft:soul_sand",
+                "minecraft:soul_sand",
+                efficiency,
+            );
+            let drag = (1.0_f32 - (1.0_f32 - 0.6_f32)) * (1.0_f32 - (1.0_f32 - 0.91_f32));
+            assert!(session.motion.on_ground);
+            assert_eq!(
+                session.motion.velocity.x,
+                0.2 * f64::from(factor) * f64::from(drag)
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_movement_efficiency_blocks_player_save_draft() {
+        let mut session = session();
+        session.unresolved_player_movement_efficiency = true;
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(Vec::new()),
+        };
+        let error = session.draft_player_state(&original).err().unwrap();
+        assert!(error.to_string().contains("movement efficiency"));
     }
 
     #[test]

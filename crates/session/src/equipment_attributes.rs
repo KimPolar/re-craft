@@ -627,7 +627,7 @@ mod tests {
                 Ok(vec![ResourceId::parse("example:movement")?])
             }
             fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
-                Ok(Some(br#"{"slots":["feet"],"effects":{"minecraft:attributes":[{"id":"example:speed","attribute":"minecraft:movement_speed","operation":"add_value","amount":0.1},{"id":"example:gravity","attribute":"minecraft:gravity","operation":"add_value","amount":0.2},{"id":"example:jump","attribute":"minecraft:jump_strength","operation":"add_value","amount":0.3},{"id":"example:water","attribute":"minecraft:water_movement_efficiency","operation":"add_value","amount":0.4}]}}"#.to_vec()))
+                Ok(Some(br#"{"slots":["feet"],"effects":{"minecraft:attributes":[{"id":"example:speed","attribute":"minecraft:movement_speed","operation":"add_value","amount":0.1},{"id":"example:gravity","attribute":"minecraft:gravity","operation":"add_value","amount":0.2},{"id":"example:jump","attribute":"minecraft:jump_strength","operation":"add_value","amount":0.3},{"id":"example:water","attribute":"minecraft:water_movement_efficiency","operation":"add_value","amount":0.4},{"id":"example:efficiency","attribute":"minecraft:movement_efficiency","operation":"add_value","amount":0.5}]}}"#.to_vec()))
             }
         }
         let registry = OxygenEnchantments::load(&mut MovementData).unwrap();
@@ -643,6 +643,7 @@ mod tests {
             ("gravity", 0.2),
             ("jump_strength", 0.3),
             ("water_movement_efficiency", 0.4),
+            ("movement_efficiency", 0.5),
         ] {
             let attribute =
                 equipped_attribute(&SavedAttribute::with_base(0.0), &inventory, &registry, name)

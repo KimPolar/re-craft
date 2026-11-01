@@ -514,6 +514,10 @@ pub fn read_saved_water_movement_efficiency_attribute(player: &NamedTag) -> Resu
     saved_attribute(player, "water_movement_efficiency", 0.0)
 }
 
+pub fn read_saved_movement_efficiency_attribute(player: &NamedTag) -> Result<SavedAttribute> {
+    saved_attribute(player, "movement_efficiency", 0.0)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedMiningAttributes {
     pub efficiency: SavedAttribute,

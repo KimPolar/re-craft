@@ -1379,14 +1379,15 @@ impl LoadedSession {
     }
 
     fn player_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
-        let outcome = match self.fall.damage_outcome(
+        let outcome = match self.fall.damage_with_equipment(
             amount,
             source,
-            &self.inventory,
-            self.armor.value(),
+            Arc::make_mut(&mut self.inventory),
+            &mut self.armor,
             &mut self.vitals,
             self.game_mode,
-            Some(&mut self.damage_cooldown),
+            &mut self.damage_cooldown,
+            &mut self.level_random,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -14987,7 +14988,10 @@ impl LoadedSession {
             let is_stalagmite = landing_state
                 .and_then(|id| self.world.state(id))
                 .is_some_and(|state| state.name == "minecraft:pointed_dripstone");
-            let landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id)) {
+            let before_landing_vitals = self.vitals;
+            let before_landing_cooldown = self.damage_cooldown;
+            let mut landing = if let Some(state) = landing_state.and_then(|id| self.world.state(id))
+            {
                 match self.fall.land_with_cooldown(
                     self.fall_distance,
                     Some(state),
@@ -15009,6 +15013,30 @@ impl LoadedSession {
             } else {
                 Default::default()
             };
+            if landing.damage.accepted {
+                self.vitals = before_landing_vitals;
+                self.damage_cooldown = before_landing_cooldown;
+                landing.damage = match self.fall.damage_with_equipment(
+                    landing.amount as f32,
+                    landing
+                        .source
+                        .expect("accepted landing has a damage source"),
+                    Arc::make_mut(&mut self.inventory),
+                    &mut self.armor,
+                    &mut self.vitals,
+                    self.game_mode,
+                    &mut self.damage_cooldown,
+                    &mut self.level_random,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.stream_errors
+                            .push(format!("player fall equipment damage: {error:#}"));
+                        self.unresolved_player_damage = true;
+                        Default::default()
+                    }
+                };
+            }
             let fall_amount = landing.amount;
             if fall_amount > 0 {
                 let fall_sound = if fall_amount > 4 {
@@ -40066,6 +40094,52 @@ mod tests {
                 "{cause}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn player_damage_breaks_armor_before_mitigation_and_respects_cooldown() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut test = session();
+        let helmet = ItemStack::new(
+            "minecraft:iron_helmet".into(),
+            1,
+            1,
+            Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(164))]),
+        )
+        .unwrap();
+        Arc::make_mut(&mut test.inventory).set_slot(PlayerSlot::Armor(0), Some(helmet));
+        test.armor.refresh(&test.inventory).unwrap();
+        assert!(test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+        assert!(test.inventory.slot(PlayerSlot::Armor(0)).is_none());
+        assert_eq!(test.armor.value().unwrap().armor, 0.0);
+        assert_eq!(test.vitals.health, 16.0);
+        assert!(!test.player_damage(3.0, "minecraft:hot_floor", DeathCause::HotFloor));
+        assert_eq!(test.vitals.health, 16.0);
+        assert!(test.player_damage(6.0, "minecraft:hot_floor", DeathCause::HotFloor));
+        assert_eq!(test.vitals.health, 14.0);
+        assert!(!test.unresolved_player_damage);
+
+        let mut test = session();
+        let helmet = ItemStack::new(
+            "minecraft:iron_helmet".into(),
+            1,
+            1,
+            Tag::Compound(vec![(
+                "minecraft:damage_resistant".into(),
+                Tag::Compound(vec![]),
+            )]),
+        )
+        .unwrap();
+        Arc::make_mut(&mut test.inventory).set_slot(PlayerSlot::Armor(0), Some(helmet));
+        test.armor.refresh(&test.inventory).unwrap();
+        let before = test.inventory.clone();
+        let mut expected = test.level_random.clone();
+        assert!(!test.player_damage(4.0, "minecraft:hot_floor", DeathCause::HotFloor));
+        assert_eq!(test.vitals.health, 20.0);
+        assert_eq!(test.inventory, before);
+        assert_eq!(test.level_random.next_int(), expected.next_int());
+        assert!(test.unresolved_player_damage);
     }
 
     #[test]

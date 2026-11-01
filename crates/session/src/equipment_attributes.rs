@@ -159,6 +159,10 @@ impl ArmorTracker {
         self.value
     }
 
+    pub(crate) fn value_for(&self, inventory: &PlayerInventory) -> Result<ArmorValues> {
+        armor_values(&self.armor, &self.toughness, inventory, &self.enchantments)
+    }
+
     /// Recompute only after an inventory change. Unknown effects suppress the
     /// result instead of displaying a value guessed from partial information.
     pub fn refresh(&mut self, inventory: &PlayerInventory) -> Result<()> {

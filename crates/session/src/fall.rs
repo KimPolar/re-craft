@@ -649,6 +649,82 @@ impl FallTracker {
         })
     }
 
+    /// Stage equipment, health, cooldown and level RNG together so unsupported
+    /// item or pack data cannot leave a partially applied hit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn damage_with_equipment(
+        &self,
+        amount: f32,
+        damage: &str,
+        inventory: &mut PlayerInventory,
+        armor: &mut crate::equipment_attributes::ArmorTracker,
+        vitals: &mut PlayerVitals,
+        mode: GameMode,
+        cooldown: &mut DamageCooldown,
+        random: &mut native_core::random::LegacyRandom,
+    ) -> Result<DamageOutcome> {
+        let mut first_vitals = *vitals;
+        let mut first_cooldown = *cooldown;
+        let initial = self.damage_outcome(
+            amount,
+            damage,
+            inventory,
+            armor.value(),
+            &mut first_vitals,
+            mode,
+            Some(&mut first_cooldown),
+        )?;
+        if !initial.accepted {
+            return Ok(initial);
+        }
+        if self.damage_tag("minecraft:bypasses_armor", damage)? {
+            *vitals = first_vitals;
+            *cooldown = first_cooldown;
+            return Ok(initial);
+        }
+        let bypass = self.damage_tag("minecraft:bypasses_cooldown", damage)?;
+        let mut accepted_cooldown = *cooldown;
+        let accepted_amount = accepted_cooldown
+            .accept(amount, bypass)
+            .context("accepted damage disappeared")?;
+        let mut staged_inventory = inventory.clone();
+        let mut staged_random = random.clone();
+        staged_inventory.damage_equipped_armor(
+            accepted_amount,
+            damage,
+            &mut staged_random,
+            self.enchantments.as_deref(),
+        )?;
+        if staged_inventory.revision() == inventory.revision() {
+            *random = staged_random;
+            *vitals = first_vitals;
+            *cooldown = first_cooldown;
+            return Ok(initial);
+        }
+        let staged_armor = armor.value_for(&staged_inventory)?;
+        let mut final_vitals = *vitals;
+        let mut final_cooldown = *cooldown;
+        let result = self.damage_outcome(
+            amount,
+            damage,
+            &staged_inventory,
+            Some(staged_armor),
+            &mut final_vitals,
+            mode,
+            Some(&mut final_cooldown),
+        )?;
+        ensure!(
+            result.accepted,
+            "equipment changes invalidated accepted player damage"
+        );
+        *inventory = staged_inventory;
+        *random = staged_random;
+        *vitals = final_vitals;
+        *cooldown = final_cooldown;
+        armor.refresh(inventory)?;
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn damage_outcome(
         &self,

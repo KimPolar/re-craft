@@ -14,6 +14,17 @@ import net.minecraft.util.Mth;
 import org.joml.Vector3f;
 
 public class SkyBackgroundOracle {
+    private static <T> T weather(EnvironmentAttribute<T> attribute, T value, float rain, float thunder) {
+        var interpolation = attribute.type().stateChangeLerp();
+        var rainEntry = WeatherAttributes.RAIN.get(attribute);
+        var thunderEntry = WeatherAttributes.THUNDER.get(attribute);
+        float rainOnly = rain - thunder;
+        if (rainOnly > 0 && rainEntry != null)
+            value = interpolation.apply(rainOnly, value, rainEntry.applyModifier(value));
+        if (thunder > 0 && thunderEntry != null)
+            value = interpolation.apply(thunder, value, thunderEntry.applyModifier(value));
+        return attribute.sanitizeValue(value);
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var input = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
@@ -122,6 +133,18 @@ public class SkyBackgroundOracle {
             if (rainOnly > 0f) value = starWeatherLerp.apply(rainOnly, value, starWeatherRain.applyModifier(value));
             if (thunder > 0f) value = starWeatherLerp.apply(thunder, value, starWeatherThunder.applyModifier(value));
             var row = new JsonArray(); row.add(value); output.add(row);
+        }
+        for (var item : input.getAsJsonArray("weatherCases")) {
+            var c = item.getAsJsonObject();
+            float rain = c.get("rain").getAsFloat(), thunder = c.get("thunder").getAsFloat();
+            var sky = weather(EnvironmentAttributes.SKY_COLOR, new Vector3f(0.8f, 0.3f, 0.05f), rain, thunder);
+            var fog = weather(EnvironmentAttributes.FOG_COLOR, new Vector3f(0.8f, 0.3f, 0.05f), rain, thunder);
+            var sunset = weather(EnvironmentAttributes.SUNRISE_SUNSET_COLOR, new org.joml.Vector4f(0.8f,0.3f,0.05f,0.4f), rain, thunder);
+            var row = new JsonArray();
+            row.add(sky.x()); row.add(sky.y()); row.add(sky.z());
+            row.add(fog.x()); row.add(fog.y()); row.add(fog.z());
+            row.add(sunset.x()); row.add(sunset.y()); row.add(sunset.z()); row.add(sunset.w());
+            output.add(row);
         }
         Files.writeString(Path.of(args[1]), new Gson().toJson(output));
     }

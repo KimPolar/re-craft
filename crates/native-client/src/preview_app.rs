@@ -131,17 +131,6 @@ fn interpolate_sun_angle(previous: f32, current: f32, partial: f32) -> f32 {
     }
 }
 
-pub(crate) fn star_brightness_weather(mut brightness: f32, rain: f32, thunder: f32) -> f32 {
-    let rain_only = rain - thunder;
-    if rain_only > 0.0 {
-        brightness += rain_only * (0.0 - brightness);
-    }
-    if thunder > 0.0 {
-        brightness += thunder * (0.0 - brightness);
-    }
-    brightness.clamp(0.0, 1.0)
-}
-
 pub struct Camera {
     pub eye: Vec3,
     pub yaw: f32,
@@ -942,18 +931,23 @@ impl Viewer {
                             .map(|state| state.total_ticks)
                     })
                 });
-                if let Some(crate::sky_background::BackgroundSample {
-                    color: value,
-                    background_is_fog,
-                    fog_color,
-                    fog_range,
-                    sky_mix,
-                    sunset,
-                    mut celestial_values,
-                    moon_phase,
-                    water,
-                }) = value
-                {
+                if let Some(mut sample) = value {
+                    if let Some(weather) = snapshot.weather {
+                        sample.apply_weather(weather);
+                    } else {
+                        sample.celestial_values[3] = None;
+                    }
+                    let crate::sky_background::BackgroundSample {
+                        color: value,
+                        background_is_fog,
+                        fog_color,
+                        fog_range,
+                        sky_mix,
+                        sunset,
+                        celestial_values,
+                        moon_phase,
+                        water,
+                    } = sample;
                     if play.sky_background_tick != Some(snapshot.tick)
                         || play.sky_background_previous.is_none()
                     {
@@ -977,15 +971,6 @@ impl Viewer {
                     }
                     play.sunset_current = sunset;
                     play.moon_phase = moon_phase;
-                    celestial_values[3] = celestial_values[3].and_then(|value| {
-                        snapshot.weather.map(|weather| {
-                            star_brightness_weather(
-                                value,
-                                weather.rain_at(1.0),
-                                weather.thunder_at(1.0),
-                            )
-                        })
-                    });
                     for (index, angle) in celestial_values.into_iter().enumerate() {
                         if play.sky_background_tick != Some(snapshot.tick)
                             || play.celestial_values_previous[index].is_none()

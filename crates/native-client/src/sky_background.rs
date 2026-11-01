@@ -645,6 +645,30 @@ pub struct BackgroundSample {
     pub water: Option<WaterFogSample>,
 }
 
+impl BackgroundSample {
+    /// Apply Java's final weather layers before partial-tick interpolation.
+    pub fn apply_weather(&mut self, weather: native_session::weather::WeatherVisual) {
+        let rain = weather.rain_at(1.0);
+        let thunder = weather.thunder_at(1.0);
+        self.color = if self.background_is_fog {
+            crate::sky_weather::fog(self.color, rain, thunder)
+        } else {
+            crate::sky_weather::sky(self.color, rain, thunder)
+        };
+        self.fog_color = self
+            .fog_color
+            .map(|color| crate::sky_weather::fog(color, rain, thunder));
+        self.sky_mix = self
+            .sky_mix
+            .map(|(color, distance)| (crate::sky_weather::sky(color, rain, thunder), distance));
+        self.sunset = self
+            .sunset
+            .map(|(angle, color)| (angle, crate::sky_weather::sunrise(color, rain, thunder)));
+        self.celestial_values[3] = self.celestial_values[3]
+            .map(|brightness| crate::sky_weather::stars(brightness, rain, thunder));
+    }
+}
+
 pub(crate) fn void_darkness_at(min_y: i32, flat: bool, camera_y: f64) -> f32 {
     let range = if flat { 1.0_f32 } else { 32.0_f32 };
     ((range + min_y as f32 - camera_y as f32) / range).clamp(0.0, 1.0)
@@ -1257,6 +1281,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn weather_uses_fog_layer_for_skyless_background_and_preserves_water() {
+        let base = [0.8, 0.3, 0.05];
+        let water = WaterFogSample {
+            color: [0.1, 0.2, 0.3],
+            range: [-8.0, 96.0],
+        };
+        let mut sample = BackgroundSample {
+            color: base,
+            background_is_fog: true,
+            fog_color: Some(base),
+            fog_range: Some([2.0, 20.0]),
+            sky_mix: Some((base, 512.0)),
+            sunset: None,
+            celestial_values: [None; 4],
+            moon_phase: None,
+            water: Some(water),
+        };
+        sample.apply_weather(native_session::weather::WeatherVisual {
+            previous_rain: 0.0,
+            rain: 1.0,
+            previous_thunder: 0.0,
+            thunder: 1.0,
+        });
+        assert_eq!(sample.color, sample.fog_color.unwrap());
+        assert_eq!(sample.color, crate::sky_weather::fog(base, 1.0, 1.0));
+        assert_eq!(
+            sample.sky_mix.unwrap().0,
+            crate::sky_weather::sky(base, 1.0, 1.0)
+        );
+        assert_eq!(sample.water, Some(water));
+    }
+
+    #[test]
     fn unsupported_sunset_layer_is_limited_to_sampled_biomes() {
         let mut sunset = SunsetTimeline::new(None).unwrap();
         sunset.biome_angles.insert("known".into(), Some(None));
@@ -1460,7 +1517,7 @@ mod tests {
                 + sunset_modifier_cases.len()
                 + sunset_track_cases.len() * 5
                 + (-100..=24100).step_by(37).count() * 3
-                + weather_cases.len()
+                + weather_cases.len() * 2
         );
         for (case, expected) in cases.iter().zip(&expected) {
             let p = &case["position"];
@@ -1713,7 +1770,7 @@ mod tests {
             }
         }
         for case in &weather_cases {
-            let actual = crate::preview_app::star_brightness_weather(
+            let actual = crate::sky_weather::stars(
                 0.5,
                 case["rain"].as_f64().unwrap() as f32,
                 case["thunder"].as_f64().unwrap() as f32,
@@ -1723,6 +1780,71 @@ mod tests {
                 "star weather {case}: {actual} != {}",
                 expected[offset][0]
             );
+            offset += 1;
+        }
+        let star_weather_offset = offset - weather_cases.len();
+        for (case_index, case) in weather_cases.iter().enumerate() {
+            let rain = case["rain"].as_f64().unwrap() as f32;
+            let thunder = case["thunder"].as_f64().unwrap() as f32;
+            let actual = crate::sky_weather::sky([0.8, 0.3, 0.05], rain, thunder)
+                .into_iter()
+                .chain(crate::sky_weather::fog([0.8, 0.3, 0.05], rain, thunder))
+                .chain(crate::sky_weather::sunrise(
+                    [0.8, 0.3, 0.05, 0.4],
+                    rain,
+                    thunder,
+                ));
+            for (channel, (actual, expected)) in actual.zip(&expected[offset]).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 0.000_001,
+                    "weather {case}, channel {channel}: {actual} != {expected}"
+                );
+            }
+            if thunder <= rain {
+                let mut sample = BackgroundSample {
+                    color: [0.8, 0.3, 0.05],
+                    background_is_fog: false,
+                    fog_color: Some([0.8, 0.3, 0.05]),
+                    fog_range: Some([2.0, 5.0]),
+                    sky_mix: Some(([0.8, 0.3, 0.05], 512.0)),
+                    sunset: Some((120.0, [0.8, 0.3, 0.05, 0.4])),
+                    celestial_values: [Some(1.0), Some(2.0), Some(3.0), Some(0.5)],
+                    moon_phase: None,
+                    water: None,
+                };
+                sample.apply_weather(native_session::weather::WeatherVisual {
+                    previous_rain: 1.0,
+                    rain,
+                    previous_thunder: 1.0,
+                    thunder: if rain == 0.0 { 0.0 } else { thunder / rain },
+                });
+                let reference = &expected[offset];
+                for (channel, actual) in sample
+                    .color
+                    .into_iter()
+                    .chain(sample.fog_color.unwrap())
+                    .chain(sample.sunset.unwrap().1)
+                    .enumerate()
+                {
+                    assert!(
+                        (actual - reference[channel]).abs() < 0.000_001,
+                        "sample weather {case}, channel {channel}"
+                    );
+                }
+                assert_eq!(sample.sky_mix.unwrap().1, 512.0);
+                assert_eq!(sample.sky_mix.unwrap().0, sample.color);
+                assert_eq!(sample.sunset.unwrap().0, 120.0);
+                assert_eq!(
+                    sample.celestial_values[..3],
+                    [Some(1.0), Some(2.0), Some(3.0)]
+                );
+                assert!(
+                    (sample.celestial_values[3].unwrap()
+                        - expected[star_weather_offset + case_index][0])
+                        .abs()
+                        < 0.000_001
+                );
+            }
             offset += 1;
         }
         let nether = SkyBackground::load(&mut resources, "minecraft:the_nether", 0, 128)

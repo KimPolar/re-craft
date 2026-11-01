@@ -61,6 +61,7 @@ mod renderer;
 mod screen_blur;
 mod screenshot;
 mod sky_background;
+mod sky_weather;
 mod smoke_particles;
 mod sound_ui;
 mod star_geometry;

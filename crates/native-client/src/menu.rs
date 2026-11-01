@@ -935,6 +935,7 @@ struct Menu<'a> {
     #[cfg(test)]
     software_presented: Option<((u32, u32), u64, usize)>,
     overlay_dirty: bool,
+    hover_buttons: Option<Rc<[Button]>>,
     occluded: bool,
     refresh_interval: Duration,
     cursor: (i32, i32),
@@ -999,6 +1000,7 @@ impl<'a> Menu<'a> {
             #[cfg(test)]
             software_presented: None,
             overlay_dirty: true,
+            hover_buttons: None,
             occluded: false,
             refresh_interval: Duration::from_nanos(1_000_000_000 / 60),
             cursor: (-1, -1),
@@ -1275,6 +1277,11 @@ impl<'a> Menu<'a> {
     }
 
     fn invalidate(&mut self) {
+        self.hover_buttons = None;
+        self.invalidate_overlay();
+    }
+
+    fn invalidate_overlay(&mut self) {
         self.overlay_dirty = true;
         // While the panorama is running, coalesce interaction changes into the
         // next scheduled frame instead of rendering an extra frame per input.
@@ -1288,6 +1295,15 @@ impl<'a> Menu<'a> {
     fn logical_size(&self) -> (i32, i32) {
         let size = gui_size(self.size, self.scale);
         (size.0 as i32, size.1 as i32)
+    }
+
+    fn hover_buttons(&mut self) -> Rc<[Button]> {
+        if let Some(buttons) = &self.hover_buttons {
+            return Rc::clone(buttons);
+        }
+        let buttons: Rc<[Button]> = self.buttons().into();
+        self.hover_buttons = Some(Rc::clone(&buttons));
+        buttons
     }
 
     fn hover_target(
@@ -2969,6 +2985,7 @@ impl ApplicationHandler for Menu<'_> {
             }
         }
         let mut request_redraw = !matches!(event, WindowEvent::RedrawRequested);
+        let mut hover_only = false;
         match event {
             WindowEvent::CloseRequested => {
                 if self.state.video_dirty {
@@ -2990,7 +3007,7 @@ impl ApplicationHandler for Menu<'_> {
             WindowEvent::CursorMoved { position, .. } => {
                 // Both hit tests use the same layout. Rebuilding every label
                 // twice for each high-frequency pointer event is unnecessary.
-                let buttons = self.buttons();
+                let buttons = self.hover_buttons();
                 let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor_raw = Some((position.x, position.y));
                 self.cursor = gui_cursor(self.size, self.scale, (position.x, position.y));
@@ -3033,13 +3050,15 @@ impl ApplicationHandler for Menu<'_> {
                     audio.set_gain(self.state.sound.ui_gain());
                 }
                 request_redraw = dragged || previous != self.hover_target(&buttons, self.cursor);
+                hover_only = !dragged;
             }
             WindowEvent::CursorLeft { .. } => {
-                let buttons = self.buttons();
+                let buttons = self.hover_buttons();
                 let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor = (-1, -1);
                 self.cursor_raw = None;
                 request_redraw = previous != self.hover_target(&buttons, self.cursor);
+                hover_only = true;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -3599,7 +3618,11 @@ impl ApplicationHandler for Menu<'_> {
             _ => {}
         }
         if request_redraw {
-            self.invalidate();
+            if hover_only {
+                self.invalidate_overlay();
+            } else {
+                self.invalidate();
+            }
         }
     }
 
@@ -5799,6 +5822,53 @@ public class GuiScaleOracle {
     }
 
     #[test]
+    fn hover_layout_cache_matches_current_buttons_and_invalidates() {
+        let mut state = State::new(PathBuf::new(), Vec::new());
+        state.asset_load = None;
+        for screen in [
+            Screen::Title,
+            Screen::Options,
+            Screen::Video,
+            Screen::Sound,
+            Screen::Packs,
+        ] {
+            state.screen = screen;
+            let mut menu = Menu::new(&mut state);
+            menu.size = (1280, 720);
+            menu.scale = gui_scale(1280, 720);
+            let cached = menu.hover_buttons();
+            assert!(Rc::ptr_eq(&cached, &menu.hover_buttons()));
+            menu.invalidate_overlay();
+            assert!(Rc::ptr_eq(&cached, &menu.hover_buttons()));
+            let fresh = menu.buttons();
+            for y in (0..240).step_by(7) {
+                for x in (0..427).step_by(11) {
+                    assert_eq!(
+                        menu.hover_target(&cached, (x, y)),
+                        menu.hover_target(&fresh, (x, y)),
+                        "{screen:?} at {x},{y}"
+                    );
+                }
+            }
+            menu.size = (800, 600);
+            menu.update_gui_scale();
+            menu.invalidate();
+            let resized = menu.hover_buttons();
+            assert!(!Rc::ptr_eq(&cached, &resized));
+            let fresh = menu.buttons();
+            for y in (0..300).step_by(11) {
+                for x in (0..400).step_by(13) {
+                    assert_eq!(
+                        menu.hover_target(&resized, (x, y)),
+                        menu.hover_target(&fresh, (x, y)),
+                        "resized {screen:?} at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "performance measurement using the locally installed Minecraft 26.3 assets"]
     fn measure_menu_hover_layout_reuse() {
         use std::hint::black_box;
@@ -5841,8 +5911,21 @@ public class GuiScaleOracle {
             }
             let new_time = start.elapsed();
             assert_eq!(old_changes, new_changes, "{screen:?}");
+            let start = Instant::now();
+            let mut cached_changes = 0;
+            for pair in positions.windows(2) {
+                let buttons = menu.hover_buttons();
+                let old = menu.hover_target(&buttons, black_box(pair[0]));
+                let new = menu.hover_target(&buttons, black_box(pair[1]));
+                if old != new {
+                    cached_changes += 1;
+                    menu.invalidate_overlay();
+                }
+            }
+            let cached_time = start.elapsed();
+            assert_eq!(old_changes, cached_changes, "{screen:?}");
             println!(
-                "Menu hover hit tests: screen={screen:?} events={} separate-layouts={old_time:?} shared-layout={new_time:?}",
+                "Menu hover hit tests: screen={screen:?} events={} separate-layouts={old_time:?} shared-layout={new_time:?} cached-layout={cached_time:?}",
                 positions.len() - 1
             );
         }

@@ -2204,6 +2204,7 @@ impl LoadedSession {
         let mut stage = DiskWorld {
             session: self,
             frozen: BTreeSet::new(),
+            entity_cache: BTreeMap::new(),
         };
         let mut ordered = Vec::new();
         for absolute in positions {
@@ -17810,6 +17811,7 @@ fn cell(
 struct DiskWorld<'a> {
     session: &'a LoadedSession,
     frozen: BTreeSet<[i32; 3]>,
+    entity_cache: BTreeMap<ChunkPos, Result<(), String>>,
 }
 
 impl DiskWorld<'_> {
@@ -17981,10 +17983,19 @@ impl native_resources::enchantments::disk_predicate::PredicateWorld for DiskWorl
             .div_euclid(16);
         for z in min_z..=max_z {
             for x in min_x..=max_x {
-                match self.session.entity_chunks.get(&ChunkPos { x, z }) {
-                    Some(SavedEntityData::Empty) => {}
-                    Some(SavedEntityData::Present(chunk)) if chunk.entities().is_empty() => {}
-                    _ => anyhow::bail!("disk entity collision information is incomplete"),
+                let pos = ChunkPos { x, z };
+                let result = self.entity_cache.entry(pos).or_insert_with(|| {
+                    match self.session.entity_chunks.get(&pos) {
+                        Some(SavedEntityData::Empty) => Ok(()),
+                        Some(SavedEntityData::Present(chunk)) => {
+                            crate::spawn_entities::require_nonblocking_building_chunk(chunk)
+                                .map_err(|error| format!("{error:#}"))
+                        }
+                        _ => Err("disk entity collision information is incomplete".into()),
+                    }
+                });
+                if let Err(error) = result {
+                    anyhow::bail!("{error}");
                 }
             }
         }
@@ -28052,7 +28063,7 @@ pub(crate) mod tests {
 
     #[test]
     fn frost_walker_freezes_known_water_and_defers_unknown_entities_atomically() {
-        use native_persistence::nbt::{NamedTag, Tag};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
         use native_resources::packs::{ResourceId, ResourceProvider};
         struct DiskPack;
         impl ResourceProvider for DiskPack {
@@ -28147,6 +28158,60 @@ pub(crate) mod tests {
         };
         assert!(active.draft_player_state(&original).is_err());
 
+        let inject_entities = |session: &mut LoadedSession, entities: Vec<Tag>| {
+            let pos = session.player_chunk().unwrap();
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: entities,
+                    },
+                )]),
+            };
+            session.entity_chunks.insert(
+                pos,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                    document: Arc::new(document),
+                })),
+            );
+        };
+        let entity = |id: &str| Tag::Compound(vec![("id".into(), Tag::String(id.into()))]);
+        let mut harmless = setup(false);
+        inject_entities(
+            &mut harmless,
+            vec![entity("minecraft:item"), entity("minecraft:experience_orb")],
+        );
+        harmless.run_location_effects(true);
+        assert_eq!(harmless.ice_ticks, active.ice_ticks);
+        let mut staged = DiskWorld {
+            session: &harmless,
+            frozen: BTreeSet::new(),
+            entity_cache: BTreeMap::new(),
+        };
+        for x in [7, 8, 9] {
+            let point = (harmless.origin + IVec3::new(x, 1, 8)).to_array();
+            assert!(
+                native_resources::enchantments::disk_predicate::PredicateWorld::unobstructed(
+                    &mut staged,
+                    point
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(staged.entity_cache.len(), 1);
+        let mut occupied = setup(false);
+        inject_entities(
+            &mut occupied,
+            vec![entity("minecraft:item"), entity("minecraft:pig")],
+        );
+        let random_before = occupied.level_random.clone().next_int();
+        occupied.run_location_effects(true);
+        assert!(occupied.ice_ticks.is_empty());
+        assert_eq!(occupied.level_random.next_int(), random_before);
+
         let mut missing = setup(false);
         let before_random = missing.level_random.clone().next_int();
         missing.run_location_effects(true);
@@ -28202,6 +28267,7 @@ pub(crate) mod tests {
         let mut stage = DiskWorld {
             session: &intersecting,
             frozen: BTreeSet::new(),
+            entity_cache: BTreeMap::new(),
         };
         assert!(
             !native_resources::enchantments::disk_predicate::PredicateWorld::unobstructed(

@@ -29,6 +29,11 @@ pub(crate) struct Replacement {
     pub original_hash: Option<[u8; 32]>,
 }
 
+pub(crate) struct Deletion {
+    pub target: PathBuf,
+    pub backup: PathBuf,
+}
+
 pub(crate) enum Dependency {
     Present { target: PathBuf, backup: PathBuf },
     Absent { target: PathBuf },
@@ -45,6 +50,8 @@ struct Manifest {
     absent_dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     absent_directories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deletions: Vec<DependencyRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -382,7 +389,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9),
         "unsupported transaction version"
     );
     ensure!(
@@ -393,6 +400,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                 + manifest.dependencies.len()
                 + manifest.absent_dependencies.len()
                 + manifest.absent_directories.len()
+                + manifest.deletions.len()
                 <= 4096,
         "invalid transaction file count"
     );
@@ -436,6 +444,27 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         }
     }
     for record in &manifest.dependencies {
+        ensure!(
+            targets.insert(relative_path_key(&record.target)?),
+            "duplicate transaction target"
+        );
+        ensure!(
+            backups.insert(relative_path_key(&record.backup)?),
+            "duplicate transaction backup"
+        );
+        ensure!(valid_digest(&record.original), "invalid transaction hash");
+    }
+    ensure!(
+        manifest.version >= 9 || manifest.deletions.is_empty(),
+        "invalid transaction version for deletions"
+    );
+    for record in &manifest.deletions {
+        let region =
+            external_chunk_region(&record.target).context("invalid deleted external chunk path")?;
+        ensure!(
+            file_targets.contains(&relative_path_key(&region)?),
+            "deleted external chunk requires its region in the same transaction"
+        );
         ensure!(
             targets.insert(relative_path_key(&record.target)?),
             "duplicate transaction target"
@@ -524,11 +553,22 @@ fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn prepare(
     root: &Path,
     backup_dir: &Path,
     files: Vec<Replacement>,
     dependencies: Vec<Dependency>,
+) -> Result<Prepared> {
+    prepare_with_deletions(root, backup_dir, files, dependencies, Vec::new())
+}
+
+fn prepare_with_deletions(
+    root: &Path,
+    backup_dir: &Path,
+    files: Vec<Replacement>,
+    dependencies: Vec<Dependency>,
+    deletions: Vec<Deletion>,
 ) -> Result<Prepared> {
     ensure_no_pending(root)?;
     let backups = root.join(".minecraft-native-backups");
@@ -638,8 +678,25 @@ fn prepare(
             }
         }
     }
+    let mut deleted_records = Vec::with_capacity(deletions.len());
+    for deletion in &deletions {
+        let target = relative(root, &deletion.target)?;
+        let backup = relative(&backup_dir, &deletion.backup)?;
+        let original = digest(&checked_file(&backup_dir, &backup, false)?)?;
+        ensure!(
+            digest(&checked_file(root, &target, true)?)? == original,
+            "world file changed during deletion staging"
+        );
+        deleted_records.push(DependencyRecord {
+            target,
+            backup,
+            original,
+        });
+    }
     let manifest = Manifest {
-        version: if records.iter().any(|record| {
+        version: if !deleted_records.is_empty() {
+            9
+        } else if records.iter().any(|record| {
             record.original.is_none() && external_chunk_region(&record.target).is_some()
         }) {
             8
@@ -681,6 +738,7 @@ fn prepare(
         dependencies: dependency_records,
         absent_dependencies,
         absent_directories,
+        deletions: deleted_records,
     };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
@@ -773,17 +831,42 @@ pub(crate) fn commit(
     files: Vec<Replacement>,
     dependencies: Vec<Dependency>,
 ) -> Result<()> {
-    let prepared = prepare(root, backup_dir, files, dependencies)?;
+    commit_with_deletions(root, backup_dir, files, dependencies, Vec::new())
+}
+
+pub(crate) fn commit_with_deletions(
+    root: &Path,
+    backup_dir: &Path,
+    files: Vec<Replacement>,
+    dependencies: Vec<Dependency>,
+    deletions: Vec<Deletion>,
+) -> Result<()> {
+    let prepared = prepare_with_deletions(root, backup_dir, files, dependencies, deletions)?;
     let result = (|| -> Result<()> {
         check_dependencies(root, &prepared.manifest)?;
         for (record, file) in prepared.manifest.files.iter().zip(prepared.files) {
             replace_one(root, record, file)?;
+        }
+        for record in &prepared.manifest.deletions {
+            let target = checked_file(root, &record.target, true)?;
+            ensure!(
+                digest(&target)? == record.original,
+                "world file changed before deletion: {}",
+                target.display()
+            );
+            fs::remove_file(&target).context("cannot delete external chunk")?;
         }
         for record in &prepared.manifest.files {
             let target = checked_file(root, &record.target, true)?;
             ensure!(
                 digest(&target)? == record.replacement,
                 "replaced world file changed"
+            );
+        }
+        for record in &prepared.manifest.deletions {
+            ensure!(
+                !checked_target(root, &record.target)?.1,
+                "deleted world file reappeared"
             );
         }
         check_dependencies(root, &prepared.manifest)?;
@@ -884,6 +967,18 @@ pub(crate) fn recover(root: &Path) -> Result<bool> {
             "dependency backup changed"
         );
     }
+    for record in &manifest.deletions {
+        let (target, exists) = checked_target(root, &record.target)?;
+        ensure!(
+            !exists || digest(&target)? == record.original,
+            "deleted world file was changed outside the transaction: {}",
+            target.display()
+        );
+        ensure!(
+            digest(&checked_file(&backup_dir, &record.backup, false)?)? == record.original,
+            "deleted world file backup changed"
+        );
+    }
     for record in &manifest.files {
         let (target, exists) = checked_target(root, &record.target)?;
         match (&record.original, &record.backup) {
@@ -911,6 +1006,30 @@ pub(crate) fn recover(root: &Path) -> Result<bool> {
             ),
             _ => bail!("invalid transaction original"),
         }
+    }
+    for record in &manifest.deletions {
+        let (target, exists) = checked_target(root, &record.target)?;
+        if exists {
+            ensure!(
+                digest(&target)? == record.original,
+                "world file changed during recovery"
+            );
+            continue;
+        }
+        let backup = checked_file(&backup_dir, &record.backup, false)?;
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-restore-")
+            .tempfile_in(target.parent().context("target has no parent")?)?;
+        std::io::copy(&mut File::open(backup)?, stage.as_file_mut())?;
+        stage.as_file().sync_all()?;
+        ensure!(
+            digest(stage.path())? == record.original,
+            "restored backup failed verification"
+        );
+        stage
+            .persist_noclobber(&target)
+            .map_err(|error| error.error)
+            .context("cannot restore deleted external chunk")?;
     }
     for record in &manifest.files {
         let (target, exists) = checked_target(root, &record.target)?;
@@ -981,6 +1100,14 @@ pub(crate) fn recover(root: &Path) -> Result<bool> {
         };
         ensure!(
             unchanged,
+            "world file changed during recovery: {}",
+            target.display()
+        );
+    }
+    for record in &manifest.deletions {
+        let target = checked_file(root, &record.target, true)?;
+        ensure!(
+            digest(&target)? == record.original,
             "world file changed during recovery: {}",
             target.display()
         );
@@ -1404,6 +1531,115 @@ mod tests {
     }
 
     #[test]
+    fn external_deletion_crash_helper() {
+        let Some(root) = std::env::var_os("NATIVE_EXTERNAL_DELETE_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let phase = std::env::var("NATIVE_EXTERNAL_DELETE_CRASH_PHASE").unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (files, _) = replacements(&root);
+        let target = root.join("dimensions/minecraft/overworld/region/c.2.0.mcc");
+        let deletions = vec![Deletion {
+            target: target.clone(),
+            backup: backup.join("external-original"),
+        }];
+        let mut prepared =
+            prepare_with_deletions(&root, &backup, files, vec![], deletions).unwrap();
+        assert_eq!(prepared.manifest.version, 9);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        if phase == "deleted" {
+            fs::remove_file(target).unwrap();
+        }
+        std::process::exit(25);
+    }
+
+    #[test]
+    fn interrupted_external_deletion_recovers_and_respects_conflicts() {
+        for phase in ["region", "deleted"] {
+            let dir = fixture();
+            let root = dir.path().canonicalize().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "save_transaction::tests::external_deletion_crash_helper",
+                    "--nocapture",
+                ])
+                .env("NATIVE_EXTERNAL_DELETE_CRASH_FIXTURE", &root)
+                .env("NATIVE_EXTERNAL_DELETE_CRASH_PHASE", phase)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(25),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let target = root.join("dimensions/minecraft/overworld/region/c.2.0.mcc");
+            let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+            assert_eq!(target.exists(), phase == "region");
+            fs::write(&target, b"outside writer").unwrap();
+            assert!(recover(&root).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+            assert_eq!(fs::read(&region).unwrap(), NEW_REGION);
+            if phase == "region" {
+                fs::write(&target, EXTERNAL).unwrap();
+            } else {
+                fs::remove_file(&target).unwrap();
+            }
+            assert!(recover(&root).unwrap());
+            assert_eq!(fs::read(target).unwrap(), EXTERNAL);
+            assert_eq!(fs::read(region).unwrap(), OLD_REGION);
+            assert!(!root.join(PENDING).exists());
+        }
+    }
+
+    #[test]
+    fn external_deletion_requires_owning_region_and_valid_paths() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (mut files, _) = replacements(&root);
+        files.remove(0);
+        let deletions = vec![Deletion {
+            target: root.join("dimensions/minecraft/overworld/region/c.2.0.mcc"),
+            backup: backup.join("external-original"),
+        }];
+        assert!(prepare_with_deletions(&root, &backup, files, vec![], deletions).is_err());
+        assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
+    fn external_deletion_manifest_rejects_invalid_versions_paths_and_backups() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let (files, _) = replacements(&root);
+        let deletions = vec![Deletion {
+            target: root.join("dimensions/minecraft/overworld/region/c.2.0.mcc"),
+            backup: backup.join("external-original"),
+        }];
+        let mut prepared =
+            prepare_with_deletions(&root, &backup, files, vec![], deletions).unwrap();
+        assert!(validate_manifest(&prepared.manifest).is_ok());
+        prepared.manifest.version = 8;
+        assert!(validate_manifest(&prepared.manifest).is_err());
+        prepared.manifest.version = 9;
+        let valid = prepared.manifest.deletions[0].target.clone();
+        for invalid in [
+            "players/data/c.2.0.mcc",
+            "dimensions/minecraft/overworld/region/c.32.0.mcc",
+            "dimensions/minecraft/overworld/region/c.02.0.mcc",
+        ] {
+            prepared.manifest.deletions[0].target = invalid.into();
+            assert!(validate_manifest(&prepared.manifest).is_err(), "{invalid}");
+        }
+        prepared.manifest.deletions[0].target = valid;
+        prepared.manifest.deletions[0].backup = prepared.manifest.files[0].backup.clone().unwrap();
+        assert!(validate_manifest(&prepared.manifest).is_err());
+    }
+
+    #[test]
     fn created_level_backup_is_versioned_and_rolled_back_without_clobbering() {
         assert!(!valid_created_target("level.dat_old", 5));
         assert!(valid_created_target("level.dat_old", 6));
@@ -1541,6 +1777,7 @@ mod tests {
             dependencies: vec![],
             absent_dependencies: vec![],
             absent_directories: vec![],
+            deletions: vec![],
         };
         assert!(validate_manifest(&manifest).is_err());
         manifest.version = 4;

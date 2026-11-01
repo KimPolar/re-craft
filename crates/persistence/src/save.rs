@@ -887,6 +887,7 @@ impl WorldWriteGuard {
                 + 2 * plan.level_time.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
+        let mut deletions = Vec::new();
         let mut absent_dependencies = Vec::new();
         if let Some(expected_seed) = named_loot_seed {
             let directory = self.root.join("data/minecraft");
@@ -1139,12 +1140,17 @@ impl WorldWriteGuard {
                 } else if original_nbt.is_some() {
                     let external_file =
                         region_dir.join(format!("c.{}.{}.mcc", position.x, position.z));
-                    match fs::symlink_metadata(&external_file) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Ok(_) => anyhow::bail!(
-                            "clearing a chunk with external storage is not yet supported"
-                        ),
-                        Err(error) => return Err(error.into()),
+                    if let Some(backup) = dependencies.remove(&external_file) {
+                        deletions.push(crate::save_transaction::Deletion {
+                            target: external_file,
+                            backup,
+                        });
+                    } else {
+                        match fs::symlink_metadata(&external_file) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Ok(_) => anyhow::bail!("unreferenced external chunk already exists"),
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                     clear_staged_chunk(
                         stage.as_file_mut(),
@@ -1564,13 +1570,19 @@ impl WorldWriteGuard {
             .map(|(target, backup)| crate::save_transaction::Dependency::Present { target, backup })
             .collect();
         dependencies.extend(absent_dependencies);
-        crate::save_transaction::commit(&self.root, &backup_directory, replacements, dependencies)
-            .with_context(|| {
-                format!(
-                    "cannot atomically replace world data; backup retained at {}",
-                    backup_directory.display()
-                )
-            })?;
+        crate::save_transaction::commit_with_deletions(
+            &self.root,
+            &backup_directory,
+            replacements,
+            dependencies,
+            deletions,
+        )
+        .with_context(|| {
+            format!(
+                "cannot atomically replace world data; backup retained at {}",
+                backup_directory.display()
+            )
+        })?;
 
         Ok(WorldSaveResult {
             region_paths,
@@ -2792,7 +2804,7 @@ mod tests {
         );
         let mut plan = WorldSavePlan::new();
         plan.add_entity_chunk(
-            dimension,
+            dimension.clone(),
             position,
             Some(&replacement),
             &small,
@@ -2821,6 +2833,50 @@ mod tests {
             )
             .unwrap(),
             nbt::write(&small).unwrap()
+        );
+        let previous_region = fs::read(&region).unwrap();
+        let previous_external = fs::read(&external).unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(
+            dimension.clone(),
+            position,
+            Some(&small),
+            &entity_chunk(0, vec![]),
+            126,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert!(!external.exists());
+        assert!(
+            RegionReader::open(&region)
+                .unwrap()
+                .read_chunk(0, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            previous_region
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/c.0.0.mcc")).unwrap(),
+            previous_external
+        );
+        let mut plan = WorldSavePlan::new();
+        plan.add_entity_chunk(dimension, position, None, &source, 127, |_, _| Ok(()))
+            .unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            nbt::write(
+                &RegionReader::open(&region)
+                    .unwrap()
+                    .read_chunk(0, 0)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            nbt::write(&source).unwrap()
         );
         assert!(!world.path().join(".minecraft-native-pending").exists());
     }

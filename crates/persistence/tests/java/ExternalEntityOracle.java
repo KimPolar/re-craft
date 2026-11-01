@@ -12,6 +12,14 @@ public class ExternalEntityOracle {
         Path directory=Path.of(args[1]).resolve("dimensions/minecraft/overworld/entities");
         try(var region=new RegionFile(new RegionStorageInfo("parity",null,"entities"),
                 directory.resolve("r.0.0.mca"),directory,RegionFileVersion.VERSION_DEFLATE,false)) {
+            if(args[0].equals("absent")) {
+                try(var in=region.getChunkDataInputStream(new ChunkPos(1,0))) {
+                    if(in!=null) throw new AssertionError("deleted entity chunk remains readable");
+                }
+                if(Files.exists(directory.resolve("c.1.0.mcc"))) throw new AssertionError("deleted external chunk remains");
+                System.out.println("OK");
+                return;
+            }
             CompoundTag chunk;
             try(var in=region.getChunkDataInputStream(new ChunkPos(0,0))) {
                 if(in==null) throw new AssertionError("entity chunk missing");

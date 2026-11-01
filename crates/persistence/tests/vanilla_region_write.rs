@@ -1145,6 +1145,61 @@ fn coordinated_external_entity_chunks_round_trip_with_java() {
     std::fs::write(&payload_path, [7, 11, 13]).unwrap();
     assert!(std::fs::metadata(&external).unwrap().len() < 4096);
     assert!(invoke("verify").lines().any(|line| line == "OK"));
+    let mut other = document.clone();
+    let Tag::Compound(fields) = &mut other.value else {
+        unreachable!()
+    };
+    fields.retain(|(name, _)| !name.matches("future"));
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("Position"))
+        .unwrap()
+        .1 = Tag::IntArray(vec![1, 0]);
+    let other_position = ChunkPos { x: 1, z: 0 };
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(
+        DimensionId::parse("overworld").unwrap(),
+        other_position,
+        None,
+        &other,
+        4,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    assert!(
+        world
+            .join("dimensions/minecraft/overworld/entities/c.1.0.mcc")
+            .exists()
+    );
+    let mut empty = other.clone();
+    let Tag::Compound(fields) = &mut empty.value else {
+        unreachable!()
+    };
+    fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("Entities"))
+        .unwrap()
+        .1 = Tag::List {
+        element_type: TagType::Compound,
+        values: vec![],
+    };
+    let mut plan = WorldSavePlan::new();
+    plan.add_entity_chunk(
+        DimensionId::parse("overworld").unwrap(),
+        other_position,
+        Some(&other),
+        &empty,
+        5,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    assert!(result.backup_directory.join("region-0/c.1.0.mcc").exists());
+    assert!(invoke("absent").lines().any(|line| line == "OK"));
+    assert!(invoke("verify").lines().any(|line| line == "OK"));
 }
 
 #[test]

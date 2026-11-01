@@ -309,6 +309,38 @@ impl TerrainGenerator {
             },
         )
     }
+    /// Select one set entry and invoke its start generator in Java's order.
+    /// Structure-specific generation must still implement its own biome and
+    /// height checks; an unsupported type must return an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_structure_set<P: ResourceProvider, T>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        generate: impl FnMut(
+            &mut P,
+            &native_resources::structure_placement::StructureEntry,
+        ) -> Result<Option<T>>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<T>> {
+        cache.try_generate_start(
+            provider,
+            biome_rules,
+            &self.possible_biomes,
+            id,
+            self.seed,
+            chunk,
+            existing,
+            generate,
+            |provider, _, placement| {
+                self.concentric_structure_positions(provider, evaluator, placement)
+            },
+        )
+    }
     /// Resolve concentric-ring candidates against the active biome source.
     /// Per-search history is isolated; as with Java's worker-local climate
     /// cache, exact ties may depend on the prior history of that worker.

@@ -52,7 +52,7 @@ fn salted(seed: i64, x: i32, z: i32, salt: i32) -> LegacyRandom {
             .wrapping_add(i64::from(salt)),
     )
 }
-fn large_feature(seed: i64, x: i32, z: i32) -> LegacyRandom {
+pub(crate) fn large_feature(seed: i64, x: i32, z: i32) -> LegacyRandom {
     let mut r = LegacyRandom::new(seed);
     let a = r.next_long();
     let b = r.next_long();
@@ -442,29 +442,57 @@ impl RandomSpreadSet {
     }
     /// Order in which Java tries structures if preceding attempts fail.
     pub fn attempt_order(&self, seed: i64, chunk: [i32; 2]) -> Vec<ResourceId> {
-        if self.structures.len() < 2 {
-            return self.structures.iter().map(|v| v.id.clone()).collect();
-        }
-        let mut options = self.structures.clone();
-        let mut total: i32 = options.iter().map(|v| v.weight).sum();
-        let mut random = large_feature(seed, chunk[0], chunk[1]);
-        let mut result = Vec::with_capacity(options.len());
-        while !options.is_empty() {
-            let mut choice = random.next_int_bound(total).unwrap();
-            let mut index = 0;
-            for v in &options {
-                choice -= v.weight;
-                if choice < 0 {
-                    break;
-                }
-                index += 1;
-            }
-            let chosen = options.remove(index);
-            total -= chosen.weight;
-            result.push(chosen.id);
-        }
-        result
+        WeightedAttempts::new(&self.structures, seed, chunk)
+            .map(|entry| entry.id)
+            .collect()
     }
+}
+
+struct WeightedAttempts {
+    options: Vec<StructureEntry>,
+    total: i32,
+    random: Option<LegacyRandom>,
+}
+impl WeightedAttempts {
+    fn new(entries: &[StructureEntry], seed: i64, chunk: [i32; 2]) -> Self {
+        Self {
+            options: entries.to_vec(),
+            total: entries.iter().map(|entry| entry.weight).sum(),
+            random: (entries.len() >= 2).then(|| large_feature(seed, chunk[0], chunk[1])),
+        }
+    }
+}
+impl Iterator for WeightedAttempts {
+    type Item = StructureEntry;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.options.is_empty() {
+            return None;
+        }
+        let mut choice = self
+            .random
+            .as_mut()
+            .map_or(0, |random| random.next_int_bound(self.total).unwrap());
+        let mut index = 0;
+        for v in &self.options {
+            choice -= v.weight;
+            if choice < 0 {
+                break;
+            }
+            index += 1;
+        }
+        let chosen = self.options.remove(index);
+        self.total -= chosen.weight;
+        Some(chosen)
+    }
+}
+
+/// Result of selecting and attempting entries in a structure set.
+#[derive(Debug)]
+pub enum StructureSetStart<T> {
+    Existing,
+    NotCandidate,
+    Rejected,
+    Generated { structure: ResourceId, start: T },
 }
 
 /// Cache belongs to one active data-pack stack and one generator configuration.
@@ -621,6 +649,45 @@ impl StructureSetCache {
             return Ok(false);
         }
         self.is_structure_chunk_with_rings(provider, id, seed, chunk, rings)
+    }
+
+    /// Attempt a set's entries in Java's weighted order, stopping at the first
+    /// valid start. Errors are propagated rather than treated as invalid starts.
+    /// The callbacks must use the same dimension, biome source and pack stack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_start<P: ResourceProvider, T>(
+        &mut self,
+        provider: &mut P,
+        biome_rules: &crate::structure_biomes::StructureBiomes,
+        possible: &BTreeSet<ResourceId>,
+        id: &ResourceId,
+        seed: i64,
+        chunk: [i32; 2],
+        mut existing: impl FnMut(&ResourceId) -> Result<bool>,
+        mut generate: impl FnMut(&mut P, &StructureEntry) -> Result<Option<T>>,
+        rings: impl FnMut(&mut P, &ResourceId, &ConcentricRingsPlacement) -> Result<Vec<[i32; 2]>>,
+    ) -> Result<StructureSetStart<T>> {
+        let structures = self.load_set(provider, id)?.structures().to_vec();
+        if !biome_rules.set_has_possible_biome(&structures, possible)? {
+            return Ok(StructureSetStart::NotCandidate);
+        }
+        for entry in &structures {
+            if existing(&entry.id)? {
+                return Ok(StructureSetStart::Existing);
+            }
+        }
+        if !self.is_structure_chunk_with_rings(provider, id, seed, chunk, rings)? {
+            return Ok(StructureSetStart::NotCandidate);
+        }
+        for entry in WeightedAttempts::new(&structures, seed, chunk) {
+            if let Some(start) = generate(provider, &entry)? {
+                return Ok(StructureSetStart::Generated {
+                    structure: entry.id,
+                    start,
+                });
+            }
+        }
+        Ok(StructureSetStart::Rejected)
     }
     fn resolve<
         P: ResourceProvider,

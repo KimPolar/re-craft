@@ -141,4 +141,121 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn set_selection_attempts_simple_starts_in_order_and_propagates_errors() {
+        use crate::structure_placement::{StructureSetCache, StructureSetStart};
+        use crate::structure_start::{BiomeQuery, Heightmap, SimpleStructure, StartEnvironment};
+        struct Env;
+        impl StartEnvironment for Env {
+            fn vertical_bounds(&self) -> (i32, i32) {
+                (-64, 319)
+            }
+            fn sea_level(&self) -> i32 {
+                63
+            }
+            fn first_occupied_height(&mut self, _: i32, _: i32, _: Heightmap) -> Result<i32> {
+                Ok(75)
+            }
+            fn biome_allowed(&mut self, _: [i32; 3], _: BiomeQuery) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let mut data = Data::default();
+        for biome in ["a", "b"] {
+            data.0.insert(
+                format!("data/example/worldgen/biome/{biome}.json"),
+                vec![br#"{"has_precipitation":true,"temperature":0.8}"#.to_vec()],
+            );
+        }
+        for (name, kind) in [("pyramid", "desert_pyramid"), ("hut", "swamp_hut")] {
+            data.0.insert(
+                format!("data/example/worldgen/structure/{name}.json"),
+                vec![
+                    serde_json::to_vec(
+                        &json!({"type":format!("minecraft:{kind}"),"biomes":["example:a"]}),
+                    )
+                    .unwrap(),
+                ],
+            );
+        }
+        let set_id = ResourceId::parse("example:test").unwrap();
+        data.0.insert("data/example/worldgen/structure_set/test.json".into(),vec![serde_json::to_vec(&json!({"placement":{"type":"random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":3},{"structure":"example:hut","weight":1}]})).unwrap()]);
+        let ids = [
+            ResourceId::parse("example:pyramid").unwrap(),
+            ResourceId::parse("example:hut").unwrap(),
+        ];
+        let rules = StructureBiomes::load(&mut data, ids.clone()).unwrap();
+        let possible = BTreeSet::from([ResourceId::parse("example:a").unwrap()]);
+        let mut cache = StructureSetCache::default();
+        let mut attempts = Vec::new();
+        let result = cache
+            .try_generate_start(
+                &mut data,
+                &rules,
+                &possible,
+                &set_id,
+                42,
+                [0, 0],
+                |_| Ok(false),
+                |data, entry| {
+                    attempts.push(entry.id.clone());
+                    if attempts.len() == 1 {
+                        return Ok(None);
+                    }
+                    let path = format!(
+                        "data/{}/worldgen/structure/{}.json",
+                        entry.id.namespace, entry.id.path
+                    );
+                    let value: Value = serde_json::from_slice(&data.read_data(&path)?.unwrap())?;
+                    SimpleStructure::decode(&value)?.generate(&mut Env, 42, [0, 0])
+                },
+                |_, _, _| panic!("random-spread set must not request rings"),
+            )
+            .unwrap();
+        match result {
+            StructureSetStart::Generated { structure, start } => {
+                assert_eq!(structure, attempts[1]);
+                assert_eq!(start.chunk, [0, 0]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(attempts.len(), 2);
+        let expected = cache
+            .load(&mut data, &set_id)
+            .unwrap()
+            .attempt_order(42, [0, 0]);
+        assert_eq!(attempts, expected);
+        let existing = cache
+            .try_generate_start::<_, ()>(
+                &mut data,
+                &rules,
+                &possible,
+                &set_id,
+                42,
+                [0, 0],
+                |_| Ok(true),
+                |_, _| panic!("existing start must prevent generation"),
+                |_, _, _| panic!("existing start must prevent placement"),
+            )
+            .unwrap();
+        assert!(matches!(existing, StructureSetStart::Existing));
+        let failed = cache.try_generate_start::<_, ()>(
+            &mut data,
+            &rules,
+            &possible,
+            &set_id,
+            42,
+            [0, 0],
+            |_| Ok(false),
+            |_, _| anyhow::bail!("unsupported piece"),
+            |_, _, _| panic!("unexpected ring query"),
+        );
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported piece")
+        );
+    }
 }

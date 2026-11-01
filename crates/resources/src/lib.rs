@@ -40,6 +40,7 @@ pub mod sounds;
 pub mod sprites;
 pub mod structure_biomes;
 pub mod structure_placement;
+pub mod structure_start;
 pub mod surface_biomes;
 pub mod surface_pass;
 pub mod surface_rules;

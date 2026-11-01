@@ -1415,28 +1415,37 @@ impl ItemEntities {
 
     /// `Containers.dropContents`: even an empty slot consumes its location
     /// samples; all fragments from one slot use that same location.
-    pub(crate) fn drop_container_contents(&mut self, position: IVec3, slots: &[Option<ItemStack>]) {
+    pub(crate) fn drop_container_contents_with_random(
+        &mut self,
+        position: IVec3,
+        slots: &[Option<ItemStack>],
+        random: &mut LegacyRandom,
+    ) {
         for slot in slots {
             let location = DVec3::new(
-                f64::from(position.x) + self.random.next_double() * 0.75 + 0.125,
-                f64::from(position.y) + self.random.next_double() * 0.75,
-                f64::from(position.z) + self.random.next_double() * 0.75 + 0.125,
+                f64::from(position.x) + random.next_double() * 0.75 + 0.125,
+                f64::from(position.y) + random.next_double() * 0.75,
+                f64::from(position.z) + random.next_double() * 0.75 + 0.125,
             );
             let Some(stack) = slot else { continue };
             let mut remaining = stack.count();
             while remaining > 0 {
-                let count = remaining
-                    .min((self.random.next_int_bound(21).expect("positive bound") + 10) as u32);
+                let count =
+                    remaining.min((random.next_int_bound(21).expect("positive bound") + 10) as u32);
                 remaining -= count;
                 let triangle = |random: &mut LegacyRandom, center: f64| {
                     center + 0.11485000171139836 * (random.next_double() - random.next_double())
                 };
                 let velocity = DVec3::new(
-                    triangle(&mut self.random, 0.0),
-                    triangle(&mut self.random, 0.2),
-                    triangle(&mut self.random, 0.0),
+                    triangle(random, 0.0),
+                    triangle(random, 0.2),
+                    triangle(random, 0.0),
                 );
-                let (uuid, bob_offset, yaw, entity_random) = self.item_visuals();
+                let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
+                // ItemEntity's default constructor samples velocity before
+                // Containers replaces it with the scatter velocity above.
+                entity_random.next_double();
+                entity_random.next_double();
                 self.entities.push(ItemEntity {
                     item: DroppedItem {
                         entity_id: 0,
@@ -1606,70 +1615,6 @@ impl ItemEntities {
         tables: Option<&BlockLootTables>,
     ) {
         self.drop_block_with_name(position, name, hand, mode, enabled, tables, None, None);
-    }
-
-    /// Check the active table without advancing the session RNG or dropping an item.
-    pub(crate) fn can_drop_block(
-        &self,
-        name: &str,
-        hand: Option<&ItemStack>,
-        mode: GameMode,
-        enabled: bool,
-        tables: Option<&BlockLootTables>,
-        properties: Option<mining::MiningProperties>,
-    ) -> bool {
-        if !enabled || mode == GameMode::Creative {
-            return true;
-        }
-        let Some(material) = Material::from_block_name(name) else {
-            return false;
-        };
-        let Some(properties) = properties.or_else(|| mining::mining_properties(material, hand))
-        else {
-            return false;
-        };
-        if !properties.correct_for_drops {
-            return true;
-        }
-        let Some(tables) = tables else { return false };
-        if !tables.fully_supported_block(name) {
-            return false;
-        }
-        let Ok(enchantments) = hand.map(crate::inventory::item_enchantments).transpose() else {
-            return false;
-        };
-        let enchantments = enchantments.unwrap_or_default();
-        let tool = BasicTool {
-            item: hand.map(ItemStack::id),
-            count: hand.map_or(0, ItemStack::count),
-            enchantments: &enchantments,
-        };
-        let mut random = self.random.clone();
-        tables
-            .drops_with_random(name, tool, Some(&mut random))
-            .is_ok()
-    }
-
-    pub(crate) fn can_drop_container_block(
-        &self,
-        position: IVec3,
-        slots: &[Option<ItemStack>],
-        name: &str,
-        hand: Option<&ItemStack>,
-        mode: GameMode,
-        enabled: bool,
-        tables: Option<&BlockLootTables>,
-        properties: Option<mining::MiningProperties>,
-    ) -> bool {
-        if !enabled || mode == GameMode::Creative {
-            return true;
-        }
-        let mut preview = ItemEntities {
-            random: self.random.clone(),
-            ..Default::default()
-        };
-        preview.drop_container_contents(position, slots);
-        preview.can_drop_block(name, hand, mode, enabled, tables, properties)
     }
 
     pub(crate) fn drop_block_with_name(
@@ -1883,6 +1828,76 @@ impl ItemEntities {
                 None,
                 Some(components),
             );
+        }
+    }
+
+    /// `Block.popResource` uses the level RNG for the three position samples,
+    /// including when the block-drops rule suppresses entity creation.
+    pub(crate) fn drop_chest_block_loot(
+        &mut self,
+        position: IVec3,
+        drops: Vec<Drop>,
+        components: &[Tag],
+        enabled: bool,
+        random: &mut LegacyRandom,
+    ) {
+        for (index, drop) in drops.into_iter().enumerate() {
+            let id = format!("{}:{}", drop.item.namespace, drop.item.path);
+            let component = &components[index];
+            let maximum =
+                crate::inventory::saved_item_max(&id, component).expect("preflighted loot item");
+            let mut remaining = drop.count;
+            while remaining > 0 {
+                let count = remaining.min(maximum);
+                remaining -= count;
+                let location = DVec3::new(
+                    f64::from(position.x) + 0.5 + (-0.25 + random.next_double() * 0.5),
+                    f64::from(position.y) + 0.5 + (-0.25 + random.next_double() * 0.5) - 0.125,
+                    f64::from(position.z) + 0.5 + (-0.25 + random.next_double() * 0.5),
+                );
+                if !enabled {
+                    continue;
+                }
+                let stack = ItemStack::new(id.clone(), count, maximum, component.clone())
+                    .expect("preflighted loot item");
+                let (uuid, bob_offset, yaw, mut entity_random) = self.item_visuals();
+                let velocity = DVec3::new(
+                    entity_random.next_double() * 0.2 - 0.1,
+                    0.2,
+                    entity_random.next_double() * 0.2 - 0.1,
+                );
+                self.entities.push(ItemEntity {
+                    item: DroppedItem {
+                        entity_id: 0,
+                        item_age: 0,
+                        position: location,
+                        previous_position: location,
+                        stack,
+                        age: 0,
+                        bob_offset,
+                    },
+                    velocity,
+                    on_ground: false,
+                    ground_without_support: false,
+                    pickup_delay: 10,
+                    lifetime: 0,
+                    no_gravity: false,
+                    owner: None,
+                    _saved_source: None,
+                    created: Some(CreatedItemIdentity::new(
+                        location,
+                        CreatedThrower::Known(None),
+                        yaw,
+                        uuid,
+                    )),
+                    id: self.next_id,
+                    section_sequence: self.next_section_sequence,
+                    random: entity_random,
+                    _damage_state: ItemDamageState::default(),
+                });
+                self.next_id = self.next_id.wrapping_add(1);
+                self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+            }
         }
     }
 
@@ -5514,10 +5529,8 @@ mod tests {
         let rows: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(rows.len(), 32);
         for (seed, row) in rows.iter().enumerate() {
-            let mut items = ItemEntities {
-                random: LegacyRandom::new(seed as i64),
-                ..Default::default()
-            };
+            let mut items = ItemEntities::default();
+            let mut random = LegacyRandom::new(seed as i64);
             let counts = [1, 9, 10, 11, 29, 30, 31, 64];
             let slots: Vec<_> = (0..27)
                 .map(|i| {
@@ -5541,7 +5554,7 @@ mod tests {
                 seed as i32 - 64,
                 -(seed as i32) * 31,
             );
-            items.drop_container_contents(pos, &slots);
+            items.drop_container_contents_with_random(pos, &slots, &mut random);
             let expected = row["drops"].as_array().unwrap();
             assert_eq!(items.entities.len(), expected.len(), "seed {seed}");
             for (item, row) in items.entities.iter().zip(expected) {
@@ -5566,10 +5579,33 @@ mod tests {
                 }
             }
             assert_eq!(
-                items.random.next_double().to_bits(),
+                random.next_double().to_bits(),
                 row["next"].as_f64().unwrap().to_bits(),
                 "seed {seed} random"
             );
+            for enabled in [false, true] {
+                let mut block_random = random.clone();
+                let mut block_items = ItemEntities::default();
+                block_items.drop_chest_block_loot(
+                    pos,
+                    vec![Drop {
+                        item: native_resources::packs::ResourceId::parse("minecraft:chest")
+                            .unwrap(),
+                        count: 1,
+                        copy_block_entity_custom_name: false,
+                        copy_block_entity_components: vec![],
+                    }],
+                    &[Tag::Compound(vec![])],
+                    enabled,
+                    &mut block_random,
+                );
+                assert_eq!(block_items.entities.len(), usize::from(enabled));
+                assert_eq!(
+                    block_random.next_double().to_bits(),
+                    row["blockNext"].as_f64().unwrap().to_bits(),
+                    "seed {seed} block random enabled={enabled}"
+                );
+            }
         }
     }
 

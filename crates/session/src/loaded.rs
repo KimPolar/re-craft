@@ -10045,18 +10045,31 @@ impl LoadedSession {
         if self.game_mode != GameMode::Creative && properties.is_none() {
             return;
         }
-        if !self.dropped_items.can_drop_container_block(
-            absolute,
-            &chest.slots,
-            &block.name,
-            hand.as_ref(),
-            self.game_mode,
-            self.block_drops,
-            self.loot.as_deref(),
-            properties,
-        ) {
-            return;
-        }
+        let needs_loot =
+            self.game_mode != GameMode::Creative && properties.is_some_and(|p| p.correct_for_drops);
+        let components = if needs_loot {
+            let Ok(value) = chest.collected_components_after_scatter() else {
+                return;
+            };
+            if crate::items::ItemEntities::validate_block_entity_drops(
+                &block.name,
+                &value,
+                self.loot.as_deref(),
+            )
+            .is_err()
+            {
+                return;
+            }
+            let Ok((_, checkpoint)) =
+                self.stage_block_entity_loot(&block.name, &block, hand.as_ref(), true, &value)
+            else {
+                return;
+            };
+            self.rollback_block_loot(checkpoint);
+            Some(value)
+        } else {
+            None
+        };
         let replacement = if block
             .properties
             .get("waterlogged")
@@ -10071,8 +10084,11 @@ impl LoadedSession {
         if !self.set_with_notify(relative, replacement, false) {
             return;
         }
-        self.dropped_items
-            .drop_container_contents(absolute, &chest.slots);
+        self.dropped_items.drop_container_contents_with_random(
+            absolute,
+            &chest.slots,
+            &mut self.level_random,
+        );
         self.block_notifications
             .push_back((relative, id, replacement));
         self.notify_fluid_neighbors();
@@ -10100,16 +10116,18 @@ impl LoadedSession {
         if self.game_mode != GameMode::Creative && damage != 0 {
             Arc::make_mut(&mut self.inventory).damage_selected_tool(damage, &mut self.level_random);
         }
-        self.dropped_items.drop_block_with_name(
-            absolute,
-            &block.name,
-            hand.as_ref(),
-            self.game_mode,
-            self.block_drops,
-            self.loot.as_deref(),
-            chest.custom_name(),
-            properties,
-        );
+        if let Some(components) = components {
+            let ((drops, prepared), _) = self
+                .stage_block_entity_loot(&block.name, &block, hand.as_ref(), true, &components)
+                .expect("preflighted chest loot remains evaluable");
+            self.dropped_items.drop_chest_block_loot(
+                absolute,
+                drops,
+                &prepared,
+                self.block_drops,
+                &mut self.level_random,
+            );
+        }
     }
 
     fn finish_breaking_banner(&mut self, relative: IVec3, id: BlockStateId) {
@@ -10296,7 +10314,7 @@ impl LoadedSession {
                 return false;
             }
             let Ok((_, checkpoint)) =
-                self.stage_banner_loot(&item_id, &block, hand.as_ref(), player, &value)
+                self.stage_block_entity_loot(&item_id, &block, hand.as_ref(), player, &value)
             else {
                 return false;
             };
@@ -10306,8 +10324,14 @@ impl LoadedSession {
         // Non-player destruction evaluates loot before its block update.
         let mut drops = if !player && needs_loot {
             Some(
-                self.stage_banner_loot(&item_id, &block, None, false, components.as_ref().unwrap())
-                    .expect("preflighted banner loot remains evaluable"),
+                self.stage_block_entity_loot(
+                    &item_id,
+                    &block,
+                    None,
+                    false,
+                    components.as_ref().unwrap(),
+                )
+                .expect("preflighted banner loot remains evaluable"),
             )
         } else {
             None
@@ -10336,7 +10360,7 @@ impl LoadedSession {
         if player && needs_loot {
             // Player destruction resolves the original entity after tool wear.
             drops = Some(
-                self.stage_banner_loot(
+                self.stage_block_entity_loot(
                     &item_id,
                     &block,
                     hand.as_ref(),
@@ -12342,7 +12366,7 @@ impl LoadedSession {
         }
     }
 
-    fn stage_banner_loot(
+    fn stage_block_entity_loot(
         &mut self,
         table: &str,
         block: &BlockState,
@@ -25881,6 +25905,114 @@ mod tests {
             "minecraft:chest"
         );
         assert!(session.dropped_items.snapshot().is_empty());
+    }
+
+    #[test]
+    fn chest_break_waits_for_named_loot_and_advances_it_when_drops_are_disabled() {
+        use native_resources::{loot::BlockLootTables, packs::ResourceProvider};
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/chest.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:chest","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
+            }
+        }
+        for enabled in [false, true] {
+            let (mut session, _, position, _) = saved_chest_fixture();
+            session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+            session.set_block_drops(enabled);
+            session.level_random = native_core::random::LegacyRandom::new(123);
+            let mut before = session.level_random.clone();
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:chest"
+            );
+            assert!(session.dropped_items.snapshot().is_empty());
+            assert_eq!(session.level_random.next_long(), before.next_long());
+            session.level_random = native_core::random::LegacyRandom::new(123);
+            let mut expected = native_persistence::random_sequences::RandomSequences::read(None)
+                .unwrap()
+                .get("example:chest", 42)
+                .unwrap();
+            expected.next_float();
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            let chest_count = session
+                .dropped_items
+                .snapshot()
+                .iter()
+                .filter(|item| item.stack.id() == "minecraft:chest")
+                .count();
+            assert_eq!(chest_count, usize::from(enabled));
+            let mut actual = session
+                .random_sequences
+                .as_ref()
+                .unwrap()
+                .data
+                .get("example:chest", 42)
+                .unwrap();
+            assert_eq!(actual.next_long(), expected.next_long());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn breaking_chest_uses_installed_vanilla_loot_sequence() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for enabled in [false, true] {
+            let (mut session, _, position, _) = saved_chest_fixture();
+            session.set_block_loot(Arc::clone(&tables));
+            session.set_block_drops(enabled);
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session.finish_breaking(position);
+            assert_eq!(
+                session
+                    .world
+                    .block(position.x, position.y, position.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            assert_eq!(
+                session
+                    .dropped_items
+                    .snapshot()
+                    .iter()
+                    .filter(|item| item.stack.id() == "minecraft:chest")
+                    .count(),
+                usize::from(enabled)
+            );
+            assert!(session.random_sequences.as_ref().unwrap().data.is_dirty());
+        }
     }
 
     #[test]

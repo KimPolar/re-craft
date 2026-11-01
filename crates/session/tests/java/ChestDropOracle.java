@@ -64,7 +64,9 @@ public class ChestDropOracle {
             Containers.dropContents(world,position,container);
             var row=new JsonObject(); row.addProperty("seed",seed); var drops=new JsonArray();
             for(var item:world.items) { var drop=new JsonObject(); drop.addProperty("count",item.getItem().getCount()); drop.addProperty("x",item.getX()); drop.addProperty("y",item.getY()); drop.addProperty("z",item.getZ()); drop.addProperty("vx",item.getDeltaMovement().x); drop.addProperty("vy",item.getDeltaMovement().y); drop.addProperty("vz",item.getDeltaMovement().z); drop.addProperty("delay",delay.getInt(item)); drops.add(drop); }
-            row.add("drops",drops); row.addProperty("next",world.seeded.nextDouble()); rows.add(row);
+            row.add("drops",drops); row.addProperty("next",world.seeded.nextDouble());
+            net.minecraft.world.level.block.Block.popResource(world,position,new ItemStack(Items.CHEST));
+            row.addProperty("blockNext",world.seeded.nextDouble()); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

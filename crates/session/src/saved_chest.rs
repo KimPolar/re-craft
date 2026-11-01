@@ -208,6 +208,44 @@ impl SavedChest {
         self.source.get("CustomName")
     }
 
+    /// Components visible to block loot after the chest's contents scatter.
+    pub(crate) fn collected_components_after_scatter(&self) -> Result<Tag> {
+        let mut components = match unique(&self.source, "components")? {
+            Some(Tag::Compound(entries)) => entries.clone(),
+            Some(_) => bail!("invalid chest block entity components"),
+            None => Vec::new(),
+        };
+        let mut seen = BTreeSet::new();
+        for (key, _) in &components {
+            let name = String::from_utf16(&key.0).context("invalid component identifier")?;
+            let id = ResourceId::parse(&name)?;
+            ensure!(seen.insert(id), "duplicate block entity component");
+        }
+        let mut replace = |name: &str, value: Tag| {
+            let target = ResourceId::parse(name).expect("valid component identifier");
+            components.retain(|(key, _)| {
+                let key = String::from_utf16(&key.0).expect("validated component identifier");
+                ResourceId::parse(&key).expect("validated component identifier") != target
+            });
+            components.push((name.into(), value));
+        };
+        if let Some(name) = unique(&self.source, "CustomName")? {
+            replace("minecraft:custom_name", name.clone());
+        }
+        if let Some(lock) = unique(&self.source, "lock")? {
+            replace("minecraft:lock", lock.clone());
+        }
+        // Containers.dropContents has split every stack before block loot runs.
+        replace(
+            "minecraft:container",
+            Tag::List {
+                element_type: TagType::Compound,
+                values: Vec::new(),
+            },
+        );
+        Ok(Tag::Compound(components))
+    }
+
     /// Interpret the supported subset of 26.3's lock item predicate.
     /// Unknown predicates remain unavailable rather than being treated as open.
     pub(crate) fn can_unlock(

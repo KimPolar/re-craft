@@ -156,21 +156,47 @@ impl FallTracker {
         &self.effects
     }
 
+    pub(crate) fn safe_attribute(&self) -> &SavedAttribute {
+        &self.safe
+    }
+
+    fn refresh_jump_boost_modifier(&mut self) {
+        let id = ResourceId::parse("minecraft:effect.jump_boost").unwrap();
+        self.safe.remove_modifier(&id);
+        if let Some(effect) = &self.effects.jump_boost {
+            self.safe.apply(AttributeModifier {
+                id,
+                operation: AttributeOperation::AddValue,
+                amount: f64::from(effect.amplifier) + 1.0,
+            });
+        }
+    }
+
     pub(crate) fn clear_effects(&mut self) {
+        let jump = self.effects.jump_boost.is_some();
         self.effects = FallEffects::default();
+        if jump {
+            self.refresh_jump_boost_modifier();
+        }
     }
 
     pub(crate) fn remove_status(&mut self, kind: crate::survival::FoodStatusKind) {
+        let jump =
+            kind == crate::survival::FoodStatusKind::JumpBoost && self.effects.jump_boost.is_some();
         match kind {
             crate::survival::FoodStatusKind::Hunger => self.effects.hunger = None,
             crate::survival::FoodStatusKind::Poison => self.effects.poison = None,
             crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
             crate::survival::FoodStatusKind::Regeneration => self.effects.regeneration = None,
+            crate::survival::FoodStatusKind::JumpBoost => self.effects.jump_boost = None,
             crate::survival::FoodStatusKind::Speed => self.effects.speed = None,
             crate::survival::FoodStatusKind::Slowness => self.effects.slowness = None,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
+        }
+        if jump {
+            self.refresh_jump_boost_modifier();
         }
     }
 
@@ -192,18 +218,23 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Poison => &mut self.effects.poison,
             crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
             crate::survival::FoodStatusKind::Regeneration => &mut self.effects.regeneration,
+            crate::survival::FoodStatusKind::JumpBoost => &mut self.effects.jump_boost,
             crate::survival::FoodStatusKind::Speed => &mut self.effects.speed,
             crate::survival::FoodStatusKind::Slowness => &mut self.effects.slowness,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
         };
-        if let Some(effect) = slot {
+        let changed = if let Some(effect) = slot {
             effect.merge(incoming)
         } else {
             *slot = Some(incoming);
             true
+        };
+        if changed && application.kind == crate::survival::FoodStatusKind::JumpBoost {
+            self.refresh_jump_boost_modifier();
         }
+        changed
     }
 
     pub fn reset_after_death(&mut self) {
@@ -226,7 +257,15 @@ impl FallTracker {
     }
 
     pub fn tick_effects(&mut self) {
+        let transition = self
+            .effects
+            .jump_boost
+            .as_ref()
+            .is_some_and(|effect| effect.duration != -1 && effect.duration <= 1);
         self.effects.tick();
+        if transition {
+            self.refresh_jump_boost_modifier();
+        }
     }
 
     fn damage_tag(&self, tag: &str, damage: &str) -> Result<bool> {
@@ -352,14 +391,7 @@ impl FallTracker {
             return Ok(());
         }
         let surface = FallSurface::for_state(state);
-        let mut safe = self.safe.clone();
-        if let Some(effect) = &self.effects.jump_boost {
-            safe.apply(AttributeModifier {
-                id: ResourceId::parse("minecraft:effect.jump_boost")?,
-                operation: AttributeOperation::AddValue,
-                amount: f64::from(effect.amplifier) + 1.0,
-            });
-        }
+        let safe = self.safe.clone();
         let (safe, multiplier) = if let Some(registry) = &self.enchantments {
             (
                 equipped_attribute(&safe, inventory, registry, "safe_fall_distance")?
@@ -454,6 +486,192 @@ mod tests {
     use super::*;
     use crate::survival::EffectDuration;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn jump_boost_updates_safe_fall_modifier_on_promotion_and_removal() {
+        use crate::survival::{FoodStatusKind, StatusApplication};
+        let id = ResourceId::parse("minecraft:effect.jump_boost").unwrap();
+        let other = ResourceId::parse("example:keep").unwrap();
+        let mut tracker = FallTracker::default();
+        tracker.safe.apply(AttributeModifier {
+            id: other.clone(),
+            operation: AttributeOperation::AddValue,
+            amount: 2.0,
+        });
+        let apply = |duration, amplifier| StatusApplication {
+            kind: FoodStatusKind::JumpBoost,
+            duration,
+            amplifier,
+            ambient: false,
+            visible: true,
+            show_icon: true,
+        };
+        tracker.add_status(apply(100, 0));
+        tracker.add_status(apply(1, 1));
+        assert_eq!(tracker.safe.modifier(&id).unwrap().amount, 2.0);
+        tracker.tick_effects();
+        assert_eq!(tracker.effects.jump_boost.as_ref().unwrap().amplifier, 0);
+        assert_eq!(tracker.safe.modifier(&id).unwrap().amount, 1.0);
+        tracker.remove_status(FoodStatusKind::JumpBoost);
+        assert!(tracker.safe.modifier(&id).is_none());
+        assert_eq!(tracker.safe.modifier(&other).unwrap().amount, 2.0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn applying_jump_boost_matches_java_effect_and_attribute() {
+        use crate::survival::{FoodStatusKind, StatusApplication};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("JumpBoostApplyOracle.java");
+        let output = temp.path().join("jump.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/JumpBoostApplyOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("JumpBoostApplyOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let old = [
+            (0, 0, false, true, true),
+            (100, 0, false, true, true),
+            (100, 2, true, false, false),
+            (50, 3, true, true, false),
+            (-1, 1, false, true, true),
+        ];
+        let incoming = [
+            (40, 0, false, false, false),
+            (1800, 0, false, true, true),
+            (400, 3, false, true, true),
+            (100, 2, false, true, true),
+            (-1, 1, true, false, false),
+            (0, 0, false, true, true),
+        ];
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 60);
+        for row in rows {
+            let index = row["existing"].as_u64().unwrap() as usize;
+            let (duration, amplifier, ambient, visible, show_icon) = old[index];
+            let (new_duration, new_amplifier, new_ambient, new_visible, new_icon) =
+                incoming[row["add"].as_u64().unwrap() as usize];
+            let id = ResourceId::parse("minecraft:effect.jump_boost").unwrap();
+            let mut safe = SavedAttribute::with_base(3.0);
+            if row["modifier"].as_i64().unwrap() != 0 {
+                safe.apply(AttributeModifier {
+                    id: id.clone(),
+                    operation: AttributeOperation::AddValue,
+                    amount: f64::from(amplifier) + 1.0,
+                });
+            }
+            let mut tracker = FallTracker::default();
+            tracker.configure(
+                safe,
+                SavedAttribute::with_base(1.0),
+                FallEffects {
+                    jump_boost: (index != 0).then_some(EffectDuration {
+                        duration,
+                        amplifier,
+                        ambient,
+                        visible,
+                        show_icon,
+                        hidden: None,
+                    }),
+                    ..Default::default()
+                },
+                Arc::new(OxygenEnchantments::default()),
+            );
+            let changed = tracker.add_status(StatusApplication {
+                kind: FoodStatusKind::JumpBoost,
+                duration: new_duration,
+                amplifier: new_amplifier,
+                ambient: new_ambient,
+                visible: new_visible,
+                show_icon: new_icon,
+            });
+            assert_eq!(changed, row["changed"].as_bool().unwrap(), "{row}");
+            let effect = tracker.effects.jump_boost.as_ref().unwrap();
+            assert_eq!(
+                (
+                    effect.duration,
+                    effect.amplifier,
+                    effect.ambient,
+                    effect.visible,
+                    effect.show_icon
+                ),
+                (
+                    row["duration"].as_i64().unwrap() as i32,
+                    row["amplifier"].as_u64().unwrap() as u8,
+                    row["ambient"].as_bool().unwrap(),
+                    row["visible"].as_bool().unwrap(),
+                    row["icon"].as_bool().unwrap()
+                ),
+                "{row}"
+            );
+            assert_eq!(
+                effect.hidden.as_ref().map(|v| (
+                    v.duration,
+                    v.amplifier,
+                    v.ambient,
+                    v.visible,
+                    v.show_icon
+                )),
+                row["hidden_duration"].as_i64().map(|duration| (
+                    duration as i32,
+                    row["hidden_amplifier"].as_u64().unwrap() as u8,
+                    row["hidden_ambient"].as_bool().unwrap(),
+                    row["hidden_visible"].as_bool().unwrap(),
+                    row["hidden_icon"].as_bool().unwrap()
+                )),
+                "{row}"
+            );
+            assert_eq!(
+                tracker.safe.modifier(&id).map(|v| v.amount.to_bits()),
+                row["amount"].as_f64().map(f64::to_bits),
+                "{row}"
+            );
+            assert_eq!(
+                tracker.safe.value(-1024.0, 1024.0).unwrap().to_bits(),
+                row["value"].as_f64().unwrap().to_bits(),
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     fn damage_sources_share_cooldown_and_leave_failed_damage_untouched() {
@@ -672,13 +890,13 @@ mod tests {
         assert_eq!(vitals.health, 5.0);
         vitals.health = 20.0;
         vitals.absorption = 1.0;
-        tracker.effects.jump_boost = Some(EffectDuration {
+        tracker.add_status(crate::survival::StatusApplication {
+            kind: crate::survival::FoodStatusKind::JumpBoost,
             ambient: false,
             visible: true,
             show_icon: true,
             amplifier: 1,
             duration: 5,
-            hidden: None,
         });
         tracker.effects.resistance = Some(EffectDuration {
             ambient: false,

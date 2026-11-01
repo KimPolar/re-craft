@@ -621,6 +621,7 @@ pub struct LoadedSession {
 struct EffectSaveTracking {
     breathing: crate::survival::BreathingEffects,
     fall: crate::survival::FallEffects,
+    safe_fall: crate::player_data::SavedAttribute,
     movement_speed: crate::player_data::SavedAttribute,
     gravity: crate::player_data::SavedAttribute,
     water_efficiency: crate::player_data::SavedAttribute,
@@ -957,6 +958,7 @@ impl LoadedSession {
             .get_or_insert_with(|| EffectSaveTracking {
                 breathing: self.breathing_effects.clone(),
                 fall: self.fall.effects().clone(),
+                safe_fall: self.fall.safe_attribute().clone(),
                 movement_speed: self.movement_speed_attribute.clone(),
                 gravity: self.gravity_attribute.clone(),
                 water_efficiency: self.water_efficiency_attribute.clone(),
@@ -1049,6 +1051,9 @@ impl LoadedSession {
                                 }
                                 crate::survival::FoodStatusKind::Regeneration => {
                                     self.fall.effects().regeneration.is_some()
+                                }
+                                crate::survival::FoodStatusKind::JumpBoost => {
+                                    self.fall.effects().jump_boost.is_some()
                                 }
                                 crate::survival::FoodStatusKind::Speed => {
                                     self.fall.effects().speed.is_some()
@@ -2310,6 +2315,14 @@ impl LoadedSession {
                 == *initial_movement,
             "saved movement attribute does not match the initial session state"
         );
+        let initial_safe_fall = self
+            .effect_save_tracking
+            .as_ref()
+            .map_or(self.fall.safe_attribute(), |tracking| &tracking.safe_fall);
+        anyhow::ensure!(
+            crate::player_data::read_saved_fall_attributes(original)?.0 == *initial_safe_fall,
+            "saved safe fall attribute does not match the initial session state"
+        );
         anyhow::ensure!(
             crate::player_data::read_saved_no_gravity(original) == self.no_gravity,
             "saved no-gravity state does not match the session"
@@ -2439,6 +2452,7 @@ impl LoadedSession {
             initial_movement,
             &self.movement_speed_attribute,
         )?;
+        draft.set_jump_effect_modifier(original, initial_safe_fall, self.fall.safe_attribute())?;
         Ok(draft)
     }
 
@@ -39597,6 +39611,9 @@ mod tests {
             "swiftness",
             "long_swiftness",
             "strong_swiftness",
+            "leaping",
+            "long_leaping",
+            "strong_leaping",
         ] {
             let original = NamedTag {
                 name: "".into(),
@@ -39651,6 +39668,25 @@ mod tests {
                         }
                     );
                 }
+                "leaping" | "long_leaping" | "strong_leaping" => {
+                    let effect = session.fall.effects().jump_boost.as_ref().unwrap();
+                    assert_eq!(
+                        (effect.duration, effect.amplifier),
+                        match potion {
+                            "leaping" => (3600, 0),
+                            "long_leaping" => (9600, 0),
+                            _ => (1800, 1),
+                        }
+                    );
+                    assert_eq!(
+                        session
+                            .fall
+                            .safe_attribute()
+                            .value(-1024.0, 1024.0)
+                            .unwrap(),
+                        4.0 + f64::from(effect.amplifier),
+                    );
+                }
                 "slowness" | "long_slowness" | "strong_slowness" | "swiftness"
                 | "long_swiftness" | "strong_swiftness" => {
                     let (expected, speed) = match potion {
@@ -39681,6 +39717,13 @@ mod tests {
             assert!(!session.effect_save_invalid, "{potion}");
             let draft = session.draft_player_state(&original).unwrap();
             assert_eq!(
+                crate::player_data::read_saved_fall_attributes(draft.document())
+                    .unwrap()
+                    .0,
+                *session.fall.safe_attribute(),
+                "{potion}"
+            );
+            assert_eq!(
                 crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
                 *session.fall.effects(),
                 "{potion}"
@@ -39701,6 +39744,200 @@ mod tests {
             );
             assert_eq!(native_persistence::nbt::write(&original).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn jump_and_speed_effects_update_both_saved_attributes_and_clear_with_milk() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        };
+        let effects = ["speed", "jump_boost"]
+            .into_iter()
+            .map(|id| {
+                Tag::Compound(vec![
+                    (
+                        "id".into(),
+                        Tag::String(format!("minecraft:{id}").as_str().into()),
+                    ),
+                    ("duration".into(), Tag::Int(100)),
+                ])
+            })
+            .collect();
+        let component = Tag::Compound(vec![(
+            "minecraft:consumable".into(),
+            Tag::Compound(vec![
+                ("consume_seconds".into(), Tag::Float(0.0)),
+                (
+                    "on_consume_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("type".into(), Tag::String("minecraft:apply_effects".into())),
+                            (
+                                "effects".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: effects,
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        )]);
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:apple".into(), 1, 64, component),
+        );
+        session.set_player_inventory(inventory);
+        session.vitals.food = 10;
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let id = |name| native_resources::packs::ResourceId::parse(name).unwrap();
+        let draft = session.draft_player_state(&original).unwrap();
+        let safe = crate::player_data::read_saved_fall_attributes(draft.document())
+            .unwrap()
+            .0;
+        let speed =
+            crate::player_data::read_saved_movement_speed_attribute(draft.document()).unwrap();
+        assert_eq!(
+            safe.modifier(&id("minecraft:effect.jump_boost"))
+                .unwrap()
+                .amount,
+            1.0
+        );
+        assert_eq!(
+            speed
+                .modifier(&id("minecraft:effect.speed"))
+                .unwrap()
+                .amount,
+            f64::from(0.2_f32)
+        );
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        Arc::make_mut(&mut session.inventory).set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:milk_bucket".into(), 1, 1, Tag::Compound(vec![])),
+        );
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..32 {
+            session.update(TICK);
+        }
+        let draft = session.draft_player_state(&original).unwrap();
+        assert!(
+            crate::player_data::read_saved_fall_attributes(draft.document())
+                .unwrap()
+                .0
+                .modifier(&id("minecraft:effect.jump_boost"))
+                .is_none()
+        );
+        assert!(
+            crate::player_data::read_saved_movement_speed_attribute(draft.document())
+                .unwrap()
+                .modifier(&id("minecraft:effect.speed"))
+                .is_none()
+        );
+        assert!(
+            session.fall.effects().jump_boost.is_none() && session.fall.effects().speed.is_none()
+        );
+    }
+
+    #[test]
+    fn promoted_jump_boost_updates_saved_safe_fall_modifier() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let modifier = |name: &str, amount| {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String(name.into())),
+                ("amount".into(), Tag::Double(amount)),
+                ("operation".into(), Tag::String("add_value".into())),
+            ])
+        };
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "active_effects".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:jump_boost".into())),
+                            ("duration".into(), Tag::Int(1)),
+                            ("amplifier".into(), Tag::Byte(1)),
+                            (
+                                "hidden_effect".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(100))]),
+                            ),
+                        ])],
+                    },
+                ),
+                (
+                    "attributes".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            (
+                                "id".into(),
+                                Tag::String("minecraft:safe_fall_distance".into()),
+                            ),
+                            ("base".into(), Tag::Double(3.0)),
+                            (
+                                "modifiers".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![
+                                        modifier("minecraft:effect.jump_boost", 2.0),
+                                        modifier("example:keep", 0.5),
+                                    ],
+                                },
+                            ),
+                        ])],
+                    },
+                ),
+            ]),
+        };
+        let (safe, multiplier) = crate::player_data::read_saved_fall_attributes(&original).unwrap();
+        let mut session = session();
+        session.fall.configure(
+            safe,
+            multiplier,
+            crate::player_data::read_saved_fall_effects(&original).unwrap(),
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.update(TICK);
+        let draft = session.draft_player_state(&original).unwrap();
+        let safe = crate::player_data::read_saved_fall_attributes(draft.document())
+            .unwrap()
+            .0;
+        let id = |name| native_resources::packs::ResourceId::parse(name).unwrap();
+        assert_eq!(
+            safe.modifier(&id("minecraft:effect.jump_boost"))
+                .unwrap()
+                .amount,
+            1.0
+        );
+        assert_eq!(safe.modifier(&id("example:keep")).unwrap().amount, 0.5);
+        assert_eq!(
+            crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
+            *session.fall.effects()
+        );
+        assert_eq!(
+            session
+                .fall
+                .effects()
+                .jump_boost
+                .as_ref()
+                .unwrap()
+                .amplifier,
+            0
+        );
     }
 
     #[test]

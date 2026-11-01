@@ -40,6 +40,7 @@ public class HungerSaveOracle {
           var kind=object==null || !object.has("kind") ? MobEffects.HUNGER : switch(object.get("kind").getAsString()) {
             case "poison" -> MobEffects.POISON;
             case "regeneration" -> MobEffects.REGENERATION;
+            case "jump_boost" -> MobEffects.JUMP_BOOST;
             default -> MobEffects.HUNGER;
           };
           if(object!=null && object.has("remove") && object.get("remove").getAsBoolean()) {

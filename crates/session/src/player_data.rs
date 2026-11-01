@@ -1093,10 +1093,52 @@ impl PlayerStateDraft {
         initial: &SavedAttribute,
         current: &SavedAttribute,
     ) -> Result<()> {
-        let ids = [
-            ResourceId::parse("minecraft:effect.speed")?,
-            ResourceId::parse("minecraft:effect.slowness")?,
-        ];
+        self.set_effect_attribute_modifiers(
+            original,
+            initial,
+            current,
+            "movement_speed",
+            f64::from(0.1_f32),
+            &["minecraft:effect.speed", "minecraft:effect.slowness"],
+            AttributeOperation::AddMultipliedTotal,
+            true,
+        )
+    }
+
+    pub(crate) fn set_jump_effect_modifier(
+        &mut self,
+        original: &NamedTag,
+        initial: &SavedAttribute,
+        current: &SavedAttribute,
+    ) -> Result<()> {
+        self.set_effect_attribute_modifiers(
+            original,
+            initial,
+            current,
+            "safe_fall_distance",
+            3.0,
+            &["minecraft:effect.jump_boost"],
+            AttributeOperation::AddValue,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_effect_attribute_modifiers(
+        &mut self,
+        original: &NamedTag,
+        initial: &SavedAttribute,
+        current: &SavedAttribute,
+        attribute_name: &str,
+        default_base: f64,
+        modifier_names: &[&str],
+        operation: AttributeOperation,
+        allow_base_change: bool,
+    ) -> Result<()> {
+        let ids: Vec<_> = modifier_names
+            .iter()
+            .map(|name| ResourceId::parse(name))
+            .collect::<Result<_>>()?;
         let mut unchanged_initial = initial.clone();
         let mut unchanged_current = current.clone();
         for id in &ids {
@@ -1105,22 +1147,26 @@ impl PlayerStateDraft {
         }
         ensure!(
             unchanged_initial == unchanged_current,
-            "untracked movement attribute change"
+            "untracked {attribute_name} attribute change"
         );
         let modifier_changed = ids
             .iter()
             .any(|id| initial.modifier(id) != current.modifier(id));
-        let mut source_attribute = read_saved_movement_speed_attribute(original)?;
+        let mut source_attribute = saved_attribute(original, attribute_name, default_base)?;
         let base_changed = source_attribute.base != initial.base;
+        ensure!(
+            !base_changed || allow_base_change,
+            "unexpected saved attribute base change"
+        );
         source_attribute.set_base(initial.base);
         ensure!(
             source_attribute == *initial,
-            "saved movement attribute does not match initial state"
+            "saved {attribute_name} attribute does not match initial state"
         );
         if !modifier_changed && !base_changed {
             return Ok(());
         }
-        let mut attributes = match unique_field(&original.value, "attributes")? {
+        let mut attributes = match unique_field(&self.0.document.value, "attributes")? {
             Some(Tag::List {
                 element_type,
                 values,
@@ -1134,7 +1180,7 @@ impl PlayerStateDraft {
             None => Vec::new(),
             Some(_) => bail!("attributes are not a list"),
         };
-        let mut movement_index = None;
+        let mut attribute_index = None;
         let mut attribute_ids = std::collections::BTreeSet::new();
         for (index, attribute) in attributes.iter().enumerate() {
             let id = unique_field(attribute, "id")?
@@ -1142,26 +1188,29 @@ impl PlayerStateDraft {
                 .context("attribute has no valid id")?;
             let id = ResourceId::parse(&id)?;
             ensure!(attribute_ids.insert(id.clone()), "duplicate attribute id");
-            if id.namespace == "minecraft" && id.path == "movement_speed" {
-                movement_index = Some(index);
+            if id.namespace == "minecraft" && id.path == attribute_name {
+                attribute_index = Some(index);
             }
         }
-        if movement_index.is_none() {
+        if attribute_index.is_none() {
             ensure!(
                 initial.modifiers.is_empty(),
-                "missing original movement attribute"
+                "missing original {attribute_name} attribute"
             );
             attributes.push(Tag::Compound(vec![
-                ("id".into(), Tag::String("minecraft:movement_speed".into())),
+                (
+                    "id".into(),
+                    Tag::String(format!("minecraft:{attribute_name}").as_str().into()),
+                ),
                 ("base".into(), Tag::Double(initial.base)),
             ]));
-            movement_index = Some(attributes.len() - 1);
+            attribute_index = Some(attributes.len() - 1);
         }
-        let attribute = &mut attributes[movement_index.unwrap()];
+        let attribute = &mut attributes[attribute_index.unwrap()];
         let base = unique_field(attribute, "base")?
             .and_then(numeric_double)
-            .context("movement attribute has no numeric base")?;
-        ensure!(base.is_finite(), "movement attribute base is not finite");
+            .context("attribute has no numeric base")?;
+        ensure!(base.is_finite(), "attribute base is not finite");
         if base_changed {
             set_field(attribute, "base", Some(Tag::Double(initial.base)))?;
         }
@@ -1174,26 +1223,29 @@ impl PlayerStateDraft {
             }) => {
                 ensure!(
                     *element_type == TagType::Compound || values.is_empty(),
-                    "movement modifiers are not a compound list"
+                    "attribute modifiers are not a compound list"
                 );
                 values.clone()
             }
-            Some(_) => bail!("movement modifiers are not a list"),
+            Some(_) => bail!("attribute modifiers are not a list"),
         };
         let mut modifier_ids = std::collections::BTreeSet::new();
         for modifier in &modifiers {
             let id = unique_field(modifier, "id")?
                 .and_then(text)
-                .context("movement modifier has no valid id")?;
+                .context("attribute modifier has no valid id")?;
             let id = ResourceId::parse(&id)?;
-            ensure!(modifier_ids.insert(id), "duplicate movement modifier id");
+            ensure!(modifier_ids.insert(id), "duplicate attribute modifier id");
             let amount = unique_field(modifier, "amount")?
                 .and_then(numeric_double)
-                .context("movement modifier has no amount")?;
-            ensure!(amount.is_finite(), "movement modifier amount is not finite");
+                .context("attribute modifier has no amount")?;
+            ensure!(
+                amount.is_finite(),
+                "attribute modifier amount is not finite"
+            );
             let operation = unique_field(modifier, "operation")?
                 .and_then(text)
-                .context("movement modifier has no operation")?;
+                .context("attribute modifier has no operation")?;
             AttributeOperation::parse(&operation)?;
         }
         for id in &ids {
@@ -1215,15 +1267,14 @@ impl PlayerStateDraft {
                     entries.iter().all(|(name, _)| ["id", "amount", "operation"]
                         .iter()
                         .any(|field| name.matches(field))),
-                    "changed movement modifier contains unsupported fields"
+                    "changed effect modifier contains unsupported fields"
                 );
                 modifiers.remove(index);
             }
             if let Some(modifier) = current.modifier(id) {
                 ensure!(
-                    modifier.operation == AttributeOperation::AddMultipliedTotal
-                        && modifier.amount.is_finite(),
-                    "unsupported effect movement modifier"
+                    modifier.operation == operation && modifier.amount.is_finite(),
+                    "unsupported effect attribute modifier"
                 );
                 modifiers.push(Tag::Compound(vec![
                     (
@@ -1233,7 +1284,14 @@ impl PlayerStateDraft {
                     ("amount".into(), Tag::Double(modifier.amount)),
                     (
                         "operation".into(),
-                        Tag::String("add_multiplied_total".into()),
+                        Tag::String(
+                            match operation {
+                                AttributeOperation::AddValue => "add_value",
+                                AttributeOperation::AddMultipliedBase => "add_multiplied_base",
+                                AttributeOperation::AddMultipliedTotal => "add_multiplied_total",
+                            }
+                            .into(),
+                        ),
                     ),
                 ]));
             }
@@ -1257,7 +1315,7 @@ impl PlayerStateDraft {
             }),
         )?;
         native_persistence::nbt::write(&self.0.document)
-            .context("movement attribute draft cannot be encoded")?;
+            .context("effect attribute draft cannot be encoded")?;
         Ok(())
     }
 
@@ -1601,6 +1659,7 @@ pub(crate) fn replay_saved_status_effects(
                             crate::survival::FoodStatusKind::Regeneration => {
                                 "minecraft:regeneration"
                             }
+                            crate::survival::FoodStatusKind::JumpBoost => "minecraft:jump_boost",
                             crate::survival::FoodStatusKind::Speed => "minecraft:speed",
                             crate::survival::FoodStatusKind::Slowness => "minecraft:slowness",
                             crate::survival::FoodStatusKind::NightVision => {
@@ -1728,6 +1787,7 @@ pub(crate) fn replay_saved_status_effects(
                                     crate::survival::FoodStatusKind::Hunger => "hunger",
                                     crate::survival::FoodStatusKind::Poison => "poison",
                                     crate::survival::FoodStatusKind::Regeneration => "regeneration",
+                                    crate::survival::FoodStatusKind::JumpBoost => "jump_boost",
                                     crate::survival::FoodStatusKind::Speed => "speed",
                                     crate::survival::FoodStatusKind::Slowness => "slowness",
                                     crate::survival::FoodStatusKind::NightVision => "night_vision",
@@ -1753,6 +1813,7 @@ pub(crate) fn replay_saved_status_effects(
                                 crate::survival::FoodStatusKind::Hunger => "hunger",
                                 crate::survival::FoodStatusKind::Poison => "poison",
                                 crate::survival::FoodStatusKind::Regeneration => "regeneration",
+                                crate::survival::FoodStatusKind::JumpBoost => "jump_boost",
                                 crate::survival::FoodStatusKind::Speed => "speed",
                                 crate::survival::FoodStatusKind::Slowness => "slowness",
                                 crate::survival::FoodStatusKind::NightVision => "night_vision",
@@ -2802,104 +2863,116 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness", crate::survival::FoodStatusKind::JumpBoost => "jump_boost" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }
                 }
             }
         }
-        for duration in [-1, 20, 100] {
-            for amplifier in [0, 1] {
-                for hidden in [false, true] {
-                    for remove in [false, true] {
-                        let mut effect = vec![
-                            ("id".into(), Tag::String("minecraft:regeneration".into())),
-                            ("duration".into(), Tag::Int(duration)),
-                            ("amplifier".into(), Tag::Byte(amplifier)),
-                        ];
-                        if hidden {
-                            effect.push((
-                                "hidden_effect".into(),
-                                Tag::Compound(vec![("duration".into(), Tag::Int(200))]),
-                            ));
+        for (effect_name, effect_kind) in [
+            (
+                "regeneration",
+                crate::survival::FoodStatusKind::Regeneration,
+            ),
+            ("jump_boost", crate::survival::FoodStatusKind::JumpBoost),
+        ] {
+            for duration in [-1, 20, 100] {
+                for amplifier in [0, 1] {
+                    for hidden in [false, true] {
+                        for remove in [false, true] {
+                            let mut effect = vec![
+                                (
+                                    "id".into(),
+                                    Tag::String(format!("minecraft:{effect_name}").as_str().into()),
+                                ),
+                                ("duration".into(), Tag::Int(duration)),
+                                ("amplifier".into(), Tag::Byte(amplifier)),
+                            ];
+                            if hidden {
+                                effect.push((
+                                    "hidden_effect".into(),
+                                    Tag::Compound(vec![("duration".into(), Tag::Int(200))]),
+                                ));
+                            }
+                            let original = NamedTag {
+                                name: "".into(),
+                                value: Tag::Compound(vec![(
+                                    "active_effects".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(effect)],
+                                    },
+                                )]),
+                            };
+                            let mut updates = vec![
+                                StatusUpdate {
+                                    kind: effect_kind,
+                                    remove: false,
+                                    clear_all: false,
+                                    update: HungerUpdate {
+                                        tick: 0,
+                                        duration: 30,
+                                        amplifier: 2,
+                                        ambient: false,
+                                        visible: true,
+                                        show_icon: true,
+                                    },
+                                },
+                                StatusUpdate {
+                                    kind: effect_kind,
+                                    remove: false,
+                                    clear_all: false,
+                                    update: HungerUpdate {
+                                        tick: 5,
+                                        duration: 150,
+                                        amplifier: 0,
+                                        ambient: true,
+                                        visible: false,
+                                        show_icon: false,
+                                    },
+                                },
+                            ];
+                            if remove {
+                                updates.push(StatusUpdate {
+                                    kind: effect_kind,
+                                    remove: true,
+                                    clear_all: false,
+                                    update: HungerUpdate {
+                                        tick: 25,
+                                        duration: 0,
+                                        amplifier: 0,
+                                        ambient: false,
+                                        visible: false,
+                                        show_icon: false,
+                                    },
+                                });
+                            }
+                            let effects =
+                                replay_saved_status_effects(&original, 50, &updates).unwrap();
+                            let draft = NamedTag {
+                                name: "".into(),
+                                value: Tag::Compound(
+                                    effects
+                                        .map(|value| ("active_effects".into(), value))
+                                        .into_iter()
+                                        .collect(),
+                                ),
+                            };
+                            let index = input.len();
+                            std::fs::write(
+                                temp.path().join(format!("source{index}.nbt")),
+                                native_persistence::nbt::write(&original).unwrap(),
+                            )
+                            .unwrap();
+                            std::fs::write(
+                                temp.path().join(format!("draft{index}.nbt")),
+                                native_persistence::nbt::write(&draft).unwrap(),
+                            )
+                            .unwrap();
+                            let events: Vec<_> = updates.iter().map(|event| { let value=event.update; serde_json::json!({"kind":effect_name, "remove":event.remove, "tick":value.tick, "duration":value.duration, "amplifier":value.amplifier, "ambient":value.ambient, "visible":value.visible, "show_icon":value.show_icon}) }).collect();
+                            input.push(serde_json::json!({"ticks":50,"events":events}));
                         }
-                        let original = NamedTag {
-                            name: "".into(),
-                            value: Tag::Compound(vec![(
-                                "active_effects".into(),
-                                Tag::List {
-                                    element_type: TagType::Compound,
-                                    values: vec![Tag::Compound(effect)],
-                                },
-                            )]),
-                        };
-                        let mut updates = vec![
-                            StatusUpdate {
-                                kind: crate::survival::FoodStatusKind::Regeneration,
-                                remove: false,
-                                clear_all: false,
-                                update: HungerUpdate {
-                                    tick: 0,
-                                    duration: 30,
-                                    amplifier: 2,
-                                    ambient: false,
-                                    visible: true,
-                                    show_icon: true,
-                                },
-                            },
-                            StatusUpdate {
-                                kind: crate::survival::FoodStatusKind::Regeneration,
-                                remove: false,
-                                clear_all: false,
-                                update: HungerUpdate {
-                                    tick: 5,
-                                    duration: 150,
-                                    amplifier: 0,
-                                    ambient: true,
-                                    visible: false,
-                                    show_icon: false,
-                                },
-                            },
-                        ];
-                        if remove {
-                            updates.push(StatusUpdate {
-                                kind: crate::survival::FoodStatusKind::Regeneration,
-                                remove: true,
-                                clear_all: false,
-                                update: HungerUpdate {
-                                    tick: 25,
-                                    duration: 0,
-                                    amplifier: 0,
-                                    ambient: false,
-                                    visible: false,
-                                    show_icon: false,
-                                },
-                            });
-                        }
-                        let effects = replay_saved_status_effects(&original, 50, &updates).unwrap();
-                        let draft = NamedTag {
-                            name: "".into(),
-                            value: Tag::Compound(
-                                effects
-                                    .map(|value| ("active_effects".into(), value))
-                                    .into_iter()
-                                    .collect(),
-                            ),
-                        };
-                        let index = input.len();
-                        std::fs::write(
-                            temp.path().join(format!("source{index}.nbt")),
-                            native_persistence::nbt::write(&original).unwrap(),
-                        )
-                        .unwrap();
-                        std::fs::write(
-                            temp.path().join(format!("draft{index}.nbt")),
-                            native_persistence::nbt::write(&draft).unwrap(),
-                        )
-                        .unwrap();
-                        let events: Vec<_> = updates.iter().map(|event| { let value=event.update; serde_json::json!({"kind":"regeneration", "remove":event.remove, "tick":value.tick, "duration":value.duration, "amplifier":value.amplifier, "ambient":value.ambient, "visible":value.visible, "show_icon":value.show_icon}) }).collect();
-                        input.push(serde_json::json!({"ticks":50,"events":events}));
                     }
                 }
             }

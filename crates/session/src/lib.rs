@@ -1711,7 +1711,15 @@ impl LocalSession {
                 input,
                 0.6,
                 movement_speeds[usize::from(input.sprinting)],
-                0.42_f32,
+                physics::jump_power(
+                    f64::from(0.42_f32),
+                    1.0,
+                    self.fall
+                        .effects()
+                        .jump_boost
+                        .as_ref()
+                        .map(|effect| effect.amplifier),
+                ),
                 0.08,
                 false,
                 None,
@@ -2558,6 +2566,33 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_jump_uses_boost_effect() {
+        let jump = |boost| {
+            let mut session = LocalSession::demo();
+            session.motion.on_ground = true;
+            if boost {
+                session.fall.add_status(survival::StatusApplication {
+                    kind: survival::FoodStatusKind::JumpBoost,
+                    duration: 100,
+                    amplifier: 1,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                });
+            }
+            let before = session.motion.position.y;
+            session.submit_command(PlayerCommand::Move {
+                forward: 0.0,
+                strafe: 0.0,
+                jump: true,
+            });
+            session.update(TICK);
+            session.motion.position.y - before
+        };
+        assert!((jump(true) - jump(false) - f64::from(0.2_f32)).abs() < 1e-6);
+    }
 
     #[test]
     fn demo_movement_uses_cached_speed_and_slowness_effects() {

@@ -192,6 +192,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::SlowFalling => self.effects.slow_falling = None,
             crate::survival::FoodStatusKind::Speed => self.effects.speed = None,
             crate::survival::FoodStatusKind::Slowness => self.effects.slowness = None,
+            crate::survival::FoodStatusKind::Resistance => self.effects.resistance = None,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }
@@ -223,6 +224,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::SlowFalling => &mut self.effects.slow_falling,
             crate::survival::FoodStatusKind::Speed => &mut self.effects.speed,
             crate::survival::FoodStatusKind::Slowness => &mut self.effects.slowness,
+            crate::survival::FoodStatusKind::Resistance => &mut self.effects.resistance,
             crate::survival::FoodStatusKind::WaterBreathing => {
                 unreachable!("breathing effects are handled separately")
             }

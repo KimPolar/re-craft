@@ -107,6 +107,7 @@ pub(crate) enum FoodStatusKind {
     SlowFalling,
     Speed,
     Slowness,
+    Resistance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +159,8 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::Speed)
     } else if value.matches("minecraft:slowness") || value.matches("slowness") {
         Some(FoodStatusKind::Slowness)
+    } else if value.matches("minecraft:resistance") || value.matches("resistance") {
+        Some(FoodStatusKind::Resistance)
     } else {
         None
     }
@@ -204,6 +207,9 @@ fn supported_potion(id: &ResourceId) -> bool {
                 | "swiftness"
                 | "long_swiftness"
                 | "strong_swiftness"
+                | "turtle_master"
+                | "long_turtle_master"
+                | "strong_turtle_master"
                 | "regeneration"
                 | "long_regeneration"
                 | "strong_regeneration"
@@ -295,6 +301,33 @@ fn base_potion_effects(id: Option<&ResourceId>) -> Option<Vec<StatusApplication>
     };
     if matches!(id.path.as_str(), "water" | "mundane" | "thick" | "awkward") {
         return Some(Vec::new());
+    }
+    if matches!(
+        id.path.as_str(),
+        "turtle_master" | "long_turtle_master" | "strong_turtle_master"
+    ) {
+        let duration = if id.path == "long_turtle_master" {
+            800
+        } else {
+            400
+        };
+        let strong = id.path == "strong_turtle_master";
+        return Some(
+            [
+                (FoodStatusKind::Slowness, if strong { 5 } else { 3 }),
+                (FoodStatusKind::Resistance, if strong { 3 } else { 2 }),
+            ]
+            .into_iter()
+            .map(|(kind, amplifier)| StatusApplication {
+                kind,
+                duration,
+                amplifier,
+                ambient: false,
+                visible: true,
+                show_icon: true,
+            })
+            .collect(),
+        );
     }
     let (kind, duration, amplifier) = match id.path.as_str() {
         "night_vision" => (FoodStatusKind::NightVision, 3600, 0),
@@ -404,6 +437,7 @@ fn status_color(kind: FoodStatusKind) -> u32 {
         FoodStatusKind::SlowFalling => 0xf3cfb9,
         FoodStatusKind::Speed => 0x33ebff,
         FoodStatusKind::Slowness => 0x8bafe0,
+        FoodStatusKind::Resistance => 0x9146f0,
     }
 }
 
@@ -1895,6 +1929,7 @@ mod tests {
             "slow_falling",
             "speed",
             "slowness",
+            "resistance",
         ] {
             for duration in [-1, 0, 1, 20, 21, 600] {
                 for amplifier in [0_i32, 1, 255] {
@@ -1921,6 +1956,18 @@ mod tests {
                 contents["potion"] = base.into();
             }
             cases.push(serde_json::json!({"contents":contents,"scale":0.5,"seed":23}));
+        }
+        for potion in [
+            "turtle_master",
+            "long_turtle_master",
+            "strong_turtle_master",
+        ] {
+            for scale in [0.0, 0.25, 1.0, 1.5] {
+                for seed in [0, 1, 23, 42] {
+                    cases.push(serde_json::json!({"contents":{"potion":format!("minecraft:{potion}"),"custom_effects":[]},"scale":scale,"seed":seed}));
+                    cases.push(serde_json::json!({"contents":{"potion":format!("minecraft:{potion}"),"custom_effects":[{"id":"minecraft:resistance","duration":120,"amplifier":1},{"id":"minecraft:slowness","duration":200,"amplifier":0}]},"scale":scale,"seed":seed}));
+                }
+            }
         }
         std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
         for command in [
@@ -2064,6 +2111,7 @@ mod tests {
                     FoodStatusKind::SlowFalling => "slow_falling",
                     FoodStatusKind::Speed => "speed",
                     FoodStatusKind::Slowness => "slowness",
+                    FoodStatusKind::Resistance => "resistance",
                 };
                 assert_eq!(
                     format!("minecraft:{id}"),
@@ -2270,6 +2318,7 @@ mod tests {
                         FoodStatusKind::Speed => "minecraft:speed",
                         FoodStatusKind::Slowness => "minecraft:slowness",
                         FoodStatusKind::Hunger => "minecraft:hunger",
+                        FoodStatusKind::Resistance => "minecraft:resistance",
                     };
                     assert_eq!(name, expected["id"].as_str().unwrap());
                     assert_eq!(
@@ -3282,7 +3331,8 @@ mod tests {
                                 | FoodStatusKind::JumpBoost
                                 | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
-                                | FoodStatusKind::Slowness => {
+                                | FoodStatusKind::Slowness
+                                | FoodStatusKind::Resistance => {
                                     unreachable!()
                                 }
                             };
@@ -3304,7 +3354,8 @@ mod tests {
                                 | FoodStatusKind::JumpBoost
                                 | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
-                                | FoodStatusKind::Slowness => {
+                                | FoodStatusKind::Slowness
+                                | FoodStatusKind::Resistance => {
                                     unreachable!()
                                 }
                             }

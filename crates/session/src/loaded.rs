@@ -1064,6 +1064,9 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::Slowness => {
                                     self.fall.effects().slowness.is_some()
                                 }
+                                crate::survival::FoodStatusKind::Resistance => {
+                                    self.fall.effects().resistance.is_some()
+                                }
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     self.breathing_effects.water_breathing.is_some()
                                 }
@@ -39676,6 +39679,9 @@ mod tests {
             "strong_leaping",
             "slow_falling",
             "long_slow_falling",
+            "turtle_master",
+            "long_turtle_master",
+            "strong_turtle_master",
         ] {
             let original = NamedTag {
                 name: "".into(),
@@ -39755,6 +39761,42 @@ mod tests {
                         (effect.duration, effect.amplifier),
                         (if potion == "slow_falling" { 1800 } else { 4800 }, 0)
                     );
+                }
+                "turtle_master" | "long_turtle_master" | "strong_turtle_master" => {
+                    let strong = potion == "strong_turtle_master";
+                    let duration = if potion == "long_turtle_master" {
+                        800
+                    } else {
+                        400
+                    };
+                    let slowness = session.fall.effects().slowness.as_ref().unwrap();
+                    let resistance = session.fall.effects().resistance.as_ref().unwrap();
+                    assert_eq!(
+                        (slowness.duration, slowness.amplifier),
+                        (duration, if strong { 5 } else { 3 })
+                    );
+                    assert_eq!(
+                        (resistance.duration, resistance.amplifier),
+                        (duration, if strong { 3 } else { 2 })
+                    );
+                    let id =
+                        native_resources::packs::ResourceId::parse("minecraft:effect.slowness")
+                            .unwrap();
+                    assert!(session.movement_speed_attribute.modifier(&id).is_some());
+                    let mut vitals = crate::survival::PlayerVitals::default();
+                    session
+                        .fall
+                        .damage(
+                            10.0,
+                            "minecraft:fall",
+                            &session.inventory,
+                            session.armor.value(),
+                            &mut vitals,
+                            session.game_mode,
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(vitals.health, if strong { 18.0 } else { 16.0 });
                 }
                 "slowness" | "long_slowness" | "strong_slowness" | "swiftness"
                 | "long_swiftness" | "strong_swiftness" => {
@@ -39907,7 +39949,7 @@ mod tests {
             name: "".into(),
             value: Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
         };
-        let effects = ["speed", "jump_boost"]
+        let effects = ["speed", "jump_boost", "resistance"]
             .into_iter()
             .map(|id| {
                 Tag::Compound(vec![
@@ -39975,6 +40017,7 @@ mod tests {
             crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
             *session.fall.effects()
         );
+        assert!(session.fall.effects().resistance.is_some());
         Arc::make_mut(&mut session.inventory).set_slot(
             PlayerSlot::Storage(0),
             ItemStack::new("minecraft:milk_bucket".into(), 1, 1, Tag::Compound(vec![])),
@@ -39999,6 +40042,13 @@ mod tests {
         );
         assert!(
             session.fall.effects().jump_boost.is_none() && session.fall.effects().speed.is_none()
+        );
+        assert!(session.fall.effects().resistance.is_none());
+        assert!(
+            crate::player_data::read_saved_fall_effects(draft.document())
+                .unwrap()
+                .resistance
+                .is_none()
         );
     }
 
@@ -40260,6 +40310,10 @@ mod tests {
                                 ("id".into(), Tag::String("minecraft:poison".into())),
                                 ("duration".into(), Tag::Int(100)),
                             ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:resistance".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
                         ],
                     },
                 ),
@@ -40277,6 +40331,7 @@ mod tests {
                     values: vec![
                         Tag::String("minecraft:hunger".into()),
                         Tag::String("minecraft:poison".into()),
+                        Tag::String("minecraft:resistance".into()),
                     ],
                 },
             ),
@@ -40328,6 +40383,7 @@ mod tests {
         session.update(TICK);
         assert!(!session.snapshot().hunger_effect);
         assert!(session.snapshot().poison_effect);
+        assert!(session.fall.effects().resistance.is_none());
         assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 13);
         let updates = &session
             .effect_save_tracking
@@ -40342,6 +40398,7 @@ mod tests {
             vec![
                 (crate::survival::FoodStatusKind::Hunger, true),
                 (crate::survival::FoodStatusKind::Poison, true),
+                (crate::survival::FoodStatusKind::Resistance, true),
                 (crate::survival::FoodStatusKind::Poison, false),
             ]
         );

@@ -39,6 +39,7 @@ pub mod respawn_tags;
 pub mod sounds;
 pub mod sprites;
 pub mod structure_biomes;
+pub mod structure_piece;
 pub mod structure_placement;
 pub mod structure_start;
 pub mod surface_biomes;

@@ -631,6 +631,7 @@ pub struct LoadedSession {
     lava_fizz: VecDeque<LavaFizz>,
     plant_break_particles: VecDeque<PlantBreakParticles>,
     honey_particles: VecDeque<HoneyParticleBurst>,
+    drown_particles: VecDeque<DrownParticleSpawn>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -829,6 +830,14 @@ pub struct HoneyParticleBurst {
     pub position: DVec3,
     pub tick: u64,
     pub kind: HoneyParticleKind,
+}
+
+/// A client-side bubble created by the player's drowning entity event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrownParticleSpawn {
+    pub tick: u64,
+    pub position: DVec3,
+    pub velocity: DVec3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4743,6 +4752,7 @@ impl LoadedSession {
             lava_fizz: VecDeque::new(),
             plant_break_particles: VecDeque::new(),
             honey_particles: VecDeque::new(),
+            drown_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -5819,6 +5829,28 @@ impl LoadedSession {
 
     pub fn take_honey_particles(&mut self) -> Vec<HoneyParticleBurst> {
         self.honey_particles.drain(..).collect()
+    }
+
+    pub fn take_drown_particles(&mut self) -> Vec<DrownParticleSpawn> {
+        self.drown_particles.drain(..).collect()
+    }
+
+    fn push_drown_particles(&mut self) {
+        let position = self.origin.as_dvec3() + self.motion.position;
+        for _ in 0..8 {
+            let mut triangle = || {
+                self.player_client_random.next_double() - self.player_client_random.next_double()
+            };
+            let offset = DVec3::new(triangle(), triangle(), triangle());
+            if self.drown_particles.len() == 4096 {
+                self.drown_particles.pop_front();
+            }
+            self.drown_particles.push_back(DrownParticleSpawn {
+                tick: self.tick.saturating_add(1),
+                position: position + offset,
+                velocity: self.motion.velocity,
+            });
+        }
     }
 
     fn push_honey_particles(&mut self, kind: HoneyParticleKind) {
@@ -14443,6 +14475,7 @@ impl LoadedSession {
                 &mut || self.player_random.next_double(),
             );
             if drowning {
+                self.push_drown_particles();
                 let was_alive = self.death.is_none();
                 self.player_damage(2.0, "minecraft:drown", DeathCause::Drown);
                 if was_alive && self.death.is_some() {
@@ -38572,6 +38605,113 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn drowning_particles_and_following_damage_sounds_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerDrownParticlesOracle.java");
+        let output = temp.path().join("drown.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerDrownParticlesOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("PlayerDrownParticlesOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 48);
+        for row in rows {
+            let mut test = session();
+            test.origin = IVec3::ZERO;
+            let base = row["base"].as_f64().unwrap();
+            test.motion.position = DVec3::new(base, 2.5, base + 0.25);
+            test.motion.velocity = DVec3::new(0.2, -0.125, 0.4);
+            test.player_client_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            test.push_drown_particles();
+            if row["hit"].as_bool().unwrap() {
+                if row["dead"].as_bool().unwrap() {
+                    test.vitals.health = 1.0;
+                }
+                assert!(test.player_damage(2.0, "minecraft:drown", DeathCause::Drown));
+            } else if row["dead"].as_bool().unwrap() {
+                test.queue_client_damage_sound("entity.player.death");
+            }
+            let particles = test.take_drown_particles();
+            let java_particles = row["particles"].as_array().unwrap();
+            assert_eq!(particles.len(), 8);
+            assert_eq!(particles.len(), java_particles.len());
+            for (particle, expected) in particles.iter().zip(java_particles) {
+                let actual = [
+                    particle.position.x,
+                    particle.position.y,
+                    particle.position.z,
+                    particle.velocity.x,
+                    particle.velocity.y,
+                    particle.velocity.z,
+                ];
+                for (actual, expected) in actual.iter().zip(expected.as_array().unwrap()) {
+                    assert_eq!(actual.to_bits(), expected.as_i64().unwrap() as u64, "{row}");
+                }
+                assert_eq!(particle.tick, 1);
+            }
+            let sounds = test.take_consume_sounds();
+            let expected = row["sounds"].as_array().unwrap();
+            assert_eq!(sounds.len(), expected.len(), "{row}");
+            for (sound, expected) in sounds.iter().zip(expected) {
+                assert_eq!(
+                    format!("minecraft:{}", sound.info.event),
+                    expected["event"].as_str().unwrap()
+                );
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    expected["pitch_bits"].as_i64().unwrap() as u32
+                );
+            }
+            assert_eq!(
+                test.player_client_random.next_int(),
+                row["next"].as_i64().unwrap() as i32
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn player_client_damage_sounds_and_random_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -40023,6 +40163,14 @@ mod tests {
                             test.player_client_random = native_core::random::LegacyRandom::new(73);
                             let mut expected_random = test.player_client_random.clone();
                             test.update(TICK);
+                            if source == "minecraft:drown" {
+                                for _ in 0..48 {
+                                    expected_random.next_double();
+                                }
+                                assert_eq!(test.take_drown_particles().len(), 8);
+                            } else {
+                                assert!(test.take_drown_particles().is_empty());
+                            }
                             let base = if source == "minecraft:drown" {
                                 2.0_f32
                             } else {

@@ -210,6 +210,7 @@ struct State {
     audio: Option<crate::audio::Audio>,
     video: VideoSettings,
     panorama_seconds: f64,
+    hud_hidden: bool,
     sound: SoundSettings,
     video_dirty: bool,
     #[cfg(test)]
@@ -334,6 +335,7 @@ impl State {
             audio: None,
             video: VideoSettings::default(),
             panorama_seconds: 0.0,
+            hud_hidden: false,
             sound: SoundSettings::default(),
             video_dirty: false,
             #[cfg(test)]
@@ -703,15 +705,17 @@ pub fn run() -> Result<()> {
                         content,
                         video,
                         audio,
+                        state.hud_hidden,
                     ),
                     PreparedLaunch::World(world) => {
-                        crate::run_prepared_world(&mut event_loop, world, audio)
+                        crate::run_prepared_world(&mut event_loop, world, audio, state.hud_hidden)
                     }
                 };
                 match result {
                     Ok(crate::GameExit::Quit) => return Ok(()),
-                    Ok(crate::GameExit::ReturnToTitle(video)) => {
+                    Ok(crate::GameExit::ReturnToTitle(video, hud_hidden)) => {
                         state.video = video;
+                        state.hud_hidden = hud_hidden;
                         state.sound = menu_settings::load().sound;
                         if let Some(audio) = &state.audio {
                             audio.set_gain(state.sound.ui_gain());
@@ -4350,8 +4354,17 @@ mod tests {
                     assets,
                     video,
                 } => {
-                    crate::run_demo(&mut event_loop, atlas, true, assets, content, video, None)
-                        .unwrap();
+                    crate::run_demo(
+                        &mut event_loop,
+                        atlas,
+                        true,
+                        assets,
+                        content,
+                        video,
+                        None,
+                        false,
+                    )
+                    .unwrap();
                 }
                 PreparedLaunch::World(_) => panic!("expected the demo"),
             },

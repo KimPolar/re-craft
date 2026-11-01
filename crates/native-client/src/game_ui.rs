@@ -166,6 +166,7 @@ pub struct GameUi {
     smoke_sprite_result: std::sync::mpsc::Receiver<Result<Vec<Arc<image::RgbaImage>>, String>>,
     armor_models: crate::equipment_visual::ArmorCache,
     paused: bool,
+    hud_hidden: bool,
     pause_page: PausePage,
     pause_focus: Option<PauseButton>,
     video: VideoSettings,
@@ -256,6 +257,7 @@ impl GameUi {
             smoke_sprite_result,
             armor_models,
             paused: false,
+            hud_hidden: false,
             pause_page: PausePage::Game,
             pause_focus: None,
             video: VideoSettings::default(),
@@ -496,6 +498,21 @@ impl GameUi {
 
     pub fn paused(&self) -> bool {
         self.paused || self.death.as_ref().is_some_and(DeathScreen::is_confirming)
+    }
+
+    pub fn hud_hidden(&self) -> bool {
+        self.hud_hidden
+    }
+
+    pub fn toggle_hud(&mut self) {
+        self.hud_hidden = !self.hud_hidden;
+        self.last_draw = None;
+    }
+
+    pub fn set_hud_hidden(&mut self, hidden: bool) {
+        if self.hud_hidden != hidden {
+            self.toggle_hud();
+        }
     }
 
     /// Switch screens when the authoritative session reports a death. The
@@ -1703,6 +1720,7 @@ impl GameUi {
         let tick = snapshot.tick;
         self.locked_chest_message = snapshot.locked_chest_message.clone();
         self.sync_hud(snapshot);
+        renderer.set_hud_hidden(self.hud_hidden);
         renderer.set_screen_blur(
             if self.death.is_none() && (self.paused || inventory.is_open()) {
                 self.video.menu_blur
@@ -1992,68 +2010,70 @@ impl GameUi {
         let (w, h) = (canvas.width, canvas.height);
         let assets = &*self.assets;
         let quick_preview = inventory.quick_craft_preview();
-        let hotbar_x = w / 2 - 91;
-        canvas.image(
-            &assets.hotbar,
-            Rect {
-                x: hotbar_x,
-                y: h - 22,
-                w: 182,
-                h: 22,
-            },
-        );
-        let slot = i32::from(inventory.selected());
-        canvas.image(
-            &assets.hotbar_selection,
-            Rect {
-                x: hotbar_x - 1 + slot * 20,
-                y: h - 23,
-                w: 24,
-                h: 23,
-            },
-        );
-        if let Some(item) = inventory.slot(PlayerSlot::Offhand) {
-            let (sprite, icon) = offhand_hotbar_layout(w, h, assets.main_hand_left);
+        if !self.hud_hidden {
+            let hotbar_x = w / 2 - 91;
             canvas.image(
-                if assets.main_hand_left {
-                    &assets.hotbar_offhand_right
-                } else {
-                    &assets.hotbar_offhand_left
+                &assets.hotbar,
+                Rect {
+                    x: hotbar_x,
+                    y: h - 22,
+                    w: 182,
+                    h: 22,
                 },
-                sprite,
             );
-            stack_icon_seeded(
-                &mut canvas,
-                assets,
-                &mut self.held_models,
-                icon.0,
-                icon.1,
-                item,
-                10,
+            let slot = i32::from(inventory.selected());
+            canvas.image(
+                &assets.hotbar_selection,
+                Rect {
+                    x: hotbar_x - 1 + slot * 20,
+                    y: h - 23,
+                    w: 24,
+                    h: 23,
+                },
             );
-        }
-        for slot in 0..9_u8 {
-            if let Some(item) = inventory.slot(PlayerSlot::Storage(slot)) {
+            if let Some(item) = inventory.slot(PlayerSlot::Offhand) {
+                let (sprite, icon) = offhand_hotbar_layout(w, h, assets.main_hand_left);
+                canvas.image(
+                    if assets.main_hand_left {
+                        &assets.hotbar_offhand_right
+                    } else {
+                        &assets.hotbar_offhand_left
+                    },
+                    sprite,
+                );
                 stack_icon_seeded(
                     &mut canvas,
                     assets,
                     &mut self.held_models,
-                    hotbar_x + 3 + i32::from(slot) * 20,
-                    h - 19,
+                    icon.0,
+                    icon.1,
                     item,
-                    i32::from(slot) + 1,
+                    10,
                 );
             }
+            for slot in 0..9_u8 {
+                if let Some(item) = inventory.slot(PlayerSlot::Storage(slot)) {
+                    stack_icon_seeded(
+                        &mut canvas,
+                        assets,
+                        &mut self.held_models,
+                        hotbar_x + 3 + i32::from(slot) * 20,
+                        h - 19,
+                        item,
+                        i32::from(slot) + 1,
+                    );
+                }
+            }
+            crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
+            crate::experience_hud::draw(&mut canvas, assets, self.experience);
+            crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
+            crate::action_bar::draw(
+                &mut canvas,
+                Some(assets),
+                self.locked_chest_message.as_deref(),
+                tick,
+            );
         }
-        crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
-        crate::experience_hud::draw(&mut canvas, assets, self.experience);
-        crate::chat_hud::draw(&mut canvas, assets, &self.system_messages, tick);
-        crate::action_bar::draw(
-            &mut canvas,
-            Some(assets),
-            self.locked_chest_message.as_deref(),
-            tick,
-        );
         if self.video.menu_blur > 0 && (self.paused || inventory.is_open()) {
             self.pre_blur_hud = Some(canvas);
             canvas = Canvas::new(logical.0, logical.1);
@@ -3232,6 +3252,51 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn hidden_hud_leaves_screens_visible_and_clears_blurred_hud() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&game, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut inventory = PlayerInventory::default();
+        let visible = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert!(visible.pixels.iter().any(|&pixel| pixel != 0));
+
+        ui.toggle_hud();
+        let hidden = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert!(hidden.pixels.iter().all(|&pixel| pixel == 0));
+        inventory.toggle();
+        let inventory_screen = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert!(inventory_screen.pixels.iter().any(|&pixel| pixel != 0));
+        assert!(
+            ui.pre_blur_hud
+                .as_ref()
+                .unwrap()
+                .pixels
+                .iter()
+                .all(|&pixel| pixel == 0)
+        );
+
+        inventory.toggle();
+        ui.toggle_pause();
+        let pause_screen = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert!(pause_screen.pixels.iter().any(|&pixel| pixel != 0));
+        assert!(
+            ui.pre_blur_hud
+                .as_ref()
+                .unwrap()
+                .pixels
+                .iter()
+                .all(|&pixel| pixel == 0)
+        );
+        ui.toggle_pause();
+        ui.toggle_hud();
+        let restored = ui.compose((1280, 720), &inventory, 0).unwrap();
+        assert_eq!(restored.pixels, visible.pixels);
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

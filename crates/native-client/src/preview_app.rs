@@ -177,7 +177,7 @@ pub fn run(
     video: VideoSettings,
 ) -> Result<crate::GameExit> {
     run_inner(
-        event_loop, scene, camera, smoke_test, None, None, None, video, None,
+        event_loop, scene, camera, smoke_test, None, None, None, video, None, false,
     )
 }
 
@@ -196,6 +196,7 @@ pub fn run_play(
     sky_background: Option<crate::sky_background::SkyBackground>,
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
+    hud_hidden: bool,
 ) -> Result<crate::GameExit> {
     let mut session = session;
     session.set_fov_effect_scale(video.fov_effect_scale.value() as f32);
@@ -266,6 +267,7 @@ pub fn run_play(
         }),
         video,
         audio,
+        hud_hidden,
     )
 }
 
@@ -280,6 +282,7 @@ fn run_inner(
     play: Option<PlayState>,
     video: VideoSettings,
     audio: Option<crate::audio::UiAudio>,
+    hud_hidden: bool,
 ) -> Result<crate::GameExit> {
     let _ = smoke_test;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -288,6 +291,7 @@ fn run_inner(
     if let Some(ui) = &mut ui {
         ui.set_video_settings(video);
         ui.set_audio(audio.clone());
+        ui.set_hud_hidden(hud_hidden);
     }
     if let (Some(ui), Some(play)) = (&mut ui, &play) {
         ui.set_crafting_recipes(play.session.crafting_recipes());
@@ -342,7 +346,7 @@ fn run_inner(
     Ok(if app.quit_application {
         crate::GameExit::Quit
     } else {
-        crate::GameExit::ReturnToTitle(app.video)
+        crate::GameExit::ReturnToTitle(app.video, app.ui.as_ref().is_some_and(GameUi::hud_hidden))
     })
 }
 
@@ -1450,6 +1454,14 @@ impl ApplicationHandler for Viewer {
                                 .unwrap()
                                 .pause_key(code, self.inventory_shift);
                             self.pause_action(action, event_loop);
+                        }
+                        return;
+                    }
+                    if code == KeyCode::F1 && pressed && !event.repeat {
+                        if self.play.is_some()
+                            && let Some(ui) = &mut self.ui
+                        {
+                            ui.toggle_hud();
                         }
                         return;
                     }

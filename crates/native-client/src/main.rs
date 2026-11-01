@@ -431,6 +431,7 @@ fn run_cli() -> Result<()> {
         },
         menu_settings::VideoSettings::default(),
         None,
+        false,
     )
     .map(|_| ())
 }
@@ -465,7 +466,7 @@ fn load_block_loot(
 
 #[derive(Clone, Copy, Debug)]
 enum GameExit {
-    ReturnToTitle(menu_settings::VideoSettings),
+    ReturnToTitle(menu_settings::VideoSettings, bool),
     Quit,
 }
 
@@ -477,12 +478,14 @@ fn run_demo(
     content: SessionContent,
     video: menu_settings::VideoSettings,
     audio: Option<audio::UiAudio>,
+    hud_hidden: bool,
 ) -> Result<GameExit> {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(atlas, smoke_test, assets, content, video);
     app.audio = audio.clone();
     if let Some(ui) = &mut app.ui {
         ui.set_audio(audio);
+        ui.set_hud_hidden(hud_hidden);
     }
     event_loop
         .run_app_on_demand(&mut app)
@@ -493,7 +496,7 @@ fn run_demo(
     Ok(if app.quit_application {
         GameExit::Quit
     } else {
-        GameExit::ReturnToTitle(app.video)
+        GameExit::ReturnToTitle(app.video, app.ui.as_ref().is_some_and(GameUi::hud_hidden))
     })
 }
 
@@ -579,13 +582,14 @@ fn view_existing_world(
     assets: Option<Arc<MenuAssets>>,
 ) -> Result<GameExit> {
     let prepared = prepare_existing_world(world_dir, minecraft_dir, packs, options, assets)?;
-    run_prepared_world(event_loop, prepared, None)
+    run_prepared_world(event_loop, prepared, None, false)
 }
 
 fn run_prepared_world(
     event_loop: &mut EventLoop<()>,
     prepared: PreparedWorld,
     audio: Option<audio::UiAudio>,
+    hud_hidden: bool,
 ) -> Result<GameExit> {
     match prepared {
         PreparedWorld::Play(world) => {
@@ -616,6 +620,7 @@ fn run_prepared_world(
                 sky_background,
                 video,
                 audio,
+                hud_hidden,
             )
         }
         #[cfg(debug_assertions)]
@@ -1917,6 +1922,12 @@ impl App {
             }
             return;
         }
+        if code == KeyCode::F1 && pressed && !repeat {
+            if let Some(ui) = &mut self.ui {
+                ui.toggle_hud();
+            }
+            return;
+        }
         if code == KeyCode::Escape && pressed && !repeat {
             if let Some(ui) = &mut self.ui {
                 let paused = ui.toggle_pause();
@@ -2721,6 +2732,94 @@ mod world_open_tests {
 mod video_window_tests {
     use super::*;
     use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]
+    fn f1_toggles_hud_only_during_gameplay() {
+        if !crate::window_test::isolated("video_window_tests::f1_toggles_hud_only_during_gameplay")
+        {
+            return;
+        }
+        struct Harness {
+            app: App,
+            stage: u8,
+        }
+        impl ApplicationHandler for Harness {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                let redraw = matches!(event, WindowEvent::RedrawRequested);
+                self.app.window_event(event_loop, id, event);
+                if !redraw {
+                    return;
+                }
+                match self.stage {
+                    0 => {
+                        self.app.key(KeyCode::F1, true, false, event_loop);
+                        self.app.key(KeyCode::F1, true, true, event_loop);
+                        self.app.key(KeyCode::F1, false, false, event_loop);
+                        assert!(self.app.ui.as_ref().unwrap().hud_hidden());
+                    }
+                    1 => {
+                        assert!(self.app.renderer.as_ref().unwrap().hud_hidden());
+                        self.app.key(KeyCode::Escape, true, false, event_loop);
+                        self.app.key(KeyCode::F1, true, false, event_loop);
+                        assert!(self.app.ui.as_ref().unwrap().hud_hidden());
+                        self.app.key(KeyCode::Escape, true, false, event_loop);
+                        self.app
+                            .session
+                            .submit_command(PlayerCommand::ToggleInventory);
+                        self.app.session.update(Duration::from_millis(50));
+                        assert!(self.app.session.snapshot().inventory.is_open());
+                        self.app.key(KeyCode::F1, true, false, event_loop);
+                        assert!(self.app.ui.as_ref().unwrap().hud_hidden());
+                        self.app
+                            .session
+                            .submit_command(PlayerCommand::ToggleInventory);
+                        self.app.session.update(Duration::from_millis(50));
+                        assert!(!self.app.session.snapshot().inventory.is_open());
+                        self.app.key(KeyCode::F1, true, false, event_loop);
+                        assert!(!self.app.ui.as_ref().unwrap().hud_hidden());
+                    }
+                    _ => {
+                        assert!(!self.app.renderer.as_ref().unwrap().hud_hidden());
+                        event_loop.exit();
+                    }
+                }
+                self.stage += 1;
+                if let Some(window) = &self.app.window {
+                    window.request_redraw();
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.about_to_wait(event_loop);
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut harness = Harness {
+            app: App::new(
+                native_resources::load_atlas(&game).unwrap(),
+                false,
+                Some(Arc::new(MenuAssets::load(&game, &[]).unwrap())),
+                SessionContent::default(),
+                menu_settings::VideoSettings::default(),
+            ),
+            stage: 0,
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+        assert!(harness.stage >= 3);
+    }
 
     #[test]
     #[ignore = "requires the local Minecraft 26.3 assets and a Windows GPU window"]

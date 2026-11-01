@@ -256,6 +256,7 @@ pub struct Renderer {
     overlay_bind_group: Option<wgpu::BindGroup>,
     overlay_size: (u32, u32),
     hide_crosshair: bool,
+    hud_hidden: bool,
     screen_blur: Option<crate::screen_blur::ScreenBlur>,
     screen_blur_radius: u8,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -377,6 +378,15 @@ impl Renderer {
             a: 1.0,
         };
         self.sky_rgb = None;
+    }
+
+    pub fn set_hud_hidden(&mut self, hidden: bool) {
+        self.hud_hidden = hidden;
+    }
+
+    #[cfg(test)]
+    pub fn hud_hidden(&self) -> bool {
+        self.hud_hidden
     }
 
     pub fn set_screen_blur(&mut self, radius: u8) {
@@ -1276,6 +1286,7 @@ impl Renderer {
             overlay_bind_group: None,
             overlay_size: (0, 0),
             hide_crosshair: false,
+            hud_hidden: false,
             screen_blur: Some(screen_blur),
             screen_blur_radius: 0,
             vertex_buffer: None,
@@ -2195,14 +2206,16 @@ impl Renderer {
                 );
             }
         }
-        self.first_person.draw(
-            &self.queue,
-            &mut encoder,
-            view,
-            &self.depth,
-            hand_projection * self.effective_bob(),
-        );
-        if !self.hide_crosshair {
+        if !self.hud_hidden {
+            self.first_person.draw(
+                &self.queue,
+                &mut encoder,
+                view,
+                &self.depth,
+                hand_projection * self.effective_bob(),
+            );
+        }
+        if !self.hide_crosshair && !self.hud_hidden {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("crosshair pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

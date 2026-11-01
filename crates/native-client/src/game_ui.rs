@@ -15,7 +15,7 @@ use crate::{
     first_person::{FirstPersonInput, ItemUseAnimation},
     fov_ui::FovSlider,
     held_items::ItemModelCache,
-    menu::gui_scale,
+    menu::gui_scale_for,
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
     menu_settings::{SoundCategory, SoundSettings, VideoSettings},
@@ -26,6 +26,9 @@ use crate::{
     survival_hud::HudDisplay,
     video_ui::{VideoControl, VideoUi},
 };
+
+#[cfg(test)]
+use crate::menu::gui_scale;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PauseAction {
@@ -72,6 +75,7 @@ enum PauseButton {
     Framerate,
     Vsync,
     Fullscreen,
+    GuiScale,
     Inactivity,
     Accessibility,
     ViewBobbing,
@@ -178,6 +182,7 @@ pub struct GameUi {
     video_dirty: bool,
     video_error: Option<String>,
     cursor: (i32, i32),
+    cursor_raw: Option<(f64, f64)>,
     size: (u32, u32),
     inventory_menu: Option<InventoryMenu>,
     pointer_button: Option<ClickButton>,
@@ -267,6 +272,7 @@ impl GameUi {
             video_dirty: false,
             video_error: None,
             cursor: (-1, -1),
+            cursor_raw: None,
             size: (0, 0),
             inventory_menu: None,
             pointer_button: None,
@@ -338,7 +344,7 @@ impl GameUi {
             return BookAction::None;
         };
         self.recipe_book.sync(inventory, &self.assets);
-        let scale = gui_scale(self.size.0, self.size.1).max(1);
+        let scale = self.gui_scale();
         self.recipe_book.click(
             (self.size.0 / scale) as i32,
             (self.size.1 / scale) as i32,
@@ -363,7 +369,7 @@ impl GameUi {
         self.recipe_book.unfocus();
     }
     pub fn recipe_book_escape(&mut self) -> Option<BookAction> {
-        let scale = gui_scale(self.size.0, self.size.1).max(1);
+        let scale = self.gui_scale();
         self.recipe_book.close_narrow((self.size.0 / scale) as i32)
     }
 
@@ -372,6 +378,7 @@ impl GameUi {
         self.video_ui = VideoUi::new(video);
         self.fov_ui = FovSlider::new(video.fov);
         self.video_dirty = false;
+        self.update_cursor_scale();
         self.last_draw = None;
     }
 
@@ -383,6 +390,24 @@ impl GameUi {
         self.video.fullscreen = !self.video.fullscreen;
         self.video_dirty = true;
         self.last_draw = None;
+    }
+
+    fn gui_scale(&self) -> u32 {
+        gui_scale_for(self.size.0, self.size.1, self.video.gui_scale)
+    }
+
+    fn update_cursor_scale(&mut self) {
+        if let Some((x, y)) = self.cursor_raw {
+            let scale = f64::from(self.gui_scale());
+            self.cursor = ((x / scale) as i32, (y / scale) as i32);
+        }
+    }
+
+    fn set_size(&mut self, size: (u32, u32)) {
+        if self.size != size {
+            self.size = size;
+            self.update_cursor_scale();
+        }
     }
 
     pub fn debug_focus_pause(&mut self, enabled: bool, tick: u64) {
@@ -538,12 +563,13 @@ impl GameUi {
     }
 
     fn logical_size(&self) -> (i32, i32) {
-        let scale = gui_scale(self.size.0, self.size.1).max(1);
+        let scale = self.gui_scale();
         ((self.size.0 / scale) as i32, (self.size.1 / scale) as i32)
     }
 
     pub fn cursor_moved(&mut self, x: f64, y: f64) {
-        let scale = gui_scale(self.size.0, self.size.1).max(1) as f64;
+        self.cursor_raw = Some((x, y));
+        let scale = self.gui_scale() as f64;
         self.cursor = ((x / scale) as i32, (y / scale) as i32);
         if self.paused && self.pause_page == PausePage::Sound {
             let (w, h) = self.logical_size();
@@ -753,6 +779,7 @@ impl GameUi {
                             VideoControl::Framerate => PauseButton::Framerate,
                             VideoControl::Vsync => PauseButton::Vsync,
                             VideoControl::Fullscreen => PauseButton::Fullscreen,
+                            VideoControl::GuiScale => PauseButton::GuiScale,
                             VideoControl::Inactivity => PauseButton::Inactivity,
                             VideoControl::MenuBlur => PauseButton::VideoBlur,
                             VideoControl::RenderDistance => PauseButton::VideoDistance,
@@ -942,6 +969,14 @@ impl GameUi {
                 self.toggle_fullscreen();
                 PauseAction::None
             }
+            PauseButton::GuiScale => {
+                self.video.gui_scale =
+                    crate::menu::next_gui_scale(self.size.0, self.size.1, self.video.gui_scale);
+                self.video_dirty = true;
+                self.update_cursor_scale();
+                self.last_draw = None;
+                PauseAction::None
+            }
             PauseButton::Inactivity => {
                 self.video.inactivity_fps_limit = self.video.inactivity_fps_limit.next();
                 self.video_dirty = true;
@@ -1129,6 +1164,7 @@ impl GameUi {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
+                    Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -1270,6 +1306,7 @@ impl GameUi {
                         .visible(h, self.video_ui.control_rect(w, VideoControl::Inactivity))
                     {
                         buttons.push(PauseButton::Inactivity);
+                        buttons.push(PauseButton::GuiScale);
                     }
                     if self
                         .video_ui
@@ -1493,16 +1530,17 @@ impl GameUi {
     }
 
     pub fn inventory_slot(&self) -> Option<PlayerSlot> {
-        inventory_slot_at(
+        inventory_slot_at_scale(
             self.size,
             self.cursor,
             self.inventory_menu?,
             self.recipe_book.is_open(),
+            self.gui_scale(),
         )
     }
 
     pub fn inventory_outside(&self) -> bool {
-        let scale = gui_scale(self.size.0, self.size.1).max(1);
+        let scale = self.gui_scale();
         let w = (self.size.0 / scale) as i32;
         let h = (self.size.1 / scale) as i32;
         if let Some(InventoryMenu::Chest { other, .. }) = self.inventory_menu {
@@ -1516,7 +1554,7 @@ impl GameUi {
             }
             .contains(self.cursor.0, self.cursor.1);
         }
-        inventory_outside_at(self.size, self.cursor, self.recipe_book.is_open())
+        inventory_outside_at_scale(self.size, self.cursor, self.recipe_book.is_open(), scale)
             && !self.recipe_book.contains(w, h, self.cursor)
     }
 
@@ -1574,7 +1612,7 @@ impl GameUi {
         if self.size.0 == 0 || self.size.1 == 0 {
             return false;
         }
-        let scale = gui_scale(self.size.0, self.size.1);
+        let scale = self.gui_scale();
         let w = (self.size.0 / scale) as i32;
         let h = (self.size.1 / scale) as i32;
         if self.recipe_book.is_open() && w < 379 {
@@ -1684,9 +1722,9 @@ impl GameUi {
                 0
             },
         );
+        self.set_size(size);
+        let scale = self.gui_scale();
         if let Some(death) = &mut self.death {
-            self.size = size;
-            let scale = gui_scale(size.0, size.1).max(1);
             let logical = (size.0 / scale, size.1 / scale);
             if let Some(canvas) = death.draw(logical, self.cursor, &self.assets) {
                 renderer.update_overlay(&canvas, true)?;
@@ -1877,7 +1915,7 @@ impl GameUi {
         inventory: &PlayerInventory,
         tick: u64,
     ) -> Option<Canvas> {
-        self.size = size;
+        self.set_size(size);
         self.inventory_menu = inventory.menu();
         if self.inventory_menu.is_none() {
             self.inventory_pointer_cancel();
@@ -1901,7 +1939,7 @@ impl GameUi {
             (main, off)
         };
         let player_menu = inventory.menu() == Some(InventoryMenu::Player);
-        let logical_width = size.0 / gui_scale(size.0, size.1).max(1);
+        let logical_width = size.0 / self.gui_scale();
         let avatar_visible = player_menu && !(self.recipe_book.is_open() && logical_width < 379);
         let right_model = avatar_visible
             .then(|| right_hand.and_then(|item| self.held_models.get_item(item)))
@@ -1942,7 +1980,7 @@ impl GameUi {
             book_open: inventory.is_open() && self.recipe_book.is_open(),
             book_revision: self.recipe_book.revision(),
             book_hover: if inventory.is_open() {
-                let scale = gui_scale(size.0, size.1).max(1);
+                let scale = self.gui_scale();
                 self.recipe_book.hover_state(
                     (size.0 / scale) as i32,
                     (size.1 / scale) as i32,
@@ -1963,7 +2001,7 @@ impl GameUi {
         if self.last_draw == Some(key) {
             return None;
         }
-        let scale = gui_scale(size.0, size.1);
+        let scale = self.gui_scale();
         let mut canvas = Canvas::new((size.0 / scale).max(1), (size.1 / scale).max(1));
         let (w, h) = (canvas.width, canvas.height);
         let assets = &*self.assets;
@@ -2715,6 +2753,7 @@ impl GameUi {
                     Some(PauseButton::Framerate) => Some(VideoControl::Framerate),
                     Some(PauseButton::Vsync) => Some(VideoControl::Vsync),
                     Some(PauseButton::Fullscreen) => Some(VideoControl::Fullscreen),
+                    Some(PauseButton::GuiScale) => Some(VideoControl::GuiScale),
                     Some(PauseButton::Inactivity) => Some(VideoControl::Inactivity),
                     Some(PauseButton::VideoBlur) => Some(VideoControl::MenuBlur),
                     Some(PauseButton::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -2873,16 +2912,26 @@ fn menu_slot_position(slot: PlayerSlot, menu: InventoryMenu) -> Option<(i32, i32
     }
 }
 
+#[cfg(test)]
 fn inventory_slot_at(
     size: (u32, u32),
     cursor: (i32, i32),
     menu: InventoryMenu,
     book_open: bool,
 ) -> Option<PlayerSlot> {
+    inventory_slot_at_scale(size, cursor, menu, book_open, gui_scale(size.0, size.1))
+}
+
+fn inventory_slot_at_scale(
+    size: (u32, u32),
+    cursor: (i32, i32),
+    menu: InventoryMenu,
+    book_open: bool,
+    scale: u32,
+) -> Option<PlayerSlot> {
     if size.0 == 0 || size.1 == 0 {
         return None;
     }
-    let scale = gui_scale(size.0, size.1);
     let w = (size.0 / scale) as i32;
     let h = (size.1 / scale) as i32;
     let book_open = book_open && !matches!(menu, InventoryMenu::Chest { .. });
@@ -2921,11 +2970,20 @@ fn inventory_slot_at(
         })
 }
 
+#[cfg(test)]
 fn inventory_outside_at(size: (u32, u32), cursor: (i32, i32), book_open: bool) -> bool {
+    inventory_outside_at_scale(size, cursor, book_open, gui_scale(size.0, size.1))
+}
+
+fn inventory_outside_at_scale(
+    size: (u32, u32),
+    cursor: (i32, i32),
+    book_open: bool,
+    scale: u32,
+) -> bool {
     if size.0 == 0 || size.1 == 0 {
         return false;
     }
-    let scale = gui_scale(size.0, size.1);
     let (x, y) = inventory_origin((size.0 / scale) as i32, (size.1 / scale) as i32, book_open);
     !Rect {
         x,
@@ -4031,6 +4089,16 @@ mod inventory_tests {
         ui.pause_key(KeyCode::Enter, false);
         assert!(!ui.video_settings().fullscreen);
 
+        ui.cursor_moved(f64::from(w / 2 + 15) * scale, 110.0 * scale);
+        assert_eq!(ui.click(), PauseAction::None);
+        assert_eq!(ui.video_settings().gui_scale, 1);
+        assert_eq!(ui.gui_scale(), 1);
+        for expected in [2, 3, 0] {
+            ui.pause_key(KeyCode::Enter, false);
+            assert_eq!(ui.video_settings().gui_scale, expected);
+        }
+        assert_eq!(ui.gui_scale(), 3);
+
         ui.cursor_moved(f64::from(w / 2 + 15) * scale, 90.0 * scale);
         assert_eq!(ui.click(), PauseAction::None);
         assert!(!ui.video_settings().vsync);
@@ -4227,6 +4295,85 @@ mod inventory_tests {
         assert_eq!(color[2], 0);
         model.gui.rotation.z = 15.0;
         assert!(crate::item_gui::render(&model).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn selected_gui_scale_updates_rendered_inventory_and_pointer() {
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        let size = (1280, 720);
+        for (requested, scale) in [(0, 3), (1, 1), (2, 2), (3, 3)] {
+            ui.set_video_settings(VideoSettings {
+                gui_scale: requested,
+                ..VideoSettings::default()
+            });
+            let canvas = ui.compose(size, &inventory, 0).unwrap();
+            assert_eq!(
+                (canvas.width, canvas.height),
+                ((size.0 / scale) as i32, (size.1 / scale) as i32)
+            );
+            let origin = inventory_origin(canvas.width, canvas.height, false);
+            let (x, y) = player_slot_position(PlayerSlot::Storage(0));
+            ui.cursor_moved(
+                f64::from((origin.0 + x + 8) * scale as i32),
+                f64::from((origin.1 + y + 8) * scale as i32),
+            );
+            assert_eq!(ui.inventory_slot(), Some(PlayerSlot::Storage(0)));
+        }
+        ui.cursor_moved(600.0, 300.0);
+        ui.set_video_settings(VideoSettings {
+            gui_scale: 1,
+            ..VideoSettings::default()
+        });
+        assert_eq!(ui.cursor, (600, 300));
+        ui.set_video_settings(VideoSettings {
+            gui_scale: 3,
+            ..VideoSettings::default()
+        });
+        assert_eq!(ui.cursor, (200, 100));
+    }
+
+    #[test]
+    fn selected_gui_scales_move_inventory_hit_targets_with_the_layout() {
+        let size = (1280, 720);
+        for requested in [0, 1, 2, 3, 9] {
+            let scale = gui_scale_for(size.0, size.1, requested);
+            let w = (size.0 / scale) as i32;
+            let h = (size.1 / scale) as i32;
+            for menu in [
+                InventoryMenu::Player,
+                InventoryMenu::CraftingTable {
+                    position: glam::IVec3::ZERO,
+                },
+                InventoryMenu::Chest {
+                    position: glam::IVec3::ZERO,
+                    other: None,
+                },
+            ] {
+                let origin = match menu {
+                    InventoryMenu::Chest { .. } => ((w - 176) / 2, (h - 168) / 2),
+                    _ => inventory_origin(w, h, false),
+                };
+                let slot = PlayerSlot::Storage(0);
+                let (x, y) = menu_slot_position(slot, menu).unwrap();
+                assert_eq!(
+                    inventory_slot_at_scale(
+                        size,
+                        (origin.0 + x + 8, origin.1 + y + 8),
+                        menu,
+                        false,
+                        scale
+                    ),
+                    Some(slot)
+                );
+            }
+        }
     }
 
     #[test]

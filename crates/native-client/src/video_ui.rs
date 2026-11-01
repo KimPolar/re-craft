@@ -15,6 +15,7 @@ pub enum VideoControl {
     Framerate,
     Vsync,
     Fullscreen,
+    GuiScale,
     Inactivity,
     MenuBlur,
     RenderDistance,
@@ -221,13 +222,16 @@ impl VideoUi {
     pub fn control_rect(&self, width: i32, control: VideoControl) -> Rect {
         Rect {
             x: width / 2
-                + if matches!(control, VideoControl::Vsync | VideoControl::RenderDistance) {
+                + if matches!(
+                    control,
+                    VideoControl::Vsync | VideoControl::RenderDistance | VideoControl::GuiScale
+                ) {
                     5
                 } else {
                     -155
                 },
             y: match control {
-                VideoControl::Inactivity => 105,
+                VideoControl::Inactivity | VideoControl::GuiScale => 105,
                 VideoControl::Fullscreen => 130,
                 VideoControl::MenuBlur => 366,
                 VideoControl::WeatherRadius => 441,
@@ -250,6 +254,7 @@ impl VideoUi {
             VideoControl::Vsync,
             VideoControl::Fullscreen,
             VideoControl::Inactivity,
+            VideoControl::GuiScale,
             VideoControl::MenuBlur,
             VideoControl::RenderDistance,
             VideoControl::BiomeBlend,
@@ -695,6 +700,23 @@ impl VideoUi {
                                         } else {
                                             VideoControl::Vsync
                                         }),
+                                &value,
+                            );
+                        } else if label.key == "options.guiScale" {
+                            let value = if video.gui_scale == 0 {
+                                assets.translate("options.guiScale.auto", "Auto").to_owned()
+                            } else {
+                                video.gui_scale.to_string()
+                            };
+                            let value = assets
+                                .translate("options.generic_value", "%s: %s")
+                                .replacen("%s", tr(label), 1)
+                                .replacen("%s", &value, 1);
+                            list.button(
+                                Some(assets),
+                                rect,
+                                true,
+                                hovered || focused == Some(VideoControl::GuiScale),
                                 &value,
                             );
                         } else if label.key == "options.inactivityFpsLimit" {

@@ -81,6 +81,7 @@ enum ButtonId {
     VideoFps,
     VideoVsync,
     VideoFullscreen,
+    VideoGuiScale,
     VideoInactivity,
     VideoBlur,
     VideoDistance,
@@ -832,10 +833,11 @@ struct PanoramaClock {
 }
 
 // A completed panorama may still be shown after a pointer or focus change,
-// but never after the underlying screen, size, assets or blur have changed.
+// but never after the underlying screen, size, GUI scale, assets or blur changed.
 struct SoftwareScene {
     screen: Screen,
     size: (u32, u32),
+    scale: u32,
     blur: u8,
     assets: Option<Arc<MenuAssets>>,
 }
@@ -845,11 +847,13 @@ impl SoftwareScene {
         &self,
         screen: Screen,
         size: (u32, u32),
+        scale: u32,
         blur: u8,
         assets: &Option<Arc<MenuAssets>>,
     ) -> bool {
         self.screen == screen
             && self.size == size
+            && self.scale == scale
             && self.blur == blur
             && match (&self.assets, assets) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -892,6 +896,7 @@ struct Menu<'a> {
     occluded: bool,
     refresh_interval: Duration,
     cursor: (i32, i32),
+    cursor_raw: Option<(f64, f64)>,
     focused: Option<ButtonId>,
     action: Option<Action>,
     error: Option<anyhow::Error>,
@@ -939,6 +944,7 @@ impl<'a> Menu<'a> {
             occluded: false,
             refresh_interval: Duration::from_nanos(1_000_000_000 / 60),
             cursor: (-1, -1),
+            cursor_raw: None,
             focused: None,
             action: None,
             error: None,
@@ -991,6 +997,20 @@ impl<'a> Menu<'a> {
             crate::apply_fullscreen(window, self.state.video.fullscreen);
         }
         self.invalidate();
+    }
+
+    fn update_gui_scale(&mut self) {
+        self.scale = gui_scale_for(self.size.0, self.size.1, self.state.video.gui_scale);
+        if let Some((x, y)) = self.cursor_raw {
+            self.cursor = (
+                (x / f64::from(self.scale)) as i32,
+                (y / f64::from(self.scale)) as i32,
+            );
+        }
+        let (_, height) = self.logical_size();
+        self.video_ui.resize(height);
+        self.accessibility_ui.resize(height);
+        self.sound_ui.resize(height);
     }
 
     fn begin_launch(&mut self, request: LaunchRequest) -> Result<()> {
@@ -1262,6 +1282,7 @@ impl<'a> Menu<'a> {
             ButtonId::VideoFps => Some(VideoControl::Framerate),
             ButtonId::VideoVsync => Some(VideoControl::Vsync),
             ButtonId::VideoFullscreen => Some(VideoControl::Fullscreen),
+            ButtonId::VideoGuiScale => Some(VideoControl::GuiScale),
             ButtonId::VideoInactivity => Some(VideoControl::Inactivity),
             ButtonId::VideoBlur => Some(VideoControl::MenuBlur),
             ButtonId::VideoDistance => Some(VideoControl::RenderDistance),
@@ -1621,6 +1642,7 @@ impl<'a> Menu<'a> {
                     (ButtonId::VideoFps, VideoControl::Framerate),
                     (ButtonId::VideoVsync, VideoControl::Vsync),
                     (ButtonId::VideoInactivity, VideoControl::Inactivity),
+                    (ButtonId::VideoGuiScale, VideoControl::GuiScale),
                     (ButtonId::VideoFullscreen, VideoControl::Fullscreen),
                     (ButtonId::VideoBlend, VideoControl::BiomeBlend),
                     (ButtonId::VideoDistance, VideoControl::RenderDistance),
@@ -1877,6 +1899,12 @@ impl<'a> Menu<'a> {
                 self.state.video_dirty = true;
             }
             ButtonId::VideoFullscreen => self.toggle_fullscreen(),
+            ButtonId::VideoGuiScale => {
+                self.state.video.gui_scale =
+                    next_gui_scale(self.size.0, self.size.1, self.state.video.gui_scale);
+                self.state.video_dirty = true;
+                self.update_gui_scale();
+            }
             ButtonId::VideoInactivity => {
                 self.state.video.inactivity_fps_limit =
                     self.state.video.inactivity_fps_limit.next();
@@ -2064,6 +2092,7 @@ impl<'a> Menu<'a> {
                     | ButtonId::VideoWeather
                     | ButtonId::VideoVsync
                     | ButtonId::VideoFullscreen
+                    | ButtonId::VideoGuiScale
                     | ButtonId::VideoInactivity
                     | ButtonId::OptionsFov
                     | ButtonId::ViewBobbing
@@ -2160,6 +2189,7 @@ impl<'a> Menu<'a> {
                 !scene.matches(
                     self.state.screen,
                     self.size,
+                    self.scale,
                     self.state.video.menu_blur,
                     &self.state.assets,
                 )
@@ -2168,6 +2198,7 @@ impl<'a> Menu<'a> {
                 self.software_scene = Some(SoftwareScene {
                     screen: self.state.screen,
                     size: self.size,
+                    scale: self.scale,
                     blur: self.state.video.menu_blur,
                     assets: self.state.assets.clone(),
                 });
@@ -2512,6 +2543,7 @@ impl<'a> Menu<'a> {
                         Some(ButtonId::VideoFps) => Some(VideoControl::Framerate),
                         Some(ButtonId::VideoVsync) => Some(VideoControl::Vsync),
                         Some(ButtonId::VideoFullscreen) => Some(VideoControl::Fullscreen),
+                        Some(ButtonId::VideoGuiScale) => Some(VideoControl::GuiScale),
                         Some(ButtonId::VideoInactivity) => Some(VideoControl::Inactivity),
                         Some(ButtonId::VideoBlur) => Some(VideoControl::MenuBlur),
                         Some(ButtonId::VideoDistance) => Some(VideoControl::RenderDistance),
@@ -2670,6 +2702,7 @@ impl<'a> Menu<'a> {
                     ButtonId::VideoFps
                         | ButtonId::VideoVsync
                         | ButtonId::VideoFullscreen
+                        | ButtonId::VideoGuiScale
                         | ButtonId::VideoInactivity
                         | ButtonId::VideoBlur
                         | ButtonId::VideoDistance
@@ -2795,7 +2828,7 @@ impl ApplicationHandler for Menu<'_> {
             Ok((window, surface, gpu)) => {
                 let size = window.inner_size();
                 self.size = (size.width, size.height);
-                self.scale = gui_scale(size.width, size.height);
+                self.update_gui_scale();
                 self.refresh_interval = monitor_frame_interval(&window);
                 if gpu.is_none() {
                     match MenuSoftwareWorker::new(window.clone()) {
@@ -2849,11 +2882,7 @@ impl ApplicationHandler for Menu<'_> {
             }
             WindowEvent::Resized(size) => {
                 self.size = (size.width, size.height);
-                self.scale = gui_scale(size.width, size.height);
-                let (_, height) = self.logical_size();
-                self.video_ui.resize(height);
-                self.accessibility_ui.resize(height);
-                self.sound_ui.resize(height);
+                self.update_gui_scale();
             }
             WindowEvent::Occluded(value) => self.occluded = value,
             WindowEvent::Moved(_) => {
@@ -2866,6 +2895,7 @@ impl ApplicationHandler for Menu<'_> {
                 // twice for each high-frequency pointer event is unnecessary.
                 let buttons = self.buttons();
                 let previous = self.hover_target(&buttons, self.cursor);
+                self.cursor_raw = Some((position.x, position.y));
                 self.cursor = (
                     (position.x / self.scale as f64) as i32,
                     (position.y / self.scale as f64) as i32,
@@ -2914,6 +2944,7 @@ impl ApplicationHandler for Menu<'_> {
                 let buttons = self.buttons();
                 let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor = (-1, -1);
+                self.cursor_raw = None;
                 request_redraw = previous != self.hover_target(&buttons, self.cursor);
             }
             WindowEvent::MouseInput {
@@ -2928,6 +2959,10 @@ impl ApplicationHandler for Menu<'_> {
                     && let Some(cursor) = current_window_cursor(window, self.size, self.scale)
                 {
                     self.cursor = cursor;
+                    self.cursor_raw = Some((
+                        f64::from(cursor.0 * self.scale as i32),
+                        f64::from(cursor.1 * self.scale as i32),
+                    ));
                 }
                 let (w, h) = self.logical_size();
                 let scrollbar = self.state.screen == Screen::Video
@@ -2982,6 +3017,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::VideoWeather
                                 | ButtonId::VideoVsync
                                 | ButtonId::VideoFullscreen
+                                | ButtonId::VideoGuiScale
                                 | ButtonId::VideoInactivity
                                 | ButtonId::OptionsFov
                                 | ButtonId::ViewBobbing
@@ -3573,12 +3609,25 @@ fn expand_canvas(canvas: &Canvas, destination: &mut [u32], width: u32, scale: u3
     }
 }
 
+#[cfg(test)]
 pub(crate) fn gui_scale(width: u32, height: u32) -> u32 {
+    gui_scale_for(width, height, 0)
+}
+
+pub(crate) fn gui_scale_for(width: u32, height: u32, requested: u32) -> u32 {
     let mut scale = 1;
-    while width / (scale + 1) >= 320 && height / (scale + 1) >= 240 {
+    while scale != requested && width / (scale + 1) >= 320 && height / (scale + 1) >= 240 {
         scale += 1;
     }
     scale
+}
+
+pub(crate) fn next_gui_scale(width: u32, height: u32, current: u32) -> u32 {
+    if current >= gui_scale_for(width, height, 0) {
+        0
+    } else {
+        current + 1
+    }
 }
 
 fn logical_cursor(
@@ -4618,6 +4667,15 @@ mod tests {
                 click(&mut self.menu, event_loop, ButtonId::VideoFullscreen, false);
                 assert!(!self.menu.state.video.fullscreen);
                 assert!(self.menu.window.as_ref().unwrap().fullscreen().is_none());
+                let max_scale = gui_scale(self.menu.size.0, self.menu.size.1);
+                for expected in (1..=max_scale).chain(std::iter::once(0)) {
+                    click(&mut self.menu, event_loop, ButtonId::VideoGuiScale, false);
+                    assert_eq!(self.menu.state.video.gui_scale, expected);
+                    assert_eq!(
+                        self.menu.scale,
+                        if expected == 0 { max_scale } else { expected }
+                    );
+                }
                 click(&mut self.menu, event_loop, ButtonId::VideoInactivity, false);
                 click(&mut self.menu, event_loop, ButtonId::VideoFps, true);
                 assert_eq!(
@@ -4792,6 +4850,97 @@ mod tests {
         assert_eq!(gui_scale(1280, 720), 3);
         assert_eq!(gui_scale(320, 240), 1);
         assert_eq!(gui_scale(1920, 1080), 4);
+        assert_eq!(gui_scale_for(1920, 1080, 1), 1);
+        assert_eq!(gui_scale_for(1920, 1080, 3), 3);
+        assert_eq!(gui_scale_for(1920, 1080, 20), 4);
+        assert_eq!(
+            (0..=4)
+                .map(|value| next_gui_scale(1920, 1080, value))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 0]
+        );
+        assert_eq!(next_gui_scale(320, 240, 200), 0);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java 26.3 and Java 25 JDK"]
+    fn selected_gui_scales_match_java_window_calculation() {
+        use std::{ffi::OsString, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("GuiScaleOracle.java");
+        std::fs::write(
+            &source,
+            r#"
+import java.lang.reflect.*;
+import com.mojang.blaze3d.platform.Window;
+public class GuiScaleOracle {
+  public static void main(String[] args) throws Exception {
+    var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true);
+    var u=(sun.misc.Unsafe)f.get(null); var window=(Window)u.allocateInstance(Window.class);
+    var w=Window.class.getDeclaredField("framebufferWidth"); w.setAccessible(true);
+    var h=Window.class.getDeclaredField("framebufferHeight"); h.setAccessible(true);
+    for(int width:new int[]{1,319,320,639,640,853,1279,1280,1920,2560,3840})
+      for(int height:new int[]{1,239,240,479,480,719,720,1080,1440,2160})
+        for(int requested:new int[]{0,1,2,3,4,5,6,8,100}) {
+          w.setInt(window,width); h.setInt(window,height);
+          System.out.println(window.calculateScale(requested,false));
+        }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp: OsString = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "Java GUI-scale oracle failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GuiScaleOracle"));
+        let mut lines = output.lines();
+        for width in [1, 319, 320, 639, 640, 853, 1279, 1280, 1920, 2560, 3840] {
+            for height in [1, 239, 240, 479, 480, 719, 720, 1080, 1440, 2160] {
+                for requested in [0, 1, 2, 3, 4, 5, 6, 8, 100] {
+                    let expected: u32 = lines.next().unwrap().parse().unwrap();
+                    assert_eq!(
+                        gui_scale_for(width, height, requested),
+                        expected,
+                        "{width}x{height} requested {requested}"
+                    );
+                }
+            }
+        }
+        assert!(lines.next().is_none());
     }
 
     #[test]
@@ -4944,6 +5093,19 @@ mod tests {
     }
 
     #[test]
+    fn software_menu_discards_frames_from_a_previous_gui_scale() {
+        let scene = SoftwareScene {
+            screen: Screen::Video,
+            size: (1280, 720),
+            scale: 3,
+            blur: 5,
+            assets: None,
+        };
+        assert!(scene.matches(Screen::Video, (1280, 720), 3, 5, &None));
+        assert!(!scene.matches(Screen::Video, (1280, 720), 2, 5, &None));
+    }
+
+    #[test]
     fn software_canvas_expansion_handles_partial_last_pixels() {
         for (width, height, scale) in [(10_u32, 8_u32, 3_u32), (15, 11, 4), (7, 7, 1)] {
             let mut canvas = Canvas::new(width / scale, height / scale);
@@ -4974,13 +5136,14 @@ mod tests {
         menu.size = (1280, 720);
         menu.scale = gui_scale(1280, 720);
         let buttons = menu.buttons();
-        let first: Vec<_> = buttons.iter().take(4).map(|button| button.id).collect();
+        let first: Vec<_> = buttons.iter().take(5).map(|button| button.id).collect();
         assert_eq!(
             first,
             [
                 ButtonId::VideoFps,
                 ButtonId::VideoVsync,
                 ButtonId::VideoInactivity,
+                ButtonId::VideoGuiScale,
                 ButtonId::VideoFullscreen
             ]
         );

@@ -1423,6 +1423,16 @@ impl LoadedSession {
     }
 
     fn player_damage(&mut self, amount: f32, source: &'static str, cause: DeathCause) -> bool {
+        self.apply_player_damage(amount, source, cause)
+            .is_some_and(|outcome| outcome.accepted)
+    }
+
+    fn apply_player_damage(
+        &mut self,
+        amount: f32,
+        source: &'static str,
+        cause: DeathCause,
+    ) -> Option<crate::fall::DamageOutcome> {
         let previous_inventory = Arc::clone(&self.inventory);
         let outcome = match self.fall.damage_with_equipment(
             amount,
@@ -1441,11 +1451,11 @@ impl LoadedSession {
                 self.stream_errors
                     .push(format!("player {label} damage: {error:#}"));
                 self.unresolved_player_damage = true;
-                return false;
+                return None;
             }
         };
         if !outcome.accepted {
-            return false;
+            return Some(outcome);
         }
         self.queue_broken_equipment(&previous_inventory);
         self.player_damage_feedback(source, outcome);
@@ -1461,7 +1471,7 @@ impl LoadedSession {
             });
             self.record_last_death();
         }
-        true
+        Some(outcome)
     }
 
     fn player_damage_feedback(&mut self, source: &str, outcome: crate::fall::DamageOutcome) {
@@ -14552,51 +14562,62 @@ impl LoadedSession {
             .regeneration_due(self.player_effect_tick);
         // Java's effect map iteration order is not encoded in player NBT. Keep
         // the other ordering to check whether it can change the saved state.
-        let alternate =
-            (poison_due && regeneration_due).then_some((self.vitals, self.damage_cooldown));
-        let poison_attempted = poison_due && self.vitals.health > 1.0;
-        if self.vitals.health > 1.0
-            && poison_due
-            && let Err(error) = self.fall.damage(
-                1.0,
-                "minecraft:magic",
-                &self.inventory,
-                self.armor.value(),
-                &mut self.vitals,
-                self.game_mode,
-                Some(&mut self.damage_cooldown),
+        let alternate = (poison_due && regeneration_due).then(|| {
+            (
+                self.vitals,
+                self.damage_cooldown,
+                (*self.inventory).clone(),
+                self.armor.clone(),
+                self.level_random.clone(),
             )
-        {
-            self.stream_errors
-                .push(format!("player poison damage: {error:#}"));
-            self.effect_save_invalid = true;
-            self.unresolved_player_damage = true;
-        }
+        });
+        let poison_attempted = poison_due && self.vitals.health > 1.0;
+        let actual_poison = if poison_attempted {
+            let result = self.apply_player_damage(1.0, "minecraft:magic", DeathCause::Magic);
+            if result.is_none() || self.unresolved_player_damage {
+                self.stream_errors
+                    .push("player poison damage could not be resolved".into());
+                self.effect_save_invalid = true;
+            }
+            result
+        } else {
+            Some(crate::fall::DamageOutcome::default())
+        };
         if self.vitals.health < self.vitals.max_health && regeneration_due {
             self.vitals.heal(1.0);
         }
-        if let Some((mut vitals, mut cooldown)) = alternate {
+        if let Some((mut vitals, mut cooldown, mut inventory, mut armor, mut random)) = alternate {
             if vitals.health < vitals.max_health {
                 vitals.heal(1.0);
             }
             let alternate_attempted = vitals.health > 1.0;
             let alternate_damage = if alternate_attempted {
-                self.fall.damage(
+                self.fall.damage_with_equipment(
                     1.0,
                     "minecraft:magic",
-                    &self.inventory,
-                    self.armor.value(),
+                    &mut inventory,
+                    &mut armor,
                     &mut vitals,
                     self.game_mode,
-                    Some(&mut cooldown),
+                    &mut cooldown,
+                    &mut random,
+                    self.item_registry.as_deref(),
                 )
             } else {
-                Ok(())
+                Ok(crate::fall::DamageOutcome::default())
             };
-            if alternate_damage.is_err()
+            if let Ok(outcome) = &alternate_damage
+                && outcome.health_damage > 0.0
+                && let Ok(info) = self.fall.damage_info("minecraft:magic")
+            {
+                vitals.add_exhaustion(info.exhaustion);
+            }
+            if alternate_damage.as_ref().ok() != actual_poison.as_ref()
                 || poison_attempted != alternate_attempted
                 || vitals != self.vitals
                 || cooldown != self.damage_cooldown
+                || inventory != *self.inventory
+                || random.state() != self.level_random.state()
             {
                 self.effect_save_invalid = true;
             }
@@ -38854,7 +38875,7 @@ mod tests {
             let sources: &[&str] = match row["effects"].as_str().unwrap() {
                 "BURNING" => &["lava"],
                 "DROWNING" => &["drown"],
-                "HURT" => &["fall", "starve"],
+                "HURT" => &["fall", "starve", "magic"],
                 _ => panic!("unexpected damage effect"),
             };
             for source in sources {
@@ -38885,6 +38906,7 @@ mod tests {
                         "lava" => ("minecraft:lava", DeathCause::Lava),
                         "drown" => ("minecraft:drown", DeathCause::Drown),
                         "starve" => ("minecraft:starve", DeathCause::Starve),
+                        "magic" => ("minecraft:magic", DeathCause::Magic),
                         _ => unreachable!(),
                     };
                     assert!(test.player_damage(4.0, id, cause));
@@ -42855,21 +42877,30 @@ mod tests {
                         "bypasses_effects",
                         "bypasses_resistance",
                         "bypasses_enchantments",
+                        "no_knockback",
                     ]
                     .into_iter()
                     .map(|name| ResourceId::parse(&format!("minecraft:{name}")))
                     .collect()
+                } else if path == "damage_type" {
+                    Ok(vec![ResourceId::parse("minecraft:magic")?])
                 } else {
                     Ok(vec![])
                 }
             }
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 if path.contains("tags/damage_type/") {
-                    Ok(Some(if path.ends_with("bypasses_armor.json") {
-                        br#"{"values":["minecraft:magic"]}"#.to_vec()
-                    } else {
-                        br#"{"values":[]}"#.to_vec()
-                    }))
+                    Ok(Some(
+                        if path.ends_with("bypasses_armor.json")
+                            || path.ends_with("no_knockback.json")
+                        {
+                            br#"{"values":["minecraft:magic"]}"#.to_vec()
+                        } else {
+                            br#"{"values":[]}"#.to_vec()
+                        },
+                    ))
+                } else if path == "data/minecraft/damage_type/magic.json" {
+                    Ok(Some(br#"{"exhaustion":0.0}"#.to_vec()))
                 } else {
                     Ok(None)
                 }
@@ -42906,6 +42937,12 @@ mod tests {
         session.vitals.health = 1.5;
         session.update(TICK);
         assert_eq!(session.snapshot().vitals.health, 0.5);
+        assert!(
+            session
+                .take_consume_sounds()
+                .iter()
+                .any(|sound| sound.info.event == "entity.player.hurt")
+        );
         assert!(session.snapshot().poison_effect);
         for _ in 0..24 {
             session.update(TICK);
@@ -42923,6 +42960,88 @@ mod tests {
             "{:?}",
             session.stream_errors
         );
+    }
+
+    #[test]
+    fn poison_uses_data_pack_armor_wear_feedback_and_effect_order_audit() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "damage_type" => &["minecraft:magic"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                        "minecraft:no_knockback",
+                    ],
+                    _ => &[],
+                };
+                names.iter().map(|id| ResourceId::parse(id)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/damage_type/magic.json" {
+                    Some(br#"{"exhaustion":0.3,"effects":"burning"}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/no_knockback.json" {
+                    Some(br#"{"values":["minecraft:magic"]}"#.to_vec())
+                } else if path.contains("tags/damage_type/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        let mut test = session();
+        let registry = Arc::new(OxygenEnchantments::load(&mut Data).unwrap());
+        let effect = crate::survival::EffectDuration {
+            ambient: false,
+            visible: true,
+            show_icon: true,
+            amplifier: 0,
+            duration: 50,
+            hidden: None,
+        };
+        test.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                poison: Some(effect.clone()),
+                regeneration: Some(effect),
+                ..Default::default()
+            },
+            Arc::clone(&registry),
+        );
+        test.armor.set_enchantments(registry);
+        let components = Tag::Compound(vec![("minecraft:damage".into(), Tag::Int(164))]);
+        Arc::make_mut(&mut test.inventory).set_slot(
+            PlayerSlot::Armor(0),
+            ItemStack::new("minecraft:iron_helmet".into(), 1, 1, components),
+        );
+        test.set_player_vitals(crate::survival::PlayerVitals {
+            health: 10.0,
+            ..Default::default()
+        });
+        test.update(TICK);
+        assert!(test.inventory.slot(PlayerSlot::Armor(0)).is_none());
+        assert_eq!(test.vitals.health, 10.0);
+        assert_eq!(test.vitals.exhaustion.to_bits(), 0.3_f32.to_bits());
+        assert_eq!(test.take_consume_particles().len(), 5);
+        assert_eq!(
+            test.take_consume_sounds()
+                .iter()
+                .map(|sound| sound.info.event.as_ref())
+                .collect::<Vec<_>>(),
+            ["entity.item.break", "entity.player.hurt_on_fire"]
+        );
+        assert!(!test.effect_save_invalid);
+        assert!(!test.unresolved_player_damage, "{:?}", test.stream_errors);
     }
 
     #[test]
@@ -43115,21 +43234,30 @@ mod tests {
                         "bypasses_effects",
                         "bypasses_resistance",
                         "bypasses_enchantments",
+                        "no_knockback",
                     ]
                     .into_iter()
                     .map(|name| ResourceId::parse(&format!("minecraft:{name}")))
                     .collect()
+                } else if path == "damage_type" {
+                    Ok(vec![ResourceId::parse("minecraft:magic")?])
                 } else {
                     Ok(vec![])
                 }
             }
             fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 if path.contains("tags/damage_type/") {
-                    Ok(Some(if path.ends_with("bypasses_armor.json") {
-                        br#"{"values":["minecraft:magic"]}"#.to_vec()
-                    } else {
-                        br#"{"values":[]}"#.to_vec()
-                    }))
+                    Ok(Some(
+                        if path.ends_with("bypasses_armor.json")
+                            || path.ends_with("no_knockback.json")
+                        {
+                            br#"{"values":["minecraft:magic"]}"#.to_vec()
+                        } else {
+                            br#"{"values":[]}"#.to_vec()
+                        },
+                    ))
+                } else if path == "data/minecraft/damage_type/magic.json" {
+                    Ok(Some(br#"{"exhaustion":0.0}"#.to_vec()))
                 } else {
                     Ok(None)
                 }

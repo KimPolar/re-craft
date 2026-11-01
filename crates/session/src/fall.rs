@@ -407,6 +407,7 @@ impl FallTracker {
                         | "minecraft:stalagmite"
                         | "minecraft:drown"
                         | "minecraft:starve"
+                        | "minecraft:magic"
                 ),
                 _ => false,
             })
@@ -637,7 +638,7 @@ impl FallTracker {
             | "minecraft:campfire"
             | "minecraft:hot_floor" => (0.1, DamageEffects::Burning),
             "minecraft:on_fire" => (0.0, DamageEffects::Burning),
-            "minecraft:fall" | "minecraft:stalagmite" | "minecraft:starve" => {
+            "minecraft:fall" | "minecraft:stalagmite" | "minecraft:starve" | "minecraft:magic" => {
                 (0.0, DamageEffects::Hurt)
             }
             "minecraft:drown" => (0.0, DamageEffects::Drowning),

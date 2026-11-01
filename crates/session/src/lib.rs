@@ -424,6 +424,7 @@ pub enum DeathCause {
     InFire,
     Campfire,
     HotFloor,
+    Magic,
     Starve,
 }
 
@@ -696,6 +697,35 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
+    fn queue_broken_equipment(&mut self, before: &PlayerInventory) {
+        let items: Vec<_> = (0..4)
+            .rev()
+            .filter_map(|index| {
+                let slot = PlayerSlot::Armor(index);
+                if self.inventory.slot(slot).is_none() {
+                    before.slot(slot).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let position = self.motion.position;
+        for item in items {
+            consume_particles::equipment_break(
+                &Arc::new(item),
+                false,
+                position,
+                position + DVec3::Y * f64::from(self.player.pose.eye_height()),
+                self.player.yaw.to_degrees() - 180.0,
+                -self.player.pitch.to_degrees(),
+                self.tick.saturating_add(1),
+                &mut self.player_client_random,
+                &mut self.consume_sounds,
+                &mut self.consume_particles,
+            );
+        }
+    }
+
     fn player_damage_feedback(&mut self, source: &str, outcome: fall::DamageOutcome) {
         if !outcome.accepted {
             return;
@@ -1731,19 +1761,37 @@ impl LocalSession {
         self.food_use
             .prepare(&mut self.inventory, &mut self.vitals, self.game_mode);
         self.process_food_events();
-        if self.vitals.health > 1.0
-            && self.fall.effects().poison_due(self.player_effect_tick)
-            && let Err(error) = self.fall.damage(
+        if self.vitals.health > 1.0 && self.fall.effects().poison_due(self.player_effect_tick) {
+            let before = Arc::clone(&self.inventory);
+            match self.fall.damage_with_equipment(
                 1.0,
                 "minecraft:magic",
-                &self.inventory,
-                self.armor.value(),
+                Arc::make_mut(&mut self.inventory),
+                &mut self.armor,
                 &mut self.vitals,
                 self.game_mode,
-                Some(&mut self.damage_cooldown),
-            )
-        {
-            eprintln!("player poison damage: {error:#}");
+                &mut self.damage_cooldown,
+                &mut self.level_random,
+                None,
+            ) {
+                Ok(outcome) if outcome.accepted => {
+                    self.queue_broken_equipment(&before);
+                    self.player_damage_feedback("minecraft:magic", outcome);
+                    if self.vitals.health <= 0.0 && self.death.is_none() {
+                        self.death = Some(DeathInfo {
+                            cause: DeathCause::Magic,
+                            tick: self.tick.saturating_add(1),
+                            score: self.score,
+                            show_message: true,
+                            inventory_unresolved: false,
+                            respawn_pending: false,
+                            can_respawn: false,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("player poison damage: {error:#}"),
+            }
         }
         if self.vitals.health < self.vitals.max_health
             && self
@@ -2740,6 +2788,78 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_poison_damage_feedback_is_independent_of_frame_rate() {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "damage_type" => &["minecraft:magic"],
+                    "tags/damage_type" => &[
+                        "minecraft:bypasses_cooldown",
+                        "minecraft:bypasses_armor",
+                        "minecraft:bypasses_effects",
+                        "minecraft:bypasses_enchantments",
+                    ],
+                    _ => &[],
+                };
+                names.iter().map(|name| ResourceId::parse(name)).collect()
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/damage_type/magic.json" {
+                    Some(br#"{"exhaustion":0.0}"#.to_vec())
+                } else if path == "data/minecraft/tags/damage_type/bypasses_armor.json" {
+                    Some(br#"{"values":["minecraft:magic"]}"#.to_vec())
+                } else if path.contains("tags/damage_type/") {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+        }
+        let registry =
+            Arc::new(native_resources::enchantments::OxygenEnchantments::load(&mut Data).unwrap());
+        for frames in [1, 5] {
+            let mut test = LocalSession::demo();
+            let effect = survival::EffectDuration {
+                ambient: false,
+                visible: true,
+                show_icon: true,
+                amplifier: 0,
+                duration: 25,
+                hidden: None,
+            };
+            test.fall.configure(
+                player_data::SavedAttribute::with_base(3.0),
+                player_data::SavedAttribute::with_base(1.0),
+                survival::FallEffects {
+                    poison: Some(effect),
+                    ..Default::default()
+                },
+                Arc::clone(&registry),
+            );
+            test.vitals.health = 10.0;
+            test.player_client_random = native_core::random::LegacyRandom::new(123);
+            for _ in 0..frames {
+                test.update(TICK / frames);
+            }
+            assert_eq!(test.vitals.health, 9.0);
+            let sounds = test.take_consume_sounds();
+            assert_eq!(sounds.len(), 1);
+            assert_eq!(sounds[0].info.event, "entity.player.hurt");
+            let mut expected = native_core::random::LegacyRandom::new(123);
+            assert_eq!(
+                sounds[0].info.pitch.to_bits(),
+                client_damage_pitch(&mut expected).to_bits()
+            );
+            assert_eq!(test.player_client_random.state(), expected.state());
+        }
+    }
 
     #[test]
     fn demo_starvation_feedback_respects_absorption_cooldown_and_death() {

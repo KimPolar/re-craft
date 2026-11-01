@@ -103,6 +103,7 @@ impl ArmorValues {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ArmorTracker {
     armor: SavedAttribute,
     toughness: SavedAttribute,

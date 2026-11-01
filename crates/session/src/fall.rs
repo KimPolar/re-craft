@@ -189,6 +189,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::NightVision => self.effects.night_vision = None,
             crate::survival::FoodStatusKind::Regeneration => self.effects.regeneration = None,
             crate::survival::FoodStatusKind::JumpBoost => self.effects.jump_boost = None,
+            crate::survival::FoodStatusKind::SlowFalling => self.effects.slow_falling = None,
             crate::survival::FoodStatusKind::Speed => self.effects.speed = None,
             crate::survival::FoodStatusKind::Slowness => self.effects.slowness = None,
             crate::survival::FoodStatusKind::WaterBreathing => {
@@ -219,6 +220,7 @@ impl FallTracker {
             crate::survival::FoodStatusKind::NightVision => &mut self.effects.night_vision,
             crate::survival::FoodStatusKind::Regeneration => &mut self.effects.regeneration,
             crate::survival::FoodStatusKind::JumpBoost => &mut self.effects.jump_boost,
+            crate::survival::FoodStatusKind::SlowFalling => &mut self.effects.slow_falling,
             crate::survival::FoodStatusKind::Speed => &mut self.effects.speed,
             crate::survival::FoodStatusKind::Slowness => &mut self.effects.slowness,
             crate::survival::FoodStatusKind::WaterBreathing => {

@@ -1882,6 +1882,10 @@ public class PaletteOracle {
             ("swiftness", [51.0 / 255.0, 235.0 / 255.0, 1.0]),
             ("regeneration", [205.0 / 255.0, 92.0 / 255.0, 171.0 / 255.0]),
             ("leaping", [253.0 / 255.0, 1.0, 132.0 / 255.0]),
+            (
+                "slow_falling",
+                [243.0 / 255.0, 207.0 / 255.0, 185.0 / 255.0],
+            ),
             ("strength", [1.0, 199.0 / 255.0, 0.0]),
         ] {
             let components = Tag::Compound(vec![(

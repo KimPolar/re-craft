@@ -1055,6 +1055,9 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::JumpBoost => {
                                     self.fall.effects().jump_boost.is_some()
                                 }
+                                crate::survival::FoodStatusKind::SlowFalling => {
+                                    self.fall.effects().slow_falling.is_some()
+                                }
                                 crate::survival::FoodStatusKind::Speed => {
                                     self.fall.effects().speed.is_some()
                                 }
@@ -39614,6 +39617,8 @@ mod tests {
             "leaping",
             "long_leaping",
             "strong_leaping",
+            "slow_falling",
+            "long_slow_falling",
         ] {
             let original = NamedTag {
                 name: "".into(),
@@ -39685,6 +39690,13 @@ mod tests {
                             .value(-1024.0, 1024.0)
                             .unwrap(),
                         4.0 + f64::from(effect.amplifier),
+                    );
+                }
+                "slow_falling" | "long_slow_falling" => {
+                    let effect = session.fall.effects().slow_falling.as_ref().unwrap();
+                    assert_eq!(
+                        (effect.duration, effect.amplifier),
+                        (if potion == "slow_falling" { 1800 } else { 4800 }, 0)
                     );
                 }
                 "slowness" | "long_slowness" | "strong_slowness" | "swiftness"
@@ -39847,6 +39859,44 @@ mod tests {
         assert!(
             session.fall.effects().jump_boost.is_none() && session.fall.effects().speed.is_none()
         );
+    }
+
+    #[test]
+    fn slow_falling_potion_changes_air_movement_and_fall_distance() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let mut session = session();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:potion".into(),
+                1,
+                1,
+                Tag::Compound(vec![(
+                    "minecraft:potion_contents".into(),
+                    Tag::Compound(vec![(
+                        "potion".into(),
+                        Tag::String("minecraft:slow_falling".into()),
+                    )]),
+                )]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        for _ in 0..32 {
+            session.update(TICK);
+        }
+        assert!(session.fall.effects().slow_falling.is_some());
+        session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+        session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+        session.motion.on_ground = false;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = false;
+        session.fall_distance = 20.0;
+        session.update(TICK);
+        assert!((session.motion.velocity.y - (-0.21 * f64::from(0.98_f32))).abs() < 1e-12);
+        assert!(session.fall_distance < 1.0);
     }
 
     #[test]

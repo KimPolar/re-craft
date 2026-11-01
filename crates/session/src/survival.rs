@@ -104,6 +104,7 @@ pub(crate) enum FoodStatusKind {
     WaterBreathing,
     Regeneration,
     JumpBoost,
+    SlowFalling,
     Speed,
     Slowness,
 }
@@ -151,6 +152,8 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::Regeneration)
     } else if value.matches("minecraft:jump_boost") || value.matches("jump_boost") {
         Some(FoodStatusKind::JumpBoost)
+    } else if value.matches("minecraft:slow_falling") || value.matches("slow_falling") {
+        Some(FoodStatusKind::SlowFalling)
     } else if value.matches("minecraft:speed") || value.matches("speed") {
         Some(FoodStatusKind::Speed)
     } else if value.matches("minecraft:slowness") || value.matches("slowness") {
@@ -205,6 +208,8 @@ pub(crate) fn inventory_potion_contents(components: &Tag) -> Option<()> {
             | "leaping"
             | "long_leaping"
             | "strong_leaping"
+            | "slow_falling"
+            | "long_slow_falling"
             | "strength"
     )
     .then_some(())
@@ -233,6 +238,8 @@ pub(crate) fn potion_effects(components: &Tag) -> Option<Vec<StatusApplication>>
         "leaping" => (FoodStatusKind::JumpBoost, 3600, 0),
         "long_leaping" => (FoodStatusKind::JumpBoost, 9600, 0),
         "strong_leaping" => (FoodStatusKind::JumpBoost, 1800, 1),
+        "slow_falling" => (FoodStatusKind::SlowFalling, 1800, 0),
+        "long_slow_falling" => (FoodStatusKind::SlowFalling, 4800, 0),
         "slowness" => (FoodStatusKind::Slowness, 1800, 0),
         "long_slowness" => (FoodStatusKind::Slowness, 4800, 0),
         "strong_slowness" => (FoodStatusKind::Slowness, 400, 3),
@@ -261,6 +268,7 @@ pub fn potion_color(components: &Tag) -> Option<u32> {
         "swiftness" | "long_swiftness" | "strong_swiftness" => Some(0x33ebff),
         "regeneration" | "long_regeneration" | "strong_regeneration" => Some(0xcd5cab),
         "leaping" | "long_leaping" | "strong_leaping" => Some(0xfdff84),
+        "slow_falling" | "long_slow_falling" => Some(0xf3cfb9),
         "strength" => Some(0xffc700),
         _ => None,
     }
@@ -1714,7 +1722,7 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 460);
+        assert_eq!(rows.len(), 500);
         for row in rows {
             let name = row["potion"].as_str().unwrap();
             let components = Tag::Compound(vec![(
@@ -1785,6 +1793,7 @@ mod tests {
                     FoodStatusKind::Poison => "minecraft:poison",
                     FoodStatusKind::Regeneration => "minecraft:regeneration",
                     FoodStatusKind::JumpBoost => "minecraft:jump_boost",
+                    FoodStatusKind::SlowFalling => "minecraft:slow_falling",
                     FoodStatusKind::Speed => "minecraft:speed",
                     FoodStatusKind::Slowness => "minecraft:slowness",
                     FoodStatusKind::Hunger => "minecraft:hunger",
@@ -2797,6 +2806,7 @@ mod tests {
                                 | FoodStatusKind::WaterBreathing
                                 | FoodStatusKind::Regeneration
                                 | FoodStatusKind::JumpBoost
+                                | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
                                 | FoodStatusKind::Slowness => {
                                     unreachable!()
@@ -2818,6 +2828,7 @@ mod tests {
                                 | FoodStatusKind::WaterBreathing
                                 | FoodStatusKind::Regeneration
                                 | FoodStatusKind::JumpBoost
+                                | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
                                 | FoodStatusKind::Slowness => {
                                     unreachable!()

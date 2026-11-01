@@ -60,6 +60,15 @@ pub fn jump_power(strength: f64, block_factor: f32, boost: Option<u8>) -> f32 {
     strength as f32 * block_factor + boost
 }
 
+/// LivingEntity.getEffectiveGravity uses the velocity at the point of travel.
+fn effective_gravity(gravity: f64, slow_falling: bool, vertical_velocity: f64) -> f64 {
+    if slow_falling && vertical_velocity <= 0.0 {
+        gravity.min(0.01)
+    } else {
+        gravity
+    }
+}
+
 /// Vanilla block jump factors are independent of block state.
 pub fn block_jump_factor(block: &str) -> f32 {
     if block == "minecraft:honey_block" {
@@ -440,11 +449,7 @@ impl MotionState {
         let vertical_velocity = if let Some(amplifier) = levitation {
             self.velocity.y + (0.05 * (f64::from(amplifier) + 1.0) - self.velocity.y) * 0.2
         } else {
-            let gravity = if slow_falling && self.velocity.y <= 0.0 {
-                gravity.min(0.01)
-            } else {
-                gravity
-            };
+            let gravity = effective_gravity(gravity, slow_falling, self.velocity.y);
             self.velocity.y - gravity
         };
         self.velocity.y = vertical_velocity * f64::from(vertical_drag);
@@ -520,11 +525,7 @@ impl MotionState {
             }
         }
         let falling = self.velocity.y <= 0.0;
-        let gravity = if slow_falling && falling {
-            gravity.min(0.01)
-        } else {
-            gravity
-        };
+        let gravity = effective_gravity(gravity, slow_falling, self.velocity.y);
         let mut horizontal_drag = if input.sprinting { 0.9_f32 } else { 0.8_f32 };
         let mut acceleration = 0.02_f32;
         if fluid.kind == FluidKind::Water {
@@ -761,6 +762,113 @@ pub fn java_sin(radians: f64, cosine: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_falling_gravity_uses_velocity_after_air_collision() {
+        let input = MovementInput {
+            forward: 0.0,
+            right: 0.0,
+            yaw_degrees: 0.0,
+            jump: false,
+            sprinting: false,
+            using_item: false,
+            moving_slowly: false,
+        };
+        for slow in [false, true] {
+            let mut motion = MotionState {
+                position: DVec3::ZERO,
+                velocity: DVec3::new(0.0, 0.2, 0.0),
+                on_ground: false,
+                jump_delay: 0,
+            };
+            motion.tick_resolved_with_effects(
+                input,
+                0.6,
+                0.1_f32,
+                0.42_f32,
+                0.08,
+                slow,
+                None,
+                |_, requested, _| (requested, DVec3::new(requested.x, 0.0, requested.z)),
+            );
+            let gravity = if slow { 0.01 } else { 0.08 };
+            assert_eq!(
+                motion.velocity.y.to_bits(),
+                (-gravity * f64::from(0.98_f32)).to_bits()
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn slow_falling_gravity_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("SlowFallingGravityOracle.java");
+        let output = temp.path().join("gravity.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SlowFallingGravityOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("SlowFallingGravityOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 144);
+        for row in rows {
+            let gravity = if row["no_gravity"].as_bool().unwrap() {
+                0.0
+            } else {
+                row["gravity"].as_f64().unwrap()
+            };
+            let actual = effective_gravity(
+                gravity,
+                row["effect"].as_bool().unwrap(),
+                row["vertical"].as_f64().unwrap(),
+            );
+            assert_eq!(
+                actual.to_bits(),
+                row["bits"].as_str().unwrap().parse::<i64>().unwrap() as u64,
+                "{row}"
+            );
+        }
+    }
 
     #[test]
     fn flying_jump_does_not_apply_ground_jump_impulse() {

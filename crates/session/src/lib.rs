@@ -1678,6 +1678,10 @@ impl LocalSession {
         if input.jump && self.motion.on_ground && self.motion.jump_delay <= 1 {
             self.vitals.record_jump(self.game_mode, input.sprinting);
         }
+        let slow_falling = self.fall.effects().slow_falling.is_some();
+        if slow_falling {
+            self.fall_distance = 0.0;
+        }
         let before_move = self.motion.position;
         let (major_collision, actual) = if self.game_mode == GameMode::Spectator {
             (
@@ -1721,7 +1725,7 @@ impl LocalSession {
                         .map(|effect| effect.amplifier),
                 ),
                 0.08,
-                false,
+                slow_falling,
                 None,
                 |position, requested, on_ground| {
                     let adjusted = movement::back_off(
@@ -2566,6 +2570,33 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_slow_falling_reduces_gravity_and_resets_fall_distance() {
+        let step = |boost| {
+            let mut session = LocalSession::demo();
+            session.motion.position.y += 10.0;
+            session.motion.velocity.y = -0.2;
+            session.motion.on_ground = false;
+            session.fall_distance = 20.0;
+            if boost {
+                session.fall.add_status(survival::StatusApplication {
+                    kind: survival::FoodStatusKind::SlowFalling,
+                    duration: 100,
+                    amplifier: 0,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                });
+            }
+            session.update(TICK);
+            (session.motion.velocity.y, session.fall_distance)
+        };
+        let (normal_velocity, normal_distance) = step(false);
+        let (slow_velocity, slow_distance) = step(true);
+        assert!(slow_velocity > normal_velocity);
+        assert!(slow_distance < 1.0 && normal_distance > 20.0);
+    }
 
     #[test]
     fn demo_jump_uses_boost_effect() {

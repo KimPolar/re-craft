@@ -441,6 +441,117 @@ struct EnchantmentEffect {
     amount: LevelValue,
 }
 
+/// The display-relevant attribute effects of one data-driven enchantment.
+/// This parser deliberately covers every attribute, including ones that are
+/// not yet simulated by the player physics implementation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TooltipEnchantment {
+    slots: Vec<String>,
+    effects: Vec<EnchantmentEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TooltipAttributeModifier {
+    pub attribute: ResourceId,
+    pub modifier: AttributeModifier,
+}
+
+impl TooltipEnchantment {
+    pub fn groups(&self) -> &[String] {
+        &self.slots
+    }
+
+    pub fn parse(value: &Value) -> Result<Self> {
+        let slots = value
+            .get("slots")
+            .and_then(Value::as_array)
+            .context("enchantment has no slot list")?
+            .iter()
+            .map(|slot| {
+                let slot = slot.as_str().context("invalid enchantment slot")?;
+                ensure!(
+                    EquipmentSlot::valid_group(slot),
+                    "unknown enchantment slot {slot}"
+                );
+                Ok(slot.to_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let effects = match value.get("effects").and_then(|effects| {
+            effects
+                .get("minecraft:attributes")
+                .or_else(|| effects.get("attributes"))
+        }) {
+            None => Vec::new(),
+            Some(entries) => entries
+                .as_array()
+                .context("invalid enchantment attribute list")?
+                .iter()
+                .map(|entry| {
+                    let attribute = ResourceId::parse(
+                        entry
+                            .get("attribute")
+                            .and_then(Value::as_str)
+                            .context("missing attribute")?,
+                    )?;
+                    let id = ResourceId::parse(
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .context("missing modifier id")?,
+                    )?;
+                    let operation = AttributeOperation::parse(
+                        entry
+                            .get("operation")
+                            .and_then(Value::as_str)
+                            .context("missing modifier operation")?,
+                    )?;
+                    let amount = LevelValue::parse(
+                        entry.get("amount").context("missing modifier amount")?,
+                        0,
+                    )?;
+                    Ok(EnchantmentEffect {
+                        attribute,
+                        id,
+                        operation,
+                        amount,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        Ok(Self { slots, effects })
+    }
+
+    /// Java checks exact slot groups for tooltip display, not slot overlap.
+    pub fn modifiers_for_group(
+        &self,
+        group: &str,
+        level: u32,
+    ) -> Result<Vec<TooltipAttributeModifier>> {
+        ensure!((1..=255).contains(&level), "invalid enchantment level");
+        if !self.slots.iter().any(|slot| slot == group) {
+            return Ok(Vec::new());
+        }
+        self.effects
+            .iter()
+            .map(|effect| {
+                let amount = effect.amount.calculate(level);
+                ensure!(amount.is_finite(), "nonfinite enchantment modifier");
+                Ok(TooltipAttributeModifier {
+                    attribute: effect.attribute.clone(),
+                    modifier: AttributeModifier {
+                        id: ResourceId {
+                            namespace: effect.id.namespace.clone(),
+                            path: format!("{}/{group}", effect.id.path),
+                        },
+                        operation: effect.operation,
+                        amount: f64::from(amount),
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Definition {
     slots: Vec<String>,
@@ -1242,6 +1353,30 @@ mod tests {
                 .map(|value| serde_json::to_vec(value).map_err(Into::into))
                 .collect()
         }
+    }
+
+    #[test]
+    fn tooltip_attribute_effects_use_exact_groups_and_all_attributes() {
+        let enchantment = TooltipEnchantment::parse(&json!({
+            "slots":["armor","head"],
+            "effects":{"attributes":[
+                {"id":"example:damage","attribute":"minecraft:attack_damage","amount":{"type":"minecraft:linear","base":1.0,"per_level_above_first":2.0},"operation":"add_value"},
+                {"id":"example:sweep","attribute":"minecraft:sweeping_damage_ratio","amount":{"type":"minecraft:fraction","numerator":2.0,"denominator":3.0},"operation":"add_multiplied_total"}
+            ]}
+        })).unwrap();
+        let effects = enchantment.modifiers_for_group("armor", 3).unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0].attribute.path, "attack_damage");
+        assert_eq!(effects[0].modifier.id.path, "damage/armor");
+        assert_eq!(effects[0].modifier.amount, 5.0);
+        assert_eq!(effects[1].modifier.amount, f64::from(2.0_f32 / 3.0_f32));
+        assert!(
+            enchantment
+                .modifiers_for_group("feet", 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(enchantment.modifiers_for_group("head", 0).is_err());
     }
 
     #[test]

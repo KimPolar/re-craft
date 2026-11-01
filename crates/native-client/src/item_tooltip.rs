@@ -177,7 +177,12 @@ pub fn lines(
         }
     }
     if !hidden(display, "minecraft:attribute_modifiers") {
-        lines.extend(crate::attribute_tooltip::lines(item, assets, attack_base));
+        lines.extend(crate::attribute_tooltip::lines(
+            item,
+            assets,
+            attack_base,
+            enchantments,
+        ));
     }
     lines
 }
@@ -502,6 +507,13 @@ mod tests {
                         cases.push(case);
                     }
                 }
+                for item in ["apple", "diamond_sword", "enchanted_book"] {
+                    for player in [false, true] {
+                        let mut values = serde_json::Map::new();
+                        values.insert(enchantment.to_owned(), serde_json::json!(level));
+                        cases.push(serde_json::json!({"id":format!("minecraft:{item}"),"attributes_only":true,"player":player,"enchantments":values}));
+                    }
+                }
             }
         }
         cases.push(serde_json::json!({"id":"minecraft:apple","potion":"swiftness","enchantments":{"minecraft:mending":1,"minecraft:sharpness":5,"minecraft:binding_curse":1},"stored_enchantments":{"minecraft:vanishing_curse":1,"minecraft:efficiency":3},"lore":["Lore"]}));
@@ -535,6 +547,8 @@ mod tests {
         }
         cases.push(serde_json::json!({"id":"minecraft:diamond_sword","attributes_only":true,"player":true,"remove_attributes":true}));
         cases.push(serde_json::json!({"id":"minecraft:diamond_sword","attributes_only":true,"player":true,"hide_attributes":true}));
+        cases.push(serde_json::json!({"id":"minecraft:apple","attributes_only":true,"player":true,"enchantments":{"minecraft:sweeping_edge":3},"hide_enchantments":true}));
+        cases.push(serde_json::json!({"id":"minecraft:enchanted_book","attributes_only":true,"player":true,"stored_enchantments":{"minecraft:sweeping_edge":3}}));
         for amount in [
             -1234.555, -1.675, -0.005, -0.0, 0.0, 0.005, 0.015, 1.005, 1.675, 1234.555,
         ] {
@@ -737,7 +751,12 @@ mod tests {
                 if case["hide_attributes"].as_bool() == Some(true) {
                     vec![]
                 } else {
-                    crate::attribute_tooltip::lines(&item, &assets, attack_base)
+                    crate::attribute_tooltip::lines(
+                        &item,
+                        &assets,
+                        attack_base,
+                        &assets.enchantments,
+                    )
                 }
             } else {
                 lines(&item, &assets, &assets.enchantments, attack_base)
@@ -766,9 +785,10 @@ mod tests {
             } else {
                 1
             };
-            if potion_case
-                && !case["enchantments"].is_object()
-                && !case["stored_enchantments"].is_object()
+            if attribute_case
+                || (potion_case
+                    && !case["enchantments"].is_object()
+                    && !case["stored_enchantments"].is_object())
             {
                 assert_eq!(actual.len(), expected_lines.len(), "{case} {expected}");
             }

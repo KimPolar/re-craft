@@ -46,8 +46,16 @@ public class ItemTooltipOracle {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var lookup=VanillaRegistries.createWorldLookup(); var registries=VanillaRegistries.createReloadableLookup(lookup);
     for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
+    var cases=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
     var enchantments=new MappedRegistry<Enchantment>(Registries.ENCHANTMENT,Lifecycle.stable());
     registries.lookupOrThrow(Registries.ENCHANTMENT).listElements().forEach(holder -> enchantments.register(holder.key(),holder.value(),RegistrationInfo.BUILT_IN));
+    for(var element:cases) if(element.getAsJsonObject().has("custom_enchantment")) {
+      var key=ResourceKey.create(Registries.ENCHANTMENT,Identifier.parse("example:warp"));
+      if(enchantments.get(key).isEmpty()) {
+        var value=Enchantment.DIRECT_CODEC.parse(registries.createSerializationContext(JsonOps.INSTANCE),element.getAsJsonObject().get("custom_enchantment")).getOrThrow();
+        enchantments.register(key,value,RegistrationInfo.BUILT_IN);
+      }
+    }
     var tags=new java.util.HashMap<net.minecraft.tags.TagKey<Enchantment>,java.util.List<Holder<Enchantment>>>();
     for(var tag:java.util.List.of(EnchantmentTags.TOOLTIP_ORDER,EnchantmentTags.CURSE)) {
       var path="data/minecraft/tags/enchantment/"+tag.location().getPath()+".json";
@@ -61,7 +69,6 @@ public class ItemTooltipOracle {
     enchantments.bindTags(tags); enchantments.freeze();
     var tooltipRegistries=HolderLookup.Provider.create(java.util.stream.Stream.concat(registries.listRegistries().filter(registry -> !registry.key().equals(Registries.ENCHANTMENT)),java.util.stream.Stream.of(enchantments)));
     var context=Item.TooltipContext.of(tooltipRegistries);
-    var cases=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
     var result=new JsonArray();
     for(var element:cases) {
       var input=element.getAsJsonObject();

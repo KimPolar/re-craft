@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 struct Definition {
     description: Tag,
     max_level: i32,
+    attributes: Option<native_resources::enchantments::TooltipEnchantment>,
 }
 
 #[derive(Default)]
@@ -146,6 +147,8 @@ impl Registry {
                 Definition {
                     description,
                     max_level,
+                    attributes: native_resources::enchantments::TooltipEnchantment::parse(&value)
+                        .ok(),
                 },
             );
         }
@@ -164,6 +167,49 @@ impl Registry {
             order,
             curses,
         })
+    }
+
+    pub fn attribute_modifiers(
+        &self,
+        item: &native_session::inventory::ItemStack,
+    ) -> Vec<(
+        String,
+        native_resources::enchantments::TooltipAttributeModifier,
+    )> {
+        let Some(Tag::Compound(entries)) = item.components().get("minecraft:enchantments") else {
+            return Vec::new();
+        };
+        let mut output = Vec::new();
+        for (id, value) in entries {
+            let Ok(id) = String::from_utf16(&id.0) else {
+                continue;
+            };
+            let Ok(id) = ResourceId::parse(&id) else {
+                continue;
+            };
+            let Some(level) = value
+                .as_java_int()
+                .and_then(|level| u32::try_from(level).ok())
+            else {
+                continue;
+            };
+            let Some(attributes) = self
+                .definitions
+                .get(&qualified(&id))
+                .and_then(|definition| definition.attributes.as_ref())
+            else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for group in attributes.groups() {
+                if seen.insert(group)
+                    && let Ok(values) = attributes.modifiers_for_group(group, level)
+                {
+                    output.extend(values.into_iter().map(|value| (group.clone(), value)));
+                }
+            }
+        }
+        output
     }
 
     pub fn lines(&self, value: &Tag, assets: &MenuAssets) -> Vec<Vec<Span>> {
@@ -293,7 +339,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             pack.join("data/example/enchantment/warp.json"),
-            br#"{"description":{"text":"Warp","color":"yellow"},"max_level":3}"#,
+            br#"{"description":{"text":"Warp","color":"yellow"},"supported_items":["minecraft:apple"],"weight":1,"max_level":3,"min_cost":{"base":1,"per_level_above_first":1},"max_cost":{"base":5,"per_level_above_first":1},"anvil_cost":1,"slots":["mainhand","head"],"effects":{"minecraft:attributes":[{"id":"example:power","attribute":"minecraft:attack_damage","amount":{"type":"minecraft:linear","base":1.0,"per_level_above_first":2.0},"operation":"add_value"},{"id":"example:gravity","attribute":"minecraft:gravity","amount":{"type":"minecraft:fraction","numerator":2.0,"denominator":3.0},"operation":"add_multiplied_total"}]}}"#,
         )
         .unwrap();
         std::fs::write(pack.join("data/minecraft/tags/enchantment/tooltip_order.json"), br##"{"replace":true,"values":["example:warp","#example:group",{"id":"#example:missing","required":false},"minecraft:sharpness"]}"##).unwrap();
@@ -330,7 +376,13 @@ mod tests {
         );
         assert!(registry.curses.contains("example:warp"));
         assert!(!registry.curses.contains("minecraft:binding_curse"));
-        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        let english = ResourceStack::open(&game)
+            .unwrap()
+            .read_asset("assets/minecraft/lang/en_us.json")
+            .unwrap()
+            .unwrap();
+        assets.language = serde_json::from_slice(&english).unwrap();
         let entries = Tag::Compound(vec![
             ("minecraft:sharpness".into(), Tag::Int(1)),
             ("minecraft:binding_curse".into(), Tag::Int(1)),
@@ -345,5 +397,155 @@ mod tests {
         assert_eq!(lines[2][0].text, "Mystic");
         assert_eq!(lines[2][0].style.color, Some([85, 255, 85]));
         assert_eq!(lines[2].len(), 1);
+        let enchanted = native_session::inventory::ItemStack::new(
+            "minecraft:apple".into(),
+            1,
+            64,
+            Tag::Compound(vec![(
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("example:warp".into(), Tag::Int(3))]),
+            )]),
+        )
+        .unwrap();
+        let values = registry.attribute_modifiers(&enchanted);
+        let mainhand: Vec<_> = values
+            .iter()
+            .filter(|(group, _)| group == "mainhand")
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(mainhand.len(), 2);
+        assert_eq!(mainhand[0].attribute.path, "attack_damage");
+        assert_eq!(mainhand[0].modifier.amount, 5.0);
+        assert_eq!(mainhand[1].modifier.amount, f64::from(2.0_f32 / 3.0_f32));
+        assert_eq!(
+            values
+                .iter()
+                .filter(|(group, _)| group == "head")
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            mainhand
+                .iter()
+                .cloned()
+                .map(|mut modifier| {
+                    modifier.modifier.id.path =
+                        modifier.modifier.id.path.replace("/mainhand", "/head");
+                    modifier
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(!values.iter().any(|(group, _)| group == "armor"));
+        let displayed =
+            crate::attribute_tooltip::lines(&enchanted, &assets, Some([1.0, 4.0]), &registry);
+        assert_eq!(displayed.len(), 8);
+        assert_eq!(displayed[2][0].text, "+5 Attack Damage");
+        assert_eq!(displayed[3][0].text, "+66.67% Gravity");
+
+        // Load the same synthetic enchantment through Java's real codec and
+        // compare the resulting attribute tooltip text and colors.
+        let definition: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(pack.join("data/example/enchantment/warp.json")).unwrap(),
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemTooltipOracle.java");
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ItemTooltipOracle.java"),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        for id in ["minecraft:apple", "minecraft:diamond_sword"] {
+            for level in [1, 2, 3, 255] {
+                for player in [false, true] {
+                    cases.push(serde_json::json!({"id":id,"attributes_only":true,"player":player,"custom_enchantment":definition,"enchantments":{"example:warp":level}}));
+                }
+            }
+        }
+        std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+        for command in [
+            std::process::Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            std::process::Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ItemTooltipOracle")
+                .arg(&input)
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for (case, expected) in cases.iter().zip(expected) {
+            let level = case["enchantments"]["example:warp"].as_i64().unwrap() as i32;
+            let item = native_session::inventory::ItemStack::new(
+                case["id"].as_str().unwrap().into(),
+                1,
+                64,
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("example:warp".into(), Tag::Int(level))]),
+                )]),
+            )
+            .unwrap();
+            let actual = crate::attribute_tooltip::lines(
+                &item,
+                &assets,
+                case["player"].as_bool().unwrap().then_some([1.0, 4.0]),
+                &registry,
+            );
+            let expected = expected["spans"].as_array().unwrap();
+            assert_eq!(actual.len(), expected.len(), "{case}");
+            for (actual, expected) in actual.iter().zip(expected) {
+                let actual: Vec<_> = actual
+                    .iter()
+                    .flat_map(|span| {
+                        span.text
+                            .chars()
+                            .map(move |ch| (ch, span.style.color.unwrap_or([255, 255, 255])))
+                    })
+                    .collect();
+                let expected: Vec<_> = expected
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|span| {
+                        let rgb = span["color"].as_u64().unwrap() as u32;
+                        let color = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                        span["text"]
+                            .as_str()
+                            .unwrap()
+                            .chars()
+                            .map(move |ch| (ch, color))
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "{case}");
+            }
+        }
     }
 }

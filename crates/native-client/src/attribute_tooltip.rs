@@ -265,8 +265,14 @@ fn decimal(value: f64) -> String {
     output
 }
 
-pub fn lines(item: &ItemStack, assets: &MenuAssets, base: Option<[f64; 2]>) -> Vec<Vec<Span>> {
-    let modifiers = match item.components().get("minecraft:attribute_modifiers") {
+pub fn lines(
+    item: &ItemStack,
+    assets: &MenuAssets,
+    base: Option<[f64; 2]>,
+    enchantments: &crate::enchantment_tooltip::Registry,
+) -> Vec<Vec<Span>> {
+    let mut modifiers: Vec<Modifier> = match item.components().get("minecraft:attribute_modifiers")
+    {
         Some(Tag::List { values, .. }) => values.iter().filter_map(parse_modifier).collect(),
         Some(_) => Vec::new(),
         None if item
@@ -278,6 +284,28 @@ pub fn lines(item: &ItemStack, assets: &MenuAssets, base: Option<[f64; 2]>) -> V
         }
         None => default_modifiers(item.id()),
     };
+    for (slot, effect) in enchantments.attribute_modifiers(item) {
+        if effect.attribute.namespace != "minecraft" {
+            continue;
+        }
+        use native_resources::enchantments::AttributeOperation;
+        modifiers.push(Modifier {
+            attribute: effect.attribute.path,
+            id: format!(
+                "{}:{}",
+                effect.modifier.id.namespace, effect.modifier.id.path
+            ),
+            slot,
+            amount: effect.modifier.amount,
+            operation: match effect.modifier.operation {
+                AttributeOperation::AddValue => 0,
+                AttributeOperation::AddMultipliedBase => 1,
+                AttributeOperation::AddMultipliedTotal => 2,
+            },
+            hidden: false,
+            override_text: None,
+        });
+    }
     let mut output = Vec::new();
     for slot in [
         "any", "mainhand", "offhand", "hand", "feet", "legs", "chest", "head", "armor", "body",

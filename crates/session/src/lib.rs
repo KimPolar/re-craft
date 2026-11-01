@@ -701,8 +701,8 @@ impl LocalSession {
                     survival::FoodRandomEvent::StatusGroup { effects, .. }
                     | survival::FoodRandomEvent::PotionEffects(effects) => {
                         for effect in effects {
-                            if effect.kind == survival::FoodStatusKind::WaterBreathing {
-                                self.breathing_effects.add_water_breathing(effect);
+                            if effect.kind.is_breathing() {
+                                self.breathing_effects.add_status(effect);
                             } else {
                                 self.fall.add_status(effect);
                             }
@@ -710,8 +710,8 @@ impl LocalSession {
                     }
                     survival::FoodRandomEvent::RemoveStatuses(effects) => {
                         for kind in effects {
-                            if kind == survival::FoodStatusKind::WaterBreathing {
-                                self.breathing_effects.water_breathing = None;
+                            if kind.is_breathing() {
+                                self.breathing_effects.remove_status(kind);
                             } else {
                                 self.fall.remove_status(kind);
                             }
@@ -2599,7 +2599,7 @@ mod tests {
         }
         session
             .breathing_effects
-            .add_water_breathing(survival::StatusApplication {
+            .add_status(survival::StatusApplication {
                 kind: survival::FoodStatusKind::WaterBreathing,
                 duration: 100,
                 amplifier: 0,

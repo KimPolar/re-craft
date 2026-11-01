@@ -1692,6 +1692,16 @@ pub(crate) fn replay_saved_status_effects(
                             crate::survival::FoodStatusKind::Speed => "minecraft:speed",
                             crate::survival::FoodStatusKind::Slowness => "minecraft:slowness",
                             crate::survival::FoodStatusKind::Resistance => "minecraft:resistance",
+                            crate::survival::FoodStatusKind::Levitation => "minecraft:levitation",
+                            crate::survival::FoodStatusKind::DolphinsGrace => {
+                                "minecraft:dolphins_grace"
+                            }
+                            crate::survival::FoodStatusKind::ConduitPower => {
+                                "minecraft:conduit_power"
+                            }
+                            crate::survival::FoodStatusKind::BreathOfTheNautilus => {
+                                "minecraft:breath_of_the_nautilus"
+                            }
                             crate::survival::FoodStatusKind::NightVision => {
                                 "minecraft:night_vision"
                             }
@@ -1822,6 +1832,16 @@ pub(crate) fn replay_saved_status_effects(
                                     crate::survival::FoodStatusKind::Speed => "speed",
                                     crate::survival::FoodStatusKind::Slowness => "slowness",
                                     crate::survival::FoodStatusKind::Resistance => "resistance",
+                                    crate::survival::FoodStatusKind::Levitation => "levitation",
+                                    crate::survival::FoodStatusKind::DolphinsGrace => {
+                                        "dolphins_grace"
+                                    }
+                                    crate::survival::FoodStatusKind::ConduitPower => {
+                                        "conduit_power"
+                                    }
+                                    crate::survival::FoodStatusKind::BreathOfTheNautilus => {
+                                        "breath_of_the_nautilus"
+                                    }
                                     crate::survival::FoodStatusKind::NightVision => "night_vision",
                                     crate::survival::FoodStatusKind::WaterBreathing => {
                                         "water_breathing"
@@ -1850,6 +1870,12 @@ pub(crate) fn replay_saved_status_effects(
                                 crate::survival::FoodStatusKind::Speed => "speed",
                                 crate::survival::FoodStatusKind::Slowness => "slowness",
                                 crate::survival::FoodStatusKind::Resistance => "resistance",
+                                crate::survival::FoodStatusKind::Levitation => "levitation",
+                                crate::survival::FoodStatusKind::DolphinsGrace => "dolphins_grace",
+                                crate::survival::FoodStatusKind::ConduitPower => "conduit_power",
+                                crate::survival::FoodStatusKind::BreathOfTheNautilus => {
+                                    "breath_of_the_nautilus"
+                                }
                                 crate::survival::FoodStatusKind::NightVision => "night_vision",
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     "water_breathing"
@@ -2938,7 +2964,7 @@ mod tests {
                         .unwrap();
                         let events: Vec<_> = updates.iter().map(|event| {
                         let value = event.update;
-                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness", crate::survival::FoodStatusKind::JumpBoost => "jump_boost", crate::survival::FoodStatusKind::SlowFalling => "slow_falling", crate::survival::FoodStatusKind::Resistance => "resistance" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
+                        serde_json::json!({"kind": match event.kind { crate::survival::FoodStatusKind::Poison => "poison", crate::survival::FoodStatusKind::Hunger => "hunger", crate::survival::FoodStatusKind::NightVision => "night_vision", crate::survival::FoodStatusKind::WaterBreathing => "water_breathing", crate::survival::FoodStatusKind::Regeneration => "regeneration", crate::survival::FoodStatusKind::Speed => "speed", crate::survival::FoodStatusKind::Slowness => "slowness", crate::survival::FoodStatusKind::JumpBoost => "jump_boost", crate::survival::FoodStatusKind::SlowFalling => "slow_falling", crate::survival::FoodStatusKind::Resistance => "resistance", crate::survival::FoodStatusKind::Levitation => "levitation", crate::survival::FoodStatusKind::DolphinsGrace => "dolphins_grace", crate::survival::FoodStatusKind::ConduitPower => "conduit_power", crate::survival::FoodStatusKind::BreathOfTheNautilus => "breath_of_the_nautilus" }, "remove":event.remove, "tick":value.tick,"duration":value.duration,"amplifier":value.amplifier,"ambient":value.ambient,"visible":value.visible,"show_icon":value.show_icon})
                     }).collect();
                         input.push(serde_json::json!({"ticks":50,"events":events}));
                     }
@@ -2953,6 +2979,19 @@ mod tests {
             ("jump_boost", crate::survival::FoodStatusKind::JumpBoost),
             ("slow_falling", crate::survival::FoodStatusKind::SlowFalling),
             ("resistance", crate::survival::FoodStatusKind::Resistance),
+            ("levitation", crate::survival::FoodStatusKind::Levitation),
+            (
+                "dolphins_grace",
+                crate::survival::FoodStatusKind::DolphinsGrace,
+            ),
+            (
+                "conduit_power",
+                crate::survival::FoodStatusKind::ConduitPower,
+            ),
+            (
+                "breath_of_the_nautilus",
+                crate::survival::FoodStatusKind::BreathOfTheNautilus,
+            ),
         ] {
             for duration in [-1, 20, 100] {
                 for amplifier in [0, 1] {

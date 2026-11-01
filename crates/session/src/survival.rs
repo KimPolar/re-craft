@@ -108,6 +108,19 @@ pub(crate) enum FoodStatusKind {
     Speed,
     Slowness,
     Resistance,
+    Levitation,
+    DolphinsGrace,
+    ConduitPower,
+    BreathOfTheNautilus,
+}
+
+impl FoodStatusKind {
+    pub(crate) fn is_breathing(self) -> bool {
+        matches!(
+            self,
+            Self::WaterBreathing | Self::ConduitPower | Self::BreathOfTheNautilus
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +174,16 @@ fn parse_status_kind(value: &native_persistence::nbt::JavaString) -> Option<Food
         Some(FoodStatusKind::Slowness)
     } else if value.matches("minecraft:resistance") || value.matches("resistance") {
         Some(FoodStatusKind::Resistance)
+    } else if value.matches("minecraft:levitation") || value.matches("levitation") {
+        Some(FoodStatusKind::Levitation)
+    } else if value.matches("minecraft:dolphins_grace") || value.matches("dolphins_grace") {
+        Some(FoodStatusKind::DolphinsGrace)
+    } else if value.matches("minecraft:conduit_power") || value.matches("conduit_power") {
+        Some(FoodStatusKind::ConduitPower)
+    } else if value.matches("minecraft:breath_of_the_nautilus")
+        || value.matches("breath_of_the_nautilus")
+    {
+        Some(FoodStatusKind::BreathOfTheNautilus)
     } else {
         None
     }
@@ -438,6 +461,10 @@ fn status_color(kind: FoodStatusKind) -> u32 {
         FoodStatusKind::Speed => 0x33ebff,
         FoodStatusKind::Slowness => 0x8bafe0,
         FoodStatusKind::Resistance => 0x9146f0,
+        FoodStatusKind::Levitation => 0xceffff,
+        FoodStatusKind::DolphinsGrace => 0x88a3be,
+        FoodStatusKind::ConduitPower => 0x1dc2d1,
+        FoodStatusKind::BreathOfTheNautilus => 0x00ffee,
     }
 }
 
@@ -1467,12 +1494,26 @@ pub(crate) fn display_effects(
 }
 
 impl BreathingEffects {
-    pub(crate) fn add_water_breathing(&mut self, application: StatusApplication) {
+    fn slot(&mut self, kind: FoodStatusKind) -> &mut Option<EffectDuration> {
+        match kind {
+            FoodStatusKind::WaterBreathing => &mut self.water_breathing,
+            FoodStatusKind::ConduitPower => &mut self.conduit_power,
+            FoodStatusKind::BreathOfTheNautilus => &mut self.breath_of_the_nautilus,
+            _ => unreachable!("not a breathing effect"),
+        }
+    }
+
+    pub(crate) fn remove_status(&mut self, kind: FoodStatusKind) {
+        *self.slot(kind) = None;
+    }
+
+    pub(crate) fn add_status(&mut self, application: StatusApplication) {
         let incoming = EffectDuration::from_application(application);
-        if let Some(effect) = &mut self.water_breathing {
+        let slot = self.slot(application.kind);
+        if let Some(effect) = slot {
             effect.merge(incoming);
         } else {
-            self.water_breathing = Some(incoming);
+            *slot = Some(incoming);
         }
     }
     pub fn tick(&mut self) {
@@ -1930,6 +1971,10 @@ mod tests {
             "speed",
             "slowness",
             "resistance",
+            "levitation",
+            "dolphins_grace",
+            "conduit_power",
+            "breath_of_the_nautilus",
         ] {
             for duration in [-1, 0, 1, 20, 21, 600] {
                 for amplifier in [0_i32, 1, 255] {
@@ -2112,6 +2157,10 @@ mod tests {
                     FoodStatusKind::Speed => "speed",
                     FoodStatusKind::Slowness => "slowness",
                     FoodStatusKind::Resistance => "resistance",
+                    FoodStatusKind::Levitation => "levitation",
+                    FoodStatusKind::DolphinsGrace => "dolphins_grace",
+                    FoodStatusKind::ConduitPower => "conduit_power",
+                    FoodStatusKind::BreathOfTheNautilus => "breath_of_the_nautilus",
                 };
                 assert_eq!(
                     format!("minecraft:{id}"),
@@ -2319,6 +2368,10 @@ mod tests {
                         FoodStatusKind::Slowness => "minecraft:slowness",
                         FoodStatusKind::Hunger => "minecraft:hunger",
                         FoodStatusKind::Resistance => "minecraft:resistance",
+                        FoodStatusKind::Levitation => "minecraft:levitation",
+                        FoodStatusKind::DolphinsGrace => "minecraft:dolphins_grace",
+                        FoodStatusKind::ConduitPower => "minecraft:conduit_power",
+                        FoodStatusKind::BreathOfTheNautilus => "minecraft:breath_of_the_nautilus",
                     };
                     assert_eq!(name, expected["id"].as_str().unwrap());
                     assert_eq!(
@@ -3332,7 +3385,11 @@ mod tests {
                                 | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
                                 | FoodStatusKind::Slowness
-                                | FoodStatusKind::Resistance => {
+                                | FoodStatusKind::Resistance
+                                | FoodStatusKind::Levitation
+                                | FoodStatusKind::DolphinsGrace
+                                | FoodStatusKind::ConduitPower
+                                | FoodStatusKind::BreathOfTheNautilus => {
                                     unreachable!()
                                 }
                             };
@@ -3355,7 +3412,11 @@ mod tests {
                                 | FoodStatusKind::SlowFalling
                                 | FoodStatusKind::Speed
                                 | FoodStatusKind::Slowness
-                                | FoodStatusKind::Resistance => {
+                                | FoodStatusKind::Resistance
+                                | FoodStatusKind::Levitation
+                                | FoodStatusKind::DolphinsGrace
+                                | FoodStatusKind::ConduitPower
+                                | FoodStatusKind::BreathOfTheNautilus => {
                                     unreachable!()
                                 }
                             }

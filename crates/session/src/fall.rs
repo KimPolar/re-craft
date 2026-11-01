@@ -193,7 +193,11 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Speed => self.effects.speed = None,
             crate::survival::FoodStatusKind::Slowness => self.effects.slowness = None,
             crate::survival::FoodStatusKind::Resistance => self.effects.resistance = None,
-            crate::survival::FoodStatusKind::WaterBreathing => {
+            crate::survival::FoodStatusKind::Levitation => self.effects.levitation = None,
+            crate::survival::FoodStatusKind::DolphinsGrace => self.effects.dolphins_grace = None,
+            crate::survival::FoodStatusKind::WaterBreathing
+            | crate::survival::FoodStatusKind::ConduitPower
+            | crate::survival::FoodStatusKind::BreathOfTheNautilus => {
                 unreachable!("breathing effects are handled separately")
             }
         }
@@ -225,7 +229,11 @@ impl FallTracker {
             crate::survival::FoodStatusKind::Speed => &mut self.effects.speed,
             crate::survival::FoodStatusKind::Slowness => &mut self.effects.slowness,
             crate::survival::FoodStatusKind::Resistance => &mut self.effects.resistance,
-            crate::survival::FoodStatusKind::WaterBreathing => {
+            crate::survival::FoodStatusKind::Levitation => &mut self.effects.levitation,
+            crate::survival::FoodStatusKind::DolphinsGrace => &mut self.effects.dolphins_grace,
+            crate::survival::FoodStatusKind::WaterBreathing
+            | crate::survival::FoodStatusKind::ConduitPower
+            | crate::survival::FoodStatusKind::BreathOfTheNautilus => {
                 unreachable!("breathing effects are handled separately")
             }
         };

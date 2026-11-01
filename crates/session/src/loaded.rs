@@ -1067,8 +1067,20 @@ impl LoadedSession {
                                 crate::survival::FoodStatusKind::Resistance => {
                                     self.fall.effects().resistance.is_some()
                                 }
+                                crate::survival::FoodStatusKind::Levitation => {
+                                    self.fall.effects().levitation.is_some()
+                                }
+                                crate::survival::FoodStatusKind::DolphinsGrace => {
+                                    self.fall.effects().dolphins_grace.is_some()
+                                }
                                 crate::survival::FoodStatusKind::WaterBreathing => {
                                     self.breathing_effects.water_breathing.is_some()
+                                }
+                                crate::survival::FoodStatusKind::ConduitPower => {
+                                    self.breathing_effects.conduit_power.is_some()
+                                }
+                                crate::survival::FoodStatusKind::BreathOfTheNautilus => {
+                                    self.breathing_effects.breath_of_the_nautilus.is_some()
                                 }
                             };
                             if !active {
@@ -1090,8 +1102,8 @@ impl LoadedSession {
                                     remove: true,
                                     clear_all: false,
                                 });
-                            if kind == crate::survival::FoodStatusKind::WaterBreathing {
-                                self.breathing_effects.water_breathing = None;
+                            if kind.is_breathing() {
+                                self.breathing_effects.remove_status(kind);
                             } else {
                                 self.fall.remove_status(kind);
                                 if matches!(
@@ -1128,8 +1140,8 @@ impl LoadedSession {
                                 show_icon: effect.show_icon,
                             },
                         });
-                    if effect.kind == crate::survival::FoodStatusKind::WaterBreathing {
-                        self.breathing_effects.add_water_breathing(effect);
+                    if effect.kind.is_breathing() {
+                        self.breathing_effects.add_status(effect);
                     } else {
                         let changed = self.fall.add_status(effect);
                         if changed
@@ -39887,6 +39899,10 @@ mod tests {
                                 effect("minecraft:speed", 200, 1),
                                 effect("minecraft:speed", 500, 0),
                                 effect("minecraft:water_breathing", 600, 0),
+                                effect("minecraft:levitation", 400, 1),
+                                effect("minecraft:dolphins_grace", 200, 0),
+                                effect("minecraft:conduit_power", 300, 0),
+                                effect("minecraft:breath_of_the_nautilus", 500, 0),
                             ],
                         },
                     ),
@@ -39919,6 +39935,65 @@ mod tests {
                 .duration,
             300
         );
+        assert_eq!(
+            session.fall.effects().levitation.as_ref().unwrap().duration,
+            200
+        );
+        assert_eq!(
+            session
+                .fall
+                .effects()
+                .dolphins_grace
+                .as_ref()
+                .unwrap()
+                .duration,
+            100
+        );
+        assert_eq!(
+            session
+                .breathing_effects
+                .conduit_power
+                .as_ref()
+                .unwrap()
+                .duration,
+            150
+        );
+        assert_eq!(
+            session
+                .breathing_effects
+                .breath_of_the_nautilus
+                .as_ref()
+                .unwrap()
+                .duration,
+            250
+        );
+        assert_eq!(session.mining_context().conduit_power, Some(0));
+        for (effects, expected_air) in [
+            (
+                crate::survival::BreathingEffects {
+                    conduit_power: session.breathing_effects.conduit_power.clone(),
+                    ..Default::default()
+                },
+                104,
+            ),
+            (
+                crate::survival::BreathingEffects {
+                    breath_of_the_nautilus: session
+                        .breathing_effects
+                        .breath_of_the_nautilus
+                        .clone(),
+                    ..Default::default()
+                },
+                100,
+            ),
+        ] {
+            let mut vitals = crate::survival::PlayerVitals {
+                air: 100,
+                ..Default::default()
+            };
+            vitals.tick_air_with(true, false, GameMode::Survival, &effects, 0.0, &mut || 0.0);
+            assert_eq!(vitals.air, expected_air);
+        }
         assert!(!session.effect_save_invalid);
         let draft = session.draft_player_state(&original).unwrap();
         assert_eq!(
@@ -39939,6 +40014,16 @@ mod tests {
             "minecraft:glass_bottle"
         );
         assert_eq!(native_persistence::nbt::write(&original).unwrap(), bytes);
+        session.motion.position = DVec3::new(8.5, 10.0, 8.5);
+        session.motion.velocity = DVec3::new(0.0, -0.2, 0.0);
+        session.motion.on_ground = false;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = false;
+        session.fall_distance = 20.0;
+        session.update(TICK);
+        let expected = (-0.2 + (0.1 - (-0.2)) * 0.2) * f64::from(0.98_f32);
+        assert!((session.motion.velocity.y - expected).abs() < 1e-9);
+        assert!(session.fall_distance < 1.0);
     }
 
     #[test]
@@ -40314,6 +40399,25 @@ mod tests {
                                 ("id".into(), Tag::String("minecraft:resistance".into())),
                                 ("duration".into(), Tag::Int(100)),
                             ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:levitation".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:dolphins_grace".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                            Tag::Compound(vec![
+                                ("id".into(), Tag::String("minecraft:conduit_power".into())),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
+                            Tag::Compound(vec![
+                                (
+                                    "id".into(),
+                                    Tag::String("minecraft:breath_of_the_nautilus".into()),
+                                ),
+                                ("duration".into(), Tag::Int(100)),
+                            ]),
                         ],
                     },
                 ),
@@ -40332,6 +40436,10 @@ mod tests {
                         Tag::String("minecraft:hunger".into()),
                         Tag::String("minecraft:poison".into()),
                         Tag::String("minecraft:resistance".into()),
+                        Tag::String("minecraft:levitation".into()),
+                        Tag::String("minecraft:dolphins_grace".into()),
+                        Tag::String("minecraft:conduit_power".into()),
+                        Tag::String("minecraft:breath_of_the_nautilus".into()),
                     ],
                 },
             ),
@@ -40369,6 +40477,8 @@ mod tests {
             crate::player_data::read_saved_fall_effects(&original).unwrap(),
             Arc::new(OxygenEnchantments::default()),
         );
+        session.breathing_effects =
+            crate::player_data::read_saved_breathing_effects(&original).unwrap();
         let mut inventory = PlayerInventory::default();
         inventory.set_slot(
             PlayerSlot::Storage(0),
@@ -40384,6 +40494,10 @@ mod tests {
         assert!(!session.snapshot().hunger_effect);
         assert!(session.snapshot().poison_effect);
         assert!(session.fall.effects().resistance.is_none());
+        assert!(session.fall.effects().levitation.is_none());
+        assert!(session.fall.effects().dolphins_grace.is_none());
+        assert!(session.breathing_effects.conduit_power.is_none());
+        assert!(session.breathing_effects.breath_of_the_nautilus.is_none());
         assert_eq!(session.fall.effects().poison.as_ref().unwrap().duration, 13);
         let updates = &session
             .effect_save_tracking
@@ -40399,6 +40513,10 @@ mod tests {
                 (crate::survival::FoodStatusKind::Hunger, true),
                 (crate::survival::FoodStatusKind::Poison, true),
                 (crate::survival::FoodStatusKind::Resistance, true),
+                (crate::survival::FoodStatusKind::Levitation, true),
+                (crate::survival::FoodStatusKind::DolphinsGrace, true),
+                (crate::survival::FoodStatusKind::ConduitPower, true),
+                (crate::survival::FoodStatusKind::BreathOfTheNautilus, true),
                 (crate::survival::FoodStatusKind::Poison, false),
             ]
         );
@@ -40406,6 +40524,10 @@ mod tests {
         assert_eq!(
             crate::player_data::read_saved_fall_effects(draft.document()).unwrap(),
             *session.fall.effects()
+        );
+        assert_eq!(
+            crate::player_data::read_saved_breathing_effects(draft.document()).unwrap(),
+            session.breathing_effects
         );
     }
 

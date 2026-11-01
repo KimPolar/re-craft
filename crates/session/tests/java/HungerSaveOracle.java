@@ -43,6 +43,10 @@ public class HungerSaveOracle {
             case "jump_boost" -> MobEffects.JUMP_BOOST;
             case "slow_falling" -> MobEffects.SLOW_FALLING;
             case "resistance" -> MobEffects.RESISTANCE;
+            case "levitation" -> MobEffects.LEVITATION;
+            case "dolphins_grace" -> MobEffects.DOLPHINS_GRACE;
+            case "conduit_power" -> MobEffects.CONDUIT_POWER;
+            case "breath_of_the_nautilus" -> MobEffects.BREATH_OF_THE_NAUTILUS;
             default -> MobEffects.HUNGER;
           };
           if(object!=null && object.has("remove") && object.get("remove").getAsBoolean()) {

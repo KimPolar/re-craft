@@ -11812,6 +11812,26 @@ impl LoadedSession {
                         self.tick.saturating_add(1),
                     );
                 }
+                PlayerCommand::Weather(command) => {
+                    let kind = if !self.game_master_permission {
+                        crate::SystemMessageKind::TimePermissionDenied
+                    } else if self.weather_source.is_none() || self.weather.is_none() {
+                        crate::SystemMessageKind::WeatherSaveUnavailable
+                    } else if crate::weather_command::apply(
+                        &mut self.weather.as_mut().expect("checked weather").data,
+                        command,
+                        &mut self.level_random,
+                    ) {
+                        crate::SystemMessageKind::WeatherSet(command.kind)
+                    } else {
+                        crate::SystemMessageKind::CommandUnavailable
+                    };
+                    crate::push_system_message(
+                        &mut self.system_messages,
+                        kind,
+                        self.tick.saturating_add(1),
+                    );
+                }
                 PlayerCommand::Move {
                     forward,
                     strafe,
@@ -14419,6 +14439,88 @@ fn move_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_command_requires_permission_and_preserves_shared_data_source() {
+        use crate::weather_command::{WeatherCommand, WeatherKind};
+        use native_persistence::{
+            nbt::Tag,
+            world::{SavedWeather, WorldReader},
+        };
+        let mut source =
+            WorldReader::update_weather_document(None, SavedWeather::default()).unwrap();
+        let Tag::Compound(root) = &mut source.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        data.push(("future".into(), Tag::Int(42)));
+        let mut session = session();
+        // A Nether-like dimension still addresses the server-wide weather data.
+        session.set_weather(Some(false), Some(SavedWeather::default()), false);
+        let command = WeatherCommand {
+            kind: WeatherKind::Thunder,
+            duration: Some(40),
+        };
+        session.submit_command(PlayerCommand::Weather(command));
+        session.update(TICK);
+        assert!(matches!(
+            session.snapshot().system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimePermissionDenied
+        ));
+        assert_eq!(
+            session.weather.as_ref().unwrap().data,
+            SavedWeather::default()
+        );
+        session.set_game_master_permission(true);
+        session.submit_command(PlayerCommand::Weather(command));
+        session.update(TICK);
+        assert!(matches!(
+            session.snapshot().system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::WeatherSaveUnavailable
+        ));
+        // Capture is normally done at load time; initialize a fresh session for it.
+        let mut session = self::session();
+        session.set_weather(Some(false), Some(SavedWeather::default()), false);
+        session.capture_weather_source(Some(&source)).unwrap();
+        session.set_game_master_permission(true);
+        session.submit_command(PlayerCommand::Weather(command));
+        session.update(TICK);
+        let weather = session.weather.as_ref().unwrap().data;
+        assert_eq!(
+            weather,
+            SavedWeather {
+                rain_time: 40,
+                thunder_time: 40,
+                raining: true,
+                thundering: true,
+                ..Default::default()
+            }
+        );
+        assert!(matches!(
+            session.snapshot().system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::WeatherSet(WeatherKind::Thunder)
+        ));
+        assert_eq!(
+            session.weather_visual(),
+            Some(crate::weather::WeatherVisual::default())
+        );
+        let updated = WorldReader::update_weather_document(Some(&source), weather).unwrap();
+        assert_eq!(
+            updated.value.get("data").unwrap().get("future"),
+            Some(&Tag::Int(42))
+        );
+        assert_eq!(
+            native_persistence::world::parse_weather_data(&updated).unwrap(),
+            weather
+        );
+    }
 
     #[test]
     fn time_rate_and_timeline_queries_use_registered_data_and_safe_clock_source() {

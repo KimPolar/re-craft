@@ -57,6 +57,7 @@ pub mod stair_placement;
 pub mod survival;
 pub mod time_command;
 pub mod weather;
+pub mod weather_command;
 pub mod world_spawn;
 pub mod worldgen;
 
@@ -219,6 +220,7 @@ impl GameMode {
 
 #[derive(Clone, Debug)]
 pub enum PlayerCommand {
+    Weather(weather_command::WeatherCommand),
     WorldTime(Arc<time_command::TimeCommand>),
     /// Read the verified seed of this local world.
     QueryWorldSeed,
@@ -437,6 +439,8 @@ pub enum SystemMessageKind {
     TimeSaveUnavailable,
     TimeUnknownClock(Arc<str>),
     TimeMarkerDataUnavailable,
+    WeatherSet(weather_command::WeatherKind),
+    WeatherSaveUnavailable,
     TimeRate {
         name: Arc<str>,
         rate_bits: u32,
@@ -1186,7 +1190,7 @@ impl LocalSession {
                         self.tick.saturating_add(1),
                     );
                 }
-                PlayerCommand::WorldTime(_) => {
+                PlayerCommand::WorldTime(_) | PlayerCommand::Weather(_) => {
                     push_system_message(
                         &mut Arc::make_mut(&mut self.snapshot).system_messages,
                         SystemMessageKind::CommandUnavailable,

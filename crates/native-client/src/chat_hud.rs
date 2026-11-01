@@ -362,6 +362,7 @@ fn prepare_lines(
                 | SystemMessageKind::TimeSaveUnavailable
                 | SystemMessageKind::TimeUnknownClock(_)
                 | SystemMessageKind::TimeMarkerDataUnavailable
+                | SystemMessageKind::WeatherSaveUnavailable
                 | SystemMessageKind::TimeTimelineDataUnavailable
                 | SystemMessageKind::TimeUnknownTimeline(_)
                 | SystemMessageKind::TimeWrongTimeline { .. }
@@ -610,6 +611,31 @@ fn prepare_lines(
                         "Unknown or incomplete command. See below for error",
                     )
                     .to_owned(),
+                None,
+                Vec::new(),
+                None,
+            ),
+            SystemMessageKind::WeatherSet(kind) => {
+                let (key, fallback) = match kind {
+                    native_session::weather_command::WeatherKind::Clear => {
+                        ("commands.weather.set.clear", "Set the weather to clear")
+                    }
+                    native_session::weather_command::WeatherKind::Rain => {
+                        ("commands.weather.set.rain", "Set the weather to rain")
+                    }
+                    native_session::weather_command::WeatherKind::Thunder => {
+                        ("commands.weather.set.thunder", "Set the weather to thunder")
+                    }
+                };
+                (
+                    assets.translate(key, fallback).to_owned(),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
+            SystemMessageKind::WeatherSaveUnavailable => (
+                "Cannot change the weather because its saved data is unavailable.".to_owned(),
                 None,
                 Vec::new(),
                 None,

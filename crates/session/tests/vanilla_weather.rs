@@ -32,6 +32,7 @@ fn weather_timer_and_intensities_match_java() {
     let saved_data = temp.path().join("weather.dat");
     let rust_data = temp.path().join("rust-weather.dat");
     let rust_level = temp.path().join("rust-level.dat");
+    let command_output = temp.path().join("weather-commands.json");
     let state = SavedWeather {
         clear_weather_time: 37,
         rain_time: 239,
@@ -84,7 +85,8 @@ fn weather_timer_and_intensities_match_java() {
             .arg(&output)
             .arg(&saved_data)
             .arg(&rust_data)
-            .arg(&rust_level),
+            .arg(&rust_level)
+            .arg(&command_output),
     ] {
         let result = command.output().unwrap();
         assert!(
@@ -96,6 +98,57 @@ fn weather_timer_and_intensities_match_java() {
     }
     let cases: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let commands: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(command_output).unwrap()).unwrap();
+    assert_eq!(commands.len(), 72);
+    for row in &commands {
+        use native_session::weather_command::{WeatherCommand, WeatherKind, apply};
+        let mode = row["mode"].as_str().unwrap();
+        let kind = match mode {
+            "clear" => WeatherKind::Clear,
+            "rain" => WeatherKind::Rain,
+            "thunder" => WeatherKind::Thunder,
+            _ => unreachable!(),
+        };
+        let duration = row["duration"].as_i64().unwrap() as i32;
+        let mut rng = LegacyRandom::new(row["seed"].as_i64().unwrap());
+        let mut data = SavedWeather {
+            clear_weather_time: 37,
+            rain_time: 239,
+            thunder_time: 919,
+            raining: true,
+            thundering: true,
+        };
+        assert!(apply(
+            &mut data,
+            WeatherCommand {
+                kind,
+                duration: (duration != -1).then_some(duration)
+            },
+            &mut rng
+        ));
+        assert_eq!(
+            data,
+            SavedWeather {
+                clear_weather_time: row["clear"].as_i64().unwrap() as i32,
+                rain_time: row["rain"].as_i64().unwrap() as i32,
+                thunder_time: row["thunder"].as_i64().unwrap() as i32,
+                raining: row["raining"].as_bool().unwrap(),
+                thundering: row["thundering"].as_bool().unwrap()
+            },
+            "{row}"
+        );
+        assert_eq!(
+            rng.next_int(),
+            row["next"].as_i64().unwrap() as i32,
+            "{row}"
+        );
+        assert_eq!(row["returned"].as_i64().unwrap(), i64::from(duration));
+        assert_eq!(
+            row["message"].as_str().unwrap(),
+            format!("commands.weather.set.{mode}")
+        );
+    }
     let saved =
         native_persistence::nbt::read_gzip(std::fs::File::open(saved_data).unwrap()).unwrap();
     assert_eq!(

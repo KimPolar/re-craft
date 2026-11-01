@@ -20,8 +20,22 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.gamerules.GameRule;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.saveddata.WeatherData;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.contents.TranslatableContents;
+import net.minecraft.server.commands.WeatherCommand;
 
 public class WeatherOracle {
+    static class Source extends CommandSourceStack {
+        String message;
+        Source() { super(null,null,null,null,null,(MinecraftServer)null,(Entity)null); }
+        @Override public void sendSuccess(java.util.function.Supplier<Component> supplier, boolean broadcast) {
+            if (!broadcast) throw new AssertionError("weather message should broadcast");
+            message = ((TranslatableContents)supplier.get().getContents()).getKey();
+        }
+    }
     static class Rules extends GameRules {
         boolean enabled;
         Rules() { super((FeatureFlagSet)null); }
@@ -85,6 +99,26 @@ public class WeatherOracle {
             item.add("trace",trace); result.add(item);
         }
         Files.writeString(Path.of(args[0]),result.toString());
+        var source=(Source)u.allocateInstance(Source.class);
+        field(CommandSourceStack.class,"server").set(source,server);
+        field(CommandSourceStack.class,"level").set(source,world);
+        var commands=new JsonArray();
+        for(String mode:new String[]{"clear","rain","thunder"}) {
+            String methodName="set"+Character.toUpperCase(mode.charAt(0))+mode.substring(1);
+            var method=WeatherCommand.class.getDeclaredMethod(methodName,CommandSourceStack.class,int.class);
+            method.setAccessible(true);
+            for(int duration:new int[]{-1,1,40,Integer.MAX_VALUE}) for(long seed:new long[]{0,1,-1,123456789,Long.MIN_VALUE,Long.MAX_VALUE}) {
+                var data=new WeatherData(37,239,919,true,true);
+                field(MinecraftServer.class,"weatherData").set(server,data);
+                var rng=RandomSource.create(seed); randomField.set(world,rng);
+                int returned=(int)method.invoke(null,source,duration);
+                var row=new JsonObject(); row.addProperty("mode",mode); row.addProperty("duration",duration); row.addProperty("seed",seed);
+                row.addProperty("clear",data.getClearWeatherTime()); row.addProperty("rain",data.getRainTime()); row.addProperty("thunder",data.getThunderTime());
+                row.addProperty("raining",data.isRaining()); row.addProperty("thundering",data.isThundering());
+                row.addProperty("next",rng.nextInt()); row.addProperty("returned",returned); row.addProperty("message",source.message); commands.add(row);
+            }
+        }
+        Files.writeString(Path.of(args[4]),commands.toString());
         var saved=new WeatherData(37,239,919,true,false);
         var document=new CompoundTag();
         document.putInt("DataVersion",5023);

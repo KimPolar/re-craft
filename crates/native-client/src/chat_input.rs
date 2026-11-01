@@ -640,7 +640,17 @@ mod tests {
         let mut clock_definitions = 0;
         let mut timeline_cases = 0;
         let mut rate_strings = 0;
+        let mut weather_syntax = 0;
         for row in rows {
+            if let Some(input) = row["weatherSyntax"].as_str() {
+                weather_syntax += 1;
+                assert_eq!(
+                    native_session::weather_command::parse(input).is_some(),
+                    row["weatherSyntaxAccepted"].as_bool().unwrap(),
+                    "{row}"
+                );
+                continue;
+            }
             if let Some(value) = row["rateValue"].as_str() {
                 rate_strings += 1;
                 assert_eq!(
@@ -813,6 +823,7 @@ mod tests {
         assert_eq!(syntax_cases, 27);
         assert_eq!(timeline_cases, 55);
         assert_eq!(rate_strings, 511);
+        assert_eq!(weather_syntax, 16);
         assert_eq!(clock_definitions, 7);
     }
 }

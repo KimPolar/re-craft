@@ -940,7 +940,8 @@ fn prepare_existing_world(
                 }
             };
         }
-        let weather = if can_weather == Some(true) {
+        // WeatherData is server-wide, so commands may change it from any dimension.
+        let weather = {
             match reader.weather_document() {
                 Ok(source) => {
                     let data = source
@@ -955,8 +956,6 @@ fn prepare_existing_world(
                     None
                 }
             }
-        } else {
-            None
         };
         session.set_weather(
             can_weather,

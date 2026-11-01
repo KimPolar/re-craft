@@ -33,6 +33,7 @@ import net.minecraft.world.timeline.Timeline;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.server.commands.TimeCommand;
+import net.minecraft.server.commands.WeatherCommand;
 import com.mojang.serialization.Lifecycle;
 import com.mojang.serialization.JsonOps;
 import com.google.gson.JsonParser;
@@ -255,6 +256,16 @@ public final class ChatEditOracle {
         set(source, CommandSourceStack.class, "permissions", PermissionSet.NO_PERMISSIONS);
         var unauthorized = commands.parse("time of example:clock query time", source);
         if (!unauthorized.getReader().canRead()) throw new AssertionError("unprivileged time command accepted");
+        var weatherCommands = new CommandDispatcher<CommandSourceStack>();
+        WeatherCommand.register(weatherCommands);
+        set(source, CommandSourceStack.class, "permissions", PermissionSet.ALL_PERMISSIONS);
+        for (String command : new String[]{"weather clear", "weather rain", "weather thunder", "weather clear 1", "weather rain .5s", "weather thunder 1d", "weather thunder 0", "weather rain -1", "weather rain 1e2", "weather snow", "weather clear 1 extra", "weather", "weather clear 0.5", "weather clear 0.4", "weather clear 2147483648", "weather clear 1t"}) {
+            var parsed = weatherCommands.parse(command, source);
+            JsonObject row = new JsonObject(); row.addProperty("weatherSyntax", "/" + command);
+            row.addProperty("weatherSyntaxAccepted", !parsed.getReader().canRead() && parsed.getContext().getCommand() != null); rows.add(row);
+        }
+        set(source, CommandSourceStack.class, "permissions", PermissionSet.NO_PERMISSIONS);
+        if (!weatherCommands.parse("weather clear", source).getReader().canRead()) throw new AssertionError("unprivileged weather command accepted");
         for (String json : new String[]{"{}", "{\"ignored\":42}", "[]", "null", "42", "\"text\"", "true"}) {
             JsonObject row = new JsonObject();
             row.addProperty("worldClockJson", json);

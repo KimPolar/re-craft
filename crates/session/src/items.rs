@@ -445,6 +445,8 @@ pub enum CreatedRemovalCause {
     Pickup,
     /// The item reached its expiration age.
     Expired,
+    /// The entire stack was transferred to another item entity.
+    Merged,
 }
 
 /// A verified inventory change or successful Java pickup for a created item.
@@ -472,8 +474,33 @@ struct RemovedCreatedItem {
 }
 
 struct SavedMergeParticipant {
-    source: Arc<Tag>,
+    identity: MergeIdentity,
     position: DVec3,
+}
+
+enum MergeIdentity {
+    Saved(Arc<Tag>),
+    Created([i32; 4]),
+}
+
+impl SavedMergeParticipant {
+    fn capture(entity: &ItemEntity) -> Option<Self> {
+        let identity = match (&entity._saved_source, &entity.created) {
+            (Some(source), None) => MergeIdentity::Saved(Arc::clone(source)),
+            (None, Some(created))
+                if created.base_valid
+                    && created.verified_position == entity.item.position
+                    && created.thrower != CreatedThrower::Unknown =>
+            {
+                MergeIdentity::Created(created.uuid?)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            identity,
+            position: entity.item.position,
+        })
+    }
 }
 
 struct SavedItemMerge {
@@ -484,6 +511,7 @@ struct SavedItemMerge {
 #[derive(Default)]
 struct MergeChanges {
     saved: Vec<SavedItemMerge>,
+    removed_created: Vec<usize>,
     unresolved: bool,
 }
 
@@ -738,49 +766,79 @@ impl ItemEntities {
                 z: (position.z.floor() as i32).div_euclid(16),
             })
         };
-        let mut final_chunks = std::collections::BTreeMap::new();
+        let mut final_chunks = std::collections::BTreeMap::<[i32; 4], BTreeSet<ChunkPos>>::new();
         for entity in self
             .entities
             .iter()
             .chain(self.removed_saved.iter().map(|removed| &removed.entity))
         {
-            if let Some(source) = &entity._saved_source
-                && let Some(uuid) = crate::saved_item::optional_uuid(source, "UUID")?
-            {
+            let uuid = if let Some(source) = &entity._saved_source {
+                crate::saved_item::optional_uuid(source, "UUID")?
+            } else {
+                entity.created.as_ref().and_then(|created| created.uuid)
+            };
+            if let Some(uuid) = uuid {
+                let mut affected = BTreeSet::from([chunk(entity.item.position)?]);
+                if let Some(source) = saved_uuids.get(&uuid) {
+                    affected.insert(*source);
+                }
+                if let Some(created) = &entity.created {
+                    affected.insert(chunk(created.origin)?);
+                    affected.extend(created.visited.iter().copied());
+                }
                 ensure!(
-                    final_chunks
-                        .insert(uuid, chunk(entity.item.position)?)
-                        .is_none(),
+                    final_chunks.insert(uuid, affected).is_none(),
                     "duplicate live or removed item UUID"
                 );
             }
         }
+        for removed in &self.removed_created {
+            ensure!(
+                final_chunks
+                    .insert(removed.uuid, removed.chunks.clone())
+                    .is_none(),
+                "duplicate live or removed item UUID"
+            );
+        }
         for event in &self.saved_merges {
-            let first = crate::saved_item::optional_uuid(&event.first.source, "UUID")?
-                .context("merged item has no UUID")?;
-            let second = crate::saved_item::optional_uuid(&event.second.source, "UUID")?
-                .context("merged item has no UUID")?;
+            let mut affected = BTreeSet::new();
+            let mut resolve = |participant: &SavedMergeParticipant| -> anyhow::Result<[i32; 4]> {
+                affected.insert(chunk(participant.position)?);
+                let uuid = match &participant.identity {
+                    MergeIdentity::Saved(source) => {
+                        let uuid = crate::saved_item::optional_uuid(source, "UUID")?
+                            .context("merged item has no UUID")?;
+                        affected.insert(
+                            *saved_uuids
+                                .get(&uuid)
+                                .context("merged item source chunk is unavailable")?,
+                        );
+                        uuid
+                    }
+                    MergeIdentity::Created(uuid) => {
+                        ensure!(
+                            !saved_uuids.contains_key(uuid),
+                            "created merge UUID conflicts with a saved item"
+                        );
+                        *uuid
+                    }
+                };
+                affected.extend(
+                    final_chunks
+                        .get(&uuid)
+                        .context("merged item final state is unavailable")?
+                        .iter()
+                        .copied(),
+                );
+                Ok(uuid)
+            };
+            let first = resolve(&event.first)?;
+            let second = resolve(&event.second)?;
             ensure!(first != second, "merged items have duplicate UUIDs");
-            let affected = [
-                *saved_uuids
-                    .get(&first)
-                    .context("merged item source chunk is unavailable")?,
-                chunk(event.first.position)?,
-                *final_chunks
-                    .get(&first)
-                    .context("merged item final state is unavailable")?,
-                *saved_uuids
-                    .get(&second)
-                    .context("merged item source chunk is unavailable")?,
-                chunk(event.second.position)?,
-                *final_chunks
-                    .get(&second)
-                    .context("merged item final state is unavailable")?,
-            ];
-            if affected.iter().any(|pos| positions.contains(pos)) {
+            if !affected.is_disjoint(positions) {
                 ensure!(
-                    affected.iter().all(|pos| positions.contains(pos)),
-                    "saved item merge requires all affected chunks"
+                    affected.is_subset(positions),
+                    "item merge requires all affected chunks"
                 );
             }
         }
@@ -1269,6 +1327,17 @@ impl ItemEntities {
                 },
             )
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_freeze_created(&mut self) {
+        for entity in &mut self.entities {
+            if entity.created.is_some() {
+                entity.velocity = DVec3::ZERO;
+                entity.no_gravity = true;
+                entity.pickup_delay = 0;
+            }
+        }
     }
     pub fn set_damage_rules(
         &mut self,
@@ -2494,6 +2563,9 @@ impl ItemEntities {
                     index,
                     candidates.as_deref(),
                 );
+                for &removed_index in &changes.removed_created {
+                    created_removal_causes[removed_index] = Some(CreatedRemovalCause::Merged);
+                }
                 self.uncoordinated_saved_merge |= changes.unresolved;
                 self.saved_merges.extend(changes.saved);
             }
@@ -2718,23 +2790,21 @@ impl ItemEntities {
                 || target.pickup_delay < source.pickup_delay
                 || target.lifetime > source.lifetime
             {
-                match (&target._saved_source, &source._saved_source) {
-                    (Some(first), Some(second)) => changes.saved.push(SavedItemMerge {
-                        first: SavedMergeParticipant {
-                            source: Arc::clone(first),
-                            position: target.item.position,
-                        },
-                        second: SavedMergeParticipant {
-                            source: Arc::clone(second),
-                            position: source.item.position,
-                        },
-                    }),
-                    (None, None) => {
-                        // A partial merge can leave both new entities alive in
-                        // different chunks. Until their histories are linked,
-                        // saving either chunk independently could duplicate items.
-                        changes.unresolved |= target.created.is_some() || source.created.is_some();
+                match (
+                    SavedMergeParticipant::capture(target),
+                    SavedMergeParticipant::capture(source),
+                ) {
+                    (Some(first), Some(second)) => {
+                        changes.saved.push(SavedItemMerge { first, second });
+                        if source.created.is_some() && amount == source.item.stack.count() {
+                            changes.removed_created.push(source_index);
+                        }
                     }
+                    (None, None)
+                        if target._saved_source.is_none()
+                            && target.created.is_none()
+                            && source._saved_source.is_none()
+                            && source.created.is_none() => {}
                     _ => changes.unresolved = true,
                 }
             }
@@ -4537,7 +4607,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_merge_of_created_items_blocks_independent_chunk_drafts() {
+    fn partial_merge_of_created_items_requires_both_chunk_histories() {
         use native_world::loaded::ChunkPos;
         let mut items = ItemEntities::default();
         for (x, count) in [(15.8, 60), (16.2, 20)] {
@@ -4569,8 +4639,25 @@ mod tests {
             );
         }
         assert_eq!(items.entities.len(), 2, "partial merge keeps both entities");
-        assert!(items.uncoordinated_saved_merge);
-        assert!(items.affected_item_chunks(&Default::default()).is_err());
+        assert!(!items.uncoordinated_saved_merge);
+        let all = BTreeSet::from([ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }]);
+        assert_eq!(
+            items.affected_item_chunks(&Default::default()).unwrap(),
+            all
+        );
+        let drafts = items.draft_created_items_in_chunks(&all).unwrap();
+        let mut counts: Vec<_> = drafts
+            .iter()
+            .map(|draft| {
+                crate::saved_item::read(&draft.document().value)
+                    .unwrap()
+                    .unwrap()
+                    .stack
+                    .count()
+            })
+            .collect();
+        counts.sort();
+        assert_eq!(counts, [16, 64]);
         for pos in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }] {
             assert!(
                 items
@@ -4578,6 +4665,180 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn created_and_saved_item_merges_follow_both_lifecycles() {
+        use native_world::loaded::ChunkPos;
+        let saved_uuid = [1, 2, 3, 4];
+        let left = ChunkPos { x: 0, z: 0 };
+        let right = ChunkPos { x: 1, z: 0 };
+        for (saved_count, new_count) in [(1, 2), (2, 1)] {
+            let mut items = ItemEntities::default();
+            let mut saved = test_saved_item(saved_uuid, saved_count);
+            saved.position.x = 15.8;
+            let Tag::Compound(fields) = Arc::make_mut(&mut saved.source) else {
+                unreachable!()
+            };
+            let (_, Tag::List { values, .. }) = fields
+                .iter_mut()
+                .find(|(name, _)| name.matches("Pos"))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            values[0] = Tag::Double(15.8);
+            items.spawn_saved(saved);
+            items.spawn_from_entity(
+                DVec3::new(16.2, 2.0, 3.5),
+                ItemStack::new(
+                    "minecraft:stone".into(),
+                    new_count,
+                    64,
+                    Tag::Compound(vec![]),
+                )
+                .unwrap(),
+            );
+            let fresh_uuid = items.entities[1].created.as_ref().unwrap().uuid.unwrap();
+            items.entities[1].velocity = DVec3::ZERO;
+            items.entities[1].no_gravity = true;
+            let mut inventory = Arc::new(PlayerInventory::default());
+            for _ in 0..40 {
+                items.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    DVec3::splat(100.0),
+                    PlayerPose::Standing,
+                    GameMode::Spectator,
+                    &mut inventory,
+                    |_| &[],
+                    |_| 0.6,
+                    |_| 0.0,
+                    |_| false,
+                    |_| native_world::fluid::FluidContacts::default(),
+                    false,
+                    |_, _, _| None,
+                    |_, _| true,
+                    |_| Some(false),
+                );
+            }
+            let sources = std::collections::BTreeMap::from([(saved_uuid, left)]);
+            let both = BTreeSet::from([left, right]);
+            assert!(!items.uncoordinated_saved_merge);
+            assert_eq!(items.affected_item_chunks(&sources).unwrap(), both);
+            for single in [left, right] {
+                assert!(
+                    items
+                        .validate_item_chunk_group(&BTreeSet::from([single]), &sources)
+                        .is_err()
+                );
+                assert!(
+                    items
+                        .validate_removed_item_chunk_group(&BTreeSet::from([single]), &sources)
+                        .is_err()
+                );
+            }
+            assert!(items.validate_item_chunk_group(&both, &sources).is_ok());
+            assert!(
+                items
+                    .validate_removed_item_chunk_group(&both, &sources)
+                    .is_ok()
+            );
+            if saved_count < new_count {
+                assert!(items.draft_removed_item(saved_uuid).unwrap().is_some());
+                let drafts = items.draft_created_items_in_chunks(&both).unwrap();
+                assert_eq!(drafts.len(), 1);
+                assert_eq!(
+                    crate::saved_item::read(&drafts[0].document().value)
+                        .unwrap()
+                        .unwrap()
+                        .stack
+                        .count(),
+                    3
+                );
+            } else {
+                assert_eq!(
+                    items.created_removal_effects(&both),
+                    vec![(fresh_uuid, CreatedRemovalCause::Merged)]
+                );
+                let draft = items.draft_saved_item(saved_uuid).unwrap().unwrap();
+                assert_eq!(
+                    crate::saved_item::read(&draft.document().value)
+                        .unwrap()
+                        .unwrap()
+                        .stack
+                        .count(),
+                    3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merged_created_items_remain_coordinated_after_pickup() {
+        use native_world::loaded::ChunkPos;
+        let mut items = ItemEntities::default();
+        for (x, count) in [(15.8, 1), (16.2, 2)] {
+            items.spawn_from_entity(
+                DVec3::new(x, 5.0, 2.0),
+                ItemStack::new("minecraft:stone".into(), count, 64, Tag::Compound(vec![])).unwrap(),
+            );
+        }
+        items.debug_freeze_created();
+        let mut inventory = Arc::new(PlayerInventory::default());
+        let mut tick = |items: &mut ItemEntities, position, mode| {
+            items.tick_with_fluid_and_proof(
+                IVec3::ZERO,
+                position,
+                PlayerPose::Standing,
+                mode,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| native_world::fluid::FluidContacts::default(),
+                false,
+                |_, _, _| None,
+                |_, _| true,
+                |_| Some(false),
+            )
+        };
+        for _ in 0..40 {
+            tick(&mut items, DVec3::splat(100.0), GameMode::Spectator);
+        }
+        assert_eq!(items.entities.len(), 1);
+        let position = items.entities[0].item.position;
+        tick(&mut items, position, GameMode::Survival);
+        assert!(items.entities.is_empty());
+        let both = BTreeSet::from([ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }]);
+        assert_eq!(
+            items.affected_item_chunks(&Default::default()).unwrap(),
+            both
+        );
+        let removals = items.created_removal_effects(&both);
+        assert_eq!(removals.len(), 2);
+        assert!(
+            removals
+                .iter()
+                .any(|(_, cause)| *cause == CreatedRemovalCause::Merged)
+        );
+        assert!(
+            removals
+                .iter()
+                .any(|(_, cause)| *cause == CreatedRemovalCause::Pickup)
+        );
+        let pickups = items.created_pickup_effects(&both);
+        assert_eq!(pickups.len(), 1);
+        assert_eq!(pickups[0].original_stack.count(), 3);
+        assert_eq!(pickups[0].transferred, 3);
+        assert!(
+            items
+                .validate_removed_item_chunk_group(
+                    &BTreeSet::from([ChunkPos { x: 0, z: 0 }]),
+                    &Default::default()
+                )
+                .is_err()
+        );
     }
 
     #[test]

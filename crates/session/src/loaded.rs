@@ -36560,6 +36560,94 @@ mod tests {
     }
 
     #[test]
+    fn created_and_saved_item_merges_join_the_session_entity_draft() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        for (saved_count, created_count) in [(1, 2), (2, 1)] {
+            let mut session = session();
+            let home = session.player_chunk().unwrap();
+            let position = session.origin.as_dvec3() + DVec3::new(3.5, 3.0, 3.5);
+            let saved_uuid = [1, 2, 3, 4];
+            let entity = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:item".into())),
+                ("UUID".into(), Tag::IntArray(saved_uuid.to_vec())),
+                (
+                    "Pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: position.to_array().into_iter().map(Tag::Double).collect(),
+                    },
+                ),
+                ("NoGravity".into(), Tag::Byte(1)),
+                ("future".into(), Tag::Int(42)),
+                (
+                    "Item".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:stone".into())),
+                        ("count".into(), Tag::Int(saved_count)),
+                    ]),
+                ),
+            ]);
+            let document = Arc::new(NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                    (
+                        "Entities".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: vec![entity],
+                        },
+                    ),
+                ]),
+            });
+            session
+                .set_initial_entity_chunk(
+                    home,
+                    SavedEntityData::Present(Arc::new(
+                        native_persistence::world::SavedEntityChunk {
+                            position: native_persistence::world::ChunkPos {
+                                x: home.x,
+                                z: home.z,
+                            },
+                            document: Arc::clone(&document),
+                        },
+                    )),
+                )
+                .unwrap();
+            session.dropped_items.spawn_from_entity(
+                position,
+                ItemStack::new(
+                    "minecraft:stone".into(),
+                    created_count,
+                    64,
+                    Tag::Compound(vec![]),
+                )
+                .unwrap(),
+            );
+            session.dropped_items.debug_freeze_created();
+            for _ in 0..40 {
+                session.update(TICK);
+            }
+            let drafts = session.draft_tracked_entity_chunks().unwrap();
+            let Some(Tag::List { values, .. }) = drafts[&home].document().value.get("Entities")
+            else {
+                panic!()
+            };
+            assert_eq!(values.len(), 1);
+            let item = crate::saved_item::read(&values[0]).unwrap().unwrap();
+            assert_eq!(item.stack.count(), 3);
+            if saved_count > created_count as i32 {
+                assert_eq!(item.uuid, Some(saved_uuid));
+                assert_eq!(item.source.get("future"), Some(&Tag::Int(42)));
+            } else {
+                assert_ne!(item.uuid, Some(saved_uuid));
+            }
+            assert!(drafts[&home].matches_source(&document).unwrap());
+        }
+    }
+
+    #[test]
     fn saved_falling_sand_restores_and_does_not_duplicate_after_chunk_reload() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let mut session = session();

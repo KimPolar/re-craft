@@ -1376,6 +1376,22 @@ impl LoadedSession {
         }
     }
 
+    fn play_player_extinguish_sound(&mut self) {
+        let pitch = crate::extinguish_pitch(&mut self.player_random);
+        if self.consume_sounds.len() == 4096 {
+            self.consume_sounds.pop_front();
+        }
+        self.consume_sounds.push_back(crate::ConsumeSound {
+            position: self.origin.as_dvec3() + self.motion.position,
+            info: crate::ConsumeSoundInfo {
+                event: "entity.generic.extinguish_fire",
+                volume: 0.7,
+                pitch,
+                category: crate::ConsumeSoundCategory::Player,
+            },
+        });
+    }
+
     fn ignite_player_for(&mut self, base_ticks: i32) {
         let registry = self
             .oxygen_equipment
@@ -14753,6 +14769,7 @@ impl LoadedSession {
             self.ground_support = None;
         }
         let fire_before_block_effects = self.player_fire_ticks;
+        let was_burning = self.player_fire_ticks > 0;
         let step_for = |axis, position| {
             crate::fire_contact::traversal_step(
                 player_bounds,
@@ -14854,6 +14871,9 @@ impl LoadedSession {
                 Some(false) => {}
                 None => self.unresolved_player_fire_contact = true,
             }
+        }
+        if was_burning && self.player_fire_ticks <= 0 {
+            self.play_player_extinguish_sound();
         }
         if self.game_mode != GameMode::Spectator
             && self.player_fire_ticks <= 0
@@ -37339,6 +37359,143 @@ mod tests {
         // Drowning is processed first and suppresses the weaker starvation hit.
         assert_eq!(session.vitals.health, 14.0);
         assert_eq!(session.vitals.air, 0);
+    }
+
+    #[test]
+    fn player_extinguish_uses_player_category_and_advances_entity_random() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        for silent in [false, true] {
+            for seed in [0, 1, 37, 1234567] {
+                let mut session = session();
+                let source = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![("Silent".into(), Tag::Byte(i8::from(silent)))]),
+                };
+                session.restore_saved_player_inventory(&source).unwrap();
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set(IVec3::new(8, 1, 8), water));
+                session.player_fire_ticks = 41;
+                session.player_random = native_core::random::LegacyRandom::new(seed);
+                let mut expected = session.player_random.clone();
+                let pitch = crate::extinguish_pitch(&mut expected);
+                session.update(TICK);
+                assert_eq!(session.player_fire_ticks, -20);
+                let sounds = session.take_consume_sounds();
+                assert_eq!(sounds.len(), 1, "silent={silent}, seed={seed}");
+                assert_eq!(
+                    sounds[0].position,
+                    session.origin.as_dvec3() + session.motion.position
+                );
+                assert_eq!(sounds[0].info.event, "entity.generic.extinguish_fire");
+                assert_eq!(sounds[0].info.category, crate::ConsumeSoundCategory::Player);
+                assert_eq!(sounds[0].info.volume.to_bits(), 0.7_f32.to_bits());
+                assert_eq!(sounds[0].info.pitch.to_bits(), pitch.to_bits());
+                assert_eq!(session.player_random.next_int(), expected.next_int());
+                session.update(TICK);
+                assert!(session.take_consume_sounds().is_empty());
+            }
+        }
+        for initial in [0, 1] {
+            let mut session = session();
+            let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+            assert!(session.set(IVec3::new(8, 1, 8), water));
+            session.player_fire_ticks = initial;
+            session.update(TICK);
+            assert!(session.take_consume_sounds().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_extinguish_sound_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerExtinguishSoundOracle.java");
+        let result = temp.path().join("sound.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerExtinguishSoundOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("PlayerExtinguishSoundOracle")
+            .arg(&result)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            let mut test = session();
+            test.motion.position = DVec3::new(3.5, 7.25, -4.5) - test.origin.as_dvec3();
+            test.player_random =
+                native_core::random::LegacyRandom::new(row["seed"].as_i64().unwrap());
+            test.play_player_extinguish_sound();
+            let sound = test.take_consume_sounds().pop().unwrap();
+            assert_eq!(
+                row["sound"].as_str().unwrap(),
+                format!("minecraft:{}", sound.info.event)
+            );
+            assert_eq!(row["category"].as_str().unwrap(), "player");
+            assert_eq!(sound.info.category, crate::ConsumeSoundCategory::Player);
+            assert_eq!(
+                sound.position.to_array(),
+                [
+                    row["x"].as_f64().unwrap(),
+                    row["y"].as_f64().unwrap(),
+                    row["z"].as_f64().unwrap()
+                ]
+            );
+            assert_eq!(
+                sound.info.volume.to_bits(),
+                row["volume_bits"].as_i64().unwrap() as u32
+            );
+            assert_eq!(
+                sound.info.pitch.to_bits(),
+                row["pitch_bits"].as_i64().unwrap() as u32
+            );
+            assert_eq!(
+                test.player_random.next_int(),
+                row["next"].as_i64().unwrap() as i32
+            );
+        }
     }
 
     #[test]

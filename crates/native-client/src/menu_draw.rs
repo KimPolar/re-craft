@@ -82,6 +82,10 @@ impl Canvas {
     }
 
     pub fn image(&mut self, image: &RgbaImage, rect: Rect) {
+        self.image_alpha(image, rect, 255);
+    }
+
+    pub fn image_alpha(&mut self, image: &RgbaImage, rect: Rect, alpha: u8) {
         if rect.w <= 0 || rect.h <= 0 || image.width() == 0 || image.height() == 0 {
             return;
         }
@@ -90,7 +94,11 @@ impl Canvas {
             for x in rect.x.max(0)..(rect.x + rect.w).min(self.width) {
                 let sx =
                     ((x - rect.x) as u32 * image.width() / rect.w as u32).min(image.width() - 1);
-                self.pixel(x, y, image.get_pixel(sx, sy).0);
+                let mut color = image.get_pixel(sx, sy).0;
+                if alpha != 255 {
+                    color[3] = ((u32::from(color[3]) * u32::from(alpha) + 127) / 255) as u8;
+                }
+                self.pixel(x, y, color);
             }
         }
     }

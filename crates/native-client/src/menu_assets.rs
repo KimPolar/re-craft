@@ -73,6 +73,11 @@ pub struct MenuAssets {
 }
 
 pub struct HudSprites {
+    pub effect_background: GuiSprite,
+    pub effect_background_ambient: GuiSprite,
+    pub effect_icons: Vec<GuiSprite>,
+    pub inventory_effect_background: GuiSprite,
+    pub inventory_effect_background_ambient: GuiSprite,
     pub experience_background: GuiSprite,
     pub experience_progress: GuiSprite,
     pub armor_empty: GuiSprite,
@@ -105,6 +110,23 @@ pub struct HudSprites {
 
 impl HudSprites {
     fn load(stack: &mut ResourceStack) -> Result<Self> {
+        let effect_icons = crate::status_effect_ui::EFFECTS
+            .iter()
+            .map(|effect| {
+                load_gui_sprite_path(
+                    stack,
+                    &format!("assets/minecraft/textures/mob_effect/{}.png", effect.id),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inventory_effect_background = load_gui_sprite_path(
+            stack,
+            "assets/minecraft/textures/gui/sprites/container/inventory/effect_background.png",
+        )?;
+        let inventory_effect_background_ambient = load_gui_sprite_path(
+            stack,
+            "assets/minecraft/textures/gui/sprites/container/inventory/effect_background_ambient.png",
+        )?;
         let mut sprite = |name: &str| {
             load_gui_sprite_path(
                 stack,
@@ -112,6 +134,11 @@ impl HudSprites {
             )
         };
         Ok(Self {
+            effect_background: sprite("effect_background")?,
+            effect_background_ambient: sprite("effect_background_ambient")?,
+            effect_icons,
+            inventory_effect_background,
+            inventory_effect_background_ambient,
             experience_background: sprite("experience_bar_background")?,
             experience_progress: sprite("experience_bar_progress")?,
             armor_empty: sprite("armor_empty")?,

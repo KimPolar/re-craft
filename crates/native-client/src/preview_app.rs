@@ -2706,6 +2706,7 @@ mod tests {
             vitals: previous.vitals,
             hunger_effect: previous.hunger_effect,
             poison_effect: previous.poison_effect,
+            active_effects: Arc::clone(&previous.active_effects),
             night_vision_duration: previous.night_vision_duration,
             experience: previous.experience,
             death: previous.death,

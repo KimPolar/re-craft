@@ -527,6 +527,8 @@ pub struct WorldSnapshot {
     pub vitals: survival::PlayerVitals,
     pub hunger_effect: bool,
     pub poison_effect: bool,
+    /// Status instances exposed to the renderer without mutable session access.
+    pub active_effects: Arc<[survival::DisplayEffect]>,
     /// Remaining night-vision ticks, or -1 for an infinite effect.
     pub night_vision_duration: Option<i32>,
     pub experience: experience::Experience,
@@ -774,6 +776,7 @@ impl LocalSession {
             vitals: survival::PlayerVitals::default(),
             hunger_effect: false,
             poison_effect: false,
+            active_effects: Arc::from([]),
             night_vision_duration: None,
             experience: experience::Experience::default(),
             death: None,
@@ -947,6 +950,7 @@ impl LocalSession {
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
             poison_effect: self.fall.effects().poison.is_some(),
+            active_effects: survival::display_effects(self.fall.effects(), &self.breathing_effects),
             night_vision_duration: self
                 .fall
                 .effects()
@@ -2070,6 +2074,10 @@ impl GameSession for LocalSession {
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
                 poison_effect: self.fall.effects().poison.is_some(),
+                active_effects: survival::display_effects(
+                    self.fall.effects(),
+                    &self.breathing_effects,
+                ),
                 night_vision_duration: self
                     .fall
                     .effects()
@@ -2570,6 +2578,66 @@ fn move_axis(world: &World, position: &mut Vec3, axis: usize, amount: f32) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_expose_active_effects_without_hidden_replacements() {
+        let mut session = LocalSession::demo();
+        for (duration, amplifier, show_icon) in [(100, 0, true), (2, 1, false)] {
+            session.fall.add_status(survival::StatusApplication {
+                kind: survival::FoodStatusKind::JumpBoost,
+                duration,
+                amplifier,
+                ambient: false,
+                visible: true,
+                show_icon,
+            });
+        }
+        session
+            .breathing_effects
+            .add_water_breathing(survival::StatusApplication {
+                kind: survival::FoodStatusKind::WaterBreathing,
+                duration: 100,
+                amplifier: 0,
+                ambient: true,
+                visible: true,
+                show_icon: true,
+            });
+        session.update(TICK);
+        let first = session.snapshot();
+        assert_eq!(first.active_effects.len(), 2);
+        let jump = first
+            .active_effects
+            .iter()
+            .find(|effect| effect.id == "jump_boost")
+            .unwrap();
+        assert_eq!(
+            (jump.duration, jump.amplifier, jump.show_icon),
+            (1, 1, false)
+        );
+        assert!(
+            first
+                .active_effects
+                .iter()
+                .any(|effect| effect.id == "water_breathing" && effect.ambient)
+        );
+        session.update(TICK);
+        let second = session.snapshot();
+        let jump = second
+            .active_effects
+            .iter()
+            .find(|effect| effect.id == "jump_boost")
+            .unwrap();
+        assert_eq!((jump.amplifier, jump.show_icon), (0, true));
+        assert_eq!(
+            first
+                .active_effects
+                .iter()
+                .find(|effect| effect.id == "jump_boost")
+                .unwrap()
+                .amplifier,
+            1
+        );
+    }
 
     #[test]
     fn demo_slow_falling_reduces_gravity_and_resets_fall_distance() {

@@ -57,6 +57,7 @@ mod screenshot;
 mod sky_background;
 mod smoke_particles;
 mod sound_ui;
+mod status_effect_ui;
 mod survival_hud;
 mod text_component;
 mod toggle_key;

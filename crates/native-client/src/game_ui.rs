@@ -138,6 +138,7 @@ struct DrawKey {
     book_hover: usize,
     book_tick: Option<u64>,
     hud: HudDisplay,
+    effects: crate::status_effect_ui::Frame,
     experience: crate::experience_hud::Display,
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
@@ -198,6 +199,8 @@ pub struct GameUi {
     compass_visible: bool,
     pre_blur_hud: Option<Canvas>,
     hud: HudDisplay,
+    effect_source: Arc<[native_session::survival::DisplayEffect]>,
+    effects: crate::status_effect_ui::Frame,
     experience: crate::experience_hud::Display,
     death: Option<DeathScreen>,
     system_messages: Arc<[native_session::SystemMessage]>,
@@ -292,6 +295,8 @@ impl GameUi {
             compass_visible: false,
             pre_blur_hud: None,
             hud: HudDisplay::default(),
+            effect_source: Arc::from([]),
+            effects: crate::status_effect_ui::Frame::default(),
             experience: crate::experience_hud::Display::new(
                 Default::default(),
                 native_session::GameMode::Survival,
@@ -2141,6 +2146,10 @@ impl GameUi {
     }
 
     fn sync_hud(&mut self, snapshot: &native_session::WorldSnapshot) {
+        if !Arc::ptr_eq(&self.effect_source, &snapshot.active_effects) {
+            self.effect_source = Arc::clone(&snapshot.active_effects);
+            self.effects = crate::status_effect_ui::Frame::new(&self.effect_source);
+        }
         self.hud =
             HudDisplay::with_air(snapshot.vitals, snapshot.game_mode, snapshot.eyes_in_water)
                 .with_armor(snapshot.armor)
@@ -2182,6 +2191,10 @@ impl GameUi {
         let player_menu = inventory.menu() == Some(InventoryMenu::Player);
         let logical_width = gui_size(size, self.gui_scale()).0;
         let avatar_visible = player_menu && !(self.recipe_book.is_open() && logical_width < 379);
+        let player_shows_effects = player_menu && {
+            let (left, _) = inventory_origin(logical_width as i32, 0, self.recipe_book.is_open());
+            crate::status_effect_ui::inventory_has_room(logical_width as i32, left)
+        };
         let right_model = avatar_visible
             .then(|| right_hand.and_then(|item| self.held_models.get_item(item)))
             .flatten();
@@ -2230,6 +2243,13 @@ impl GameUi {
                 && (self.recipe_book.is_open() || inventory.ghost_recipe().is_some()))
             .then_some(tick / self.recipe_book.redraw_period()),
             hud: self.hud,
+            effects: if player_shows_effects {
+                self.effects.inventory_key()
+            } else if self.hud_hidden {
+                crate::status_effect_ui::Frame::default()
+            } else {
+                self.effects.hud_key()
+            },
             experience: self.experience,
             hud_tick: self.hud.animation_key(tick),
             chat: crate::chat_hud::display_key(
@@ -2308,6 +2328,9 @@ impl GameUi {
             }
             crate::survival_hud::draw(&mut canvas, &assets.hud, self.hud, tick);
             crate::experience_hud::draw(&mut canvas, assets, self.experience);
+            if !player_shows_effects {
+                crate::status_effect_ui::draw_hud(&mut canvas, &assets.hud, self.effects);
+            }
             if !self.chat_input.is_open() {
                 crate::chat_hud::draw(
                     &mut canvas,
@@ -2342,6 +2365,9 @@ impl GameUi {
             } else {
                 inventory_origin(w, h, book_open)
             };
+            if player_menu {
+                crate::status_effect_ui::draw_inventory(&mut canvas, assets, self.effects, x, y);
+            }
             if !(book_open && w < 379) {
                 canvas.image(
                     match menu {
@@ -4214,6 +4240,56 @@ mod inventory_tests {
             displayed_item_use(&hands, 0.5).unwrap().duration_ticks,
             None
         );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn status_effects_use_pack_icons_and_move_into_player_inventory() {
+        use native_session::{GameSession, survival::DisplayEffect};
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let pack = tempfile::tempdir().unwrap();
+        let icons = pack.path().join("assets/minecraft/textures/mob_effect");
+        std::fs::create_dir_all(&icons).unwrap();
+        RgbaImage::from_pixel(18, 18, image::Rgba([231, 19, 47, 255]))
+            .save(icons.join("speed.png"))
+            .unwrap();
+        let assets = Arc::new(MenuAssets::load(&directory, &[pack.path().to_path_buf()]).unwrap());
+        let mut ui = GameUi::new(assets);
+        let mut snapshot = (*native_session::LocalSession::demo().snapshot()).clone();
+        let effect = DisplayEffect {
+            id: "speed",
+            duration: 3600,
+            amplifier: 0,
+            ambient: false,
+            show_icon: true,
+        };
+        snapshot.active_effects = Arc::from([effect]);
+        ui.sync_hud(&snapshot);
+        let mut inventory = PlayerInventory::default();
+        let canvas = ui.compose((1280, 720), &inventory, 0).unwrap();
+        let pixel =
+            |canvas: &Canvas, x: i32, y: i32| canvas.pixels[(y * canvas.width + x) as usize];
+        assert_eq!(pixel(&canvas, canvas.width - 22, 4), 0xffe7132f);
+        snapshot.active_effects = Arc::from([DisplayEffect {
+            duration: 3599,
+            ..effect
+        }]);
+        ui.sync_hud(&snapshot);
+        assert!(ui.compose((1280, 720), &inventory, 1).is_none());
+        inventory.toggle();
+        let canvas = ui.compose((1280, 720), &inventory, 1).unwrap();
+        let (left, top) = inventory_origin(canvas.width, canvas.height, false);
+        assert_eq!(pixel(&canvas, left + 178 + 7, top + 7), 0xffe7132f);
+        assert_ne!(pixel(&canvas, canvas.width - 22, 4), 0xffe7132f);
+        snapshot.active_effects = Arc::from([DisplayEffect {
+            show_icon: false,
+            ..effect
+        }]);
+        ui.sync_hud(&snapshot);
+        let canvas = ui.compose((1280, 720), &inventory, 2).unwrap();
+        assert_eq!(pixel(&canvas, left + 178 + 7, top + 7), 0xffe7132f);
     }
 
     #[test]

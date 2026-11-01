@@ -1346,6 +1346,8 @@ impl LoadedSession {
         }
         self.effect_save_invalid |= self.tick != 0;
         self.breathing_effects = effects;
+        Arc::make_mut(&mut self.snapshot).active_effects =
+            crate::survival::display_effects(self.fall.effects(), &self.breathing_effects);
         self.oxygen_bonus = oxygen_bonus;
         self.oxygen_equipment = None;
         self.oxygen_inventory_revision = None;
@@ -1834,6 +1836,8 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("active enchantment registry is unavailable"))?;
         self.effect_save_invalid |= self.tick != 0;
         self.fall.configure(safe, multiplier, effects, registry);
+        Arc::make_mut(&mut self.snapshot).active_effects =
+            crate::survival::display_effects(self.fall.effects(), &self.breathing_effects);
         Arc::make_mut(&mut self.snapshot).hunger_effect = self.fall.effects().hunger.is_some();
         Arc::make_mut(&mut self.snapshot).poison_effect = self.fall.effects().poison.is_some();
         Arc::make_mut(&mut self.snapshot).night_vision_duration = self
@@ -3985,6 +3989,10 @@ impl LoadedSession {
             vitals: self.vitals,
             hunger_effect: self.fall.effects().hunger.is_some(),
             poison_effect: self.fall.effects().poison.is_some(),
+            active_effects: crate::survival::display_effects(
+                self.fall.effects(),
+                &self.breathing_effects,
+            ),
             night_vision_duration: self
                 .fall
                 .effects()
@@ -4103,6 +4111,7 @@ impl LoadedSession {
             vitals: crate::survival::PlayerVitals::default(),
             hunger_effect: false,
             poison_effect: false,
+            active_effects: Arc::from([]),
             night_vision_duration: None,
             experience: crate::experience::Experience::default(),
             death: None,
@@ -14835,6 +14844,10 @@ impl GameSession for LoadedSession {
                 vitals: self.vitals,
                 hunger_effect: self.fall.effects().hunger.is_some(),
                 poison_effect: self.fall.effects().poison.is_some(),
+                active_effects: crate::survival::display_effects(
+                    self.fall.effects(),
+                    &self.breathing_effects,
+                ),
                 night_vision_duration: self
                     .fall
                     .effects()

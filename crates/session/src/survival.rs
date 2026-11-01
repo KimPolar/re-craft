@@ -1253,6 +1253,53 @@ pub struct BreathingEffects {
     pub breath_of_the_nautilus: Option<EffectDuration>,
 }
 
+/// The visible instance, excluding any hidden replacement chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayEffect {
+    pub id: &'static str,
+    pub duration: i32,
+    pub amplifier: u8,
+    pub ambient: bool,
+    pub show_icon: bool,
+}
+
+pub(crate) fn display_effects(
+    fall: &FallEffects,
+    breathing: &BreathingEffects,
+) -> std::sync::Arc<[DisplayEffect]> {
+    [
+        ("night_vision", &fall.night_vision),
+        ("jump_boost", &fall.jump_boost),
+        ("resistance", &fall.resistance),
+        ("slow_falling", &fall.slow_falling),
+        ("levitation", &fall.levitation),
+        ("speed", &fall.speed),
+        ("slowness", &fall.slowness),
+        ("dolphins_grace", &fall.dolphins_grace),
+        ("haste", &fall.haste),
+        ("mining_fatigue", &fall.mining_fatigue),
+        ("hunger", &fall.hunger),
+        ("poison", &fall.poison),
+        ("regeneration", &fall.regeneration),
+        ("luck", &fall.luck),
+        ("unluck", &fall.unluck),
+        ("water_breathing", &breathing.water_breathing),
+        ("conduit_power", &breathing.conduit_power),
+        ("breath_of_the_nautilus", &breathing.breath_of_the_nautilus),
+    ]
+    .into_iter()
+    .filter_map(|(id, effect)| {
+        effect.as_ref().map(|effect| DisplayEffect {
+            id,
+            duration: effect.duration,
+            amplifier: effect.amplifier,
+            ambient: effect.ambient,
+            show_icon: effect.show_icon,
+        })
+    })
+    .collect()
+}
+
 impl BreathingEffects {
     pub(crate) fn add_water_breathing(&mut self, application: StatusApplication) {
         let incoming = EffectDuration::from_application(application);

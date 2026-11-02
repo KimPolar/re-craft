@@ -8,6 +8,7 @@ import net.minecraft.world.level.*;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.*;
+import net.minecraft.world.level.chunk.status.*;
 import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.levelgen.feature.*;
 import net.minecraft.world.level.levelgen.placement.*;
@@ -70,6 +71,16 @@ public class OreVeinOracle {
     for(long seed=0;seed<8;seed++){
       blocks=new HashMap<>();var random=new WorldgenRandom(new XoroshiroRandomSource(0));long deco=random.setDecorationSeed(seed,-32,48);random.setFeatureSeed(deco,7,3);
       out.println("I "+seed);place(modifiers,0,context,random,new BlockPos(-32,0,48),world(true,false),new OreFeature(targets,9,0.5f));out.println("T "+random.nextLong());
+    }
+    if(args.length>0 && args[0].equals("--batch")) out.println("Z "+ChunkPyramid.GENERATION_PYRAMID.getStepTo(ChunkStatus.FEATURES).blockStateWriteRadius());
+    if(args.length>0 && args[0].equals("--batch")) for(long seed=0;seed<8;seed++){
+      blocks=new HashMap<>();var random=new WorldgenRandom(new XoroshiroRandomSource(0));long deco=random.setDecorationSeed(seed,-32,48);
+      out.println("B "+seed);
+      for(int feature=0;feature<2;feature++){
+        random.setFeatureSeed(deco,feature,0);
+        place(modifiers,0,context,random,new BlockPos(-32,0,48),world(true,false),new OreFeature(targets,9,0.5f));
+      }
+      out.println("U "+random.nextLong());
     }
   }
 }

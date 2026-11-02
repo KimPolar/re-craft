@@ -33,7 +33,7 @@ mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
-pub use ore::{OreVeinRegion, PlacedOreVein, ScheduledOreVein};
+pub use ore::{OreVeinRegion, PlacedOreVein, PreparedOreDecoration, ScheduledOreVein};
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
@@ -66,6 +66,9 @@ pub struct CarvedTerrainWorld {
     seed: i64,
     min_y: i32,
     height: i32,
+    // Completed only when every selected feature has been processed with
+    // structures disabled; lighting and later generation are still pending.
+    completed_decoration: std::collections::BTreeSet<native_world::loaded::ChunkPos>,
     // Direct feature section writes do not update Java's primed heightmap.
     ore_ocean_floor_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     postprocessing: BTreeMap<native_world::loaded::ChunkPos, Arc<[bool]>>,
@@ -96,6 +99,7 @@ impl CarvedTerrainWorld {
             seed,
             min_y,
             height,
+            completed_decoration: std::collections::BTreeSet::new(),
             ore_ocean_floor_heights: BTreeMap::new(),
             postprocessing: BTreeMap::from([(position, postprocessing)]),
             noise_postprocessing: noise_postprocessing
@@ -462,14 +466,24 @@ pub struct BiomeNeighborhood {
 /// Selected decoration features for one chunk. Structure placements still
 /// have to run before the corresponding feature step.
 pub struct DecorationPlan<'a> {
-    pub origin: [i32; 3],
-    pub decoration_seed: i64,
-    pub features: Vec<SelectedFeature<'a>>,
+    origin: [i32; 3],
+    decoration_seed: i64,
+    features: Vec<SelectedFeature<'a>>,
+    schedule: &'a FeatureSchedule,
     biomes: &'a BiomeNeighborhood,
     generator_min_y: i32,
     generator_height: i32,
 }
 impl DecorationPlan<'_> {
+    pub fn origin(&self) -> [i32; 3] {
+        self.origin
+    }
+    pub fn decoration_seed(&self) -> i64 {
+        self.decoration_seed
+    }
+    pub fn features(&self) -> &[SelectedFeature<'_>] {
+        &self.features
+    }
     /// Java reseeds the shared decoration RNG for every selected feature.
     pub fn feature_random(&self, feature: &SelectedFeature<'_>) -> DecorationRandom {
         let mut random = DecorationRandom::new(0);
@@ -796,6 +810,7 @@ impl TerrainGenerator {
             origin,
             decoration_seed,
             features: schedule.select(present),
+            schedule,
             biomes: neighborhood,
             generator_min_y: self.noise.router().min_y,
             generator_height: self.noise.router().height,

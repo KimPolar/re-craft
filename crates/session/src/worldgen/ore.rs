@@ -47,6 +47,116 @@ pub struct ScheduledOreVein<'a> {
     schedule: &'a FeatureSchedule,
 }
 
+/// A fully resolved ore-only chunk decoration attempt. Unsupported selected
+/// features are rejected before any generated terrain is changed.
+pub struct PreparedOreDecoration<'p, 's> {
+    plan: &'p DecorationPlan<'s>,
+    ores: BTreeMap<FeatureKey, ScheduledOreVein<'s>>,
+    tags: OreBlockTags,
+    motion: HeightmapTags,
+}
+
+impl<'p, 's> PreparedOreDecoration<'p, 's> {
+    /// The provider, complete block registry and resolver must describe the
+    /// same immutable data-pack stack as the plan and generated terrain.
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        plan: &'p DecorationPlan<'s>,
+        block_registry: &BTreeSet<String>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        let mut ores = BTreeMap::new();
+        let mut required = BTreeSet::new();
+        for selected in &plan.features {
+            let step = usize::try_from(selected.step).context("invalid feature step")?;
+            let index = usize::try_from(selected.index).context("invalid feature index")?;
+            let canonical = plan
+                .schedule
+                .steps()
+                .get(step)
+                .and_then(|v| v.get(index))
+                .context("feature absent from decoration schedule")?;
+            ensure!(
+                std::ptr::eq(canonical, selected.feature),
+                "plan refers to a different feature schedule"
+            );
+            if !ores.contains_key(selected.feature) {
+                let ore =
+                    ScheduledOreVein::load(provider, plan.schedule, selected.feature, resolve)
+                        .with_context(|| {
+                            format!("unsupported planned feature {:?}", selected.feature)
+                        })?;
+                required.extend(ore.required_tags());
+                ores.insert(selected.feature.clone(), ore);
+            }
+        }
+        let tags = OreBlockTags::load(provider, block_registry, &required)?;
+        let motion = HeightmapTags::load(provider, block_registry)?;
+        Ok(Self {
+            plan,
+            ores,
+            tags,
+            motion,
+        })
+    }
+
+    /// `structures_enabled` must be read from this world's generation settings.
+    /// Until structure placement exists it is an error to enable it. Results
+    /// match the selected feature order, and a failure publishes no changes.
+    pub fn execute(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+    ) -> Result<Vec<bool>> {
+        ensure!(
+            !structures_enabled,
+            "structure decoration is not implemented"
+        );
+        ensure!(
+            terrain.seed == self.plan.biomes.seed
+                && terrain.min_y == self.plan.biomes.min_y
+                && terrain.height == self.plan.biomes.height,
+            "plan and terrain differ"
+        );
+        let center = ChunkPos {
+            x: self.plan.origin[0].div_euclid(16),
+            z: self.plan.origin[2].div_euclid(16),
+        };
+        ensure!(
+            !terrain.completed_decoration.contains(&center),
+            "chunk decoration already completed"
+        );
+        let mut writable = BTreeSet::new();
+        // The 26.3 FEATURES generation step has write radius one.
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                writable.insert(ChunkPos {
+                    x: center
+                        .x
+                        .checked_add(dx)
+                        .context("decoration chunk X overflow")?,
+                    z: center
+                        .z
+                        .checked_add(dz)
+                        .context("decoration chunk Z overflow")?,
+                });
+            }
+        }
+        let mut region = terrain.ore_vein_region(&self.tags, &self.motion, writable)?;
+        let mut results = Vec::with_capacity(self.plan.features.len());
+        for (index, selected) in self.plan.features.iter().enumerate() {
+            let ore = self
+                .ores
+                .get(selected.feature)
+                .context("prepared ore is missing")?;
+            results.push(region.place_planned_auto(self.plan, index, ore)?);
+        }
+        region.finish()?;
+        terrain.completed_decoration.insert(center);
+        Ok(results)
+    }
+}
+
 impl<'a> ScheduledOreVein<'a> {
     /// Read both named and inline placed features from the same active packs
     /// and block registry that were used to prepare the schedule.
@@ -555,6 +665,7 @@ mod tests {
             seed: 0,
             min_y: 0,
             height: 16,
+            completed_decoration: BTreeSet::new(),
             ore_ocean_floor_heights: BTreeMap::new(),
             postprocessing: BTreeMap::new(),
             noise_postprocessing: BTreeMap::new(),
@@ -819,6 +930,7 @@ mod tests {
             origin: [0, 0, 0],
             decoration_seed: random.set_decoration_seed(0, 0, 0),
             features: schedule.select([&plains]),
+            schedule,
             biomes: neighborhood,
             generator_min_y: 0,
             generator_height: 16,
@@ -1032,6 +1144,88 @@ mod tests {
         assert!(!ambiguous_ore.biome_allows(&forest).unwrap());
     }
 
+    struct BatchData {
+        unsupported: bool,
+    }
+    impl ResourceProvider for BatchData {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            if path == "data/minecraft/worldgen/biome/plains.json" {
+                let second = if self.unsupported {
+                    json!({"feature":{"type":"minecraft:tree"},"placement":[]})
+                } else {
+                    ScheduledData {
+                        heightmap: Some("WORLD_SURFACE_WG"),
+                    }
+                    .definition()
+                };
+                return Ok(Some(serde_json::to_vec(
+                    &json!({"features":[["test:ore",second]]}),
+                )?));
+            }
+            ScheduledData { heightmap: None }.read_data(path)
+        }
+    }
+    fn batch_registry() -> BTreeSet<String> {
+        ["minecraft:air", "minecraft:stone", "minecraft:diamond_ore"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn prepared_ore_batch_runs_in_order_and_rejects_structures() {
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        assert!(prepared.execute(&mut terrain, true).is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        let results = prepared.execute(&mut terrain, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|&placed| placed));
+        let after = terrain.snapshot();
+        assert!((0..16).any(|x| {
+            (0..16).any(|z| (0..8).any(|y| after.block(x, y, z) != before.block(x, y, z)))
+        }));
+        assert!(prepared.execute(&mut terrain, false).is_err());
+        assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn prepared_ore_batch_rejects_unknown_features_and_rolls_back_failures() {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let mut data = BatchData { unsupported: true };
+        let schedule =
+            FeatureSchedule::load(&mut data, std::slice::from_ref(&plains), &registry).unwrap();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        assert!(
+            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+                .is_err()
+        );
+
+        let mut data = BatchData { unsupported: false };
+        let schedule =
+            FeatureSchedule::load(&mut data, std::slice::from_ref(&plains), &registry).unwrap();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        assert!(prepared.execute(&mut terrain, false).is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn generated_chunk_veins_match_java() {
@@ -1093,12 +1287,16 @@ mod tests {
         let output = run(Command::new(java.join("java.exe"))
             .arg("-classpath")
             .arg(&cp)
-            .arg("OreVeinOracle"));
+            .arg("OreVeinOracle")
+            .arg("--batch"));
         let mut expected =
             BTreeMap::<(i32, String, i64), (BTreeMap<[i32; 3], String>, bool, i64)>::new();
         let mut integrated = BTreeMap::<i64, (BTreeMap<[i32; 3], String>, i64)>::new();
+        let mut batches = BTreeMap::<i64, BTreeMap<[i32; 3], String>>::new();
         let mut key = None;
         let mut integrated_key = None;
+        let mut batch_key = None;
+        let mut write_radius = None;
         let mut writes = BTreeMap::new();
         for line in output.lines() {
             let words: Vec<_> = line.split_whitespace().collect();
@@ -1115,7 +1313,16 @@ mod tests {
                     integrated_key = Some(seed.parse().unwrap());
                     writes.clear();
                 }
-                ["W", x, y, z, name] if key.is_some() || integrated_key.is_some() => {
+                ["B", seed] => {
+                    batch_key = Some(seed.parse().unwrap());
+                    writes.clear();
+                }
+                ["Z", radius] => {
+                    write_radius = Some(radius.parse::<i32>().unwrap());
+                }
+                ["W", x, y, z, name]
+                    if key.is_some() || integrated_key.is_some() || batch_key.is_some() =>
+                {
                     writes.insert(
                         [x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap()],
                         (*name).to_owned(),
@@ -1137,9 +1344,13 @@ mod tests {
                         (std::mem::take(&mut writes), next.parse().unwrap()),
                     );
                 }
+                ["U", _] if batch_key.is_some() => {
+                    batches.insert(batch_key.take().unwrap(), std::mem::take(&mut writes));
+                }
                 _ => {}
             }
         }
+        assert_eq!(write_radius, Some(1));
         struct OracleData;
         impl ResourceProvider for OracleData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -1269,6 +1480,7 @@ mod tests {
             {"state":"minecraft:diamond_ore","target":{"predicate_type":"minecraft:all_of","rules":[{"predicate_type":"minecraft:tag_match","tag":"minecraft:base_stone_overworld"},{"predicate_type":"minecraft:height_match","min_inclusive":-2,"max_inclusive":2},{"predicate_type":"minecraft:not","rule":{"predicate_type":"minecraft:random_block_match","block":"minecraft:stone","probability":0.25}}]}},
             {"state":"minecraft:gold_ore","target":{"predicate_type":"minecraft:any_of","rules":[{"predicate_type":"minecraft:block_match","block":"minecraft:deepslate"},{"predicate_type":"minecraft:random_block_match","block":"minecraft:stone","probability":0.5}]}}
         ]});
+        let batch_ore = ore.clone();
         let placement = PlacedFeature::decode(&json!({"feature":ore,"placement":[
             {"type":"minecraft:count","count":4},{"type":"minecraft:in_square"},
             {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-5},"max_inclusive":{"absolute":5}}}
@@ -1352,6 +1564,7 @@ mod tests {
                     index: 7,
                     feature: &key,
                 }],
+                schedule: &java_schedule,
                 biomes: &neighborhood,
                 generator_min_y: -16,
                 generator_height: 32,
@@ -1381,6 +1594,100 @@ mod tests {
                 &actual, &integrated[&seed].0,
                 "planned Java ore blocks {seed}"
             );
+        }
+        struct OracleBatchData(Value);
+        impl ResourceProvider for OracleBatchData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/worldgen/biome/plains.json" => {
+                        Some(json!({"features":[["test:ore0","test:ore1"]]}))
+                    }
+                    "data/test/worldgen/placed_feature/ore0.json"
+                    | "data/test/worldgen/placed_feature/ore1.json" => Some(
+                        json!({"feature":self.0,"placement":[{"type":"minecraft:count","count":4},{"type":"minecraft:in_square"},{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-5},"max_inclusive":{"absolute":5}}}]}),
+                    ),
+                    _ => None,
+                };
+                match value {
+                    Some(value) => Ok(Some(serde_json::to_vec(&value)?)),
+                    None => OracleData.read_data(path),
+                }
+            }
+        }
+        let mut batch_data = OracleBatchData(batch_ore);
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let placed_registry = [
+            ResourceId::parse("test:ore0").unwrap(),
+            ResourceId::parse("test:ore1").unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        let schedule = FeatureSchedule::load(
+            &mut batch_data,
+            std::slice::from_ref(&plains),
+            &placed_registry,
+        )
+        .unwrap();
+        let block_registry = ["air", "stone", "deepslate", "diamond_ore", "gold_ore"]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+        for seed in 0..8i64 {
+            let mut terrain = oracle_terrain();
+            terrain.seed = seed;
+            let before = terrain.snapshot();
+            let mut neighborhood = super::super::BiomeNeighborhood::new(seed, -16, 32).unwrap();
+            for z in 2..=4 {
+                for x in -3..=-1 {
+                    neighborhood
+                        .insert(Arc::new(
+                            super::super::QuartBiomeChunk::from_values(
+                                [x, z],
+                                seed,
+                                -16,
+                                32,
+                                vec![plains.clone(); 128],
+                            )
+                            .unwrap(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let mut random = DecorationRandom::new(0);
+            let plan = DecorationPlan {
+                origin: [-32, -16, 48],
+                decoration_seed: random.set_decoration_seed(seed, -32, 48),
+                features: schedule.select([&plains]),
+                schedule: &schedule,
+                biomes: &neighborhood,
+                generator_min_y: -16,
+                generator_height: 32,
+            };
+            assert_eq!(plan.features.len(), 2);
+            let batch = PreparedOreDecoration::load(
+                &mut batch_data,
+                &plan,
+                &block_registry,
+                &mut resolve_test,
+            )
+            .unwrap();
+            assert_eq!(batch.execute(&mut terrain, false).unwrap().len(), 2);
+            let world = terrain.snapshot();
+            let mut actual = BTreeMap::new();
+            for z in 16..80 {
+                for x in -48..16 {
+                    for y in -16..16 {
+                        let after = world.block(x, y, z).unwrap();
+                        if before.block(x, y, z).unwrap() != after {
+                            actual.insert([x, y, z], after.name.clone());
+                        }
+                    }
+                }
+            }
+            assert_eq!(&actual, &batches[&seed], "ordered Java ore batch {seed}");
         }
     }
 }

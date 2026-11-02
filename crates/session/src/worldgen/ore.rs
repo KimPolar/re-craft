@@ -23,6 +23,7 @@ use native_resources::{
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
+    root_system_feature::{RootSystemFeature, RootSystemWorld},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
     spring_feature::{SpringFeature, SpringWorld},
     tree_beehive::BeehiveWorld,
@@ -108,6 +109,7 @@ enum ConfiguredDecoration {
     Multiface(MultifaceGrowth),
     HugeMushroom(HugeMushroomFeature<BlockState>),
     VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
+    RootSystem(RootSystemFeature<BlockState>, Box<PlacedDecorationFeature>),
     Selector(Vec<PlacedDecorationFeature>),
     BooleanSelector(Box<PlacedDecorationFeature>, Box<PlacedDecorationFeature>),
     WeightedSelector(
@@ -136,6 +138,11 @@ impl ConfiguredDecoration {
             Self::Multiface(v) => v.required_blocks(),
             Self::HugeMushroom(v) => v.required_blocks(),
             Self::VegetationPatch(v, nested) => {
+                let mut blocks = v.required_blocks();
+                blocks.extend(nested.required_blocks());
+                blocks
+            }
+            Self::RootSystem(v, nested) => {
                 let mut blocks = v.required_blocks();
                 blocks.extend(nested.required_blocks());
                 blocks
@@ -185,6 +192,7 @@ impl ConfiguredDecoration {
             Self::VegetationPatch(v, nested) => {
                 v.needs_survival(name) || nested.needs_survival(name)
             }
+            Self::RootSystem(v, nested) => v.needs_survival(name) || nested.needs_survival(name),
             Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
             Self::BooleanSelector(a, b) => a.needs_survival(name) || b.needs_survival(name),
             Self::WeightedSelector(values, default) => {
@@ -193,14 +201,17 @@ impl ConfiguredDecoration {
             _ => false,
         }
     }
-    fn needs_lake(&self) -> bool {
+    fn needs_water_fluids(&self) -> bool {
         match self {
             Self::Lake(_) => true,
-            Self::VegetationPatch(_, nested) => nested.needs_lake(),
-            Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_lake),
-            Self::BooleanSelector(a, b) => a.needs_lake() || b.needs_lake(),
+            Self::VegetationPatch(_, nested) => nested.needs_water_fluids(),
+            Self::RootSystem(_, _) => true,
+            Self::Selector(values) => values
+                .iter()
+                .any(PlacedDecorationFeature::needs_water_fluids),
+            Self::BooleanSelector(a, b) => a.needs_water_fluids() || b.needs_water_fluids(),
             Self::WeightedSelector(values, default) => {
-                default.needs_lake() || values.iter().any(|(_, v)| v.needs_lake())
+                default.needs_water_fluids() || values.iter().any(|(_, v)| v.needs_water_fluids())
             }
             _ => false,
         }
@@ -209,10 +220,26 @@ impl ConfiguredDecoration {
         match self {
             Self::Freeze => true,
             Self::VegetationPatch(_, nested) => nested.needs_freeze(),
+            Self::RootSystem(_, nested) => nested.needs_freeze(),
             Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_freeze),
             Self::BooleanSelector(a, b) => a.needs_freeze() || b.needs_freeze(),
             Self::WeightedSelector(values, default) => {
                 default.needs_freeze() || values.iter().any(|(_, v)| v.needs_freeze())
+            }
+            _ => false,
+        }
+    }
+    fn needs_root_system(&self) -> bool {
+        match self {
+            Self::RootSystem(_, _) => true,
+            Self::VegetationPatch(_, nested) => nested.feature.needs_root_system(),
+            Self::Selector(values) => values.iter().any(|v| v.feature.needs_root_system()),
+            Self::BooleanSelector(a, b) => {
+                a.feature.needs_root_system() || b.feature.needs_root_system()
+            }
+            Self::WeightedSelector(values, default) => {
+                default.feature.needs_root_system()
+                    || values.iter().any(|(_, v)| v.feature.needs_root_system())
             }
             _ => false,
         }
@@ -271,6 +298,17 @@ impl ConfiguredDecoration {
                     depth + 1,
                 )?;
                 Ok(Self::VegetationPatch(patch, Box::new(nested)))
+            }
+            ("minecraft", "root_system") => {
+                let root = RootSystemFeature::decode(provider, value, resolve)?;
+                let nested = PlacedDecorationFeature::load_nested(
+                    provider,
+                    root.tree(),
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                Ok(Self::RootSystem(root, Box::new(nested)))
             }
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
@@ -374,6 +412,11 @@ impl ConfiguredDecoration {
                 tags.extend(nested.required_tags());
                 tags
             }
+            Self::RootSystem(v, nested) => {
+                let mut tags = v.required_tags();
+                tags.extend(nested.required_tags());
+                tags
+            }
             Self::Freeze => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
@@ -444,6 +487,9 @@ impl ConfiguredDecoration {
                     world.place_nested(nested, random, origin, generator_min_y, generator_height)
                 })
             }
+            Self::RootSystem(v, nested) => v.place(world, random, pos, |world, random, origin| {
+                world.place_nested(nested, random, origin, generator_min_y, generator_height)
+            }),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -548,7 +594,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut required = BTreeSet::new();
         let mut needs_sugar_cane = false;
         let mut needs_cactus = false;
-        let mut needs_lake = false;
+        let mut needs_water_fluids = false;
         let mut needs_freeze = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
@@ -573,8 +619,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .with_context(|| format!("unsupported planned feature {:?}", selected.feature))?;
                 let blocks = feature.placed.required_blocks();
                 needs_sugar_cane |= feature.placed.needs_survival("sugar_cane");
-                needs_cactus |= feature.placed.needs_survival("cactus");
-                needs_lake |= feature.placed.needs_lake();
+                needs_cactus |= feature.placed.needs_survival("cactus")
+                    || feature.placed.feature.needs_root_system();
+                needs_water_fluids |= feature.placed.needs_water_fluids();
                 needs_freeze |= feature.placed.needs_freeze();
                 for id in blocks {
                     ensure!(
@@ -596,7 +643,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let cactus_lava_fluids = needs_cactus
             .then(|| native_resources::fluid_tags::load_lava(provider))
             .transpose()?;
-        let lake_water_fluids = needs_lake
+        let lake_water_fluids = needs_water_fluids
             .then(|| native_resources::fluid_tags::load_water(provider))
             .transpose()?;
         let freeze = if needs_freeze {
@@ -1088,8 +1135,8 @@ impl PlacedDecorationFeature {
     fn needs_survival(&self, name: &str) -> bool {
         self.placement.needs_survival(name) || self.feature.needs_survival(name)
     }
-    fn needs_lake(&self) -> bool {
-        self.feature.needs_lake()
+    fn needs_water_fluids(&self) -> bool {
+        self.feature.needs_water_fluids()
     }
     fn needs_freeze(&self) -> bool {
         self.feature.needs_freeze()
@@ -2106,6 +2153,65 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
     }
 }
 
+impl RootSystemWorld for DecorationRegion<'_> {
+    fn root_world_surface(&mut self, x: i32, z: i32) -> Result<i32> {
+        self.final_height(0, x, z)
+    }
+    fn root_can_survive(&mut self, state: &BlockState, pos: [i32; 3]) -> Result<bool> {
+        ensure!(
+            valid_hanging_roots(state),
+            "unsupported hanging root survival"
+        );
+        let above = OreWorld::block(self, [pos[0], pos[1].wrapping_add(1), pos[2]])?;
+        DiskWorld::face_sturdy(
+            self,
+            &above,
+            [pos[0], pos[1].wrapping_add(1), pos[2]],
+            [0, -1, 0],
+        )
+    }
+    fn set_root_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "root system chunk is missing"
+            );
+            ensure!(
+                (state.name == "minecraft:rooted_dirt" && state.properties.is_empty())
+                    || valid_hanging_roots(state),
+                "unsupported root replacement effects"
+            );
+            if self.is_outside(pos[1]) {
+                return Ok(true);
+            }
+            let old = self.read(pos)?;
+            ensure!(
+                disk_safe_solid(&old.name).is_some() || valid_hanging_roots(&old),
+                "unsupported root source effects"
+            );
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
+fn valid_hanging_roots(state: &BlockState) -> bool {
+    state.name == "minecraft:hanging_roots"
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
 impl GroundDecorationWorld for DecorationRegion<'_> {
     fn ground_solid_render(&mut self, state: &BlockState) -> Result<bool> {
         tree_solid_render(state)
@@ -2880,6 +2986,7 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
         | "minecraft:ice"
         | "minecraft:podzol"
         | "minecraft:coarse_dirt"
+        | "minecraft:rooted_dirt"
         | "minecraft:mycelium"
         | "minecraft:tuff"
         | "minecraft:calcite"
@@ -2890,7 +2997,9 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
         | "minecraft:red_sand"
         | "minecraft:moss_block" => Some(true),
         "minecraft:magma_block" | "minecraft:cactus" => Some(true),
-        "minecraft:sugar_cane" | "minecraft:cactus_flower" => Some(false),
+        "minecraft:sugar_cane" | "minecraft:cactus_flower" | "minecraft:hanging_roots" => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -6566,6 +6675,87 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    fn root_system_executes_nested_feature_and_writes_generated_chunk() {
+        struct RootData;
+        impl ResourceProvider for RootData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" =>
+                        Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:rooted_dirt","minecraft:melon"]}"#.to_vec())),
+                    _ => Data.read_data(path),
+                }
+            }
+        }
+        let value = json!({"feature":{"type":"minecraft:root_system",
+            "feature":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[]},
+            "required_vertical_space_for_tree":1,"level_test_distance":0,"max_level_deviation":0,
+            "root_radius":1,"root_replaceable":["minecraft:stone"],"root_state_provider":{"id":"minecraft:rooted_dirt"},
+            "root_placement_attempts":1,"root_column_max_height":10,"hanging_root_radius":1,
+            "hanging_roots_vertical_span":1,"hanging_root_state_provider":{"id":"minecraft:hanging_roots","properties":{"waterlogged":"false"}},
+            "hanging_root_placement_attempts":1,"allowed_vertical_water_for_tree":1,
+            "allowed_tree_position":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"}},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut RootData,
+            PlacedFeature::decode(&value).unwrap(),
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        assert!(placed.feature.needs_root_system());
+        assert!(placed.needs_water_fluids());
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:rooted_dirt".into(),
+            "minecraft:hanging_roots".into(),
+            "minecraft:melon".into(),
+        ]);
+        let tags = OreBlockTags::load(&mut RootData, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut RootData, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let water = BTreeSet::from(["minecraft:water".into(), "minecraft:flowing_water".into()]);
+        let lava = BTreeSet::from(["minecraft:lava".into(), "minecraft:flowing_lava".into()]);
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        region.lake_water_fluids = Some(&water);
+        region.cactus_lava_fluids = Some(&lava);
+        let air = state("air");
+        region.set_section_block([8, 5, 8], &air).unwrap();
+        region.update_final_heightmaps([8, 5, 8], &air).unwrap();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(
+                    &placed,
+                    &mut DecorationRandom::new(42),
+                    [8, 5, 8],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        assert_eq!(region.final_height(0, 8, 8).unwrap(), 9);
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert_eq!(before.block(8, 6, 8).unwrap().name, "minecraft:stone");
+        assert_eq!(after.block(8, 6, 8).unwrap().name, "minecraft:rooted_dirt");
+        assert_eq!(
+            after.block(8, 5, 8).unwrap().name,
+            "minecraft:hanging_roots"
+        );
+        assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:melon");
     }
 
     #[test]

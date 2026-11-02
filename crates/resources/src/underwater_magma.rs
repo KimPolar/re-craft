@@ -31,6 +31,7 @@ pub fn vanilla_full_occlusion(name: &str) -> Option<bool> {
         | "minecraft:snow_block"
         | "minecraft:podzol"
         | "minecraft:coarse_dirt"
+        | "minecraft:rooted_dirt"
         | "minecraft:mycelium"
         | "minecraft:tuff"
         | "minecraft:calcite"

@@ -56,6 +56,7 @@ pub mod surface_biomes;
 pub mod surface_pass;
 pub mod surface_rules;
 pub mod transforms;
+pub mod tree_placers;
 pub mod underwater_magma;
 pub mod vanilla_atlas;
 pub mod vanilla_stitcher;

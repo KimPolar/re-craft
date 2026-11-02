@@ -467,6 +467,119 @@ impl FreshGenerationLightTracker {
     }
 }
 
+/// A frozen batch of initialized generation chunks with monotonically
+/// activated light sources. This is separate from the live world: it cannot
+/// accept section updates, block changes, restored light or new registrations.
+/// Every initialized chunk that affects the batch must be registered before
+/// the tracker is moved here. Requested columns need their 3x3 neighborhood
+/// and, for sky light, its initialized source heights.
+pub struct StagedGenerationLightEngine {
+    fresh: FreshGenerationLightTracker,
+    active: BTreeSet<native_world::loaded::ChunkPos>,
+}
+
+impl StagedGenerationLightEngine {
+    pub fn new(fresh: FreshGenerationLightTracker) -> Self {
+        Self {
+            fresh,
+            active: BTreeSet::new(),
+        }
+    }
+
+    /// Capture a revision without modifying the world or a previous snapshot.
+    pub fn snapshot(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        covered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        self.snapshot_for(terrain, covered, registry, &self.active)
+    }
+
+    /// Activate one initialized chunk and return the requested visible data.
+    /// Failed calculation leaves the prior activation state untouched.
+    pub fn activate(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+        covered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        self.fresh.validate_terrain(terrain)?;
+        ensure!(
+            self.fresh.sky_sources.contains_key(&pos),
+            "light chunk is not initialized"
+        );
+        ensure!(!self.active.contains(&pos), "light chunk is already active");
+        let mut active = self.active.clone();
+        active.insert(pos);
+        let snapshot = self.snapshot_for(terrain, covered, registry, &active)?;
+        self.active = active;
+        Ok(snapshot)
+    }
+
+    fn snapshot_for(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        covered: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        use native_world::generation_light::{VisibleLayers, VisibleLightColumn};
+        use native_world::loaded::ChunkPos;
+
+        let covered: BTreeSet<_> = covered.into_iter().collect();
+        let mut snapshot = self
+            .fresh
+            .snapshot(terrain, covered.iter().copied(), registry)?;
+        for pos in covered {
+            // Propagation loses at least one level per horizontal step, so a
+            // source more than one chunk away cannot reach this column.
+            let affected = (-1i32..=1).any(|dz| {
+                (-1i32..=1).any(|dx| {
+                    pos.x
+                        .checked_add(dx)
+                        .zip(pos.z.checked_add(dz))
+                        .is_some_and(|(x, z)| active.contains(&ChunkPos { x, z }))
+                })
+            });
+            if !affected {
+                continue;
+            }
+            let block = self
+                .fresh
+                .calculate_block_light_for_active_chunks(terrain, pos, active, registry)?;
+            let sky = if self.fresh.has_skylight {
+                self.fresh
+                    .calculate_sky_light_for_active_chunks(terrain, pos, active, registry)?
+            } else {
+                VisibleLayers::new()
+            };
+            let mut visible_block = VisibleLayers::new();
+            for (y, layer) in block {
+                if snapshot
+                    .block_section_allocated(pos, y)
+                    .context("uncovered block-light column")?
+                {
+                    visible_block.insert(y, layer);
+                }
+            }
+            let mut visible_sky = VisibleLayers::new();
+            for (y, layer) in sky {
+                if snapshot
+                    .sky_section_allocated(pos, y)
+                    .context("uncovered sky-light column")?
+                {
+                    visible_sky.insert(y, layer);
+                }
+            }
+            snapshot
+                .insert_complete_column(pos, VisibleLightColumn::new(visible_block, visible_sky));
+        }
+        Ok(snapshot)
+    }
+}
+
 impl CarvedTerrainWorld {
     /// Start with a generated chunk without copying its block sections.
     pub fn new(first: MaterializedTerrain) -> Self {

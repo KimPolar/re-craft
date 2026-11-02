@@ -3656,6 +3656,180 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_generation_light_snapshots_match_java() {
+        use super::super::StagedGenerationLightEngine;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let output = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected_path = temp.path().join("expected.json");
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&expected_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<Vec<u8>>> =
+            serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
+
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(17, 10, 8, torch).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                terrain.completed_decoration.insert(pos);
+                tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
+            }
+        }
+        let mut engine = StagedGenerationLightEngine::new(tracker);
+        let before = engine.snapshot(&terrain, [center], &registry).unwrap();
+        // East's 3x3 halo is not loaded. The attempted activation must roll back.
+        assert!(
+            engine
+                .activate(&terrain, center, [east], &registry)
+                .is_err()
+        );
+        use super::super::schedule::{GenerationSchedule, GenerationStage};
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(center, GenerationStage::Light).unwrap();
+        // Earlier generation steps are represented by the prepared fixture.
+        while !schedule.ready(center, GenerationStage::Light) {
+            let (pos, stage) = schedule.next_ready().unwrap();
+            schedule.complete(pos, stage).unwrap();
+        }
+        terrain.completed_decoration.remove(&east);
+        assert!(
+            schedule
+                .run_light(&terrain, center, &mut engine, &registry)
+                .is_err()
+        );
+        assert_eq!(
+            schedule.completed(center),
+            Some(GenerationStage::InitializeLight)
+        );
+        terrain.completed_decoration.insert(east);
+        let first = schedule
+            .run_light(&terrain, center, &mut engine, &registry)
+            .unwrap();
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Light));
+        assert!(
+            engine
+                .activate(&terrain, center, [center], &registry)
+                .is_err()
+        );
+        let second = engine
+            .activate(&terrain, east, [center], &registry)
+            .unwrap();
+        let recaptured = engine.snapshot(&terrain, [center], &registry).unwrap();
+        for (stage, actual) in [&before, &first, &second].into_iter().enumerate() {
+            for y in -16..32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let p = [x, y, z];
+                        let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                        assert_eq!(
+                            actual.block_light(p),
+                            Some(expected[stage][0][index]),
+                            "block stage {stage} at {p:?}"
+                        );
+                        assert_eq!(
+                            actual.sky_light(p),
+                            Some(expected[stage][1][index]),
+                            "sky stage {stage} at {p:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(before.block_light([15, 10, 8]), Some(0));
+        assert_eq!(second.block_light([15, 10, 8]), Some(12));
+        assert_eq!(recaptured.block_light([15, 10, 8]), Some(12));
+        let mut dark_tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                dark_tracker
+                    .initialize_chunk(&terrain, ChunkPos { x, z }, &registry)
+                    .unwrap();
+            }
+        }
+        let mut no_sky = StagedGenerationLightEngine::new(dark_tracker);
+        no_sky
+            .activate(&terrain, center, [center], &registry)
+            .unwrap();
+        let dark = no_sky
+            .activate(&terrain, east, [center], &registry)
+            .unwrap();
+        for y in -16..32 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let p = [x, y, z];
+                    let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                    assert_eq!(
+                        dark.block_light(p),
+                        Some(expected[2][0][index]),
+                        "no-sky block at {p:?}"
+                    );
+                    assert_eq!(dark.sky_light(p), Some(0));
+                }
+            }
+        }
+        let world = Arc::make_mut(&mut terrain.world);
+        let air = world.intern_state(state("air"));
+        world.set_block_id(17, 10, 8, air).unwrap();
+        assert!(engine.snapshot(&terrain, [center], &registry).is_err());
+        assert_eq!(second.block_light([15, 10, 8]), Some(12));
+    }
+
+    #[test]
     fn generated_light_waits_for_writers_and_uses_current_blocks() {
         let (mut terrain, _, _, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

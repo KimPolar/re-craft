@@ -354,6 +354,24 @@ impl GenerationSchedule {
         tracker.initialize_chunk(terrain, center, registry)?;
         self.complete(center, InitializeLight)
     }
+
+    /// Advance LIGHT within a frozen, fully initialized generation batch.
+    /// The returned snapshot does not write a chunk or make it saveable.
+    pub fn run_light(
+        &mut self,
+        terrain: &super::CarvedTerrainWorld,
+        center: ChunkPos,
+        engine: &mut super::StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        ensure!(
+            self.ready(center, Light),
+            "light dependencies are incomplete"
+        );
+        let snapshot = engine.activate(terrain, center, [center], registry)?;
+        self.complete(center, Light)?;
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]

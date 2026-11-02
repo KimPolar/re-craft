@@ -22,6 +22,7 @@ pub mod datapacks;
 pub mod density;
 pub mod enchantments;
 pub mod entity_collision;
+pub mod feature_order;
 pub mod fluid_environment;
 pub mod fluid_tags;
 pub mod game_event_tags;

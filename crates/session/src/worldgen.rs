@@ -724,6 +724,19 @@ impl TerrainGenerator {
     pub fn possible_biomes(&self) -> &std::collections::BTreeSet<ResourceId> {
         &self.possible_biomes
     }
+    /// Compile the generator's global decoration order from the active biome
+    /// data and validated placed-feature registry, preserving source order.
+    pub fn feature_schedule(
+        &self,
+        provider: &mut impl ResourceProvider,
+        registry: &std::collections::BTreeSet<ResourceId>,
+    ) -> Result<native_resources::feature_order::FeatureSchedule> {
+        native_resources::feature_order::FeatureSchedule::load(
+            provider,
+            &self.source.possible_biomes_in_order(),
+            registry,
+        )
+    }
     /// Check a set's candidate chunk after the biome-source filter, including
     /// concentric rings and exclusion references. This does not generate starts.
     pub fn is_structure_candidate<P: ResourceProvider>(
@@ -1568,6 +1581,41 @@ mod tests {
             "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,
                 "erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
         }})
+    }
+    #[test]
+    fn generator_compiles_feature_schedule_from_its_biome_source() {
+        use native_resources::feature_order::FeatureKey;
+        struct BiomeData;
+        impl ResourceProvider for BiomeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/worldgen/biome/plains.json").then(|| br#"{"features":[["minecraft:ore_iron","minecraft:ore_gold"],[],["minecraft:ore_diamond"]]}"#.to_vec()))
+            }
+        }
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut Data, &definition(), 42, 0, 16)
+                .unwrap();
+        let ids: Vec<_> = ["ore_iron", "ore_gold", "ore_diamond"]
+            .into_iter()
+            .map(|s| ResourceId::parse(s).unwrap())
+            .collect();
+        let registry = ids.iter().cloned().collect();
+        let schedule = generator
+            .feature_schedule(&mut BiomeData, &registry)
+            .unwrap();
+        assert_eq!(
+            schedule.steps,
+            vec![
+                vec![
+                    FeatureKey::Registered(ids[0].clone()),
+                    FeatureKey::Registered(ids[1].clone())
+                ],
+                vec![],
+                vec![FeatureKey::Registered(ids[2].clone())]
+            ]
+        );
     }
     #[test]
     fn generates_biomes_and_surface_only_with_complete_matching_neighbors() {

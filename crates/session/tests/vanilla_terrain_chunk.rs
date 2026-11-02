@@ -7,7 +7,8 @@ use native_resources::{
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk},
 };
 use native_session::worldgen::{
-    CarverBlockState, TerrainGenerator, materialize_carved_terrain, resolve_generated_terrain_state,
+    CarvedTerrainWorld, CarverBlockState, TerrainGenerator, materialize_carved_terrain,
+    resolve_generated_terrain_state,
 };
 use serde_json::Value;
 use std::{
@@ -175,6 +176,10 @@ fn terrain_matches_java_before_and_after_carvers() {
             "0",
             "0",
             "overworld",
+            "2345",
+            "1",
+            "0",
+            "overworld",
             "0",
             "-17",
             "32",
@@ -205,6 +210,7 @@ fn terrain_matches_java_before_and_after_carvers() {
         ]));
     let cases = [
         ("minecraft:overworld", 2345, [0, 0], -64, 384),
+        ("minecraft:overworld", 2345, [1, 0], -64, 384),
         ("minecraft:overworld", 0, [-17, 32], -64, 384),
         ("minecraft:overworld", -1, [64, -23], -64, 384),
         ("minecraft:overworld", 12345, [-100, 17], -64, 384),
@@ -303,6 +309,7 @@ fn terrain_matches_java_before_and_after_carvers() {
     )
     .unwrap();
     let tags = CarverBlockTags::load(&mut resources, &registry).unwrap();
+    let mut assembled = None;
     for (i, (dimension, seed, pos, min_y, height)) in cases.into_iter().enumerate() {
         let mut generator = TerrainGenerator::without_terrain_adjustments(
             &mut resources,
@@ -428,6 +435,34 @@ fn terrain_matches_java_before_and_after_carvers() {
                         ),
                         Some(format!("{}:{}", biome.namespace, biome.path).as_str())
                     );
+                }
+            }
+        }
+        if i == 0 {
+            assembled = Some(CarvedTerrainWorld::new(generated));
+        } else if i == 1 {
+            let assembled = assembled.as_mut().unwrap();
+            let previous = assembled.snapshot();
+            let flags = generated.fluid_postprocessing().to_vec();
+            assembled.insert(&generated).unwrap();
+            let combined = assembled.snapshot();
+            let first = native_world::loaded::ChunkPos { x: 0, z: 0 };
+            let second = native_world::loaded::ChunkPos { x: 1, z: 0 };
+            assert_eq!(combined.chunks.len(), 2);
+            assert!(Arc::ptr_eq(
+                &previous.chunks[&first],
+                &combined.chunks[&first]
+            ));
+            assert_eq!(
+                assembled.fluid_postprocessing(second),
+                Some(flags.as_slice())
+            );
+            for z in 0..16 {
+                for x in 0..16 {
+                    for y in min_y..min_y + height {
+                        assert_eq!(combined.block(16 + x, y, z), world.block(16 + x, y, z));
+                        assert_eq!(combined.biome(16 + x, y, z), world.biome(16 + x, y, z));
+                    }
                 }
             }
         }

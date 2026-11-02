@@ -43,9 +43,78 @@ pub struct QuartBiomeChunk {
 /// embedded chunk is deliberately not marked FULL or safe for world saving.
 pub struct MaterializedTerrain {
     world: native_world::loaded::World,
+    position: native_world::loaded::ChunkPos,
+    seed: i64,
     min_y: i32,
     height: i32,
-    postprocessing: Box<[bool]>,
+    postprocessing: Arc<[bool]>,
+}
+
+/// A collection of intermediate generated chunks sharing one world registry.
+/// These chunks remain at CARVERS stage and are not ready for play or saving.
+pub struct CarvedTerrainWorld {
+    world: Arc<native_world::loaded::World>,
+    seed: i64,
+    min_y: i32,
+    height: i32,
+    postprocessing: BTreeMap<native_world::loaded::ChunkPos, Arc<[bool]>>,
+}
+
+impl CarvedTerrainWorld {
+    /// Start with a generated chunk without copying its block sections.
+    pub fn new(first: MaterializedTerrain) -> Self {
+        let MaterializedTerrain {
+            world,
+            position,
+            seed,
+            min_y,
+            height,
+            postprocessing,
+        } = first;
+        Self {
+            world: Arc::new(world),
+            seed,
+            min_y,
+            height,
+            postprocessing: BTreeMap::from([(position, postprocessing)]),
+        }
+    }
+
+    /// Remap a chunk's local block and biome IDs without replacing existing
+    /// chunks or fluid flags. The caller must also ensure the generator and
+    /// active packs match; dimension, seed and bounds alone cannot prove that.
+    pub fn insert(&mut self, terrain: &MaterializedTerrain) -> Result<()> {
+        ensure!(
+            terrain.world.dimension == self.world.dimension,
+            "terrain dimension differs"
+        );
+        ensure!(terrain.seed == self.seed, "terrain seed differs");
+        ensure!(
+            terrain.min_y == self.min_y && terrain.height == self.height,
+            "terrain height range differs"
+        );
+        ensure!(
+            !self.postprocessing.contains_key(&terrain.position),
+            "terrain chunk already exists"
+        );
+        let inserted = Arc::make_mut(&mut self.world)
+            .import_chunk(&terrain.world, terrain.position)
+            .context("cannot import generated terrain chunk")?;
+        ensure!(inserted, "terrain chunk already exists in world");
+        self.postprocessing
+            .insert(terrain.position, Arc::clone(&terrain.postprocessing));
+        Ok(())
+    }
+
+    /// A snapshot retains its existing chunks when another chunk is inserted.
+    pub fn snapshot(&self) -> Arc<native_world::loaded::World> {
+        Arc::clone(&self.world)
+    }
+
+    /// Z, X, Y order, with Y measured from this collection's minimum height.
+    pub fn fluid_postprocessing(&self, pos: native_world::loaded::ChunkPos) -> Option<&[bool]> {
+        self.postprocessing.get(&pos).map(AsRef::as_ref)
+    }
 }
 
 /// Resolve supported generated block states without a generated block report.
@@ -90,7 +159,7 @@ impl MaterializedTerrain {
     }
 
     /// Transfer the chunk and its unconsumed postprocessing flags together.
-    pub fn into_parts(self) -> (native_world::loaded::World, Box<[bool]>) {
+    pub fn into_parts(self) -> (native_world::loaded::World, Arc<[bool]>) {
         (self.world, self.postprocessing)
     }
 }
@@ -218,9 +287,11 @@ pub fn materialize_carved_terrain(
         .insert(position, SavedBlockEntities::Unavailable);
     Ok(MaterializedTerrain {
         world,
+        position,
+        seed: biomes.seed,
         min_y: terrain.min_y,
         height: terrain.height,
-        postprocessing: terrain.fluid_updates.into_boxed_slice(),
+        postprocessing: Arc::from(terrain.fluid_updates.into_boxed_slice()),
     })
 }
 impl QuartBiomeChunk {
@@ -1025,6 +1096,99 @@ impl TerrainGenerator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn generated_chunks_share_a_world_without_losing_flags_or_snapshots() {
+        use native_world::loaded::{BlockState, ChunkPos};
+
+        let make = |position: [i32; 2], seed, min_y, dimension: &str, reverse: bool| {
+            let stone = Arc::new(json!("minecraft:stone"));
+            let water = Arc::new(json!("minecraft:water"));
+            let states = (0..4096)
+                .map(|index| {
+                    Arc::clone(if (index % 2 == 0) ^ reverse {
+                        &stone
+                    } else {
+                        &water
+                    })
+                })
+                .collect();
+            let updates = (0..4096).map(|index| index % 17 == 0).collect();
+            let terrain = SurfaceStageChunk {
+                chunk_position: position,
+                min_y,
+                height: 16,
+                states,
+                fluid_updates: updates,
+            };
+            let biomes = QuartBiomeChunk::from_values(
+                position,
+                seed,
+                min_y,
+                16,
+                vec![
+                    ResourceId::parse(if reverse {
+                        "minecraft:desert"
+                    } else {
+                        "minecraft:plains"
+                    })
+                    .unwrap();
+                    64
+                ],
+            )
+            .unwrap();
+            materialize_carved_terrain(terrain, &biomes, dimension, |value| {
+                Ok(BlockState {
+                    name: value.as_str().unwrap().to_owned(),
+                    properties: BTreeMap::new(),
+                })
+            })
+            .unwrap()
+        };
+
+        let first_pos = ChunkPos { x: -1, z: 0 };
+        let second_pos = ChunkPos { x: 0, z: 0 };
+        let mut assembled =
+            CarvedTerrainWorld::new(make([-1, 0], 42, -16, "minecraft:overworld", false));
+        let before = assembled.snapshot();
+        let second = make([0, 0], 42, -16, "minecraft:overworld", true);
+        let second_flags = second.fluid_postprocessing().to_vec();
+        assembled.insert(&second).unwrap();
+        let after = assembled.snapshot();
+        assert_eq!(before.chunks.len(), 1);
+        assert_eq!(after.chunks.len(), 2);
+        assert!(Arc::ptr_eq(
+            &before.chunks[&first_pos],
+            &after.chunks[&first_pos]
+        ));
+        assert_eq!(before.block(0, -16, 0), None);
+        assert_eq!(after.block(-16, -16, 0).unwrap().name, "minecraft:stone");
+        assert_eq!(after.block(0, -16, 0).unwrap().name, "minecraft:water");
+        assert_eq!(after.biome(-1, -16, 0), Some("minecraft:plains"));
+        assert_eq!(after.biome(0, -16, 0), Some("minecraft:desert"));
+        assert_eq!(
+            assembled.fluid_postprocessing(second_pos),
+            Some(second_flags.as_slice())
+        );
+        assert_eq!(
+            assembled.fluid_postprocessing(ChunkPos { x: 1, z: 0 }),
+            None
+        );
+
+        for invalid in [
+            make([0, 0], 42, -16, "minecraft:overworld", false),
+            make([1, 0], 43, -16, "minecraft:overworld", false),
+            make([1, 0], 42, 0, "minecraft:overworld", false),
+            make([1, 0], 42, -16, "minecraft:the_nether", false),
+        ] {
+            assert!(assembled.insert(&invalid).is_err());
+            assert!(Arc::ptr_eq(&after, &assembled.snapshot()));
+            assert_eq!(
+                assembled.fluid_postprocessing(second_pos),
+                Some(second_flags.as_slice())
+            );
+        }
+    }
 
     #[test]
     fn materialized_terrain_preserves_states_biomes_and_postprocessing() {

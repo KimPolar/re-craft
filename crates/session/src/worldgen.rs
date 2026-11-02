@@ -312,6 +312,46 @@ impl FreshGenerationLightTracker {
             .context("sky sources were not initialized")
     }
 
+    /// Calculate block-light values for a hypothetical sequence of activated
+    /// chunks, starting from this fresh engine revision. This does not advance
+    /// the engine, apply sky light, or publish any arrays.
+    pub fn calculate_block_light_for_active_chunks(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        center: native_world::loaded::ChunkPos,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
+        ensure!(
+            active.iter().all(|pos| self.registered.contains_key(pos)),
+            "active light chunk was not registered"
+        );
+        let mut covered = BTreeSet::new();
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                covered.insert(native_world::loaded::ChunkPos {
+                    x: center.x.checked_add(dx).context("light X overflow")?,
+                    z: center.z.checked_add(dz).context("light Z overflow")?,
+                });
+            }
+        }
+        let storage = self.snapshot(terrain, covered, registry)?;
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        native_world::generation_block_light::generated_block_light_from_active_chunks(
+            &terrain.world,
+            bounds,
+            center,
+            active,
+            &storage,
+        )
+        .context("active generated block-light inputs are incomplete or unsupported")
+    }
+
     /// Capture one immutable engine revision. Any later registered-chunk edit
     /// invalidates this tracker before another snapshot or registration.
     pub fn snapshot(

@@ -3876,11 +3876,14 @@ mod tests {
             let (_, _, neighborhood) = scheduled_fixture(None);
             let plan = fixture_plan(&schedule, &neighborhood);
             let mut registry = batch_registry();
-            registry.insert("minecraft:brown_mushroom".into());
+            registry.extend(["minecraft:brown_mushroom".into(), "minecraft:torch".into()]);
             let prepared =
                 PreparedDecoration::load(&mut MushroomAt(x), &plan, &registry, &mut resolve_test)
                     .unwrap();
             let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let torch = world.intern_state(state("torch"));
+            world.set_block_id(17, 10, 8, torch).unwrap();
             let registered = ChunkPos { x: 1, z: 0 };
             let center = ChunkPos { x: 0, z: 0 };
             let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
@@ -3901,6 +3904,35 @@ mod tests {
             let second = ChunkPos { x: 0, z: 1 };
             terrain.completed_decoration.insert(second);
             tracker.register_chunk(&terrain, second, &vanilla).unwrap();
+            assert!(
+                tracker
+                    .calculate_block_light_for_active_chunks(
+                        &terrain,
+                        center,
+                        &BTreeSet::from([center]),
+                        &vanilla
+                    )
+                    .is_err()
+            );
+            let dark = tracker
+                .calculate_block_light_for_active_chunks(
+                    &terrain,
+                    center,
+                    &BTreeSet::new(),
+                    &vanilla,
+                )
+                .unwrap();
+            let active = tracker
+                .calculate_block_light_for_active_chunks(
+                    &terrain,
+                    center,
+                    &BTreeSet::from([registered]),
+                    &vanilla,
+                )
+                .unwrap();
+            let index = 15 + 8 * 16 + 10 * 256;
+            assert_eq!(dark[&0][index / 2] >> 4, 0);
+            assert_eq!(active[&0][index / 2] >> 4, 12);
             let mut covered = Vec::new();
             for z in -2..=2 {
                 for x in -2..=2 {
@@ -3984,7 +4016,12 @@ mod tests {
                     Some(0)
                 );
             } else {
-                assert!(result.is_err());
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("registered light chunk has changed")
+                );
                 assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
                 assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
                 assert!(!terrain.completed_decoration.contains(&center));

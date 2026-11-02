@@ -8,10 +8,13 @@ use crate::{
         DIRECTIONS, LightBounds, LightProperties, faces_occlude, light_properties,
         transparent_light_properties,
     },
-    generation_light::VisibleLayers,
+    generation_light::{VisibleLayers, VisibleLightSnapshot},
     loaded::{ChunkPos, LIGHT_BYTES, World},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 /// Compute one target chunk and its two padding sections without mutating the
 /// input. Any missing chunk, section, state or unsupported light behavior
@@ -21,6 +24,31 @@ pub fn initialize_generated_block_light(
     bounds: LightBounds,
     center: ChunkPos,
 ) -> Option<VisibleLayers> {
+    calculate_generated_block_light(world, bounds, center, None, None)
+}
+
+/// Recompute block light after only the specified chunks have propagated
+/// their sources. The supplied storage snapshot must be from a fresh engine
+/// before any propagation and contain the entire 3x3 area. The source set
+/// must include every chunk activated since that snapshot. Blocks and section
+/// allocation must remain unchanged throughout this calculation.
+pub fn generated_block_light_from_active_chunks(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    active: &BTreeSet<ChunkPos>,
+    fresh_storage: &VisibleLightSnapshot,
+) -> Option<VisibleLayers> {
+    calculate_generated_block_light(world, bounds, center, Some(active), Some(fresh_storage))
+}
+
+fn calculate_generated_block_light(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    active: Option<&BTreeSet<ChunkPos>>,
+    fresh_storage: Option<&VisibleLightSnapshot>,
+) -> Option<VisibleLayers> {
     const SIDE: usize = 48;
     const PLANE: usize = SIDE * SIDE;
     let light_range = bounds.light_range();
@@ -29,6 +57,7 @@ pub fn initialize_generated_block_light(
     let count = PLANE.checked_mul(height)?;
     let mut behavior = vec![0u32; count];
     let mut levels = vec![0u8; count];
+    let mut allocated = vec![fresh_storage.is_none(); count];
     let mut properties: Vec<LightProperties> = vec![transparent_light_properties()];
     let mut known: HashMap<u32, u32> = HashMap::new();
     let mut queue: [Vec<usize>; 16] = std::array::from_fn(|_| Vec::new());
@@ -41,6 +70,20 @@ pub fn initialize_generated_block_light(
             let chunk = world.chunks.get(&pos)?;
             if chunk.position != pos {
                 return None;
+            }
+            if let Some(storage) = fresh_storage {
+                for section_y in light_range.start.div_euclid(16)..light_range.end.div_euclid(16) {
+                    if !storage.block_section_allocated(pos, section_y)? {
+                        continue;
+                    }
+                    let y0 = usize::try_from(section_y * 16 - light_range.start).ok()?;
+                    for y in y0..y0 + 16 {
+                        for z in cz * 16..cz * 16 + 16 {
+                            let start = cx * 16 + z * SIDE + y * PLANE;
+                            allocated[start..start + 16].fill(true);
+                        }
+                    }
+                }
             }
             for section_y in build_range.start.div_euclid(16)..build_range.end.div_euclid(16) {
                 let section = chunk.sections.get(&i8::try_from(section_y).ok()?)?;
@@ -63,7 +106,10 @@ pub fn initialize_generated_block_light(
                     let target = x + z * SIDE + y * PLANE;
                     behavior[target] = index;
                     let value = properties[index as usize].emission;
-                    if value > 0 {
+                    if value > 0
+                        && allocated[target]
+                        && active.is_none_or(|chunks| chunks.contains(&pos))
+                    {
                         levels[target] = value;
                         queue[value as usize].push(target);
                     }
@@ -96,6 +142,9 @@ pub fn initialize_generated_block_light(
                     continue;
                 }
                 let next = nx as usize + nz as usize * SIDE + ny as usize * PLANE;
+                if !allocated[next] {
+                    continue;
+                }
                 let to = &properties[behavior[next] as usize];
                 let candidate = level.saturating_sub(to.opacity.max(1));
                 if candidate <= levels[next] {
@@ -224,5 +273,30 @@ mod tests {
         });
         world.set_block_id(4, 8, 4, unknown).unwrap();
         assert!(initialize_generated_block_light(&world, bounds, center).is_none());
+    }
+
+    #[test]
+    fn staged_calculation_requires_known_storage_and_respects_unallocated_sections() {
+        let mut world = fixture();
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let torch = world.intern_state(BlockState {
+            name: "minecraft:torch".into(),
+            properties: Default::default(),
+        });
+        world.set_block_id(8, 8, 8, torch).unwrap();
+        let active = BTreeSet::from([center]);
+        let incomplete = VisibleLightSnapshot::new(true, false);
+        assert!(
+            generated_block_light_from_active_chunks(&world, bounds, center, &active, &incomplete)
+                .is_none()
+        );
+        let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+        let unallocated =
+            VisibleLightSnapshot::fresh_after_section_updates(true, false, [], covered).unwrap();
+        let result =
+            generated_block_light_from_active_chunks(&world, bounds, center, &active, &unallocated)
+                .unwrap();
+        assert_eq!(value(&result, 8, 8, 8), 0);
     }
 }

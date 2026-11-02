@@ -97,6 +97,15 @@ impl VisibleLightSnapshot {
         self.columns.insert(pos, column)
     }
 
+    /// Whether this visible engine revision has storage for a block-light
+    /// section. An uncovered column remains unknown rather than absent.
+    pub fn block_section_allocated(&self, pos: ChunkPos, section_y: i32) -> Option<bool> {
+        if !self.has_block {
+            return Some(false);
+        }
+        Some(self.columns.get(&pos)?.block.contains_key(&section_y))
+    }
+
     /// Capture a newly created engine after the listed nonempty section status
     /// updates have been drained. No lighting may have been enabled, queued,
     /// propagated, removed or restored before this snapshot. The caller must

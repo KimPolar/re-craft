@@ -6829,6 +6829,51 @@ impl LoadedSession {
         }
     }
 
+    /// Block-position game events use the center of the affected block.
+    fn player_block_vibration(&mut self, event: &str, relative: IVec3, state: BlockStateId) {
+        if self.sculk_listeners.is_empty()
+            || self.vibration_event_tags.is_none()
+            || self.vibration_block_tags.is_none()
+        {
+            return;
+        }
+        let Some(position) = add(self.origin, relative) else {
+            return;
+        };
+        let Some(name) = self.world.state(state).map(|state| state.name.clone()) else {
+            return;
+        };
+        self.dispatch_vibration(
+            event,
+            position.as_dvec3() + DVec3::splat(0.5),
+            self.player_uuid,
+            true,
+            self.game_mode == GameMode::Spectator,
+            self.sneak,
+            Some(&name),
+        );
+    }
+
+    fn placed_block_vibration(&mut self, relative: IVec3) {
+        if let Cell::State(id) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            relative,
+            self.states[0],
+        ) {
+            self.player_block_vibration("minecraft:block_place", relative, id);
+        }
+    }
+
+    fn set_player_placed(&mut self, relative: IVec3, id: BlockStateId) -> bool {
+        if !self.set(relative, id) {
+            return false;
+        }
+        self.placed_block_vibration(relative);
+        true
+    }
+
     /// Dispatch an item splash to resident listeners using active pack tags.
     fn dispatch_item_splash(&mut self, event: crate::ItemWaterEntry) {
         self.dispatch_vibration(
@@ -9792,7 +9837,7 @@ impl LoadedSession {
             return None;
         }
         let id = self.intern_block(block);
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     fn place_stairs(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -9848,7 +9893,7 @@ impl LoadedSession {
             return None;
         }
         let id = self.intern_block(block);
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     /// Snow uses the active support tags before testing the upper collision face.
@@ -9942,7 +9987,7 @@ impl LoadedSession {
             return None;
         }
         let id = self.intern_block(placed);
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     fn place_snow_block(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -10007,7 +10052,7 @@ impl LoadedSession {
             return None;
         }
         let id = self.intern_block(block);
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     /// Query known POI records and replay later lodestone transitions.
@@ -10289,7 +10334,7 @@ impl LoadedSession {
             return None;
         }
         let id = self.intern_block(state(name, &[]));
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     /// Test candidate supports in Java's view-dependent order. An unknown
@@ -10363,7 +10408,7 @@ impl LoadedSession {
                         block.name = "minecraft:lever".into();
                     }
                     let id = self.intern_block(block);
-                    return self.set(target, id).then_some(hand);
+                    return self.set_player_placed(target, id).then_some(hand);
                 }
             }
         }
@@ -10435,7 +10480,7 @@ impl LoadedSession {
             state("minecraft:redstone_block", &[])
         };
         let id = self.intern_block(block);
-        self.set(target, id).then_some(hand)
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     fn place_chest(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -10605,6 +10650,7 @@ impl LoadedSession {
                 return None;
             }
         }
+        self.placed_block_vibration(target);
         Some(hand)
     }
 
@@ -10680,6 +10726,7 @@ impl LoadedSession {
         Arc::make_mut(&mut self.world)
             .live_block_entities
             .insert(chunk, visible);
+        self.placed_block_vibration(target);
         Some(hand)
     }
 
@@ -12061,7 +12108,9 @@ impl LoadedSession {
         } else {
             self.states[0]
         };
-        if self.set(relative, replacement) {
+        if let Some(block_check) = self.check_block_set(relative, replacement, true, false) {
+            self.player_block_vibration("minecraft:block_destroy", relative, id);
+            assert!(self.apply_block_set(relative, replacement, true, block_check));
             let damage = if mining::Material::from_block_name(&name)
                 .is_some_and(|material| material.hardness() == 0.0)
             {
@@ -12221,9 +12270,11 @@ impl LoadedSession {
         };
         // Vanilla removes the block entity and scatters it before notifying
         // neighbors; those notifications may themselves produce drops.
-        if !self.set_with_notify(relative, replacement, false) {
+        let Some(checked) = self.check_block_set(relative, replacement, false, false) else {
             return;
-        }
+        };
+        self.player_block_vibration("minecraft:block_destroy", relative, id);
+        assert!(self.apply_block_set(relative, replacement, false, checked));
         self.dropped_items.drop_container_contents_with_random(
             absolute,
             &chest.slots,
@@ -12479,12 +12530,16 @@ impl LoadedSession {
         } else {
             None
         };
-        if !self.set_with_banner_removal(relative, self.states[0], true, true) {
+        let Some(checked) = self.check_block_set(relative, self.states[0], true, true) else {
             if let Some((_, checkpoint)) = drops {
                 self.rollback_block_loot(checkpoint);
             }
             return false;
+        };
+        if player {
+            self.player_block_vibration("minecraft:block_destroy", relative, id);
         }
+        assert!(self.apply_block_set(relative, self.states[0], true, checked));
         if !self.placed_banners.contains_key(&key)
             && let Some(entity) = entity
         {
@@ -16518,7 +16573,7 @@ impl LoadedSession {
                                 )
                                 && {
                                     self.placement_id_at(target, block.orient_for_face(hit.face))
-                                        .is_some_and(|id| self.set(target, id))
+                                        .is_some_and(|id| self.set_player_placed(target, id))
                                 }
                             {
                                 handled = true;
@@ -21099,6 +21154,121 @@ pub(crate) mod tests {
         session.register_saved_sculk_chunk(chunk);
         session.game_time = 100;
         (session, position)
+    }
+
+    struct BlockEventPacks {
+        dampens: bool,
+        occludes: bool,
+    }
+    impl native_resources::packs::ResourceProvider for BlockEventPacks {
+        fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+            let stone = (self.dampens && path.ends_with("dampens_vibrations.json"))
+                || (self.occludes && path.ends_with("occludes_vibration_signals.json"));
+            Ok(vec![if stone {
+                br#"{"values":["minecraft:stone"]}"#.to_vec()
+            } else {
+                br#"{"values":[]}"#.to_vec()
+            }])
+        }
+    }
+
+    fn block_event_session(
+        dampens: bool,
+        occludes: bool,
+        ignore_sneak: bool,
+    ) -> (LoadedSession, IVec3) {
+        let (mut session, sensor) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let ids = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:sculk_sensor".into(),
+        ]);
+        let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+            &mut BlockEventPacks { dampens, occludes },
+            &ids,
+        )
+        .unwrap();
+        let events = BTreeSet::from([
+            "minecraft:block_place".into(),
+            "minecraft:block_destroy".into(),
+        ]);
+        let ignored = if ignore_sneak {
+            events.clone()
+        } else {
+            BTreeSet::new()
+        };
+        session.set_vibration_tags(
+            Arc::new(native_resources::game_event_tags::GameEventTags::new(
+                events, ignored,
+            )),
+            Arc::new(blocks),
+        );
+        session.set_vanilla_block_ids(Arc::new(ids));
+        session.player_uuid = Some([1, 2, 3, 4]);
+        session.set_random_tick_speed(0);
+        (session, sensor)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_player_block_events_with_java(rows: &[serde_json::Value]) {
+        assert_eq!(rows.len(), 10);
+        for (index, row) in rows.iter().enumerate() {
+            let (mut session, sensor) = block_event_session(false, false, false);
+            session.sneak = row["careful"].as_bool().unwrap();
+            session.set_game_mode(GameMode::Creative);
+            let relative = IVec3::new(8, 2, 6);
+            if let Some(allowed) = row["allowed"].as_bool() {
+                if allowed {
+                    let target = IVec3::new(8, 2, 7);
+                    if !row["success"].as_bool().unwrap() {
+                        let stone = session.states[3];
+                        assert!(session.set(target, stone));
+                    }
+                    let stone = session.states[3];
+                    assert_eq!(
+                        session.set_player_placed(target, stone),
+                        row["success"].as_bool().unwrap()
+                    );
+                }
+            } else {
+                session.finish_breaking(session.origin + relative);
+            }
+            let pending = session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending()
+                .map(|(_, event)| event);
+            let expected = row["event"].as_str().unwrap();
+            assert_eq!(
+                pending.map(|event| event.event.as_str()).unwrap_or("none"),
+                match expected {
+                    "block_place" => "minecraft:block_place",
+                    "block_destroy" => "minecraft:block_destroy",
+                    "none" => "none",
+                    _ => panic!("unexpected event"),
+                },
+                "Java block event {index}: {row}"
+            );
+            if let Some(event) = pending {
+                let target = if row["allowed"].is_boolean() {
+                    IVec3::new(8, 2, 7)
+                } else {
+                    relative
+                };
+                assert_eq!(
+                    event.position,
+                    (session.origin + target).as_dvec3() + DVec3::splat(0.5),
+                    "Java block event {index}"
+                );
+                assert_eq!(event.source, session.player_uuid);
+                assert_eq!(row["center"], true);
+                assert_eq!(row["source"], true);
+                assert_eq!(row["affected"], true);
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -32049,6 +32219,78 @@ pub(crate) mod tests {
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
         );
+    }
+
+    #[test]
+    fn player_block_actions_deliver_vibrations_after_success_and_respect_tags() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for place in [false, true] {
+            for (sneak, dampens, occludes, ignore_sneak) in [
+                (false, false, false, false),
+                (true, false, false, false),
+                (true, false, false, true),
+                (false, true, false, false),
+                (false, false, true, false),
+            ] {
+                let (mut session, sensor) = block_event_session(dampens, occludes, ignore_sneak);
+                session.set_game_mode(GameMode::Creative);
+                session.sneak = sneak;
+                if place {
+                    let mut inventory = PlayerInventory::default();
+                    assert!(inventory.set_slot(
+                        PlayerSlot::Storage(0),
+                        ItemStack::new("minecraft:stone".into(), 2, 64, Tag::Compound(vec![]))
+                    ));
+                    session.set_player_inventory(inventory);
+                }
+                session.submit_command(if place {
+                    PlayerCommand::Place
+                } else {
+                    PlayerCommand::Break
+                });
+                session.update(TICK);
+                let target = IVec3::new(8, 2, if place { 7 } else { 6 });
+                let absolute = session.origin + target;
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    if place {
+                        "minecraft:stone"
+                    } else {
+                        "minecraft:air"
+                    }
+                );
+                let pending = session.sculk_listeners[&sensor.to_array()]
+                    .vibration
+                    .pending()
+                    .map(|(_, event)| event);
+                let expected = !dampens && !occludes && !(sneak && ignore_sneak);
+                assert_eq!(
+                    pending.is_some(),
+                    expected,
+                    "place={place}, sneak={sneak}, dampens={dampens}, occludes={occludes}, ignore={ignore_sneak}"
+                );
+                if let Some(event) = pending {
+                    assert_eq!(
+                        event.event,
+                        if place {
+                            "minecraft:block_place"
+                        } else {
+                            "minecraft:block_destroy"
+                        }
+                    );
+                    assert_eq!(
+                        event.position,
+                        (session.origin + target).as_dvec3() + DVec3::splat(0.5)
+                    );
+                    assert_eq!(event.source, session.player_uuid);
+                }
+            }
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState, movementState, affectedState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId; net.minecraft.world.level.block.entity.BlockEntity sensorEntity; String movementEvent;
+        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState, movementState, affectedState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId; net.minecraft.world.level.block.entity.BlockEntity sensorEntity; String movementEvent; Vec3 eventPosition; Entity eventSource;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
@@ -41,7 +41,9 @@ public class VibrationOracle {
         @Override public void playSound(Entity entity, BlockPos pos, SoundEvent event, SoundSource source, float volume, float pitch) { sounds++;soundPitch=pitch;soundId=event.location().toString(); }
         @Override public void playSound(Entity entity, double x,double y,double z,SoundEvent event,SoundSource source,float volume,float pitch) { sounds++;soundPitch=pitch;soundId=event.location().toString(); }
         @Override public void gameEvent(Entity entity, Holder<GameEvent> event, BlockPos pos) { events++; }
-        @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { movementEvent=event==GameEvent.STEP ? "step" : event==GameEvent.HIT_GROUND ? "hit_ground" : "other"; affectedState=context.affectedState(); }
+        @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { movementEvent=event==GameEvent.STEP ? "step" : event==GameEvent.HIT_GROUND ? "hit_ground" : event==GameEvent.BLOCK_PLACE ? "block_place" : event==GameEvent.BLOCK_DESTROY ? "block_destroy" : "other"; affectedState=context.affectedState();eventPosition=pos;eventSource=context.sourceEntity(); }
+        @Override public net.minecraft.world.flag.FeatureFlagSet enabledFeatures() { return net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS; }
+        @Override public void levelEvent(Entity player, int id, BlockPos pos, int data) {}
         @Override public <T extends ParticleOptions> int sendParticles(T type, double x, double y, double z, int count, double dx, double dy, double dz, double speed) { return 0; }
     }
     static class User implements VibrationSystem.User {
@@ -79,6 +81,29 @@ public class VibrationOracle {
         boolean landed;
         ProbeBlock() { super(net.minecraft.world.level.block.state.BlockBehaviour.Properties.of().setId(net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.BLOCK,net.minecraft.resources.Identifier.parse("test:fall_probe")))); }
         @Override public void fallOn(net.minecraft.world.level.Level level, BlockState state, BlockPos pos, Entity entity, double distance) { landed=true; }
+    }
+    static class ProbePlayer extends net.minecraft.world.entity.player.Player {
+        boolean careful;
+        ProbePlayer() { super(null,null); }
+        @Override public net.minecraft.world.level.GameType gameMode() { return net.minecraft.world.level.GameType.SURVIVAL; }
+        @Override public boolean hasInfiniteMaterials() { return false; }
+        @Override public boolean isSteppingCarefully() { return careful; }
+    }
+    static class ProbePlacement extends net.minecraft.world.item.context.BlockPlaceContext {
+        World world; ProbePlayer player; ItemStack stack; boolean canPlace;
+        ProbePlacement() { super(null,null,null,null); }
+        @Override public net.minecraft.world.level.Level getLevel() { return world; }
+        @Override public net.minecraft.world.entity.player.Player getPlayer() { return player; }
+        @Override public ItemStack getItemInHand() { return stack; }
+        @Override public BlockPos getClickedPos() { return BlockPos.ZERO; }
+        @Override public boolean canPlace() { return canPlace; }
+    }
+    static class ProbeItem extends net.minecraft.world.item.BlockItem {
+        boolean success;
+        ProbeItem() { super(null,new net.minecraft.world.item.Item.Properties()); }
+        @Override public Block getBlock() { return Blocks.STONE; }
+        @Override protected BlockState getPlacementState(net.minecraft.world.item.context.BlockPlaceContext context) { return Blocks.STONE.defaultBlockState(); }
+        @Override protected boolean placeBlock(net.minecraft.world.item.context.BlockPlaceContext context,BlockState state) { return success; }
     }
     public static void main(String[] args) throws Exception {
         net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -274,7 +299,23 @@ public class VibrationOracle {
             var row=new JsonObject();row.addProperty("water",water);row.addProperty("ground",ground);row.addProperty("support",support);row.addProperty("initial",distance);row.addProperty("vertical",vertical);row.addProperty("fall_bits",Double.doubleToRawLongBits(mover.fallDistance));row.addProperty("event",world.movementEvent);row.addProperty("fall_on",probe.landed);row.addProperty("affected",world.affectedState==null ? "none" : world.affectedState==world.movementState ? "support" : "legacy");fallRows.add(row);
         }
         world.movementState=null;
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);result.add("movement",movementRows);result.add("landing",fallRows);
+        var player=(ProbePlayer)unsafe.allocateInstance(ProbePlayer.class);var placeContext=(ProbePlacement)unsafe.allocateInstance(ProbePlacement.class);var placeItem=(ProbeItem)unsafe.allocateInstance(ProbeItem.class);
+        net.minecraft.world.item.Items.STONE.builtInRegistryHolder().bindComponents(net.minecraft.core.component.DataComponentMap.builder().set(net.minecraft.core.component.DataComponents.MAX_STACK_SIZE,64).build());
+        placeContext.world=world;placeContext.player=player;world.movementState=Blocks.STONE.defaultBlockState();
+        var blockEvents=new JsonArray();
+        for(boolean careful:new boolean[]{false,true}) for(boolean allowed:new boolean[]{false,true}) for(boolean succeeds:new boolean[]{false,true}) {
+            player.careful=careful;placeContext.canPlace=allowed;placeItem.success=succeeds;placeContext.stack=new ItemStack(net.minecraft.world.item.Items.STONE,2);
+            world.movementEvent="none";world.affectedState=null;world.eventPosition=null;world.eventSource=null;
+            placeItem.place(placeContext);
+            var row=new JsonObject();row.addProperty("careful",careful);row.addProperty("allowed",allowed);row.addProperty("success",succeeds);row.addProperty("event",world.movementEvent);row.addProperty("affected",world.affectedState==world.movementState);row.addProperty("source",world.eventSource==player);row.addProperty("center",new Vec3(0.5,0.5,0.5).equals(world.eventPosition));row.addProperty("count",placeContext.stack.getCount());blockEvents.add(row);
+        }
+        for(boolean careful:new boolean[]{false,true}) {
+            player.careful=careful;world.movementEvent="none";world.affectedState=null;world.eventPosition=null;world.eventSource=null;
+            Blocks.STONE.playerWillDestroy(world,BlockPos.ZERO,world.movementState,player);
+            var row=new JsonObject();row.addProperty("careful",careful);row.addProperty("event",world.movementEvent);row.addProperty("affected",world.affectedState==world.movementState);row.addProperty("source",world.eventSource==player);row.addProperty("center",new Vec3(0.5,0.5,0.5).equals(world.eventPosition));blockEvents.add(row);
+        }
+        world.movementState=null;
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);result.add("movement",movementRows);result.add("landing",fallRows);result.add("block_events",blockEvents);
         Files.writeString(Path.of(args[0]), result.toString());
         var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
         var sensorNbt=new net.minecraft.nbt.CompoundTag();

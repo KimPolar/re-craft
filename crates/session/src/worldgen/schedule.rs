@@ -264,6 +264,11 @@ impl GenerationSchedule {
     pub fn requested_chunks(&self) -> usize {
         self.required.len()
     }
+    pub fn is_complete(&self) -> bool {
+        self.required
+            .iter()
+            .all(|(pos, required)| self.completed.get(pos).copied().unwrap_or(Empty) >= *required)
+    }
 
     pub fn ready(&self, pos: ChunkPos, target: GenerationStage) -> bool {
         let Some(current) = self.completed(pos) else {

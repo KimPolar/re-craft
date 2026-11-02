@@ -34,6 +34,7 @@ mod generated_spawner;
 mod ore;
 pub mod postprocessing;
 pub mod schedule;
+mod terrain_batch;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
@@ -41,6 +42,7 @@ pub use generated_spawner::GeneratedMonsterSpawner;
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
+pub use terrain_batch::FreshTerrainBatch;
 
 /// Block entities created by a monster-room feature in intermediate terrain.
 #[derive(Clone, Debug)]
@@ -2509,6 +2511,100 @@ mod tests {
             "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,
                 "erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
         }})
+    }
+    #[test]
+    fn fresh_terrain_batch_runs_dependencies_and_stops_after_failure() {
+        use native_resources::carver::tags::CarverBlockTags;
+        use native_world::loaded::{BlockState, ChunkPos};
+        let mut data = Data;
+        let registry: BTreeSet<_> = ["air", "bedrock", "stone", "dirt", "water", "lava"]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}"))
+            .collect();
+        let make_batch = |data: &mut Data| {
+            let tags = CarverBlockTags::load(data, &registry).unwrap();
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(data, &definition(), 42, 0, 16)
+                    .unwrap();
+            FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
+                .unwrap()
+        };
+        let mut classify = |v: &Value| -> Result<CarverBlockState> {
+            let name = v.as_str().context("expected fixture state")?;
+            Ok(CarverBlockState {
+                is_air: name == "minecraft:air",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let mut resolve = |v: &Value| -> Result<BlockState> {
+            Ok(BlockState {
+                name: v.as_str().context("expected fixture state")?.into(),
+                properties: BTreeMap::new(),
+            })
+        };
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let mut batch = make_batch(&mut data);
+        assert!(batch.is_complete());
+        assert!(batch.request(ChunkPos { x: i32::MAX, z: 0 }).is_err());
+        assert!(batch.is_complete());
+        batch.request(center).unwrap();
+        batch.request(east).unwrap();
+        let mut first_snapshot = None;
+        let mut terrain_steps = Vec::new();
+        while let Some((pos, stage)) = batch.step(&mut data, &mut classify, &mut resolve).unwrap() {
+            if stage == schedule::GenerationStage::Terrain {
+                terrain_steps.push(pos);
+                if first_snapshot.is_none() {
+                    first_snapshot = batch.snapshot();
+                }
+            }
+        }
+        assert!(batch.is_complete());
+        assert_eq!(terrain_steps.len(), 2);
+        let first = first_snapshot.unwrap();
+        assert_eq!(first.chunks.len(), 1);
+        let (schedule, biomes, world) = batch.into_parts().unwrap();
+        assert_eq!(
+            schedule.completed(center),
+            Some(schedule::GenerationStage::Terrain)
+        );
+        assert_eq!(
+            schedule.completed(east),
+            Some(schedule::GenerationStage::Terrain)
+        );
+        assert!(biomes.chunk([0, 0]).is_some() && biomes.chunk([1, 0]).is_some());
+        let snapshot = world.unwrap().snapshot();
+        assert_eq!(snapshot.chunks.len(), 2);
+        assert_eq!(snapshot.block(0, 0, 0).unwrap().name, "minecraft:dirt");
+        assert_eq!(snapshot.block(16, 0, 0).unwrap().name, "minecraft:dirt");
+        assert_eq!(first.chunks.len(), 1);
+        let mut failing = make_batch(&mut data);
+        failing.request(center).unwrap();
+        let mut reject = |_: &Value| -> Result<BlockState> { anyhow::bail!("unsupported block") };
+        loop {
+            match failing.step(&mut data, &mut classify, &mut reject) {
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    assert!(error.to_string().contains("Terrain"));
+                    break;
+                }
+                Ok(None) => panic!("terrain should have failed"),
+            }
+        }
+        assert_eq!(
+            failing.schedule().completed(center),
+            Some(schedule::GenerationStage::Biomes)
+        );
+        assert!(failing.snapshot().is_none());
+        assert!(!failing.is_complete());
+        assert!(
+            failing
+                .step(&mut data, &mut classify, &mut resolve)
+                .is_err()
+        );
+        assert!(failing.request(east).is_err());
+        assert!(failing.into_parts().is_err());
     }
     #[test]
     fn schedule_runs_biomes_and_carved_terrain_transactionally() {

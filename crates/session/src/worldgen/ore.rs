@@ -32,6 +32,7 @@ use native_resources::{
     tree_ground_decorator::GroundDecorationWorld,
     tree_leaf_update::{LeafUpdateWorld, finish_generated_tree},
     underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
+    vegetation_patch::{VegetationPatch, VegetationPatchWorld},
 };
 use native_world::loaded::{
     BlockState, BlockStateId, ChunkPos, SavedBlockTick, SavedFluidTick, World,
@@ -106,6 +107,7 @@ enum ConfiguredDecoration {
     Geode(GeodeFeature<BlockState>),
     Multiface(MultifaceGrowth),
     HugeMushroom(HugeMushroomFeature<BlockState>),
+    VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -132,6 +134,11 @@ impl ConfiguredDecoration {
             Self::Geode(v) => v.required_blocks(),
             Self::Multiface(v) => v.required_blocks(),
             Self::HugeMushroom(v) => v.required_blocks(),
+            Self::VegetationPatch(v, nested) => {
+                let mut blocks = v.required_blocks();
+                blocks.extend(nested.required_blocks());
+                blocks
+            }
             Self::Freeze => ["minecraft:ice", "minecraft:snow"]
                 .into_iter()
                 .map(|v| ResourceId::parse(v).unwrap())
@@ -169,6 +176,9 @@ impl ConfiguredDecoration {
             Self::Geode(v) => v.needs_survival(name),
             Self::Tree(v) => v.needs_survival(name),
             Self::HugeMushroom(v) => v.needs_survival(name),
+            Self::VegetationPatch(v, nested) => {
+                v.needs_survival(name) || nested.needs_survival(name)
+            }
             Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
@@ -179,6 +189,7 @@ impl ConfiguredDecoration {
     fn needs_lake(&self) -> bool {
         match self {
             Self::Lake(_) => true,
+            Self::VegetationPatch(_, nested) => nested.needs_lake(),
             Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_lake),
             Self::WeightedSelector(values, default) => {
                 default.needs_lake() || values.iter().any(|(_, v)| v.needs_lake())
@@ -189,6 +200,7 @@ impl ConfiguredDecoration {
     fn needs_freeze(&self) -> bool {
         match self {
             Self::Freeze => true,
+            Self::VegetationPatch(_, nested) => nested.needs_freeze(),
             Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_freeze),
             Self::WeightedSelector(values, default) => {
                 default.needs_freeze() || values.iter().any(|(_, v)| v.needs_freeze())
@@ -240,6 +252,17 @@ impl ConfiguredDecoration {
             ("minecraft", "huge_brown_mushroom" | "huge_red_mushroom") => Ok(Self::HugeMushroom(
                 HugeMushroomFeature::decode(provider, value, resolve)?,
             )),
+            ("minecraft", "vegetation_patch" | "waterlogged_vegetation_patch") => {
+                let patch = VegetationPatch::decode(provider, value, resolve)?;
+                let nested = PlacedDecorationFeature::load_nested(
+                    provider,
+                    patch.vegetation(),
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                Ok(Self::VegetationPatch(patch, Box::new(nested)))
+            }
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -316,6 +339,11 @@ impl ConfiguredDecoration {
             Self::Geode(v) => v.required_tags(),
             Self::Multiface(v) => v.required_tags(),
             Self::HugeMushroom(v) => v.required_tags(),
+            Self::VegetationPatch(v, nested) => {
+                let mut tags = v.required_tags();
+                tags.extend(nested.required_tags());
+                tags
+            }
             Self::Freeze => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
@@ -376,6 +404,11 @@ impl ConfiguredDecoration {
             Self::Geode(v) => v.place(world, random, world.target.seed, pos),
             Self::Multiface(v) => v.place(world, random, pos),
             Self::HugeMushroom(v) => v.place(world, random, pos),
+            Self::VegetationPatch(v, nested) => {
+                v.place(world, random, pos, |world, random, origin| {
+                    world.place_nested(nested, random, origin, generator_min_y, generator_height)
+                })
+            }
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -1969,6 +2002,65 @@ impl MushroomWorld for DecorationRegion<'_> {
         self.set_section_block(pos, state)?;
         self.update_final_heightmaps(pos, state)?;
         Ok(())
+    }
+}
+
+impl VegetationPatchWorld for DecorationRegion<'_> {
+    fn same_block(&mut self, a: &BlockState, b: &BlockState) -> Result<bool> {
+        Ok(a.name == b.name)
+    }
+    fn patch_face_sturdy(&mut self, state: &BlockState, _: [i32; 3], _: [i32; 3]) -> Result<bool> {
+        tree_sturdy_up(state)
+    }
+    fn set_patch_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(());
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "vegetation patch chunk is missing"
+            );
+            let valid = (matches!(
+                state.name.as_str(),
+                "minecraft:moss_block" | "minecraft:clay"
+            ) && state.properties.is_empty())
+                || (state.name == "minecraft:water"
+                    && native_world::fluid::FluidState::from_block(state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some())
+                || tree_generated_leaf(state)?;
+            ensure!(valid, "unsupported vegetation patch replacement effects");
+            if self.is_outside(pos[1]) {
+                return Ok(());
+            }
+            let old = self.read(pos)?;
+            ensure!(
+                disk_safe_solid(&old.name).is_some() || tree_generated_leaf(&old)?,
+                "unsupported vegetation patch source effects"
+            );
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn patch_waterlogged(&mut self, mut state: BlockState) -> Result<Option<BlockState>> {
+        match state.properties.get("waterlogged").map(String::as_str) {
+            None | Some("true") => Ok(None),
+            Some("false") => {
+                ensure!(
+                    tree_generated_leaf(&state)?,
+                    "unsupported vegetation patch waterlogging"
+                );
+                state.properties.insert("waterlogged".into(), "true".into());
+                Ok(Some(state))
+            }
+            _ => bail!("invalid waterlogged property"),
+        }
     }
 }
 
@@ -6302,6 +6394,49 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn vegetation_patch_executes_nested_feature_in_generated_chunk() {
+        struct PatchData;
+        impl ResourceProvider for PatchData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/worldgen/biome/plains.json" => json!({"features":[[{"feature":{
+                        "type":"minecraft:vegetation_patch","replaceable":"#minecraft:base_stone_overworld","ground_state":{"id":"minecraft:moss_block"},
+                        "vegetation_feature":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"}},"placement":[]},
+                        "surface":"floor","depth":1,"extra_bottom_block_chance":0.0,"vertical_range":3,"vegetation_chance":1.0,"xz_radius":0,"extra_edge_column_chance":0.0
+                    },"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}]]}),
+                    "data/minecraft/tags/block/supports_vegetation.json" => {
+                        json!({"values":["minecraft:moss_block"]})
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:moss_block"]})
+                    }
+                    _ => return Data.read_data(path),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(&mut PatchData, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.insert("minecraft:moss_block".into());
+        let prepared =
+            PreparedDecoration::load(&mut PatchData, &plan, &registry, &mut resolve_test).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+        let after = terrain.snapshot();
+        assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
+        assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
+        assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
     }
 
     #[test]

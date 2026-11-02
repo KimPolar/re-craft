@@ -21,6 +21,8 @@ use native_resources::{
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
     spring_feature::{SpringFeature, SpringWorld},
     tree_beehive::BeehiveWorld,
+    tree_fallen_decorators::Direction as FallenDirection,
+    tree_fallen_feature::{FallenFeatureWorld, FallenTreeFeature},
     tree_feature::{TreeFeature, TreeWorld, TreeWrite},
     tree_leaf_update::{LeafUpdateWorld, finish_generated_tree},
     underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
@@ -78,6 +80,7 @@ enum ConfiguredDecoration {
     Column(BlockColumnFeature<BlockState>),
     Lake(LakeFeature<BlockState>),
     Tree(TreeFeature<BlockState>),
+    FallenTree(FallenTreeFeature<BlockState>),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -100,6 +103,7 @@ impl ConfiguredDecoration {
             Self::Column(v) => v.required_blocks(),
             Self::Lake(v) => v.required_blocks(),
             Self::Tree(v) => v.required_blocks(),
+            Self::FallenTree(v) => v.required_blocks(),
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_blocks)
@@ -169,6 +173,9 @@ impl ConfiguredDecoration {
             }
             ("minecraft", "lake") => Ok(Self::Lake(LakeFeature::decode(value, resolve)?)),
             ("minecraft", "tree") => Ok(Self::Tree(TreeFeature::decode(provider, value, resolve)?)),
+            ("minecraft", "fallen_tree") => Ok(Self::FallenTree(FallenTreeFeature::decode(
+                provider, value, resolve,
+            )?)),
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -241,6 +248,7 @@ impl ConfiguredDecoration {
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
                 tags
             }
+            Self::FallenTree(v) => v.required_tags(),
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_tags)
@@ -288,6 +296,7 @@ impl ConfiguredDecoration {
             Self::Magma(v) => v.place(world, random, pos),
             Self::Column(v) => v.place(world, random, pos),
             Self::Lake(v) => v.place(world, random, pos),
+            Self::FallenTree(v) => v.place(world, random, pos),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -1513,6 +1522,109 @@ impl BeehiveWorld for DecorationRegion<'_> {
             "duplicate generated bee nest"
         );
         Ok(())
+    }
+}
+
+impl DecorationRegion<'_> {
+    fn set_fallen_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "fallen tree chunk is missing"
+        );
+        if self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        let old = self.read(pos)?;
+        ensure!(
+            disk_safe_solid(&old.name).is_some()
+                || tree_oak_leaf(&old)?
+                || tree_oak_log(&old)
+                || simple_plant_kind(&old).is_ok()
+                || tree_edge_plant(&old)?.is_some()
+                || matches!(
+                    old.name.as_str(),
+                    "minecraft:vine" | "minecraft:red_mushroom" | "minecraft:brown_mushroom"
+                ),
+            "unsupported fallen tree source effects"
+        );
+        self.set_section_block(pos, state)?;
+        self.update_final_heightmaps(pos, state)?;
+        Ok(())
+    }
+}
+impl FallenFeatureWorld for DecorationRegion<'_> {
+    fn fallen_sturdy_below(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+        if tree_oak_log(&below) {
+            return Ok(true);
+        }
+        ensure!(
+            !matches!(
+                below.name.as_str(),
+                "minecraft:cactus" | "minecraft:cactus_flower" | "minecraft:sugar_cane"
+            ),
+            "unsupported fallen tree support shape"
+        );
+        disk_safe_solid(&below.name).context("unsupported fallen tree support shape")
+    }
+    fn fallen_write_log(
+        &mut self,
+        pos: [i32; 3],
+        mut state: BlockState,
+        axis: Option<native_resources::tree_fancy_trunk::LogAxis>,
+    ) -> Result<()> {
+        if let Some(axis) = axis {
+            state = TreeWorld::trunk_axis(self, state, axis)?;
+        }
+        ensure!(tree_oak_log(&state), "unsupported fallen tree log effects");
+        self.set_fallen_block(pos, &state)
+    }
+    fn fallen_postprocess_above(&mut self, pos: [i32; 3]) -> Result<()> {
+        for dy in 1..=2 {
+            let above = [pos[0], pos[1].wrapping_add(dy), pos[2]];
+            if is_air(&OreWorld::block(self, above)?) {
+                break;
+            }
+            DiskWorld::mark_postprocessing(self, above)?;
+        }
+        Ok(())
+    }
+    fn fallen_write_vine(&mut self, pos: [i32; 3], attachment: FallenDirection) -> Result<()> {
+        let mut properties = BTreeMap::from([
+            ("up".into(), "false".into()),
+            ("north".into(), "false".into()),
+            ("south".into(), "false".into()),
+            ("east".into(), "false".into()),
+            ("west".into(), "false".into()),
+        ]);
+        let side = match attachment {
+            FallenDirection::North => "north",
+            FallenDirection::South => "south",
+            FallenDirection::West => "west",
+            FallenDirection::East => "east",
+            _ => bail!("invalid vine support"),
+        };
+        properties.insert(side.into(), "true".into());
+        self.set_fallen_block(
+            pos,
+            &BlockState {
+                name: "minecraft:vine".into(),
+                properties,
+            },
+        )
+    }
+    fn fallen_write_decoration(&mut self, pos: [i32; 3], state: BlockState) -> Result<()> {
+        ensure!(
+            matches!(
+                state.name.as_str(),
+                "minecraft:red_mushroom" | "minecraft:brown_mushroom"
+            ) && state.properties.is_empty(),
+            "unsupported fallen tree decoration effects"
+        );
+        self.set_fallen_block(pos, &state)
     }
 }
 
@@ -3794,6 +3906,216 @@ mod tests {
             terrain.snapshot().block(pos[0], pos[1], pos[2]).unwrap(),
             &nest
         );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_fallen_oak_chunk_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("FallenTreeChunkOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/FallenTreeChunkOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let output = c.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actual = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("FallenTreeChunkOracle"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:fallen_oak_tree","placement":[]}))
+                .unwrap();
+        let placed =
+            PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |value| {
+                super::super::resolve_generated_terrain_state(value, &generated)
+            })
+            .unwrap();
+        // This selector eagerly loads fancy, fallen and ordinary oak branches.
+        let plains_selector =
+            PlacedFeature::decode(&json!({"feature":"minecraft:trees_plains","placement":[]}))
+                .unwrap();
+        let plains_selector = PlacedDecorationFeature::from_placement(
+            &mut resources,
+            plains_selector,
+            &mut |value| super::super::resolve_generated_terrain_state(value, &generated),
+        )
+        .unwrap();
+        let tags = OreBlockTags::load(&mut resources, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut expected = Vec::new();
+        let mut saw_horizontal_log = false;
+        let mut saw_vine = false;
+        let mut saw_mushroom = false;
+        for seed in [0, 1, -1, 987654321, 11, 42, 100, 218] {
+            let (mut terrain, _, _, _) = fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+            let mut random = DecorationRandom::new(seed);
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            let ok = region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                .unwrap();
+            region.finish().unwrap();
+            let world = terrain.snapshot();
+            let mut blocks = Vec::new();
+            for x in 0..16 {
+                for y in 8..16 {
+                    for z in 0..16 {
+                        let block = world.block(x, y, z).unwrap();
+                        let name = block.name.strip_prefix("minecraft:").unwrap();
+                        let extra = match name {
+                            "air" => continue,
+                            "oak_log" => {
+                                saw_horizontal_log |= block.properties["axis"] != "y";
+                                format!(",{}", block.properties["axis"])
+                            }
+                            "vine" => {
+                                saw_vine = true;
+                                format!(
+                                    ",{},{},{},{},{}",
+                                    block.properties["up"],
+                                    block.properties["north"],
+                                    block.properties["south"],
+                                    block.properties["west"],
+                                    block.properties["east"]
+                                )
+                            }
+                            "red_mushroom" | "brown_mushroom" => {
+                                saw_mushroom = true;
+                                String::new()
+                            }
+                            _ => panic!("unexpected generated block {}", block.name),
+                        };
+                        blocks.push(format!("{x},{y},{z},{name}{extra}"));
+                    }
+                }
+            }
+            expected.push(format!(
+                "C {seed} {ok} B {} R {}",
+                blocks.join(";"),
+                random.next_long()
+            ));
+        }
+        assert!(
+            saw_horizontal_log && saw_vine && saw_mushroom,
+            "oracle seeds must exercise logs, vines and mushrooms"
+        );
+        let actual: Vec<_> = actual
+            .lines()
+            .filter(|line| line.starts_with("C "))
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(*a, b, "seed case {i}");
+        }
+        let selector_tags =
+            OreBlockTags::load(&mut resources, &registry, &plains_selector.required_tags())
+                .unwrap();
+        let mut seen = [false; 3];
+        for seed in 0..10_000i64 {
+            let mut selection = DecorationRandom::new(seed);
+            let branch = if selection.next_float() < 0.33333334 {
+                0
+            } else if selection.next_float() < 0.0125 {
+                1
+            } else {
+                2
+            };
+            if seen[branch] {
+                continue;
+            }
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let dirt = world.intern_state(state("dirt"));
+            let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks.as_mut().unwrap()[8 + 8 * 16 + 7 * 256] = dirt;
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain
+                .decoration_region(&selector_tags, &motion, writable)
+                .unwrap();
+            let mut random = DecorationRandom::new(seed);
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            if region
+                .place_placed(&plains_selector, &mut random, [8, 8, 8], 0, 16, &mut env)
+                .unwrap()
+            {
+                region.finish().unwrap();
+                seen[branch] = true;
+            }
+            if seen.iter().all(|v| *v) {
+                break;
+            }
+        }
+        assert_eq!(seen, [true, true, true], "real plains selector branches");
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let unknown_support = world.intern_state(state("diamond_ore"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[7 * 256..8 * 256].fill(unknown_support);
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(0);
+        let mut unchanged = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), unchanged.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub use generated_spawner::GeneratedMonsterSpawner;
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
-pub use terrain_batch::FreshTerrainBatch;
+pub use terrain_batch::{FreshBatchLight, FreshTerrainBatch};
 
 /// Block entities created by a monster-room feature in intermediate terrain.
 #[derive(Clone, Debug)]
@@ -2521,6 +2521,7 @@ mod tests {
         use native_world::loaded::{BlockState, ChunkPos};
         struct FeatureData {
             crossing: bool,
+            brown: bool,
         }
         impl ResourceProvider for FeatureData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -2528,8 +2529,13 @@ mod tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let mushroom = if self.brown {
+                        "minecraft:brown_mushroom"
+                    } else {
+                        "minecraft:red_mushroom"
+                    };
                     let mut features = vec![
-                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:red_mushroom"}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":mushroom}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
                     ];
                     if self.crossing {
                         features.push(json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:offset","x":-1,"y":8,"z":8}]}));
@@ -2579,7 +2585,10 @@ mod tests {
                 .into_iter()
                 .map(|name| format!("minecraft:{name}")),
             );
-            let mut data = FeatureData { crossing };
+            let mut data = FeatureData {
+                crossing,
+                brown: false,
+            };
             let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
             let generator =
                 TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
@@ -2635,6 +2644,7 @@ mod tests {
             );
             let before = batch.snapshot().unwrap();
             assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:dirt");
+            assert!(batch.seal_for_light_propagation().is_err());
             batch.request_features(east).unwrap();
             let mut before_attempt = None;
             loop {
@@ -2681,7 +2691,9 @@ mod tests {
                 Some(schedule::GenerationStage::Features)
             );
             let terrain = terrain.unwrap();
-            let (tracker, registry) = light.unwrap();
+            let (FreshBatchLight::Initialized(tracker), registry) = light.unwrap() else {
+                panic!("expected registered but unpropagated lighting");
+            };
             assert_eq!(tracker.sky_sources(&terrain, center).unwrap()[0], 16);
             let visible = tracker
                 .snapshot(&terrain, [east, ChunkPos { x: 3, z: 0 }], &registry)
@@ -2689,6 +2701,126 @@ mod tests {
             assert_eq!(visible.sky_light([24, 8, 8]), Some(0));
             assert_eq!(visible.sky_light([48, 8, 8]), Some(15));
         }
+        // Prepare a frozen 3x3 registration batch, then propagate exactly one
+        // chunk. Brown mushrooms emit level one in the no-sky dimension.
+        let generated_registry = resources.vanilla_generated_block_registry().unwrap();
+        let mut block_registry: BTreeSet<String> =
+            generated_registry.ids().map(str::to_owned).collect();
+        block_registry.extend(
+            [
+                "air",
+                "cave_air",
+                "void_air",
+                "bedrock",
+                "stone",
+                "dirt",
+                "water",
+                "lava",
+                "melon",
+                "brown_mushroom",
+            ]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}")),
+        );
+        let mut data = FeatureData {
+            crossing: false,
+            brown: true,
+        };
+        let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        let mut batch =
+            FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
+                .unwrap();
+        let lighting = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            dimension_type: None,
+            min_y: 0,
+            height: 16,
+            has_skylight: false,
+        };
+        batch
+            .enable_decoration(&mut data, &BTreeSet::new(), block_registry, &lighting)
+            .unwrap();
+        batch
+            .enable_light_initialization(generated_registry)
+            .unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        for z in -1..=1 {
+            for x in -1..=1 {
+                batch
+                    .request_light_initialization(ChunkPos { x, z })
+                    .unwrap();
+            }
+        }
+        assert!(batch.seal_for_light_propagation().is_err());
+        let mut classify = |v: &Value| -> Result<CarverBlockState> {
+            let id = v
+                .as_str()
+                .or_else(|| v.get("id").and_then(Value::as_str))
+                .context("state ID")?;
+            Ok(CarverBlockState {
+                is_air: id == "minecraft:air",
+                has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let mut resolve = |v: &Value| -> Result<BlockState> {
+            Ok(BlockState {
+                name: v
+                    .as_str()
+                    .or_else(|| v.get("id").and_then(Value::as_str))
+                    .context("state ID")?
+                    .into(),
+                properties: BTreeMap::new(),
+            })
+        };
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        assert!(batch.request_light(center).is_err());
+        batch.seal_for_light_propagation().unwrap();
+        assert!(batch.request(east).is_err());
+        assert!(batch.request_features(east).is_err());
+        assert!(batch.request_light_initialization(east).is_err());
+        assert!(batch.request_light(east).is_err()); // eastern 3x3 is not fully initialized
+        assert!(batch.is_complete());
+        let before = batch.light_snapshot([center]).unwrap();
+        assert_eq!(before.block_light([8, 8, 8]), Some(0));
+        batch.request_light(center).unwrap();
+        assert_eq!(
+            batch.step(&mut data, &mut classify, &mut resolve).unwrap(),
+            Some((center, schedule::GenerationStage::Light))
+        );
+        assert!(
+            batch
+                .step(&mut data, &mut classify, &mut resolve)
+                .unwrap()
+                .is_none()
+        );
+        let after = batch.light_snapshot([center]).unwrap();
+        assert_eq!(after.block_light([8, 8, 8]), Some(1));
+        assert_eq!(after.sky_light([8, 8, 8]), Some(0));
+        assert_eq!(before.block_light([8, 8, 8]), Some(0));
+        assert!(!batch.snapshot().unwrap().chunks[&center].block_light_correct);
+        let (schedule, _, terrain, light) = batch.into_parts().unwrap();
+        assert_eq!(
+            schedule.completed(center),
+            Some(schedule::GenerationStage::Light)
+        );
+        let (FreshBatchLight::Staged(engine), registry) = light.unwrap() else {
+            panic!("expected propagated light history")
+        };
+        assert_eq!(
+            engine
+                .snapshot(&terrain.unwrap(), [center], &registry)
+                .unwrap()
+                .block_light([8, 8, 8]),
+            Some(1)
+        );
     }
     #[test]
     fn fresh_batch_executes_features_with_initial_light_and_rolls_back_failures() {

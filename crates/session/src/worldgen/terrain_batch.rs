@@ -8,13 +8,14 @@ use native_resources::{
     feature_order::FeatureSchedule,
     packs::{ResourceId, ResourceProvider},
 };
+use native_world::generation_light::VisibleLightSnapshot;
 use native_world::loaded::{BlockState, ChunkPos, World};
 use serde_json::Value;
 use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
     BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
-    PreparedDecoration, TerrainGenerator,
+    PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
 };
 
@@ -35,7 +36,14 @@ pub struct FreshTerrainBatch {
     decoration: Option<DecorationConfig>,
     light_registry: Option<GeneratedBlockRegistry>,
     light_tracker: Option<FreshGenerationLightTracker>,
+    light_engine: Option<StagedGenerationLightEngine>,
     failed: bool,
+}
+
+/// The light-engine history accompanying intermediate generated terrain.
+pub enum FreshBatchLight {
+    Initialized(FreshGenerationLightTracker),
+    Staged(StagedGenerationLightEngine),
 }
 
 struct DecorationConfig {
@@ -70,6 +78,7 @@ impl FreshTerrainBatch {
             decoration: None,
             light_registry: None,
             light_tracker: None,
+            light_engine: None,
             failed: false,
         })
     }
@@ -130,6 +139,10 @@ impl FreshTerrainBatch {
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
+        ensure!(
+            self.light_engine.is_none(),
+            "terrain batch is sealed for light propagation"
+        );
         self.schedule.request(pos, GenerationStage::Terrain)
     }
 
@@ -140,11 +153,15 @@ impl FreshTerrainBatch {
             "generation batch failed and must be discarded"
         );
         ensure!(self.decoration.is_some(), "decoration is not configured");
+        ensure!(
+            self.light_engine.is_none(),
+            "terrain batch is sealed for light propagation"
+        );
         self.schedule.request(pos, GenerationStage::Features)
     }
 
     /// Request FEATURES and light section/source registration for a chunk.
-    /// Propagation and saveable lighting are not performed by this batch.
+    /// This step does not propagate light or produce saveable lighting.
     pub fn request_light_initialization(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(
             !self.failed,
@@ -154,7 +171,108 @@ impl FreshTerrainBatch {
             self.light_registry.is_some(),
             "light initialization is not configured"
         );
+        ensure!(
+            self.light_engine.is_none(),
+            "terrain batch is sealed for light propagation"
+        );
         self.schedule.request(pos, GenerationStage::InitializeLight)
+    }
+
+    /// Finish all requested registrations before entering a frozen light
+    /// batch. After this, terrain, decoration and registration requests are
+    /// rejected until a mutable incremental engine is implemented.
+    pub fn seal_for_light_propagation(&mut self) -> Result<()> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before sealing lighting"
+        );
+        ensure!(
+            self.light_engine.is_none(),
+            "light propagation is already sealed"
+        );
+        ensure!(self.light_registry.is_some(), "light registry is missing");
+        let tracker = self
+            .light_tracker
+            .as_ref()
+            .context("no initialized light chunks")?;
+        ensure!(
+            tracker
+                .registered
+                .keys()
+                .any(|&pos| self.has_light_dependencies(pos)),
+            "no chunk has complete light dependencies"
+        );
+        let tracker = self
+            .light_tracker
+            .take()
+            .context("no initialized light chunks")?;
+        self.light_engine = Some(StagedGenerationLightEngine::new(tracker));
+        Ok(())
+    }
+
+    /// Request LIGHT only when its complete accumulated dependencies have
+    /// already been generated and registered before the seal.
+    pub fn request_light(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed && self.light_engine.is_some(),
+            "light propagation is not sealed"
+        );
+        ensure!(
+            self.has_light_dependencies(pos),
+            "chunk light dependencies are incomplete"
+        );
+        self.schedule.request(pos, GenerationStage::Light)
+    }
+
+    fn has_light_dependencies(&self, pos: ChunkPos) -> bool {
+        if self.schedule.completed(pos) != Some(GenerationStage::InitializeLight) {
+            return false;
+        }
+        for (radius, &required) in GenerationStage::Light.accumulated().iter().enumerate() {
+            let Ok(r) = i32::try_from(radius) else {
+                return false;
+            };
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs().max(dz.abs()) != r {
+                        continue;
+                    }
+                    let (Some(x), Some(z)) = (pos.x.checked_add(dx), pos.z.checked_add(dz)) else {
+                        return false;
+                    };
+                    if !self
+                        .schedule
+                        .completed(ChunkPos { x, z })
+                        .is_some_and(|stage| stage >= required)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Capture selected columns from the sealed, staged light engine. This
+    /// does not write light arrays into generated chunks.
+    pub fn light_snapshot(
+        &self,
+        covered: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<VisibleLightSnapshot> {
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        let terrain = self.terrain.as_ref().context("light terrain is missing")?;
+        let registry = self
+            .light_registry
+            .as_ref()
+            .context("light registry is missing")?;
+        engine.snapshot(terrain, covered, registry)
     }
 
     pub fn is_complete(&self) -> bool {
@@ -283,6 +401,19 @@ impl FreshTerrainBatch {
                     registry,
                 )
             })(),
+            GenerationStage::Light => (|| {
+                let terrain = self.terrain.as_ref().context("light terrain is missing")?;
+                let registry = self
+                    .light_registry
+                    .as_ref()
+                    .context("light registry is missing")?;
+                let engine = self
+                    .light_engine
+                    .as_mut()
+                    .context("light propagation is not sealed")?;
+                self.schedule.run_light(terrain, pos, engine, registry)?;
+                Ok(())
+            })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),
         };
         if let Err(error) = result {
@@ -305,13 +436,18 @@ impl FreshTerrainBatch {
         GenerationSchedule,
         BiomeNeighborhood,
         Option<CarvedTerrainWorld>,
-        Option<(FreshGenerationLightTracker, GeneratedBlockRegistry)>,
+        Option<(FreshBatchLight, GeneratedBlockRegistry)>,
     )> {
         ensure!(self.is_complete(), "terrain batch is incomplete or failed");
-        let light = match (self.light_tracker, self.light_registry) {
-            (Some(tracker), Some(registry)) => Some((tracker, registry)),
-            (None, _) => None,
-            (Some(_), None) => bail!("light registry is missing"),
+        let light = match (self.light_tracker, self.light_engine, self.light_registry) {
+            (Some(tracker), None, Some(registry)) => {
+                Some((FreshBatchLight::Initialized(tracker), registry))
+            }
+            (None, Some(engine), Some(registry)) => {
+                Some((FreshBatchLight::Staged(engine), registry))
+            }
+            (None, None, _) => None,
+            _ => bail!("invalid light registration history"),
         };
         Ok((self.schedule, self.biomes, self.terrain, light))
     }

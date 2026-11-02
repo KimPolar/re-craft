@@ -40,6 +40,9 @@ enum StateSchema {
     LeafLitter,
     CaveVinesBody,
     CaveVinesHead,
+    SmallDripleaf,
+    BigDripleaf,
+    BigDripleafStem,
 }
 
 impl StateSchema {
@@ -92,6 +95,23 @@ impl StateSchema {
                     ("berries".into(), "false".into()),
                 ]);
             }
+            Self::SmallDripleaf => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "lower".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::BigDripleaf | Self::BigDripleafStem => {
+                let mut properties = BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+                if matches!(self, Self::BigDripleaf) {
+                    properties.insert("tilt".into(), "none".into());
+                }
+                return properties;
+            }
             Self::Snowy => ("snowy", "false"),
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
@@ -106,6 +126,20 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::SmallDripleaf | Self::BigDripleaf | Self::BigDripleafStem
+                if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
+                    || (name == "waterlogged" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::SmallDripleaf if name == "half" && matches!(value, "lower" | "upper") => {
+                Some(value.to_owned())
+            }
+            Self::BigDripleaf
+                if name == "tilt" && matches!(value, "none" | "unstable" | "partial" | "full") =>
+            {
+                Some(value.to_owned())
+            }
             Self::Multiface
                 if matches!(
                     name,
@@ -333,6 +367,15 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/CaveVinesBlock" => {
                     Some(StateSchema::CaveVinesHead)
+                }
+                "net/minecraft/world/level/block/SmallDripleafBlock" => {
+                    Some(StateSchema::SmallDripleaf)
+                }
+                "net/minecraft/world/level/block/BigDripleafBlock" => {
+                    Some(StateSchema::BigDripleaf)
+                }
+                "net/minecraft/world/level/block/BigDripleafStemBlock" => {
+                    Some(StateSchema::BigDripleafStem)
                 }
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"

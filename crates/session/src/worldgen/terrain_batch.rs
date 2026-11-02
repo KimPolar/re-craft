@@ -51,6 +51,7 @@ struct DecorationConfig {
     schedule: FeatureSchedule,
     block_registry: BTreeSet<String>,
     has_skylight: bool,
+    dimension_type: Option<String>,
 }
 
 impl FreshTerrainBatch {
@@ -115,6 +116,10 @@ impl FreshTerrainBatch {
             schedule,
             block_registry,
             has_skylight: lighting.has_skylight,
+            dimension_type: lighting
+                .dimension_type
+                .as_ref()
+                .map(|id| format!("{}:{}", id.namespace, id.path)),
         });
         Ok(())
     }
@@ -420,20 +425,30 @@ impl FreshTerrainBatch {
                 &mut self.biomes,
                 pos,
             ),
-            GenerationStage::Terrain => self.schedule.run_terrain(
-                &mut self.generator,
-                provider,
-                &mut self.evaluator,
-                &mut self.carvers,
-                &self.biomes,
-                &self.tags,
-                &mut self.terrain,
-                pos,
-                &self.dimension,
-                false,
-                classify,
-                resolve,
-            ),
+            GenerationStage::Terrain => self
+                .schedule
+                .run_terrain(
+                    &mut self.generator,
+                    provider,
+                    &mut self.evaluator,
+                    &mut self.carvers,
+                    &self.biomes,
+                    &self.tags,
+                    &mut self.terrain,
+                    pos,
+                    &self.dimension,
+                    false,
+                    classify,
+                    resolve,
+                )
+                .map(|()| {
+                    if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
+                        if terrain.world.dimension_type != config.dimension_type {
+                            Arc::make_mut(&mut terrain.world).dimension_type =
+                                config.dimension_type.clone();
+                        }
+                    }
+                }),
             GenerationStage::Features => (|| {
                 let config = self
                     .decoration

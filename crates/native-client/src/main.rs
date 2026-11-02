@@ -29,6 +29,7 @@ mod fluid_mesh;
 mod focus_pause;
 mod fov_ui;
 mod frame_pacer;
+mod fresh_generation;
 mod game_ui;
 mod generated_item;
 mod generation_worker;

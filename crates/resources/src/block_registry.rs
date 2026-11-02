@@ -17,6 +17,7 @@ use crate::{Manifest, TARGET_VERSION, open_verified_client, packs::ResourceId};
 pub type DefaultProperties = BTreeMap<String, BTreeMap<String, String>>;
 
 /// Resolved built-in block classes whose state definitions are implemented.
+#[derive(Clone)]
 pub struct GeneratedBlockRegistry {
     states: BTreeMap<String, StateSchema>,
 }

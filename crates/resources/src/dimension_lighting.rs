@@ -22,6 +22,15 @@ impl GeneratedDimensionLighting {
         preset: &str,
         dimension: &str,
     ) -> Result<Self> {
+        Self::load_preset_with_generator(provider, preset, dimension).map(|(lighting, _)| lighting)
+    }
+
+    /// Resolve the generator and lighting from the same selected dimension stem.
+    pub fn load_preset_with_generator(
+        provider: &mut impl ResourceProvider,
+        preset: &str,
+        dimension: &str,
+    ) -> Result<(Self, Value)> {
         let preset = ResourceId::parse(preset)?;
         let dimension = ResourceId::parse(dimension)?;
         let path = format!(
@@ -57,10 +66,11 @@ impl GeneratedDimensionLighting {
             })
             .transpose()?;
         let stem = override_stem.as_ref().unwrap_or(preset_stem);
-        ensure!(
-            stem.get("generator").is_some_and(Value::is_object),
-            "dimension generator is missing or invalid"
-        );
+        let generator = stem
+            .get("generator")
+            .filter(|v| v.is_object())
+            .context("dimension generator is missing or invalid")?
+            .clone();
         let definition = stem.get("type").context("dimension type is missing")?;
         let (dimension_type, definition) = if let Some(name) = definition.as_str() {
             let id = ResourceId::parse(name)?;
@@ -101,13 +111,16 @@ impl GeneratedDimensionLighting {
             .get("has_skylight")
             .and_then(Value::as_bool)
             .context("dimension has_skylight is missing or invalid")?;
-        Ok(Self {
-            dimension,
-            dimension_type,
-            min_y,
-            height,
-            has_skylight,
-        })
+        Ok((
+            Self {
+                dimension,
+                dimension_type,
+                min_y,
+                height,
+                has_skylight,
+            },
+            generator,
+        ))
     }
 }
 
@@ -144,11 +157,15 @@ mod tests {
         );
         p.0.insert(
             "data/example/dimension/world.json".into(),
-            br#"{"type":"example:override","generator":{"type":"minecraft:noise"}}"#.to_vec(),
+            br#"{"type":"example:override","generator":{"type":"example:override"}}"#.to_vec(),
         );
-        let selected =
-            GeneratedDimensionLighting::load_preset(&mut p, "example:test", "example:world")
-                .unwrap();
+        let (selected, generator) = GeneratedDimensionLighting::load_preset_with_generator(
+            &mut p,
+            "example:test",
+            "example:world",
+        )
+        .unwrap();
+        assert_eq!(generator["type"], "example:override");
         assert_eq!(
             (selected.min_y, selected.height, selected.has_skylight),
             (0, 256, false)

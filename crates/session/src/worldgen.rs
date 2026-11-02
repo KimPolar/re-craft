@@ -2952,7 +2952,7 @@ mod tests {
             assert!(batch.request_features(center).is_err());
             let lighting = GeneratedDimensionLighting {
                 dimension: ResourceId::parse("minecraft:overworld").unwrap(),
-                dimension_type: None,
+                dimension_type: Some(ResourceId::parse("example:custom_type").unwrap()),
                 min_y: 0,
                 height: 16,
                 has_skylight: has_sky,
@@ -3005,6 +3005,10 @@ mod tests {
                 }
             }
             let before = before_feature.unwrap();
+            assert_eq!(
+                before.dimension_type.as_deref(),
+                Some("example:custom_type")
+            );
             assert_eq!(before.chunks.len(), 9);
             assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:dirt");
             if unsupported {

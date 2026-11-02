@@ -1,5 +1,5 @@
-//! Read sculk sensor block entities without discarding their pending vibration.
-//! This does not yet register listeners or authorize world writes.
+//! Read and stage sculk sensor block entities without discarding vibrations.
+//! The resulting partial edit does not authorize a world write.
 
 use anyhow::{Context, Result, bail, ensure};
 use glam::{DVec3, IVec3};
@@ -24,6 +24,173 @@ impl SavedSculkSensor {
     pub fn source(&self) -> &Tag {
         &self.source
     }
+
+    /// Preserve unrelated block-entity fields while updating the listener.
+    /// Unknown listener fields cannot be safely carried to a different event.
+    pub fn draft(
+        &self,
+        original: &Tag,
+        registry: &BTreeSet<String>,
+    ) -> Result<native_persistence::edit::BlockEntityChange> {
+        ensure!(
+            original == self.source(),
+            "sensor block entity changed since loading"
+        );
+        let initial = decode(original.clone(), self.position, registry)?;
+        ensure!(
+            initial.calibrated == self.calibrated,
+            "sensor block entity type changed"
+        );
+        if initial.last_frequency == self.last_frequency && initial.vibration == self.vibration {
+            return Ok(native_persistence::edit::BlockEntityChange {
+                expected: original.clone(),
+                replacement: original.clone(),
+            });
+        }
+        let mut replacement = original.clone();
+        if initial.last_frequency != self.last_frequency {
+            replace_field(
+                &mut replacement,
+                "last_vibration_frequency",
+                Tag::Int(self.last_frequency),
+            )?;
+        }
+        if initial.vibration == self.vibration {
+            return Ok(native_persistence::edit::BlockEntityChange {
+                expected: original.clone(),
+                replacement,
+            });
+        }
+        if let Some(listener) = unique(original, "listener")? {
+            validate_listener_fields(listener)?;
+        }
+        ensure!(self.vibration.remaining() >= 0, "negative vibration delay");
+        let mut selector = vec![(
+            "tick".into(),
+            Tag::Long(self.vibration.pending().map_or(-1, |(tick, _)| tick)),
+        )];
+        if let Some((_, event)) = self.vibration.pending() {
+            selector.push(("event".into(), encode_event(event, registry)?));
+        }
+        let mut listener = vec![("selector".into(), Tag::Compound(selector))];
+        if let Some(event) = self.vibration.current() {
+            listener.push(("event".into(), encode_event(event, registry)?));
+        }
+        if self.vibration.remaining() != 0 {
+            listener.push(("event_delay".into(), Tag::Int(self.vibration.remaining())));
+        }
+        replace_field(&mut replacement, "listener", Tag::Compound(listener))?;
+        Ok(native_persistence::edit::BlockEntityChange {
+            expected: original.clone(),
+            replacement,
+        })
+    }
+}
+
+fn replace_field(tag: &mut Tag, name: &str, value: Tag) -> Result<()> {
+    let Tag::Compound(fields) = tag else {
+        bail!("expected a compound for {name}")
+    };
+    let mut positions = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, _))| key.matches(name).then_some(index));
+    let index = positions.next();
+    ensure!(positions.next().is_none(), "duplicate field {name}");
+    if let Some(index) = index {
+        fields[index].1 = value;
+    } else {
+        fields.push((name.into(), value));
+    }
+    Ok(())
+}
+
+fn known_fields(tag: &Tag, allowed: &[&str]) -> Result<()> {
+    let Tag::Compound(fields) = tag else {
+        bail!("expected a compound")
+    };
+    let mut seen = BTreeSet::new();
+    for (key, _) in fields {
+        let name = String::from_utf16(&key.0).context("invalid listener field name")?;
+        ensure!(
+            allowed.contains(&name.as_str()),
+            "unsupported listener field {name}"
+        );
+        ensure!(seen.insert(name), "duplicate listener field");
+    }
+    Ok(())
+}
+
+fn validate_listener_fields(listener: &Tag) -> Result<()> {
+    known_fields(listener, &["event", "event_delay", "selector"])?;
+    if let Some(event) = unique(listener, "event")? {
+        known_fields(
+            event,
+            &[
+                "game_event",
+                "distance",
+                "pos",
+                "source",
+                "projectile_owner",
+            ],
+        )?;
+    }
+    if let Some(selector) = unique(listener, "selector")? {
+        known_fields(selector, &["event", "tick"])?;
+        if let Some(event) = unique(selector, "event")? {
+            known_fields(
+                event,
+                &[
+                    "game_event",
+                    "distance",
+                    "pos",
+                    "source",
+                    "projectile_owner",
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_event(event: &Vibration, registry: &BTreeSet<String>) -> Result<Tag> {
+    let parsed = native_resources::packs::ResourceId::parse(&event.event)?;
+    let id = format!("{}:{}", parsed.namespace, parsed.path);
+    ensure!(
+        registry.contains(&id),
+        "game event is absent from the active registry"
+    );
+    ensure!(
+        event.distance.is_finite() && event.distance >= 0.0,
+        "invalid vibration distance"
+    );
+    ensure!(
+        event.position.is_finite(),
+        "vibration position is not finite"
+    );
+    let mut fields = vec![
+        ("game_event".into(), Tag::String(id.as_str().into())),
+        ("distance".into(), Tag::Float(event.distance)),
+        (
+            "pos".into(),
+            Tag::List {
+                element_type: TagType::Double,
+                values: event
+                    .position
+                    .to_array()
+                    .into_iter()
+                    .map(Tag::Double)
+                    .collect(),
+            },
+        ),
+    ];
+    if let Some(source) = event.source {
+        fields.push(("source".into(), Tag::IntArray(source.to_vec())));
+    }
+    if let Some(owner) = event.projectile_owner {
+        fields.push(("projectile_owner".into(), Tag::IntArray(owner.to_vec())));
+    }
+    Ok(Tag::Compound(fields))
 }
 
 fn unique<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
@@ -155,6 +322,12 @@ fn entities(payload: &SavedBlockEntities, chunk: ChunkPos) -> Result<Vec<(IVec3,
 }
 
 fn decode(entity: Tag, position: IVec3, registry: &BTreeSet<String>) -> Result<SavedSculkSensor> {
+    for (name, expected) in [("x", position.x), ("y", position.y), ("z", position.z)] {
+        ensure!(
+            matches!(unique(&entity,name)?, Some(Tag::Int(value)) if *value == expected),
+            "sensor block entity coordinates changed"
+        );
+    }
     let calibrated = match unique(&entity, "id")? {
         Some(Tag::String(id))
             if id.matches("minecraft:sculk_sensor") || id.matches("sculk_sensor") =>
@@ -348,6 +521,101 @@ mod tests {
         };
         fields.push(("source".into(), Tag::IntArray(vec![1, 2, 3])));
         assert!(listener(&build(Tag::Compound(fields), 2), &registry).is_err());
+    }
+
+    #[test]
+    fn draft_preserves_original_and_roundtrips_pending_and_current_vibrations() {
+        let original = sensor();
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let position = IVec3::new(1, 4, 2);
+        let registry = BTreeSet::from(["minecraft:splash".into(), "minecraft:step".into()]);
+        let mut saved = read(&payload(vec![original.clone()]), chunk, position, &registry)
+            .unwrap()
+            .unwrap();
+        let current = Vibration {
+            event: "minecraft:splash".into(),
+            distance: 4.25,
+            position: DVec3::new(-1.25, 64.0, 3.75),
+            source: Some([1, 2, 3, 4]),
+            projectile_owner: Some([5, 6, 7, 8]),
+        };
+        let pending = Vibration {
+            event: "minecraft:step".into(),
+            distance: 2.5,
+            position: DVec3::new(9.0, 1.5, -4.0),
+            source: None,
+            projectile_owner: None,
+        };
+        saved.vibration =
+            VibrationData::from_saved(Some(current.clone()), 3, Some((99, pending.clone())));
+        saved.last_frequency = 7;
+        let change = saved.draft(&original, &registry).unwrap();
+        assert_eq!(change.expected, original);
+        assert_eq!(change.replacement.get("unknown"), Some(&Tag::Int(37)));
+        let decoded = decode(change.replacement, position, &registry).unwrap();
+        assert_eq!(decoded.last_frequency, 7);
+        assert_eq!(decoded.vibration.current(), Some(&current));
+        assert_eq!(decoded.vibration.pending(), Some((99, &pending)));
+        assert_eq!(decoded.vibration.remaining(), 3);
+        assert!(saved.draft(&sensor_with_extra_field(), &registry).is_err());
+        let mut relocated = saved.clone();
+        relocated.position.x += 1;
+        assert!(relocated.draft(&original, &registry).is_err());
+        assert!(
+            saved
+                .draft(&original, &BTreeSet::from(["minecraft:step".into()]))
+                .is_err()
+        );
+        saved.vibration = VibrationData::from_saved(None, -1, None);
+        assert!(saved.draft(&original, &registry).is_err());
+    }
+
+    fn sensor_with_extra_field() -> Tag {
+        let Tag::Compound(mut fields) = sensor() else {
+            unreachable!()
+        };
+        fields.push(("extra".into(), Tag::Int(1)));
+        Tag::Compound(fields)
+    }
+
+    #[test]
+    fn draft_refuses_unknown_listener_fields_when_listener_changes() {
+        let Tag::Compound(mut fields) = sensor() else {
+            unreachable!()
+        };
+        let listener = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("listener"))
+            .unwrap();
+        let Tag::Compound(listener_fields) = &mut listener.1 else {
+            unreachable!()
+        };
+        listener_fields.push(("future".into(), Tag::Int(42)));
+        let original = Tag::Compound(fields);
+        let registry = BTreeSet::from(["minecraft:splash".into()]);
+        let mut saved = decode(original.clone(), IVec3::new(1, 4, 2), &registry).unwrap();
+        assert_eq!(
+            saved.draft(&original, &registry).unwrap().replacement,
+            original
+        );
+        saved.last_frequency = 2;
+        let frequency_only = saved.draft(&original, &registry).unwrap().replacement;
+        assert_eq!(frequency_only.get("listener"), original.get("listener"));
+        assert_eq!(
+            frequency_only.get("last_vibration_frequency"),
+            Some(&Tag::Int(2))
+        );
+        saved.vibration.offer(
+            Vibration {
+                event: "minecraft:splash".into(),
+                distance: 1.0,
+                position: DVec3::ZERO,
+                source: None,
+                projectile_owner: None,
+            },
+            10,
+        );
+        assert!(saved.draft(&original, &registry).is_err());
     }
 
     #[test]

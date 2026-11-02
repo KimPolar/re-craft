@@ -3911,6 +3911,7 @@ impl LoadedSession {
         }
         self.stage_chest_lifecycle(position, original, &mut draft)?;
         self.stage_banner_lifecycle(position, original, &mut draft)?;
+        self.stage_sculk_listeners(position, original, &mut draft)?;
         Ok(draft)
     }
 
@@ -4432,6 +4433,132 @@ impl LoadedSession {
                 expected: self.removed_banners.get(&(x, y, z)).cloned(),
                 replacement,
             });
+        }
+        draft.stage_block_entity_mutations(&changes)
+    }
+
+    /// Stage listener state alongside the chunk, without authorizing a write.
+    pub fn stage_sculk_listeners(
+        &self,
+        position: ChunkPos,
+        original: &native_persistence::nbt::NamedTag,
+        draft: &mut native_persistence::edit::ChunkDraft,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use native_persistence::edit::BlockEntityMutation;
+        ensure!(
+            draft.matches_source(original)?,
+            "chunk draft source differs"
+        );
+        let x = i64::from(position.x) * 16;
+        if x > i64::from(i32::MAX) || x + 15 < i64::from(i32::MIN) {
+            return Ok(());
+        }
+        let start = [x.max(i64::from(i32::MIN)) as i32, i32::MIN, i32::MIN];
+        let end = [(x + 15).min(i64::from(i32::MAX)) as i32, i32::MAX, i32::MAX];
+        let mut sensors = self
+            .sculk_listeners
+            .range(start..=end)
+            .map(|(_, sensor)| sensor)
+            .filter(|sensor| sensor.position.z.div_euclid(16) == position.z)
+            .peekable();
+        if sensors.peek().is_none() {
+            return Ok(());
+        }
+        let chunk = self
+            .world
+            .chunks
+            .get(&position)
+            .or_else(|| self.parked_chunks.get(&position))
+            .context("sensor chunk is unavailable")?;
+        let source_sections = native_persistence::palette::decode_sections(&original.value)?;
+        static EVENTS: OnceLock<BTreeSet<String>> = OnceLock::new();
+        let registry = EVENTS.get_or_init(crate::vibration::vanilla_game_events);
+        let mut changes = Vec::new();
+        for sensor in sensors {
+            ensure!(
+                self.registered_sculk_chunks.contains(&position),
+                "sensor chunk was not registered"
+            );
+            let section_y = i8::try_from(sensor.position.y.div_euclid(16))
+                .context("sensor section is out of range")?;
+            let index = sensor.position.x.rem_euclid(16) as usize
+                + sensor.position.z.rem_euclid(16) as usize * 16
+                + sensor.position.y.rem_euclid(16) as usize * 256;
+            let source_block = source_sections
+                .iter()
+                .find(|section| section.y == section_y)
+                .and_then(|section| section.blocks.as_ref())
+                .and_then(|blocks| {
+                    blocks.block(
+                        sensor.position.x.rem_euclid(16) as usize,
+                        sensor.position.y.rem_euclid(16) as usize,
+                        sensor.position.z.rem_euclid(16) as usize,
+                    )
+                })
+                .context("source sensor block is unavailable")?;
+            let expected_name = if sensor.calibrated {
+                "minecraft:calibrated_sculk_sensor"
+            } else {
+                "minecraft:sculk_sensor"
+            };
+            ensure!(
+                source_block.name.matches(expected_name),
+                "source sensor block and block entity differ"
+            );
+            let block = chunk
+                .sections
+                .get(&section_y)
+                .and_then(|section| section.blocks.as_ref())
+                .and_then(|blocks| self.world.state(blocks[index]))
+                .context("sensor block is unavailable")?;
+            ensure!(
+                crate::sculk_sensor::Sensor::from_block(block)
+                    .is_some_and(|state| state.facing.is_some() == sensor.calibrated),
+                "sensor block and block entity differ"
+            );
+            let initial = if let Some(edit) = self.block_edits.get(&position).and_then(|edits| {
+                edits.get(&(sensor.position.x, sensor.position.y, sensor.position.z))
+            }) {
+                self.world
+                    .state(
+                        edit.original
+                            .context("source sensor block state is unknown")?,
+                    )
+                    .context("source sensor state is unavailable")?
+            } else {
+                block
+            };
+            let source_matches = if source_block.properties.is_empty() {
+                let default = crate::sculk_sensor::Sensor {
+                    phase: crate::sculk_sensor::Phase::Inactive,
+                    power: 0,
+                    waterlogged: false,
+                    facing: sensor.calibrated.then_some(IVec3::NEG_Z),
+                };
+                crate::sculk_sensor::Sensor::from_block(initial) == Some(default)
+            } else {
+                source_block.properties.len() == initial.properties.len()
+                    && initial.properties.iter().all(|(name, property)| {
+                        source_block
+                            .properties
+                            .iter()
+                            .filter(|(key, value)| key.matches(name) && value.matches(property))
+                            .count()
+                            == 1
+                    })
+            };
+            ensure!(
+                initial.name == expected_name && source_matches,
+                "source sensor state changed since loading"
+            );
+            let change = sensor.draft(sensor.source(), registry)?;
+            if change.expected != change.replacement {
+                changes.push(BlockEntityMutation {
+                    expected: Some(change.expected),
+                    replacement: Some(change.replacement),
+                });
+            }
         }
         draft.stage_block_entity_mutations(&changes)
     }
@@ -32248,6 +32375,308 @@ pub(crate) mod tests {
                 .all(|event| event.info.event != "entity.generic.splash")
         );
         assert!(session.take_item_water_entries().is_empty());
+    }
+
+    #[test]
+    fn sculk_listener_draft_keeps_source_and_rejects_stale_chunk_entities() {
+        use native_persistence::nbt::{self, Tag, TagType};
+        let (mut session, sensor_pos) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let chunk = ChunkPos {
+            x: sensor_pos.x.div_euclid(16),
+            z: sensor_pos.z.div_euclid(16),
+        };
+        let source_entity = session.sculk_listeners[&sensor_pos.to_array()]
+            .source()
+            .clone();
+        // This fixture inserts the sensor after construction; model it as an
+        // original saved block for the source-state consistency check.
+        session.block_edits.get_mut(&chunk).unwrap().remove(&(
+            sensor_pos.x,
+            sensor_pos.y,
+            sensor_pos.z,
+        ));
+        let mut source = fixture_chunk_document(chunk);
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: sections, ..
+        } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0] else {
+            unreachable!()
+        };
+        let Tag::Compound(states) = &mut section
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::List {
+            element_type,
+            values: palette,
+        } = &mut states
+            .iter_mut()
+            .find(|(name, _)| name.matches("palette"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        *element_type = TagType::Compound;
+        for entry in palette.iter_mut() {
+            *entry = Tag::Compound(vec![("".into(), entry.clone())]);
+        }
+        palette.push(Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:sculk_sensor".into())),
+            (
+                "properties".into(),
+                Tag::Compound(vec![
+                    ("power".into(), Tag::String("0".into())),
+                    ("sculk_sensor_phase".into(), Tag::String("inactive".into())),
+                    ("waterlogged".into(), Tag::String("false".into())),
+                ]),
+            ),
+        ]));
+        let data = &mut states
+            .iter_mut()
+            .find(|(name, _)| name.matches("data"))
+            .unwrap()
+            .1;
+        let Tag::LongArray(words) = data else {
+            unreachable!()
+        };
+        let mut indices =
+            native_persistence::palette::decode_indices(2, Some(words), BLOCK_COUNT, 4).unwrap();
+        indices[4 + 4 * 16 + 2 * 256] = 2;
+        *words = native_persistence::palette::encode_indices(3, &indices, 4)
+            .unwrap()
+            .unwrap();
+        fields.push((
+            "block_entities".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![source_entity.clone()],
+            },
+        ));
+        let source_bytes = nbt::write(&source).unwrap();
+        session.dispatch_item_splash(crate::ItemWaterEntry {
+            tick: 0,
+            entity_id: 1,
+            position: sensor_pos.as_dvec3() + DVec3::new(2.5, 0.5, 0.5),
+            velocity: DVec3::ZERO,
+            source_uuid: Some([1, 2, 3, 4]),
+        });
+        assert!(
+            session.sculk_listeners[&sensor_pos.to_array()]
+                .vibration
+                .pending()
+                .is_some()
+        );
+        let mut draft = session.draft_unchanged_chunk(chunk, &source).unwrap();
+        session
+            .stage_sculk_listeners(chunk, &source, &mut draft)
+            .unwrap();
+        let combined = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                chunk,
+                &source,
+                &test_heightmap_tags(),
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+            )
+            .unwrap();
+        assert_eq!(
+            combined.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
+        assert_eq!(nbt::write(&source).unwrap(), source_bytes);
+        let entities = draft.document().value.get("block_entities").unwrap();
+        let payload = native_world::loaded::SavedBlockEntities::Encoded(
+            nbt::write(&native_persistence::nbt::NamedTag {
+                name: "".into(),
+                value: entities.clone(),
+            })
+            .unwrap()
+            .into(),
+        );
+        let decoded = crate::saved_sculk::read(
+            &payload,
+            chunk,
+            sensor_pos,
+            &crate::vibration::vanilla_game_events(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            decoded.vibration,
+            session.sculk_listeners[&sensor_pos.to_array()].vibration
+        );
+        assert_eq!(
+            decoded.vibration.pending().unwrap().1.source,
+            Some([1, 2, 3, 4])
+        );
+        let mut stale = source.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(entity) = &mut values[0] else {
+            unreachable!()
+        };
+        entity.push(("untracked".into(), Tag::Int(1)));
+        let mut stale_draft = session.draft_unchanged_chunk(chunk, &stale).unwrap();
+        let before = nbt::write(stale_draft.document()).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &stale, &mut stale_draft)
+                .is_err()
+        );
+        assert_eq!(nbt::write(stale_draft.document()).unwrap(), before);
+        let mut wrong_block = source.clone();
+        let Tag::Compound(root) = &mut wrong_block.value else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: sections, ..
+        } = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0] else {
+            unreachable!()
+        };
+        let Tag::Compound(states) = &mut section
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: palette, ..
+        } = &mut states
+            .iter_mut()
+            .find(|(name, _)| name.matches("palette"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        palette[2] = Tag::Compound(vec![("".into(), Tag::String("minecraft:glass".into()))]);
+        let mut wrong_draft = session.draft_unchanged_chunk(chunk, &wrong_block).unwrap();
+        let before = nbt::write(wrong_draft.document()).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &wrong_block, &mut wrong_draft)
+                .is_err()
+        );
+        assert_eq!(nbt::write(wrong_draft.document()).unwrap(), before);
+        let mut duplicate = source.clone();
+        let Tag::Compound(root) = &mut duplicate.value else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: sections, ..
+        } = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections[0] else {
+            unreachable!()
+        };
+        let Tag::Compound(states) = &mut section
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::List {
+            values: palette, ..
+        } = &mut states
+            .iter_mut()
+            .find(|(name, _)| name.matches("palette"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(sensor) = &mut palette[2] else {
+            unreachable!()
+        };
+        let Tag::Compound(properties) = &mut sensor
+            .iter_mut()
+            .find(|(name, _)| name.matches("properties"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let power = properties
+            .iter()
+            .find(|(name, _)| name.matches("power"))
+            .unwrap()
+            .clone();
+        properties.retain(|(name, _)| !name.matches("sculk_sensor_phase"));
+        properties.push(power);
+        assert!(session.draft_unchanged_chunk(chunk, &duplicate).is_err());
+        let active = crate::sculk_sensor::Sensor {
+            phase: crate::sculk_sensor::Phase::Active,
+            power: 6,
+            waterlogged: false,
+            facing: None,
+        }
+        .to_block()
+        .unwrap();
+        let active_id = session.intern_block(active);
+        assert!(session.set(sensor_pos - session.origin, active_id));
+        let mut changed_draft = session.draft_changed_chunk(chunk, &source).unwrap();
+        session
+            .stage_sculk_listeners(chunk, &source, &mut changed_draft)
+            .unwrap();
+        assert_eq!(
+            changed_draft.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
+        let parked = Arc::make_mut(&mut session.world)
+            .chunks
+            .remove(&chunk)
+            .unwrap();
+        session.parked_chunks.insert(chunk, parked);
+        let mut parked_draft = session.draft_unchanged_chunk(chunk, &source).unwrap();
+        session
+            .stage_sculk_listeners(chunk, &source, &mut parked_draft)
+            .unwrap();
+        assert_eq!(
+            parked_draft.document().value.get("block_entities"),
+            draft.document().value.get("block_entities")
+        );
     }
 
     #[test]

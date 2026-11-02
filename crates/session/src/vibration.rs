@@ -722,6 +722,90 @@ mod tests {
                 assert!(saved.vibration.current().is_none());
             }
         }
+        {
+            use native_persistence::nbt::{NamedTag, Tag, TagType};
+            let mut drafts = Vec::new();
+            for n in 0..8 {
+                let original = sensors
+                    .value
+                    .get(if n & 4 != 0 { "sensor1" } else { "sensor0" })
+                    .unwrap()
+                    .clone();
+                let bytes = native_persistence::nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![original.clone()],
+                    },
+                })
+                .unwrap();
+                let mut sensor = crate::saved_sculk::read(
+                    &native_world::loaded::SavedBlockEntities::Encoded(bytes.into()),
+                    native_world::loaded::ChunkPos { x: -1, z: 0 },
+                    IVec3::new(-1, 42, 3),
+                    &registry,
+                )
+                .unwrap()
+                .unwrap();
+                let current = (n & 1 != 0).then(|| Vibration {
+                    event: "minecraft:step".into(),
+                    distance: 4.5,
+                    position: DVec3::new(2.25, 42.0, -3.5),
+                    source: Some([0, 3, 0, 4]),
+                    projectile_owner: Some([0, 5, 0, 6]),
+                });
+                let pending = (n & 2 != 0).then(|| {
+                    (
+                        99,
+                        Vibration {
+                            event: "minecraft:splash".into(),
+                            distance: 1.25,
+                            position: DVec3::new(-1.25, 42.5, 3.75),
+                            source: Some([0, 1, 0, 2]),
+                            projectile_owner: None,
+                        },
+                    )
+                });
+                sensor.last_frequency = n + 1;
+                sensor.vibration =
+                    VibrationData::from_saved(current, if n & 1 != 0 { 3 } else { 0 }, pending);
+                drafts.push((
+                    format!("sensor{n}").as_str().into(),
+                    sensor.draft(&original, &registry).unwrap().replacement,
+                ));
+            }
+            let input = temp.path().join("sculk-drafts.nbt");
+            std::fs::write(
+                &input,
+                native_persistence::nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(drafts),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let source = temp.path().join("SculkDraftOracle.java");
+            std::fs::write(&source, include_str!("../tests/java/SculkDraftOracle.java")).unwrap();
+            for command in [
+                Command::new(java.join("javac.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg(&source),
+                Command::new(java.join("java.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg("SculkDraftOracle")
+                    .arg(&input),
+            ] {
+                let result = command.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let tags =
             native_resources::game_event_tags::GameEventTags::load(&mut resources, &registry)

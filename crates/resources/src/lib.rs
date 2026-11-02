@@ -50,6 +50,7 @@ pub mod placed_feature;
 pub mod recipes;
 pub mod respawn_environment;
 pub mod respawn_tags;
+pub mod root_system_feature;
 pub mod simple_block_feature;
 pub mod sounds;
 pub mod spring_feature;

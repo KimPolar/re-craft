@@ -258,6 +258,18 @@ pub struct PlacedFeature {
     modifiers: Vec<Modifier>,
 }
 impl PlacedFeature {
+    /// Each codec decode creates a distinct uniform/trapezoid height-provider
+    /// object in 26.3. Since HeightRangePlacement is a record containing that
+    /// object, separately decoded placed features cannot be equal when this
+    /// modifier is present, even if their JSON is identical.
+    pub fn has_independent_height_provider(&self) -> bool {
+        self.modifiers.iter().any(|modifier| {
+            matches!(
+                modifier,
+                Modifier::Height(HeightProvider::Uniform(..) | HeightProvider::Trapezoid(..))
+            )
+        })
+    }
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
         let path = format!(
             "data/{}/worldgen/placed_feature/{}.json",

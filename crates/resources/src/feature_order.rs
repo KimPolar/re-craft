@@ -37,6 +37,7 @@ pub struct FeatureSchedule {
     biomes: BTreeMap<ResourceId, BiomeFeatures>,
     possible_biomes: Vec<ResourceId>,
     indices: BTreeMap<ResourceId, Vec<Vec<usize>>>,
+    membership: BTreeMap<ResourceId, BTreeSet<FeatureKey>>,
 }
 
 /// A selected feature retains its global index even when earlier features are
@@ -84,6 +85,7 @@ impl FeatureSchedule {
             );
         }
         let mut indices = BTreeMap::new();
+        let mut membership = BTreeMap::new();
         for (id, biome) in &biomes {
             let mut features = Vec::with_capacity(biome.steps.len());
             for (step, keys) in biome.steps.iter().enumerate() {
@@ -98,12 +100,14 @@ impl FeatureSchedule {
                 features.push(values);
             }
             indices.insert(id.clone(), features);
+            membership.insert(id.clone(), biome.steps.iter().flatten().cloned().collect());
         }
         Ok(Self {
             steps,
             biomes,
             possible_biomes: possible_biomes.to_vec(),
             indices,
+            membership,
         })
     }
 
@@ -115,6 +119,19 @@ impl FeatureSchedule {
     }
     pub fn possible_biomes(&self) -> &[ResourceId] {
         &self.possible_biomes
+    }
+    /// Identity lookup only; Java's `hasFeature` can also match a distinct
+    /// structurally equal placed feature. Callers must account for that case.
+    pub fn biome_contains_identity(
+        &self,
+        biome: &ResourceId,
+        feature: &FeatureKey,
+    ) -> Result<bool> {
+        Ok(self
+            .membership
+            .get(biome)
+            .context("biome is absent from the feature schedule")?
+            .contains(feature))
     }
 
     /// Union features from present possible biomes, in global step/index order.

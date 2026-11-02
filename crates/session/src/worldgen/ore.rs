@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
     block_column_feature::{BlockColumnFeature, ColumnWorld},
-    disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
+    disk_feature::{BlockPredicate, DiskFeature, DiskWorld, is_simple_carpet_id},
     feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule, FeatureTags},
     freeze_feature::freeze_top_layer,
     geode_feature::{Direction as GeodeDirection, GeodeEnvironment, GeodeFeature},
@@ -2097,7 +2097,9 @@ fn tree_mushroom_block(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
-    if matches!(
+    if is_simple_carpet_id(&state.name) {
+        Ok(Some(simple_plant_kind(state)?))
+    } else if matches!(
         state.name.as_str(),
         "minecraft:short_grass"
             | "minecraft:fern"
@@ -3222,18 +3224,20 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 }
             }
             let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
-            let survives =
-                if matches!(kind, SimplePlantKind::Double) && state.properties["half"] == "upper" {
-                    below.name == state.name
-                        && below.properties.get("half").map(String::as_str) == Some("lower")
+            let survives = if matches!(kind, SimplePlantKind::Carpet) {
+                !is_air(&below)
+            } else if matches!(kind, SimplePlantKind::Double) && state.properties["half"] == "upper"
+            {
+                below.name == state.name
+                    && below.properties.get("half").map(String::as_str) == Some("lower")
+            } else {
+                let tag = if matches!(kind, SimplePlantKind::Azalea) {
+                    tree_azalea_tag()
                 } else {
-                    let tag = if matches!(kind, SimplePlantKind::Azalea) {
-                        tree_azalea_tag()
-                    } else {
-                        tree_vegetation_tag(matches!(kind, SimplePlantKind::DryVegetation))
-                    };
-                    self.tags.contains(tag, &below.name)?
+                    tree_vegetation_tag(matches!(kind, SimplePlantKind::DryVegetation))
                 };
+                self.tags.contains(tag, &below.name)?
+            };
             if !survives {
                 return Ok(BlockState {
                     name: "minecraft:air".into(),
@@ -3899,6 +3903,7 @@ enum SimplePlantKind {
     Vegetation,
     DryVegetation,
     Azalea,
+    Carpet,
     Double,
     Unconditional,
     Mushroom,
@@ -3911,6 +3916,10 @@ enum SimplePlantKind {
 // survival implementation, POI/block-entity effects and postprocessing.
 fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
     let name = state.name.as_str();
+    if is_simple_carpet_id(name) {
+        ensure!(state.properties.is_empty(), "invalid carpet state");
+        return Ok(SimplePlantKind::Carpet);
+    }
     let kind = match name {
         "minecraft:leaf_litter" => {
             tree_leaf_litter(state)?;
@@ -4076,6 +4085,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             let survives = match kind {
                 SimplePlantKind::Unconditional => true,
                 SimplePlantKind::Mushroom => self.mushroom_survival(pos)?,
+                SimplePlantKind::Carpet => !is_air(&self.block(below)?),
                 SimplePlantKind::LeafLitter => {
                     let state = self.block(below)?;
                     DiskWorld::face_sturdy(self, &state, below, [0, 1, 0])?
@@ -7806,6 +7816,185 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn carpet_generation_matches_java_survival_and_edges() {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("CarpetFeatureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/CarpetFeatureOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("CarpetFeatureOracle"));
+        let names = [
+            "moss_carpet",
+            "white_carpet",
+            "orange_carpet",
+            "magenta_carpet",
+            "light_blue_carpet",
+            "yellow_carpet",
+            "lime_carpet",
+            "pink_carpet",
+            "gray_carpet",
+            "light_gray_carpet",
+            "cyan_carpet",
+            "purple_carpet",
+            "blue_carpet",
+            "brown_carpet",
+            "green_carpet",
+            "red_carpet",
+            "black_carpet",
+        ];
+        let mut registry = batch_registry();
+        registry.extend(names.iter().map(|name| format!("minecraft:{name}")));
+        registry.extend(["minecraft:water".into(), "minecraft:lava".into()]);
+        let tags = OreBlockTags::load(&mut Data, &registry, &BTreeSet::new()).unwrap();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let mut cases = 0;
+        let mut edges = 0;
+        for line in output.lines().filter(|line| line.starts_with("C ")) {
+            let p: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(p.len(), 11, "{line}");
+            let kind: usize = p[1].parse().unwrap();
+            let base: usize = p[2].parse().unwrap();
+            let here: usize = p[3].parse().unwrap();
+            let mut support = state(
+                [
+                    "air",
+                    "cave_air",
+                    "stone",
+                    "water",
+                    "lava",
+                    "short_grass",
+                    "moss_carpet",
+                ][base],
+            );
+            if matches!(support.name.as_str(), "minecraft:water" | "minecraft:lava") {
+                support.properties.insert("level".into(), "0".into());
+            }
+            let mut current = state(["air", "stone", "water", "moss_carpet"][here]);
+            if current.name == "minecraft:water" {
+                current.properties.insert("level".into(), "0".into());
+            }
+            region.set_section_block([8, 7, 8], &support).unwrap();
+            region.set_section_block([8, 8, 8], &current).unwrap();
+            let target = state(names[kind]);
+            let predicate = BlockPredicate::decode(
+                &json!({"type":"minecraft:would_survive","state":{"id":target.name}}),
+            )
+            .unwrap();
+            assert!(predicate.required_tags().is_empty());
+            assert_eq!(
+                predicate.test(&mut region, [8, 8, 8]).unwrap(),
+                p[5] == "true",
+                "{line}"
+            );
+            assert_eq!(
+                DiskWorld::is_solid(&mut region, &target).unwrap(),
+                p[10] == "true",
+                "{line}"
+            );
+            let feature = SimpleBlockFeature::decode(
+                &json!({"type":"minecraft:simple_block","to_place":{"id":target.name}}),
+                &mut resolve_tree_test,
+            )
+            .unwrap();
+            let mut random = DecorationRandom::new(42);
+            assert_eq!(
+                feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                p[6] == "true",
+                "{line}"
+            );
+            assert_eq!(
+                feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                p[7] == "true",
+                "{line}"
+            );
+            assert_eq!(region.read([8, 8, 8]).unwrap().name, p[8], "{line}");
+            assert_eq!(random.next_long(), p[9].parse::<i64>().unwrap(), "{line}");
+            assert_eq!(p[4], p[5], "{line}");
+            for edge in output
+                .lines()
+                .filter(|edge| edge.starts_with(&format!("U {kind} {base} {here} ")))
+            {
+                let u: Vec<_> = edge.split_whitespace().collect();
+                let direction = match u[4] {
+                    "down" => [0, -1, 0],
+                    "up" => [0, 1, 0],
+                    "north" => [0, 0, -1],
+                    "south" => [0, 0, 1],
+                    "west" => [-1, 0, 0],
+                    "east" => [1, 0, 0],
+                    _ => panic!("{edge}"),
+                };
+                assert_eq!(
+                    region
+                        .update_shape([8, 8, 8], &target, direction, [0, 0, 0], &state("stone"))
+                        .unwrap()
+                        .name,
+                    u[5],
+                    "{edge}"
+                );
+                edges += 1;
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 17 * 7 * 4);
+        assert_eq!(edges, cases * 6);
+        for name in ["moss_carpet", "minecraft:moss_carpet"] {
+            let predicate = BlockPredicate::decode(
+                &json!({"type":"minecraft:would_survive","state":{"id":name}}),
+            )
+            .unwrap();
+            assert!(predicate.required_tags().is_empty());
+            assert!(predicate.test(&mut region, [8, 8, 8]).unwrap());
+        }
+        assert!(!is_simple_carpet_id("minecraft:pale_moss_carpet"));
+        assert!(!is_simple_carpet_id("custom:moss_carpet"));
     }
 
     #[test]

@@ -69,6 +69,16 @@ pub trait DiskWorld: OreWorld {
             id.namespace == "minecraft",
             "unsupported would_survive block"
         );
+        if is_simple_carpet_id(&format!("{}:{}", id.namespace, id.path)) {
+            if let Some(properties) = state.get("properties") {
+                ensure!(
+                    properties.as_object().is_some_and(|p| p.is_empty()),
+                    "invalid carpet state"
+                );
+            }
+            let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            return Ok(!self.is_air(&below)?);
+        }
         if matches!(id.path.as_str(), "brown_mushroom" | "red_mushroom") {
             return self.mushroom_survives(pos);
         }
@@ -116,6 +126,38 @@ pub trait DiskWorld: OreWorld {
         }
         Ok(false)
     }
+}
+
+/// The stateless carpets using vanilla CarpetBlock's non-air support rule.
+pub fn is_simple_carpet_id(id: &str) -> bool {
+    let Some(name) = id.strip_prefix("minecraft:") else {
+        return false;
+    };
+    if name == "moss_carpet" {
+        return true;
+    }
+    let Some(color) = name.strip_suffix("_carpet") else {
+        return false;
+    };
+    matches!(
+        color,
+        "white"
+            | "orange"
+            | "magenta"
+            | "light_blue"
+            | "yellow"
+            | "lime"
+            | "pink"
+            | "gray"
+            | "light_gray"
+            | "cyan"
+            | "purple"
+            | "blue"
+            | "brown"
+            | "green"
+            | "red"
+            | "black"
+    )
 }
 
 fn vegetation_support(id: &ResourceId) -> Option<&'static str> {

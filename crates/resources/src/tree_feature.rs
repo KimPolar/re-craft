@@ -13,7 +13,7 @@ use crate::{
     tree_beehive::{BeehiveDecorator, BeehiveWorld},
     tree_placers::{
         TreeFeatureSize, TrunkHeight, VanillaTreeClearance, permitted_tree_height,
-        place_blob_foliage, place_straight_trunk,
+        place_blob_foliage, place_fancy_foliage, place_straight_trunk,
     },
 };
 
@@ -38,6 +38,7 @@ pub struct TreeFeature<S> {
     below: Provider<S>,
     trunk_height: TrunkHeight,
     foliage_height: i32,
+    fancy_foliage: bool,
     radius: IntProvider,
     offset: IntProvider,
     size: TreeFeatureSize,
@@ -46,7 +47,7 @@ pub struct TreeFeature<S> {
 }
 
 impl<S: Clone + Eq> TreeFeature<S> {
-    /// Decode a straight-trunk, blob-foliage tree without roots.
+    /// Decode a straight-trunk tree with blob or fancy foliage, without roots.
     /// Reject unsupported configurations before a world can be modified.
     pub fn decode(
         provider: &mut impl ResourceProvider,
@@ -117,10 +118,11 @@ impl<S: Clone + Eq> TreeFeature<S> {
             "unsupported tree trunk placer"
         );
         let foliage_placer = field(value, "foliage_placer")?;
-        ensure!(
-            name(foliage_placer)? == ResourceId::parse("minecraft:blob_foliage_placer")?,
-            "unsupported tree foliage placer"
-        );
+        let fancy_foliage = match name(foliage_placer)? {
+            id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => false,
+            id if id == ResourceId::parse("minecraft:fancy_foliage_placer")? => true,
+            _ => anyhow::bail!("unsupported tree foliage placer"),
+        };
         let foliage_height = integer(foliage_placer, "height")?;
         ensure!(
             (0..=16).contains(&foliage_height),
@@ -146,6 +148,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 integer(trunk_placer, "height_rand_b")?,
             )?,
             foliage_height,
+            fancy_foliage,
             radius,
             offset,
             size: TreeFeatureSize::decode(field(value, "minimum_size")?)?,
@@ -226,24 +229,36 @@ impl<S: Clone + Eq> TreeFeature<S> {
             Ok(())
         })?;
         let offset = self.offset.sample(random);
-        place_blob_foliage(
-            random,
-            attachment,
-            self.foliage_height,
-            radius,
-            offset,
-            |pos, random| {
-                if !world.persistent_foliage(pos)? && valid_tree_pos(world, pos)? {
-                    let state = self
-                        .foliage
-                        .state(world, random, pos)?
-                        .context("tree foliage provider returned no state")?;
-                    let state = world.foliage_state(pos, state)?;
-                    world.write_tree(pos, &state, TreeWrite::Foliage)?;
-                }
-                Ok(())
-            },
-        )?;
+        let mut place = |pos, random: &mut DecorationRandom| {
+            if !world.persistent_foliage(pos)? && valid_tree_pos(world, pos)? {
+                let state = self
+                    .foliage
+                    .state(world, random, pos)?
+                    .context("tree foliage provider returned no state")?;
+                let state = world.foliage_state(pos, state)?;
+                world.write_tree(pos, &state, TreeWrite::Foliage)?;
+            }
+            Ok(())
+        };
+        if self.fancy_foliage {
+            place_fancy_foliage(
+                random,
+                attachment,
+                self.foliage_height,
+                radius,
+                offset,
+                &mut place,
+            )?;
+        } else {
+            place_blob_foliage(
+                random,
+                attachment,
+                self.foliage_height,
+                radius,
+                offset,
+                &mut place,
+            )?;
+        }
         Ok(true)
     }
 }

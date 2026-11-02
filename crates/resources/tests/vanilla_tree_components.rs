@@ -244,47 +244,53 @@ fn straight_blob_tree_components_match_java() {
     for seed in [0, 1, -1, 987654321] {
         for mode in 0..6 {
             for ignore in [false, true] {
-                let tree =
-                    TreeFeature::decode(&mut Data, &definition(ignore), &mut resolve).unwrap();
-                let mut world = World {
-                    blocks: BTreeMap::from([([3, 2, -4], state("minecraft:stone"))]),
-                    writes: Vec::new(),
-                };
-                match mode {
-                    1 => {
-                        world.blocks.insert([3, 5, -4], state("minecraft:stone"));
+                for fancy in [false, true] {
+                    let mut config = definition(ignore);
+                    if fancy {
+                        config["foliage_placer"]["type"] = json!("minecraft:fancy_foliage_placer");
                     }
-                    2 => {
-                        let mut s = state("minecraft:oak_leaves");
-                        s.persistent = true;
-                        world.blocks.insert([4, 6, -4], s);
+                    let tree = TreeFeature::decode(&mut Data, &config, &mut resolve).unwrap();
+                    let mut world = World {
+                        blocks: BTreeMap::from([([3, 2, -4], state("minecraft:stone"))]),
+                        writes: Vec::new(),
+                    };
+                    match mode {
+                        1 => {
+                            world.blocks.insert([3, 5, -4], state("minecraft:stone"));
+                        }
+                        2 => {
+                            let mut s = state("minecraft:oak_leaves");
+                            s.persistent = true;
+                            world.blocks.insert([4, 6, -4], s);
+                        }
+                        3 => {
+                            world.blocks.insert([2, 6, -4], state("minecraft:water"));
+                        }
+                        4 => {
+                            world.blocks.insert([3, 5, -4], state("minecraft:vine"));
+                        }
+                        5 => {
+                            world.blocks.insert([3, 5, -4], state("minecraft:oak_log"));
+                        }
+                        _ => {}
                     }
-                    3 => {
-                        world.blocks.insert([2, 6, -4], state("minecraft:water"));
-                    }
-                    4 => {
-                        world.blocks.insert([3, 5, -4], state("minecraft:vine"));
-                    }
-                    5 => {
-                        world.blocks.insert([3, 5, -4], state("minecraft:oak_log"));
-                    }
-                    _ => {}
+                    let mut random = DecorationRandom::new(seed);
+                    let ok = tree
+                        .place_components(&mut world, &mut random, [3, 3, -4])
+                        .unwrap();
+                    expected.push(format!(
+                        "{} {seed} {mode} {ignore} {ok} {} R {}",
+                        if fancy { "F" } else { "C" },
+                        world.writes.join(";"),
+                        random.next_long()
+                    ));
                 }
-                let mut random = DecorationRandom::new(seed);
-                let ok = tree
-                    .place_components(&mut world, &mut random, [3, 3, -4])
-                    .unwrap();
-                expected.push(format!(
-                    "C {seed} {mode} {ignore} {ok} {} R {}",
-                    world.writes.join(";"),
-                    random.next_long()
-                ));
             }
         }
     }
     let actual: Vec<_> = actual
         .lines()
-        .filter(|line| line.starts_with("C "))
+        .filter(|line| line.starts_with("C ") || line.starts_with("F "))
         .collect();
     assert_eq!(actual.len(), expected.len());
     for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {

@@ -13,6 +13,7 @@ import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.levelgen.feature.TreeFeature;
 import net.minecraft.world.level.levelgen.feature.foliageplacers.BlobFoliagePlacer;
+import net.minecraft.world.level.levelgen.feature.foliageplacers.FancyFoliagePlacer;
 import net.minecraft.world.level.levelgen.feature.foliageplacers.FoliagePlacer;
 import net.minecraft.world.level.levelgen.feature.stateproviders.BlockStateProvider;
 import net.minecraft.world.level.levelgen.feature.trunkplacers.StraightTrunkPlacer;
@@ -62,5 +63,20 @@ public class TreePlacersOracle {
               blob.createFoliage(world,setter,random,tree,trunkHeight,attachment,height,radius);
               out.printf("C %d %d %d %d %s %s %d %s L %s R %d%n",seed,height,radius,offset,big,obstructed,trunkHeight,String.join(";",trunks),String.join(";",positions),random.nextLong());
             }
+    for(long seed:new long[]{0,1,-1,987654321})
+      for(int height:new int[]{0,1,3,5})for(int radius:new int[]{0,2,4})for(int offset:new int[]{0,1,4})
+        for(boolean big:new boolean[]{false,true})for(boolean obstructed:new boolean[]{false,true}){
+          obstacles=obstructed;var random=new WorldgenRandom(new XoroshiroRandomSource(seed));
+          var fancy=new FancyFoliagePlacer(ConstantInt.of(radius),ConstantInt.of(offset),height);
+          var positions=new ArrayList<String>();
+          var setter=new FoliagePlacer.FoliageSetter(){
+            public void set(BlockPos p,BlockState s){positions.add(p.getX()+","+p.getY()+","+p.getZ());}
+            public boolean isSet(BlockPos p){return false;}
+          };
+          int size=big?2:1;
+          var attachment=new FoliagePlacer.FoliageAttachment(new BlockPos(3,30,-4),1,1,size,size);
+          fancy.createFoliage(world,setter,random,tree,7,attachment,height,radius);
+          out.printf("F %d %d %d %d %s %s L %s R %d%n",seed,height,radius,offset,big,obstructed,String.join(";",positions),random.nextLong());
+        }
   }
 }

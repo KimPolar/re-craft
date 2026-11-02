@@ -4199,6 +4199,89 @@ mod tests {
             )
         );
 
+        struct FancyTreeData;
+        impl ResourceProvider for FancyTreeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let Some(bytes) = TreeData.read_data(path)? else {
+                    return Ok(None);
+                };
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let mut v: Value = serde_json::from_slice(&bytes)?;
+                    v["features"][0][0]["feature"]["foliage_placer"]["type"] =
+                        json!("minecraft:fancy_foliage_placer");
+                    return Ok(Some(serde_json::to_vec(&v)?));
+                }
+                Ok(Some(bytes))
+            }
+        }
+        let fancy_output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeChunkOracle")
+            .arg("fancy"));
+        let fancy_actual = fancy_output
+            .lines()
+            .find(|line| line.starts_with("RESULT "))
+            .unwrap();
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let fancy_schedule =
+            FeatureSchedule::load(&mut FancyTreeData, &[plains], &BTreeSet::new()).unwrap();
+        let fancy_plan = fixture_plan(&fancy_schedule, &neighborhood);
+        let fancy_prepared = PreparedDecoration::load(
+            &mut FancyTreeData,
+            &fancy_plan,
+            &registry,
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        let (mut fancy_terrain, _, _, _) = fixture();
+        let fancy_success = fancy_prepared.execute(&mut fancy_terrain, false).unwrap();
+        let fancy_world = fancy_terrain.snapshot();
+        let mut fancy_blocks = Vec::new();
+        for x in 0..16 {
+            for y in 7..16 {
+                for z in 0..16 {
+                    let b = fancy_world.block(x, y, z).unwrap();
+                    let extra = match b.name.as_str() {
+                        "minecraft:oak_log" => format!(",axis={}", b.properties["axis"]),
+                        "minecraft:oak_leaves" => format!(
+                            ",distance={},persistent={},waterlogged={}",
+                            b.properties["distance"],
+                            b.properties["persistent"],
+                            b.properties["waterlogged"]
+                        ),
+                        "minecraft:dirt" => String::new(),
+                        _ => continue,
+                    };
+                    fancy_blocks.push(format!("{x},{y},{z},{}{extra}", b.name));
+                }
+            }
+        }
+        let fancy_ticks = fancy_world
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                format!(
+                    "{},{},{},{}",
+                    t.position[0], t.position[1], t.position[2], t.block
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fancy_actual,
+            format!(
+                "RESULT {} B {} T {}",
+                fancy_success[0],
+                fancy_blocks.join(";"),
+                fancy_ticks.join(";")
+            )
+        );
+
         struct BeeTreeData;
         impl ResourceProvider for BeeTreeData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {

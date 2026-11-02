@@ -1,6 +1,6 @@
 use native_core::random::DecorationRandom;
 use native_resources::tree_placers::{
-    FoliageAttachment, TrunkHeight, place_blob_foliage, place_straight_trunk,
+    FoliageAttachment, TrunkHeight, place_blob_foliage, place_fancy_foliage, place_straight_trunk,
 };
 use std::{path::PathBuf, process::Command};
 
@@ -35,6 +35,7 @@ fn invalid_dimensions_and_failed_world_writes_stop_placement() {
     );
     assert_eq!(writes, 1);
     assert!(place_blob_foliage(&mut random, attachment, 17, 2, 0, |_, _| Ok(())).is_err());
+    assert!(place_fancy_foliage(&mut random, attachment, 17, 2, 0, |_, _| Ok(())).is_err());
 }
 
 #[test]
@@ -137,12 +138,63 @@ fn trunk_heights_and_blob_foliage_match_java() {
             }
         }
     }
-    let actual: Vec<_> = actual
+    let actual_blob: Vec<_> = actual
         .lines()
         .filter(|line| line.starts_with("C "))
         .collect();
-    assert_eq!(actual.len(), expected.len());
-    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+    assert_eq!(actual_blob.len(), expected.len());
+    for (index, (actual, expected)) in actual_blob.iter().zip(&expected).enumerate() {
         assert_eq!(*actual, expected, "case {index}");
+    }
+    let mut fancy_expected = Vec::new();
+    for seed in [0, 1, -1, 987654321] {
+        for height in [0, 1, 3, 5] {
+            for radius in [0, 2, 4] {
+                for offset in [0, 1, 4] {
+                    for big in [false, true] {
+                        for obstructed in [false, true] {
+                            let mut random = DecorationRandom::new(seed);
+                            let mut positions = Vec::new();
+                            place_fancy_foliage(
+                                &mut random,
+                                FoliageAttachment {
+                                    position: [3, 30, -4],
+                                    radius_offset: 1,
+                                    height_offset: 1,
+                                    double_trunk: big,
+                                },
+                                height,
+                                radius,
+                                offset,
+                                |[x, y, z], random| {
+                                    if !obstructed
+                                        || (x * 3 + y * 5 + z * 7_i32).rem_euclid(11) != 0
+                                    {
+                                        random.next_int_bound(17).unwrap();
+                                        positions.push(format!("{x},{y},{z}"));
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .unwrap();
+                            fancy_expected.push(format!(
+                                "F {seed} {height} {radius} {offset} {big} {obstructed} L {} R {}",
+                                positions.join(";"),
+                                random.next_long()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let fancy_actual: Vec<_> = actual
+        .lines()
+        .filter(|line| line.starts_with("F "))
+        .collect();
+    assert_eq!(fancy_actual.len(), 576);
+    assert_eq!(fancy_actual.len(), fancy_expected.len());
+    for (index, (actual, expected)) in fancy_actual.iter().zip(&fancy_expected).enumerate() {
+        assert_eq!(*actual, expected, "fancy case {index}");
     }
 }

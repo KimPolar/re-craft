@@ -313,3 +313,49 @@ pub fn place_blob_foliage(
     }
     Ok(())
 }
+
+/// Enumerate the rounded rows of the 26.3 fancy foliage placer.
+pub fn place_fancy_foliage(
+    random: &mut DecorationRandom,
+    attachment: FoliageAttachment,
+    height: i32,
+    radius: i32,
+    offset: i32,
+    mut place: impl FnMut([i32; 3], &mut DecorationRandom) -> Result<()>,
+) -> Result<()> {
+    ensure!((0..=16).contains(&height), "invalid fancy foliage height");
+    ensure!((0..=16).contains(&radius), "invalid foliage radius");
+    ensure!((0..=16).contains(&offset), "invalid foliage offset");
+    for y in (offset - height..=offset).rev() {
+        let row_radius = radius + i32::from(y != offset && y != offset - height);
+        let extra = i32::from(attachment.double_trunk);
+        for x in -row_radius..=row_radius + extra {
+            for z in -row_radius..=row_radius + extra {
+                let dx = if attachment.double_trunk {
+                    x.abs().min((x - 1).abs())
+                } else {
+                    x.abs()
+                };
+                let dz = if attachment.double_trunk {
+                    z.abs().min((z - 1).abs())
+                } else {
+                    z.abs()
+                };
+                let x_squared = (dx as f32 + 0.5) * (dx as f32 + 0.5);
+                let z_squared = (dz as f32 + 0.5) * (dz as f32 + 0.5);
+                if x_squared + z_squared > (row_radius * row_radius) as f32 {
+                    continue;
+                }
+                place(
+                    [
+                        attachment.position[0].wrapping_add(x),
+                        attachment.position[1].wrapping_add(y),
+                        attachment.position[2].wrapping_add(z),
+                    ],
+                    random,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}

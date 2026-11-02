@@ -24,12 +24,168 @@ pub trait LeafUpdateWorld {
 }
 
 // The vanilla queues are java.util.HashSets. Retaining their bucket order is
-// important when a pre-existing leaf already has a short distance. Tree bins
-// are deliberately rejected until their ordering has also been implemented.
+// important when a pre-existing leaf already has a short distance.
 #[derive(Default)]
 struct PositionSet {
-    buckets: Vec<Vec<Pos>>,
+    buckets: Vec<Bucket>,
     len: usize,
+}
+
+#[derive(Default)]
+struct Bucket {
+    order: Vec<Pos>,
+    tree: Option<TreeBin>,
+    removed_from_tree: bool,
+}
+
+struct TreeNode {
+    pos: Pos,
+    parent: Option<usize>,
+    left: Option<usize>,
+    right: Option<usize>,
+    red: bool,
+}
+
+#[derive(Default)]
+struct TreeBin {
+    nodes: Vec<TreeNode>,
+    root: Option<usize>,
+}
+impl TreeBin {
+    fn rotate(&mut self, at: usize, left: bool) {
+        let child = if left {
+            self.nodes[at].right.unwrap()
+        } else {
+            self.nodes[at].left.unwrap()
+        };
+        let middle = if left {
+            self.nodes[child].left
+        } else {
+            self.nodes[child].right
+        };
+        if left {
+            self.nodes[at].right = middle;
+        } else {
+            self.nodes[at].left = middle;
+        }
+        if let Some(m) = middle {
+            self.nodes[m].parent = Some(at);
+        }
+        let parent = self.nodes[at].parent;
+        self.nodes[child].parent = parent;
+        if let Some(p) = parent {
+            if self.nodes[p].left == Some(at) {
+                self.nodes[p].left = Some(child);
+            } else {
+                self.nodes[p].right = Some(child);
+            }
+        } else {
+            self.root = Some(child);
+        }
+        if left {
+            self.nodes[child].left = Some(at);
+        } else {
+            self.nodes[child].right = Some(at);
+        }
+        self.nodes[at].parent = Some(child);
+    }
+    /// Insert by Java's signed spread hash. Equal hashes use JVM identity and
+    /// cannot be reproduced from coordinates alone.
+    fn insert(&mut self, pos: Pos) -> Result<Option<Pos>> {
+        let mut parent = None;
+        let mut cursor = self.root;
+        let hash = PositionSet::hash(pos) as i32;
+        while let Some(i) = cursor {
+            parent = Some(i);
+            let other = PositionSet::hash(self.nodes[i].pos) as i32;
+            ensure!(
+                hash != other,
+                "unsupported Java identity-dependent hash collision"
+            );
+            cursor = if hash < other {
+                self.nodes[i].left
+            } else {
+                self.nodes[i].right
+            };
+        }
+        let index = self.nodes.len();
+        self.nodes.push(TreeNode {
+            pos,
+            parent,
+            left: None,
+            right: None,
+            red: true,
+        });
+        if let Some(p) = parent {
+            if hash < PositionSet::hash(self.nodes[p].pos) as i32 {
+                self.nodes[p].left = Some(index);
+            } else {
+                self.nodes[p].right = Some(index);
+            }
+        } else {
+            self.root = Some(index);
+        }
+        let parent_pos = parent.map(|p| self.nodes[p].pos);
+        let mut x = index;
+        while let Some(p) = self.nodes[x].parent {
+            if !self.nodes[p].red {
+                break;
+            }
+            let Some(g) = self.nodes[p].parent else { break };
+            let parent_on_left = self.nodes[g].left == Some(p);
+            let uncle = if parent_on_left {
+                self.nodes[g].right
+            } else {
+                self.nodes[g].left
+            };
+            if uncle.is_some_and(|u| self.nodes[u].red) {
+                self.nodes[p].red = false;
+                self.nodes[uncle.unwrap()].red = false;
+                self.nodes[g].red = true;
+                x = g;
+                continue;
+            }
+            let inner = if parent_on_left {
+                self.nodes[p].right == Some(x)
+            } else {
+                self.nodes[p].left == Some(x)
+            };
+            if inner {
+                x = p;
+                self.rotate(x, parent_on_left);
+            }
+            let p = self.nodes[x].parent.unwrap();
+            let g = self.nodes[p].parent.unwrap();
+            self.nodes[p].red = false;
+            self.nodes[g].red = true;
+            self.rotate(g, !parent_on_left);
+        }
+        self.nodes[self.root.unwrap()].red = false;
+        Ok(parent_pos)
+    }
+    fn root_pos(&self) -> Pos {
+        self.nodes[self.root.unwrap()].pos
+    }
+}
+
+impl Bucket {
+    fn move_root_front(&mut self) {
+        let root = self.tree.as_ref().unwrap().root_pos();
+        let index = self.order.iter().position(|p| *p == root).unwrap();
+        if index != 0 {
+            self.order.remove(index);
+            self.order.insert(0, root);
+        }
+    }
+    fn treeify(&mut self) -> Result<()> {
+        let mut tree = TreeBin::default();
+        for &p in &self.order {
+            tree.insert(p)?;
+        }
+        self.tree = Some(tree);
+        self.move_root_front();
+        Ok(())
+    }
 }
 impl PositionSet {
     fn hash(p: Pos) -> u32 {
@@ -39,47 +195,106 @@ impl PositionSet {
             .wrapping_add(p[0]) as u32;
         h ^ (h >> 16)
     }
-    fn resize(&mut self) {
+    fn resize(&mut self) -> Result<()> {
+        let old_capacity = self.buckets.len();
         let n = if self.buckets.is_empty() {
             16
         } else {
             self.buckets.len() * 2
         };
-        let mut buckets = vec![Vec::new(); n];
-        for bucket in self.buckets.drain(..) {
-            for p in bucket {
-                buckets[Self::hash(p) as usize & (n - 1)].push(p);
+        let mut buckets: Vec<Bucket> = (0..n).map(|_| Bucket::default()).collect();
+        for (index, bucket) in self.buckets.drain(..).enumerate() {
+            if bucket.tree.is_none() {
+                for p in bucket.order {
+                    buckets[Self::hash(p) as usize & (n - 1)].order.push(p);
+                }
+                continue;
+            }
+            let (mut low, mut high) = (Vec::new(), Vec::new());
+            for p in bucket.order {
+                if Self::hash(p) as usize & old_capacity == 0 {
+                    low.push(p)
+                } else {
+                    high.push(p)
+                }
+            }
+            let split = !low.is_empty() && !high.is_empty();
+            let mut tree = bucket.tree;
+            for (target, order) in [(index, low), (index + old_capacity, high)] {
+                if order.is_empty() {
+                    continue;
+                }
+                let entry = &mut buckets[target];
+                entry.order = order;
+                if entry.order.len() <= 6 {
+                    continue;
+                }
+                if split {
+                    entry.treeify()?;
+                } else {
+                    entry.tree = tree.take();
+                    entry.removed_from_tree = bucket.removed_from_tree;
+                }
             }
         }
         self.buckets = buckets;
+        Ok(())
     }
     fn insert(&mut self, p: Pos) -> Result<()> {
         if self.buckets.is_empty() {
-            self.resize();
+            self.resize()?;
         }
         let i = Self::hash(p) as usize & (self.buckets.len() - 1);
-        if self.buckets[i].contains(&p) {
+        if self.buckets[i].order.contains(&p) {
             return Ok(());
         }
-        self.buckets[i].push(p);
-        self.len += 1;
-        if self.buckets[i].len() >= 9 {
+        if self.buckets[i].tree.is_some() {
             ensure!(
-                self.buckets.len() < 64,
-                "unsupported Java treeified position set"
+                !self.buckets[i].removed_from_tree,
+                "unsupported insertion after Java tree-bin removal"
             );
-            self.resize();
+            let parent = self.buckets[i]
+                .tree
+                .as_mut()
+                .unwrap()
+                .insert(p)?
+                .expect("nonempty tree");
+            let index = self.buckets[i]
+                .order
+                .iter()
+                .position(|v| *v == parent)
+                .unwrap();
+            self.buckets[i].order.insert(index + 1, p);
+            self.buckets[i].move_root_front();
+        } else {
+            self.buckets[i].order.push(p);
+        }
+        self.len += 1;
+        if self.buckets[i].tree.is_none() && self.buckets[i].order.len() >= 9 {
+            if self.buckets.len() < 64 {
+                self.resize()?;
+            } else {
+                self.buckets[i].treeify()?;
+            }
         }
         if self.len > self.buckets.len() * 3 / 4 {
-            self.resize();
+            self.resize()?;
         }
         Ok(())
     }
     fn pop_first(&mut self) -> Option<Pos> {
         for bucket in &mut self.buckets {
-            if !bucket.is_empty() {
+            if !bucket.order.is_empty() {
                 self.len -= 1;
-                return Some(bucket.remove(0));
+                if bucket.tree.is_some() {
+                    bucket.removed_from_tree = true;
+                }
+                let pos = bucket.order.remove(0);
+                if bucket.order.is_empty() {
+                    bucket.tree = None;
+                    bucket.removed_from_tree = false;
+                }
+                return Some(pos);
             }
         }
         None
@@ -87,7 +302,7 @@ impl PositionSet {
     fn values(&self) -> impl Iterator<Item = Pos> + '_ {
         self.buckets
             .iter()
-            .flat_map(|bucket| bucket.iter().copied())
+            .flat_map(|bucket| bucket.order.iter().copied())
     }
 }
 
@@ -162,4 +377,44 @@ pub fn update_tree_leaves(
         }
     }
     Ok(shape)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PositionSet;
+
+    fn capacity_64() -> PositionSet {
+        let mut set = PositionSet::default();
+        set.resize().unwrap();
+        set.resize().unwrap();
+        set.resize().unwrap();
+        set
+    }
+
+    #[test]
+    fn identity_dependent_tree_collisions_and_stale_tree_inserts_are_rejected() {
+        let mut collisions = capacity_64();
+        for k in 0..8 {
+            collisions.insert([31 + 64 * k, 0, 0]).unwrap();
+        }
+        assert!(
+            collisions
+                .insert([0, 1, 0])
+                .unwrap_err()
+                .to_string()
+                .contains("identity-dependent")
+        );
+
+        let mut set = capacity_64();
+        for k in 0..9 {
+            set.insert([64 * k, 0, 0]).unwrap();
+        }
+        set.pop_first().unwrap();
+        assert!(
+            set.insert([64 * 10, 0, 0])
+                .unwrap_err()
+                .to_string()
+                .contains("after Java tree-bin removal")
+        );
+    }
 }

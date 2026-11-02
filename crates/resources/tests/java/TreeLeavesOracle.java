@@ -19,7 +19,7 @@ public class TreeLeavesOracle {
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
     bind.invoke(Blocks.OAK_LOG.builtInRegistryHolder(),List.of(BlockTags.PREVENTS_NEARBY_LEAF_DECAY));
     var method=TreeFeature.class.getDeclaredMethod("updateLeaves",LevelAccessor.class,BoundingBox.class,Set.class,Set.class,Set.class);method.setAccessible(true);
-    for(int seed=0;seed<4;seed++)for(int mode=0;mode<4;mode++){
+    for(int seed=0;seed<16;seed++)for(int mode=0;mode<5;mode++){
       var map=new HashMap<BlockPos,BlockState>();var writes=new ArrayList<String>();
       for(int x=-3;x<=3;x++)for(int y=1;y<=5;y++)for(int z=-3;z<=3;z++)if(Math.floorMod(x*7+y*13+z*17+seed,5)!=0){
         int d=mode==1?1+Math.floorMod(x*3+y*7+z*11+seed,7):7;
@@ -28,6 +28,7 @@ public class TreeLeavesOracle {
       var logs=new HashSet<BlockPos>();
       for(var p:List.of(new BlockPos(0,0,0),new BlockPos(0,1,0),new BlockPos(0,2,0),new BlockPos(9,2,0))){logs.add(p);map.put(p,Blocks.OAK_LOG.defaultBlockState());}
       if(mode==3)logs.clear();
+      if(mode==4){logs.clear();for(int i=0;i<80;i++)logs.add(new BlockPos(i*1024,0,0));}
       if(mode==1)map.put(new BlockPos(2,3,2),Blocks.OAK_LOG.defaultBlockState());
       var decoration=new HashSet<BlockPos>();var roots=new HashSet<BlockPos>();
       if(mode==2){decoration.add(new BlockPos(1,2,0));roots.add(new BlockPos(-1,2,0));}

@@ -88,8 +88,8 @@ fn leaf_distance_shape_and_write_order_match_java() {
         .arg(&cp)
         .arg("TreeLeavesOracle"));
     let mut expected = Vec::new();
-    for seed in 0i32..4 {
-        for mode in 0..4 {
+    for seed in 0i32..16 {
+        for mode in 0..5 {
             let mut world = World::default();
             for x in -3i32..=3 {
                 for y in 1i32..=5 {
@@ -112,6 +112,9 @@ fn leaf_distance_shape_and_write_order_match_java() {
             if mode == 3 {
                 logs.clear();
             }
+            if mode == 4 {
+                logs = (0..80).map(|i| [i * 1024, 0, 0]).collect();
+            }
             if mode == 1 {
                 world.blocks.insert([2, 3, 2], 0);
             }
@@ -127,15 +130,7 @@ fn leaf_distance_shape_and_write_order_match_java() {
                 &decorations,
                 &roots,
             );
-            let shape = match shape {
-                Ok(shape) => shape,
-                Err(error) if seed == 3 && mode == 1 => {
-                    assert!(error.to_string().contains("treeified position set"));
-                    expected.push(None);
-                    continue;
-                }
-                Err(error) => panic!("seed {seed} mode {mode}: {error:#}"),
-            };
+            let shape = shape.unwrap_or_else(|error| panic!("seed {seed} mode {mode}: {error:#}"));
             let mut occupied = Vec::new();
             let mut leaves = Vec::new();
             for x in -4..=4 {
@@ -151,12 +146,12 @@ fn leaf_distance_shape_and_write_order_match_java() {
                     }
                 }
             }
-            expected.push(Some(format!(
+            expected.push(format!(
                 "C {seed} {mode} W {} S {} D {}",
                 world.writes.join(";"),
                 occupied.join(";"),
                 leaves.join(";")
-            )));
+            ));
         }
     }
     let actual: Vec<_> = actual
@@ -165,8 +160,6 @@ fn leaf_distance_shape_and_write_order_match_java() {
         .collect();
     assert_eq!(actual.len(), expected.len());
     for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-        if let Some(expected) = expected {
-            assert_eq!(*actual, expected, "case {i}");
-        }
+        assert_eq!(*actual, expected, "case {i}");
     }
 }

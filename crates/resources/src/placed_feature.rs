@@ -1,8 +1,9 @@
 //! Placement modifiers for data-pack features. Feature execution itself is
 //! separate: callers must consume the same random source between positions.
 use anyhow::{Context, Result, bail, ensure};
-use native_core::random::DecorationRandom;
+use native_core::{random::DecorationRandom, simplex::Simplex2D};
 use serde_json::Value;
+use std::sync::OnceLock;
 
 use crate::{
     disk_feature::BlockPredicate,
@@ -247,6 +248,16 @@ impl HeightProvider {
 #[derive(Clone, Debug)]
 enum Modifier {
     Count(IntProvider),
+    NoiseThreshold {
+        level: f64,
+        below: i32,
+        above: i32,
+    },
+    NoiseBased {
+        ratio: i32,
+        factor: f64,
+        offset: f64,
+    },
     InSquare,
     Height(HeightProvider),
     Rarity(i32),
@@ -344,6 +355,25 @@ impl PlacedFeature {
                     ensure!(min >= 0 && max <= 4096, "unsupported count range");
                     Modifier::Count(p)
                 }
+                "noise_threshold_count" => Modifier::NoiseThreshold {
+                    level: entry
+                        .get("noise_level")
+                        .and_then(Value::as_f64)
+                        .context("missing noise level")?,
+                    below: integer(entry, "below_noise")?,
+                    above: integer(entry, "above_noise")?,
+                },
+                "noise_based_count" => Modifier::NoiseBased {
+                    ratio: integer(entry, "noise_to_count_ratio")?,
+                    factor: entry
+                        .get("noise_factor")
+                        .and_then(Value::as_f64)
+                        .context("missing noise factor")?,
+                    offset: match entry.get("noise_offset") {
+                        None => 0.0,
+                        Some(v) => v.as_f64().context("invalid noise offset")?,
+                    },
+                },
                 "in_square" => Modifier::InSquare,
                 "height_range" => Modifier::Height(HeightProvider::parse(
                     entry.get("height").context("missing height")?,
@@ -452,6 +482,15 @@ pub struct PlacementPositions<'a> {
     done: bool,
     failed: bool,
 }
+
+// Biome.BIOME_INFO_NOISE is a single fixed-seed simplex, independent of the
+// world's seed and the placement RNG. Its float result is widened to a double.
+fn biome_info_noise(pos: [i32; 3], factor: f64) -> f64 {
+    static NOISE: OnceLock<Simplex2D> = OnceLock::new();
+    let noise = NOISE.get_or_init(|| Simplex2D::new(2345, true));
+    f64::from(noise.sample(f64::from(pos[0]) / factor, f64::from(pos[2]) / factor))
+}
+
 impl PlacementPositions<'_> {
     pub fn next(
         &mut self,
@@ -486,10 +525,30 @@ impl PlacementPositions<'_> {
             };
             let position = frame.position;
             let output = match &self.feature.modifiers[depth] {
-                Modifier::Count(provider) => {
-                    let remaining = frame
-                        .remaining
-                        .get_or_insert_with(|| provider.sample(random));
+                modifier @ (Modifier::Count(_)
+                | Modifier::NoiseThreshold { .. }
+                | Modifier::NoiseBased { .. }) => {
+                    let remaining = frame.remaining.get_or_insert_with(|| match modifier {
+                        Modifier::Count(provider) => provider.sample(random),
+                        Modifier::NoiseThreshold {
+                            level,
+                            below,
+                            above,
+                        } => {
+                            if biome_info_noise(position, 200.0) < *level {
+                                *below
+                            } else {
+                                *above
+                            }
+                        }
+                        Modifier::NoiseBased {
+                            ratio,
+                            factor,
+                            offset,
+                        } => ((biome_info_noise(position, *factor) + offset) * f64::from(*ratio))
+                            .ceil() as i32,
+                        _ => unreachable!(),
+                    });
                     if *remaining <= 0 {
                         None
                     } else {
@@ -529,7 +588,9 @@ impl PlacementPositions<'_> {
                                 position[1].wrapping_add(y.sample(random)),
                                 position[2].wrapping_add(z.sample(random)),
                             ]),
-                            Modifier::Count(_) => unreachable!(),
+                            Modifier::Count(_)
+                            | Modifier::NoiseThreshold { .. }
+                            | Modifier::NoiseBased { .. } => unreachable!(),
                         }
                     }
                 }

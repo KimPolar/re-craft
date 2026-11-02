@@ -22,11 +22,14 @@ impl PlacementEnvironment for Environment {
     }
 }
 fn collect(feature: &PlacedFeature, seed: i64, allow: bool) -> Vec<String> {
+    collect_at(feature, seed, allow, [-32, 0, 48])
+}
+fn collect_at(feature: &PlacedFeature, seed: i64, allow: bool, origin: [i32; 3]) -> Vec<String> {
     let mut random = DecorationRandom::new(0);
     let decoration = random.set_decoration_seed(seed, -32, 48);
     random.set_feature_seed(decoration, 7, 3);
     let mut env = Environment { allow };
-    let mut iter = feature.positions([-32, 0, 48], -64, 384).unwrap();
+    let mut iter = feature.positions(origin, -64, 384).unwrap();
     let mut output = Vec::new();
     while let Some([x, y, z]) = iter.next(&mut random, &mut env).unwrap() {
         let extra = random.next_int_bound(101).unwrap();
@@ -147,6 +150,64 @@ fn modifiers_and_feature_randomness_match_java() {
             .retain(|entry| entry["type"] != "minecraft:biome");
         cases.push(value);
     }
+    let coords = [
+        [0, 0, 0],
+        [-32, 0, 48],
+        [1234, 9, -4321],
+        [-30000000, 0, 30000000],
+        [i32::MIN, -63, i32::MAX],
+        [100, 1, 200],
+        [-10000, 2, -20000],
+    ];
+    for name in [
+        "bamboo",
+        "kelp_cold",
+        "kelp_warm",
+        "warm_ocean_vegetation",
+        "flower_cherry",
+        "flower_plains",
+        "patch_grass_meadow",
+        "patch_grass_plain",
+        "patch_tall_grass_2",
+        "wildflowers_meadow",
+    ] {
+        let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
+        if !name.starts_with("kelp_") {
+            PlacedFeature::load(&mut resources, &id).unwrap();
+        }
+        let bytes = resources
+            .read_builtin_data(&format!(
+                "data/minecraft/worldgen/placed_feature/{name}.json"
+            ))
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let noise = value["placement"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                matches!(
+                    v["type"].as_str(),
+                    Some("minecraft:noise_threshold_count" | "minecraft:noise_based_count")
+                )
+            })
+            .unwrap();
+        for origin in coords {
+            cases.push(json!({"feature":"minecraft:ore_dirt","origin":origin,"placement":[noise,{"type":"minecraft:in_square"},{"type":"minecraft:rarity_filter","chance":2}]}));
+        }
+    }
+    for origin in [[0, 0, 0], [123, 0, -456]] {
+        for modifier in [
+            json!({"type":"minecraft:noise_based_count","noise_to_count_ratio":10,"noise_factor":0.0}),
+            json!({"type":"minecraft:noise_based_count","noise_to_count_ratio":-10,"noise_factor":80.0,"noise_offset":0.4}),
+            json!({"type":"minecraft:noise_threshold_count","noise_level":0.0,"below_noise":-2,"above_noise":3}),
+        ] {
+            cases.push(
+                json!({"feature":"minecraft:ore_dirt","origin":origin,"placement":[modifier]}),
+            );
+        }
+    }
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -157,9 +218,20 @@ fn modifiers_and_feature_randomness_match_java() {
     let mut expected = Vec::new();
     for (index, value) in cases.iter().enumerate() {
         let feature = PlacedFeature::decode(value).unwrap();
+        let origin = value
+            .get("origin")
+            .and_then(Value::as_array)
+            .map(|v| {
+                [
+                    v[0].as_i64().unwrap() as i32,
+                    v[1].as_i64().unwrap() as i32,
+                    v[2].as_i64().unwrap() as i32,
+                ]
+            })
+            .unwrap_or([-32, 0, 48]);
         for seed in [0, 1, -1, 987654321] {
             expected.push(format!("C {index} {seed}"));
-            expected.extend(collect(&feature, seed, true));
+            expected.extend(collect_at(&feature, seed, true, origin));
         }
     }
     let actual: Vec<_> = output

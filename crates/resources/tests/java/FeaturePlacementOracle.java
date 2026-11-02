@@ -30,9 +30,11 @@ public class FeaturePlacementOracle {
     for(var entry:cases){
       var data=entry.getAsJsonObject();var mods=new ArrayList<PlacementModifier>();
       for(var item:data.getAsJsonArray("placement"))mods.add(PlacementModifier.CODEC.parse(JsonOps.INSTANCE,item).getOrThrow());
+      var o=data.has("origin")?data.getAsJsonArray("origin"):null;
+      var origin=o==null?new BlockPos(-32,0,48):new BlockPos(o.get(0).getAsInt(),o.get(1).getAsInt(),o.get(2).getAsInt());
       for(long seed:new long[]{0,1,-1,987654321}){
         var random=new WorldgenRandom(new XoroshiroRandomSource(0));long deco=random.setDecorationSeed(seed,-32,48);random.setFeatureSeed(deco,7,3);
-        out.printf("C %d %d%n",n,seed);emit(mods,0,context,random,new BlockPos(-32,0,48));out.println("R "+random.nextLong());
+        out.printf("C %d %d%n",n,seed);emit(mods,0,context,random,origin);out.println("R "+random.nextLong());
       }n++;
     }
   }

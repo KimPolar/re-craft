@@ -591,6 +591,27 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         )
     }
 
+    /// Use a complete published light-engine snapshot when its visible revision
+    /// is known to remain fixed throughout this decoration attempt.
+    pub fn execute_with_visible_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<Vec<bool>> {
+        let block = |p| {
+            light
+                .block_light(p)
+                .context("block-light column not captured")
+        };
+        let raw = |_: &World, p| {
+            light
+                .raw_brightness(p, 0)
+                .context("raw-brightness column not captured")
+        };
+        self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
+    }
+
     fn execute_inner(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -6191,6 +6212,47 @@ mod tests {
             }
         }
         assert_eq!(actual, format!("RESULT true {}", values.join(";")));
+        // The same published engine layers must drive the same freeze result.
+        let mut block_layer = [0u8; native_world::loaded::LIGHT_BYTES];
+        for y in 0..16usize {
+            for z in 0..16usize {
+                for x in 0..16usize {
+                    let i = x + z * 16 + y * 256;
+                    let value = if (x + 2 * z) % 5 == 0 { 10 } else { 9 };
+                    if i % 2 == 0 {
+                        block_layer[i / 2] |= value;
+                    } else {
+                        block_layer[i / 2] |= value << 4;
+                    }
+                }
+            }
+        }
+        let mut block = native_world::generation_light::VisibleLayers::new();
+        block.insert(0, Arc::new(block_layer));
+        let mut light = native_world::generation_light::VisibleLightSnapshot::new(true, true);
+        light.insert_complete_column(
+            ChunkPos { x: 0, z: 0 },
+            native_world::generation_light::VisibleLightColumn::new(block, Default::default()),
+        );
+        let mut via_snapshot = make_terrain();
+        assert_eq!(
+            prepared
+                .execute_with_visible_light(&mut via_snapshot, false, &light)
+                .unwrap(),
+            [true]
+        );
+        let via_snapshot = via_snapshot.snapshot();
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in [7, 8] {
+                    assert_eq!(
+                        via_snapshot.block(x, y, z),
+                        world.block(x, y, z),
+                        "{x},{y},{z}"
+                    );
+                }
+            }
+        }
         let warm_schedule = FeatureSchedule::load(
             &mut FreezeData(true),
             std::slice::from_ref(&plains),
@@ -7835,6 +7897,41 @@ mod tests {
                             .is_err()
                     );
                     assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                    use native_world::generation_light::{
+                        VisibleLayers, VisibleLightColumn, VisibleLightSnapshot,
+                    };
+                    let missing = VisibleLightSnapshot::new(true, true);
+                    let (mut terrain, _, _, _) = fixture();
+                    let before = terrain.snapshot();
+                    assert!(
+                        prepared
+                            .execute_with_visible_light(&mut terrain, false, &missing)
+                            .is_err()
+                    );
+                    assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                    for (sky_enabled, level, expected) in
+                        [(true, 0, false), (false, 0, true), (false, 13, false)]
+                    {
+                        let mut block = VisibleLayers::new();
+                        if level != 0 {
+                            block.insert(
+                                0,
+                                Arc::new([level | (level << 4); native_world::loaded::LIGHT_BYTES]),
+                            );
+                        }
+                        let mut snapshot = VisibleLightSnapshot::new(true, sky_enabled);
+                        snapshot.insert_complete_column(
+                            ChunkPos { x: 0, z: 0 },
+                            VisibleLightColumn::new(block, VisibleLayers::new()),
+                        );
+                        let (mut terrain, _, _, _) = fixture();
+                        assert_eq!(
+                            prepared
+                                .execute_with_visible_light(&mut terrain, false, &snapshot)
+                                .unwrap(),
+                            [expected]
+                        );
+                    }
                 }
             }
         }

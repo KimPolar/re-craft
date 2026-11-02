@@ -138,37 +138,7 @@ impl OrbDraft {
 
     pub(crate) fn set_fall_distance(&mut self, original: &NamedTag, distance: f64) -> Result<()> {
         ensure!(self.matches_source(original)?, "orb source changed");
-        saved_fall_distance(&original.value)?;
-        ensure!(distance.is_finite(), "invalid orb fall distance");
-        let Tag::Compound(fields) = &mut self.document.value else {
-            bail!("entity must be a compound")
-        };
-        if let Some((_, value)) = fields
-            .iter_mut()
-            .find(|(key, _)| key.matches("fall_distance"))
-        {
-            *value = Tag::Double(distance);
-        } else {
-            fields.push(("fall_distance".into(), Tag::Double(distance)));
-        }
-        Ok(())
-    }
-}
-
-/// Only unambiguous, finite data can be written back without losing information.
-pub(crate) fn saved_fall_distance(entity: &Tag) -> Result<f64> {
-    let Tag::Compound(fields) = entity else {
-        bail!("entity must be a compound")
-    };
-    let mut values = fields
-        .iter()
-        .filter(|(key, _)| key.matches("fall_distance"));
-    let value = values.next();
-    ensure!(values.next().is_none(), "duplicate entity fall_distance");
-    match value.map(|(_, value)| value) {
-        None => Ok(0.0),
-        Some(Tag::Double(value)) if value.is_finite() => Ok(*value),
-        _ => bail!("fall distance cannot be preserved safely"),
+        crate::saved_entity::set_fall_distance(&mut self.document.value, &original.value, distance)
     }
 }
 

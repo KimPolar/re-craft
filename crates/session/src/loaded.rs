@@ -40876,6 +40876,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn loaded_item_draft_preserves_verified_fall_distance() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut session = session();
+        session.set_game_mode(GameMode::Spectator);
+        session.set_random_tick_speed(0);
+        let home = session.player_chunk().unwrap();
+        let uuid = [2, 3, 4, 5];
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 10.0, 8.5);
+        let vector = |v: DVec3| Tag::List {
+            element_type: TagType::Double,
+            values: v.to_array().into_iter().map(Tag::Double).collect(),
+        };
+        let item = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ("Pos".into(), vector(position)),
+            ("Motion".into(), vector(DVec3::new(0.0, -0.2, 0.0))),
+            ("fall_distance".into(), Tag::Double(5.0)),
+            (
+                "Item".into(),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:stone".into())),
+                    ("count".into(), Tag::Int(1)),
+                ]),
+            ),
+            ("future".into(), Tag::Int(17)),
+        ]);
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![home.x, home.z])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![item.clone()],
+                    },
+                ),
+            ]),
+        });
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::clone(&document),
+                })),
+            )
+            .unwrap();
+        let mut previous = position;
+        let mut expected = 5.0;
+        for _ in 0..3 {
+            session.update(TICK);
+            let current = session.snapshot().dropped_items[0].position;
+            expected -= f64::from((current.y - previous.y) as f32);
+            previous = current;
+        }
+        let drafts = session.draft_tracked_entity_chunks().unwrap();
+        let Tag::List { values, .. } = drafts[&home].document().value.get("Entities").unwrap()
+        else {
+            panic!("missing entities")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("fall_distance"), Some(&Tag::Double(expected)));
+        assert_eq!(values[0].get("future"), Some(&Tag::Int(17)));
+        assert_eq!(item.get("fall_distance"), Some(&Tag::Double(5.0)));
+        assert!(drafts[&home].matches_source(&document).unwrap());
+    }
+
+    #[test]
     fn loaded_orb_draft_preserves_verified_fall_distance() {
         use native_persistence::nbt::{NamedTag, Tag, TagType};
         let mut session = session();

@@ -12,17 +12,10 @@ use native_core::random::LegacyRandom;
 use native_resources::enchantments::OxygenEnchantments;
 use native_world::{collision::Aabb, movement::BoundingBox};
 
+use crate::saved_entity::advance_fall_distance;
 use crate::{GameMode, PlayerPose, experience::Experience, inventory::PlayerInventory, movement};
 
 const VALUES: [i32; 11] = [1, 3, 7, 17, 37, 73, 149, 307, 617, 1237, 2477];
-
-fn advance_fall_distance(fall: &mut f64, displacement: f64, on_ground: bool, in_water: bool) {
-    if on_ground {
-        *fall = 0.0;
-    } else if !in_water && displacement < 0.0 {
-        *fall -= f64::from(displacement as f32);
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExperienceOrb {
@@ -368,7 +361,7 @@ impl Orbs {
         self.next_entity_id = self.next_entity_id.wrapping_add(1);
         let section_sequence = self.next_section_sequence;
         self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
-        let saved_fall_distance = crate::saved_orb::saved_fall_distance(&saved.source).ok();
+        let saved_fall_distance = crate::saved_entity::fall_distance(&saved.source).ok();
         self.entities.push(Orb {
             id,
             section_sequence,
@@ -1072,16 +1065,14 @@ impl Orbs {
             entity.on_ground = hit_y && requested.y < 0.0;
             // Java emits HIT_GROUND when a positive fall reaches the floor.
             // That game event is not yet included in coordinated saves.
-            if entity.on_ground
-                && entity.saved_fall_distance.is_some_and(|fall| {
-                    let displacement = if contacts.water.depth <= 0.0 && actual.y < 0.0 {
-                        f64::from(actual.y as f32)
-                    } else {
-                        0.0
-                    };
-                    fall - displacement > 0.0
-                })
-            {
+            if entity.saved_fall_distance.is_some_and(|fall| {
+                crate::saved_entity::landing_emits_event(
+                    fall,
+                    actual.y,
+                    entity.on_ground,
+                    contacts.water.depth > 0.0,
+                )
+            }) {
                 entity.saved_fall_distance = None;
             }
             if let Some(fall) = &mut entity.saved_fall_distance {
@@ -1959,7 +1950,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-    fn orb_fall_distance_matches_java_entity_check() {
+    fn item_and_orb_fall_distance_match_java_entity_check() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -1981,48 +1972,55 @@ mod tests {
         let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
             .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
                 .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
-        let source = temp.path().join("OrbFallDistanceOracle.java");
-        let output = temp.path().join("output.json");
-        std::fs::write(
-            &source,
-            include_str!("../tests/java/OrbFallDistanceOracle.java"),
-        )
-        .unwrap();
-        for command in [
-            Command::new(java.join("javac.exe"))
-                .arg("-cp")
-                .arg(&cp)
-                .arg(&source),
-            Command::new(java.join("java.exe"))
-                .arg("-cp")
-                .arg(&cp)
-                .arg("OrbFallDistanceOracle")
-                .arg(&output),
+        for (class, fixture) in [
+            (
+                "OrbFallDistanceOracle",
+                include_str!("../tests/java/OrbFallDistanceOracle.java"),
+            ),
+            (
+                "ItemFallDistanceOracle",
+                include_str!("../tests/java/ItemFallDistanceOracle.java"),
+            ),
         ] {
-            let result = command.output().unwrap();
-            assert!(
-                result.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 40);
-        for row in rows {
-            let mut fall = row["initial"].as_f64().unwrap();
-            advance_fall_distance(
-                &mut fall,
-                row["movement"].as_f64().unwrap(),
-                false,
-                row["water"].as_bool().unwrap(),
-            );
-            assert_eq!(
-                fall.to_bits(),
-                row["fall_bits"].as_i64().unwrap() as u64,
-                "{row}"
-            );
+            let source = temp.path().join(format!("{class}.java"));
+            let output = temp.path().join(format!("{class}.json"));
+            std::fs::write(&source, fixture).unwrap();
+            for command in [
+                Command::new(java.join("javac.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg(&source),
+                Command::new(java.join("java.exe"))
+                    .arg("-cp")
+                    .arg(&cp)
+                    .arg(class)
+                    .arg(&output),
+            ] {
+                let result = command.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(rows.len(), 40);
+            for row in rows {
+                let mut fall = row["initial"].as_f64().unwrap();
+                advance_fall_distance(
+                    &mut fall,
+                    row["movement"].as_f64().unwrap(),
+                    false,
+                    row["water"].as_bool().unwrap(),
+                );
+                assert_eq!(
+                    fall.to_bits(),
+                    row["fall_bits"].as_i64().unwrap() as u64,
+                    "{class}: {row}"
+                );
+            }
         }
     }
 

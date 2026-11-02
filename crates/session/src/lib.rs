@@ -50,6 +50,7 @@ pub mod redstone;
 pub mod respawn;
 mod saved_banner;
 pub mod saved_chest;
+mod saved_entity;
 pub mod saved_falling_block;
 pub mod saved_item;
 pub mod saved_orb;

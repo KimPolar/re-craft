@@ -340,6 +340,7 @@ struct ItemEntity {
     no_gravity: bool,
     owner: Option<[i32; 4]>,
     _saved_source: Option<Arc<Tag>>,
+    saved_fall_distance: Option<f64>,
     created: Option<CreatedItemIdentity>,
     id: u32,
     section_sequence: u64,
@@ -1145,7 +1146,14 @@ impl ItemEntities {
             invulnerable_time: entity._damage_state.invulnerable_time,
             stack: &entity.item.stack,
         };
-        crate::saved_item::draft(&original, state)
+        let mut draft = crate::saved_item::draft(&original, state)?;
+        draft.set_fall_distance(
+            &original,
+            entity
+                .saved_fall_distance
+                .context("item fall distance is not verified")?,
+        )?;
+        Ok(draft)
     }
 
     pub(crate) fn draft_removed_item(
@@ -1421,6 +1429,7 @@ impl ItemEntities {
 
     pub fn spawn_saved(&mut self, saved: crate::saved_item::SavedItemState) {
         let position = saved.position;
+        let saved_fall_distance = crate::saved_entity::fall_distance(&saved.source).ok();
         let (_, bob_offset, _, entity_random) = self.item_visuals();
         self.entities.push(ItemEntity {
             item: DroppedItem {
@@ -1440,6 +1449,7 @@ impl ItemEntities {
             no_gravity: saved.no_gravity,
             owner: saved.owner,
             _saved_source: Some(saved.source),
+            saved_fall_distance,
             created: None,
             id: self.next_id,
             section_sequence: self.next_section_sequence,
@@ -1483,6 +1493,7 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: Some(CreatedItemIdentity::new(
                 position,
                 CreatedThrower::Known(None),
@@ -1580,6 +1591,7 @@ impl ItemEntities {
                     no_gravity: false,
                     owner: None,
                     _saved_source: None,
+                    saved_fall_distance: None,
                     created: Some(CreatedItemIdentity::new(
                         location,
                         CreatedThrower::Known(None),
@@ -1635,6 +1647,7 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: Some(CreatedItemIdentity::new(
                 position,
                 CreatedThrower::Known(None),
@@ -1701,6 +1714,7 @@ impl ItemEntities {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: Some(CreatedItemIdentity::new(
                 position,
                 match drop_origin {
@@ -2055,6 +2069,7 @@ impl ItemEntities {
                     no_gravity: false,
                     owner: None,
                     _saved_source: None,
+                    saved_fall_distance: None,
                     created: Some(CreatedItemIdentity::new(
                         location,
                         CreatedThrower::Known(None),
@@ -2188,6 +2203,7 @@ impl ItemEntities {
                     no_gravity: false,
                     owner: None,
                     _saved_source: None,
+                    saved_fall_distance: None,
                     created: Some(CreatedItemIdentity::new(
                         location,
                         CreatedThrower::Known(None),
@@ -2385,6 +2401,14 @@ impl ItemEntities {
             let relative = entity.item.position - origin.as_dvec3();
             let bounds = item_bounds(relative);
             let contacts = fluid(bounds);
+            if let Some(fall) = &mut entity.saved_fall_distance {
+                if contacts.water.depth > 0.0 {
+                    *fall = 0.0;
+                }
+                if contacts.lava.depth > 0.0 {
+                    *fall *= 0.5;
+                }
+            }
             if let Some(created) = &mut entity.created {
                 if contacts.water.depth > 0.0 {
                     created.fall_distance = 0.0;
@@ -2444,6 +2468,17 @@ impl ItemEntities {
                 let hit_z = (requested.z - actual.z).abs() >= f64::from(1.0e-5_f32);
                 let hit_y = requested.y != actual.y;
                 entity.on_ground = hit_y && requested.y < 0.0;
+                if entity.saved_fall_distance.is_some_and(|fall| {
+                    crate::saved_entity::landing_emits_event(
+                        fall,
+                        actual.y,
+                        entity.on_ground,
+                        contacts.water.depth > 0.0,
+                    )
+                }) {
+                    // Positive fall distance emits HIT_GROUND, which is not yet saved.
+                    entity.saved_fall_distance = None;
+                }
                 let relative_position = entity.item.position - origin.as_dvec3();
                 let support = if entity.on_ground {
                     let found = movement::supporting_box(
@@ -2465,12 +2500,20 @@ impl ItemEntities {
                     &mut keep_support_height,
                 );
                 if let Some(created) = &mut entity.created {
-                    if entity.on_ground {
-                        created.fall_distance = 0.0;
-                    } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
-                        // Entity.checkFallDamage rounds the displacement to float.
-                        created.fall_distance -= f64::from(actual.y as f32);
-                    }
+                    crate::saved_entity::advance_fall_distance(
+                        &mut created.fall_distance,
+                        actual.y,
+                        entity.on_ground,
+                        contacts.water.depth > 0.0,
+                    );
+                }
+                if let Some(fall) = &mut entity.saved_fall_distance {
+                    crate::saved_entity::advance_fall_distance(
+                        fall,
+                        actual.y,
+                        entity.on_ground,
+                        contacts.water.depth > 0.0,
+                    );
                 }
                 if hit_x {
                     entity.velocity.x = 0.0;
@@ -2506,10 +2549,12 @@ impl ItemEntities {
                 entity.last_bubble_movement =
                     Some((entity.item.previous_position, actual, requested));
             }
+            let mut bubble_unresolved = false;
             if let Some((from, movement, original)) = entity.last_bubble_movement {
                 match bubble(item_bounds(from - origin.as_dvec3()), movement, original) {
                     Some(contacts) => {
                         for contact in contacts {
+                            bubble_unresolved = true;
                             entity.velocity = crate::bubble_column::player_velocity(
                                 entity.velocity,
                                 contact.drag_down,
@@ -2517,6 +2562,9 @@ impl ItemEntities {
                                 false,
                             );
                             if !contact.surface {
+                                if let Some(fall) = &mut entity.saved_fall_distance {
+                                    *fall = 0.0;
+                                }
                                 if let Some(created) = &mut entity.created {
                                     created.fall_distance = 0.0;
                                 }
@@ -2524,7 +2572,10 @@ impl ItemEntities {
                             on_bubble(Some(contact.surface.then_some(contact.position)));
                         }
                     }
-                    None => on_bubble(None),
+                    None => {
+                        bubble_unresolved = true;
+                        on_bubble(None);
+                    }
                 }
             }
             if let Some(drag) = item_drag {
@@ -2544,6 +2595,16 @@ impl ItemEntities {
                     entity.item.position,
                     supported,
                 );
+            }
+            if entity._saved_source.is_some() && entity.saved_fall_distance.is_some() {
+                let supported = contacts.water.depth <= 0.0
+                    && contacts.lava.depth <= 0.0
+                    && entity._damage_state.fire_ticks == 0
+                    && !bubble_unresolved
+                    && safe(bounds, actual);
+                if !supported {
+                    entity.saved_fall_distance = None;
+                }
             }
             let moved_block = entity.item.previous_position.floor() != entity.item.position.floor();
             let after = if actual == DVec3::ZERO {
@@ -4272,6 +4333,7 @@ mod tests {
             no_gravity: false,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: None,
             id: 0,
             section_sequence: 0,
@@ -4643,6 +4705,148 @@ mod tests {
     }
 
     #[test]
+    fn saved_item_tracks_fall_distance_only_on_verified_paths() {
+        use native_persistence::nbt::{NamedTag, TagType};
+        let uuid = [1, 2, 3, 4];
+        let mut saved = test_saved_item(uuid, 1);
+        saved.position = DVec3::new(8.5, 10.0, 8.5);
+        saved.velocity = DVec3::new(0.0, -0.2, 0.0);
+        saved.no_gravity = false;
+        let Tag::Compound(fields) = Arc::make_mut(&mut saved.source) else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Pos"))
+            .unwrap()
+            .1 = Tag::List {
+            element_type: TagType::Double,
+            values: saved
+                .position
+                .to_array()
+                .into_iter()
+                .map(Tag::Double)
+                .collect(),
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("NoGravity"))
+            .unwrap()
+            .1 = Tag::Byte(0);
+        fields.push((
+            "Motion".into(),
+            Tag::List {
+                element_type: TagType::Double,
+                values: saved
+                    .velocity
+                    .to_array()
+                    .into_iter()
+                    .map(Tag::Double)
+                    .collect(),
+            },
+        ));
+        fields.push(("fall_distance".into(), Tag::Double(5.0)));
+        fields.push(("future".into(), Tag::Int(17)));
+        let original = NamedTag {
+            name: "".into(),
+            value: (*saved.source).clone(),
+        };
+        for safe in [true, false] {
+            let mut items = ItemEntities::default();
+            items.spawn_saved(saved.clone());
+            let mut expected = 5.0;
+            for _ in 0..3 {
+                let before = items.entities[0].item.position;
+                items.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    DVec3::splat(100.0),
+                    PlayerPose::Standing,
+                    GameMode::Spectator,
+                    &mut Arc::new(PlayerInventory::default()),
+                    |_| &[],
+                    |_| 0.6,
+                    |_| 0.0,
+                    |_| false,
+                    |_| Default::default(),
+                    false,
+                    |_, _, _| Some(Vec::new()),
+                    |_, _| safe,
+                    |_| Some(false),
+                );
+                let displacement = items.entities[0].item.position - before;
+                expected -= f64::from(displacement.y as f32);
+            }
+            let result = items.draft_saved_item(uuid);
+            if safe {
+                let draft = result.unwrap().unwrap();
+                assert!(draft.matches_source(&original).unwrap());
+                assert_eq!(
+                    draft.document().value.get("fall_distance"),
+                    Some(&Tag::Double(expected))
+                );
+                assert_eq!(draft.document().value.get("future"), Some(&Tag::Int(17)));
+                assert_eq!(original.value.get("fall_distance"), Some(&Tag::Double(5.0)));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        for invalid in [
+            Tag::Float(1.0),
+            Tag::Double(f64::NAN),
+            Tag::String("unknown".into()),
+        ] {
+            let mut bad = saved.clone();
+            let Tag::Compound(fields) = Arc::make_mut(&mut bad.source) else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("fall_distance"))
+                .unwrap()
+                .1 = invalid;
+            let mut items = ItemEntities::default();
+            items.spawn_saved(bad);
+            assert!(items.draft_saved_item(uuid).is_err());
+        }
+        let mut duplicate = saved.clone();
+        if let Tag::Compound(fields) = Arc::make_mut(&mut duplicate.source) {
+            fields.push(("fall_distance".into(), Tag::Double(1.0)));
+        }
+        let mut items = ItemEntities::default();
+        items.spawn_saved(duplicate);
+        assert!(items.draft_saved_item(uuid).is_err());
+        let mut landing = ItemEntities::default();
+        landing.spawn_saved(saved);
+        landing.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut Arc::new(PlayerInventory::default()),
+            |pos| {
+                if pos.y == 9 {
+                    native_world::collision::unknown_barrier()
+                } else {
+                    &[]
+                }
+            },
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| Default::default(),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
+        );
+        assert!(landing.entities[0].on_ground);
+        assert!(
+            landing.draft_saved_item(uuid).is_err(),
+            "HIT_GROUND is not preserved yet"
+        );
+    }
+
+    #[test]
     fn removed_item_requires_source_and_final_chunks() {
         use native_world::loaded::ChunkPos;
         let uuid = [1, 2, 3, 4];
@@ -4652,7 +4856,7 @@ mod tests {
         items.spawn_saved(test_saved_item(uuid, 3));
         items.entities[0].item.position.x = 16.5;
         let mut inventory = Arc::new(PlayerInventory::default());
-        items.tick(
+        items.tick_with_fluid_and_proof(
             IVec3::ZERO,
             DVec3::new(16.5, 2.0, 3.5),
             PlayerPose::Standing,
@@ -4660,6 +4864,13 @@ mod tests {
             &mut inventory,
             |_| &[],
             |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| Default::default(),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
         );
         assert!(items.entities.is_empty());
         assert!(items.draft_removed_item(uuid).unwrap().is_some());
@@ -4697,7 +4908,7 @@ mod tests {
         items.spawn_saved(test_saved_item(other_uuid, 2));
         let mut inventory = Arc::new(PlayerInventory::default());
         for _ in 0..40 {
-            items.tick(
+            items.tick_with_fluid_and_proof(
                 IVec3::ZERO,
                 DVec3::splat(100.0),
                 PlayerPose::Standing,
@@ -4705,6 +4916,13 @@ mod tests {
                 &mut inventory,
                 |_| &[],
                 |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| Default::default(),
+                false,
+                |_, _, _| Some(Vec::new()),
+                |_, _| true,
+                |_| Some(false),
             );
         }
         assert_eq!(items.entities.len(), 1);
@@ -4732,7 +4950,7 @@ mod tests {
         let mut items = ItemEntities::default();
         items.spawn_saved(saved);
         let mut inventory = Arc::new(PlayerInventory::default());
-        items.tick(
+        items.tick_with_fluid_and_proof(
             IVec3::ZERO,
             DVec3::splat(100.0),
             PlayerPose::Standing,
@@ -4740,6 +4958,13 @@ mod tests {
             &mut inventory,
             |_| &[],
             |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| Default::default(),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
         );
         assert!(items.entities.is_empty());
         let draft = items.draft_removed_item(uuid).unwrap().unwrap();
@@ -5237,6 +5462,7 @@ mod tests {
                             no_gravity: true,
                             owner: None,
                             _saved_source: None,
+                            saved_fall_distance: None,
                             created: None,
                             id: index as u32,
                             section_sequence: 0,
@@ -5326,6 +5552,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: None,
                 id: index as u32,
                 section_sequence: 0,
@@ -5400,6 +5627,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: None,
                 id: index as u32,
                 section_sequence: 0,
@@ -5487,6 +5715,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: None,
                 id: count,
                 section_sequence: 0,
@@ -5546,6 +5775,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: None,
                 id: 0,
                 section_sequence: 0,
@@ -5608,6 +5838,7 @@ mod tests {
                 no_gravity: true,
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: None,
                 id: index as u32,
                 section_sequence: index as u64,
@@ -5658,6 +5889,7 @@ mod tests {
             no_gravity: true,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: None,
             id: 0,
             section_sequence: 4,
@@ -5699,6 +5931,7 @@ mod tests {
             no_gravity: true,
             owner: None,
             _saved_source: None,
+            saved_fall_distance: None,
             created: None,
             id: 0,
             section_sequence: 0,
@@ -5761,6 +5994,7 @@ mod tests {
             no_gravity: true,
             owner: Some([1, 2, 3, 4]),
             _saved_source: None,
+            saved_fall_distance: None,
             created: None,
             id: 0,
             section_sequence: 0,
@@ -7203,6 +7437,7 @@ public class ItemMotionOracle {
                         no_gravity: true,
                         owner: None,
                         _saved_source: None,
+                        saved_fall_distance: None,
                         created: None,
                         id: 0,
                         section_sequence: 0,
@@ -7271,6 +7506,7 @@ public class ItemMotionOracle {
                             no_gravity: true,
                             owner: None,
                             _saved_source: None,
+                            saved_fall_distance: None,
                             created: None,
                             id: i as u32,
                             section_sequence: 0,
@@ -7412,6 +7648,7 @@ public class ItemMotionOracle {
                 no_gravity: case["no_gravity"].as_bool().unwrap(),
                 owner: None,
                 _saved_source: None,
+                saved_fall_distance: None,
                 created: Some(CreatedItemIdentity {
                     uuid: Some([1, 2, 3, 4]),
                     origin: vec(&case["p"]),

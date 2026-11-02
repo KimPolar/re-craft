@@ -218,6 +218,11 @@ impl ItemDraft {
     pub fn matches_source(&self, current: &NamedTag) -> Result<bool> {
         Ok(native_persistence::nbt::write(current)? == self.source_nbt)
     }
+
+    pub(crate) fn set_fall_distance(&mut self, original: &NamedTag, distance: f64) -> Result<()> {
+        ensure!(self.matches_source(original)?, "item source changed");
+        crate::saved_entity::set_fall_distance(&mut self.document.value, &original.value, distance)
+    }
 }
 
 /// Update a supported item's fields while retaining its original stack and

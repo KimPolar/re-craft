@@ -1,6 +1,7 @@
 //! Incremental execution of fresh terrain generation without structures.
 use anyhow::{Context, Result, bail, ensure};
 use native_resources::{
+    block_registry::GeneratedBlockRegistry,
     carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
     dimension_lighting::GeneratedDimensionLighting,
@@ -12,7 +13,8 @@ use serde_json::Value;
 use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
-    BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, PreparedDecoration, TerrainGenerator,
+    BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
+    PreparedDecoration, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
 };
 
@@ -31,6 +33,8 @@ pub struct FreshTerrainBatch {
     dimension: String,
     terrain: Option<CarvedTerrainWorld>,
     decoration: Option<DecorationConfig>,
+    light_registry: Option<GeneratedBlockRegistry>,
+    light_tracker: Option<FreshGenerationLightTracker>,
     failed: bool,
 }
 
@@ -64,14 +68,16 @@ impl FreshTerrainBatch {
             dimension: format!("{}:{}", id.namespace, id.path),
             terrain: None,
             decoration: None,
+            light_registry: None,
+            light_tracker: None,
             failed: false,
         })
     }
 
     /// Configure FEATURES before requesting work. The lighting settings and
     /// registries must come from the same immutable pack stack as the generator.
-    /// This batch uses a freshly empty light engine and never initializes or
-    /// propagates light; no external light work may be interleaved with it.
+    /// This batch starts with an empty light engine; no external light work may
+    /// be interleaved with its registration history.
     pub fn enable_decoration(
         &mut self,
         provider: &mut impl ResourceProvider,
@@ -102,14 +108,32 @@ impl FreshTerrainBatch {
         Ok(())
     }
 
+    /// Enable INITIALIZE_LIGHT before requesting work. The validated block
+    /// registry must come from the same client and pack stack as decoration.
+    pub fn enable_light_initialization(&mut self, registry: GeneratedBlockRegistry) -> Result<()> {
+        ensure!(
+            !self.failed && self.schedule.requested_chunks() == 0 && self.light_registry.is_none(),
+            "light initialization must be configured before requests"
+        );
+        let config = self
+            .decoration
+            .as_ref()
+            .context("decoration must be configured first")?;
+        ensure!(
+            registry.ids().all(|id| config.block_registry.contains(id)),
+            "generated block registry differs from decoration registry"
+        );
+        self.light_registry = Some(registry);
+        Ok(())
+    }
+
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
         self.schedule.request(pos, GenerationStage::Terrain)
     }
 
-    /// Request terrain and supported FEATURES for one chunk. No light stage is
-    /// requested, so all decoration observes the initial empty light engine.
+    /// Request terrain and supported FEATURES for one chunk.
     pub fn request_features(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(
             !self.failed,
@@ -117,6 +141,20 @@ impl FreshTerrainBatch {
         );
         ensure!(self.decoration.is_some(), "decoration is not configured");
         self.schedule.request(pos, GenerationStage::Features)
+    }
+
+    /// Request FEATURES and light section/source registration for a chunk.
+    /// Propagation and saveable lighting are not performed by this batch.
+    pub fn request_light_initialization(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        ensure!(
+            self.light_registry.is_some(),
+            "light initialization is not configured"
+        );
+        self.schedule.request(pos, GenerationStage::InitializeLight)
     }
 
     pub fn is_complete(&self) -> bool {
@@ -182,17 +220,6 @@ impl FreshTerrainBatch {
                 )?;
                 let prepared =
                     PreparedDecoration::load(provider, &plan, &config.block_registry, resolve)?;
-                let mut covered = Vec::with_capacity(9);
-                for dz in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        covered.push(ChunkPos {
-                            x: pos.x.checked_add(dx).context("light X overflow")?,
-                            z: pos.z.checked_add(dz).context("light Z overflow")?,
-                        });
-                    }
-                }
-                let light = native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(true, config.has_skylight, [], covered)
-                    .context("invalid initial light columns")?;
                 let terrain = self
                     .terrain
                     .as_mut()
@@ -206,9 +233,55 @@ impl FreshTerrainBatch {
                             .all(|chunk| !chunk.block_light_correct),
                     "feature batch light engine is not fresh"
                 );
-                self.schedule
-                    .run_features_with_visible_light(terrain, &prepared, false, &light)?;
+                if let Some(tracker) = &self.light_tracker {
+                    let registry = self
+                        .light_registry
+                        .as_ref()
+                        .context("light registry is missing")?;
+                    self.schedule.run_features(
+                        terrain,
+                        &prepared,
+                        false,
+                        Some((tracker, registry)),
+                    )?;
+                } else {
+                    let mut covered = Vec::with_capacity(9);
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            covered.push(ChunkPos {
+                                x: pos.x.checked_add(dx).context("light X overflow")?,
+                                z: pos.z.checked_add(dz).context("light Z overflow")?,
+                            });
+                        }
+                    }
+                    let light = native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(true, config.has_skylight, [], covered).context("invalid initial light columns")?;
+                    self.schedule
+                        .run_features_with_visible_light(terrain, &prepared, false, &light)?;
+                }
                 Ok(())
+            })(),
+            GenerationStage::InitializeLight => (|| {
+                let terrain = self.terrain.as_ref().context("light terrain is missing")?;
+                let registry = self
+                    .light_registry
+                    .as_ref()
+                    .context("light registry is missing")?;
+                if self.light_tracker.is_none() {
+                    let config = self
+                        .decoration
+                        .as_ref()
+                        .context("decoration is not configured")?;
+                    self.light_tracker = Some(FreshGenerationLightTracker::new(
+                        terrain,
+                        config.has_skylight,
+                    )?);
+                }
+                self.schedule.run_light_initialization(
+                    terrain,
+                    pos,
+                    self.light_tracker.as_mut().expect("tracker initialized"),
+                    registry,
+                )
             })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),
         };
@@ -224,15 +297,22 @@ impl FreshTerrainBatch {
         Ok(Some((pos, stage)))
     }
 
-    /// Transfer completed intermediate data to subsequent generation stages.
+    /// Transfer the complete registration history together with the terrain;
+    /// preserve it before later light propagation or decoration.
     pub fn into_parts(
         self,
     ) -> Result<(
         GenerationSchedule,
         BiomeNeighborhood,
         Option<CarvedTerrainWorld>,
+        Option<(FreshGenerationLightTracker, GeneratedBlockRegistry)>,
     )> {
         ensure!(self.is_complete(), "terrain batch is incomplete or failed");
-        Ok((self.schedule, self.biomes, self.terrain))
+        let light = match (self.light_tracker, self.light_registry) {
+            (Some(tracker), Some(registry)) => Some((tracker, registry)),
+            (None, _) => None,
+            (Some(_), None) => bail!("light registry is missing"),
+        };
+        Ok((self.schedule, self.biomes, self.terrain, light))
     }
 }

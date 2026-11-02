@@ -2513,6 +2513,184 @@ mod tests {
         }})
     }
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_tracks_light_registration_between_feature_steps() {
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        struct FeatureData {
+            crossing: bool,
+        }
+        impl ResourceProvider for FeatureData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let mut features = vec![
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:red_mushroom"}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
+                    ];
+                    if self.crossing {
+                        features.push(json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:offset","x":-1,"y":8,"z":8}]}));
+                    }
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[features]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    || path == "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:dirt","minecraft:melon"]}"#
+                            .to_vec(),
+                    ));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Data.list_data(folder)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        for crossing in [false, true] {
+            let generated_registry = resources.vanilla_generated_block_registry().unwrap();
+            let mut block_registry: BTreeSet<String> =
+                generated_registry.ids().map(str::to_owned).collect();
+            block_registry.extend(
+                [
+                    "air",
+                    "cave_air",
+                    "void_air",
+                    "bedrock",
+                    "stone",
+                    "dirt",
+                    "water",
+                    "lava",
+                    "red_mushroom",
+                    "melon",
+                ]
+                .into_iter()
+                .map(|name| format!("minecraft:{name}")),
+            );
+            let mut data = FeatureData { crossing };
+            let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                    .unwrap();
+            let mut batch =
+                FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
+                    .unwrap();
+            let lighting = GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+                dimension_type: None,
+                min_y: 0,
+                height: 16,
+                has_skylight: true,
+            };
+            let center = ChunkPos { x: 0, z: 0 };
+            let east = ChunkPos { x: 1, z: 0 };
+            assert!(batch.request_light_initialization(center).is_err());
+            batch
+                .enable_decoration(&mut data, &BTreeSet::new(), block_registry, &lighting)
+                .unwrap();
+            batch
+                .enable_light_initialization(generated_registry)
+                .unwrap();
+            batch.request_light_initialization(center).unwrap();
+            let mut classify = |v: &Value| -> Result<CarverBlockState> {
+                let id = v
+                    .as_str()
+                    .or_else(|| v.get("id").and_then(Value::as_str))
+                    .context("state ID")?;
+                Ok(CarverBlockState {
+                    is_air: id == "minecraft:air",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            };
+            let mut resolve = |v: &Value| -> Result<BlockState> {
+                Ok(BlockState {
+                    name: v
+                        .as_str()
+                        .or_else(|| v.get("id").and_then(Value::as_str))
+                        .context("state ID")?
+                        .into(),
+                    properties: BTreeMap::new(),
+                })
+            };
+            while batch
+                .step(&mut data, &mut classify, &mut resolve)
+                .unwrap()
+                .is_some()
+            {}
+            assert_eq!(
+                batch.schedule().completed(center),
+                Some(schedule::GenerationStage::InitializeLight)
+            );
+            let before = batch.snapshot().unwrap();
+            assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:dirt");
+            batch.request_features(east).unwrap();
+            let mut before_attempt = None;
+            loop {
+                if batch
+                    .schedule()
+                    .next_ready()
+                    .is_some_and(|(_, stage)| stage == schedule::GenerationStage::Features)
+                {
+                    before_attempt = batch.snapshot();
+                }
+                match batch.step(&mut data, &mut classify, &mut resolve) {
+                    Ok(Some(_)) => {}
+                    Ok(None) if !crossing => break,
+                    Err(error) if crossing => {
+                        assert!(
+                            format!("{error:#}").contains("registered light chunk has changed")
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected batch result {other:?}"),
+                }
+            }
+            if crossing {
+                assert!(Arc::ptr_eq(
+                    &before_attempt.unwrap(),
+                    &batch.snapshot().unwrap()
+                ));
+                assert_eq!(
+                    batch.schedule().completed(east),
+                    Some(schedule::GenerationStage::Terrain)
+                );
+                assert!(!batch.is_complete());
+                continue;
+            }
+            let after = batch.snapshot().unwrap();
+            assert_eq!(
+                after.block(24, 8, 8).unwrap().name,
+                "minecraft:red_mushroom"
+            );
+            assert!(Arc::ptr_eq(&before.chunks[&center], &after.chunks[&center]));
+            let (schedule, _, terrain, light) = batch.into_parts().unwrap();
+            assert_eq!(
+                schedule.completed(east),
+                Some(schedule::GenerationStage::Features)
+            );
+            let terrain = terrain.unwrap();
+            let (tracker, registry) = light.unwrap();
+            assert_eq!(tracker.sky_sources(&terrain, center).unwrap()[0], 16);
+            let visible = tracker
+                .snapshot(&terrain, [east, ChunkPos { x: 3, z: 0 }], &registry)
+                .unwrap();
+            assert_eq!(visible.sky_light([24, 8, 8]), Some(0));
+            assert_eq!(visible.sky_light([48, 8, 8]), Some(15));
+        }
+    }
+    #[test]
     fn fresh_batch_executes_features_with_initial_light_and_rolls_back_failures() {
         use native_resources::{
             carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
@@ -2718,7 +2896,8 @@ mod tests {
         assert_eq!(terrain_steps.len(), 2);
         let first = first_snapshot.unwrap();
         assert_eq!(first.chunks.len(), 1);
-        let (schedule, biomes, world) = batch.into_parts().unwrap();
+        let (schedule, biomes, world, light) = batch.into_parts().unwrap();
+        assert!(light.is_none());
         assert_eq!(
             schedule.completed(center),
             Some(schedule::GenerationStage::Terrain)

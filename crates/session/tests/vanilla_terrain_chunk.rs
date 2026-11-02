@@ -542,7 +542,8 @@ fn terrain_matches_java_before_and_after_carvers() {
                 .unwrap()
                 .is_some()
             {}
-            let (schedule, _, scheduled_world) = batch.into_parts().unwrap();
+            let (schedule, _, scheduled_world, light) = batch.into_parts().unwrap();
+            assert!(light.is_none());
             let scheduled = scheduled_world.unwrap().snapshot();
             assert_eq!(schedule.completed(center), Some(GenerationStage::Terrain));
             for y in min_y..min_y + height {

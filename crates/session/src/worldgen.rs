@@ -2789,6 +2789,24 @@ mod tests {
         assert!(batch.request_light(east).is_err()); // eastern 3x3 is not fully initialized
         assert!(batch.is_complete());
         let before = batch.light_snapshot([center]).unwrap();
+        let original = batch.snapshot().unwrap();
+        let before_view = batch.lit_snapshot([center]).unwrap();
+        assert!(Arc::ptr_eq(
+            &before_view,
+            &batch.lit_snapshot([center]).unwrap()
+        ));
+        assert!(batch.lit_snapshot([ChunkPos { x: 100, z: 100 }]).is_err());
+        assert!(Arc::ptr_eq(&original, &batch.lit_snapshot([]).unwrap()));
+        assert!(Arc::ptr_eq(
+            &original.chunks[&east],
+            &before_view.chunks[&east]
+        ));
+        assert!(!Arc::ptr_eq(
+            &original.chunks[&center],
+            &before_view.chunks[&center]
+        ));
+        assert_eq!(original.light(8, 8, 8, false), None);
+        assert_eq!(before_view.light(8, 8, 8, false), Some(0));
         assert_eq!(before.block_light([8, 8, 8]), Some(0));
         batch.request_light(center).unwrap();
         assert_eq!(
@@ -2802,6 +2820,36 @@ mod tests {
                 .is_none()
         );
         let after = batch.light_snapshot([center]).unwrap();
+        let after_view = batch.lit_snapshot([center]).unwrap();
+        assert!(!Arc::ptr_eq(&before_view, &after_view));
+        assert!(Arc::ptr_eq(
+            &after_view,
+            &batch.lit_snapshot([center]).unwrap()
+        ));
+        for y in -16..32 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = [x, y, z];
+                    assert_eq!(
+                        after_view.light(x, y, z, false),
+                        after.block_light(pos),
+                        "block light {pos:?}"
+                    );
+                    assert_eq!(
+                        after_view.light(x, y, z, true),
+                        after.sky_light(pos),
+                        "sky light {pos:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(before_view.light(8, 8, 8, false), Some(0));
+        assert_eq!(after_view.light(8, 8, 8, false), Some(1));
+        assert_eq!(
+            after_view.chunks[&center].status.as_deref(),
+            Some("minecraft:terrain")
+        );
+        assert!(!after_view.chunks[&center].block_light_correct);
         assert_eq!(after.block_light([8, 8, 8]), Some(1));
         assert_eq!(after.sky_light([8, 8, 8]), Some(0));
         assert_eq!(before.block_light([8, 8, 8]), Some(0));

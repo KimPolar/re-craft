@@ -118,6 +118,40 @@ impl VisibleLightSnapshot {
         self.has_sky
     }
 
+    /// Expand one covered section into packed arrays for a consumer that
+    /// cannot read sparse engine storage. Missing sky layers inherit the
+    /// bottom slice of the next higher layer, or full sky above all layers.
+    /// Missing channels are zero, and an uncovered column remains unknown.
+    pub fn expanded_section(
+        &self,
+        pos: ChunkPos,
+        section_y: i32,
+    ) -> Option<(Box<[u8; LIGHT_BYTES]>, Box<[u8; LIGHT_BYTES]>)> {
+        let column = self.columns.get(&pos)?;
+        let block = if self.has_block {
+            column
+                .block
+                .get(&section_y)
+                .map_or_else(|| Box::new([0; LIGHT_BYTES]), |v| Box::new(**v))
+        } else {
+            Box::new([0; LIGHT_BYTES])
+        };
+        let sky = if !self.has_sky {
+            Box::new([0; LIGHT_BYTES])
+        } else if let Some(layer) = column.sky.get(&section_y) {
+            Box::new(**layer)
+        } else if let Some((_, layer)) = column.sky.range(section_y..).next() {
+            let mut expanded = Box::new([0; LIGHT_BYTES]);
+            for slice in expanded.chunks_exact_mut(LIGHT_BYTES / 16) {
+                slice.copy_from_slice(&layer[..LIGHT_BYTES / 16]);
+            }
+            expanded
+        } else {
+            Box::new([0xff; LIGHT_BYTES])
+        };
+        Some((block, sky))
+    }
+
     /// Capture a newly created engine after the listed nonempty section status
     /// updates have been drained. No lighting may have been enabled, queued,
     /// propagated, removed or restored before this snapshot. The caller must
@@ -278,6 +312,44 @@ mod tests {
         assert_eq!(light.raw_brightness([-1, 2, 0], 16), None);
         assert_eq!(light.raw_brightness([0, 2, 0], 0), None);
         assert_eq!(light.sky_light([-1, 2048, 0]), None);
+    }
+
+    #[test]
+    fn expanded_sections_match_sparse_queries_and_disabled_channels() {
+        let center = ChunkPos { x: -1, z: 2 };
+        let mut sky_layer = [0u8; LIGHT_BYTES];
+        for (i, byte) in sky_layer.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+        for (has_block, has_sky) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut light = VisibleLightSnapshot::new(has_block, has_sky);
+            light.insert_complete_column(
+                center,
+                VisibleLightColumn::new(
+                    BTreeMap::from([(0, layer(6))]),
+                    BTreeMap::from([(2, Arc::new(sky_layer))]),
+                ),
+            );
+            assert!(light.expanded_section(ChunkPos { x: 0, z: 0 }, 0).is_none());
+            for sy in [-2, 0, 1, 2, 3] {
+                let (block, sky) = light.expanded_section(center, sy).unwrap();
+                for y in 0..16 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [-16 + x as i32, sy * 16 + y as i32, 32 + z as i32];
+                            assert_eq!(
+                                VisibleLightSnapshot::nibble(&block, x, y, z),
+                                light.block_light(p).unwrap()
+                            );
+                            assert_eq!(
+                                VisibleLightSnapshot::nibble(&sky, x, y, z),
+                                light.sky_light(p).unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

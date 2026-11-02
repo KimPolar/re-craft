@@ -37,6 +37,7 @@ pub struct FreshTerrainBatch {
     light_registry: Option<GeneratedBlockRegistry>,
     light_tracker: Option<FreshGenerationLightTracker>,
     light_engine: Option<StagedGenerationLightEngine>,
+    lit_cache: Option<(BTreeSet<ChunkPos>, Arc<World>)>,
     failed: bool,
 }
 
@@ -79,6 +80,7 @@ impl FreshTerrainBatch {
             light_registry: None,
             light_tracker: None,
             light_engine: None,
+            lit_cache: None,
             failed: false,
         })
     }
@@ -275,6 +277,83 @@ impl FreshTerrainBatch {
         engine.snapshot(terrain, covered, registry)
     }
 
+    /// Build a read-only rendering view containing the selected light columns.
+    /// Chunk status and light-correct flags remain intermediate; this view is
+    /// not a saveable world. Unselected chunks retain their original data.
+    pub fn lit_snapshot(
+        &mut self,
+        covered: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<Arc<World>> {
+        use native_world::loaded::Section;
+        let covered: BTreeSet<_> = covered.into_iter().collect();
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        if let Some((cached_columns, world)) = &self.lit_cache {
+            if *cached_columns == covered {
+                return Ok(Arc::clone(world));
+            }
+        }
+        let terrain = self.terrain.as_ref().context("light terrain is missing")?;
+        let max_y = self
+            .generator
+            .min_y
+            .checked_add(self.generator.height)
+            .context("light height overflow")?;
+        native_world::block_light::LightBounds::new(self.generator.min_y, max_y)
+            .context("unsupported light bounds")?;
+        let first = self.generator.min_y.div_euclid(16);
+        let end = max_y.div_euclid(16);
+        for pos in &covered {
+            let chunk = terrain
+                .world
+                .chunks
+                .get(pos)
+                .context("render light chunk is missing")?;
+            ensure!(
+                chunk.position == *pos && !chunk.block_light_correct,
+                "render light chunk is invalid"
+            );
+            for sy in first..end {
+                let section = chunk
+                    .sections
+                    .get(&i8::try_from(sy)?)
+                    .context("render block section is missing")?;
+                ensure!(section.blocks.is_some(), "render block data is missing");
+            }
+        }
+        let light = self.light_snapshot(covered.iter().copied())?;
+        if covered.is_empty() {
+            return Ok(terrain.snapshot());
+        }
+        let mut world = (*terrain.world).clone();
+        for &pos in &covered {
+            let chunk = Arc::make_mut(world.chunks.get_mut(&pos).expect("chunk was validated"));
+            for sy in first - 1..end + 1 {
+                let key =
+                    i8::try_from(sy).context("render light section outside supported range")?;
+                let (block, sky) = light
+                    .expanded_section(pos, sy)
+                    .context("render light column not captured")?;
+                let section = chunk.sections.entry(key).or_insert_with(|| {
+                    Arc::new(Section {
+                        blocks: None,
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    })
+                });
+                let section = Arc::make_mut(section);
+                section.block_light = Some(block);
+                section.sky_light = Some(sky);
+            }
+        }
+        let world = Arc::new(world);
+        self.lit_cache = Some((covered, Arc::clone(&world)));
+        Ok(world)
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.failed && self.schedule.is_complete()
     }
@@ -412,6 +491,7 @@ impl FreshTerrainBatch {
                     .as_mut()
                     .context("light propagation is not sealed")?;
                 self.schedule.run_light(terrain, pos, engine, registry)?;
+                self.lit_cache = None;
                 Ok(())
             })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),

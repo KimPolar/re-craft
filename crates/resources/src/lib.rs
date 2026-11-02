@@ -75,6 +75,7 @@ pub mod tree_placers;
 pub mod underwater_magma;
 pub mod vanilla_atlas;
 pub mod vanilla_stitcher;
+pub mod vegetation_patch;
 pub mod world_clock;
 
 pub const TARGET_VERSION: &str = "26.3";

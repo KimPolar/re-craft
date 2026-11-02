@@ -550,6 +550,17 @@ pub(crate) fn decorator_positions(positions: &[[i32; 3]]) -> Result<Vec<[i32; 3]
     Ok(sorted)
 }
 
+/// Java HashSet iteration order for BlockPos values, including resize and tree bins.
+pub(crate) fn hash_position_order(
+    positions: impl IntoIterator<Item = [i32; 3]>,
+) -> Result<Vec<[i32; 3]>> {
+    let mut set = PositionSet::default();
+    for pos in positions {
+        set.insert(pos)?;
+    }
+    Ok(set.values().collect())
+}
+
 /// Update reachable leaves and return the occupied world positions used by
 /// `StructureTemplate.updateShapeAtEdge`. The caller must still run that edge
 /// update and must discard the enclosing transaction on errors.

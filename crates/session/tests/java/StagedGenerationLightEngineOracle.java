@@ -76,10 +76,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var engine=new LevelLightEngine(w,true,true);
         boolean ore=args.length>1 && args[1].equals("ore");
         boolean normal=args.length>1 && args[1].equals("normal");
-        boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued"));
-        boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued"));
-        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued"));
+        boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued"));
+        boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
+        boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
+        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued"));
         boolean plain=args.length>1 && args[1].startsWith("vine_plain");
+        boolean existing=args.length>1 && args[1].startsWith("vine_existing");
         w.magmaOnly=magma;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
@@ -94,7 +96,13 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0) eastSection=fake;
             for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(x==1 && z==0 && !magma) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && existing){
+                var initial=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,false);
+                fake.section.setBlockState(0,10,8,initial);
+                w.edits.put(new BlockPos(16,10,8),initial);
+            }
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
+            if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
             if((!partial && !w.mixed) || (x==1 && z==0) || (w.mixed && x==0 && z==0)){
                 chunk.sources.fillFrom(fake);

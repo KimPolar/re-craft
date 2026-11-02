@@ -701,6 +701,18 @@ pub fn same_light_behavior(a: &BlockState, b: &BlockState) -> Option<bool> {
     Some(light_properties(a)? == light_properties(b)?)
 }
 
+/// Compare supported states before any generation light has propagated.
+/// Emission changes in transparent blocks require queued light updates.
+pub fn same_fresh_generation_light(a: &BlockState, b: &BlockState) -> Option<bool> {
+    let a = light_properties(a)?;
+    let b = light_properties(b)?;
+    Some(
+        a.opacity == b.opacity
+            && a.faces == b.faces
+            && (a.emission == b.emission || a.opacity == 15),
+    )
+}
+
 /// Whether Java's ProtoChunk can skip checkBlock for a supported state pair.
 /// Both blocks must have Java's useShapeForLightOcclusion flag disabled; the
 /// whitelist is compared with the installed 26.3 registry in tests.
@@ -1750,8 +1762,22 @@ mod tests {
         let mut vine = state("cave_vines_plant", None);
         vine.properties.insert("berries".into(), "false".into());
         assert_eq!(skips_light_check_for_edit(&air, &vine), Some(true));
+        assert_eq!(same_fresh_generation_light(&air, &vine), Some(true));
         vine.properties.insert("berries".into(), "true".into());
         assert_eq!(skips_light_check_for_edit(&air, &vine), Some(false));
+        assert_eq!(same_fresh_generation_light(&air, &vine), Some(false));
+        assert_eq!(
+            same_fresh_generation_light(&air, &state("stone", None)),
+            Some(false)
+        );
+        assert_eq!(
+            same_fresh_generation_light(&state("stone", None), &state("magma_block", None)),
+            Some(true)
+        );
+        assert_eq!(
+            same_fresh_generation_light(&air, &state("unknown", None)),
+            None
+        );
     }
 
     #[test]

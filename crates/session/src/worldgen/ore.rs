@@ -4593,10 +4593,11 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let new_air = super::generated_state_is_air(guard.registry, state)
                         .context("registered light new state is unknown")?;
                     ensure!(
-                        native_world::sky_light::same_sky_behavior(&old, state) == Some(true),
-                        "registered light chunk has changed at {p:?}: {} -> {}",
+                        native_world::block_light::same_fresh_generation_light(&old, state)
+                            == Some(true),
+                        "registered light chunk has changed at {p:?}: {} -> {} (light or emission requires queued updates)",
                         old.name,
-                        state.name,
+                        state.name
                     );
                     if old_air != new_air {
                         ensure!(
@@ -6188,6 +6189,24 @@ mod tests {
                 "minecraft:cave_vines_plant"
             );
             assert_eq!(&*sources, &*tracker.sky_sources(&terrain, east).unwrap());
+            let before = terrain.snapshot();
+            {
+                let mut region = terrain
+                    .decoration_region(&vine_tags, &vine_motion, BTreeSet::from([east]))
+                    .unwrap();
+                region.light_guard = Some(DecorationLightGuard {
+                    registered: BTreeSet::from([east]),
+                    registry: &registry,
+                    changed_blocks: BTreeSet::new(),
+                    changed_chunks: BTreeSet::new(),
+                    non_air_counts: BTreeMap::new(),
+                });
+                let mut glowing = state("cave_vines_plant");
+                glowing.properties.insert("berries".into(), "true".into());
+                let error = region.set_section_block([16, 10, 8], &glowing).unwrap_err();
+                assert!(error.to_string().contains("requires queued updates"));
+            }
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             let mut oracle = Vec::new();
             for mode in ["vine_plain", "vine_plain_queued"] {
                 let path = temp.path().join(format!("{mode}.json"));
@@ -6234,6 +6253,31 @@ mod tests {
             assert!(
                 glowing_oracle[0][2][1] != glowing_oracle[1][2][1],
                 "expected sky light to depend on check ordering"
+            );
+            let mut existing_oracle = Vec::new();
+            for mode in ["vine_existing", "vine_existing_queued"] {
+                let path = temp.path().join(format!("{mode}.json"));
+                let output = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&cp)
+                    .arg("StagedGenerationLightEngineOracle")
+                    .arg(&path)
+                    .arg(mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                existing_oracle.push(
+                    serde_json::from_slice::<Vec<Vec<Vec<u8>>>>(&std::fs::read(path).unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(
+                existing_oracle[0][2][1] != existing_oracle[1][2][1],
+                "expected the existing vine to retain check ordering"
             );
             let dark = tracker.snapshot(&terrain, [center], &registry).unwrap();
             let mut engine = StagedGenerationLightEngine::new(tracker);
@@ -6341,6 +6385,31 @@ mod tests {
             let queued: Vec<Vec<Vec<u8>>> =
                 serde_json::from_slice(&std::fs::read(queued_path).unwrap()).unwrap();
             assert_eq!(queued, expected, "queued and drained pre-activation checks");
+            let mut exposed = Vec::new();
+            for mode in ["magma_exposed", "magma_exposed_queued"] {
+                let path = temp.path().join(format!("{mode}.json"));
+                let output = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&cp)
+                    .arg("StagedGenerationLightEngineOracle")
+                    .arg(&path)
+                    .arg(mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                exposed.push(
+                    serde_json::from_slice::<Vec<Vec<Vec<u8>>>>(&std::fs::read(path).unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(
+                exposed[0] == exposed[1],
+                "exposed magma light checks differed"
+            );
             let dark = tracker.snapshot(&terrain, [center], &registry).unwrap();
             let mut engine = StagedGenerationLightEngine::new(tracker);
             let active = engine

@@ -62,6 +62,7 @@ pub struct DecorationRegion<'a> {
     sugar_cane_fluids: Option<&'a BTreeSet<String>>,
     cactus_lava_fluids: Option<&'a BTreeSet<String>>,
     lake_water_fluids: Option<&'a BTreeSet<String>>,
+    bubble_column_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     tree_logs: Vec<[i32; 3]>,
     tree_leaves: Vec<[i32; 3]>,
@@ -262,6 +263,26 @@ impl ConfiguredDecoration {
             _ => false,
         }
     }
+    fn needs_tree_edges(&self) -> bool {
+        match self {
+            Self::Tree(_) => true,
+            Self::VegetationPatch(_, nested) | Self::RootSystem(_, nested) => {
+                nested.feature.needs_tree_edges()
+            }
+            Self::Selector(values) => values.iter().any(|v| v.feature.needs_tree_edges()),
+            Self::BooleanSelector(a, b) => {
+                a.feature.needs_tree_edges() || b.feature.needs_tree_edges()
+            }
+            Self::WeightedSelector(values, default) => {
+                default.feature.needs_tree_edges()
+                    || values.iter().any(|(_, v)| v.feature.needs_tree_edges())
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.feature.needs_tree_edges())
+            }
+            _ => false,
+        }
+    }
     fn decode(
         provider: &mut impl ResourceProvider,
         value: &Value,
@@ -449,6 +470,10 @@ impl ConfiguredDecoration {
                 tags.insert(ResourceId::parse("minecraft:snow").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
+                tags.insert(
+                    ResourceId::parse("minecraft:enables_bubble_column_drag_down").unwrap(),
+                );
+                tags.insert(ResourceId::parse("minecraft:enables_bubble_column_push_up").unwrap());
                 tags
             }
             Self::FallenTree(v) => v.required_tags(),
@@ -640,6 +665,7 @@ pub struct PreparedDecoration<'p, 's> {
     sugar_cane_fluids: Option<BTreeSet<String>>,
     cactus_lava_fluids: Option<BTreeSet<String>>,
     lake_water_fluids: Option<BTreeSet<String>>,
+    bubble_column_fluids: Option<BTreeSet<String>>,
     freeze: Option<PreparedFreeze>,
 }
 
@@ -669,6 +695,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut needs_cactus = false;
         let mut needs_water_fluids = false;
         let mut needs_freeze = false;
+        let mut needs_tree_edges = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
             let index = usize::try_from(selected.index).context("invalid feature index")?;
@@ -696,6 +723,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     || feature.placed.feature.needs_root_system();
                 needs_water_fluids |= feature.placed.needs_water_fluids();
                 needs_freeze |= feature.placed.needs_freeze();
+                needs_tree_edges |= feature.placed.feature.needs_tree_edges();
                 for id in blocks {
                     ensure!(
                         block_registry.contains(&format!("{}:{}", id.namespace, id.path)),
@@ -718,6 +746,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             .transpose()?;
         let lake_water_fluids = needs_water_fluids
             .then(|| native_resources::fluid_tags::load_water(provider))
+            .transpose()?;
+        let bubble_column_fluids = needs_tree_edges
+            .then(|| native_resources::fluid_tags::load_bubble_column_occupiable(provider))
             .transpose()?;
         let freeze = if needs_freeze {
             let ids = plan
@@ -752,6 +783,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             sugar_cane_fluids,
             cactus_lava_fluids,
             lake_water_fluids,
+            bubble_column_fluids,
             freeze,
         })
     }
@@ -961,6 +993,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
         region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
         region.lake_water_fluids = self.lake_water_fluids.as_ref();
+        region.bubble_column_fluids = self.bubble_column_fluids.as_ref();
         region.raw_brightness = raw_brightness;
         region.freeze_context = self.freeze.as_ref().map(|v| FreezeContext {
             biomes: self.plan.biomes,
@@ -1254,6 +1287,7 @@ impl CarvedTerrainWorld {
             sugar_cane_fluids: None,
             cactus_lava_fluids: None,
             lake_water_fluids: None,
+            bubble_column_fluids: None,
             motion_cache: BTreeMap::new(),
             tree_logs: Vec::new(),
             tree_leaves: Vec::new(),
@@ -2970,6 +3004,45 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
             if neighbor_distance + 1 != 1 || own != 1 {
                 SimpleBlockWorld::schedule_simple_tick(self, pos)?;
             }
+        } else if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            use native_world::fluid::{FluidKind, FluidState};
+            ensure!(
+                state.properties.len() == 1
+                    && state.properties.get("level").is_some_and(|raw| raw
+                        .parse::<u8>()
+                        .ok()
+                        .is_some_and(|v| v <= 15 && v.to_string() == *raw)),
+                "invalid generation fluid state"
+            );
+            let fluid = FluidState::from_block(state)
+                .map_err(anyhow::Error::msg)?
+                .context("missing generation fluid")?;
+            let neighbor_fluid = FluidState::from_block(neighbor).map_err(anyhow::Error::msg)?;
+            let id = match (fluid.kind, fluid.source) {
+                (FluidKind::Water, true) => "minecraft:water",
+                (FluidKind::Water, false) => "minecraft:flowing_water",
+                (FluidKind::Lava, true) => "minecraft:lava",
+                (FluidKind::Lava, false) => "minecraft:flowing_lava",
+            };
+            if fluid.source || neighbor_fluid.is_some_and(|f| f.source) {
+                SpringWorld::schedule_spring_tick(self, pos, &ResourceId::parse(id)?)?;
+            }
+            if direction == [0, -1, 0]
+                && fluid.source
+                && fluid.amount == 8
+                && self
+                    .bubble_column_fluids
+                    .context("bubble-column fluid tags unavailable")?
+                    .contains(id)
+            {
+                let down = ResourceId::parse("minecraft:enables_bubble_column_drag_down")?;
+                let up = ResourceId::parse("minecraft:enables_bubble_column_push_up")?;
+                if self.tags.contains(&down, &neighbor.name)?
+                    || self.tags.contains(&up, &neighbor.name)?
+                {
+                    SimpleBlockWorld::schedule_simple_tick(self, pos)?;
+                }
+            }
         } else if tree_grass_block(state) {
             if direction == [0, 1, 0] {
                 let snowy = self
@@ -4298,6 +4371,13 @@ mod tests {
                     br#"{"values":["minecraft:air","minecraft:cave_air","minecraft:void_air"]}"#
                         .to_vec(),
                 ),
+                "data/minecraft/tags/block/enables_bubble_column_drag_down.json"
+                | "data/minecraft/tags/block/enables_bubble_column_push_up.json" => {
+                    Some(br#"{"values":[]}"#.to_vec())
+                }
+                "data/minecraft/tags/fluid/bubble_column_can_occupy.json" => {
+                    Some(br#"{"values":["minecraft:water"]}"#.to_vec())
+                }
                 _ => None,
             })
         }
@@ -9161,6 +9241,170 @@ mod tests {
         let world = terrain.snapshot();
         assert_eq!(world.block(4, 8, 4).unwrap().name, "minecraft:oak_log");
         assert_eq!(world.block(12, 8, 12).unwrap().name, "minecraft:oak_log");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_edge_fluid_updates_match_java() {
+        use std::{path::PathBuf, process::Command};
+        struct BubbleData;
+        impl ResourceProvider for BubbleData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/minecraft/tags/block/enables_bubble_column_drag_down.json" => {
+                        Ok(Some(br#"{"values":["minecraft:magma_block"]}"#.to_vec()))
+                    }
+                    "data/minecraft/tags/block/enables_bubble_column_push_up.json" => Ok(Some(
+                        br#"{"values":["minecraft:soul_sand","minecraft:stone"]}"#.to_vec(),
+                    )),
+                    _ => Data.read_data(path),
+                }
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeEdgeFluidOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeEdgeFluidOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeEdgeFluidOracle"));
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:lava".into(),
+            "minecraft:magma_block".into(),
+            "minecraft:soul_sand".into(),
+        ]);
+        let tags = OreBlockTags::load(
+            &mut BubbleData,
+            &registry,
+            &[
+                ResourceId::parse("minecraft:enables_bubble_column_drag_down").unwrap(),
+                ResourceId::parse("minecraft:enables_bubble_column_push_up").unwrap(),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let motion = HeightmapTags::load(&mut BubbleData, &registry).unwrap();
+        let mut checked = 0;
+        for mode in 0..4 {
+            let (mut terrain, _, _, _) = fixture();
+            let pos = [8, 8, 8];
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut bubble = BTreeSet::new();
+            if mode & 1 != 0 {
+                bubble.insert("minecraft:water".into());
+            }
+            if mode & 2 != 0 {
+                bubble.insert("minecraft:lava".into());
+            }
+            region.bubble_column_fluids = Some(&bubble);
+            for line in output
+                .lines()
+                .filter(|line| line.starts_with(&format!("E {mode} ")))
+            {
+                let parts: Vec<_> = line.split_whitespace().collect();
+                assert!((7..=8).contains(&parts.len()), "{line}");
+                let kind: i32 = parts[2].parse().unwrap();
+                let level: i32 = parts[3].parse().unwrap();
+                let neighbor: i32 = parts[4].parse().unwrap();
+                let direction = match parts[5] {
+                    "down" => [0, -1, 0],
+                    "up" => [0, 1, 0],
+                    "north" => [0, 0, -1],
+                    "south" => [0, 0, 1],
+                    "west" => [-1, 0, 0],
+                    "east" => [1, 0, 0],
+                    _ => panic!("direction"),
+                };
+                let mut liquid = state(if kind == 0 { "water" } else { "lava" });
+                liquid.properties.insert("level".into(), level.to_string());
+                let mut other = state(match neighbor {
+                    0 => "air",
+                    1 | 2 => "water",
+                    3 => "lava",
+                    4 => "magma_block",
+                    5 => "soul_sand",
+                    _ => "stone",
+                });
+                if matches!(neighbor, 1 | 2 | 3) {
+                    other
+                        .properties
+                        .insert("level".into(), if neighbor == 2 { "1" } else { "0" }.into());
+                }
+                region.set_section_block(pos, &liquid).unwrap();
+                region.world.saved_fluid_ticks.clear();
+                region.world.saved_block_ticks.clear();
+                region.fluid_tick_keys.clear();
+                region.block_tick_keys.clear();
+                let updated = native_resources::tree_leaf_update::ShapeEdgeWorld::update_shape(
+                    &mut region,
+                    pos,
+                    &liquid,
+                    direction,
+                    [8 + direction[0], 8 + direction[1], 8 + direction[2]],
+                    &other,
+                )
+                .unwrap();
+                assert_eq!(updated == liquid, parts[6] == "true", "{line}");
+                let mut events = Vec::new();
+                if let Some(ticks) = region.world.saved_fluid_ticks.get(&center) {
+                    events.extend(ticks.iter().map(|t| format!("F:{}", t.fluid)));
+                }
+                if let Some(ticks) = region.world.saved_block_ticks.get(&center) {
+                    events.extend(ticks.iter().map(|t| format!("B:{}", t.block)));
+                }
+                assert_eq!(
+                    events.join(","),
+                    parts.get(7).copied().unwrap_or(""),
+                    "{line}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4 * 2 * 4 * 7 * 6);
     }
 
     #[test]

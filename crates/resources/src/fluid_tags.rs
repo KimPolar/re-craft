@@ -123,6 +123,12 @@ pub fn load_lava(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String
     load_fluid_tag(provider, "minecraft:lava")
 }
 
+pub fn load_bubble_column_occupiable(
+    provider: &mut impl ResourceProvider,
+) -> Result<BTreeSet<String>> {
+    load_fluid_tag(provider, "minecraft:bubble_column_can_occupy")
+}
+
 /// Active fluids that allow a sugar cane block to survive alongside them.
 pub fn load_sugar_cane_adjacent(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {
     load_fluid_tag(provider, "minecraft:supports_sugar_cane_adjacently")

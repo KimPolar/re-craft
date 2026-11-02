@@ -6,6 +6,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.*;
 import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.player.*;
@@ -18,11 +19,16 @@ import net.minecraft.world.phys.Vec3;
 public class PlayerBubblePhysicsOracle {
     static final BlockPos POS=new BlockPos(8,10,8);
     static class World extends ServerLevel {
-        BlockState above; RandomSource random; int packets;
+        BlockState above; RandomSource random; int packets; JsonArray particles;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public BlockState getBlockState(BlockPos pos) { return pos.equals(POS.above())?above:Blocks.AIR.defaultBlockState(); }
         @Override public RandomSource getRandom() { return random; }
-        @Override public <T extends ParticleOptions> int sendParticles(T type,double x,double y,double z,int count,double dx,double dy,double dz,double speed) { packets++; return 0; }
+        @Override public <T extends ParticleOptions> int sendParticles(T type,double x,double y,double z,int count,double dx,double dy,double dz,double speed) {
+            if(type!=ParticleTypes.SPLASH && type!=ParticleTypes.BUBBLE) throw new AssertionError("unexpected particle type");
+            packets++; var particle=new JsonObject(); particle.addProperty("splash",type==ParticleTypes.SPLASH);
+            particle.addProperty("x",x); particle.addProperty("y",y); particle.addProperty("z",z);
+            particle.addProperty("count",count); particle.addProperty("dx",dx); particle.addProperty("dy",dy); particle.addProperty("dz",dz); particle.addProperty("speed",speed); particles.add(particle); return 0;
+        }
     }
     static class TestPlayer extends Player {
         Abilities abilities; Vec3 velocity;
@@ -44,11 +50,11 @@ public class PlayerBubblePhysicsOracle {
         var rows=new JsonArray();
         for(int above=0;above<4;above++) for(boolean drag:new boolean[]{false,true}) for(boolean flying:new boolean[]{false,true}) for(double velocity:new double[]{-2,-0.91,-0.9,-0.31,-0.3,0,0.64,0.7,1.7,1.8,2}) {
             world.above=switch(above){case 0->Blocks.AIR.defaultBlockState(); case 1->Blocks.WATER.defaultBlockState(); case 2->Blocks.STONE.defaultBlockState(); default->Blocks.BUBBLE_COLUMN.defaultBlockState();};
-            world.random=new LegacyRandomSource(77); world.packets=0;
+            world.random=new LegacyRandomSource(77); world.packets=0; world.particles=new JsonArray();
             player.abilities.flying=flying; player.velocity=new Vec3(0.2,velocity,-0.3); player.fallDistance=5;
             var state=Blocks.BUBBLE_COLUMN.defaultBlockState().setValue(BubbleColumnBlock.DRAG_DOWN,drag);
             method.invoke(Blocks.BUBBLE_COLUMN,state,world,POS,player,null,true);
-            var row=new JsonObject(); row.addProperty("above",above); row.addProperty("drag",drag); row.addProperty("flying",flying); row.addProperty("initial",velocity); row.addProperty("velocity",player.velocity.y); row.addProperty("fall",player.fallDistance); row.addProperty("packets",world.packets); row.addProperty("next",world.random.nextInt()); rows.add(row);
+            var row=new JsonObject(); row.addProperty("above",above); row.addProperty("drag",drag); row.addProperty("flying",flying); row.addProperty("initial",velocity); row.addProperty("velocity",player.velocity.y); row.addProperty("fall",player.fallDistance); row.addProperty("packets",world.packets); row.add("particles",world.particles); row.addProperty("next",world.random.nextInt()); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

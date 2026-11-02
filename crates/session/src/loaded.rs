@@ -665,6 +665,7 @@ pub struct LoadedSession {
     player_known_movement: DVec3,
     client_movement: crate::known_movement::ClientMovement,
     drown_particles: VecDeque<DrownParticleSpawn>,
+    bubble_surface_particles: VecDeque<BubbleSurfaceParticle>,
     sound_sequence: u64,
     falling_sand: Vec<FallingSand>,
     removed_falling_sand: Vec<FallingSand>,
@@ -887,6 +888,20 @@ pub struct DrownParticleSpawn {
     pub tick: u64,
     pub position: DVec3,
     pub velocity: DVec3,
+}
+
+/// A server particle packet produced when a player crosses a bubble-column surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BubbleSurfaceParticle {
+    pub tick: u64,
+    pub position: DVec3,
+    pub kind: BubbleSurfaceParticleKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BubbleSurfaceParticleKind {
+    Splash,
+    Bubble,
 }
 
 /// Server particle packet for the soul enchantment effect.
@@ -5422,6 +5437,7 @@ impl LoadedSession {
                 origin.as_dvec3() + player.position.as_dvec3(),
             ),
             drown_particles: VecDeque::new(),
+            bubble_surface_particles: VecDeque::new(),
             sound_sequence: 0,
             falling_sand: Vec::new(),
             removed_falling_sand: Vec::new(),
@@ -6511,7 +6527,17 @@ impl LoadedSession {
         self.drown_particles.drain(..).collect()
     }
 
-    fn apply_player_bubble_contact(&mut self, drag_down: bool, surface: bool, flying: bool) {
+    pub fn take_bubble_surface_particles(&mut self) -> Vec<BubbleSurfaceParticle> {
+        self.bubble_surface_particles.drain(..).collect()
+    }
+
+    fn apply_player_bubble_contact(
+        &mut self,
+        drag_down: bool,
+        surface: bool,
+        flying: bool,
+        position: IVec3,
+    ) {
         if flying {
             return;
         }
@@ -6519,9 +6545,23 @@ impl LoadedSession {
         self.motion.velocity =
             crate::bubble_column::player_velocity(self.motion.velocity, drag_down, surface, false);
         if surface {
-            // Two splash and two bubble particle packets each sample X and Z.
-            for _ in 0..8 {
-                self.level_random.next_double();
+            for _ in 0..2 {
+                for kind in [
+                    BubbleSurfaceParticleKind::Splash,
+                    BubbleSurfaceParticleKind::Bubble,
+                ] {
+                    let x = f64::from(position.x) + self.level_random.next_double();
+                    let z = f64::from(position.z) + self.level_random.next_double();
+                    if self.bubble_surface_particles.len() == 4096 {
+                        self.bubble_surface_particles.pop_front();
+                    }
+                    self.bubble_surface_particles
+                        .push_back(BubbleSurfaceParticle {
+                            tick: self.tick.saturating_add(1),
+                            position: DVec3::new(x, f64::from(position.y) + 1.0, z),
+                            kind,
+                        });
+                }
             }
         } else {
             self.fall_distance = 0.0;
@@ -16726,7 +16766,9 @@ impl LoadedSession {
                             continue;
                         };
                         let surface = shape.is_empty() && fluid.is_none();
-                        self.apply_player_bubble_contact(drag_down, surface, flying);
+                        if let Some(position) = add(self.origin, contact.position) {
+                            self.apply_player_bubble_contact(drag_down, surface, flying, position);
+                        }
                     }
                 }
             }
@@ -30114,6 +30156,46 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn bubble_surface_events_are_ordered_bounded_and_ignore_flying() {
+        let mut session = session();
+        session.tick = 42;
+        session.level_random = native_core::random::LegacyRandom::new(77);
+        let mut expected_random = session.level_random.clone();
+        let position = IVec3::new(-8, 10, 17);
+        session.apply_player_bubble_contact(false, true, false, position);
+        let events = session.take_bubble_surface_particles();
+        assert_eq!(events.len(), 4);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.tick, 43);
+            assert_eq!(
+                event.kind,
+                if index % 2 == 0 {
+                    BubbleSurfaceParticleKind::Splash
+                } else {
+                    BubbleSurfaceParticleKind::Bubble
+                }
+            );
+            assert_eq!(
+                event.position,
+                DVec3::new(
+                    -8.0 + expected_random.next_double(),
+                    11.0,
+                    17.0 + expected_random.next_double()
+                )
+            );
+        }
+        assert_eq!(session.level_random.next_int(), expected_random.next_int());
+        session.apply_player_bubble_contact(false, true, true, position);
+        session.apply_player_bubble_contact(false, false, false, position);
+        assert!(session.take_bubble_surface_particles().is_empty());
+        for _ in 0..1025 {
+            session.apply_player_bubble_contact(false, true, false, position);
+        }
+        assert_eq!(session.take_bubble_surface_particles().len(), 4096);
+        assert!(session.take_bubble_surface_particles().is_empty());
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
@@ -30176,7 +30258,37 @@ pub(crate) mod tests {
                 row["drag"].as_bool().unwrap(),
                 surface,
                 row["flying"].as_bool().unwrap(),
+                IVec3::new(8, 10, 8),
             );
+            let particles = session.take_bubble_surface_particles();
+            let expected = row["particles"].as_array().unwrap();
+            assert_eq!(particles.len(), expected.len(), "{row}");
+            for (particle, expected) in particles.iter().zip(expected) {
+                assert_eq!(
+                    particle.kind == BubbleSurfaceParticleKind::Splash,
+                    expected["splash"].as_bool().unwrap()
+                );
+                assert_eq!(expected["count"].as_i64(), Some(1));
+                assert_eq!(expected["dx"].as_f64(), Some(0.0));
+                assert_eq!(expected["dz"].as_f64(), Some(0.0));
+                let splash = particle.kind == BubbleSurfaceParticleKind::Splash;
+                assert_eq!(
+                    expected["dy"].as_f64(),
+                    Some(if splash { 0.0 } else { 0.01 })
+                );
+                assert_eq!(
+                    expected["speed"].as_f64(),
+                    Some(if splash { 1.0 } else { 0.2 })
+                );
+                assert_eq!(
+                    particle.position,
+                    DVec3::new(
+                        expected["x"].as_f64().unwrap(),
+                        expected["y"].as_f64().unwrap(),
+                        expected["z"].as_f64().unwrap()
+                    )
+                );
+            }
             assert_eq!(
                 session.motion.velocity,
                 DVec3::new(0.2, row["velocity"].as_f64().unwrap(), -0.3),

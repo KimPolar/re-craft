@@ -107,7 +107,8 @@ pub struct CarvedTerrainWorld {
 
 /// Registration history for a newly created generation light engine. The
 /// scheduler must route every INITIALIZE_LIGHT registration through this
-/// tracker and stop using it once other light-engine work has been scheduled.
+/// tracker. Supported block checks are modeled as drained before activation;
+/// other light-engine work requires a different tracker.
 pub struct FreshGenerationLightTracker {
     dimension: String,
     seed: i64,

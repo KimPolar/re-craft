@@ -891,9 +891,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
     }
 
-    /// Use a fresh, unpropagated light-engine revision. Writes preserve it when
-    /// section occupancy and sky behavior stay unchanged. Emission changes
-    /// become visible only when the affected chunk's sources are activated.
+    /// Use a fresh, unpropagated light-engine revision. Checks for supported
+    /// writes are drained while every source is disabled, before activation.
+    /// Sections must retain their occupancy and direct sky behavior.
     pub fn execute_with_tracked_light(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -4443,7 +4443,10 @@ impl ColumnWorld for DecorationRegion<'_> {
                 "minecraft:cave_vines_plant" | "minecraft:cave_vines" => tree_cave_vines(state)?,
                 _ => false,
             };
-            ensure!(valid, "unsupported column replacement effects");
+            ensure!(
+                valid,
+                "unsupported column replacement effects at {pos:?}: {state:?}"
+            );
             if self.is_outside(pos[1]) {
                 return Ok(true);
             }
@@ -4592,21 +4595,16 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         .context("registered light old state is unknown")?;
                     let new_air = super::generated_state_is_air(guard.registry, state)
                         .context("registered light new state is unknown")?;
+                    // Model block checks as drained before activation. With
+                    // no active sources, unchanged sky behavior and section
+                    // allocation, the checked stored light remains zero.
                     ensure!(
-                        native_world::block_light::same_fresh_generation_light(&old, state)
-                            == Some(true),
-                        "registered light chunk has changed at {p:?}: {} -> {} (light or emission requires queued updates)",
+                        native_world::sky_light::same_sky_behavior(&old, state) == Some(true),
+                        "registered light chunk has changed at {p:?}: {} -> {}",
                         old.name,
                         state.name
                     );
                     if old_air != new_air {
-                        ensure!(
-                            native_world::block_light::skips_light_check_for_edit(&old, state)
-                                == Some(true),
-                            "registered light chunk has changed at {p:?}: {} -> {}",
-                            old.name,
-                            state.name
-                        );
                         let key = (chunk(p), i8::try_from(p[1].div_euclid(16))?);
                         let count = if let Some(count) = guard.non_air_counts.get(&key) {
                             *count
@@ -5584,7 +5582,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn tracked_fresh_light_drives_decoration_and_rejects_registered_writes() {
+    fn tracked_fresh_light_drives_decoration_and_detects_untracked_writes() {
         struct MushroomAt(i32);
         impl ResourceProvider for MushroomAt {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -5803,13 +5801,13 @@ mod tests {
                     Some(0)
                 );
             } else {
-                assert!(
-                    format!("{:#}", result.unwrap_err())
-                        .contains("registered light chunk has changed")
+                assert_eq!(result.unwrap(), [true]);
+                assert_eq!(steps.completed(center), Some(GenerationStage::Features));
+                assert_eq!(
+                    terrain.snapshot().block(16, 8, 8).unwrap().name,
+                    "minecraft:brown_mushroom"
                 );
-                assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
-                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
-                assert!(!terrain.completed_decoration.contains(&center));
+                assert!(tracker.snapshot(&terrain, [center], &vanilla).is_ok());
             }
             let world = Arc::make_mut(&mut terrain.world);
             let air = world.intern_state(state("air"));
@@ -6012,6 +6010,153 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn drained_glowing_vine_lighting_matches_java_across_chunk_halo() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let path = temp.path().join("vine_full.json");
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&path)
+            .arg("vine_full"));
+        let expected: Vec<Vec<Vec<Vec<u8>>>> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let east = ChunkPos { x: 1, z: 0 };
+        let world = Arc::make_mut(&mut terrain.world);
+        let template = world.chunks[&ChunkPos { x: 0, z: 0 }].as_ref().clone();
+        for z in -2..=2 {
+            for x in -2..=3 {
+                let pos = ChunkPos { x, z };
+                world.chunks.entry(pos).or_insert_with(|| {
+                    let mut chunk = template.clone();
+                    chunk.position = pos;
+                    Arc::new(chunk)
+                });
+            }
+        }
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(17, 10, 8, torch).unwrap();
+        terrain.completed_decoration.insert(east);
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        tracker.initialize_chunk(&terrain, east, &registry).unwrap();
+        struct GlowingVineData;
+        impl ResourceProvider for GlowingVineData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let vine = json!({"feature":{"type":"minecraft:block_column","direction":"down",
+                        "allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},
+                        "prioritize_tip":true,"layers":[{"height":1,
+                        "provider":{"id":"minecraft:cave_vines_plant","properties":{"berries":"true"}}}]},
+                        "placement":[{"type":"minecraft:offset","x":16,"y":10,"z":8}]});
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[vine]]}))?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule =
+            FeatureSchedule::load(&mut GlowingVineData, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, biomes) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &biomes);
+        let mut blocks = batch_registry();
+        blocks.extend([
+            "minecraft:cave_vines_plant".into(),
+            "minecraft:torch".into(),
+        ]);
+        let prepared =
+            PreparedDecoration::load(&mut GlowingVineData, &plan, &blocks, &mut resolve_tree_test)
+                .unwrap();
+        assert_eq!(
+            prepared
+                .execute_with_tracked_light(&mut terrain, false, &mut tracker, &registry)
+                .unwrap(),
+            [true]
+        );
+        assert_eq!(
+            terrain.snapshot().block(16, 10, 8).unwrap().name,
+            "minecraft:cave_vines_plant"
+        );
+        let covered: Vec<_> = (-1..=1)
+            .flat_map(|z| (0..=2).map(move |x| ChunkPos { x, z }))
+            .collect();
+        let dark = tracker
+            .snapshot(&terrain, covered.iter().copied(), &registry)
+            .unwrap();
+        let mut engine = StagedGenerationLightEngine::new(tracker);
+        let active = engine
+            .activate(&terrain, east, covered.iter().copied(), &registry)
+            .unwrap();
+        for (stage, actual) in [&dark, &dark, &active].into_iter().enumerate() {
+            for (chunk_index, chunk) in covered.iter().enumerate() {
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let pos = [chunk.x * 16 + x, y, chunk.z * 16 + z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                actual.block_light(pos),
+                                Some(expected[stage][chunk_index][0][index]),
+                                "block {stage} {pos:?}"
+                            );
+                            assert_eq!(
+                                actual.sky_light(pos),
+                                Some(expected[stage][chunk_index][1][index]),
+                                "sky {stage} {pos:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tracked_light_accepts_equivalent_ore_and_rejects_other_writes() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -6153,7 +6298,8 @@ mod tests {
             let prepared =
                 PreparedDecoration::load(&mut VineData, &plan, &blocks, &mut resolve_tree_test)
                     .unwrap();
-            let (mut terrain, vine_tags, vine_motion, _) = fixture();
+            let (mut terrain, vine_tags, _, _) = fixture();
+            let vine_motion = HeightmapTags::load(&mut Data, &blocks).unwrap();
             let world = Arc::make_mut(&mut terrain.world);
             let torch = world.intern_state(state("torch"));
             world.set_block_id(17, 10, 8, torch).unwrap();
@@ -6175,7 +6321,7 @@ mod tests {
                 });
                 let mut glowing = state("cave_vines_plant");
                 glowing.properties.insert("berries".into(), "true".into());
-                assert!(region.set_section_block([16, 10, 8], &glowing).is_err());
+                region.set_section_block([16, 10, 8], &glowing).unwrap();
             }
             assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             assert_eq!(
@@ -6203,8 +6349,7 @@ mod tests {
                 });
                 let mut glowing = state("cave_vines_plant");
                 glowing.properties.insert("berries".into(), "true".into());
-                let error = region.set_section_block([16, 10, 8], &glowing).unwrap_err();
-                assert!(error.to_string().contains("requires queued updates"));
+                region.set_section_block([16, 10, 8], &glowing).unwrap();
             }
             assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             let mut oracle = Vec::new();
@@ -6279,6 +6424,47 @@ mod tests {
                 existing_oracle[0][2][1] != existing_oracle[1][2][1],
                 "expected the existing vine to retain check ordering"
             );
+            {
+                let (mut probe, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut probe.world);
+                let torch = world.intern_state(state("torch"));
+                world.set_block_id(17, 10, 8, torch).unwrap();
+                probe.completed_decoration.insert(east);
+                let mut tracker = FreshGenerationLightTracker::new(&probe, true).unwrap();
+                tracker.initialize_chunk(&probe, east, &registry).unwrap();
+                let world = Arc::make_mut(&mut probe.world);
+                let mut glowing = state("cave_vines_plant");
+                glowing.properties.insert("berries".into(), "true".into());
+                let glowing = world.intern_state(glowing);
+                world.set_block_id(16, 10, 8, glowing).unwrap();
+                tracker
+                    .registered
+                    .insert(east, Arc::clone(&probe.world.chunks[&east]));
+                let mut engine = StagedGenerationLightEngine::new(tracker);
+                let active = engine.activate(&probe, east, [center], &registry).unwrap();
+                let mut mismatches = [[0usize; 2]; 2];
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let pos = [x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            for mode in 0..2 {
+                                mismatches[mode][0] += usize::from(
+                                    active.block_light(pos)
+                                        != Some(glowing_oracle[mode][2][0][index]),
+                                );
+                                mismatches[mode][1] += usize::from(
+                                    active.sky_light(pos)
+                                        != Some(glowing_oracle[mode][2][1][index]),
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(mismatches[0], [0, 0], "drained vine light");
+                assert_eq!(mismatches[1][0], 0, "queued vine block light");
+                assert!(mismatches[1][1] > 0, "queued vine sky light");
+            }
             let dark = tracker.snapshot(&terrain, [center], &registry).unwrap();
             let mut engine = StagedGenerationLightEngine::new(tracker);
             let active = engine

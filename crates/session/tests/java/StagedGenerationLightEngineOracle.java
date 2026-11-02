@@ -18,6 +18,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     final Map<BlockPos, BlockState> edits = new HashMap<>();
     boolean mixed;
     boolean magmaOnly;
+    boolean wide;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -28,7 +29,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(magmaOnly && p.getX()==16 && p.getY()==8 && p.getZ()==8) return Blocks.WATER.defaultBlockState();
         if(!magmaOnly && p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
-        if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=(mixed?2:1) && Math.abs(Math.floorDiv(p.getZ(),16))<=(mixed?2:1)) return Blocks.STONE.defaultBlockState();
+        if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=((mixed || wide)?2:1) && Math.abs(Math.floorDiv(p.getZ(),16))<=((mixed || wide)?2:1)) return Blocks.STONE.defaultBlockState();
         return Blocks.AIR.defaultBlockState();
     }
     public FluidState getFluidState(BlockPos p){ return getBlockState(p).getFluidState(); }
@@ -69,6 +70,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         }
         return result;
     }
+    static JsonArray captureNearby(LevelLightEngine e,boolean all){
+        if(!all)return capture(e);
+        var result=new JsonArray();
+        for(int z=-1;z<=1;z++)for(int x=0;x<=2;x++)result.add(capture(e,x,z));
+        return result;
+    }
     public static void main(String[] args)throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var w=new StagedGenerationLightEngineOracle();
@@ -76,17 +83,19 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var engine=new LevelLightEngine(w,true,true);
         boolean ore=args.length>1 && args[1].equals("ore");
         boolean normal=args.length>1 && args[1].equals("normal");
-        boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued"));
+        boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
         boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
-        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued"));
+        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
+        boolean full=args.length>1 && args[1].startsWith("vine_full");
+        w.wide=full;
         boolean plain=args.length>1 && args[1].startsWith("vine_plain");
         boolean existing=args.length>1 && args[1].startsWith("vine_existing");
         w.magmaOnly=magma;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
-        int radius=w.mixed?2:1;
+        int radius=(w.mixed || w.wide)?2:1;
         FakeChunk eastSection=null;
         for(int z=-radius;z<=radius;z++) for(int x=-radius;x<=radius;x++){
             var chunk=w.new TestChunk(x,z); w.chunks.put(new ChunkPos(x,z),chunk);
@@ -122,8 +131,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             boolean changed=LightEngine.hasDifferentLightProperties(old,state);
             if(changed==plain)throw new AssertionError("unexpected vine light check");
             if(changed)engine.checkBlock(pos);
-            stages.add(capture(engine));if(!queued)drain(engine);stages.add(capture(engine));
-            engine.propagateLightSources(new ChunkPos(1,0));drain(engine);stages.add(capture(engine));
+            stages.add(captureNearby(engine,full));if(!queued)drain(engine);stages.add(captureNearby(engine,full));
+            engine.propagateLightSources(new ChunkPos(1,0));drain(engine);stages.add(captureNearby(engine,full));
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(magma){

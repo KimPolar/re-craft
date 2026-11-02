@@ -651,5 +651,153 @@ mod tests {
                 "{row}"
             );
         }
+        let parse_sensor = |row: &serde_json::Value| {
+            let calibrated = row["calibrated"].as_bool().unwrap();
+            let mut properties = std::collections::BTreeMap::from([
+                (
+                    "sculk_sensor_phase".to_owned(),
+                    row["phase"].as_str().unwrap().to_owned(),
+                ),
+                (
+                    "power".to_owned(),
+                    row["power"].as_u64().unwrap_or(0).to_string(),
+                ),
+                (
+                    "waterlogged".to_owned(),
+                    row["wet"].as_bool().unwrap_or(false).to_string(),
+                ),
+            ]);
+            if calibrated {
+                properties.insert("facing".into(), "north".into());
+            }
+            crate::sculk_sensor::Sensor::from_block(&native_world::loaded::BlockState {
+                name: if calibrated {
+                    "minecraft:calibrated_sculk_sensor"
+                } else {
+                    "minecraft:sculk_sensor"
+                }
+                .into(),
+                properties,
+            })
+            .unwrap()
+        };
+        let signals = data["sensor_signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 2 * 3 * 16 * 2 * 6);
+        for row in signals {
+            let direction = match row["direction"].as_str().unwrap() {
+                "down" => IVec3::NEG_Y,
+                "up" => IVec3::Y,
+                "north" => IVec3::NEG_Z,
+                "south" => IVec3::Z,
+                "west" => IVec3::NEG_X,
+                "east" => IVec3::X,
+                _ => unreachable!(),
+            };
+            let signal = parse_sensor(row).signal(direction).unwrap();
+            assert_eq!(
+                (signal.0 as u64, signal.1 as u64),
+                (
+                    row["weak"].as_u64().unwrap(),
+                    row["direct"].as_u64().unwrap()
+                ),
+                "{row}"
+            );
+        }
+        let sensor_filter = data["sensor_filter"].as_array().unwrap();
+        assert_eq!(sensor_filter.len(), 61 * 3 * 2 * 17);
+        for row in sensor_filter {
+            if row["calibrated"].as_bool().unwrap() {
+                assert_eq!(parse_sensor(row).back_face(), Some(IVec3::Z));
+                assert!(row["back_is_south"].as_bool().unwrap(), "{row}");
+            }
+            assert_eq!(
+                parse_sensor(row).can_receive(
+                    row["event"].as_str().unwrap(),
+                    row["same"].as_bool().unwrap(),
+                    Some(row["input"].as_u64().unwrap() as u8)
+                ),
+                Some(row["accepted"].as_bool().unwrap()),
+                "{row}"
+            );
+        }
+        let ticks = data["sensor_ticks"].as_array().unwrap();
+        assert_eq!(ticks.len(), 2 * 3 * 16 * 2);
+        for row in ticks {
+            let before = parse_sensor(row);
+            let change = before.scheduled_tick();
+            let after = change.as_ref().map_or(before, |v| v.state);
+            let phase = match after.phase {
+                crate::sculk_sensor::Phase::Inactive => "inactive",
+                crate::sculk_sensor::Phase::Active => "active",
+                crate::sculk_sensor::Phase::Cooldown => "cooldown",
+            };
+            assert_eq!(phase, row["after_phase"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                u64::from(after.power),
+                row["after_power"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                u64::from(change.as_ref().and_then(|v| v.tick_after).unwrap_or(0)),
+                row["delay"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                u64::from(change.as_ref().is_some_and(|v| v.notify_neighbors)) * 2,
+                row["notifications"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                change.as_ref().is_some_and(|v| v.play_stop),
+                row["sounds"].as_u64().unwrap() > 0,
+                "{row}"
+            );
+        }
+        let arrivals = data["sensor_arrivals"].as_array().unwrap();
+        assert_eq!(arrivals.len(), 2 * 3 * 2 * 4 * 5);
+        for row in arrivals {
+            let before = parse_sensor(row);
+            let change = before.arrive(
+                row["event"].as_str().unwrap(),
+                row["distance"].as_f64().unwrap() as f32,
+            );
+            let after = change.as_ref().map_or(before, |v| v.state);
+            let phase = match after.phase {
+                crate::sculk_sensor::Phase::Inactive => "inactive",
+                crate::sculk_sensor::Phase::Active => "active",
+                crate::sculk_sensor::Phase::Cooldown => "cooldown",
+            };
+            assert_eq!(phase, row["after_phase"].as_str().unwrap(), "{row}");
+            assert_eq!(
+                u64::from(after.power),
+                row["after_power"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                u64::from(change.as_ref().and_then(|v| v.tick_after).unwrap_or(0)),
+                row["delay"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                u64::from(change.as_ref().is_some_and(|v| v.notify_neighbors)) * 2,
+                row["notifications"].as_u64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                change.as_ref().is_some_and(|v| v.play_click),
+                row["sounds"].as_u64().unwrap() > 0,
+                "{row}"
+            );
+            assert_eq!(
+                change.as_ref().is_some_and(|v| v.emit_clicking_event),
+                row["events"].as_u64().unwrap() > 0,
+                "{row}"
+            );
+            assert_eq!(
+                u64::from(change.as_ref().and_then(|v| v.last_frequency).unwrap_or(0)),
+                row["frequency"].as_u64().unwrap(),
+                "{row}"
+            );
+        }
     }
 }

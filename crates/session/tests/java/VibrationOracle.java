@@ -9,6 +9,15 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.SculkSensorBlock;
+import net.minecraft.world.level.block.CalibratedSculkSensorBlock;
+import net.minecraft.world.level.block.entity.SculkSensorBlockEntity;
+import net.minecraft.world.level.block.entity.CalibratedSculkSensorBlockEntity;
+import net.minecraft.world.level.block.state.properties.SculkSensorPhase;
+import net.minecraft.world.level.redstone.Orientation;
+import net.minecraft.util.RandomSource;
+import net.minecraft.sounds.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.tags.*;
 import net.minecraft.world.level.gameevent.*;
@@ -17,11 +26,20 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now; Set<BlockPos> occluders;
+        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
         @Override public BlockState getBlockState(BlockPos pos) { return occluders != null && occluders.contains(pos) ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(); }
+        @Override public int getSignal(BlockPos pos, Direction direction) { signalPosition=pos;signalDirection=direction;return signal; }
+        @Override public boolean setBlockAndUpdate(BlockPos pos, BlockState state) { sensorState=state; return true; }
+        @Override public void scheduleTick(BlockPos pos, Block block, int ticks) { delay=ticks; }
+        @Override public void updateNeighborsAt(BlockPos pos, Block block) { notifications++; }
+        @Override public void updateNeighborsAt(BlockPos pos, Block block, Orientation orientation) { notifications++; }
+        @Override public RandomSource getRandom() { return sensorRandom; }
+        @Override public void playSound(Entity entity, BlockPos pos, SoundEvent event, SoundSource source, float volume, float pitch) { sounds++; }
+        @Override public void playSound(Entity entity, double x,double y,double z,SoundEvent event,SoundSource source,float volume,float pitch) { sounds++; }
+        @Override public void gameEvent(Entity entity, Holder<GameEvent> event, BlockPos pos) { events++; }
         @Override public <T extends ParticleOptions> int sendParticles(T type, double x, double y, double z, int count, double dx, double dy, double dz, double speed) { return 0; }
     }
     static class User implements VibrationSystem.User {
@@ -129,7 +147,43 @@ public class VibrationOracle {
             row.addProperty("occluded",(boolean)isOccluded.invoke(null,world,from,to));rays.add(row);
         }
         var blockRegistry=new JsonArray(); for (var entry:BuiltInRegistries.BLOCK.entrySet()) blockRegistry.add(entry.getKey().identifier().toString());
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry);
+        var sensorSignals=new JsonArray(); var sensorFilter=new JsonArray(); var sensorTicks=new JsonArray(); var sensorArrivals=new JsonArray();
+        world.sensorRandom=RandomSource.create(1); world.occluders=Set.of();
+        for (int calibrated=0;calibrated<2;calibrated++) for (var phase:SculkSensorPhase.values()) for (int power=0;power<=15;power++) for(boolean wet:new boolean[]{false,true}) {
+            var state=(calibrated==0 ? Blocks.SCULK_SENSOR : Blocks.CALIBRATED_SCULK_SENSOR).defaultBlockState()
+                .setValue(SculkSensorBlock.PHASE,phase).setValue(SculkSensorBlock.POWER,power).setValue(SculkSensorBlock.WATERLOGGED,wet);
+            if (calibrated!=0) state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
+            for (var direction:Direction.values()) {
+                var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("power",power);row.addProperty("wet",wet);row.addProperty("direction",direction.getName());
+                row.addProperty("weak",state.getSignal(world,BlockPos.ZERO,direction));row.addProperty("direct",state.getDirectSignal(world,BlockPos.ZERO,direction));sensorSignals.add(row);
+            }
+            world.sensorState=state;world.delay=0;world.notifications=0;world.sounds=0;world.events=0;
+            state.tick(world,BlockPos.ZERO,world.sensorRandom);
+            var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("power",power);row.addProperty("wet",wet);
+            row.addProperty("after_phase",world.sensorState.getValue(SculkSensorBlock.PHASE).getSerializedName());row.addProperty("after_power",world.sensorState.getValue(SculkSensorBlock.POWER));
+            row.addProperty("delay",world.delay);row.addProperty("notifications",world.notifications);row.addProperty("sounds",world.sounds);sensorTicks.add(row);
+        }
+        for (int calibrated=0;calibrated<2;calibrated++) for (var phase:SculkSensorPhase.values()) {
+            var state=(calibrated==0 ? Blocks.SCULK_SENSOR : Blocks.CALIBRATED_SCULK_SENSOR).defaultBlockState().setValue(SculkSensorBlock.PHASE,phase);
+            if (calibrated!=0) state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
+            var blockEntity=calibrated==0 ? new SculkSensorBlockEntity(BlockPos.ZERO,state) : new CalibratedSculkSensorBlockEntity(BlockPos.ZERO,state);
+            for (var event:events) for (boolean same:new boolean[]{false,true}) for(int input=0;input<(calibrated==0 ? 1 : 16);input++) {
+                world.signal=input;var row=new JsonObject(); row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("event",event.key().identifier().toString());row.addProperty("same",same);row.addProperty("input",input);
+                world.signalPosition=null;world.signalDirection=null;
+                row.addProperty("accepted",blockEntity.getVibrationUser().canReceiveVibration(world,same ? BlockPos.ZERO : BlockPos.ZERO.north(),event,GameEvent.Context.of((Entity)null)));
+                row.addProperty("back_is_south",world.signalPosition!=null && world.signalPosition.equals(BlockPos.ZERO.south()) && world.signalDirection==Direction.SOUTH);sensorFilter.add(row);
+            }
+        }
+        for (int calibrated=0;calibrated<2;calibrated++) for (var phase:SculkSensorPhase.values()) for(boolean wet:new boolean[]{false,true}) for(var event:List.of(GameEvent.SPLASH,GameEvent.STEP,GameEvent.EXPLODE,GameEvent.BLOCK_DESTROY)) for(float distance:new float[]{0,1,4,8,16}) {
+            var state=(calibrated==0 ? Blocks.SCULK_SENSOR : Blocks.CALIBRATED_SCULK_SENSOR).defaultBlockState().setValue(SculkSensorBlock.PHASE,phase).setValue(SculkSensorBlock.WATERLOGGED,wet);
+            if(calibrated!=0)state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
+            var blockEntity=calibrated==0 ? new SculkSensorBlockEntity(BlockPos.ZERO,state) : new CalibratedSculkSensorBlockEntity(BlockPos.ZERO,state);
+            world.sensorState=state;world.delay=0;world.notifications=0;world.sounds=0;world.events=0;
+            blockEntity.getVibrationUser().onReceiveVibration(world,BlockPos.ZERO,event,null,null,distance);
+            var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("wet",wet);row.addProperty("event",event.key().identifier().toString());row.addProperty("distance",distance);
+            row.addProperty("after_phase",world.sensorState.getValue(SculkSensorBlock.PHASE).getSerializedName());row.addProperty("after_power",world.sensorState.getValue(SculkSensorBlock.POWER));row.addProperty("delay",world.delay);row.addProperty("notifications",world.notifications);row.addProperty("sounds",world.sounds);row.addProperty("events",world.events);row.addProperty("frequency",blockEntity.getLastVibrationFrequency());sensorArrivals.add(row);
+        }
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);
         Files.writeString(Path.of(args[0]), result.toString());
     }
 }

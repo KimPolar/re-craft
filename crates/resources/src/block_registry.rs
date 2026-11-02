@@ -27,6 +27,8 @@ enum StateSchema {
     Snowy,
     Liquid,
     Axis,
+    DoublePlant,
+    BerryBush,
 }
 
 impl StateSchema {
@@ -36,6 +38,8 @@ impl StateSchema {
             Self::Snowy => ("snowy", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
+            Self::DoublePlant => ("half", "lower"),
+            Self::BerryBush => ("age", "0"),
         };
         BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
     }
@@ -50,6 +54,12 @@ impl StateSchema {
             }
             Self::Liquid if name == "level" => java_decimal(value)
                 .filter(|n| (0..=15).contains(n))
+                .map(|n| n.to_string()),
+            Self::DoublePlant if name == "half" && matches!(value, "lower" | "upper") => {
+                Some(value.to_owned())
+            }
+            Self::BerryBush if name == "age" => java_decimal(value)
+                .filter(|n| (0..=3).contains(n))
                 .map(|n| n.to_string()),
             _ => None,
         }
@@ -152,12 +162,20 @@ impl GeneratedBlockRegistry {
                 };
                 if let Some(class) = class
                     && candidates.len() == 1
-                    && candidates.first().is_some_and(|(_, field)| field == member)
                 {
-                    let (owner, _) = candidates.first().expect("checked single candidate");
+                    let (owner, field) = candidates.first().expect("checked single candidate");
                     let name = if owner == IDS { &names } else { &key_names }
-                        .get(member)
-                        .with_context(|| format!("missing block reference {member}"))?;
+                        .get(field)
+                        .with_context(|| format!("missing block reference {field}"))?;
+                    // Some references name the paired item (for example
+                    // SWEET_BERRY_CROP), while Blocks uses the block ID. Only
+                    // accept this alias if the literal ID matches that field.
+                    if field != member && name != &member.to_ascii_lowercase() {
+                        candidates.clear();
+                        constructors.clear();
+                        registration = None;
+                        continue;
+                    }
                     let id = ResourceId::parse(name)?;
                     ensure!(
                         id.namespace == "minecraft",
@@ -185,6 +203,13 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
+                "net/minecraft/world/level/block/DoublePlantBlock"
+                | "net/minecraft/world/level/block/TallFlowerBlock" => {
+                    Some(StateSchema::DoublePlant)
+                }
+                "net/minecraft/world/level/block/SweetBerryBushBlock" => {
+                    Some(StateSchema::BerryBush)
+                }
                 _ if stateless_class(
                     &class,
                     &mut read_class,

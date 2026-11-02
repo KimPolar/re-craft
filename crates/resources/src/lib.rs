@@ -44,6 +44,7 @@ pub mod respawn_environment;
 pub mod respawn_tags;
 pub mod simple_block_feature;
 pub mod sounds;
+pub mod spring_feature;
 pub mod sprites;
 pub mod structure_biomes;
 pub mod structure_piece;

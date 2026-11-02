@@ -62,6 +62,7 @@ fn height_provider_identity_controls_java_biome_membership() {
         .filter(|line| {
             line.starts_with("uniform ")
                 || line.starts_with("trapezoid ")
+                || line.starts_with("very_biased ")
                 || line.starts_with("none ")
         })
         .collect();
@@ -70,6 +71,7 @@ fn height_provider_identity_controls_java_biome_membership() {
         [
             "uniform true false",
             "trapezoid true false",
+            "very_biased true false",
             "none true true"
         ]
     );

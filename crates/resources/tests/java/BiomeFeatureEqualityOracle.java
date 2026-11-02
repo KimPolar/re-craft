@@ -45,6 +45,7 @@ public class BiomeFeatureEqualityOracle {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     compare(out,"uniform","{\"type\":\"minecraft:uniform\",\"min_inclusive\":{\"absolute\":0},\"max_inclusive\":{\"absolute\":8}}");
     compare(out,"trapezoid","{\"type\":\"minecraft:trapezoid\",\"min_inclusive\":{\"absolute\":0},\"max_inclusive\":{\"absolute\":8}}");
+    compare(out,"very_biased","{\"type\":\"minecraft:very_biased_to_bottom\",\"min_inclusive\":{\"absolute\":0},\"max_inclusive\":{\"absolute\":8}}");
     var a=new PlacedFeature(null,List.of()); var b=new PlacedFeature(null,List.of());
     var s=settings(a); out.println("none "+s.hasFeature(a)+" "+s.hasFeature(b));
     var lookup=VanillaRegistries.createWorldLookup();

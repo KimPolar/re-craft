@@ -131,10 +131,19 @@ fn modifiers_and_feature_randomness_match_java() {
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":{"type":"minecraft:weighted_list","distribution":[{"data":2,"weight":0},{"data":3,"weight":4},{"data":{"type":"minecraft:uniform","min_inclusive":4,"max_inclusive":6},"weight":1}]}},{"type":"minecraft:in_square"},{"type":"minecraft:heightmap","heightmap":"WORLD_SURFACE_WG"},{"type":"minecraft:count","count":2}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":3},{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"below_top":0},"max_inclusive":{"absolute":-100}}}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":8},{"type":"minecraft:offset","x":{"type":"minecraft:trapezoid","min":-7,"max":7,"plateau":0},"y":{"type":"minecraft:biased_to_bottom","min_inclusive":0,"max_inclusive":3},"z":{"type":"minecraft:trapezoid","min":-4,"max":5,"plateau":2}}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-56},"inner":8}}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-57},"inner":8}}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-40}}}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[]}),
     ];
     let mut resources = ResourceStack::open(&game).unwrap();
-    for name in ["ore_diamond", "ore_dirt", "ore_coal_upper"] {
+    for name in [
+        "ore_diamond",
+        "ore_dirt",
+        "ore_coal_upper",
+        "spring_water",
+        "spring_lava",
+    ] {
         let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
         PlacedFeature::load(&mut resources, &id).unwrap();
         let bytes = resources

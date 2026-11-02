@@ -17,8 +17,11 @@ use native_resources::{
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
+    spring_feature::{SpringFeature, SpringWorld},
 };
-use native_world::loaded::{BlockState, BlockStateId, ChunkPos, SavedBlockTick, World};
+use native_world::loaded::{
+    BlockState, BlockStateId, ChunkPos, SavedBlockTick, SavedFluidTick, World,
+};
 use serde_json::Value;
 
 use super::{CarvedTerrainWorld, DecorationPlan};
@@ -36,6 +39,7 @@ pub struct DecorationRegion<'a> {
     final_heights: BTreeMap<ChunkPos, Arc<FinalHeightmaps>>,
     feature_marks: BTreeMap<ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     block_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
+    fluid_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -56,6 +60,7 @@ enum ConfiguredDecoration {
     Ore(ConfiguredOre<BlockState>),
     Disk(DiskFeature<BlockState>),
     Simple(SimpleBlockFeature<BlockState>),
+    Spring(SpringFeature<BlockState>),
 }
 impl ConfiguredDecoration {
     fn decode(
@@ -76,6 +81,9 @@ impl ConfiguredDecoration {
             ("minecraft", "simple_block") => {
                 Ok(Self::Simple(SimpleBlockFeature::decode(value, resolve)?))
             }
+            ("minecraft", "spring_feature") => {
+                Ok(Self::Spring(SpringFeature::decode(value, resolve)?))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -87,6 +95,7 @@ impl ConfiguredDecoration {
         match self {
             Self::Ore(v) => v.required_tags(),
             Self::Disk(v) => v.required_tags(),
+            Self::Spring(v) => v.required_tags(),
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
@@ -117,6 +126,7 @@ impl ConfiguredDecoration {
             Self::Ore(v) => v.place(world, random, pos),
             Self::Disk(v) => v.place(world, random, pos),
             Self::Simple(v) => v.place(world, random, pos),
+            Self::Spring(v) => v.place(world, pos),
         }
     }
 }
@@ -177,6 +187,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 }
                 if let ConfiguredDecoration::Simple(simple) = &feature.placed.feature {
                     blocks.extend(simple.required_blocks());
+                }
+                if let ConfiguredDecoration::Spring(spring) = &feature.placed.feature {
+                    blocks.extend(spring.required_blocks());
                 }
                 for id in blocks {
                     ensure!(
@@ -392,6 +405,7 @@ impl CarvedTerrainWorld {
             final_heights,
             feature_marks,
             block_tick_keys: BTreeMap::new(),
+            fluid_tick_keys: BTreeMap::new(),
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -1175,6 +1189,75 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
     }
 }
 
+impl SpringWorld for DecorationRegion<'_> {
+    fn set_spring_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "generation block chunk is missing"
+            );
+            ensure!(
+                matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava"),
+                "unsupported spring block"
+            );
+            if self.is_outside(pos[1]) {
+                return Ok(true);
+            }
+            ensure!(
+                disk_safe_solid(&self.read(pos)?.name).is_some(),
+                "unsupported spring source effects"
+            );
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn schedule_spring_tick(&mut self, pos: [i32; 3], fluid: &ResourceId) -> Result<()> {
+        let result = (|| {
+            let chunk = chunk(pos);
+            ensure!(
+                self.world.chunks.contains_key(&chunk),
+                "generation tick chunk is missing"
+            );
+            let fluid = format!("{}:{}", fluid.namespace, fluid.path);
+            let keys = self.fluid_tick_keys.entry(chunk).or_insert_with(|| {
+                self.world
+                    .saved_fluid_ticks
+                    .get(&chunk)
+                    .into_iter()
+                    .flatten()
+                    .map(|tick| (tick.position, tick.fluid.clone()))
+                    .collect()
+            });
+            if keys.insert((pos, fluid.clone())) {
+                self.world
+                    .saved_fluid_ticks
+                    .entry(chunk)
+                    .or_default()
+                    .push(SavedFluidTick {
+                        fluid,
+                        position: pos,
+                        delay: 0,
+                        priority: 0,
+                    });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
 impl OreVeinWorld for DecorationRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
@@ -1356,6 +1439,56 @@ mod tests {
             feature_postprocessing: BTreeMap::new(),
         };
         (result, tags, motion, feature)
+    }
+
+    #[test]
+    fn spring_writes_and_fluid_ticks_commit_or_rollback_together() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let before = terrain.snapshot();
+        let feature = SpringFeature::decode(&json!({
+            "type":"minecraft:spring_feature", "state":{"id":"minecraft:water","properties":{"falling":"true"}},
+            "valid_blocks":["minecraft:stone"]
+        }), &mut |v| {
+            let mut result = resolve_test(v)?;
+            result.properties.insert("level".into(), v["properties"]["level"].as_str().unwrap().into());
+            Ok(result)
+        }).unwrap();
+        let pos = [8, 5, 8];
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.set_section_block([7, 5, 8], &state("air")).unwrap();
+        assert!(feature.place(&mut region, pos).unwrap());
+        assert!(!feature.place(&mut region, pos).unwrap());
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert_eq!(after.block(8, 5, 8).unwrap().name, "minecraft:water");
+        assert_eq!(after.block(8, 5, 8).unwrap().properties["level"], "0");
+        assert_eq!(
+            after.saved_fluid_ticks[&center],
+            [SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: pos,
+                delay: 0,
+                priority: 0
+            }]
+        );
+        assert!(before.saved_fluid_ticks.is_empty());
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region
+            .schedule_spring_tick(pos, &ResourceId::parse("minecraft:water").unwrap())
+            .unwrap();
+        assert_eq!(region.world.saved_fluid_ticks[&center].len(), 1);
+        assert!(
+            region
+                .set_spring_block([8, 5, 8], &state("diamond_ore"))
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
     }
 
     #[test]
@@ -2126,6 +2259,80 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn prepared_batch_places_spring_and_records_fluid_tick() {
+        struct SpringData;
+        impl ResourceProvider for SpringData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{"feature":{
+                        "type":"minecraft:spring_feature","state":{"id":"minecraft:water"},"valid_blocks":["minecraft:stone"]
+                    },"placement":[{"type":"minecraft:offset","x":8,"y":5,"z":8}]}]]}))?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut SpringData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.insert("minecraft:water".into());
+        let prepared = PreparedDecoration::load(&mut SpringData, &plan, &registry, &mut |v| {
+            let mut result = resolve_test(v)?;
+            if let Some(level) = v
+                .get("properties")
+                .and_then(|p| p.get("level"))
+                .and_then(Value::as_str)
+            {
+                result.properties.insert("level".into(), level.into());
+            }
+            Ok(result)
+        })
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut setup = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        setup.set_section_block([7, 5, 8], &state("air")).unwrap();
+        setup.finish().unwrap();
+        assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+        let world = terrain.snapshot();
+        assert_eq!(world.block(8, 5, 8).unwrap().name, "minecraft:water");
+        assert_eq!(world.saved_fluid_ticks[&center][0].position, [8, 5, 8]);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_spring_definitions_load_with_the_block_registry() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        for name in [
+            "spring_water",
+            "spring_lava",
+            "spring_lava_frozen",
+            "spring_delta",
+        ] {
+            let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
+            PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {
+                super::super::resolve_generated_terrain_state(value, &registry)
+            })
+            .unwrap_or_else(|err| panic!("{name}: {err:#}"));
+        }
     }
 
     #[test]

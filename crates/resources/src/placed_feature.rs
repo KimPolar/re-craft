@@ -187,6 +187,7 @@ enum HeightProvider {
     Constant(Anchor),
     Uniform(Anchor, Anchor),
     Trapezoid(Anchor, Anchor, i32),
+    VeryBiased(Anchor, Anchor, i32),
 }
 impl HeightProvider {
     fn parse(v: &Value) -> Result<Self> {
@@ -205,6 +206,15 @@ impl HeightProvider {
                     .unwrap_or(0);
                 ensure!(plateau >= 0, "negative plateau");
                 Ok(Self::Trapezoid(min()?, max()?, plateau))
+            }
+            "very_biased_to_bottom" => {
+                let inner = v
+                    .get("inner")
+                    .map(|_| integer(v, "inner"))
+                    .transpose()?
+                    .unwrap_or(1);
+                ensure!(inner >= 1, "invalid inner height range");
+                Ok(Self::VeryBiased(min()?, max()?, inner))
             }
             name => bail!("unsupported height provider {name}"),
         }
@@ -240,6 +250,23 @@ impl HeightProvider {
                 let high = width as i32 - slope;
                 Ok(a.wrapping_add(between(random, 0, high)?)
                     .wrapping_add(between(random, 0, slope)?))
+            }
+            Self::VeryBiased(a, b, inner) => {
+                let a = a.resolve(min_y, height);
+                let b = b.resolve(min_y, height);
+                if b.wrapping_sub(a).wrapping_sub(*inner).wrapping_add(1) <= 0 {
+                    return Ok(a);
+                }
+                let next = |random: &mut DecorationRandom, min: i32, max: i32| -> Result<i32> {
+                    if min >= max {
+                        Ok(min)
+                    } else {
+                        between(random, min, max)
+                    }
+                };
+                let first = next(random, a.wrapping_add(*inner), b)?;
+                let second = next(random, a, first.wrapping_sub(1))?;
+                next(random, a, second.wrapping_sub(1).wrapping_add(*inner))
             }
         }
     }
@@ -301,7 +328,11 @@ impl PlacedFeature {
         self.modifiers.iter().any(|modifier| {
             matches!(
                 modifier,
-                Modifier::Height(HeightProvider::Uniform(..) | HeightProvider::Trapezoid(..))
+                Modifier::Height(
+                    HeightProvider::Uniform(..)
+                        | HeightProvider::Trapezoid(..)
+                        | HeightProvider::VeryBiased(..)
+                )
             )
         })
     }

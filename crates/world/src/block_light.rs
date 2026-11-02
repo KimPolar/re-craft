@@ -711,7 +711,12 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
     fn known_without_shape(state: &BlockState) -> bool {
         matches!(
             state.name.as_str(),
-            "minecraft:stone"
+            "minecraft:air"
+                | "minecraft:cave_air"
+                | "minecraft:void_air"
+                | "minecraft:cave_vines"
+                | "minecraft:cave_vines_plant"
+                | "minecraft:stone"
                 | "minecraft:deepslate"
                 | "minecraft:dirt"
                 | "minecraft:sand"
@@ -1741,6 +1746,12 @@ mod tests {
             skips_light_check_for_edit(&state("stone", None), &state("deepslate", None)),
             None
         );
+        let air = state("air", None);
+        let mut vine = state("cave_vines_plant", None);
+        vine.properties.insert("berries".into(), "false".into());
+        assert_eq!(skips_light_check_for_edit(&air, &vine), Some(true));
+        vine.properties.insert("berries".into(), "true".into());
+        assert_eq!(skips_light_check_for_edit(&air, &vine), Some(false));
     }
 
     #[test]

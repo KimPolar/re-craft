@@ -81,6 +81,7 @@ struct DecorationLightGuard<'a> {
     registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
     changed_blocks: BTreeSet<String>,
     changed_chunks: BTreeSet<ChunkPos>,
+    non_air_counts: BTreeMap<(ChunkPos, i8), usize>,
 }
 
 enum DecorationLightTracking<'a> {
@@ -1026,6 +1027,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 registry,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
+                non_air_counts: BTreeMap::new(),
             });
         }
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
@@ -4586,16 +4588,58 @@ impl OreVeinWorld for DecorationRegion<'_> {
                 if old == *state {
                     unchanged_registered = true;
                 } else {
+                    let old_air = super::generated_state_is_air(guard.registry, &old)
+                        .context("registered light old state is unknown")?;
+                    let new_air = super::generated_state_is_air(guard.registry, state)
+                        .context("registered light new state is unknown")?;
                     ensure!(
-                        super::generated_state_is_air(guard.registry, &old)
-                            .zip(super::generated_state_is_air(guard.registry, state))
-                            .is_some_and(|(a, b)| a == b)
-                            && native_world::sky_light::same_sky_behavior(&old, state)
-                                == Some(true),
+                        native_world::sky_light::same_sky_behavior(&old, state) == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
                         old.name,
                         state.name,
                     );
+                    if old_air != new_air {
+                        ensure!(
+                            native_world::block_light::skips_light_check_for_edit(&old, state)
+                                == Some(true),
+                            "registered light chunk has changed at {p:?}: {} -> {}",
+                            old.name,
+                            state.name
+                        );
+                        let key = (chunk(p), i8::try_from(p[1].div_euclid(16))?);
+                        let count = if let Some(count) = guard.non_air_counts.get(&key) {
+                            *count
+                        } else {
+                            let blocks = self
+                                .world
+                                .chunks
+                                .get(&key.0)
+                                .and_then(|c| c.sections.get(&key.1))
+                                .and_then(|s| s.blocks.as_ref())
+                                .context("registered light section is missing")?;
+                            let mut count = 0;
+                            for id in blocks.iter() {
+                                let block =
+                                    self.world.state(*id).context("unknown section block")?;
+                                if !super::generated_state_is_air(guard.registry, block)
+                                    .context("unknown registered section block")?
+                                {
+                                    count += 1;
+                                }
+                            }
+                            count
+                        };
+                        ensure!(
+                            if old_air { count > 0 } else { count > 1 },
+                            "registered light section occupancy changed at {p:?}"
+                        );
+                        let updated = if old_air { count + 1 } else { count - 1 };
+                        self.light_guard
+                            .as_mut()
+                            .unwrap()
+                            .non_air_counts
+                            .insert(key, updated);
+                    }
                     self.light_guard
                         .as_mut()
                         .unwrap()
@@ -6078,6 +6122,146 @@ mod tests {
             }
         }
         {
+            struct VineData;
+            impl ResourceProvider for VineData {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    if path == "data/minecraft/worldgen/biome/plains.json" {
+                        let vine = json!({"feature":{"type":"minecraft:block_column","direction":"down",
+                            "allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},
+                            "prioritize_tip":true,"layers":[{"height":1,
+                            "provider":{"id":"minecraft:cave_vines_plant","properties":{"berries":"false"}}}]},
+                            "placement":[{"type":"minecraft:offset","x":16,"y":10,"z":8}]});
+                        return Ok(Some(serde_json::to_vec(&json!({"features":[[vine]]}))?));
+                    }
+                    Data.read_data(path)
+                }
+            }
+            let plains = ResourceId::parse("minecraft:plains").unwrap();
+            let schedule =
+                FeatureSchedule::load(&mut VineData, &[plains], &BTreeSet::new()).unwrap();
+            let (_, _, biomes) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &biomes);
+            let mut blocks = batch_registry();
+            blocks.extend([
+                "minecraft:cave_vines_plant".into(),
+                "minecraft:torch".into(),
+            ]);
+            let prepared =
+                PreparedDecoration::load(&mut VineData, &plan, &blocks, &mut resolve_tree_test)
+                    .unwrap();
+            let (mut terrain, vine_tags, vine_motion, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let torch = world.intern_state(state("torch"));
+            world.set_block_id(17, 10, 8, torch).unwrap();
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker.initialize_chunk(&terrain, east, &registry).unwrap();
+            let sources = tracker.sky_sources(&terrain, east).unwrap();
+            let before = terrain.snapshot();
+            {
+                let mut region = terrain
+                    .decoration_region(&vine_tags, &vine_motion, BTreeSet::from([east]))
+                    .unwrap();
+                region.light_guard = Some(DecorationLightGuard {
+                    registered: BTreeSet::from([east]),
+                    registry: &registry,
+                    changed_blocks: BTreeSet::new(),
+                    changed_chunks: BTreeSet::new(),
+                    non_air_counts: BTreeMap::new(),
+                });
+                let mut glowing = state("cave_vines_plant");
+                glowing.properties.insert("berries".into(), "true".into());
+                assert!(region.set_section_block([16, 10, 8], &glowing).is_err());
+            }
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert_eq!(
+                prepared
+                    .execute_with_tracked_light(&mut terrain, false, &mut tracker, &registry)
+                    .unwrap(),
+                [true]
+            );
+            assert_eq!(
+                terrain.snapshot().block(16, 10, 8).unwrap().name,
+                "minecraft:cave_vines_plant"
+            );
+            assert_eq!(&*sources, &*tracker.sky_sources(&terrain, east).unwrap());
+            let mut oracle = Vec::new();
+            for mode in ["vine_plain", "vine_plain_queued"] {
+                let path = temp.path().join(format!("{mode}.json"));
+                let output = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&cp)
+                    .arg("StagedGenerationLightEngineOracle")
+                    .arg(&path)
+                    .arg(mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                oracle.push(
+                    serde_json::from_slice::<Vec<Vec<Vec<u8>>>>(&std::fs::read(path).unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(oracle[0] == oracle[1], "plain vine light checks differed");
+            let mut glowing_oracle = Vec::new();
+            for mode in ["vine", "vine_queued"] {
+                let path = temp.path().join(format!("{mode}.json"));
+                let output = Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&cp)
+                    .arg("StagedGenerationLightEngineOracle")
+                    .arg(&path)
+                    .arg(mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                glowing_oracle.push(
+                    serde_json::from_slice::<Vec<Vec<Vec<u8>>>>(&std::fs::read(path).unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(
+                glowing_oracle[0][2][1] != glowing_oracle[1][2][1],
+                "expected sky light to depend on check ordering"
+            );
+            let dark = tracker.snapshot(&terrain, [center], &registry).unwrap();
+            let mut engine = StagedGenerationLightEngine::new(tracker);
+            let active = engine
+                .activate(&terrain, east, [center], &registry)
+                .unwrap();
+            for (stage, actual) in [&dark, &dark, &active].into_iter().enumerate() {
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let pos = [x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                actual.block_light(pos),
+                                Some(oracle[0][stage][0][index]),
+                                "vine block {stage} {pos:?}"
+                            );
+                            assert_eq!(
+                                actual.sky_light(pos),
+                                Some(oracle[0][stage][1][index]),
+                                "vine sky {stage} {pos:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        {
             struct MagmaData;
             impl ResourceProvider for MagmaData {
                 fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -6185,6 +6369,52 @@ mod tests {
         }
         let tracker = &engine.fresh;
 
+        // A section status update is required when its first non-air block is
+        // added or its last is removed, even when the light shapes match.
+        for initial in [0, 2] {
+            let (mut sparse, tags, _, _) = fixture();
+            let mut block_ids = batch_registry();
+            block_ids.insert("minecraft:cave_vines_plant".into());
+            let motion = HeightmapTags::load(&mut Data, &block_ids).unwrap();
+            let world = Arc::make_mut(&mut sparse.world);
+            let air = world.intern_state(state("air"));
+            let mut plain_vine = state("cave_vines_plant");
+            plain_vine
+                .properties
+                .insert("berries".into(), "false".into());
+            let vine = world.intern_state(plain_vine.clone());
+            let section = Arc::make_mut(
+                Arc::make_mut(world.chunks.get_mut(&east).unwrap())
+                    .sections
+                    .get_mut(&0)
+                    .unwrap(),
+            );
+            let data = section.blocks.as_mut().unwrap();
+            data.fill(air);
+            for i in 0..initial {
+                data[i] = vine;
+            }
+            let before = sparse.snapshot();
+            let mut region = sparse
+                .decoration_region(&tags, &motion, BTreeSet::from([east]))
+                .unwrap();
+            region.light_guard = Some(DecorationLightGuard {
+                registered: BTreeSet::from([east]),
+                registry: &registry,
+                changed_blocks: BTreeSet::new(),
+                changed_chunks: BTreeSet::new(),
+                non_air_counts: BTreeMap::new(),
+            });
+            if initial == 0 {
+                assert!(region.set_section_block([16, 0, 0], &plain_vine).is_err());
+            } else {
+                region.set_section_block([16, 0, 0], &state("air")).unwrap();
+                assert!(region.set_section_block([17, 0, 0], &state("air")).is_err());
+            }
+            drop(region);
+            assert!(Arc::ptr_eq(&before, &sparse.snapshot()));
+        }
+
         for replacement in ["air", "torch"] {
             let before = terrain.snapshot();
             let mut region = terrain
@@ -6195,6 +6425,7 @@ mod tests {
                 registry: &registry,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
+                non_air_counts: BTreeMap::new(),
             });
             let initial = region.read([16, 0, 0]).unwrap();
             let valid = if initial.name == "minecraft:stone" {

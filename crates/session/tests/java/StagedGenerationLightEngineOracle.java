@@ -45,6 +45,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
             if(x==1 && z==0 && !magmaOnly) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && edits.get(new BlockPos(16,7,8))==Blocks.MAGMA_BLOCK.defaultBlockState()) f.accept(new BlockPos(16,7,8),Blocks.MAGMA_BLOCK.defaultBlockState());
+            var vine=edits.get(new BlockPos(16,10,8)); if(x==1 && z==0 && vine!=null && vine.getLightEmission()>0) f.accept(new BlockPos(16,10,8),vine);
             if(mixed && x==0 && z==0) f.accept(new BlockPos(0,10,8),Blocks.TORCH.defaultBlockState());
         }
     }
@@ -75,10 +76,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var engine=new LevelLightEngine(w,true,true);
         boolean ore=args.length>1 && args[1].equals("ore");
         boolean normal=args.length>1 && args[1].equals("normal");
-        boolean queued=args.length>1 && args[1].equals("magma_queued");
-        boolean magma=queued || args.length>1 && args[1].equals("magma");
+        boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued"));
+        boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued"));
+        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued"));
+        boolean plain=args.length>1 && args[1].startsWith("vine_plain");
         w.magmaOnly=magma;
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma);
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
         int radius=w.mixed?2:1;
@@ -99,6 +102,22 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(vine){
+            var pos=new BlockPos(16,10,8);
+            var state=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,!plain);
+            boolean wasEmpty=eastSection.section.hasOnlyAir();
+            var old=eastSection.section.setBlockState(0,10,8,state);
+            w.edits.put(pos,state);
+            boolean isEmpty=eastSection.section.hasOnlyAir();
+            if(wasEmpty!=isEmpty)throw new AssertionError("section status changed");
+            w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,10,8);
+            boolean changed=LightEngine.hasDifferentLightProperties(old,state);
+            if(changed==plain)throw new AssertionError("unexpected vine light check");
+            if(changed)engine.checkBlock(pos);
+            stages.add(capture(engine));if(!queued)drain(engine);stages.add(capture(engine));
+            engine.propagateLightSources(new ChunkPos(1,0));drain(engine);stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(magma){
             var pos=new BlockPos(16,7,8);var old=eastSection.section.setBlockState(0,7,8,Blocks.MAGMA_BLOCK.defaultBlockState());
             w.edits.put(pos,Blocks.MAGMA_BLOCK.defaultBlockState());

@@ -403,6 +403,13 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (0, 0)
         }
+        "minecraft:leaf_litter" if state.properties.len() == 2 && facing() => {
+            let segments = state.properties.get("segment_amount")?;
+            if !matches!(segments.as_str(), "1" | "2" | "3" | "4") {
+                return None;
+            }
+            (0, 0)
+        }
         "minecraft:pointed_dripstone" if state.properties.len() == 3 => {
             if !matches!(
                 state.properties.get("thickness").map(String::as_str),
@@ -2680,6 +2687,17 @@ mod tests {
                 }
             }
         }
+        for facing in ["north", "south", "west", "east"] {
+            for amount in 1..=4 {
+                states.push(BlockState {
+                    name: "minecraft:leaf_litter".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), facing.into()),
+                        ("segment_amount".into(), amount.to_string()),
+                    ]),
+                });
+            }
+        }
         let cases: Vec<_> = states
             .iter()
             .map(|s| {
@@ -2698,7 +2716,12 @@ mod tests {
                     if let Some(kind) = s.properties.get("type") {
                         row["type"] = serde_json::json!(kind);
                     }
-                    row["waterlogged"] = serde_json::json!(s.properties["waterlogged"] == "true");
+                    if let Some(waterlogged) = s.properties.get("waterlogged") {
+                        row["waterlogged"] = serde_json::json!(waterlogged == "true");
+                    }
+                }
+                if let Some(amount) = s.properties.get("segment_amount") {
+                    row["segment_amount"] = serde_json::json!(amount.parse::<u8>().unwrap());
                 }
                 if let Some(half) = s.properties.get("half") {
                     row["half"] = serde_json::json!(half);

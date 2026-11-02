@@ -11,6 +11,10 @@ fn state(name: &str) -> BlockState {
         "stone" => ("stone", vec![]),
         "glass" => ("glass", vec![]),
         "water" => ("water", vec![("level", "0")]),
+        "leaf_litter" => (
+            "leaf_litter",
+            vec![("facing", "north"), ("segment_amount", "2")],
+        ),
         "slab_bottom" => (
             "stone_slab",
             vec![("type", "bottom"), ("waterlogged", "false")],
@@ -94,6 +98,18 @@ fn generated_sources_reject_incomplete_data_without_mutation() {
     let issue = generated_chunk_sky_issue(&world, bounds, pos);
     assert!(issue.contains("example:unknown"), "{issue}");
     assert!(issue.contains("[-16, 15, 32]"), "{issue}");
+}
+
+#[test]
+fn leaf_litter_transmits_generated_sky_light() {
+    let (mut world, pos) = fixture();
+    let leaf = world.intern_state(state("leaf_litter"));
+    let stone = world.intern_state(state("stone"));
+    world.set_block_id(-16, 5, 32, leaf).unwrap();
+    world.set_block_id(-16, 4, 32, stone).unwrap();
+    let sources =
+        generated_chunk_sky_sources(&world, LightBounds::new(-16, 16).unwrap(), pos).unwrap();
+    assert_eq!(sources[0], 5);
 }
 
 #[test]

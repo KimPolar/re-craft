@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use glam::IVec3;
 use native_core::beardifier::Beardifier;
 use native_core::random::DecorationRandom;
@@ -191,13 +191,33 @@ impl FreshGenerationLightTracker {
             "fresh light engine has propagated chunks"
         );
         for (pos, original) in &self.registered {
-            ensure!(
-                world
-                    .chunks
-                    .get(pos)
-                    .is_some_and(|chunk| Arc::ptr_eq(chunk, original)),
-                "registered light chunk has changed"
-            );
+            let Some(current) = world.chunks.get(pos) else {
+                bail!("registered light chunk has changed: {pos:?} is missing");
+            };
+            if !Arc::ptr_eq(current, original) {
+                for (y, before) in &original.sections {
+                    let Some(after) = current.sections.get(y) else {
+                        bail!("registered light chunk has changed: {pos:?} section {y} is missing");
+                    };
+                    if let (Some(before), Some(after)) = (&before.blocks, &after.blocks) {
+                        if let Some(index) =
+                            before.iter().zip(after.iter()).position(|(a, b)| a != b)
+                        {
+                            let position = [
+                                pos.x * 16 + (index % 16) as i32,
+                                i32::from(*y) * 16 + (index / 256) as i32,
+                                pos.z * 16 + ((index / 16) % 16) as i32,
+                            ];
+                            bail!(
+                                "registered light chunk has changed: {position:?}: {:?} -> {:?}",
+                                world.state(before[index]),
+                                world.state(after[index])
+                            );
+                        }
+                    }
+                }
+                bail!("registered light chunk has changed: {pos:?} has no differing block found");
+            }
         }
         Ok(())
     }

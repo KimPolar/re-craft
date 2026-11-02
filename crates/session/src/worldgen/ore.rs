@@ -5636,6 +5636,31 @@ mod tests {
     }
 
     #[test]
+    fn fresh_light_tracker_reports_changed_block_and_preserves_rejection() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
+        tracker
+            .registered
+            .insert(center, Arc::clone(&terrain.world.chunks[&center]));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.set_section_block([8, 5, 8], &state("air")).unwrap();
+        let error = tracker
+            .validate_world(&region.world)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("registered light chunk has changed: [8, 5, 8]"),
+            "{error}"
+        );
+        assert!(error.contains("minecraft:stone"), "{error}");
+        assert!(error.contains("minecraft:air"), "{error}");
+        assert!(tracker.validate_world(&region.target.world).is_ok());
+    }
+
+    #[test]
     fn fresh_light_tracker_stays_invalid_after_published_light_is_cleared() {
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

@@ -37,6 +37,10 @@ public class TreeChunkOracle {
       blocks.put(new BlockPos(8,8,9),Blocks.SHORT_GRASS.defaultBlockState());
       if(args[0].equals("vegetation-supported"))bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_VEGETATION));
     }
+    if(args.length>0 && args[0].startsWith("sapling")){
+      blocks.put(new BlockPos(8,8,9),Blocks.OAK_SAPLING.defaultBlockState().setValue(BlockStateProperties.STAGE,1));
+      if(args[0].equals("sapling-supported"))bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_VEGETATION));
+    }
     var worldRandom=new WorldgenRandom(new XoroshiroRandomSource(123));
     var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(proxy,m,v)->{
       if(m.getName().equals("getMinY"))return 0;if(m.getName().equals("getMaxY"))return 15;
@@ -57,7 +61,7 @@ public class TreeChunkOracle {
     for(int x=0;x<16;x++)for(int y=7;y<16;y++)for(int z=0;z<16;z++){
       var p=new BlockPos(x,y,z);var s=blocks.get(p);if(s==null || s.is(Blocks.AIR))continue;
       var name=BuiltInRegistries.BLOCK.getKey(s.getBlock()).toString();
-      var extra=s.is(Blocks.OAK_LOG)?",axis="+s.getValue(BlockStateProperties.AXIS):s.is(Blocks.OAK_LEAVES)?",distance="+s.getValue(BlockStateProperties.DISTANCE)+",persistent="+s.getValue(BlockStateProperties.PERSISTENT)+",waterlogged="+s.getValue(BlockStateProperties.WATERLOGGED):s.is(Blocks.GRASS_BLOCK)?",snowy="+s.getValue(BlockStateProperties.SNOWY):"";
+      var extra=s.is(Blocks.OAK_LOG)?",axis="+s.getValue(BlockStateProperties.AXIS):s.is(Blocks.OAK_LEAVES)?",distance="+s.getValue(BlockStateProperties.DISTANCE)+",persistent="+s.getValue(BlockStateProperties.PERSISTENT)+",waterlogged="+s.getValue(BlockStateProperties.WATERLOGGED):s.is(Blocks.GRASS_BLOCK)?",snowy="+s.getValue(BlockStateProperties.SNOWY):s.is(Blocks.OAK_SAPLING)?",stage="+s.getValue(BlockStateProperties.STAGE):"";
       result.add(pos(p)+","+name+extra);
     }
     out.println("RESULT "+success+" B "+String.join(";",result)+" T "+String.join(";",ticks));

@@ -1325,14 +1325,50 @@ fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
             | "minecraft:bush"
             | "minecraft:dandelion"
             | "minecraft:poppy"
+            | "minecraft:blue_orchid"
+            | "minecraft:allium"
+            | "minecraft:azure_bluet"
+            | "minecraft:red_tulip"
+            | "minecraft:orange_tulip"
+            | "minecraft:white_tulip"
+            | "minecraft:pink_tulip"
+            | "minecraft:oxeye_daisy"
+            | "minecraft:cornflower"
+            | "minecraft:lily_of_the_valley"
+            | "minecraft:firefly_bush"
+            | "minecraft:closed_eyeblossom"
+            | "minecraft:sweet_berry_bush"
             | "minecraft:short_dry_grass"
             | "minecraft:tall_dry_grass"
             | "minecraft:dead_bush"
             | "minecraft:tall_grass"
             | "minecraft:large_fern"
             | "minecraft:sunflower"
+            | "minecraft:rose_bush"
+            | "minecraft:peony"
+            | "minecraft:lilac"
     ) {
         Ok(Some(simple_plant_kind(state)?))
+    } else if matches!(
+        state.name.as_str(),
+        "minecraft:oak_sapling"
+            | "minecraft:spruce_sapling"
+            | "minecraft:birch_sapling"
+            | "minecraft:jungle_sapling"
+            | "minecraft:acacia_sapling"
+            | "minecraft:dark_oak_sapling"
+            | "minecraft:cherry_sapling"
+            | "minecraft:pale_oak_sapling"
+    ) {
+        ensure!(
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("stage").map(String::as_str),
+                    Some("0" | "1")
+                ),
+            "invalid sapling state"
+        );
+        Ok(Some(SimplePlantKind::Vegetation))
     } else {
         Ok(None)
     }
@@ -1364,7 +1400,8 @@ impl DecorationRegion<'_> {
             disk_safe_solid(&old.name).is_some()
                 || tree_oak_leaf(&old)?
                 || tree_oak_log(&old)
-                || simple_plant_kind(&old).is_ok(),
+                || simple_plant_kind(&old).is_ok()
+                || tree_edge_plant(&old)?.is_some(),
             "unsupported tree source effects"
         );
         self.set_section_block(pos, state)?;
@@ -3700,7 +3737,11 @@ mod tests {
                 TreeData.read_data(path)
             }
         }
-        let (schedule, neighborhood, registry) = prepare_tree_fixture();
+        let (schedule, neighborhood, mut registry) = prepare_tree_fixture();
+        registry.extend([
+            "minecraft:oak_sapling".into(),
+            "minecraft:sweet_berry_bush".into(),
+        ]);
         let plan = fixture_plan(&schedule, &neighborhood);
         for supported in [false, true] {
             let prepared = PreparedDecoration::load(
@@ -3710,21 +3751,28 @@ mod tests {
                 &mut resolve_tree_test,
             )
             .unwrap();
-            let (mut terrain, _, _, _) = fixture();
-            let world = Arc::make_mut(&mut terrain.world);
-            let id = world.intern_state(state("short_grass"));
-            let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
-            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
-            section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
-            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
-            assert_eq!(
-                terrain.snapshot().block(8, 8, 9).unwrap().name,
-                if supported {
-                    "minecraft:short_grass"
-                } else {
-                    "minecraft:air"
+            for name in ["short_grass", "oak_sapling", "sweet_berry_bush"] {
+                let (mut terrain, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut terrain.world);
+                let mut plant = state(name);
+                if name == "oak_sapling" {
+                    plant.properties.insert("stage".into(), "1".into());
                 }
-            );
+                if name == "sweet_berry_bush" {
+                    plant.properties.insert("age".into(), "3".into());
+                }
+                let id = world.intern_state(plant.clone());
+                let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+                assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+                let expected = if supported { plant } else { state("air") };
+                assert_eq!(
+                    terrain.snapshot().block(8, 8, 9).unwrap(),
+                    &expected,
+                    "{name}, support {supported}"
+                );
+            }
         }
     }
 
@@ -3799,12 +3847,36 @@ mod tests {
             "bush",
             "dandelion",
             "poppy",
+            "blue_orchid",
+            "allium",
+            "azure_bluet",
+            "red_tulip",
+            "orange_tulip",
+            "white_tulip",
+            "pink_tulip",
+            "oxeye_daisy",
+            "cornflower",
+            "lily_of_the_valley",
+            "firefly_bush",
+            "closed_eyeblossom",
+            "sweet_berry_bush",
             "short_dry_grass",
             "tall_dry_grass",
             "dead_bush",
             "tall_grass",
             "large_fern",
             "sunflower",
+            "rose_bush",
+            "peony",
+            "lilac",
+            "oak_sapling",
+            "spruce_sapling",
+            "birch_sapling",
+            "jungle_sapling",
+            "acacia_sapling",
+            "dark_oak_sapling",
+            "cherry_sapling",
+            "pale_oak_sapling",
         ];
         let (_, _, mut registry) = prepare_tree_fixture();
         for name in names {
@@ -3812,7 +3884,10 @@ mod tests {
         }
         let mut expected = Vec::new();
         for name in names {
-            let doubled = matches!(name, "tall_grass" | "large_fern" | "sunflower");
+            let doubled = matches!(
+                name,
+                "tall_grass" | "large_fern" | "sunflower" | "rose_bush" | "peony" | "lilac"
+            );
             for support in [false, true] {
                 let required = BTreeSet::from([
                     ResourceId::parse("minecraft:supports_vegetation").unwrap(),
@@ -3824,56 +3899,84 @@ mod tests {
                 let (mut terrain, _, _, _) = fixture();
                 let writable = terrain.snapshot().chunks.keys().copied().collect();
                 let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
-                for half in 0..if doubled { 2 } else { 1 } {
-                    for below_pair in 0..if doubled && half == 1 { 2 } else { 1 } {
-                        let mut plant = state(name);
-                        if doubled {
-                            plant.properties.insert(
-                                "half".into(),
-                                if half == 0 { "lower" } else { "upper" }.into(),
+                let stages = if name.ends_with("_sapling") {
+                    2
+                } else if name == "sweet_berry_bush" {
+                    4
+                } else {
+                    1
+                };
+                for stage in 0..stages {
+                    for half in 0..if doubled { 2 } else { 1 } {
+                        for below_pair in 0..if doubled && half == 1 { 2 } else { 1 } {
+                            let mut plant = state(name);
+                            if name.ends_with("_sapling") {
+                                plant.properties.insert("stage".into(), stage.to_string());
+                            }
+                            if name == "sweet_berry_bush" {
+                                plant.properties.insert("age".into(), stage.to_string());
+                            }
+                            if doubled {
+                                plant.properties.insert(
+                                    "half".into(),
+                                    if half == 0 { "lower" } else { "upper" }.into(),
+                                );
+                            }
+                            let mut below = if below_pair == 1 {
+                                state(name)
+                            } else {
+                                state("stone")
+                            };
+                            if below_pair == 1 {
+                                below.properties.insert("half".into(), "lower".into());
+                            }
+                            let id = region.world.intern_state(below);
+                            let chunk = Arc::make_mut(
+                                region
+                                    .world
+                                    .chunks
+                                    .get_mut(&ChunkPos { x: 0, z: 0 })
+                                    .unwrap(),
                             );
-                        }
-                        let mut below = if below_pair == 1 {
-                            state(name)
-                        } else {
-                            state("stone")
-                        };
-                        if below_pair == 1 {
-                            below.properties.insert("half".into(), "lower".into());
-                        }
-                        let id = region.world.intern_state(below);
-                        let chunk = Arc::make_mut(
-                            region
-                                .world
-                                .chunks
-                                .get_mut(&ChunkPos { x: 0, z: 0 })
-                                .unwrap(),
-                        );
-                        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
-                        section.blocks.as_mut().unwrap()[8 + 8 * 16 + 7 * 256] = id;
-                        for (direction_name, direction) in
-                            [("down", [0, -1, 0]), ("up", [0, 1, 0]), ("east", [1, 0, 0])]
-                        {
-                            for neighbor_kind in 0..if doubled { 3 } else { 1 } {
-                                let mut neighbor = if neighbor_kind == 0 {
-                                    state("air")
-                                } else {
-                                    state(name)
-                                };
-                                if neighbor_kind != 0 {
-                                    let other = if neighbor_kind == 1 { 1 - half } else { half };
-                                    neighbor.properties.insert(
-                                        "half".into(),
-                                        if other == 0 { "lower" } else { "upper" }.into(),
-                                    );
+                            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                            section.blocks.as_mut().unwrap()[8 + 8 * 16 + 7 * 256] = id;
+                            for (direction_name, direction) in
+                                [("down", [0, -1, 0]), ("up", [0, 1, 0]), ("east", [1, 0, 0])]
+                            {
+                                for neighbor_kind in 0..if doubled { 3 } else { 1 } {
+                                    let mut neighbor = if neighbor_kind == 0 {
+                                        state("air")
+                                    } else {
+                                        state(name)
+                                    };
+                                    if neighbor_kind != 0 {
+                                        let other =
+                                            if neighbor_kind == 1 { 1 - half } else { half };
+                                        neighbor.properties.insert(
+                                            "half".into(),
+                                            if other == 0 { "lower" } else { "upper" }.into(),
+                                        );
+                                    }
+                                    let updated=native_resources::tree_leaf_update::ShapeEdgeWorld::update_shape(&mut region,[8,8,8],&plant,direction,[8+direction[0],8+direction[1],8+direction[2]],&neighbor).unwrap();
+                                    let extra = updated
+                                        .properties
+                                        .get("half")
+                                        .map(|v| format!(",{v}"))
+                                        .or_else(|| {
+                                            updated
+                                                .properties
+                                                .get("stage")
+                                                .map(|v| format!(",stage={v}"))
+                                        })
+                                        .or_else(|| {
+                                            updated
+                                                .properties
+                                                .get("age")
+                                                .map(|v| format!(",age={v}"))
+                                        })
+                                        .unwrap_or_default();
+                                    expected.push(format!("C {name} {support} {stage} {half} {below_pair} {direction_name} {neighbor_kind} {}{extra}",updated.name));
                                 }
-                                let updated=native_resources::tree_leaf_update::ShapeEdgeWorld::update_shape(&mut region,[8,8,8],&plant,direction,[8+direction[0],8+direction[1],8+direction[2]],&neighbor).unwrap();
-                                let extra = updated
-                                    .properties
-                                    .get("half")
-                                    .map(|v| format!(",{v}"))
-                                    .unwrap_or_default();
-                                expected.push(format!("C {name} {support} {half} {below_pair} {direction_name} {neighbor_kind} {}{extra}",updated.name));
                             }
                         }
                     }
@@ -3884,6 +3987,7 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("C "))
             .collect();
+        assert_eq!(actual.len(), 564);
         assert_eq!(actual.len(), expected.len());
         for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
             assert_eq!(*actual, expected, "case {i}");
@@ -4183,81 +4287,91 @@ mod tests {
                 TreeData.read_data(path)
             }
         }
-        for supported in [false, true] {
-            let mode = if supported {
-                "vegetation-supported"
-            } else {
-                "vegetation"
-            };
-            let java_output = run(Command::new(java.join("java.exe"))
-                .arg("-classpath")
-                .arg(&cp)
-                .arg("TreeChunkOracle")
-                .arg(mode));
-            let actual = java_output
-                .lines()
-                .find(|line| line.starts_with("RESULT "))
+        let mut scenario_registry = registry.clone();
+        scenario_registry.insert("minecraft:oak_sapling".into());
+        for plant_name in ["short_grass", "oak_sapling"] {
+            for supported in [false, true] {
+                let mode = match (plant_name, supported) {
+                    ("short_grass", true) => "vegetation-supported",
+                    ("short_grass", false) => "vegetation",
+                    (_, true) => "sapling-supported",
+                    _ => "sapling",
+                };
+                let java_output = run(Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&cp)
+                    .arg("TreeChunkOracle")
+                    .arg(mode));
+                let actual = java_output
+                    .lines()
+                    .find(|line| line.starts_with("RESULT "))
+                    .unwrap();
+                let prepared = PreparedDecoration::load(
+                    &mut TreeSupport(supported),
+                    &plan,
+                    &scenario_registry,
+                    &mut resolve_tree_test,
+                )
                 .unwrap();
-            let prepared = PreparedDecoration::load(
-                &mut TreeSupport(supported),
-                &plan,
-                &registry,
-                &mut resolve_tree_test,
-            )
-            .unwrap();
-            let (mut terrain, _, _, _) = fixture();
-            let world = Arc::make_mut(&mut terrain.world);
-            let id = world.intern_state(state("short_grass"));
-            let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
-            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
-            section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
-            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
-            let world = terrain.snapshot();
-            assert_eq!(
-                world.block(8, 8, 9).unwrap().name,
-                if supported {
-                    "minecraft:short_grass"
-                } else {
-                    "minecraft:air"
+                let (mut terrain, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut terrain.world);
+                let mut plant = state(plant_name);
+                if plant_name == "oak_sapling" {
+                    plant.properties.insert("stage".into(), "1".into());
                 }
-            );
-            let mut blocks = Vec::new();
-            for x in 0..16 {
-                for y in 7..16 {
-                    for z in 0..16 {
-                        let block = world.block(x, y, z).unwrap();
-                        let extra = match block.name.as_str() {
-                            "minecraft:dirt" | "minecraft:short_grass" => String::new(),
-                            "minecraft:oak_log" => format!(",axis={}", block.properties["axis"]),
-                            "minecraft:oak_leaves" => format!(
-                                ",distance={},persistent={},waterlogged={}",
-                                block.properties["distance"],
-                                block.properties["persistent"],
-                                block.properties["waterlogged"]
-                            ),
-                            _ => continue,
-                        };
-                        blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                let id = world.intern_state(plant.clone());
+                let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+                assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+                let world = terrain.snapshot();
+                assert_eq!(
+                    world.block(8, 8, 9).unwrap(),
+                    &if supported { plant } else { state("air") }
+                );
+                let mut blocks = Vec::new();
+                for x in 0..16 {
+                    for y in 7..16 {
+                        for z in 0..16 {
+                            let block = world.block(x, y, z).unwrap();
+                            let extra = match block.name.as_str() {
+                                "minecraft:dirt" | "minecraft:short_grass" => String::new(),
+                                "minecraft:oak_sapling" => {
+                                    format!(",stage={}", block.properties["stage"])
+                                }
+                                "minecraft:oak_log" => {
+                                    format!(",axis={}", block.properties["axis"])
+                                }
+                                "minecraft:oak_leaves" => format!(
+                                    ",distance={},persistent={},waterlogged={}",
+                                    block.properties["distance"],
+                                    block.properties["persistent"],
+                                    block.properties["waterlogged"]
+                                ),
+                                _ => continue,
+                            };
+                            blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                        }
                     }
                 }
+                let ticks = world
+                    .saved_block_ticks
+                    .get(&ChunkPos { x: 0, z: 0 })
+                    .into_iter()
+                    .flatten()
+                    .map(|tick| {
+                        format!(
+                            "{},{},{},{}",
+                            tick.position[0], tick.position[1], tick.position[2], tick.block
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual,
+                    format!("RESULT true B {} T {}", blocks.join(";"), ticks.join(";")),
+                    "{mode}"
+                );
             }
-            let ticks = world
-                .saved_block_ticks
-                .get(&ChunkPos { x: 0, z: 0 })
-                .into_iter()
-                .flatten()
-                .map(|tick| {
-                    format!(
-                        "{},{},{},{}",
-                        tick.position[0], tick.position[1], tick.position[2], tick.block
-                    )
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                actual,
-                format!("RESULT true B {} T {}", blocks.join(";"), ticks.join(";")),
-                "{mode}"
-            );
         }
     }
     #[test]

@@ -38,11 +38,21 @@ public class ItemBubbleTraversalOracle {
         @Override public void setDeltaMovement(Vec3 value) { velocity=value; }
         @Override protected AABB makeBoundingBox(Vec3 pos) { return new AABB(pos.x-.125,pos.y,pos.z-.125,pos.x+.125,pos.y+.25,pos.z+.125); }
     }
+    static class Orb extends ExperienceOrb {
+        Vec3 velocity;
+        Orb() { super(null,0,0,0,1); }
+        @Override public boolean isAlive() { return true; }
+        @Override public MoveSimulationType getMoveSimulationType() { return MoveSimulationType.SERVER_AND_CLIENT; }
+        @Override public Vec3 getDeltaMovement() { return velocity; }
+        @Override public void setDeltaMovement(double x,double y,double z) { velocity=new Vec3(x,y,z); }
+        @Override public void setDeltaMovement(Vec3 value) { velocity=value; }
+        @Override protected AABB makeBoundingBox(Vec3 pos) { return new AABB(pos.x-.25,pos.y,pos.z-.25,pos.x+.25,pos.y+.5,pos.z+.25); }
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var world=(World)unsafe.allocateInstance(World.class);
-        var item=(Item)unsafe.allocateInstance(Item.class);
+        var item=(Entity)unsafe.allocateInstance(args.length>1 && args[1].equals("orb")?Orb.class:Item.class);
         var level=Entity.class.getDeclaredField("level"); unsafe.putObject(item,unsafe.objectFieldOffset(level),world);
         var visited=Entity.class.getDeclaredField("visitedBlocks"); unsafe.putObject(item,unsafe.objectFieldOffset(visited),new LongOpenHashSet());
         var movement=Class.forName("net.minecraft.world.entity.Entity$Movement").getDeclaredConstructor(Vec3.class,Vec3.class,Vec3.class); movement.setAccessible(true);
@@ -57,9 +67,9 @@ public class ItemBubbleTraversalOracle {
             {8.1,10.0,8.5,-0.99998999,0,0}, {8.1,10.0,8.5,-0.99999001,0,0}
         }) {
             world.surface=surface; world.drag=drag;
-            var from=new Vec3(value[0],value[1],value[2]); var to=from.add(value[3],value[4],value[5]); item.velocity=new Vec3(0.2,-0.2,-0.3); item.fallDistance=5;
+            var from=new Vec3(value[0],value[1],value[2]); var to=from.add(value[3],value[4],value[5]); item.setDeltaMovement(new Vec3(0.2,-0.2,-0.3)); item.fallDistance=5;
             method.invoke(item,List.of(movement.newInstance(from,to,to.subtract(from))),new InsideBlockEffectApplier.StepBasedCollector());
-            var input=new JsonArray(); for(double x:value) input.add(x); var row=new JsonObject(); row.add("input",input); row.addProperty("surface",surface); row.addProperty("drag",drag); row.addProperty("velocity",item.velocity.y); row.addProperty("fall",item.fallDistance); rows.add(row);
+            var input=new JsonArray(); for(double x:value) input.add(x); var row=new JsonObject(); row.add("input",input); row.addProperty("surface",surface); row.addProperty("drag",drag); row.addProperty("velocity",item.getDeltaMovement().y); row.addProperty("fall",item.fallDistance); rows.add(row);
         }
         Files.writeString(Path.of(args[0]),rows.toString());
     }

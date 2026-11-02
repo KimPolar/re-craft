@@ -843,6 +843,50 @@ impl Orbs {
         player_random: &mut LegacyRandom,
         xp: &mut Experience,
         score: &mut i32,
+        shape: impl FnMut(IVec3) -> &'a [Aabb],
+        friction: impl FnMut(IVec3) -> f32,
+        keep_support_height: impl FnMut(IVec3) -> bool,
+        fluid: impl FnMut(BoundingBox, DVec3) -> (native_world::fluid::FluidContacts, bool),
+        fast_lava: bool,
+        path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+        safe: impl FnMut(BoundingBox, DVec3) -> bool,
+        rain_at: impl FnMut(IVec3) -> Option<bool>,
+    ) {
+        self.tick_with_fluid_bubbles_and_proof(
+            origin,
+            player,
+            pose,
+            mode,
+            alive,
+            inventory,
+            player_random,
+            xp,
+            score,
+            shape,
+            friction,
+            keep_support_height,
+            fluid,
+            fast_lava,
+            path,
+            safe,
+            rain_at,
+            |_, _, _| Some(Vec::new()),
+            |_| {},
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tick_with_fluid_bubbles_and_proof<'a>(
+        &mut self,
+        origin: IVec3,
+        player: DVec3,
+        pose: PlayerPose,
+        mode: GameMode,
+        alive: bool,
+        inventory: &mut Arc<PlayerInventory>,
+        player_random: &mut LegacyRandom,
+        xp: &mut Experience,
+        score: &mut i32,
         mut shape: impl FnMut(IVec3) -> &'a [Aabb],
         mut friction: impl FnMut(IVec3) -> f32,
         mut keep_support_height: impl FnMut(IVec3) -> bool,
@@ -851,6 +895,12 @@ impl Orbs {
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
         mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
         mut rain_at: impl FnMut(IVec3) -> Option<bool>,
+        mut bubble: impl FnMut(
+            BoundingBox,
+            DVec3,
+            DVec3,
+        ) -> Option<Vec<crate::bubble_column::EntityContact>>,
+        mut on_bubble: impl FnMut(Option<Option<IVec3>>),
     ) {
         self.pickup_delay = self.pickup_delay.saturating_sub(1);
         if self.entities.is_empty() {
@@ -877,6 +927,14 @@ impl Orbs {
             let bounds = orb_bounds(relative);
             entity.visual.previous_position = entity.visual.position;
             let (contacts, lava_at_position) = fluid(bounds, relative);
+            if let Some(created) = &mut entity.created {
+                if contacts.water.depth > 0.0 {
+                    created.fall_distance = 0.0;
+                }
+                if contacts.lava.depth > 0.0 {
+                    created.fall_distance *= 0.5;
+                }
+            }
             if entity.damage.invulnerable_time > 0 {
                 entity.damage.invulnerable_time -= 1;
             }
@@ -984,6 +1042,47 @@ impl Orbs {
             let actual =
                 movement::resolve_box(bounds, requested, entity.on_ground, 0.0, &mut shape);
             entity.visual.position += actual;
+            if (requested.x - actual.x).abs() >= f64::from(1.0e-5_f32) {
+                entity.velocity.x = 0.0;
+            }
+            if (requested.z - actual.z).abs() >= f64::from(1.0e-5_f32) {
+                entity.velocity.z = 0.0;
+            }
+            let hit_y = requested.y != actual.y;
+            entity.on_ground = hit_y && requested.y < 0.0;
+            if let Some(created) = &mut entity.created {
+                if entity.on_ground {
+                    created.fall_distance = 0.0;
+                } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
+                    created.fall_distance -= f64::from(actual.y as f32);
+                }
+            }
+            if hit_y {
+                entity.velocity.y = 0.0;
+            }
+            match bubble(bounds, actual, requested) {
+                Some(contacts) => {
+                    for contact in contacts {
+                        entity.velocity = crate::bubble_column::player_velocity(
+                            entity.velocity,
+                            contact.drag_down,
+                            contact.surface,
+                            false,
+                        );
+                        if !contact.surface {
+                            if let Some(created) = &mut entity.created {
+                                created.fall_distance = 0.0;
+                            }
+                        }
+                        entity.save_unresolved = true;
+                        on_bubble(Some(contact.surface.then_some(contact.position)));
+                    }
+                }
+                None => {
+                    entity.save_unresolved = true;
+                    on_bubble(None);
+                }
+            }
             let was_burning = entity.damage.fire_ticks > 0;
             match path(bounds, actual, requested) {
                 Some(effects) => {
@@ -1055,20 +1154,7 @@ impl Orbs {
                     cells.entry(current).or_default().push(index);
                 }
             }
-            if (requested.x - actual.x).abs() >= f64::from(1.0e-5_f32) {
-                entity.velocity.x = 0.0;
-            }
-            if (requested.z - actual.z).abs() >= f64::from(1.0e-5_f32) {
-                entity.velocity.z = 0.0;
-            }
-            let hit_y = requested.y != actual.y;
-            entity.on_ground = hit_y && requested.y < 0.0;
             if let Some(created) = &mut entity.created {
-                if entity.on_ground {
-                    created.fall_distance = 0.0;
-                } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
-                    created.fall_distance -= f64::from(actual.y as f32);
-                }
                 let supported = contacts.water.depth <= 0.0
                     && contacts.lava.depth <= 0.0
                     && !lava_at_position
@@ -1096,9 +1182,6 @@ impl Orbs {
                 entity.ground_without_support = false;
                 None
             };
-            if hit_y {
-                entity.velocity.y = 0.0;
-            }
             let mut drag = 0.98_f32;
             if entity.on_ground {
                 let below = movement::movement_on_block(
@@ -1811,6 +1894,177 @@ mod tests {
             created: None,
             save_unresolved: false,
             damage: OrbDamageState::default(),
+        }
+    }
+
+    #[test]
+    fn orb_bubble_effect_is_applied_before_drag_and_flags_save() {
+        let mut orbs = Orbs::default();
+        orbs.entities
+            .push(test_orb(1, DVec3::new(8.5, 10.0, 8.5), 1, 0, 1));
+        orbs.entities[0].no_gravity = true;
+        let mut events = Vec::new();
+        orbs.tick_with_fluid_bubbles_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            false,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(1),
+            &mut Experience::default(),
+            &mut 0,
+            |_| &[],
+            |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| false,
+            |_| Some(false),
+            |_, _, _| {
+                Some(vec![crate::bubble_column::EntityContact {
+                    position: IVec3::new(8, 10, 8),
+                    drag_down: false,
+                    surface: true,
+                }])
+            },
+            |event| events.push(event),
+        );
+        assert_eq!(orbs.entities[0].velocity.y, 0.1 * f64::from(0.98_f32));
+        assert!(orbs.entities[0].save_unresolved);
+        assert_eq!(events, vec![Some(Some(IVec3::new(8, 10, 8)))]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn orb_bubble_motion_and_ground_bounce_match_java_tick() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("OrbBubbleMotionOracle.java");
+        let output = temp.path().join("orb.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/OrbBubbleMotionOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("OrbBubbleMotionOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 56);
+        for row in rows {
+            let mut orbs = Orbs::default();
+            let position = DVec3::new(8.5, 10.1, 8.5);
+            let mut orb = test_orb(1, position, 1, 0, 1);
+            orb.velocity = DVec3::new(0.2, row["initial"].as_f64().unwrap(), -0.3);
+            orb.created = Some(CreatedOrb::new(position, 0.0));
+            orb.created.as_mut().unwrap().fall_distance = 5.0;
+            orbs.entities.push(orb);
+            let floor = row["floor"].as_bool().unwrap();
+            let mut events = Vec::new();
+            orbs.tick_with_fluid_bubbles_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                false,
+                &mut Arc::new(PlayerInventory::default()),
+                &mut LegacyRandom::new(1),
+                &mut Experience::default(),
+                &mut 0,
+                |pos| {
+                    if floor && pos.y == 9 {
+                        native_world::collision::unknown_barrier()
+                    } else {
+                        &[]
+                    }
+                },
+                |_| 0.6,
+                |_| false,
+                |_, _| {
+                    let mut fluid = native_world::fluid::FluidContacts::default();
+                    fluid.water.depth = 1.0;
+                    fluid.water.eyes_inside = true;
+                    (fluid, false)
+                },
+                false,
+                |_, _, _| Some(vec![native_world::fluid::FluidKind::Water]),
+                |_, _| false,
+                |_| Some(false),
+                |_, _, _| {
+                    Some(vec![crate::bubble_column::EntityContact {
+                        position: IVec3::new(8, 10, 8),
+                        drag_down: row["drag"].as_bool().unwrap(),
+                        surface: row["surface"].as_bool().unwrap(),
+                    }])
+                },
+                |event| events.push(event),
+            );
+            let actual = &orbs.entities[0];
+            let expected = |name: &str| row[name].as_f64().unwrap();
+            assert!(
+                (actual.visual.position - DVec3::new(expected("x"), expected("y"), expected("z")))
+                    .abs()
+                    .max_element()
+                    < 1.0e-12,
+                "{row}"
+            );
+            assert!(
+                (actual.velocity - DVec3::new(expected("vx"), expected("vy"), expected("vz")))
+                    .abs()
+                    .max_element()
+                    < 1.0e-12,
+                "{row}: {:?}",
+                actual.velocity
+            );
+            assert_eq!(
+                actual.created.as_ref().unwrap().fall_distance,
+                expected("fall"),
+                "{row}"
+            );
+            assert_eq!(actual.on_ground, row["ground"].as_bool().unwrap(), "{row}");
+            assert_eq!(
+                events.len(),
+                row["calls"].as_u64().unwrap() as usize,
+                "{row}"
+            );
         }
     }
 

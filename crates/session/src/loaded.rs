@@ -17125,7 +17125,7 @@ impl LoadedSession {
             climates: self.biome_climates.as_deref(),
             sea_level: self.generator_sea_level,
         };
-        self.experience_orbs.tick_with_fluid_and_proof(
+        self.experience_orbs.tick_with_fluid_bubbles_and_proof(
             origin,
             self.motion.position,
             self.player.pose,
@@ -17169,6 +17169,15 @@ impl LoadedSession {
             |bounds, actual, requested| fluid::swept_effects(bounds, actual, requested, &|pos| fluid_view.at(pos)),
             |bounds, actual| orb_path_proof.safe(bounds, actual),
             |pos| rain.at(pos),
+            |bounds, actual, requested| fluid_view.bubble_contacts(bounds, actual, requested),
+            |contact| {
+                self.unresolved_bubble_tick = true;
+                if let Some(Some(relative)) = contact {
+                    if let Some(position) = add(origin, relative) {
+                        queue_bubble_surface_particles(&mut self.bubble_surface_particles, &mut self.level_random, self.tick, position);
+                    }
+                }
+            },
         );
     }
 
@@ -30319,7 +30328,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-    fn item_bubble_traversal_matches_java() {
+    fn item_and_orb_bubble_traversal_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -30342,6 +30351,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
         let source = temp.path().join("ItemBubbleTraversalOracle.java");
         let output = temp.path().join("item-traversal.json");
+        let orb_output = temp.path().join("orb-traversal.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/ItemBubbleTraversalOracle.java"),
@@ -30357,6 +30367,12 @@ pub(crate) mod tests {
                 .arg(&cp)
                 .arg("ItemBubbleTraversalOracle")
                 .arg(&output),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ItemBubbleTraversalOracle")
+                .arg(&orb_output)
+                .arg("orb"),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -30366,10 +30382,15 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&result.stderr)
             );
         }
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 56);
-        for row in rows {
+        let rows = [(false, output), (true, orb_output)]
+            .into_iter()
+            .flat_map(|(orb, output)| {
+                let values: Vec<serde_json::Value> =
+                    serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+                assert_eq!(values.len(), 56);
+                values.into_iter().map(move |value| (orb, value))
+            });
+        for (orb, row) in rows {
             let mut session = session();
             let bubble = session.intern_block(state(
                 "minecraft:bubble_column",
@@ -30392,9 +30413,10 @@ pub(crate) mod tests {
             let from = DVec3::new(number(0), number(1), number(2));
             let requested = DVec3::new(number(3), number(4), number(5));
             let movement = (from + requested) - from;
+            let half = if orb { 0.25 } else { 0.125 };
             let bounds = BoundingBox {
-                min: from + DVec3::new(-0.125, 0.0, -0.125),
-                max: from + DVec3::new(0.125, 0.25, 0.125),
+                min: from + DVec3::new(-half, 0.0, -half),
+                max: from + DVec3::new(half, half * 2.0, half),
             };
             let view = FluidView {
                 world: &session.world,
@@ -30421,6 +30443,37 @@ pub(crate) mod tests {
             assert_eq!(velocity.y, row["velocity"].as_f64().unwrap(), "{row}");
             assert_eq!(fall, row["fall"].as_f64().unwrap(), "{row}");
         }
+    }
+
+    #[test]
+    fn experience_orb_in_surface_bubble_emits_ordered_particles() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let bubble = session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+        assert!(session.set(IVec3::new(8, 1, 8), bubble));
+        session.motion.position = DVec3::new(2.5, 5.0, 2.5);
+        session.player.position = session.motion.position.as_vec3();
+        session
+            .experience_orbs
+            .award(session.origin.as_dvec3() + DVec3::new(8.5, 1.05, 8.5), 1);
+        session.update(TICK);
+        let events = session.take_bubble_surface_particles();
+        assert_eq!(events.len(), 4);
+        assert!(session.unresolved_bubble_tick);
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                BubbleSurfaceParticleKind::Splash,
+                BubbleSurfaceParticleKind::Bubble,
+                BubbleSurfaceParticleKind::Splash,
+                BubbleSurfaceParticleKind::Bubble,
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.position.y == 2.0 && event.tick == 1)
+        );
     }
 
     #[test]

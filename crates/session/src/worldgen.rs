@@ -27,9 +27,11 @@ use serde_json::Value;
 
 mod carving;
 mod generated_chest;
+mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
+pub use ore::OreVeinRegion;
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
@@ -55,12 +57,15 @@ pub struct MaterializedTerrain {
 }
 
 /// A collection of intermediate generated chunks sharing one world registry.
-/// These chunks remain at CARVERS stage and are not ready for play or saving.
+/// Individual feature attempts may have modified these CARVERS-stage chunks;
+/// they are not ready for play or saving.
 pub struct CarvedTerrainWorld {
     world: Arc<native_world::loaded::World>,
     seed: i64,
     min_y: i32,
     height: i32,
+    // Direct feature section writes do not update Java's primed heightmap.
+    ore_ocean_floor_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     postprocessing: BTreeMap<native_world::loaded::ChunkPos, Arc<[bool]>>,
     noise_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
@@ -89,6 +94,7 @@ impl CarvedTerrainWorld {
             seed,
             min_y,
             height,
+            ore_ocean_floor_heights: BTreeMap::new(),
             postprocessing: BTreeMap::from([(position, postprocessing)]),
             noise_postprocessing: noise_postprocessing
                 .into_iter()

@@ -2,7 +2,10 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail, ensure};
-use native_core::random::DecorationRandom;
+use native_core::{
+    normal_noise::NormalNoise,
+    random::{DecorationRandom, LegacyRandom},
+};
 use serde_json::Value;
 
 use crate::{
@@ -384,8 +387,39 @@ pub(crate) enum Provider<S> {
         fallback: Option<Box<Provider<S>>>,
         rules: Vec<(Predicate, Provider<S>)>,
     },
+    NoiseThreshold {
+        noise: NormalNoise,
+        scale: f32,
+        threshold: f32,
+        high_chance: f32,
+        default: S,
+        low: Vec<S>,
+        high: Vec<S>,
+    },
 }
 impl<S: Clone> Provider<S> {
+    /// Holder strings refer to the active data-pack state-provider registry.
+    pub(crate) fn load(
+        resources: &mut impl ResourceProvider,
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+    ) -> Result<Self> {
+        if let Some(name) = value.as_str() {
+            let id = ResourceId::parse(name)?;
+            let path = format!(
+                "data/{}/worldgen/block_state_provider/{}.json",
+                id.namespace, id.path
+            );
+            let bytes = resources
+                .read_data(&path)?
+                .with_context(|| format!("missing state provider {path}"))?;
+            let data: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid state provider {path}"))?;
+            Self::decode(&data, resolve, 0)
+        } else {
+            Self::decode(value, resolve, 0)
+        }
+    }
     pub(crate) fn needs_survival(&self, name: &str) -> bool {
         match self {
             Self::Rules { fallback, rules } => {
@@ -450,6 +484,63 @@ impl<S: Clone> Provider<S> {
                 ensure!(total > 0, "weighted state provider has no positive weight");
                 Ok(Self::Weighted { entries, total })
             }
+            "noise_threshold" => {
+                let seed = value
+                    .get("seed")
+                    .and_then(Value::as_i64)
+                    .context("invalid noise provider seed")?;
+                let params = crate::noise::decode_normal_noise(&serde_json::to_vec(
+                    value.get("noise").context("missing provider noise")?,
+                )?)?;
+                let noise = params
+                    .create(&mut LegacyRandom::new(seed))
+                    .map_err(anyhow::Error::msg)?;
+                let number = |key: &str| -> Result<f32> {
+                    let result = value
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .with_context(|| format!("invalid noise provider {key}"))?
+                        as f32;
+                    ensure!(result.is_finite(), "invalid noise provider {key}");
+                    Ok(result)
+                };
+                let scale = number("scale")?;
+                let threshold = number("threshold")?;
+                let high_chance = number("high_chance")?;
+                ensure!(
+                    scale > 0.0
+                        && (-1.0..=1.0).contains(&threshold)
+                        && (0.0..=1.0).contains(&high_chance),
+                    "invalid noise threshold provider range"
+                );
+                let parse_states = |name: &str, resolve: &mut _| -> Result<Vec<S>> {
+                    let list = value
+                        .get(name)
+                        .and_then(Value::as_array)
+                        .with_context(|| format!("missing {name}"))?;
+                    ensure!(
+                        !list.is_empty() && list.len() <= 4096,
+                        "invalid noise provider state list"
+                    );
+                    list.iter().map(resolve).collect()
+                };
+                let default = resolve(
+                    value
+                        .get("default_state")
+                        .context("missing default state")?,
+                )?;
+                let low = parse_states("low_states", resolve)?;
+                let high = parse_states("high_states", resolve)?;
+                Ok(Self::NoiseThreshold {
+                    noise,
+                    scale,
+                    threshold,
+                    high_chance,
+                    default,
+                    low,
+                    high,
+                })
+            }
             "rule_based" => {
                 let fallback = value
                     .get("fallback")
@@ -505,6 +596,13 @@ impl<S: Clone> Provider<S> {
         match self {
             Self::State(state) => states.push(state),
             Self::Weighted { entries, .. } => states.extend(entries.iter().map(|(_, state)| state)),
+            Self::NoiseThreshold {
+                default, low, high, ..
+            } => {
+                states.push(default);
+                states.extend(low.iter());
+                states.extend(high.iter());
+            }
             Self::Rules { fallback, rules } => {
                 if let Some(fallback) = fallback {
                     fallback.states(states);
@@ -537,6 +635,38 @@ impl<S: Clone> Provider<S> {
                     }
                 }
                 unreachable!("validated state weight sum")
+            }
+            Self::NoiseThreshold {
+                noise,
+                scale,
+                threshold,
+                high_chance,
+                default,
+                low,
+                high,
+            } => {
+                let factor = f64::from(*scale);
+                let sample = noise.sample(
+                    f64::from(pos[0]) * factor,
+                    f64::from(pos[1]) * factor,
+                    f64::from(pos[2]) * factor,
+                );
+                let selected = if sample < *threshold {
+                    Some(low)
+                } else if random.next_float() < *high_chance {
+                    Some(high)
+                } else {
+                    None
+                };
+                match selected {
+                    Some(states) => Ok(Some(
+                        states[random
+                            .next_int_bound(states.len() as i32)
+                            .expect("nonempty state list") as usize]
+                            .clone(),
+                    )),
+                    None => Ok(Some(default.clone())),
+                }
             }
             Self::Rules { fallback, rules } => {
                 for (predicate, provider) in rules {

@@ -205,9 +205,9 @@ impl ConfiguredDecoration {
                 Ok(Self::Ore(ConfiguredOre::decode(value, resolve)?))
             }
             ("minecraft", "disk") => Ok(Self::Disk(DiskFeature::decode(value, resolve)?)),
-            ("minecraft", "simple_block") => {
-                Ok(Self::Simple(SimpleBlockFeature::decode(value, resolve)?))
-            }
+            ("minecraft", "simple_block") => Ok(Self::Simple(
+                SimpleBlockFeature::decode_with_resources(provider, value, resolve)?,
+            )),
             ("minecraft", "spring_feature") => {
                 Ok(Self::Spring(SpringFeature::decode(value, resolve)?))
             }
@@ -5548,6 +5548,124 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_flower_noise_provider_matches_java_in_generated_chunk() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("NoiseThresholdOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/NoiseThresholdOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let output = c.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let oracle = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("NoiseThresholdOracle")
+            .arg("chunk"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:flower_plain","placement":[]}))
+                .unwrap();
+        let placed = PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |v| {
+            super::super::resolve_generated_terrain_state(v, &generated)
+        })
+        .unwrap();
+        let tags = OreBlockTags::load(&mut resources, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        for seed in [0, 1] {
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let grass = world.intern_state(
+                super::super::resolve_generated_terrain_state(
+                    &json!("minecraft:grass_block"),
+                    &generated,
+                )
+                .unwrap(),
+            );
+            let center = ChunkPos { x: 0, z: 0 };
+            let blocks = Arc::make_mut(
+                Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+                    .sections
+                    .get_mut(&0)
+                    .unwrap(),
+            )
+            .blocks
+            .as_mut()
+            .unwrap();
+            for z in 0..16 {
+                for x in 0..16 {
+                    blocks[x + z * 16 + 7 * 256] = grass;
+                }
+            }
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut checked = 0;
+            for line in oracle.lines().filter(|v| v.starts_with("C ")) {
+                let a = line.split_whitespace().collect::<Vec<_>>();
+                if a[4].parse::<i64>().unwrap() != seed {
+                    continue;
+                }
+                let p = [
+                    a[1].parse().unwrap(),
+                    a[2].parse().unwrap(),
+                    a[3].parse().unwrap(),
+                ];
+                let mut random = DecorationRandom::new(seed);
+                let mut env = PlacementTestEnv {
+                    allow: true,
+                    fail_after: None,
+                    calls: 0,
+                };
+                assert!(
+                    region
+                        .place_placed(&placed, &mut random, p, 0, 16, &mut env)
+                        .unwrap()
+                );
+                assert_eq!(random.next_long(), a[6].parse::<i64>().unwrap());
+                assert_eq!(region.read(p).unwrap().name, a[5]);
+                checked += 1;
+            }
+            assert_eq!(checked, 256);
+            region.finish().unwrap();
+        }
+    }
+
+    #[test]
     fn unfinished_generated_spawner_cannot_be_published() {
         let (mut terrain, tags, _, _) = fixture();
         let mut registry = batch_registry();
@@ -7514,6 +7632,8 @@ mod tests {
             "spring_delta",
             "underwater_magma",
             "patch_sugar_cane",
+            "patch_firefly_bush_near_water",
+            "flower_plains",
             "patch_cactus_desert",
             "lake_lava_surface",
             "lake_lava_underground",

@@ -37,13 +37,39 @@ impl<S: Clone + Eq> SimpleBlockFeature<S> {
         let bytes = provider
             .read_data(&path)?
             .with_context(|| format!("missing feature {path}"))?;
-        Self::decode(
+        Self::decode_with_resources(
+            provider,
             &serde_json::from_slice::<Value>(&bytes)
                 .with_context(|| format!("invalid feature {path}"))?,
             resolve,
         )
     }
     pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let state_provider = Provider::decode(
+            value
+                .get("to_place")
+                .context("missing simple-block state provider")?,
+            resolve,
+            0,
+        )?;
+        Self::decode_with_provider(value, state_provider)
+    }
+    /// Resolve named providers from the same active data packs as the feature.
+    pub fn decode_with_resources(
+        resources: &mut impl ResourceProvider,
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+    ) -> Result<Self> {
+        let state_provider = Provider::load(
+            resources,
+            value
+                .get("to_place")
+                .context("missing simple-block state provider")?,
+            resolve,
+        )?;
+        Self::decode_with_provider(value, state_provider)
+    }
+    fn decode_with_provider(value: &Value, provider: Provider<S>) -> Result<Self> {
         let kind = ResourceId::parse(
             value
                 .get("type")
@@ -59,13 +85,7 @@ impl<S: Clone + Eq> SimpleBlockFeature<S> {
             Some(value) => value.as_bool().context("invalid schedule_tick")?,
         };
         Ok(Self {
-            provider: Provider::decode(
-                value
-                    .get("to_place")
-                    .context("missing simple-block state provider")?,
-                resolve,
-                0,
-            )?,
+            provider,
             schedule_tick,
         })
     }

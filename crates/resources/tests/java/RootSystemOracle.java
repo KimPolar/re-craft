@@ -30,7 +30,7 @@ public class RootSystemOracle {
     bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
     bind.invoke(Fluids.LAVA.builtInRegistryHolder(),List.of(FluidTags.LAVA));
     bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),List.of(FluidTags.LAVA));
-    for (int mode=0;mode<5;mode++) for(long seed:new long[]{0,1,-1,42,987654321}) {
+    for (int mode=0;mode<7;mode++) for(long seed:new long[]{0,1,-1,42,987654321}) {
       final int m=mode;
       var blocks=new HashMap<BlockPos,BlockState>(); var events=new ArrayList<String>();
       java.util.function.Function<BlockPos,BlockState> at=p->{
@@ -38,6 +38,7 @@ public class RootSystemOracle {
         if(m==4 && p.getY()==3 && p.getX()==0 && p.getZ()==0)return Blocks.STONE.defaultBlockState();
         if(m==1 && p.getY()==7 && p.getX()==0 && p.getZ()==0)return Blocks.WATER.defaultBlockState();
         if(m==2 && p.getY()==8 && p.getX()==0 && p.getZ()==0)return Blocks.STONE.defaultBlockState();
+        if(m==6 && p.getY()==5 && p.getX()==0 && p.getZ()==2)return Blocks.AIR.defaultBlockState();
         return (p.getY()<=2 || p.getY()==4 || p.getY()==5 ? Blocks.STONE : Blocks.AIR).defaultBlockState();
       };
       var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(proxy,method,v)->{
@@ -53,7 +54,7 @@ public class RootSystemOracle {
       });
       Feature nested=new Feature(){public MapCodec<? extends Feature> codec(){return null;}public boolean place(WorldGenLevel w,ChunkGenerator g,RandomSource r,BlockPos p){int n=r.nextInt(3);events.add("P"+pos(p)+","+n);return m!=3 && n!=0;}};
       var tree=new PlacedFeature(Holder.direct(nested),List.of());
-      var feature=new RootSystemFeature(Holder.direct(tree),3,0,0,3,HolderSet.direct(Blocks.STONE.builtInRegistryHolder()),Holder.direct(new SimpleStateProvider(Blocks.ROOTED_DIRT.defaultBlockState())),8,10,3,2,Holder.direct(new SimpleStateProvider(Blocks.HANGING_ROOTS.defaultBlockState())),12,2,BlockPredicate.matchesBlocks(Blocks.AIR));
+      var feature=new RootSystemFeature(Holder.direct(tree),3,mode>=5?2:0,mode>=5?1:0,3,HolderSet.direct(Blocks.STONE.builtInRegistryHolder()),Holder.direct(new SimpleStateProvider(Blocks.ROOTED_DIRT.defaultBlockState())),8,10,3,2,Holder.direct(new SimpleStateProvider(Blocks.HANGING_ROOTS.defaultBlockState())),12,2,BlockPredicate.matchesBlocks(Blocks.AIR));
       var random=new WorldgenRandom(new XoroshiroRandomSource(seed));
       boolean result=feature.place(world,new VegetationPatchOracle.Generator(),random,new BlockPos(0,3,0));
       out.printf("R %d %d %s %s X %d%n",mode,seed,result,String.join(";",events),random.nextLong());

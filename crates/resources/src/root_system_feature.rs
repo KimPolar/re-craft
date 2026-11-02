@@ -323,6 +323,8 @@ mod tests {
                 "water"
             } else if self.mode == 2 && p == [0, 8, 0] {
                 "stone"
+            } else if self.mode == 6 && p == [0, 5, 2] {
+                "air"
             } else if p[1] <= 2 || p[1] == 4 || p[1] == 5 {
                 "stone"
             } else {
@@ -441,10 +443,14 @@ mod tests {
             .arg(&cp)
             .arg("RootSystemOracle"));
         let mut expected = Vec::new();
-        for mode in 0..5 {
+        for mode in 0..7 {
             for seed in [0, 1, -1, 42, 987654321] {
-                let feature =
-                    RootSystemFeature::decode(&mut Data, &definition(), &mut resolve).unwrap();
+                let mut config = definition();
+                if mode >= 5 {
+                    config["level_test_distance"] = json!(2);
+                    config["max_level_deviation"] = json!(1);
+                }
+                let feature = RootSystemFeature::decode(&mut Data, &config, &mut resolve).unwrap();
                 let mut world = World {
                     mode,
                     blocks: BTreeMap::new(),

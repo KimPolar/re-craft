@@ -381,8 +381,7 @@ impl FreshGenerationLightTracker {
         .context("active generated block-light inputs are incomplete or unsupported")
     }
 
-    /// Preview sky light for activated chunks in a fresh engine. Sparse sky
-    /// section storage is not yet supported by this calculation.
+    /// Preview sky light for activated chunks in a fresh engine.
     pub fn calculate_sky_light_for_active_chunks(
         &self,
         terrain: &CarvedTerrainWorld,

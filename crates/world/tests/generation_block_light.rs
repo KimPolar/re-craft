@@ -424,6 +424,157 @@ fn staged_block_sources_match_java_engine() {
 }
 
 #[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn sparse_staged_sky_matches_java_engine() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+    let temp = tempfile::tempdir().unwrap();
+    let version = game.join("versions/26.3");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    assert_eq!(manifest["id"], "26.3");
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for lib in manifest["libraries"].as_array().unwrap() {
+        if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+            let p = game.join("libraries").join(p);
+            if p.is_file() {
+                paths.push(p)
+            }
+        }
+    }
+    let cp = std::env::join_paths(paths).unwrap();
+    let source = temp.path().join("SparseSkyLightStagesOracle.java");
+    std::fs::write(
+        &source,
+        include_str!("java/SparseSkyLightStagesOracle.java"),
+    )
+    .unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("output.json");
+    for mode in 0..3 {
+        let roof = mode != 0;
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(state("air"));
+        let mut covered = Vec::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                covered.push(pos);
+                let mut sections = BTreeMap::new();
+                for y in 0..6 {
+                    sections.insert(
+                        y,
+                        Arc::new(Section {
+                            blocks: Some(Box::new([air; BLOCK_COUNT])),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    );
+                }
+                world.chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:features".into()),
+                        block_light_correct: false,
+                        sections,
+                    }),
+                );
+            }
+        }
+        let mut entries = Vec::new();
+        for z in -16..32 {
+            for x in -16..32 {
+                let mut add = |y, name| {
+                    entries.push(serde_json::json!({"x":x,"y":y,"z":z,"state":name}));
+                    let id = world.intern_state(state(name));
+                    world.set_block_id(x, y, z, id).unwrap();
+                };
+                add(4, "stone");
+                if roof && (x, z) != (5, 5) && (x, z) != (16, 8) {
+                    add(80, "stone");
+                }
+                if roof && (x, z) == (5, 5) {
+                    add(79, "water");
+                }
+                if mode == 2 && (x, z) == (16, 8) {
+                    add(40, "stone");
+                }
+            }
+        }
+        std::fs::write(&input, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let storage = VisibleLightSnapshot::fresh_after_chunk_initialization(
+            &world,
+            0..6,
+            covered.iter().copied(),
+            covered.iter().copied(),
+            true,
+            true,
+            |s| Some(s.name == "minecraft:air"),
+        )
+        .unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let bounds = LightBounds::new(0, 96).unwrap();
+        let orders: &[(&str, [i32; 3])] = if mode == 2 {
+            &[
+                ("0,1,-1", [0, 1, -1]),
+                ("1,0,-1", [1, 0, -1]),
+                ("-1,1,0", [-1, 1, 0]),
+            ]
+        } else {
+            &[("0,1,-1", [0, 1, -1])]
+        };
+        for &(order_name, order) in orders {
+            run(Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("SparseSkyLightStagesOracle")
+                .arg(&input)
+                .arg(&output)
+                .arg(order_name));
+            let expected: Vec<Vec<u8>> =
+                serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+            let mut active = BTreeSet::new();
+            for stage in 0..4 {
+                if stage > 0 {
+                    active.insert(ChunkPos {
+                        x: order[stage - 1],
+                        z: 0,
+                    });
+                }
+                let actual = generated_sky_light_from_active_chunks(
+                    &world, bounds, center, &active, &storage,
+                )
+                .expect("sparse sections should be supported");
+                let mut differences = Vec::new();
+                for y in -16..112 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let i = ((y + 16) * 256 + z * 16 + x) as usize;
+                            let found = value(&actual, x as usize, y, z as usize);
+                            if found != expected[stage][i] && differences.len() < 30 {
+                                differences.push((x, y, z, found, expected[stage][i]));
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    differences.is_empty(),
+                    "mode {mode} order {order_name} stage {stage}: {differences:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn generated_sky_handles_open_columns_and_incomplete_inputs() {
     let mut world = fixture();
     let center = ChunkPos { x: 0, z: 0 };
@@ -431,14 +582,23 @@ fn generated_sky_handles_open_columns_and_incomplete_inputs() {
     let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
     let sparse =
         VisibleLightSnapshot::fresh_after_section_updates(true, true, [], covered).unwrap();
-    assert!(
+    let empty =
         generated_sky_light_from_active_chunks(&world, bounds, center, &BTreeSet::new(), &sparse)
+            .unwrap();
+    assert!(empty.values().all(|layer| layer.iter().all(|&b| b == 0xff)));
+    let unknown = VisibleLightSnapshot::new(true, true);
+    assert!(
+        generated_sky_light_from_active_chunks(&world, bounds, center, &BTreeSet::new(), &unknown)
             .is_none()
     );
     let sky = initialize_generated_sky_light(&world, bounds, center).unwrap();
     assert!(sky.values().all(|layer| layer.iter().all(|&b| b == 0xff)));
     let stone = world.intern_state(state("stone"));
     world.set_block_id(8, 15, 8, stone).unwrap();
+    assert!(
+        generated_sky_light_from_active_chunks(&world, bounds, center, &BTreeSet::new(), &sparse)
+            .is_none()
+    );
     let sky = initialize_generated_sky_light(&world, bounds, center).unwrap();
     assert_eq!(value(&sky, 8, 16, 8), 15);
     assert_eq!(value(&sky, 8, 15, 8), 0);

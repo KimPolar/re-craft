@@ -25,7 +25,6 @@ pub fn initialize_generated_sky_light(
 
 /// Preview a fresh sky engine after activating the specified chunks. The source
 /// heights for every 3x3 input chunk must already reflect these immutable blocks.
-/// Every light section in that area must be allocated; sparse storage is rejected.
 pub fn generated_sky_light_from_active_chunks(
     world: &World,
     bounds: LightBounds,
@@ -49,6 +48,8 @@ fn calculate_generated_sky_light(
     let light = bounds.light_range();
     let height = usize::try_from(light.end.checked_sub(light.start)?).ok()?;
     let sections = usize::try_from((build.end - build.start) / 16).ok()?;
+    let light_sections = height / 16;
+    let mut allocated = vec![fresh_storage.is_none(); 9 * light_sections];
     let mut empty = vec![true; 9 * sections];
     let mut behavior = vec![0u32; PLANE.checked_mul(height)?];
     let mut properties: Vec<LightProperties> = vec![transparent_light_properties()];
@@ -64,10 +65,13 @@ fn calculate_generated_sky_light(
                 return None;
             }
             if let Some(storage) = fresh_storage {
+                if !storage.has_sky_channel() {
+                    return None;
+                }
                 for section_y in light.start.div_euclid(16)..light.end.div_euclid(16) {
-                    if !storage.sky_section_allocated(pos, section_y)? {
-                        return None;
-                    }
+                    let index = usize::try_from(section_y - light.start.div_euclid(16)).ok()?;
+                    allocated[(cz * 3 + cx) * light_sections + index] =
+                        storage.sky_section_allocated(pos, section_y)?;
                 }
             }
             for section_index in 0..sections {
@@ -98,6 +102,39 @@ fn calculate_generated_sky_light(
                     let y = usize::try_from(section_y * 16 + (local / 256) as i32 - light.start)
                         .ok()?;
                     behavior[x + z * SIDE + y * PLANE] = index;
+                }
+            }
+        }
+    }
+    // Initialized nonempty sections allocate their own section and the
+    // surrounding 3x3x3 halo. Sparse-gap propagation relies on this invariant.
+    if fresh_storage.is_some() {
+        for cz in 0..3usize {
+            for cx in 0..3usize {
+                for section in 0..sections {
+                    if empty[(cz * 3 + cx) * sections + section] {
+                        continue;
+                    }
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nx = cx as i32 + dx;
+                            let nz = cz as i32 + dz;
+                            if !(0..3).contains(&nx) || !(0..3).contains(&nz) {
+                                continue;
+                            }
+                            for dy in -1i32..=1 {
+                                let sy = section as i32 + 1 + dy;
+                                if !(0..light_sections as i32).contains(&sy) {
+                                    continue;
+                                }
+                                if !allocated
+                                    [(nz as usize * 3 + nx as usize) * light_sections + sy as usize]
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -134,7 +171,9 @@ fn calculate_generated_sky_light(
             source_y[x + z * SIDE] = lowest;
             if active.is_none_or(|chunks| chunks.contains(&pos)) {
                 for y in lowest..height {
-                    levels[x + z * SIDE + y * PLANE] = 15;
+                    if allocated[((z / 16) * 3 + x / 16) * light_sections + y / 16] {
+                        levels[x + z * SIDE + y * PLANE] = 15;
+                    }
                 }
             }
         }
@@ -186,6 +225,11 @@ fn calculate_generated_sky_light(
                     continue;
                 }
                 let next = nx as usize + nz as usize * SIDE + ny as usize * PLANE;
+                let nsection =
+                    ((nz as usize / 16) * 3 + nx as usize / 16) * light_sections + ny as usize / 16;
+                if !allocated[nsection] {
+                    continue;
+                }
                 // Direct sky seeds only below the neighbor's source boundary,
                 // including when that neighboring chunk is not enabled yet.
                 if active.is_some()
@@ -206,17 +250,67 @@ fn calculate_generated_sky_light(
                 }
                 levels[next] = candidate;
                 queue[candidate as usize].push(next);
+                // When this edge crosses a chunk border at the bottom of an
+                // allocated section, Java copies the boundary value into
+                // allocated neighbor sections beside empty sections below.
+                if fresh_storage.is_some()
+                    && y % 16 == 0
+                    && dy == 0
+                    && (x / 16 != nx as usize / 16 || z / 16 != nz as usize / 16)
+                {
+                    let src_chunk = (z / 16) * 3 + x / 16;
+                    let dst_chunk = (nz as usize / 16) * 3 + nx as usize / 16;
+                    let mut sy = y / 16;
+                    while sy > 0 {
+                        sy -= 1;
+                        if allocated[src_chunk * light_sections + sy] {
+                            break;
+                        }
+                        if !allocated[dst_chunk * light_sections + sy] {
+                            continue;
+                        }
+                        for down_y in sy * 16..(sy + 1) * 16 {
+                            let dest = nx as usize + nz as usize * SIDE + down_y * PLANE;
+                            if candidate > levels[dest] {
+                                levels[dest] = candidate;
+                                queue[candidate as usize].push(dest);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     let mut output = VisibleLayers::new();
+    let mut next_allocated = vec![None; light_sections];
+    let mut next = None;
+    for section in (0..light_sections).rev() {
+        if allocated[4 * light_sections + section] {
+            next = Some(section);
+        }
+        next_allocated[section] = next;
+    }
     for sy in light.start.div_euclid(16)..light.end.div_euclid(16) {
         let mut layer = [0u8; LIGHT_BYTES];
         let y0 = usize::try_from(sy * 16 - light.start).ok()?;
+        let section = y0 / 16;
+        let missing = !allocated[4 * light_sections + section];
+        let inherited = if missing {
+            match next_allocated[section] {
+                Some(above) => Some(above * 16),
+                None => {
+                    output.insert(sy, Arc::new([0xff; LIGHT_BYTES]));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         for y in 0..16usize {
             for z in 0..16usize {
                 for x in 0..16usize {
-                    let value = levels[x + 16 + (z + 16) * SIDE + (y0 + y) * PLANE];
+                    let source_y_index = inherited.unwrap_or(y0 + y);
+                    let value = levels[x + 16 + (z + 16) * SIDE + source_y_index * PLANE];
                     let local = x + z * 16 + y * 256;
                     if local % 2 == 0 {
                         layer[local / 2] = value;

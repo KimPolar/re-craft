@@ -114,6 +114,10 @@ impl VisibleLightSnapshot {
         Some(self.columns.get(&pos)?.sky.contains_key(&section_y))
     }
 
+    pub fn has_sky_channel(&self) -> bool {
+        self.has_sky
+    }
+
     /// Capture a newly created engine after the listed nonempty section status
     /// updates have been drained. No lighting may have been enabled, queued,
     /// propagated, removed or restored before this snapshot. The caller must

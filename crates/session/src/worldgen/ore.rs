@@ -4131,6 +4131,51 @@ mod tests {
                 direct.raw_brightness([0, y, 0], 0)
             );
         }
+        let (mut sparse, _, _, _) = fixture();
+        sparse.height = 96;
+        let world = Arc::make_mut(&mut sparse.world);
+        let air = world.intern_state(state("air"));
+        for chunk in world.chunks.values_mut() {
+            let chunk = Arc::make_mut(chunk);
+            for y in 1..6 {
+                chunk.sections.insert(
+                    y,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([air; BLOCK_COUNT])),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                );
+            }
+        }
+        let mut positions = Vec::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let p = ChunkPos { x, z };
+                sparse.completed_decoration.insert(p);
+                positions.push(p);
+            }
+        }
+        let mut tracker = FreshGenerationLightTracker::new(&sparse, true).unwrap();
+        for pos in positions {
+            tracker.initialize_chunk(&sparse, pos, &vanilla).unwrap();
+        }
+        let dark = tracker
+            .calculate_sky_light_for_active_chunks(&sparse, center, &BTreeSet::new(), &vanilla)
+            .unwrap();
+        let lit = tracker
+            .calculate_sky_light_for_active_chunks(
+                &sparse,
+                center,
+                &BTreeSet::from([center]),
+                &vanilla,
+            )
+            .unwrap();
+        let index = 8 + 8 * 16 + 10 * 256;
+        assert_eq!(dark[&0][index / 2] & 15, 0);
+        assert_eq!(lit[&0][index / 2] & 15, 15);
+        assert_eq!(dark[&5][index / 2] & 15, 15);
     }
 
     #[test]

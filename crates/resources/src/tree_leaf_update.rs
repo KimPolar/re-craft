@@ -23,6 +23,91 @@ pub trait LeafUpdateWorld {
     fn set_leaf_distance(&mut self, pos: Pos, distance: u8) -> Result<()>;
 }
 
+/// Real block `updateShape` rules, scheduled ticks and world randomness belong
+/// to the generation world. `State` equality must match canonical Java states.
+pub trait ShapeEdgeWorld {
+    type State: Clone + Eq;
+    fn block(&mut self, pos: Pos) -> Result<Self::State>;
+    fn update_shape(
+        &mut self,
+        pos: Pos,
+        state: &Self::State,
+        direction: Pos,
+        neighbor: Pos,
+        neighbor_state: &Self::State,
+    ) -> Result<Self::State>;
+    fn set_block(&mut self, pos: Pos, state: &Self::State, flags: i32) -> Result<()>;
+}
+
+/// Apply `StructureTemplate.updateShapeAtEdge` after the tree's leaf update.
+/// A failed callback can leave partial effects; callers must discard the
+/// generation transaction. Sparse runs avoid scanning the whole bounding box.
+pub fn update_shape_at_edges(
+    world: &mut impl ShapeEdgeWorld,
+    bounds: TreeBounds,
+    shape: &BTreeSet<Pos>,
+    flags: i32,
+) -> Result<()> {
+    ensure!(
+        (0..3).all(|i| bounds.min[i] <= bounds.max[i]),
+        "invalid tree bounding box"
+    );
+    ensure!(
+        shape.iter().all(|p| bounds.contains(*p)),
+        "shape outside tree bounding box"
+    );
+    let mut points: Vec<Pos> = shape.iter().copied().collect();
+    // Java cycles over Z, Y, X. Within each axis it scans the two other
+    // coordinates first, then the axis coordinate from low to high.
+    for (outer, inner, axis) in [(0, 1, 2), (2, 0, 1), (1, 2, 0)] {
+        points.sort_unstable_by_key(|p| (p[outer], p[inner], p[axis]));
+        let mut previous: Option<Pos> = None;
+        for &pos in &points {
+            let continues = previous.is_some_and(|p| {
+                p[outer] == pos[outer]
+                    && p[inner] == pos[inner]
+                    && p[axis].checked_add(1) == Some(pos[axis])
+            });
+            if !continues {
+                if let Some(last) = previous {
+                    update_edge(world, last, axis, 1, flags)?;
+                }
+                update_edge(world, pos, axis, -1, flags)?;
+            }
+            previous = Some(pos);
+        }
+        if let Some(last) = previous {
+            update_edge(world, last, axis, 1, flags)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_edge<W: ShapeEdgeWorld>(
+    world: &mut W,
+    pos: Pos,
+    axis: usize,
+    sign: i32,
+    flags: i32,
+) -> Result<()> {
+    let mut direction = [0; 3];
+    direction[axis] = sign;
+    let mut neighbor = pos;
+    neighbor[axis] = neighbor[axis].wrapping_add(sign);
+    let original = world.block(pos)?;
+    let other = world.block(neighbor)?;
+    let updated = world.update_shape(pos, &original, direction, neighbor, &other)?;
+    if updated != original {
+        world.set_block(pos, &updated, flags & !1)?;
+    }
+    let opposite = [-direction[0], -direction[1], -direction[2]];
+    let other_updated = world.update_shape(neighbor, &other, opposite, pos, &updated)?;
+    if other_updated != other {
+        world.set_block(neighbor, &other_updated, flags & !1)?;
+    }
+    Ok(())
+}
+
 // The vanilla queues are java.util.HashSets. Retaining their bucket order is
 // important when a pre-existing leaf already has a short distance.
 #[derive(Default)]
@@ -525,6 +610,37 @@ pub fn update_tree_leaves(
         }
     }
     Ok(shape)
+}
+
+/// Complete the non-decorator part of `TreeFeature.place` after component
+/// placement. The input lists record the setter calls, including attempted
+/// writes outside a generation region, just as the vanilla sets do.
+pub fn finish_generated_tree<W: LeafUpdateWorld + ShapeEdgeWorld>(
+    world: &mut W,
+    placed: bool,
+    logs: &[Pos],
+    leaves: &[Pos],
+    roots: &[Pos],
+    decorations: &[Pos],
+) -> Result<bool> {
+    if !placed || (logs.is_empty() && leaves.is_empty()) {
+        return Ok(false);
+    }
+    let mut all = roots.iter().chain(logs).chain(leaves).chain(decorations);
+    let first = *all.next().expect("nonempty tree positions");
+    let mut bounds = TreeBounds {
+        min: first,
+        max: first,
+    };
+    for pos in all {
+        for axis in 0..3 {
+            bounds.min[axis] = bounds.min[axis].min(pos[axis]);
+            bounds.max[axis] = bounds.max[axis].max(pos[axis]);
+        }
+    }
+    let shape = update_tree_leaves(world, bounds, logs, decorations, roots)?;
+    update_shape_at_edges(world, bounds, &shape, 3)?;
+    Ok(true)
 }
 
 #[cfg(test)]

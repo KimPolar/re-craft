@@ -57,6 +57,12 @@ public class BlockLightEngineOracle implements LightChunkGetter, LightChunk {
             case "ice" -> Blocks.ICE.defaultBlockState();
             case "podzol" -> Blocks.PODZOL.defaultBlockState().setValue(BlockStateProperties.SNOWY, true);
             case "brown_mushroom" -> Blocks.BROWN_MUSHROOM.defaultBlockState();
+            case "lichen_empty" -> Blocks.GLOW_LICHEN.defaultBlockState();
+            case "lichen_north" -> Blocks.GLOW_LICHEN.defaultBlockState().setValue(BlockStateProperties.NORTH,true);
+            case "lichen_wet" -> Blocks.GLOW_LICHEN.defaultBlockState().setValue(BlockStateProperties.NORTH,true).setValue(BlockStateProperties.WATERLOGGED,true);
+            case "small_bud" -> Blocks.SMALL_AMETHYST_BUD.defaultBlockState();
+            case "cluster_wet" -> Blocks.AMETHYST_CLUSTER.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true);
+            case "firefly_bush" -> Blocks.FIREFLY_BUSH.defaultBlockState();
             case "unlit" -> Blocks.REDSTONE_ORE.defaultBlockState().setValue(RedStoneOreBlock.LIT, false);
             case "lit" -> Blocks.REDSTONE_ORE.defaultBlockState().setValue(RedStoneOreBlock.LIT, true);
             default -> throw new IllegalArgumentException(name);

@@ -253,7 +253,12 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 },
             )
         }
-        "minecraft:glass" | "minecraft:short_grass" | "minecraft:fern"
+        "minecraft:glass"
+        | "minecraft:short_grass"
+        | "minecraft:fern"
+        | "minecraft:bush"
+        | "minecraft:short_dry_grass"
+        | "minecraft:tall_dry_grass"
             if state.properties.is_empty() =>
         {
             (0, 0)
@@ -283,6 +288,50 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (0, 0)
         }
         "minecraft:brown_mushroom" if state.properties.is_empty() => (0, 1),
+        "minecraft:firefly_bush" if state.properties.is_empty() => (0, 2),
+        "minecraft:tall_grass"
+        | "minecraft:large_fern"
+        | "minecraft:sunflower"
+        | "minecraft:rose_bush"
+        | "minecraft:peony"
+        | "minecraft:lilac"
+            if state.properties.len() == 1 =>
+        {
+            if !matches!(
+                state.properties.get("half").map(String::as_str),
+                Some("lower" | "upper")
+            ) {
+                return None;
+            }
+            (0, 0)
+        }
+        "minecraft:glow_lichen" if state.properties.len() == 7 => {
+            let mut any = false;
+            for direction in ["down", "up", "north", "south", "west", "east"] {
+                any |= boolean(direction)?;
+            }
+            (u8::from(boolean("waterlogged")?), if any { 7 } else { 0 })
+        }
+        "minecraft:small_amethyst_bud"
+        | "minecraft:medium_amethyst_bud"
+        | "minecraft:large_amethyst_bud"
+        | "minecraft:amethyst_cluster"
+            if state.properties.len() == 2 =>
+        {
+            if !matches!(
+                state.properties.get("facing").map(String::as_str),
+                Some("down" | "up" | "north" | "south" | "west" | "east")
+            ) {
+                return None;
+            }
+            let emission = match state.name.as_str() {
+                "minecraft:small_amethyst_bud" => 1,
+                "minecraft:medium_amethyst_bud" => 2,
+                "minecraft:large_amethyst_bud" => 4,
+                _ => 5,
+            };
+            (u8::from(boolean("waterlogged")?), emission)
+        }
         "minecraft:oak_sapling"
         | "minecraft:spruce_sapling"
         | "minecraft:birch_sapling"
@@ -429,6 +478,9 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:clay"
         | "minecraft:mud"
         | "minecraft:calcite"
+        | "minecraft:amethyst_block"
+        | "minecraft:budding_amethyst"
+        | "minecraft:smooth_basalt"
         | "minecraft:dripstone_block"
         | "minecraft:cobbled_deepslate"
         | "minecraft:stone_bricks"
@@ -1097,6 +1149,60 @@ mod tests {
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn generated_emissive_states_validate_faces_and_waterlogging() {
+        let mut lichen = BlockState {
+            name: "minecraft:glow_lichen".into(),
+            properties: [
+                "down",
+                "up",
+                "north",
+                "south",
+                "west",
+                "east",
+                "waterlogged",
+            ]
+            .into_iter()
+            .map(|k| (k.into(), "false".into()))
+            .collect(),
+        };
+        assert_eq!(properties(&lichen), Some((0, 0)));
+        lichen.properties.insert("north".into(), "true".into());
+        assert_eq!(properties(&lichen), Some((0, 7)));
+        lichen
+            .properties
+            .insert("waterlogged".into(), "true".into());
+        assert_eq!(properties(&lichen), Some((1, 7)));
+        assert!(!light_properties(&lichen).unwrap().has_faces);
+        lichen.properties.insert("east".into(), "invalid".into());
+        assert!(properties(&lichen).is_none());
+        for (name, emission) in [
+            ("small_amethyst_bud", 1),
+            ("medium_amethyst_bud", 2),
+            ("large_amethyst_bud", 4),
+            ("amethyst_cluster", 5),
+        ] {
+            let mut cluster = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: [
+                    ("facing".into(), "up".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into(),
+            };
+            assert_eq!(properties(&cluster), Some((0, emission)));
+            cluster
+                .properties
+                .insert("waterlogged".into(), "true".into());
+            assert_eq!(properties(&cluster), Some((1, emission)));
+            cluster
+                .properties
+                .insert("facing".into(), "sideways".into());
+            assert!(properties(&cluster).is_none());
+        }
+        assert_eq!(properties(&state("firefly_bush", None)), Some((0, 2)));
     }
 
     #[test]
@@ -1829,6 +1935,24 @@ mod tests {
             .arg(&cp)
             .arg(&source));
         let names = [
+            "glow_lichen",
+            "amethyst_block",
+            "budding_amethyst",
+            "smooth_basalt",
+            "small_amethyst_bud",
+            "medium_amethyst_bud",
+            "large_amethyst_bud",
+            "amethyst_cluster",
+            "firefly_bush",
+            "bush",
+            "short_dry_grass",
+            "tall_dry_grass",
+            "tall_grass",
+            "large_fern",
+            "sunflower",
+            "rose_bush",
+            "peony",
+            "lilac",
             "dirt_path",
             "farmland",
             "snow",
@@ -2151,6 +2275,13 @@ mod tests {
             (15, 15, 15, "air"),
             (15, 30, 15, "brown_mushroom"),
             (15, 30, 15, "air"),
+            (15, 15, 15, "lichen_empty"),
+            (15, 15, 15, "lichen_north"),
+            (15, 15, 15, "lichen_wet"),
+            (15, 15, 15, "cluster_wet"),
+            (15, 15, 15, "small_bud"),
+            (15, 15, 15, "firefly_bush"),
+            (15, 15, 15, "air"),
         ];
         let json = |items: &[(i32, i32, i32, &str)]| {
             items
@@ -2225,6 +2356,45 @@ mod tests {
         });
         let dirt_path = world.intern_state(state("dirt_path", None));
         let brown_mushroom = world.intern_state(state("brown_mushroom", None));
+        let mut lichen = BlockState {
+            name: "minecraft:glow_lichen".into(),
+            properties: [
+                "down",
+                "up",
+                "north",
+                "south",
+                "west",
+                "east",
+                "waterlogged",
+            ]
+            .into_iter()
+            .map(|k| (k.into(), "false".into()))
+            .collect(),
+        };
+        let lichen_empty = world.intern_state(lichen.clone());
+        lichen.properties.insert("north".into(), "true".into());
+        let lichen_north = world.intern_state(lichen.clone());
+        lichen
+            .properties
+            .insert("waterlogged".into(), "true".into());
+        let lichen_wet = world.intern_state(lichen);
+        let small_bud = world.intern_state(BlockState {
+            name: "minecraft:small_amethyst_bud".into(),
+            properties: [
+                ("facing".into(), "up".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        });
+        let cluster_wet = world.intern_state(BlockState {
+            name: "minecraft:amethyst_cluster".into(),
+            properties: [
+                ("facing".into(), "up".into()),
+                ("waterlogged".into(), "true".into()),
+            ]
+            .into(),
+        });
+        let firefly_bush = world.intern_state(state("firefly_bush", None));
         let spruce_log = world.intern_state(BlockState {
             name: "minecraft:spruce_log".into(),
             properties: [("axis".into(), "x".into())].into(),
@@ -2280,6 +2450,12 @@ mod tests {
             "ice" => ice,
             "podzol" => podzol,
             "brown_mushroom" => brown_mushroom,
+            "lichen_empty" => lichen_empty,
+            "lichen_north" => lichen_north,
+            "lichen_wet" => lichen_wet,
+            "small_bud" => small_bud,
+            "cluster_wet" => cluster_wet,
+            "firefly_bush" => firefly_bush,
             _ => unreachable!(),
         };
         for (x, y, z, name) in initial {

@@ -44,19 +44,7 @@ fn provider<S: Clone>(
     value: &Value,
     resolve: &mut impl FnMut(&Value) -> Result<S>,
 ) -> Result<Provider<S>> {
-    if let Some(name) = value.as_str() {
-        let id = ResourceId::parse(name)?;
-        let path = format!(
-            "data/{}/worldgen/block_state_provider/{}.json",
-            id.namespace, id.path
-        );
-        let bytes = resources
-            .read_data(&path)?
-            .with_context(|| format!("missing state provider {path}"))?;
-        Provider::decode(&serde_json::from_slice::<Value>(&bytes)?, resolve, 0)
-    } else {
-        Provider::decode(value, resolve, 0)
-    }
+    Provider::load(resources, value, resolve)
 }
 fn decorators<S: Clone>(
     resources: &mut impl ResourceProvider,

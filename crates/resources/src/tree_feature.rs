@@ -96,23 +96,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
             value: &Value,
             resolve: &mut impl FnMut(&Value) -> Result<S>,
         ) -> Result<Provider<S>> {
-            let data;
-            let value = if let Some(id) = value.as_str() {
-                let id = ResourceId::parse(id)?;
-                let path = format!(
-                    "data/{}/worldgen/block_state_provider/{}.json",
-                    id.namespace, id.path
-                );
-                let bytes = provider
-                    .read_data(&path)?
-                    .with_context(|| format!("missing tree state provider {path}"))?;
-                data = serde_json::from_slice::<Value>(&bytes)
-                    .with_context(|| format!("invalid tree state provider {path}"))?;
-                &data
-            } else {
-                value
-            };
-            Provider::decode(value, resolve, 0)
+            Provider::load(provider, value, resolve)
         }
         ensure!(
             name(value)? == ResourceId::parse("minecraft:tree")?,

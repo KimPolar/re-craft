@@ -20,6 +20,23 @@ pub trait DiskWorld: OreWorld {
     fn fluid_is(&mut self, state: &Self::State, id: &ResourceId) -> Result<bool>;
     fn set_disk_block(&mut self, pos: [i32; 3], state: &Self::State) -> Result<bool>;
     fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()>;
+    /// Resolve an integer property's actual block-state definition. None means
+    /// the property is absent or has a non-integer type.
+    fn integer_property_bounds(
+        &mut self,
+        _state: &Self::State,
+        _name: &str,
+    ) -> Result<Option<(i32, i32)>> {
+        bail!("integer block properties are unavailable")
+    }
+    fn with_integer_property(
+        &mut self,
+        _state: Self::State,
+        _name: &str,
+        _value: i32,
+    ) -> Result<Self::State> {
+        bail!("integer block properties are unavailable")
+    }
     fn fluid_in_tag(&mut self, _state: &Self::State, _tag: &ResourceId) -> Result<bool> {
         bail!("unsupported survival fluid tag")
     }
@@ -412,6 +429,11 @@ pub(crate) enum Provider<S> {
         low: Vec<S>,
         high: Vec<S>,
     },
+    RandomizedInt {
+        source: Box<Provider<S>>,
+        property: String,
+        values: IntProvider,
+    },
 }
 impl<S: Clone> Provider<S> {
     /// Holder strings refer to the active data-pack state-provider registry.
@@ -420,21 +442,13 @@ impl<S: Clone> Provider<S> {
         value: &Value,
         resolve: &mut impl FnMut(&Value) -> Result<S>,
     ) -> Result<Self> {
-        if let Some(name) = value.as_str() {
-            let id = ResourceId::parse(name)?;
-            let path = format!(
-                "data/{}/worldgen/block_state_provider/{}.json",
-                id.namespace, id.path
-            );
-            let bytes = resources
-                .read_data(&path)?
-                .with_context(|| format!("missing state provider {path}"))?;
-            let data: Value = serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid state provider {path}"))?;
-            Self::decode(&data, resolve, 0)
-        } else {
-            Self::decode(value, resolve, 0)
-        }
+        Self::decode_inner(
+            value,
+            resolve,
+            0,
+            &mut Some(resources),
+            &mut BTreeSet::new(),
+        )
     }
     pub(crate) fn needs_survival(&self, name: &str) -> bool {
         match self {
@@ -444,6 +458,7 @@ impl<S: Clone> Provider<S> {
                         .iter()
                         .any(|(p, v)| p.needs_survival(name) || v.needs_survival(name))
             }
+            Self::RandomizedInt { source, .. } => source.needs_survival(name),
             _ => false,
         }
     }
@@ -452,7 +467,39 @@ impl<S: Clone> Provider<S> {
         resolve: &mut impl FnMut(&Value) -> Result<S>,
         depth: u8,
     ) -> Result<Self> {
+        Self::decode_inner(value, resolve, depth, &mut None, &mut BTreeSet::new())
+    }
+    fn decode_inner(
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+        depth: u8,
+        resources: &mut Option<&mut dyn ResourceProvider>,
+        active: &mut BTreeSet<String>,
+    ) -> Result<Self> {
         ensure!(depth < 32, "state provider nesting is too deep");
+        if let Some(name) = value.as_str() {
+            let id = ResourceId::parse(name)?;
+            let path = format!(
+                "data/{}/worldgen/block_state_provider/{}.json",
+                id.namespace, id.path
+            );
+            ensure!(
+                active.insert(path.clone()),
+                "cyclic state provider reference {path}"
+            );
+            let result = (|| {
+                let bytes = resources
+                    .as_mut()
+                    .context("named state provider requires active resources")?
+                    .read_data(&path)?
+                    .with_context(|| format!("missing state provider {path}"))?;
+                let data: Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid state provider {path}"))?;
+                Self::decode_inner(&data, resolve, depth + 1, resources, active)
+            })();
+            active.remove(&path);
+            return result;
+        }
         if value.get("id").is_some() {
             return Ok(Self::State(resolve(value)?));
         }
@@ -560,7 +607,9 @@ impl<S: Clone> Provider<S> {
             "rule_based" => {
                 let fallback = value
                     .get("fallback")
-                    .map(|v| Self::decode(v, resolve, depth + 1).map(Box::new))
+                    .map(|v| {
+                        Self::decode_inner(v, resolve, depth + 1, resources, active).map(Box::new)
+                    })
                     .transpose()?;
                 let entries = value
                     .get("rules")
@@ -574,19 +623,47 @@ impl<S: Clone> Provider<S> {
                             entry.get("if_true").context("missing rule predicate")?,
                             0,
                         )?,
-                        Self::decode(
+                        Self::decode_inner(
                             entry.get("then").context("missing rule state")?,
                             resolve,
                             depth + 1,
+                            resources,
+                            active,
                         )?,
                     ));
                 }
                 Ok(Self::Rules { fallback, rules })
             }
+            "randomized_int" => {
+                let property = value
+                    .get("property")
+                    .and_then(Value::as_str)
+                    .context("missing randomized property")?
+                    .to_owned();
+                let values = IntProvider::parse(
+                    value.get("values").context("missing randomized values")?,
+                    0,
+                )?;
+                let source = Self::decode_inner(
+                    value.get("source").context("missing randomized source")?,
+                    resolve,
+                    depth + 1,
+                    resources,
+                    active,
+                )?;
+                Ok(Self::RandomizedInt {
+                    source: Box::new(source),
+                    property,
+                    values,
+                })
+            }
             other => bail!("unsupported disk state provider {other}"),
         }
     }
     pub(crate) fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
+        if let Self::RandomizedInt { source, .. } = self {
+            source.tags(tags);
+        }
         if let Self::Rules { fallback, rules } = self {
             if let Some(fallback) = fallback {
                 fallback.tags(tags);
@@ -598,6 +675,9 @@ impl<S: Clone> Provider<S> {
         }
     }
     pub(crate) fn blocks(&self, blocks: &mut BTreeSet<ResourceId>) {
+        if let Self::RandomizedInt { source, .. } = self {
+            source.blocks(blocks);
+        }
         if let Self::Rules { fallback, rules } = self {
             if let Some(fallback) = fallback {
                 fallback.blocks(blocks);
@@ -627,6 +707,7 @@ impl<S: Clone> Provider<S> {
                     provider.states(states);
                 }
             }
+            Self::RandomizedInt { source, .. } => source.states(states),
         }
     }
     pub(crate) fn state<W: DiskWorld<State = S>>(
@@ -697,6 +778,24 @@ impl<S: Clone> Provider<S> {
                 } else {
                     Ok(None)
                 }
+            }
+            Self::RandomizedInt {
+                source,
+                property,
+                values,
+            } => {
+                let Some(state) = source.state(world, random, pos)? else {
+                    return Ok(None);
+                };
+                let Some((min, max)) = world.integer_property_bounds(&state, property)? else {
+                    return Ok(Some(state));
+                };
+                let value = values.sample(random);
+                ensure!(
+                    (min..=max).contains(&value),
+                    "randomized property {property} value {value} is outside {min}..={max}"
+                );
+                Ok(Some(world.with_integer_property(state, property, value)?))
             }
         }
     }
@@ -821,5 +920,210 @@ impl<S: Clone + Eq> DiskFeature<S> {
             }
         }
         Ok(placed)
+    }
+}
+
+#[cfg(test)]
+mod randomized_provider_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{collections::BTreeMap, path::PathBuf, process::Command};
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct State {
+        name: String,
+        age: Option<i32>,
+        berries: Option<bool>,
+    }
+    fn resolve(v: &Value) -> Result<State> {
+        let name = v
+            .as_str()
+            .or_else(|| v.get("id").and_then(Value::as_str))
+            .context("missing state")?;
+        Ok(State {
+            name: name.into(),
+            age: (name == "minecraft:cave_vines").then_some(0),
+            berries: matches!(name, "minecraft:cave_vines" | "minecraft:cave_vines_plant")
+                .then_some(false),
+        })
+    }
+    struct World;
+    impl OreWorld for World {
+        type State = State;
+        fn block(&mut self, _: [i32; 3]) -> Result<State> {
+            unreachable!()
+        }
+        fn block_is(&mut self, _: &State, _: &ResourceId) -> Result<bool> {
+            unreachable!()
+        }
+        fn in_tag(&mut self, _: &State, _: &ResourceId) -> Result<bool> {
+            unreachable!()
+        }
+        fn is_air(&mut self, _: &State) -> Result<bool> {
+            unreachable!()
+        }
+        fn set_block(&mut self, _: [i32; 3], _: &State, _: i32) -> Result<bool> {
+            unreachable!()
+        }
+    }
+    impl DiskWorld for World {
+        fn is_solid(&mut self, _: &State) -> Result<bool> {
+            unreachable!()
+        }
+        fn fluid_is(&mut self, _: &State, _: &ResourceId) -> Result<bool> {
+            unreachable!()
+        }
+        fn set_disk_block(&mut self, _: [i32; 3], _: &State) -> Result<bool> {
+            unreachable!()
+        }
+        fn mark_postprocessing(&mut self, _: [i32; 3]) -> Result<()> {
+            unreachable!()
+        }
+        fn integer_property_bounds(&mut self, s: &State, name: &str) -> Result<Option<(i32, i32)>> {
+            Ok((name == "age" && s.age.is_some()).then_some((0, 25)))
+        }
+        fn with_integer_property(&mut self, mut s: State, name: &str, value: i32) -> Result<State> {
+            ensure!(
+                name == "age" && s.age.is_some() && (0..=25).contains(&value),
+                "invalid property"
+            );
+            s.age = Some(value);
+            Ok(s)
+        }
+    }
+    struct Packs(BTreeMap<String, Vec<u8>>);
+    impl ResourceProvider for Packs {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.get(path).cloned())
+        }
+    }
+    fn randomized(property: &str, source: Value) -> Value {
+        json!({"type":"minecraft:randomized_int","source":source,"property":property,"values":{"type":"minecraft:uniform","min_inclusive":23,"max_inclusive":26}})
+    }
+    fn weighted() -> Value {
+        json!({"type":"minecraft:weighted","entries":[{"data":"minecraft:cave_vines","weight":2},{"data":"minecraft:cave_vines_plant","weight":1},{"data":"minecraft:stone","weight":1}]})
+    }
+    #[test]
+    fn nested_holders_use_active_resources_and_reject_cycles() {
+        let path = |name: &str| format!("data/example/worldgen/block_state_provider/{name}.json");
+        let mut packs = Packs(BTreeMap::from([
+            (
+                path("outer"),
+                serde_json::to_vec(&randomized("age", json!("example:inner"))).unwrap(),
+            ),
+            (path("inner"), serde_json::to_vec(&weighted()).unwrap()),
+        ]));
+        let provider = Provider::load(&mut packs, &json!("example:outer"), &mut resolve).unwrap();
+        let mut states = Vec::new();
+        provider.states(&mut states);
+        assert_eq!(states.len(), 3);
+        let mut a = DecorationRandom::new(7);
+        let mut b = a.clone();
+        let inline = Provider::decode(&randomized("age", weighted()), &mut resolve, 0).unwrap();
+        for _ in 0..12 {
+            assert_eq!(
+                provider.state(&mut World, &mut a, [0; 3]).ok(),
+                inline.state(&mut World, &mut b, [0; 3]).ok()
+            );
+        }
+        assert_eq!(a.next_long(), b.next_long());
+        packs.0.insert(
+            path("inner"),
+            serde_json::to_vec(&randomized("age", json!("example:outer"))).unwrap(),
+        );
+        assert!(
+            Provider::load(&mut packs, &json!("example:outer"), &mut resolve)
+                .unwrap_err()
+                .to_string()
+                .contains("cyclic")
+        );
+        assert!(
+            Provider::decode(&randomized("age", json!("example:inner")), &mut resolve, 0).is_err()
+        );
+    }
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn randomized_int_matches_java_property_lookup_and_random_consumption() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("RandomizedStateOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/RandomizedStateOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actual = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RandomizedStateOracle"));
+        let mut expected = Vec::new();
+        for property in ["age", "berries", "missing"] {
+            for seed in [0, 1, -1, 42, 987654321] {
+                let provider =
+                    Provider::decode(&randomized(property, weighted()), &mut resolve, 0).unwrap();
+                let mut random = DecorationRandom::new(seed);
+                let mut samples = Vec::new();
+                for _ in 0..12 {
+                    let item = provider.state(&mut World, &mut random, [0; 3]);
+                    samples.push(match item {
+                        Err(_) => "ERR".into(),
+                        Ok(Some(s)) => {
+                            let extra = match (s.age, s.berries) {
+                                (Some(age), Some(berries)) => {
+                                    format!(",age={age},berries={berries}")
+                                }
+                                (None, Some(berries)) => format!(",berries={berries}"),
+                                _ => String::new(),
+                            };
+                            format!("{}{extra}", s.name)
+                        }
+                        Ok(None) => panic!("empty state"),
+                    });
+                }
+                expected.push(format!(
+                    "I {property} {seed} {} R {}",
+                    samples.join(";"),
+                    random.next_long()
+                ));
+            }
+        }
+        let actual: Vec<_> = actual.lines().filter(|v| v.starts_with("I ")).collect();
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(&expected) {
+            assert_eq!(*a, b);
+        }
     }
 }

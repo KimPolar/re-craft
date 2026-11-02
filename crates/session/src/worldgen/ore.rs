@@ -109,6 +109,7 @@ enum ConfiguredDecoration {
     HugeMushroom(HugeMushroomFeature<BlockState>),
     VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
     Selector(Vec<PlacedDecorationFeature>),
+    BooleanSelector(Box<PlacedDecorationFeature>, Box<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
         Box<PlacedDecorationFeature>,
@@ -157,6 +158,11 @@ impl ConfiguredDecoration {
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_blocks)
                 .collect(),
+            Self::BooleanSelector(a, b) => {
+                let mut blocks = a.required_blocks();
+                blocks.extend(b.required_blocks());
+                blocks
+            }
             Self::WeightedSelector(values, default) => {
                 let mut blocks = default.required_blocks();
                 for (_, feature) in values {
@@ -180,6 +186,7 @@ impl ConfiguredDecoration {
                 v.needs_survival(name) || nested.needs_survival(name)
             }
             Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
+            Self::BooleanSelector(a, b) => a.needs_survival(name) || b.needs_survival(name),
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
             }
@@ -191,6 +198,7 @@ impl ConfiguredDecoration {
             Self::Lake(_) => true,
             Self::VegetationPatch(_, nested) => nested.needs_lake(),
             Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_lake),
+            Self::BooleanSelector(a, b) => a.needs_lake() || b.needs_lake(),
             Self::WeightedSelector(values, default) => {
                 default.needs_lake() || values.iter().any(|(_, v)| v.needs_lake())
             }
@@ -202,6 +210,7 @@ impl ConfiguredDecoration {
             Self::Freeze => true,
             Self::VegetationPatch(_, nested) => nested.needs_freeze(),
             Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_freeze),
+            Self::BooleanSelector(a, b) => a.needs_freeze() || b.needs_freeze(),
             Self::WeightedSelector(values, default) => {
                 default.needs_freeze() || values.iter().any(|(_, v)| v.needs_freeze())
             }
@@ -274,6 +283,27 @@ impl ConfiguredDecoration {
                 )?;
                 ensure!(!entries.is_empty(), "empty selector feature set");
                 Ok(Self::Selector(entries))
+            }
+            ("minecraft", "random_boolean_selector") => {
+                let a = PlacedDecorationFeature::load_nested(
+                    provider,
+                    value
+                        .get("feature_true")
+                        .context("missing true selector feature")?,
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                let b = PlacedDecorationFeature::load_nested(
+                    provider,
+                    value
+                        .get("feature_false")
+                        .context("missing false selector feature")?,
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                Ok(Self::BooleanSelector(Box::new(a), Box::new(b)))
             }
             ("minecraft", "random_selector") => {
                 let entries = value
@@ -352,6 +382,11 @@ impl ConfiguredDecoration {
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_tags)
                 .collect(),
+            Self::BooleanSelector(a, b) => {
+                let mut tags = a.required_tags();
+                tags.extend(b.required_tags());
+                tags
+            }
             Self::WeightedSelector(values, default) => {
                 let mut tags = default.required_tags();
                 for (_, feature) in values {
@@ -442,6 +477,13 @@ impl ConfiguredDecoration {
                     generator_height,
                 )
             }
+            Self::BooleanSelector(a, b) => world.place_nested(
+                if random.next_bool() { a } else { b },
+                random,
+                pos,
+                generator_min_y,
+                generator_height,
+            ),
             Self::WeightedSelector(values, default) => {
                 for (chance, feature) in values {
                     if random.next_float() < *chance {
@@ -5890,8 +5932,10 @@ mod tests {
             let inner = json!({"feature":{"type":"minecraft:random_selector","features":[{"chance":0.25,"feature":a},{"chance":0.6,"feature":b}],"default":a},"placement":[{"type":"minecraft:count","count":2}]});
             let feature = if kind == 0 {
                 json!({"type":"minecraft:simple_random_selector","features":[a,b,inner]})
-            } else {
+            } else if kind == 1 {
                 json!({"type":"minecraft:random_selector","features":[{"chance":0.4,"feature":inner},{"chance":0.3,"feature":b}],"default":a})
+            } else {
+                json!({"type":"minecraft:random_boolean_selector","feature_true":inner,"feature_false":b})
             };
             json!({"feature":feature,"placement":[{"type":"minecraft:count","count":2}]})
         }
@@ -5978,7 +6022,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(cases.len(), 2 * 2 * 2 * 16);
+        assert_eq!(cases.len(), 3 * 2 * 2 * 16);
         let mut registry = batch_registry();
         registry.extend(["minecraft:melon".into(), "minecraft:pumpkin".into()]);
         let tags = OreBlockTags::load(&mut SelectorData, &registry, &BTreeSet::new()).unwrap();

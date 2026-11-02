@@ -28,14 +28,14 @@ public class SelectorOracle {
     var a=leaf(Blocks.MELON,3,true);var b=leaf(Blocks.PUMPKIN,2,false);
     var weighted=new RandomSelectorFeature(List.of(new WeightedPlacedFeature(Holder.direct(a),0.25f),new WeightedPlacedFeature(Holder.direct(b),0.6f)),Holder.direct(a));
     var inner=new PlacedFeature(Holder.direct(weighted),List.of(CountPlacement.of(2)));
-    Feature chosen=kind==0?new SimpleRandomSelectorFeature(HolderSet.direct(Holder.direct(a),Holder.direct(b),Holder.direct(inner))):new RandomSelectorFeature(List.of(new WeightedPlacedFeature(Holder.direct(inner),0.4f),new WeightedPlacedFeature(Holder.direct(b),0.3f)),Holder.direct(a));
+    Feature chosen=kind==0?new SimpleRandomSelectorFeature(HolderSet.direct(Holder.direct(a),Holder.direct(b),Holder.direct(inner))):kind==1?new RandomSelectorFeature(List.of(new WeightedPlacedFeature(Holder.direct(inner),0.4f),new WeightedPlacedFeature(Holder.direct(b),0.3f)),Holder.direct(a)):new RandomBooleanSelectorFeature(Holder.direct(inner),Holder.direct(b));
     return new PlacedFeature(Holder.direct(chosen),List.of(CountPlacement.of(2)));
   }
   static BlockState initial(int x,int z,int profile){return profile==1&&Math.floorMod(x*7+z*3,5)==0?Blocks.STONE.defaultBlockState():Blocks.AIR.defaultBlockState();}
   public static void main(String[]args)throws Exception {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var generator=WorldPresets.getNormalOverworld(VanillaRegistries.createWorldLookup()).generator();
-    for(int kind=0;kind<2;kind++)for(int profile=0;profile<2;profile++)for(int limited=0;limited<2;limited++)for(long seed=0;seed<16;seed++) {
+    for(int kind=0;kind<3;kind++)for(int profile=0;profile<2;profile++)for(int limited=0;limited<2;limited++)for(long seed=0;seed<16;seed++) {
       var map=new HashMap<BlockPos,BlockState>();int terrain=profile,restriction=limited;
       var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
         if(m.getName().equals("getMinY"))return 0;if(m.getName().equals("getHeight"))return 16;

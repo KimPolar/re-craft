@@ -17358,7 +17358,8 @@ impl LoadedSession {
         if flying || landing_in_water {
             self.fall_distance = 0.0;
         } else {
-            self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
+            self.fall_distance =
+                crate::fall::accumulate_distance(self.fall_distance, actual.y, false);
         }
         let support = if self.motion.on_ground {
             collision_support.get().unwrap_or_else(|| {
@@ -17383,7 +17384,6 @@ impl LoadedSession {
                 Cell::Missing => false,
             }
         });
-        self.emit_player_movement_event(actual, flying, in_water, support, legacy);
         if self.motion.on_ground {
             self.ground_without_support = support.is_none();
             self.ground_support = support.and_then(|relative| add(self.origin, relative));
@@ -17501,6 +17501,32 @@ impl LoadedSession {
                 });
                 self.record_last_death();
             }
+            if crate::fall::emits_landing(self.fall_distance, true) {
+                // The supporting state is looked up after fallOn, which can
+                // change it (for example when farmland is trampled).
+                let affected = match cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    support.unwrap_or(legacy),
+                    self.states[0],
+                ) {
+                    Cell::State(id) => self.world.state(id).map(|state| state.name.clone()),
+                    Cell::Missing => None,
+                };
+                if let Some(affected) = affected {
+                    self.dispatch_vibration(
+                        "minecraft:hit_ground",
+                        self.origin.as_dvec3() + self.motion.position,
+                        self.player_uuid,
+                        true,
+                        self.game_mode == GameMode::Spectator,
+                        self.sneak,
+                        Some(&affected),
+                    );
+                }
+            }
+            self.emit_player_movement_event(actual, flying, in_water, support, legacy);
             if self.game_mode != GameMode::Spectator && !self.sneak {
                 self.set_redstone_ore_lit(legacy, true);
             }
@@ -17529,6 +17555,7 @@ impl LoadedSession {
             }
             self.fall_distance = 0.0;
         } else {
+            self.emit_player_movement_event(actual, flying, in_water, support, legacy);
             self.ground_without_support = false;
             self.ground_support = None;
         }
@@ -32022,6 +32049,82 @@ pub(crate) mod tests {
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
         );
+    }
+
+    #[test]
+    fn landing_vibration_respects_tags_sneaking_and_support_block() {
+        struct LandingPacks(bool);
+        impl native_resources::packs::ResourceProvider for LandingPacks {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                let value = if self.0 && path.ends_with("dampens_vibrations.json") {
+                    br#"{"values":["minecraft:stone"]}"#.as_slice()
+                } else {
+                    br#"{"values":[]}"#.as_slice()
+                };
+                Ok(vec![value.to_vec()])
+            }
+        }
+        for (sneak, dampens, listens, falling) in [
+            (false, false, true, true),
+            (true, false, true, true),
+            (false, true, true, true),
+            (false, false, false, true),
+            (false, false, true, false),
+        ] {
+            let (mut session, sensor) =
+                splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+            let registry = BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:stone".into(),
+                "minecraft:sculk_sensor".into(),
+            ]);
+            let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+                &mut LandingPacks(dampens),
+                &registry,
+            )
+            .unwrap();
+            let events = native_resources::game_event_tags::GameEventTags::new(
+                if listens {
+                    BTreeSet::from(["minecraft:hit_ground".into(), "minecraft:step".into()])
+                } else {
+                    BTreeSet::new()
+                },
+                BTreeSet::from(["minecraft:hit_ground".into(), "minecraft:step".into()]),
+            );
+            session.set_vibration_tags(Arc::new(events), Arc::new(blocks));
+            session.set_vanilla_block_ids(Arc::new(registry));
+            session.set_movement_climbable_tag(Arc::new(BTreeSet::new()));
+            session.set_random_tick_speed(0);
+            session.motion.position = DVec3::new(6.5, if falling { 1.1 } else { 1.0 }, 6.5);
+            session.motion.velocity = DVec3::new(0.0, if falling { -0.4 } else { 0.0 }, 0.0);
+            session.motion.on_ground = !falling;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = !falling;
+            session.fall_distance = if falling { 0.1 } else { 0.0 };
+            session.movement_events.distance = if falling { 1.1 } else { 0.0 };
+            session.sneak = sneak;
+            session.update(TICK);
+            assert!(
+                session.motion.on_ground || !falling,
+                "sneak={sneak}, dampens={dampens}, listens={listens}, falling={falling}, motion={:?}",
+                session.motion
+            );
+            let selected = session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending();
+            let expected = falling && !sneak && !dampens && listens;
+            assert_eq!(
+                selected.is_some(),
+                expected,
+                "sneak={sneak}, dampens={dampens}, listens={listens}, falling={falling}"
+            );
+            if let Some((_, event)) = selected {
+                assert_eq!(event.event, "minecraft:hit_ground");
+            }
+        }
     }
 
     #[test]

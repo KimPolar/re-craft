@@ -18,6 +18,20 @@ use crate::{
     survival::{FallEffects, PlayerVitals, SurvivalRules},
 };
 
+/// Entity.checkFallDamage accumulates vertical motion as a rounded float.
+pub(super) fn accumulate_distance(distance: f64, vertical: f64, in_water: bool) -> f64 {
+    if !in_water && vertical < 0.0 {
+        distance - f64::from(vertical as f32)
+    } else {
+        distance
+    }
+}
+
+/// HIT_GROUND is emitted even when the fall is too short to cause damage.
+pub(super) fn emits_landing(distance: f64, on_ground: bool) -> bool {
+    on_ground && distance > 0.0
+}
+
 // Sound types are properties of block code, while resource packs supply the
 // sound event itself. Leave unimplemented block types unresolved.
 pub(crate) fn block_fall_sound(id: &str) -> Option<&'static str> {

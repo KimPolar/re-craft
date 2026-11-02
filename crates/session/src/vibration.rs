@@ -554,6 +554,42 @@ mod tests {
         }
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let landings = data["landing"].as_array().unwrap();
+        assert_eq!(landings.len(), 200);
+        for (index, row) in landings.iter().enumerate() {
+            let ground = row["ground"].as_bool().unwrap();
+            let water = row["water"].as_bool().unwrap();
+            let accumulated = crate::fall::accumulate_distance(
+                row["initial"].as_f64().unwrap(),
+                row["vertical"].as_f64().unwrap(),
+                water,
+            );
+            let emitted = crate::fall::emits_landing(accumulated, ground);
+            assert_eq!(
+                emitted,
+                row["event"] == "hit_ground",
+                "landing {index}: {row}"
+            );
+            assert_eq!(
+                emitted,
+                row["fall_on"].as_bool().unwrap(),
+                "landing {index}: {row}"
+            );
+            let final_distance = if ground { 0.0 } else { accumulated };
+            assert_eq!(
+                final_distance.to_bits(),
+                row["fall_bits"].as_i64().unwrap() as u64,
+                "landing {index}: {row}"
+            );
+            let expected_affected = if !emitted {
+                "none"
+            } else if row["support"].as_bool().unwrap() {
+                "support"
+            } else {
+                "legacy"
+            };
+            assert_eq!(row["affected"], expected_affected, "landing {index}: {row}");
+        }
         let rows = data["movement"].as_array().unwrap();
         assert_eq!(rows.len(), 1024);
         let mut movement = crate::movement_events::MovementEvents::default();

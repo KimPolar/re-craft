@@ -6,7 +6,7 @@ use native_resources::{
     packs::{ResourceProvider, ResourceStack},
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk},
 };
-use native_session::worldgen::{CarverBlockState, TerrainGenerator};
+use native_session::worldgen::{CarverBlockState, TerrainGenerator, materialize_carved_terrain};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -342,5 +342,80 @@ fn terrain_matches_java_before_and_after_carvers() {
             &defaults,
             &updates[i * 2 + 1],
         );
+        let biome_chunk = neighborhood.chunk(pos).unwrap();
+        let generated = materialize_carved_terrain(chunk, biome_chunk, dimension, |state| {
+            let raw = state
+                .as_str()
+                .or_else(|| state.get("id").and_then(Value::as_str))
+                .context("missing block id")?;
+            let id = native_resources::packs::ResourceId::parse(raw)?;
+            let name = format!("{}:{}", id.namespace, id.path);
+            let mut properties = defaults
+                .get(&name)
+                .context("block missing from Java registry")?
+                .clone();
+            if let Some(extra) = state.get("properties").and_then(Value::as_object) {
+                for (key, value) in extra {
+                    anyhow::ensure!(properties.contains_key(key), "unknown block property");
+                    properties.insert(
+                        key.clone(),
+                        value.as_str().context("invalid block property")?.to_owned(),
+                    );
+                }
+            }
+            Ok(native_world::loaded::BlockState { name, properties })
+        })
+        .unwrap();
+        let world = generated.world();
+        let mut names = BTreeMap::new();
+        let expected = &groups[i * 2 + 1];
+        let words = &updates[i * 2 + 1];
+        for z in 0..16usize {
+            for x in 0..16usize {
+                for y in 0..height as usize {
+                    let index = (z * 16 + x) * height as usize + y;
+                    let state = world
+                        .block(
+                            pos[0] * 16 + x as i32,
+                            min_y + y as i32,
+                            pos[1] * 16 + z as i32,
+                        )
+                        .unwrap();
+                    let key = names.entry(state.clone()).or_insert_with(|| {
+                        let mut value = format!("{}|", state.name);
+                        for (name, property) in &state.properties {
+                            value.push_str(&format!("{name}={property};"));
+                        }
+                        value
+                    });
+                    assert_eq!(
+                        *key,
+                        palette[expected[z * 16 + x][y]],
+                        "materialized {dimension} {pos:?} {x} {y} {z}"
+                    );
+                    assert_eq!(
+                        generated.fluid_postprocessing()[index],
+                        words
+                            .get(index / 64)
+                            .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+                    );
+                }
+            }
+        }
+        for z in 0..4usize {
+            for x in 0..4usize {
+                for y in 0..height as usize / 4 {
+                    let biome = &biome_chunk.values()[(z * 4 + x) * (height as usize / 4) + y];
+                    assert_eq!(
+                        world.biome(
+                            pos[0] * 16 + (x * 4) as i32,
+                            min_y + (y * 4) as i32,
+                            pos[1] * 16 + (z * 4) as i32
+                        ),
+                        Some(format!("{}:{}", biome.namespace, biome.path).as_str())
+                    );
+                }
+            }
+        }
     }
 }

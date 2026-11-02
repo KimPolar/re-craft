@@ -38,6 +38,182 @@ pub struct QuartBiomeChunk {
     height: i32,
     values: Vec<ResourceId>,
 }
+
+/// A CARVERS-stage result ready for the remaining generation stages. The
+/// embedded chunk is deliberately not marked FULL or safe for world saving.
+pub struct MaterializedTerrain {
+    world: native_world::loaded::World,
+    min_y: i32,
+    height: i32,
+    postprocessing: Box<[bool]>,
+}
+
+impl MaterializedTerrain {
+    pub fn world(&self) -> &native_world::loaded::World {
+        &self.world
+    }
+
+    /// Z, X, Y order, matching the generated terrain's original flags.
+    pub fn fluid_postprocessing(&self) -> &[bool] {
+        &self.postprocessing
+    }
+
+    /// Query a local X/Z and absolute Y without exposing the storage layout.
+    pub fn fluid_postprocessing_at(&self, x: u8, y: i32, z: u8) -> Option<bool> {
+        if x >= 16 || z >= 16 {
+            return None;
+        }
+        let y = usize::try_from(y.checked_sub(self.min_y)?).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        if y >= height {
+            return None;
+        }
+        self.postprocessing
+            .get((usize::from(z) * 16 + usize::from(x)) * height + y)
+            .copied()
+    }
+
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+
+    /// Transfer the chunk and its unconsumed postprocessing flags together.
+    pub fn into_parts(self) -> (native_world::loaded::World, Box<[bool]>) {
+        (self.world, self.postprocessing)
+    }
+}
+
+/// Resolve a generated CARVERS-stage chunk against the active block-state
+/// registry. The resolver must return the complete state, including defaults,
+/// and reject identifiers or properties absent from that registry.
+pub fn materialize_carved_terrain(
+    terrain: SurfaceStageChunk,
+    biomes: &QuartBiomeChunk,
+    dimension: &str,
+    mut resolve: impl FnMut(&Value) -> Result<native_world::loaded::BlockState>,
+) -> Result<MaterializedTerrain> {
+    use native_world::loaded::{
+        BIOME_COUNT, BLOCK_COUNT, BiomeId, BlockStateId, Chunk, ChunkPos, SavedBlockEntities,
+        Section, World,
+    };
+
+    let dimension = ResourceId::parse(dimension)?;
+    ensure!(
+        terrain.chunk_position == biomes.chunk,
+        "terrain and biome chunk positions differ"
+    );
+    ensure!(
+        terrain.min_y == biomes.min_y && terrain.height == biomes.height,
+        "terrain and biome height ranges differ"
+    );
+    ensure!(
+        terrain.height > 0 && terrain.min_y % 16 == 0 && terrain.height % 16 == 0,
+        "invalid terrain height range"
+    );
+    let max_y = terrain
+        .min_y
+        .checked_add(terrain.height)
+        .context("terrain height overflow")?;
+    let first_section = terrain.min_y.div_euclid(16);
+    let end_section = max_y.div_euclid(16);
+    i8::try_from(first_section).context("first terrain section is out of range")?;
+    i8::try_from(end_section - 1).context("last terrain section is out of range")?;
+    for coord in terrain.chunk_position {
+        coord
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(15))
+            .context("terrain chunk coordinate overflow")?;
+    }
+    let height = usize::try_from(terrain.height)?;
+    let expected = height
+        .checked_mul(256)
+        .context("terrain volume size overflow")?;
+    ensure!(
+        terrain.states.len() == expected && terrain.fluid_updates.len() == expected,
+        "invalid terrain volume length"
+    );
+    ensure!(
+        biomes.values.len() == height / 4 * 16,
+        "invalid biome volume length"
+    );
+
+    let position = ChunkPos {
+        x: terrain.chunk_position[0],
+        z: terrain.chunk_position[1],
+    };
+    let mut world = World::new(format!("{}:{}", dimension.namespace, dimension.path));
+    world.set_biome_world_seed(Some(biomes.seed));
+    let mut state_cache: HashMap<*const Value, BlockStateId> = HashMap::new();
+    let mut biome_cache: BTreeMap<&ResourceId, BiomeId> = BTreeMap::new();
+    let mut sections = BTreeMap::new();
+    for section_y in first_section..end_section {
+        let offset = usize::try_from(section_y * 16 - terrain.min_y)?;
+        let mut blocks = Box::new([BlockStateId(0); BLOCK_COUNT]);
+        for y in 0..16usize {
+            for z in 0..16usize {
+                for x in 0..16usize {
+                    let source = &terrain.states[(z * 16 + x) * height + offset + y];
+                    let key = Arc::as_ptr(source);
+                    let id = if let Some(id) = state_cache.get(&key) {
+                        *id
+                    } else {
+                        let state = resolve(source)?;
+                        let id = world.intern_state(state);
+                        state_cache.insert(key, id);
+                        id
+                    };
+                    blocks[x + z * 16 + y * 256] = id;
+                }
+            }
+        }
+        let mut biome_values = Box::new([BiomeId(0); BIOME_COUNT]);
+        for y in 0..4usize {
+            for z in 0..4usize {
+                for x in 0..4usize {
+                    let biome = &biomes.values[(z * 4 + x) * (height / 4) + offset / 4 + y];
+                    let id = if let Some(id) = biome_cache.get(biome) {
+                        *id
+                    } else {
+                        let id = world.intern_biome(format!("{}:{}", biome.namespace, biome.path));
+                        biome_cache.insert(biome, id);
+                        id
+                    };
+                    biome_values[x + z * 4 + y * 16] = id;
+                }
+            }
+        }
+        sections.insert(
+            i8::try_from(section_y)?,
+            Arc::new(Section {
+                blocks: Some(blocks),
+                biomes: Some(biome_values),
+                block_light: None,
+                sky_light: None,
+            }),
+        );
+    }
+    world.chunks.insert(
+        position,
+        Arc::new(Chunk {
+            position,
+            status: Some("minecraft:carvers".into()),
+            block_light_correct: false,
+            sections,
+        }),
+    );
+    world
+        .saved_block_entities
+        .insert(position, SavedBlockEntities::Unavailable);
+    Ok(MaterializedTerrain {
+        world,
+        min_y: terrain.min_y,
+        height: terrain.height,
+        postprocessing: terrain.fluid_updates.into_boxed_slice(),
+    })
+}
 impl QuartBiomeChunk {
     /// Construct from decoded saved biome IDs in Z, X, Y order. The caller
     /// supplies the saved world's seed and ensures IDs match its active packs.
@@ -840,6 +1016,188 @@ impl TerrainGenerator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn materialized_terrain_preserves_states_biomes_and_postprocessing() {
+        let position = [-2, 3];
+        let height = 32usize;
+        let stone = Arc::new(json!("minecraft:stone"));
+        let water = Arc::new(json!({"id":"minecraft:water", "properties":{"level":"3"}}));
+        let mut states = Vec::new();
+        let mut updates = Vec::new();
+        for z in 0..16usize {
+            for x in 0..16usize {
+                for y in 0..height {
+                    states.push(Arc::clone(if (x + z + y) % 3 == 0 {
+                        &water
+                    } else {
+                        &stone
+                    }));
+                    updates.push((x + y * 3 + z * 7) % 13 == 0);
+                }
+            }
+        }
+        let biome_values: Vec<_> = (0..16 * height / 4)
+            .map(|i| {
+                ResourceId::parse(if i % 2 == 0 {
+                    "minecraft:plains"
+                } else {
+                    "minecraft:desert"
+                })
+                .unwrap()
+            })
+            .collect();
+        let biomes =
+            QuartBiomeChunk::from_values(position, 123, -16, height as i32, biome_values.clone())
+                .unwrap();
+        let terrain = SurfaceStageChunk {
+            chunk_position: position,
+            min_y: -16,
+            height: height as i32,
+            states,
+            fluid_updates: updates.clone(),
+        };
+        let mut resolved = 0;
+        let generated =
+            materialize_carved_terrain(terrain, &biomes, "minecraft:overworld", |value| {
+                resolved += 1;
+                if value.is_string() {
+                    Ok(native_world::loaded::BlockState {
+                        name: "minecraft:stone".into(),
+                        properties: BTreeMap::new(),
+                    })
+                } else {
+                    Ok(native_world::loaded::BlockState {
+                        name: "minecraft:water".into(),
+                        properties: BTreeMap::from([("level".into(), "3".into())]),
+                    })
+                }
+            })
+            .unwrap();
+        assert_eq!(resolved, 2, "resolve each shared state once");
+        assert_eq!(generated.fluid_postprocessing(), updates);
+        assert_eq!((generated.min_y(), generated.height()), (-16, 32));
+        assert_eq!(generated.fluid_postprocessing_at(0, -16, 0), Some(true));
+        assert_eq!(
+            generated.fluid_postprocessing_at(15, 15, 15),
+            Some(updates[(15 * 16 + 15) * height + 31])
+        );
+        assert_eq!(generated.fluid_postprocessing_at(16, 0, 0), None);
+        assert_eq!(generated.fluid_postprocessing_at(0, -17, 0), None);
+        assert_eq!(generated.fluid_postprocessing_at(0, 16, 0), None);
+        let world = generated.world();
+        assert_eq!(world.biome_zoom_seed(), Some(obfuscate_seed(123)));
+        let chunk = &world.chunks[&native_world::loaded::ChunkPos { x: -2, z: 3 }];
+        assert_eq!(chunk.status.as_deref(), Some("minecraft:carvers"));
+        assert!(!chunk.block_light_correct);
+        for section in chunk.sections.values() {
+            assert!(section.block_light.is_none() && section.sky_light.is_none());
+        }
+        for z in 0..16usize {
+            for x in 0..16usize {
+                for y in 0..height {
+                    let block = world
+                        .block(
+                            position[0] * 16 + x as i32,
+                            -16 + y as i32,
+                            position[1] * 16 + z as i32,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        block.name,
+                        if (x + z + y) % 3 == 0 {
+                            "minecraft:water"
+                        } else {
+                            "minecraft:stone"
+                        }
+                    );
+                    if block.name == "minecraft:water" {
+                        assert_eq!(block.properties.get("level").map(String::as_str), Some("3"));
+                    }
+                    let biome = &biome_values[((z / 4) * 4 + x / 4) * (height / 4) + y / 4];
+                    assert_eq!(
+                        world.biome(
+                            position[0] * 16 + x as i32,
+                            -16 + y as i32,
+                            position[1] * 16 + z as i32
+                        ),
+                        Some(format!("{}:{}", biome.namespace, biome.path).as_str())
+                    );
+                }
+            }
+        }
+        let (world, flags) = generated.into_parts();
+        assert_eq!(flags.as_ref(), updates);
+        assert_eq!(world.chunks.len(), 1);
+    }
+
+    #[test]
+    fn materialized_terrain_rejects_bad_ranges_and_unresolved_states() {
+        let biomes = QuartBiomeChunk::from_values(
+            [0, 0],
+            0,
+            0,
+            16,
+            vec![ResourceId::parse("minecraft:plains").unwrap(); 64],
+        )
+        .unwrap();
+        let terrain = || SurfaceStageChunk {
+            chunk_position: [0, 0],
+            min_y: 0,
+            height: 16,
+            states: vec![Arc::new(json!("minecraft:stone")); 4096],
+            fluid_updates: vec![false; 4096],
+        };
+        assert!(
+            materialize_carved_terrain(
+                terrain(),
+                &biomes,
+                "minecraft:overworld",
+                |_| anyhow::bail!("unregistered block")
+            )
+            .is_err()
+        );
+        let mut bad = terrain();
+        bad.fluid_updates.pop();
+        assert!(
+            materialize_carved_terrain(bad, &biomes, "minecraft:overworld", |_| unreachable!())
+                .is_err()
+        );
+        let mut bad = terrain();
+        bad.chunk_position = [1, 0];
+        assert!(
+            materialize_carved_terrain(bad, &biomes, "minecraft:overworld", |_| unreachable!())
+                .is_err()
+        );
+        let bad_biomes = QuartBiomeChunk::from_values(
+            [i32::MAX, 0],
+            0,
+            0,
+            16,
+            vec![ResourceId::parse("minecraft:plains").unwrap(); 64],
+        )
+        .unwrap();
+        let mut bad = terrain();
+        bad.chunk_position = [i32::MAX, 0];
+        assert!(
+            materialize_carved_terrain(bad, &bad_biomes, "minecraft:overworld", |_| unreachable!())
+                .is_err()
+        );
+        let high = QuartBiomeChunk::from_values(
+            [0, 0],
+            0,
+            2048,
+            16,
+            vec![ResourceId::parse("minecraft:plains").unwrap(); 64],
+        )
+        .unwrap();
+        let mut bad = terrain();
+        bad.min_y = 2048;
+        assert!(
+            materialize_carved_terrain(bad, &high, "minecraft:overworld", |_| unreachable!())
+                .is_err()
+        );
+    }
     struct Data;
     impl ResourceProvider for Data {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {

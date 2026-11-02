@@ -190,7 +190,21 @@ public class VibrationOracle {
             var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("wet",wet);row.addProperty("event",event.key().identifier().toString());row.addProperty("distance",distance);
             row.addProperty("after_phase",world.sensorState.getValue(SculkSensorBlock.PHASE).getSerializedName());row.addProperty("after_power",world.sensorState.getValue(SculkSensorBlock.POWER));row.addProperty("delay",world.delay);row.addProperty("notifications",world.notifications);row.addProperty("sounds",world.sounds);row.addProperty("events",world.events);row.addProperty("frequency",blockEntity.getLastVibrationFrequency());row.addProperty("sound",world.soundId);row.addProperty("pitch_bits",Float.floatToRawIntBits(world.soundPitch));row.addProperty("next_random",world.sensorRandom.nextInt());sensorArrivals.add(row);
         }
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);
+        bind.invoke(GameEvent.SPLASH,List.of(GameEventTags.VIBRATIONS));
+        var sensorDispatch=new JsonArray(); world.now=100;
+        var listenerRange=net.minecraft.world.level.gameevent.EuclideanGameEventListenerRegistry.class.getDeclaredMethod("getPostableListenerPosition",ServerLevel.class,Vec3.class,net.minecraft.world.level.gameevent.GameEventListener.class); listenerRange.setAccessible(true);
+        for (boolean calibrated:new boolean[]{false,true}) for(var phase:SculkSensorPhase.values()) for(int input:new int[]{0,2,7,15}) for(boolean wall:new boolean[]{false,true}) for(double eventX:new double[]{3.5,8.99,9.0,16.99,17.0}) {
+            var state=(calibrated ? Blocks.CALIBRATED_SCULK_SENSOR : Blocks.SCULK_SENSOR).defaultBlockState().setValue(SculkSensorBlock.PHASE,phase);
+            if(calibrated)state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
+            var blockEntity=calibrated ? new CalibratedSculkSensorBlockEntity(BlockPos.ZERO,state) : new SculkSensorBlockEntity(BlockPos.ZERO,state);
+            world.signal=input;world.occluders=new HashSet<>();
+            if(wall)for(int y=-2;y<=2;y++)for(int z=-2;z<=2;z++)world.occluders.add(new BlockPos(1,y,z));
+            var position=new Vec3(eventX,0.5,0.5);
+            boolean inRange=((Optional<?>)listenerRange.invoke(null,world,position,blockEntity.getListener())).isPresent();
+            boolean accepted=inRange && blockEntity.getListener().handleGameEvent(world,GameEvent.SPLASH,GameEvent.Context.of((Entity)null),position);
+            var row=new JsonObject();row.addProperty("calibrated",calibrated);row.addProperty("phase",phase.getSerializedName());row.addProperty("input",input);row.addProperty("wall",wall);row.addProperty("x",eventX);row.addProperty("accepted",accepted);sensorDispatch.add(row);
+        }
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);
         Files.writeString(Path.of(args[0]), result.toString());
         var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
         var sensorNbt=new net.minecraft.nbt.CompoundTag();

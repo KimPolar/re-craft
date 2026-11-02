@@ -437,6 +437,8 @@ pub struct LoadedSession {
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
+    vibration_event_tags: Option<Arc<native_resources::game_event_tags::GameEventTags>>,
+    vibration_block_tags: Option<Arc<native_resources::game_event_tags::VibrationBlockTags>>,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     pickup_sounds: VecDeque<crate::PickupSound>,
@@ -4750,6 +4752,15 @@ impl LoadedSession {
         self.time_markers = Some(markers);
     }
 
+    pub fn set_vibration_tags(
+        &mut self,
+        events: Arc<native_resources::game_event_tags::GameEventTags>,
+        blocks: Arc<native_resources::game_event_tags::VibrationBlockTags>,
+    ) {
+        self.vibration_event_tags = Some(events);
+        self.vibration_block_tags = Some(blocks);
+    }
+
     pub fn set_falling_fire_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.falling_fire_tag = Some(tag);
         self.sand_deferred_revision = None;
@@ -5265,6 +5276,8 @@ impl LoadedSession {
             biome_climates: None,
             generator_sea_level: None,
             vanilla_block_ids: None,
+            vibration_event_tags: None,
+            vibration_block_tags: None,
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
@@ -6722,6 +6735,124 @@ impl LoadedSession {
                     .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
             })
         })
+    }
+
+    /// Dispatch an item splash to resident listeners using active pack tags.
+    fn dispatch_item_splash(&mut self, event: crate::ItemWaterEntry) {
+        let (Some(events), Some(blocks)) = (
+            self.vibration_event_tags.clone(),
+            self.vibration_block_tags.clone(),
+        ) else {
+            return;
+        };
+        if !events.vibrates("minecraft:splash") || !event.position.is_finite() {
+            return;
+        }
+        let event_block = event.position.floor();
+        if event_block.min_element() < f64::from(i32::MIN)
+            || event_block.max_element() > f64::from(i32::MAX)
+        {
+            return;
+        }
+        let x = event_block.x;
+        if x < f64::from(i32::MIN) + 16.0 || x > f64::from(i32::MAX) - 16.0 {
+            return;
+        }
+        let low = [x as i32 - 16, i32::MIN, i32::MIN];
+        let high = [x as i32 + 16, i32::MAX, i32::MAX];
+        let keys: Vec<_> = self
+            .sculk_listeners
+            .range(low..=high)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            let position = IVec3::from_array(key);
+            let chunk = ChunkPos {
+                x: position.x.div_euclid(16),
+                z: position.z.div_euclid(16),
+            };
+            if !self
+                .world
+                .chunks
+                .get(&chunk)
+                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            {
+                continue;
+            }
+            let Some(saved) = self.sculk_listeners.get(&key) else {
+                continue;
+            };
+            if saved.vibration.current().is_some() {
+                continue;
+            }
+            let Some(block) = self.world.block(position.x, position.y, position.z) else {
+                continue;
+            };
+            let Some(sensor) = crate::sculk_sensor::Sensor::from_block(block) else {
+                continue;
+            };
+            if sensor.facing.is_some() != saved.calibrated {
+                continue;
+            }
+            let listener = position.as_dvec3() + DVec3::splat(0.5);
+            // EuclideanGameEventListenerRegistry compares floored block positions.
+            let delta = event_block - position.as_dvec3();
+            if delta.length_squared() > f64::from(sensor.radius()).powi(2) {
+                continue;
+            }
+            let Some(relative) = subtract(position, self.origin) else {
+                continue;
+            };
+            let input = if let Some(back) = sensor.back_face() {
+                let Some(at) = add(relative, back) else {
+                    continue;
+                };
+                crate::redstone::signal_from(at, back, |at, direction| {
+                    self.redstone_source(at, direction)
+                })
+            } else {
+                None
+            };
+            if sensor.can_receive("minecraft:splash", false, input) != Some(true) {
+                continue;
+            }
+            let blocked = crate::vibration::occluded(event.position, listener, |absolute| {
+                let relative = subtract(absolute, self.origin)?;
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    return None;
+                };
+                blocks.occludes(&self.world.state(id)?.name)
+            });
+            if blocked != Some(false) {
+                continue;
+            }
+            let Some(distance) = crate::vibration::travel_distance(event.position, listener) else {
+                continue;
+            };
+            let vibration = crate::vibration::Vibration {
+                event: "minecraft:splash".into(),
+                distance,
+                position: event.position,
+                source: event.source_uuid,
+                projectile_owner: None,
+            };
+            let Some(saved) = self.sculk_listeners.get_mut(&key) else {
+                continue;
+            };
+            let before = saved.vibration.clone();
+            saved.vibration.offer(vibration, self.game_time);
+            let changed = saved.vibration != before;
+            if changed {
+                self.active_sculk_listeners.insert(key);
+                self.mark_tick_chunk_dirty(position.x, position.z);
+            }
+        }
     }
 
     /// Resume persisted vibrations. Particle restoration and secondary
@@ -15560,7 +15691,6 @@ impl LoadedSession {
         self.advance_fluid_ticks();
         self.advance_random_block_ticks();
         self.advance_falling_sand();
-        self.advance_saved_sculk_listeners();
         if self.death.is_some() {
             let requested = self
                 .commands
@@ -17773,11 +17903,18 @@ impl GameSession for LoadedSession {
                 &mut self.experience_orbs,
             );
             crate::collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
-            crate::collect_item_water_entries(
-                &mut self.item_water_entries,
-                &mut self.dropped_items,
-                self.tick,
-            );
+            let entries: Vec<_> = self.dropped_items.drain_water_entries().collect();
+            for mut entry in entries {
+                entry.tick = self.tick;
+                self.dispatch_item_splash(entry);
+                if self.item_water_entries.len() == 4096 {
+                    self.item_water_entries.pop_front();
+                }
+                self.item_water_entries.push_back(entry);
+            }
+            // Server block entities run after entity ticks, so a splash cannot
+            // replace a vibration that is still in flight during this tick.
+            self.advance_saved_sculk_listeners();
             processed += 1;
         }
         if processed > 0 {
@@ -20581,6 +20718,186 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    struct SplashTestPacks;
+    impl native_resources::packs::ResourceProvider for SplashTestPacks {
+        fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+            let value = match path {
+                "data/minecraft/tags/block/occludes_vibration_signals.json" => {
+                    br#"{"values":["minecraft:stone"]}"#.as_slice()
+                }
+                "data/minecraft/tags/block/dampens_vibrations.json"
+                | "data/minecraft/tags/block/vibration_resonators.json" => {
+                    br#"{"values":[]}"#.as_slice()
+                }
+                _ => return Ok(Vec::new()),
+            };
+            Ok(vec![value.to_vec()])
+        }
+    }
+
+    fn splash_test_tags() -> (
+        Arc<native_resources::game_event_tags::GameEventTags>,
+        Arc<native_resources::game_event_tags::VibrationBlockTags>,
+    ) {
+        let events = native_resources::game_event_tags::GameEventTags::new(
+            BTreeSet::from(["minecraft:splash".into()]),
+            BTreeSet::new(),
+        );
+        let registry = [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:sculk_sensor",
+            "minecraft:calibrated_sculk_sensor",
+            "minecraft:redstone_lamp",
+            "minecraft:water",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+            &mut SplashTestPacks,
+            &registry,
+        )
+        .unwrap();
+        (Arc::new(events), Arc::new(blocks))
+    }
+
+    fn splash_test_session(
+        calibrated: bool,
+        phase: crate::sculk_sensor::Phase,
+        input: u8,
+        wall: bool,
+    ) -> (LoadedSession, IVec3) {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        let mut session = session();
+        let (events, blocks) = splash_test_tags();
+        session.set_vibration_tags(events, blocks);
+        let at = IVec3::new(4, 2, 4);
+        let position = session.origin + at;
+        let state = crate::sculk_sensor::Sensor {
+            phase,
+            power: 0,
+            waterlogged: false,
+            facing: calibrated.then_some(IVec3::NEG_Z),
+        };
+        let id = session.intern_block(state.to_block().unwrap());
+        assert!(session.set(at, id));
+        if calibrated && input > 0 {
+            let source = crate::sculk_sensor::Sensor {
+                phase: crate::sculk_sensor::Phase::Active,
+                power: input,
+                waterlogged: false,
+                facing: None,
+            };
+            let id = session.intern_block(source.to_block().unwrap());
+            assert!(session.set(at + IVec3::Z, id));
+        }
+        if wall {
+            let stone = session.states[3];
+            for y in -2..=2 {
+                for z in -2..=2 {
+                    let _ = session.set(at + IVec3::new(1, y, z), stone);
+                }
+            }
+        }
+        let entity = Tag::Compound(vec![
+            (
+                "id".into(),
+                Tag::String(
+                    if calibrated {
+                        "minecraft:calibrated_sculk_sensor"
+                    } else {
+                        "minecraft:sculk_sensor"
+                    }
+                    .into(),
+                ),
+            ),
+            ("x".into(), Tag::Int(position.x)),
+            ("y".into(), Tag::Int(position.y)),
+            ("z".into(), Tag::Int(position.z)),
+        ]);
+        let bytes = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity],
+            },
+        })
+        .unwrap();
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let pos = ChunkPos {
+                    x: chunk.x + dx,
+                    z: chunk.z + dz,
+                };
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: false,
+                        sections: BTreeMap::new(),
+                    }),
+                );
+            }
+        }
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                native_world::loaded::SavedBlockEntities::Encoded(bytes.into()),
+            );
+        session.register_saved_sculk_chunk(chunk);
+        session.game_time = 100;
+        (session, position)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_item_splash_dispatch_with_java(rows: &[serde_json::Value]) {
+        for row in rows {
+            let calibrated = row["calibrated"].as_bool().unwrap();
+            let phase = match row["phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            let (mut session, pos) = splash_test_session(
+                calibrated,
+                phase,
+                row["input"].as_u64().unwrap() as u8,
+                row["wall"].as_bool().unwrap(),
+            );
+            let event = crate::ItemWaterEntry {
+                tick: 0,
+                entity_id: 1,
+                position: pos.as_dvec3() + DVec3::new(row["x"].as_f64().unwrap(), 0.5, 0.5),
+                velocity: DVec3::ZERO,
+                source_uuid: Some([1, 2, 3, 4]),
+            };
+            session.dispatch_item_splash(event);
+            let candidate = session.sculk_listeners[&pos.to_array()].vibration.pending();
+            assert_eq!(
+                candidate.is_some(),
+                row["accepted"].as_bool().unwrap(),
+                "{row}"
+            );
+            if let Some((tick, event)) = candidate {
+                assert_eq!((tick, event.source), (100, Some([1, 2, 3, 4])));
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -31359,6 +31676,186 @@ pub(crate) mod tests {
                 .all(|event| event.info.event != "entity.generic.splash")
         );
         assert!(session.take_item_water_entries().is_empty());
+    }
+
+    #[test]
+    fn dropped_item_splash_schedules_sensor_and_activates_after_travel() {
+        let (mut session, sensor_pos) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        session.set_random_tick_speed(0);
+        session.set_game_mode(GameMode::Spectator);
+        let chunk = ChunkPos {
+            x: sensor_pos.x.div_euclid(16),
+            z: sensor_pos.z.div_euclid(16),
+        };
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let pos = ChunkPos {
+                    x: chunk.x + dx,
+                    z: chunk.z + dz,
+                };
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: false,
+                        sections: BTreeMap::new(),
+                    }),
+                );
+            }
+        }
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5);
+        let stack = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            native_persistence::nbt::Tag::Compound(vec![]),
+        )
+        .unwrap();
+        session.dropped_items.spawn_from_entity(position, stack);
+        session.update(TICK);
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
+        session.update(TICK);
+        assert!(
+            session.sculk_listeners[&sensor_pos.to_array()]
+                .vibration
+                .pending()
+                .is_some()
+        );
+        assert_eq!(
+            crate::sculk_sensor::Sensor::from_block(
+                session
+                    .world
+                    .block(sensor_pos.x, sensor_pos.y, sensor_pos.z)
+                    .unwrap()
+            )
+            .unwrap()
+            .phase,
+            crate::sculk_sensor::Phase::Inactive
+        );
+        for _ in 0..12 {
+            session.update(TICK);
+        }
+        let sensor = crate::sculk_sensor::Sensor::from_block(
+            session
+                .world
+                .block(sensor_pos.x, sensor_pos.y, sensor_pos.z)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sensor.phase, crate::sculk_sensor::Phase::Active);
+        assert!(sensor.power > 0);
+        assert_eq!(
+            session.sculk_listeners[&sensor_pos.to_array()].last_frequency,
+            2
+        );
+        assert!(
+            session
+                .take_consume_sounds()
+                .iter()
+                .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
+        );
+    }
+
+    #[test]
+    fn splash_selection_respects_tags_range_and_in_flight_vibrations() {
+        let (mut session, pos) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let entry = |offset: f64, id: u32| crate::ItemWaterEntry {
+            tick: 0,
+            entity_id: id,
+            position: pos.as_dvec3() + DVec3::new(offset + 0.5, 0.5, 0.5),
+            velocity: DVec3::ZERO,
+            source_uuid: Some([0, 0, 0, id as i32]),
+        };
+        let chunk = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&chunk)
+                .unwrap(),
+        )
+        .status = Some("minecraft:noise".into());
+        session.dispatch_item_splash(entry(2.0, 0));
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .pending()
+                .is_none()
+        );
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&chunk)
+                .unwrap(),
+        )
+        .status = Some("minecraft:full".into());
+        session.dispatch_item_splash(entry(9.0, 1));
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .pending()
+                .is_none()
+        );
+        session.vibration_event_tags = Some(Arc::new(
+            native_resources::game_event_tags::GameEventTags::new(BTreeSet::new(), BTreeSet::new()),
+        ));
+        session.dispatch_item_splash(entry(2.0, 2));
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .pending()
+                .is_none()
+        );
+        session.vibration_event_tags = Some(splash_test_tags().0);
+        session.dispatch_item_splash(entry(5.0, 3));
+        session.dispatch_item_splash(entry(2.0, 4));
+        let (tick, pending) = session.sculk_listeners[&pos.to_array()]
+            .vibration
+            .pending()
+            .unwrap();
+        assert_eq!(
+            (tick, pending.distance, pending.source),
+            (100, 2.0, Some([0, 0, 0, 4]))
+        );
+        session.advance_saved_sculk_listeners();
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .current()
+                .is_none()
+        );
+        session.game_time = 101;
+        session.advance_saved_sculk_listeners();
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .current()
+                .is_some()
+        );
+        session.dispatch_item_splash(entry(1.0, 5));
+        assert!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .pending()
+                .is_none()
+        );
+        assert_eq!(
+            session.sculk_listeners[&pos.to_array()]
+                .vibration
+                .current()
+                .unwrap()
+                .source,
+            Some([0, 0, 0, 4])
+        );
     }
 
     #[test]

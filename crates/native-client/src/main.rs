@@ -1237,6 +1237,22 @@ fn prepare_existing_world(
         match resources.vanilla_block_ids() {
             Ok(registry) => {
                 session.set_vanilla_block_ids(Arc::new(registry.clone()));
+                let vibration_events = native_resources::game_event_tags::GameEventTags::load(
+                    &mut resources,
+                    &native_session::vibration::vanilla_game_events(),
+                );
+                let vibration_blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+                    &mut resources,
+                    &registry,
+                );
+                match (vibration_events, vibration_blocks) {
+                    (Ok(events), Ok(blocks)) => {
+                        session.set_vibration_tags(Arc::new(events), Arc::new(blocks))
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        eprintln!("Vibration tags are unavailable: {error:#}")
+                    }
+                }
                 match native_resources::fluid_tags::load_washed_away_blocks(
                     &mut resources,
                     &registry,

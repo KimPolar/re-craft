@@ -96,6 +96,7 @@ mod tests {
             entity_id: 1,
             position: DVec3::new(1.25, 4.5, -3.75),
             velocity: DVec3::new(0.3, -0.2, -0.4),
+            source_uuid: None,
         };
         let mut seeds = LegacyRandom::new(19);
         let mut first = LegacyRandom::new(seeds.next_long());
@@ -170,6 +171,7 @@ mod tests {
                 entity_id: 5,
                 position: DVec3::new(1.25, 4.5, -3.75),
                 velocity: DVec3::new(0.3, row["y"].as_f64().unwrap(), -0.4),
+                source_uuid: None,
             };
             let mut random = LegacyRandom::new(row["seed"].as_i64().unwrap());
             let (bubbles, splashes) = generate(event, &mut random);

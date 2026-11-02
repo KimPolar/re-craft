@@ -158,6 +158,8 @@ pub struct ItemWaterEntry {
     pub entity_id: u32,
     pub position: DVec3,
     pub velocity: DVec3,
+    /// UUID of the source entity when known to the simulation.
+    pub source_uuid: Option<[i32; 4]>,
 }
 
 fn collect_item_water_entries(

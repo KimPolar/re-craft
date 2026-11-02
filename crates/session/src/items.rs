@@ -2433,14 +2433,20 @@ impl ItemEntities {
                 &mut entity.random,
             );
             if let Some(info) = splash {
-                if self.water_entries.len() == 4096 {
-                    self.water_entries.pop_front();
-                }
                 self.water_entries.push_back(crate::ItemWaterEntry {
                     tick: 0,
                     entity_id: entity.id,
                     position: entity.item.position,
                     velocity: entity.velocity,
+                    source_uuid: entity
+                        ._saved_source
+                        .as_ref()
+                        .and_then(|source| {
+                            crate::saved_item::optional_uuid(source, "UUID")
+                                .ok()
+                                .flatten()
+                        })
+                        .or_else(|| entity.created.as_ref().and_then(|created| created.uuid)),
                 });
                 let silent = entity
                     ._saved_source

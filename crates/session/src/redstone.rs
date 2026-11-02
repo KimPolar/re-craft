@@ -233,6 +233,39 @@ pub fn trapped_chest_source(
     ))
 }
 
+/// Java Level.getSignal: weak output plus direct power relayed by conductors.
+pub fn signal_from(
+    position: IVec3,
+    direction: IVec3,
+    mut signal: impl FnMut(IVec3, IVec3) -> Option<(u8, u8, bool)>,
+) -> Option<u8> {
+    if !DIRECTIONS.contains(&direction) {
+        return None;
+    }
+    let (weak, _, conductor) = signal(position, direction)?;
+    if !conductor || weak >= 15 {
+        return Some(weak);
+    }
+    let mut strength = weak;
+    let mut unknown = false;
+    for incoming in DIRECTIONS {
+        let Some(source) = add(position, incoming) else {
+            unknown = true;
+            continue;
+        };
+        match signal(source, incoming) {
+            Some((_, direct, _)) => {
+                strength = strength.max(direct);
+                if strength >= 15 {
+                    return Some(strength);
+                }
+            }
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(strength)
+}
+
 /// Java's `hasNeighborSignal` for known sources and conductors.
 pub fn neighbor_signal<'a>(
     position: IVec3,
@@ -319,5 +352,31 @@ mod tests {
         assert_eq!(query(false, false), None);
         assert_eq!(query(false, true), None);
         assert_eq!(neighbor_signal(IVec3::ZERO, |_| Some(&air)), Some(false));
+    }
+
+    #[test]
+    fn conductor_signal_propagates_known_direct_strength_and_uncertainty() {
+        let query = |unknown: bool, direct: u8| {
+            signal_from(IVec3::ZERO, IVec3::X, |pos, dir| {
+                if pos == IVec3::ZERO {
+                    return Some((2, 0, true));
+                }
+                if pos == IVec3::NEG_Y && unknown {
+                    return None;
+                }
+                Some((
+                    0,
+                    if pos == IVec3::Y && dir == IVec3::Y {
+                        direct
+                    } else {
+                        0
+                    },
+                    false,
+                ))
+            })
+        };
+        assert_eq!(query(false, 7), Some(7));
+        assert_eq!(query(true, 7), None);
+        assert_eq!(query(true, 15), Some(15));
     }
 }

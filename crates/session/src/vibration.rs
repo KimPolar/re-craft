@@ -938,6 +938,9 @@ mod tests {
         let arrivals = data["sensor_arrivals"].as_array().unwrap();
         assert_eq!(arrivals.len(), 2 * 3 * 2 * 4 * 5);
         crate::loaded::tests::compare_saved_sensor_arrivals_with_java(arrivals);
+        let dispatch = data["sensor_dispatch"].as_array().unwrap();
+        assert_eq!(dispatch.len(), 2 * 3 * 4 * 2 * 5);
+        crate::loaded::tests::compare_item_splash_dispatch_with_java(dispatch);
         for row in arrivals {
             let before = parse_sensor(row);
             let change = before.arrive(

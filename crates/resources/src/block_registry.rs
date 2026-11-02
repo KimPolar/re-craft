@@ -10,24 +10,93 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{Manifest, TARGET_VERSION, open_verified_client, packs::ResourceId};
 
 pub type DefaultProperties = BTreeMap<String, BTreeMap<String, String>>;
 
-/// Blocks proven to inherit the empty base block state definition. Blocks
-/// with state properties still require separate default-state decoding.
-pub struct StatelessBlockRegistry {
-    ids: BTreeSet<String>,
+/// Resolved built-in block classes whose state definitions are implemented.
+pub struct GeneratedBlockRegistry {
+    states: BTreeMap<String, StateSchema>,
 }
 
-impl StatelessBlockRegistry {
+#[derive(Clone, Copy, Debug)]
+enum StateSchema {
+    Stateless,
+    Snowy,
+    Liquid,
+    Axis,
+}
+
+impl StateSchema {
+    fn default_properties(self) -> BTreeMap<String, String> {
+        let value = match self {
+            Self::Stateless => return BTreeMap::new(),
+            Self::Snowy => ("snowy", "false"),
+            Self::Liquid => ("level", "0"),
+            Self::Axis => ("axis", "y"),
+        };
+        BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
+    }
+
+    fn parse_property(self, name: &str, value: &str) -> Option<String> {
+        match self {
+            Self::Snowy if name == "snowy" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::Axis if name == "axis" && matches!(value, "x" | "y" | "z") => {
+                Some(value.to_owned())
+            }
+            Self::Liquid if name == "level" => java_decimal(value)
+                .filter(|n| (0..=15).contains(n))
+                .map(|n| n.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// Integer.parseInt reads UTF-16 chars and Character.digit(char, 10).
+fn java_decimal(value: &str) -> Option<i32> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    let negative = first == '-';
+    let signed = negative || first == '+';
+    let mut number = 0_i64;
+    let mut count = 0usize;
+    for ch in (!signed).then_some(first).into_iter().chain(chars) {
+        if ch as u32 > 0xffff || ch.general_category() != GeneralCategory::DecimalNumber {
+            return None;
+        }
+        let mut start = ch as u32;
+        while let Some(previous) = start.checked_sub(1).and_then(char::from_u32) {
+            if previous.general_category() != GeneralCategory::DecimalNumber {
+                break;
+            }
+            start -= 1;
+        }
+        let digit = (ch as u32 - start) % 10;
+        number = number.checked_mul(10)?.checked_add(i64::from(digit))?;
+        if number > i64::from(i32::MAX) + i64::from(negative) {
+            return None;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    i32::try_from(if negative { -number } else { number }).ok()
+}
+
+impl GeneratedBlockRegistry {
     /// Read class files from a hash-verified 26.3 client JAR.
     pub fn load(mut read_class: impl FnMut(&str) -> Result<Option<Vec<u8>>>) -> Result<Self> {
         const BLOCKS: &str = "net/minecraft/world/level/block/Blocks";
         const IDS: &str = "net/minecraft/references/BlockItemIds";
+        const KEYS: &str = "net/minecraft/references/BlockIds";
         const DIRECT: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
+        const KEY_FACTORY: &str = "(Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const BASE: &str = "net/minecraft/world/level/block/Block";
         let mut load = |name: &str| -> Result<crate::item_registry::Class> {
             let bytes = read_class(&format!("{name}.class"))?
@@ -37,6 +106,7 @@ impl StatelessBlockRegistry {
             Ok(class)
         };
         let names = load(IDS)?.block_reference_names()?;
+        let key_names = load(KEYS)?.block_key_reference_names()?;
         let blocks = load(BLOCKS)?;
         let mut candidates = BTreeSet::new();
         let mut registration = None;
@@ -58,8 +128,8 @@ impl StatelessBlockRegistry {
             }
             let (owner, member, descriptor) =
                 blocks.member(ins.index.context("missing class reference")?)?;
-            if ins.op == 0xb2 && owner == IDS {
-                candidates.insert(member.to_owned());
+            if ins.op == 0xb2 && (owner == IDS || owner == KEYS) {
+                candidates.insert((owner.to_owned(), member.to_owned()));
             } else if ins.op == 0xb8
                 && owner == BLOCKS
                 && member == "register"
@@ -70,7 +140,7 @@ impl StatelessBlockRegistry {
             } else if ins.op == 0xb8
                 && owner == BLOCKS
                 && member == "register"
-                && descriptor == FACTORY
+                && (descriptor == FACTORY || descriptor == KEY_FACTORY)
             {
                 ensure!(registration.is_none(), "ambiguous block registration");
                 registration = Some(false);
@@ -82,9 +152,10 @@ impl StatelessBlockRegistry {
                 };
                 if let Some(class) = class
                     && candidates.len() == 1
-                    && candidates.contains(member)
+                    && candidates.first().is_some_and(|(_, field)| field == member)
                 {
-                    let name = names
+                    let (owner, _) = candidates.first().expect("checked single candidate");
+                    let name = if owner == IDS { &names } else { &key_names }
                         .get(member)
                         .with_context(|| format!("missing block reference {member}"))?;
                     let id = ResourceId::parse(name)?;
@@ -106,30 +177,82 @@ impl StatelessBlockRegistry {
         }
         drop(load);
         let mut cache = BTreeMap::new();
-        let mut ids = BTreeSet::new();
+        let mut states = BTreeMap::new();
         for (id, class) in registered_classes {
-            if stateless_class(&class, &mut read_class, &mut cache, &mut BTreeSet::new())? {
-                ids.insert(id);
+            let schema = match class.as_str() {
+                "net/minecraft/world/level/block/SnowyBlock"
+                | "net/minecraft/world/level/block/GrassBlock"
+                | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
+                "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
+                "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
+                _ if stateless_class(
+                    &class,
+                    &mut read_class,
+                    &mut cache,
+                    &mut BTreeSet::new(),
+                )? =>
+                {
+                    Some(StateSchema::Stateless)
+                }
+                _ => None,
+            };
+            if let Some(schema) = schema {
+                states.insert(id, schema);
             }
         }
         ensure!(
-            ids.contains("minecraft:stone") && ids.contains("minecraft:dirt"),
-            "stateless block registration format is unsupported"
+            states.contains_key("minecraft:stone") && states.contains_key("minecraft:dirt"),
+            "block registration format is unsupported"
         );
-        Ok(Self { ids })
+        Ok(Self { states })
     }
 
     pub fn contains(&self, id: &str) -> bool {
-        self.ids.contains(id)
+        self.states.contains_key(id)
     }
     pub fn ids(&self) -> impl Iterator<Item = &str> {
-        self.ids.iter().map(String::as_str)
+        self.states.keys().map(String::as_str)
     }
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.states.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.states.is_empty()
+    }
+
+    pub fn default_properties(&self, id: &str) -> Option<BTreeMap<String, String>> {
+        self.states
+            .get(id)
+            .map(|schema| schema.default_properties())
+    }
+
+    /// Java's block-state codec ignores unknown or invalid property entries.
+    pub fn resolve(&self, value: &serde_json::Value) -> Result<(String, BTreeMap<String, String>)> {
+        let raw = value
+            .as_str()
+            .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+            .context("block state has no identifier")?;
+        let id = ResourceId::parse(raw)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        let schema = *self
+            .states
+            .get(&name)
+            .with_context(|| format!("block state definition is unavailable: {name}"))?;
+        let mut properties = schema.default_properties();
+        if let Some(values) = value
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, value) in values {
+                if let Some(value) = value
+                    .as_str()
+                    .and_then(|value| schema.parse_property(name, value))
+                {
+                    properties.insert(name.clone(), value);
+                }
+            }
+        }
+        Ok((name, properties))
     }
 }
 
@@ -302,8 +425,19 @@ mod tests {
 
     #[test]
     fn stateless_registry_rejects_missing_and_malformed_classes() {
-        assert!(StatelessBlockRegistry::load(|_| Ok(None)).is_err());
-        assert!(StatelessBlockRegistry::load(|_| Ok(Some(vec![0xca, 0xfe, 0xba, 0xbe]))).is_err());
+        assert!(GeneratedBlockRegistry::load(|_| Ok(None)).is_err());
+        assert!(GeneratedBlockRegistry::load(|_| Ok(Some(vec![0xca, 0xfe, 0xba, 0xbe]))).is_err());
+    }
+
+    #[test]
+    fn java_decimal_handles_signs_unicode_and_integer_limits() {
+        assert_eq!(java_decimal("+٠٧"), Some(7));
+        assert_eq!(java_decimal("-٠"), Some(0));
+        assert_eq!(java_decimal("2147483647"), Some(i32::MAX));
+        assert_eq!(java_decimal("-2147483648"), Some(i32::MIN));
+        for value in ["", "+", "-", "2147483648", "-2147483649", "1 ", "²", "𝟟"] {
+            assert_eq!(java_decimal(value), None, "{value}");
+        }
     }
 
     #[test]

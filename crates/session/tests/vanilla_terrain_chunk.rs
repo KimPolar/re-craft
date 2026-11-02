@@ -7,7 +7,7 @@ use native_resources::{
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk},
 };
 use native_session::worldgen::{
-    CarverBlockState, TerrainGenerator, materialize_carved_terrain, resolve_stateless_terrain_state,
+    CarverBlockState, TerrainGenerator, materialize_carved_terrain, resolve_generated_terrain_state,
 };
 use serde_json::Value;
 use std::{
@@ -264,31 +264,35 @@ fn terrain_matches_java_before_and_after_carvers() {
     assert_eq!(updates.len(), groups.len());
     assert!(registry.len() > 1000);
     let mut resources = ResourceStack::open(&game).unwrap();
-    let stateless_registry = resources.vanilla_stateless_block_registry().unwrap();
+    let generated_registry = resources.vanilla_generated_block_registry().unwrap();
     let stone =
-        resolve_stateless_terrain_state(&serde_json::json!("stone"), &stateless_registry).unwrap();
+        resolve_generated_terrain_state(&serde_json::json!("stone"), &generated_registry).unwrap();
     assert_eq!(stone.name, "minecraft:stone");
     assert!(stone.properties.is_empty());
     assert!(
-        resolve_stateless_terrain_state(
+        resolve_generated_terrain_state(
             &serde_json::json!({"id":"minecraft:stone","properties":{}}),
-            &stateless_registry
+            &generated_registry
         )
         .is_ok()
     );
     assert!(
-        resolve_stateless_terrain_state(
+        resolve_generated_terrain_state(
             &serde_json::json!({"id":"minecraft:stone","properties":{"unknown":"x"}}),
-            &stateless_registry
+            &generated_registry
         )
-        .is_err()
+        .is_ok()
     );
     assert!(
-        resolve_stateless_terrain_state(&serde_json::json!("minecraft:water"), &stateless_registry)
-            .is_err()
+        resolve_generated_terrain_state(&serde_json::json!("minecraft:water"), &generated_registry)
+            .unwrap()
+            .properties
+            .get("level")
+            .map(String::as_str)
+            == Some("0")
     );
     assert!(
-        resolve_stateless_terrain_state(&serde_json::json!("example:stone"), &stateless_registry)
+        resolve_generated_terrain_state(&serde_json::json!("example:stone"), &generated_registry)
             .is_err()
     );
     let preset: Value = serde_json::from_slice(
@@ -372,38 +376,10 @@ fn terrain_matches_java_before_and_after_carvers() {
             &updates[i * 2 + 1],
         );
         let biome_chunk = neighborhood.chunk(pos).unwrap();
-        let mut stateless_resolutions = 0;
         let generated = materialize_carved_terrain(chunk, biome_chunk, dimension, |state| {
-            if let Ok(resolved) = resolve_stateless_terrain_state(state, &stateless_registry) {
-                stateless_resolutions += 1;
-                return Ok(resolved);
-            }
-            let raw = state
-                .as_str()
-                .or_else(|| state.get("id").and_then(Value::as_str))
-                .context("missing block id")?;
-            let id = native_resources::packs::ResourceId::parse(raw)?;
-            let name = format!("{}:{}", id.namespace, id.path);
-            let mut properties = defaults
-                .get(&name)
-                .context("block missing from Java registry")?
-                .clone();
-            if let Some(extra) = state.get("properties").and_then(Value::as_object) {
-                for (key, value) in extra {
-                    anyhow::ensure!(properties.contains_key(key), "unknown block property");
-                    properties.insert(
-                        key.clone(),
-                        value.as_str().context("invalid block property")?.to_owned(),
-                    );
-                }
-            }
-            Ok(native_world::loaded::BlockState { name, properties })
+            resolve_generated_terrain_state(state, &generated_registry)
         })
         .unwrap();
-        assert!(
-            stateless_resolutions > 0,
-            "expected a stateless block in {dimension} {pos:?}"
-        );
         let world = generated.world();
         let mut names = BTreeMap::new();
         let expected = &groups[i * 2 + 1];

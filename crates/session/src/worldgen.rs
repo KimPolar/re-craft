@@ -48,41 +48,13 @@ pub struct MaterializedTerrain {
     postprocessing: Box<[bool]>,
 }
 
-/// Resolve proven stateless blocks without a generated block report.
-/// Stateful blocks need their own state-definition and default-state decoding.
-pub fn resolve_stateless_terrain_state(
+/// Resolve supported generated block states without a generated block report.
+pub fn resolve_generated_terrain_state(
     value: &Value,
-    registry: &native_resources::block_registry::StatelessBlockRegistry,
+    registry: &native_resources::block_registry::GeneratedBlockRegistry,
 ) -> Result<native_world::loaded::BlockState> {
-    let name = if let Some(name) = value.as_str() {
-        name
-    } else {
-        let object = value
-            .as_object()
-            .context("block state is not a string or object")?;
-        if let Some(properties) = object.get("properties") {
-            ensure!(
-                properties
-                    .as_object()
-                    .is_some_and(|fields| fields.is_empty()),
-                "stateless block has unsupported properties"
-            );
-        }
-        object
-            .get("id")
-            .and_then(Value::as_str)
-            .context("block state has no identifier")?
-    };
-    let id = ResourceId::parse(name)?;
-    let name = format!("{}:{}", id.namespace, id.path);
-    ensure!(
-        registry.contains(&name),
-        "block is not a verified stateless block: {name}"
-    );
-    Ok(native_world::loaded::BlockState {
-        name,
-        properties: BTreeMap::new(),
-    })
+    let (name, properties) = registry.resolve(value)?;
+    Ok(native_world::loaded::BlockState { name, properties })
 }
 
 impl MaterializedTerrain {

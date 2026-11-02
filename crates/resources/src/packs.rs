@@ -285,10 +285,10 @@ impl ResourceStack {
 
     /// Read stateless block registrations from the verified client, without
     /// allowing resource packs to redefine Java block classes.
-    pub fn vanilla_stateless_block_registry(
+    pub fn vanilla_generated_block_registry(
         &mut self,
-    ) -> Result<crate::block_registry::StatelessBlockRegistry> {
-        crate::block_registry::StatelessBlockRegistry::load(|path| read_zip(&mut self.base, path))
+    ) -> Result<crate::block_registry::GeneratedBlockRegistry> {
+        crate::block_registry::GeneratedBlockRegistry::load(|path| read_zip(&mut self.base, path))
     }
 }
 

@@ -14,8 +14,12 @@ import java.io.PrintStream;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.level.block.state.BlockState;
+import com.google.gson.*;
+import com.mojang.serialization.JsonOps;
+import java.nio.file.*;
 public class BlockDefaultsOracle {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         PrintStream output = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
@@ -23,6 +27,26 @@ public class BlockDefaultsOracle {
             var values = block.defaultBlockState().getValues()
                 .map(value -> value.property().getName() + "=" + value.valueName()).sorted().toList();
             output.println(BuiltInRegistries.BLOCK.getKey(block) + "\t" + String.join("\t", values));
+        }
+        if (args.length > 0) {
+            var digits=new JsonArray();
+            for(int c=0;c<=0xffff;c++) {
+                int digit=Character.digit((char)c,10);
+                if(digit>=0) { var row=new JsonArray();row.add(c);row.add(digit);digits.add(row); }
+            }
+            output.println("DIGITS\t"+digits);
+            var cases=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
+            for (var input : cases) {
+                var decoded=BlockState.CODEC.parse(JsonOps.INSTANCE,input).result().orElse(null);
+                var row=new JsonObject(); row.addProperty("success",decoded!=null);
+                if(decoded!=null) {
+                    row.addProperty("id",BuiltInRegistries.BLOCK.getKey(decoded.getBlock()).toString());
+                    var properties=new JsonObject();
+                    decoded.getValues().forEach(value -> properties.addProperty(value.property().getName(),value.valueName()));
+                    row.add("properties",properties);
+                }
+                output.println("CODEC\t"+row);
+            }
         }
     }
 }
@@ -111,12 +135,12 @@ fn local_block_report_matches_all_vanilla_default_states() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-fn stateless_block_registrations_have_no_properties_in_java() {
+fn generated_block_defaults_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_minecraft_dir().unwrap());
     let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
-    let registry = resources.vanilla_stateless_block_registry().unwrap();
+    let registry = resources.vanilla_generated_block_registry().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let pack = temp.path().join("pack");
     let blockstates = pack.join("assets/minecraft/blockstates");
@@ -127,7 +151,7 @@ fn stateless_block_registrations_have_no_properties_in_java() {
     )
     .unwrap();
     resources.push_pack(&pack).unwrap();
-    let with_pack = resources.vanilla_stateless_block_registry().unwrap();
+    let with_pack = resources.vanilla_generated_block_registry().unwrap();
     assert_eq!(
         registry.ids().collect::<Vec<_>>(),
         with_pack.ids().collect::<Vec<_>>()
@@ -142,10 +166,41 @@ fn stateless_block_registrations_have_no_properties_in_java() {
         .arg("-classpath")
         .arg(&cp)
         .arg(&source));
+    let mut cases = vec![
+        serde_json::json!("minecraft:stone"),
+        serde_json::json!({"id":"minecraft:stone", "properties":{"unknown":"x"}}),
+        serde_json::json!("minecraft:water"),
+        serde_json::json!({"id":"minecraft:water", "properties":"invalid"}),
+        serde_json::json!({"id":"minecraft:water", "properties":null}),
+        serde_json::json!({"id":"minecraft:water", "properties":{"level":7}}),
+        serde_json::json!({"id":"minecraft:water", "properties":{"level":"07"}}),
+        serde_json::json!({"id":"minecraft:water", "properties":{"level":"+7"}}),
+        serde_json::json!({"id":"minecraft:water", "properties":{"level":"-0"}}),
+        serde_json::json!({"id":"minecraft:water", "properties":{"level":"\u{0667}"}}),
+        serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":true}}),
+        serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":7}}),
+        serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":null}}),
+        serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
+        serde_json::json!({"id":"example:unknown"}),
+    ];
+    for id in ["minecraft:water", "minecraft:lava"] {
+        for level in -1..=16 {
+            cases.push(serde_json::json!({"id":id, "properties":{"level":level.to_string()}}));
+        }
+    }
+    for snowy in ["true", "false", "yes", "TRUE"] {
+        cases.push(serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":snowy,"extra":"ignored"}}));
+    }
+    for axis in ["x", "y", "z", "bad"] {
+        cases.push(serde_json::json!({"id":"minecraft:deepslate", "properties":{"axis":axis}}));
+    }
+    let input = temp.path().join("states.json");
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&cp)
-        .arg("BlockDefaultsOracle"));
+        .arg("BlockDefaultsOracle")
+        .arg(&input));
     let expected: BTreeMap<_, _> = output
         .lines()
         .filter(|line| line.starts_with("minecraft:"))
@@ -162,7 +217,7 @@ fn stateless_block_registrations_have_no_properties_in_java() {
         .collect();
     assert!(
         registry.len() >= 100,
-        "plain block registry is unexpectedly small"
+        "block registry is unexpectedly small"
     );
     assert!(registry.contains("minecraft:stone"));
     assert!(registry.contains("minecraft:dirt"));
@@ -170,22 +225,67 @@ fn stateless_block_registrations_have_no_properties_in_java() {
     assert!(registry.contains("minecraft:sand"));
     assert!(registry.contains("minecraft:powder_snow"));
     assert!(!registry.contains("minecraft:powder_snow_bucket"));
-    println!(
-        "verified {} stateless blocks; air={}, sand={}, powder_snow={}",
-        registry.len(),
-        registry.contains("minecraft:air"),
-        registry.contains("minecraft:sand"),
-        registry.contains("minecraft:powder_snow")
-    );
-    assert!(!registry.contains("minecraft:grass_block"));
-    assert!(!registry.contains("minecraft:water"));
+    assert!(registry.contains("minecraft:grass_block"));
+    assert!(registry.contains("minecraft:water"));
+    assert!(registry.contains("minecraft:lava"));
+    assert!(registry.contains("minecraft:deepslate"));
+    println!("verified {} generated block defaults", registry.len());
     for id in registry.ids() {
-        assert!(
-            expected
-                .get(id)
-                .unwrap_or_else(|| panic!("Java block missing: {id}"))
-                .is_empty(),
-            "plain block has Java properties: {id}"
-        );
+        let expected = expected
+            .get(id)
+            .unwrap_or_else(|| panic!("Java block missing: {id}"));
+        let properties = registry
+            .default_properties(id)
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        assert_eq!(&properties, expected, "Java default state: {id}");
+    }
+    let rows: Vec<serde_json::Value> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("CODEC\t"))
+        .map(|row| serde_json::from_str(row).unwrap())
+        .collect();
+    assert_eq!(rows.len(), cases.len());
+    for (case, row) in cases.iter().zip(rows) {
+        let actual = registry.resolve(case);
+        assert_eq!(actual.is_ok(), row["success"].as_bool().unwrap(), "{case}");
+        if let Ok((id, properties)) = actual {
+            assert_eq!(id, row["id"].as_str().unwrap(), "{case}");
+            assert_eq!(
+                serde_json::to_value(properties).unwrap(),
+                row["properties"],
+                "{case}"
+            );
+        }
+    }
+    let digits = output
+        .lines()
+        .find_map(|line| line.strip_prefix("DIGITS\t"))
+        .unwrap();
+    let digits: Vec<[u32; 2]> = serde_json::from_str(digits).unwrap();
+    let expected_digits: BTreeMap<_, _> = digits
+        .into_iter()
+        .map(|[code, digit]| (code, digit))
+        .collect();
+    for code in 0..=0xffff {
+        let Some(ch) = char::from_u32(code) else {
+            continue;
+        };
+        for prefix in ["0", "1"] {
+            let input = serde_json::json!({"id":"minecraft:water", "properties":{"level":format!("{prefix}{ch}")}});
+            let (_, properties) = registry.resolve(&input).unwrap();
+            let expected = expected_digits
+                .get(&code)
+                .map(|digit| if prefix == "1" { 10 + digit } else { *digit })
+                .filter(|digit| *digit <= 15)
+                .unwrap_or(0)
+                .to_string();
+            assert_eq!(
+                properties["level"], expected,
+                "Java digit U+{code:04X} with prefix {prefix}"
+            );
+        }
     }
 }

@@ -670,7 +670,7 @@ impl Class {
                 0x10 | 0x12 => {
                     r.u8()?;
                 }
-                0x11 | 0x13 | 0xbb => {
+                0x11 | 0x13 | 0xb2 | 0xbb => {
                     r.u16()?;
                 }
                 0xb7 => {
@@ -794,6 +794,53 @@ impl Class {
             }
         }
         ensure!(created.is_none(), "unfinished block reference");
+        Ok(values)
+    }
+
+    /// Block-only keys use a single literal argument and have no item ID.
+    pub(crate) fn block_key_reference_names(&self) -> Result<HashMap<String, String>> {
+        const BLOCK_KEYS: &str = "net/minecraft/references/BlockIds";
+        const KEY_TYPE: &str = "Lnet/minecraft/resources/ResourceKey;";
+        const FACTORY: &str = "(Ljava/lang/String;)Lnet/minecraft/resources/ResourceKey;";
+        ensure!(self.name == BLOCK_KEYS, "not a block key reference class");
+        let mut literal = None;
+        let mut created = None;
+        let mut values = HashMap::new();
+        for ins in self.instructions()? {
+            if matches!(ins.op, 0x12 | 0x13) {
+                if let Some(Constant::String(index)) =
+                    self.constants.get(ins.index.unwrap() as usize)
+                {
+                    ensure!(literal.is_none(), "ambiguous block key literal");
+                    literal = Some(self.utf8(*index)?.to_owned());
+                }
+            } else if ins.op == 0xb8 {
+                let (owner, method, descriptor) = self.member(ins.index.unwrap())?;
+                if owner == self.name && method == "create" && descriptor == FACTORY {
+                    ensure!(created.is_none(), "ambiguous block key factory");
+                    created = Some(literal.take().context("missing block key literal")?);
+                }
+            } else if ins.op == 0xb3 {
+                let (owner, field, descriptor) = self.member(ins.index.unwrap())?;
+                ensure!(owner == self.name, "unexpected block key owner");
+                if descriptor == KEY_TYPE {
+                    let name = created
+                        .take()
+                        .context("block key was not created directly")?;
+                    ensure!(
+                        values.insert(field.to_owned(), name).is_none(),
+                        "duplicate block key"
+                    );
+                } else {
+                    ensure!(
+                        created.is_none(),
+                        "block key assigned to another field type"
+                    );
+                }
+                literal = None;
+            }
+        }
+        ensure!(created.is_none(), "unfinished block key reference");
         Ok(values)
     }
 }

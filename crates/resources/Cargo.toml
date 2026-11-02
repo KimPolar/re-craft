@@ -13,6 +13,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 zip.workspace = true
 
 [dev-dependencies]

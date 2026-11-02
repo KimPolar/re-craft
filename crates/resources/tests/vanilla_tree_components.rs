@@ -40,10 +40,17 @@ impl OreWorld for World {
     }
     fn in_tag(&mut self, s: &State, id: &ResourceId) -> Result<bool> {
         Ok(match id.path.as_str() {
-            "logs" => s.name == "minecraft:oak_log",
+            "logs" => matches!(
+                s.name.as_str(),
+                "minecraft:oak_log" | "minecraft:dark_oak_log"
+            ),
+            "leaves" => s.name == "minecraft:dark_oak_leaves",
             "replaceable_by_trees" => matches!(
                 s.name.as_str(),
-                "minecraft:oak_leaves" | "minecraft:vine" | "minecraft:water"
+                "minecraft:oak_leaves"
+                    | "minecraft:dark_oak_leaves"
+                    | "minecraft:vine"
+                    | "minecraft:water"
             ),
             _ => false,
         })
@@ -53,6 +60,101 @@ impl OreWorld for World {
     }
     fn set_block(&mut self, _: [i32; 3], _: &State, _: i32) -> Result<bool> {
         unreachable!()
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn dark_oak_components_match_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+    let temp = tempfile::tempdir().unwrap();
+    let version = game.join("versions/26.3");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    assert_eq!(manifest["id"], "26.3");
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for lib in manifest["libraries"].as_array().unwrap() {
+        if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let cp = std::env::join_paths(paths).unwrap();
+    let source = temp.path().join("DarkOakComponentsOracle.java");
+    std::fs::write(&source, include_str!("java/DarkOakComponentsOracle.java")).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let actual = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("DarkOakComponentsOracle"));
+    let mut expected = Vec::new();
+    for seed in [0, 1, -1, 2, 42, 123, 987654321, i64::MIN] {
+        for mode in 0..6 {
+            for ignore in [false, true] {
+                let config = json!({"type":"minecraft:tree", "trunk_provider":{"id":"minecraft:dark_oak_log"},
+            "trunk_placer":{"type":"minecraft:dark_oak_trunk_placer","base_height":6,"height_rand_a":2,"height_rand_b":1},
+            "foliage_provider":{"id":"minecraft:dark_oak_leaves"},
+            "foliage_placer":{"type":"minecraft:dark_oak_foliage_placer","radius":0,"offset":0},
+            "below_trunk_provider":{"id":"minecraft:dirt"}, "minimum_size":{"type":"minecraft:three_layers_feature_size","upper_size":2}, "decorators":[],"ignore_vines":ignore});
+                let tree = TreeFeature::decode(&mut Data, &config, &mut resolve).unwrap();
+                let mut world = World {
+                    blocks: BTreeMap::new(),
+                    writes: Vec::new(),
+                };
+                for x in 3..=4 {
+                    for z in -4..=-3 {
+                        world.blocks.insert([x, 2, z], state("minecraft:stone"));
+                    }
+                }
+                match mode {
+                    1 => {
+                        world.blocks.insert([3, 5, -4], state("minecraft:stone"));
+                    }
+                    2 => {
+                        let mut s = state("minecraft:dark_oak_leaves");
+                        s.persistent = true;
+                        world.blocks.insert([4, 6, -4], s);
+                    }
+                    3 => {
+                        world.blocks.insert([2, 6, -4], state("minecraft:water"));
+                    }
+                    4 => {
+                        world.blocks.insert([3, 5, -4], state("minecraft:vine"));
+                    }
+                    5 => {
+                        world
+                            .blocks
+                            .insert([3, 5, -4], state("minecraft:dark_oak_log"));
+                    }
+                    _ => {}
+                }
+                let mut random = DecorationRandom::new(seed);
+                let ok = tree
+                    .place_components(&mut world, &mut random, [3, 3, -4])
+                    .unwrap();
+                expected.push(format!(
+                    "D {seed} {mode} {ignore} {ok} {} R {}",
+                    world.writes.join(";"),
+                    random.next_long()
+                ));
+            }
+        }
+    }
+    let actual: Vec<_> = actual
+        .lines()
+        .filter(|line| line.starts_with("D "))
+        .collect();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(*actual, expected);
     }
 }
 impl DiskWorld for World {

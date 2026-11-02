@@ -63,6 +63,7 @@ pub mod surface_pass;
 pub mod surface_rules;
 pub mod transforms;
 pub mod tree_beehive;
+pub mod tree_dark_oak;
 pub mod tree_fallen;
 pub mod tree_fallen_decorators;
 pub mod tree_fallen_feature;

@@ -11,6 +11,7 @@ use crate::{
     packs::{ResourceId, ResourceProvider},
     placed_feature::IntProvider,
     tree_beehive::{BeehiveDecorator, BeehiveWorld},
+    tree_dark_oak::{DarkOakTrunkWorld, place_dark_oak_foliage, place_dark_oak_trunk},
     tree_fancy_trunk::{FancyTrunkWorld, LogAxis, place_fancy_trunk},
     tree_ground_decorator::{GroundDecorationWorld, PlaceOnGroundDecorator},
     tree_placers::{
@@ -41,9 +42,9 @@ pub struct TreeFeature<S> {
     foliage: Provider<S>,
     below: Provider<S>,
     trunk_height: TrunkHeight,
-    fancy_trunk: bool,
+    trunk_kind: TrunkKind,
     foliage_height: i32,
-    fancy_foliage: bool,
+    foliage_kind: FoliageKind,
     radius: IntProvider,
     offset: IntProvider,
     size: TreeFeatureSize,
@@ -56,8 +57,21 @@ enum TreeDecorator<S> {
     PlaceOnGround(PlaceOnGroundDecorator<S>),
 }
 
+#[derive(Clone, Copy)]
+enum TrunkKind {
+    Straight,
+    Fancy,
+    DarkOak,
+}
+#[derive(Clone, Copy)]
+enum FoliageKind {
+    Blob,
+    Fancy,
+    DarkOak,
+}
+
 impl<S: Clone + Eq> TreeFeature<S> {
-    /// Decode straight or fancy trunks with blob or fancy foliage, without roots.
+    /// Decode supported trunk and foliage placers without roots.
     /// Reject unsupported configurations before a world can be modified.
     pub fn decode(
         provider: &mut impl ResourceProvider,
@@ -131,18 +145,27 @@ impl<S: Clone + Eq> TreeFeature<S> {
             }
         }
         let trunk_placer = field(value, "trunk_placer")?;
-        let fancy_trunk = match name(trunk_placer)? {
-            id if id == ResourceId::parse("minecraft:straight_trunk_placer")? => false,
-            id if id == ResourceId::parse("minecraft:fancy_trunk_placer")? => true,
+        let trunk_kind = match name(trunk_placer)? {
+            id if id == ResourceId::parse("minecraft:straight_trunk_placer")? => {
+                TrunkKind::Straight
+            }
+            id if id == ResourceId::parse("minecraft:fancy_trunk_placer")? => TrunkKind::Fancy,
+            id if id == ResourceId::parse("minecraft:dark_oak_trunk_placer")? => TrunkKind::DarkOak,
             _ => anyhow::bail!("unsupported tree trunk placer"),
         };
         let foliage_placer = field(value, "foliage_placer")?;
-        let fancy_foliage = match name(foliage_placer)? {
-            id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => false,
-            id if id == ResourceId::parse("minecraft:fancy_foliage_placer")? => true,
+        let foliage_kind = match name(foliage_placer)? {
+            id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => FoliageKind::Blob,
+            id if id == ResourceId::parse("minecraft:fancy_foliage_placer")? => FoliageKind::Fancy,
+            id if id == ResourceId::parse("minecraft:dark_oak_foliage_placer")? => {
+                FoliageKind::DarkOak
+            }
             _ => anyhow::bail!("unsupported tree foliage placer"),
         };
-        let foliage_height = integer(foliage_placer, "height")?;
+        let foliage_height = match foliage_kind {
+            FoliageKind::DarkOak => 4,
+            _ => integer(foliage_placer, "height")?,
+        };
         ensure!(
             (0..=16).contains(&foliage_height),
             "invalid blob foliage height"
@@ -166,9 +189,9 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 integer(trunk_placer, "height_rand_a")?,
                 integer(trunk_placer, "height_rand_b")?,
             )?,
-            fancy_trunk,
+            trunk_kind,
             foliage_height,
-            fancy_foliage,
+            foliage_kind,
             radius,
             offset,
             size: TreeFeatureSize::decode(field(value, "minimum_size")?)?,
@@ -184,6 +207,9 @@ impl<S: Clone + Eq> TreeFeature<S> {
         self.trunk.tags(&mut tags);
         self.foliage.tags(&mut tags);
         self.below.tags(&mut tags);
+        if matches!(self.trunk_kind, TrunkKind::DarkOak) {
+            tags.insert(ResourceId::parse("minecraft:leaves").unwrap());
+        }
         for decorator in &self.decorators {
             if let TreeDecorator::PlaceOnGround(v) = decorator {
                 tags.extend(v.required_tags());
@@ -256,15 +282,20 @@ impl<S: Clone + Eq> TreeFeature<S> {
         else {
             return Ok(false);
         };
-        let attachments = if self.fancy_trunk {
-            place_fancy_trunk(
+        let attachments = match self.trunk_kind {
+            TrunkKind::Fancy => place_fancy_trunk(
                 &mut FancyTreeAdapter { tree: self, world },
                 random,
                 origin,
                 height,
-            )?
-        } else {
-            vec![place_straight_trunk(
+            )?,
+            TrunkKind::DarkOak => place_dark_oak_trunk(
+                &mut DarkOakAdapter { tree: self, world },
+                random,
+                origin,
+                height,
+            )?,
+            TrunkKind::Straight => vec![place_straight_trunk(
                 random,
                 origin,
                 height,
@@ -282,7 +313,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
                     }
                     Ok(())
                 },
-            )?]
+            )?],
         };
         for attachment in attachments {
             let offset = self.offset.sample(random);
@@ -297,27 +328,62 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 }
                 Ok(())
             };
-            if self.fancy_foliage {
-                place_fancy_foliage(
+            match self.foliage_kind {
+                FoliageKind::Fancy => place_fancy_foliage(
                     random,
                     attachment,
                     self.foliage_height,
                     radius,
                     offset,
                     &mut place,
-                )?;
-            } else {
-                place_blob_foliage(
+                )?,
+                FoliageKind::Blob => place_blob_foliage(
                     random,
                     attachment,
                     self.foliage_height,
                     radius,
                     offset,
                     &mut place,
-                )?;
+                )?,
+                FoliageKind::DarkOak => {
+                    place_dark_oak_foliage(random, attachment, radius, offset, &mut place)?
+                }
             }
         }
         Ok(true)
+    }
+}
+
+struct DarkOakAdapter<'a, S, W> {
+    tree: &'a TreeFeature<S>,
+    world: &'a mut W,
+}
+impl<S: Clone + Eq, W: TreeWorld<State = S>> DarkOakTrunkWorld for DarkOakAdapter<'_, S, W> {
+    fn is_air_or_leaves(&mut self, pos: [i32; 3]) -> Result<bool> {
+        static LEAVES: OnceLock<ResourceId> = OnceLock::new();
+        let state = self.world.block(pos)?;
+        Ok(self.world.is_air(&state)?
+            || self.world.in_tag(
+                &state,
+                LEAVES.get_or_init(|| ResourceId::parse("minecraft:leaves").unwrap()),
+            )?)
+    }
+    fn place_soil(&mut self, pos: [i32; 3], random: &mut DecorationRandom) -> Result<()> {
+        if let Some(state) = self.tree.below.state(self.world, random, pos)? {
+            self.world.write_tree(pos, &state, TreeWrite::Trunk)?;
+        }
+        Ok(())
+    }
+    fn place_log(&mut self, pos: [i32; 3], random: &mut DecorationRandom) -> Result<()> {
+        if valid_tree_pos(self.world, pos)? {
+            let state = self
+                .tree
+                .trunk
+                .state(self.world, random, pos)?
+                .context("tree trunk provider returned no state")?;
+            self.world.write_tree(pos, &state, TreeWrite::Trunk)?;
+        }
+        Ok(())
     }
 }
 

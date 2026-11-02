@@ -12,6 +12,10 @@ public class TreeGroundSolidityOracle {
     for(String name:args) {
       var state=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name)).defaultBlockState();
       out.printf("S %s %s %s%n",name,state.isSolidRender(),state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,Direction.UP));
+      if(name.endsWith("_leaves")) {
+        for(var variant:state.getBlock().getStateDefinition().getPossibleStates()) if(variant.isSolid()!=state.isSolid())throw new AssertionError("solid varies: "+variant);
+        out.printf("L %s %s%n",name,state.isSolid());
+      }
     }
   }
 }

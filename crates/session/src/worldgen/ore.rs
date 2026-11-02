@@ -1391,7 +1391,9 @@ impl DecorationRegion<'_> {
                     key: &ore.key,
                     biome_allows,
                 };
-                positions.next(&mut random, &mut env)?
+                positions
+                    .next(&mut random, &mut env)
+                    .with_context(|| format!("placing {:?}", selected.feature))?
             };
             let Some(position) = next else { break };
             result |= ore
@@ -3556,6 +3558,9 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
+        if tree_generated_leaf(state)? {
+            return Ok(true);
+        }
         disk_safe_solid(&state.name)
             .with_context(|| format!("unsupported disk solid predicate block {}", state.name))
     }
@@ -4328,6 +4333,9 @@ mod tests {
             "magma_block",
             "oak_log",
             "oak_leaves",
+            "dark_oak_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
             "vine",
             "leaf_litter",
         ];
@@ -4387,7 +4395,7 @@ mod tests {
             if name == "oak_log" {
                 block.properties.insert("axis".into(), "y".into());
             }
-            if name == "oak_leaves" {
+            if name.ends_with("_leaves") {
                 block.properties = BTreeMap::from([
                     ("distance".into(), "7".into()),
                     ("persistent".into(), "false".into()),
@@ -4407,6 +4415,17 @@ mod tests {
                     tree_solid_render(&block).unwrap(),
                     tree_sturdy_up(&block).unwrap()
                 )
+            );
+        }
+        for name in [
+            "oak_leaves",
+            "dark_oak_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
+        ] {
+            assert!(
+                text.lines().any(|line| line == format!("L {name} true")),
+                "leaf solid state {name}"
             );
         }
     }

@@ -6511,6 +6511,23 @@ impl LoadedSession {
         self.drown_particles.drain(..).collect()
     }
 
+    fn apply_player_bubble_contact(&mut self, drag_down: bool, surface: bool, flying: bool) {
+        if flying {
+            return;
+        }
+        self.unresolved_bubble_tick = true;
+        self.motion.velocity =
+            crate::bubble_column::player_velocity(self.motion.velocity, drag_down, surface, false);
+        if surface {
+            // Two splash and two bubble particle packets each sample X and Z.
+            for _ in 0..8 {
+                self.level_random.next_double();
+            }
+        } else {
+            self.fall_distance = 0.0;
+        }
+    }
+
     fn push_drown_particles(&mut self) {
         let position = self.origin.as_dvec3() + self.motion.position;
         for _ in 0..8 {
@@ -16420,6 +16437,8 @@ impl LoadedSession {
                             state.name.as_str(),
                             "minecraft:campfire" | "minecraft:soul_campfire"
                         ) && native_world::collision::block_shape(state).is_none()
+                            || (state.name == "minecraft:bubble_column"
+                                && bubble_column_drag(state).is_none())
                         {
                             None
                         } else {
@@ -16677,6 +16696,37 @@ impl LoadedSession {
                                 self.push_honey_particles(HoneyParticleKind::Slide);
                             }
                         }
+                    }
+                    crate::fire_contact::InsideBlock::Bubble(drag_down) => {
+                        if flying
+                            || !crate::fire_contact::bubble_active(
+                                player_bounds,
+                                actual,
+                                requested_movement.get(),
+                                contact.axis_step,
+                                contact.position,
+                            )
+                        {
+                            continue;
+                        }
+                        self.unresolved_bubble_tick = true;
+                        let Some(above) = add(contact.position, IVec3::Y) else {
+                            continue;
+                        };
+                        let Cell::State(id) =
+                            cell(&self.world, self.origin, self.bounds, above, self.states[0])
+                        else {
+                            continue;
+                        };
+                        let Some(shape) = self.shapes.get(id.0 as usize).and_then(Option::as_deref)
+                        else {
+                            continue;
+                        };
+                        let Some(fluid) = self.fluids.get(id.0 as usize) else {
+                            continue;
+                        };
+                        let surface = shape.is_empty() && fluid.is_none();
+                        self.apply_player_bubble_contact(drag_down, surface, flying);
                     }
                 }
             }
@@ -29996,6 +30046,150 @@ pub(crate) mod tests {
             assert_eq!(
                 serde_json::json!(fluids.into_iter().map(|event| event.1).collect::<Vec<_>>()),
                 row["fluidTicks"],
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn player_bubble_contact_changes_velocity_after_water_movement() {
+        for surface in [false, true] {
+            for drag in [false, true] {
+                let setup = |bubble: bool| {
+                    let mut session = session();
+                    session.set_random_tick_speed(0);
+                    let root = session.intern_block(if bubble {
+                        state(
+                            "minecraft:bubble_column",
+                            &[("drag", if drag { "true" } else { "false" })],
+                        )
+                    } else {
+                        state("minecraft:water", &[("level", "0")])
+                    });
+                    assert!(session.set_with_notify(IVec3::new(8, 1, 8), root, false));
+                    if !surface {
+                        let water =
+                            session.intern_block(state("minecraft:water", &[("level", "0")]));
+                        assert!(session.set_with_notify(IVec3::new(8, 2, 8), water, false));
+                    }
+                    session.motion.position = DVec3::new(8.5, 1.2, 8.5);
+                    session.motion.velocity = DVec3::ZERO;
+                    session.motion.on_ground = false;
+                    session.player.position = session.motion.position.as_vec3();
+                    session.player.on_ground = false;
+                    session.level_random = native_core::random::LegacyRandom::new(77);
+                    session
+                };
+                let mut reference = setup(false);
+                let mut actual = setup(true);
+                reference.update(TICK);
+                actual.update(TICK);
+                assert_eq!(
+                    actual.motion.position, reference.motion.position,
+                    "surface={surface}, drag={drag}"
+                );
+                let expected = crate::bubble_column::player_velocity(
+                    reference.motion.velocity,
+                    drag,
+                    surface,
+                    false,
+                );
+                assert_eq!(
+                    actual.motion.velocity, expected,
+                    "surface={surface}, drag={drag}"
+                );
+                let mut expected_random = reference.level_random.clone();
+                if surface {
+                    for _ in 0..8 {
+                        expected_random.next_double();
+                    }
+                }
+                assert_eq!(
+                    actual.level_random.next_int(),
+                    expected_random.next_int(),
+                    "surface={surface}, drag={drag}"
+                );
+                assert!(actual.unresolved_bubble_tick);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn player_bubble_velocity_and_random_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerBubblePhysicsOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerBubblePhysicsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("PlayerBubblePhysicsOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 176);
+        for row in rows {
+            let mut session = session();
+            session.level_random = native_core::random::LegacyRandom::new(77);
+            session.motion.velocity = DVec3::new(0.2, row["initial"].as_f64().unwrap(), -0.3);
+            session.fall_distance = 5.0;
+            let surface = row["above"].as_u64().unwrap() == 0;
+            session.apply_player_bubble_contact(
+                row["drag"].as_bool().unwrap(),
+                surface,
+                row["flying"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                session.motion.velocity,
+                DVec3::new(0.2, row["velocity"].as_f64().unwrap(), -0.3),
+                "{row}"
+            );
+            assert_eq!(
+                session.fall_distance,
+                row["fall"].as_f64().unwrap(),
+                "{row}"
+            );
+            assert_eq!(
+                session.level_random.next_int(),
+                row["next"].as_i64().unwrap() as i32,
                 "{row}"
             );
         }

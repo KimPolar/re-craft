@@ -5,10 +5,24 @@
 //! reproduce those callbacks must stage or defer the update instead.
 
 use anyhow::{Context, Result};
-use glam::IVec3;
+use glam::{DVec3, IVec3};
 use native_resources::fluid_tags::BubbleColumnTags;
 use native_world::{fluid::FluidState, loaded::BlockState};
 use std::collections::BTreeMap;
+
+/// Player bubble-column velocity after one inside-block callback.
+pub fn player_velocity(mut velocity: DVec3, drag_down: bool, surface: bool, flying: bool) -> DVec3 {
+    if flying {
+        return velocity;
+    }
+    velocity.y = match (drag_down, surface) {
+        (true, true) => (velocity.y - 0.03).max(-0.9),
+        (true, false) => (velocity.y - 0.03).max(-0.3),
+        (false, true) => (velocity.y + 0.1).min(1.8),
+        (false, false) => (velocity.y + 0.06).min(0.7),
+    };
+    velocity
+}
 
 pub trait ColumnWorld {
     fn block(&mut self, position: IVec3) -> Result<BlockState>;

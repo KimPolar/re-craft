@@ -9,6 +9,7 @@ pub(crate) enum InsideBlock {
     Fire(u8),
     Campfire(u8),
     Honey,
+    Bubble(bool),
 }
 
 pub(crate) fn effect(state: &BlockState) -> Option<InsideBlock> {
@@ -16,6 +17,13 @@ pub(crate) fn effect(state: &BlockState) -> Option<InsideBlock> {
         "minecraft:fire" => Some(InsideBlock::Fire(1)),
         "minecraft:soul_fire" => Some(InsideBlock::Fire(2)),
         "minecraft:honey_block" if state.properties.is_empty() => Some(InsideBlock::Honey),
+        "minecraft:bubble_column" if state.properties.len() == 1 => {
+            match state.properties.get("drag").map(String::as_str) {
+                Some("true") => Some(InsideBlock::Bubble(true)),
+                Some("false") => Some(InsideBlock::Bubble(false)),
+                _ => None,
+            }
+        }
         "minecraft:campfire" if state.properties.get("lit").is_some_and(|v| v == "true") => {
             Some(InsideBlock::Campfire(1))
         }
@@ -32,6 +40,36 @@ pub(crate) struct Contact {
     pub time: f64,
     pub kind: InsideBlock,
     pub position: IVec3,
+}
+
+/// Bubble columns use the end-box flag passed to `entityInside`: short moves
+/// only apply the effect when the final inset bounds still overlap the block.
+pub(crate) fn bubble_active(
+    bounds: BoundingBox,
+    actual: DVec3,
+    requested: DVec3,
+    axis_step: u8,
+    position: IVec3,
+) -> bool {
+    let inset = f64::from(1.0e-5_f32);
+    let axes = if requested.x.abs() < requested.z.abs() {
+        [1, 2, 0]
+    } else {
+        [1, 0, 2]
+    };
+    let index = usize::from(axis_step);
+    let axis = axes[index];
+    if actual[axis] * actual[axis] > (1.0 - inset) * (1.0 - inset) {
+        return true;
+    }
+    let mut offset = DVec3::ZERO;
+    for axis in &axes[..=index] {
+        offset[*axis] = actual[*axis];
+    }
+    let min = bounds.min + offset + DVec3::splat(inset);
+    let max = bounds.max + offset - DVec3::splat(inset);
+    let block = position.as_dvec3();
+    min.cmplt(block + DVec3::ONE).all() && max.cmpgt(block).all()
 }
 
 /// The block traversal groups contacts by the leading face's grid crossings,
@@ -204,6 +242,116 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn bubble_short_crossings_require_final_overlap() {
+        let bounds = BoundingBox {
+            min: DVec3::new(0.39, 1.0, 0.2),
+            max: DVec3::new(0.99, 2.8, 0.8),
+        };
+        let block = IVec3::new(0, 1, 0);
+        assert!(bubble_active(bounds, DVec3::ZERO, DVec3::ZERO, 0, block));
+        assert!(!bubble_active(
+            bounds,
+            DVec3::new(0.7, 0.0, 0.0),
+            DVec3::new(0.7, 0.0, 0.0),
+            1,
+            block
+        ));
+        assert!(bubble_active(
+            bounds,
+            DVec3::new(1.1, 0.0, 0.0),
+            DVec3::new(1.1, 0.0, 0.0),
+            1,
+            block
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn bubble_contact_eligibility_matches_java_entity_traversal() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PlayerBubbleTraversalOracle.java");
+        let dependency = temp.path().join("PlayerBubblePhysicsOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PlayerBubbleTraversalOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            include_str!("../tests/java/PlayerBubblePhysicsOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&dependency),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("PlayerBubbleTraversalOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 16);
+        let block = IVec3::new(8, 10, 8);
+        for row in rows {
+            let input: Vec<f64> = row["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap())
+                .collect();
+            let position = DVec3::new(input[0], input[1], input[2]);
+            let delta = DVec3::new(input[3], input[4], input[5]);
+            let half = f64::from(0.3_f32);
+            let height = f64::from(1.8_f32);
+            let bounds = BoundingBox {
+                min: position - DVec3::new(half, 0.0, half),
+                max: position + DVec3::new(half, height, half),
+            };
+            let contacts = swept(bounds, delta, delta, |pos| {
+                Some((pos == block).then_some(InsideBlock::Bubble(false)))
+            })
+            .unwrap();
+            let active = contacts.iter().any(|contact| {
+                bubble_active(bounds, delta, delta, contact.axis_step, contact.position)
+            });
+            assert_eq!(active, row["active"].as_bool().unwrap(), "{row}");
+        }
     }
 
     #[test]

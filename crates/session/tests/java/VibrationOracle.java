@@ -26,11 +26,12 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId;
+        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId; net.minecraft.world.level.block.entity.BlockEntity sensorEntity;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
         @Override public BlockState getBlockState(BlockPos pos) { return occluders != null && occluders.contains(pos) ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(); }
+        @Override public net.minecraft.world.level.block.entity.BlockEntity getBlockEntity(BlockPos pos) { return sensorEntity; }
         @Override public int getSignal(BlockPos pos, Direction direction) { signalPosition=pos;signalDirection=direction;return signal; }
         @Override public boolean setBlockAndUpdate(BlockPos pos, BlockState state) { sensorState=state; return true; }
         @Override public void scheduleTick(BlockPos pos, Block block, int ticks) { delay=ticks; }
@@ -52,11 +53,13 @@ public class VibrationOracle {
         public boolean requiresAdjacentChunksToBeTicking() { return requireChunks; }
     }
     static class Source extends ItemEntity {
-        boolean spectator, careful, dampens;
+        boolean spectator, careful, dampens; Vec3 testPosition;
         Source() { super(null,0,0,0,ItemStack.EMPTY); }
         @Override public boolean isSpectator() { return spectator; }
         @Override public boolean isSteppingCarefully() { return careful; }
         @Override public boolean dampensVibrations() { return dampens; }
+        @Override public Vec3 position() { return testPosition; }
+        @Override public UUID getUUID() { return new UUID(1,2); }
     }
     public static void main(String[] args) throws Exception {
         net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -204,7 +207,21 @@ public class VibrationOracle {
             boolean accepted=inRange && blockEntity.getListener().handleGameEvent(world,GameEvent.SPLASH,GameEvent.Context.of((Entity)null),position);
             var row=new JsonObject();row.addProperty("calibrated",calibrated);row.addProperty("phase",phase.getSerializedName());row.addProperty("input",input);row.addProperty("wall",wall);row.addProperty("x",eventX);row.addProperty("accepted",accepted);sensorDispatch.add(row);
         }
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);
+        bind.invoke(GameEvent.STEP,List.of());
+        var entityTypeField=Entity.class.getDeclaredField("type");entityTypeField.setAccessible(true);entityTypeField.set(entity,net.minecraft.world.entity.EntityTypes.ITEM);
+        var sensorStep=new JsonArray();
+        for(boolean calibrated:new boolean[]{false,true}) for(var phase:SculkSensorPhase.values()) for(int input:new int[]{0,1,2,15}) for(boolean current:new boolean[]{false,true}) for(boolean careful:new boolean[]{false,true}) {
+            var state=(calibrated ? Blocks.CALIBRATED_SCULK_SENSOR : Blocks.SCULK_SENSOR).defaultBlockState().setValue(SculkSensorBlock.PHASE,phase);
+            if(calibrated)state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
+            var blockEntity=calibrated ? new CalibratedSculkSensorBlockEntity(BlockPos.ZERO,state) : new SculkSensorBlockEntity(BlockPos.ZERO,state);
+            if(current) { blockEntity.getVibrationData().setCurrentVibration(new VibrationInfo(GameEvent.SPLASH,3.0f,new Vec3(3,0,0),(UUID)null,null));blockEntity.getVibrationData().setTravelTimeInTicks(3); }
+            entity.testPosition=new Vec3(0.5,0.5,0.5);entity.careful=careful;entity.spectator=false;entity.dampens=false;
+            world.sensorEntity=blockEntity;world.signal=input;world.now=100;
+            ((SculkSensorBlock)state.getBlock()).stepOn(world,BlockPos.ZERO,state,entity);
+            var selected=blockEntity.getVibrationData().getSelectionStrategy().chosenCandidate(101);
+            var row=new JsonObject();row.addProperty("calibrated",calibrated);row.addProperty("phase",phase.getSerializedName());row.addProperty("input",input);row.addProperty("current",current);row.addProperty("careful",careful);row.addProperty("scheduled",selected.isPresent());sensorStep.add(row);
+        }
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);
         Files.writeString(Path.of(args[0]), result.toString());
         var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
         var sensorNbt=new net.minecraft.nbt.CompoundTag();

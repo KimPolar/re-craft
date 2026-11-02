@@ -6855,6 +6855,63 @@ impl LoadedSession {
         }
     }
 
+    /// SculkSensorBlock.stepOn bypasses game-event tags and ray occlusion.
+    fn player_step_on_sculk(&mut self, position: IVec3) {
+        if self.game_mode == GameMode::Spectator {
+            return;
+        }
+        let key = position.to_array();
+        let Some(saved) = self.sculk_listeners.get(&key) else {
+            return;
+        };
+        let Some(block) = self.world.block(position.x, position.y, position.z) else {
+            return;
+        };
+        let Some(sensor) = crate::sculk_sensor::Sensor::from_block(block) else {
+            return;
+        };
+        if saved.calibrated != sensor.facing.is_some() {
+            return;
+        }
+        let Some(relative) = subtract(position, self.origin) else {
+            return;
+        };
+        let input = if let Some(back) = sensor.back_face() {
+            let Some(at) = add(relative, back) else {
+                return;
+            };
+            crate::redstone::signal_from(at, back, |at, direction| {
+                self.redstone_source(at, direction)
+            })
+        } else {
+            None
+        };
+        if sensor.can_receive("minecraft:step", true, input) != Some(true) {
+            return;
+        }
+        let event_position = self.origin.as_dvec3() + self.motion.position;
+        let listener = position.as_dvec3() + DVec3::splat(0.5);
+        let Some(distance) = crate::vibration::travel_distance(event_position, listener) else {
+            return;
+        };
+        let event = crate::vibration::Vibration {
+            event: "minecraft:step".into(),
+            distance,
+            position: event_position,
+            source: self.player_uuid,
+            projectile_owner: None,
+        };
+        let Some(saved) = self.sculk_listeners.get_mut(&key) else {
+            return;
+        };
+        let before = saved.vibration.clone();
+        saved.vibration.force_offer(event, self.game_time);
+        if saved.vibration != before {
+            self.active_sculk_listeners.insert(key);
+            self.mark_tick_chunk_dirty(position.x, position.z);
+        }
+    }
+
     /// Resume persisted vibrations. Particle restoration and secondary
     /// game events are not yet simulated; world saving remains disabled.
     fn advance_saved_sculk_listeners(&mut self) {
@@ -17307,6 +17364,19 @@ impl LoadedSession {
             if self.game_mode != GameMode::Spectator && !self.sneak {
                 self.set_redstone_ore_lit(legacy, true);
             }
+            if self.game_mode != GameMode::Spectator
+                && landing_state
+                    .and_then(|id| self.world.state(id))
+                    .is_some_and(|state| {
+                        matches!(
+                            state.name.as_str(),
+                            "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor"
+                        )
+                    })
+                && let Some(position) = add(self.origin, legacy)
+            {
+                self.player_step_on_sculk(position);
+            }
             if self.death.is_none()
                 && self.game_mode != GameMode::Spectator
                 && !self.sneak
@@ -20896,6 +20966,58 @@ pub(crate) mod tests {
             );
             if let Some((tick, event)) = candidate {
                 assert_eq!((tick, event.source), (100, Some([1, 2, 3, 4])));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_player_sculk_steps_with_java(rows: &[serde_json::Value]) {
+        for row in rows {
+            let calibrated = row["calibrated"].as_bool().unwrap();
+            let phase = match row["phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            let (mut session, pos) = splash_test_session(
+                calibrated,
+                phase,
+                row["input"].as_u64().unwrap() as u8,
+                false,
+            );
+            session.vibration_event_tags = None;
+            session.vibration_block_tags = None;
+            session.sneak = row["careful"].as_bool().unwrap();
+            session.motion.position = (pos - session.origin).as_dvec3() + DVec3::splat(0.5);
+            session.player_uuid = Some([0, 1, 0, 2]);
+            if row["current"].as_bool().unwrap() {
+                let current = crate::vibration::Vibration {
+                    event: "minecraft:splash".into(),
+                    distance: 3.0,
+                    position: pos.as_dvec3() + DVec3::new(3.0, 0.0, 0.0),
+                    source: None,
+                    projectile_owner: None,
+                };
+                session
+                    .sculk_listeners
+                    .get_mut(&pos.to_array())
+                    .unwrap()
+                    .vibration =
+                    crate::vibration::VibrationData::from_saved(Some(current), 3, None);
+            }
+            session.player_step_on_sculk(pos);
+            let pending = session.sculk_listeners[&pos.to_array()].vibration.pending();
+            assert_eq!(
+                pending.is_some(),
+                row["scheduled"].as_bool().unwrap(),
+                "{row}"
+            );
+            if let Some((tick, event)) = pending {
+                assert_eq!(
+                    (tick, event.event.as_str(), event.source),
+                    (100, "minecraft:step", Some([0, 1, 0, 2]))
+                );
             }
         }
     }
@@ -31759,6 +31881,63 @@ pub(crate) mod tests {
                 .take_consume_sounds()
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
+        );
+    }
+
+    #[test]
+    fn standing_on_sculk_triggers_even_when_sneaking_and_tags_are_missing() {
+        for sneak in [false, true] {
+            let (mut session, pos) =
+                splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+            session.vibration_event_tags = None;
+            session.vibration_block_tags = None;
+            session.sneak = sneak;
+            session.motion.position = (pos - session.origin).as_dvec3() + DVec3::new(0.5, 0.7, 0.5);
+            session.motion.velocity = DVec3::new(0.0, -0.5, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.update(TICK);
+            assert!(
+                session.sculk_listeners[&pos.to_array()]
+                    .vibration
+                    .pending()
+                    .is_some(),
+                "sneak={sneak}"
+            );
+            session.update(TICK);
+            let state = crate::sculk_sensor::Sensor::from_block(
+                session.world.block(pos.x, pos.y, pos.z).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                state.phase,
+                crate::sculk_sensor::Phase::Active,
+                "sneak={sneak}"
+            );
+            assert_eq!(session.sculk_listeners[&pos.to_array()].last_frequency, 1);
+            for _ in 0..43 {
+                session.update(TICK);
+            }
+            let state = crate::sculk_sensor::Sensor::from_block(
+                session.world.block(pos.x, pos.y, pos.z).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                state.phase,
+                crate::sculk_sensor::Phase::Active,
+                "standing after cooldown, sneak={sneak}"
+            );
+        }
+        let (mut spectator, pos) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        spectator.set_game_mode(GameMode::Spectator);
+        spectator.player_step_on_sculk(pos);
+        assert!(
+            spectator.sculk_listeners[&pos.to_array()]
+                .vibration
+                .pending()
+                .is_none()
         );
     }
 

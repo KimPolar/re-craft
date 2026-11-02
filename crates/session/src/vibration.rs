@@ -365,6 +365,15 @@ impl VibrationData {
         true
     }
 
+    /// `forceScheduleVibration` queues a candidate even while another is in flight.
+    pub fn force_offer(&mut self, candidate: Vibration, tick: i64) -> bool {
+        if !candidate.distance.is_finite() || candidate.distance < 0.0 {
+            return false;
+        }
+        self.selector.offer(candidate, tick);
+        true
+    }
+
     pub fn current(&self) -> Option<&Vibration> {
         self.current.as_ref()
     }
@@ -941,6 +950,9 @@ mod tests {
         let dispatch = data["sensor_dispatch"].as_array().unwrap();
         assert_eq!(dispatch.len(), 2 * 3 * 4 * 2 * 5);
         crate::loaded::tests::compare_item_splash_dispatch_with_java(dispatch);
+        let steps = data["sensor_step"].as_array().unwrap();
+        assert_eq!(steps.len(), 2 * 3 * 4 * 2 * 2);
+        crate::loaded::tests::compare_player_sculk_steps_with_java(steps);
         for row in arrivals {
             let before = parse_sensor(row);
             let change = before.arrive(

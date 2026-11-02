@@ -105,7 +105,7 @@ impl GenerationWorker {
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                batch.step(&mut provider, &mut classify, &mut resolve)?
+                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
             } {
                 note_step(progress, pos, stage);
             }
@@ -121,7 +121,7 @@ impl GenerationWorker {
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                batch.step(&mut provider, &mut classify, &mut resolve)?
+                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
             } {
                 note_step(progress, pos, stage);
             }
@@ -191,6 +191,18 @@ impl GenerationWorker {
             }
         }
     }
+}
+
+fn generation_step(
+    batch: &mut FreshTerrainBatch,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+) -> Result<Option<(ChunkPos, GenerationStage)>> {
+    let next = batch.schedule().next_ready();
+    batch
+        .step(provider, classify, resolve)
+        .with_context(|| format!("generation step {next:?} failed"))
 }
 
 impl Drop for GenerationWorker {
@@ -276,5 +288,52 @@ mod tests {
             };
             assert_eq!(worker.progress().phase, GenerationPhase::Failed);
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and a full generation batch"]
+    fn installed_overworld_generates_a_lit_mesh_job() -> Result<()> {
+        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let targets = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+        let worker = GenerationWorker::start(
+            move || {
+                Ok(prepare(FreshGenerationSettings {
+                    minecraft_dir: game,
+                    preset: "minecraft:normal".into(),
+                    dimension: "minecraft:overworld".into(),
+                    seed: 42,
+                    structures_enabled: false,
+                    data_packs: None,
+                })?
+                .into_worker_inputs())
+            },
+            targets.clone(),
+            7,
+            0,
+            IVec3::ZERO,
+        )?;
+        let result = worker.result.recv_timeout(Duration::from_secs(300))?;
+        let generated = match result {
+            GenerationResult::Ready(generated) => generated,
+            GenerationResult::Failed(error) => {
+                return Err(error.context(format!("generation progress: {:?}", worker.progress())));
+            }
+            GenerationResult::Cancelled => anyhow::bail!("generation was cancelled"),
+        };
+        assert_eq!(worker.progress().phase, GenerationPhase::Ready);
+        assert_eq!(generated.mesh.targets.as_deref(), Some(&targets));
+        assert_eq!(generated.mesh.revision, 7);
+        assert!(
+            generated
+                .mesh
+                .world
+                .chunks
+                .contains_key(&ChunkPos { x: 0, z: 0 })
+        );
+        Ok(())
     }
 }

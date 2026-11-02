@@ -37,6 +37,7 @@ enum StateSchema {
     AmethystCluster,
     Multiface,
     HugeMushroom,
+    LeafLitter,
 }
 
 impl StateSchema {
@@ -76,6 +77,12 @@ impl StateSchema {
                     .map(|name| (name.into(), "true".into()))
                     .collect();
             }
+            Self::LeafLitter => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("segment_amount".into(), "1".into()),
+                ]);
+            }
             Self::Snowy => ("snowy", "false"),
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
@@ -104,6 +111,14 @@ impl StateSchema {
             {
                 Some(value.to_owned())
             }
+            Self::LeafLitter
+                if name == "facing" && matches!(value, "north" | "south" | "west" | "east") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::LeafLitter if name == "segment_amount" => java_decimal(value)
+                .filter(|n| (1..=4).contains(n))
+                .map(|n| n.to_string()),
             Self::AmethystCluster
                 if name == "facing"
                     && matches!(value, "down" | "up" | "north" | "south" | "west" | "east") =>
@@ -295,6 +310,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/HugeMushroomBlock" => {
                     Some(StateSchema::HugeMushroom)
                 }
+                "net/minecraft/world/level/block/LeafLitterBlock" => Some(StateSchema::LeafLitter),
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"
                 | "net/minecraft/world/level/block/TallFlowerBlock" => {

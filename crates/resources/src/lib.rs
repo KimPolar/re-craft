@@ -68,6 +68,7 @@ pub mod tree_fallen_decorators;
 pub mod tree_fallen_feature;
 pub mod tree_fancy_trunk;
 pub mod tree_feature;
+pub mod tree_ground_decorator;
 pub mod tree_leaf_update;
 pub mod tree_placers;
 pub mod underwater_magma;

@@ -12,6 +12,7 @@ use crate::{
     placed_feature::IntProvider,
     tree_beehive::{BeehiveDecorator, BeehiveWorld},
     tree_fancy_trunk::{FancyTrunkWorld, LogAxis, place_fancy_trunk},
+    tree_ground_decorator::{GroundDecorationWorld, PlaceOnGroundDecorator},
     tree_placers::{
         TreeFeatureSize, TrunkHeight, VanillaTreeClearance, permitted_tree_height,
         place_blob_foliage, place_fancy_foliage, place_straight_trunk,
@@ -47,7 +48,12 @@ pub struct TreeFeature<S> {
     offset: IntProvider,
     size: TreeFeatureSize,
     ignore_vines: bool,
-    decorators: Vec<BeehiveDecorator>,
+    decorators: Vec<TreeDecorator<S>>,
+}
+
+enum TreeDecorator<S> {
+    Beehive(BeehiveDecorator),
+    PlaceOnGround(PlaceOnGroundDecorator<S>),
 }
 
 impl<S: Clone + Eq> TreeFeature<S> {
@@ -107,14 +113,22 @@ impl<S: Clone + Eq> TreeFeature<S> {
             .as_array()
             .context("invalid tree decorators")?
         {
-            ensure!(
-                name(decorator)? == ResourceId::parse("minecraft:beehive")?,
-                "unsupported tree decorator"
-            );
-            let probability = field(decorator, "probability")?
-                .as_f64()
-                .context("invalid beehive probability")? as f32;
-            decorators.push(BeehiveDecorator::new(probability)?);
+            let kind = name(decorator)?;
+            match (kind.namespace.as_str(), kind.path.as_str()) {
+                ("minecraft", "beehive") => {
+                    let probability = field(decorator, "probability")?
+                        .as_f64()
+                        .context("invalid beehive probability")?
+                        as f32;
+                    decorators.push(TreeDecorator::Beehive(BeehiveDecorator::new(probability)?));
+                }
+                ("minecraft", "place_on_ground") => {
+                    decorators.push(TreeDecorator::PlaceOnGround(
+                        PlaceOnGroundDecorator::decode(provider, decorator, resolve)?,
+                    ));
+                }
+                _ => anyhow::bail!("unsupported tree decorator"),
+            }
         }
         let trunk_placer = field(value, "trunk_placer")?;
         let fancy_trunk = match name(trunk_placer)? {
@@ -170,6 +184,11 @@ impl<S: Clone + Eq> TreeFeature<S> {
         self.trunk.tags(&mut tags);
         self.foliage.tags(&mut tags);
         self.below.tags(&mut tags);
+        for decorator in &self.decorators {
+            if let TreeDecorator::PlaceOnGround(v) = decorator {
+                tags.extend(v.required_tags());
+            }
+        }
         tags
     }
     pub fn required_blocks(&self) -> BTreeSet<ResourceId> {
@@ -177,21 +196,38 @@ impl<S: Clone + Eq> TreeFeature<S> {
         self.trunk.blocks(&mut blocks);
         self.foliage.blocks(&mut blocks);
         self.below.blocks(&mut blocks);
-        if !self.decorators.is_empty() {
-            blocks.insert(ResourceId::parse("minecraft:bee_nest").unwrap());
+        for decorator in &self.decorators {
+            match decorator {
+                TreeDecorator::Beehive(_) => {
+                    blocks.insert(ResourceId::parse("minecraft:bee_nest").unwrap());
+                }
+                TreeDecorator::PlaceOnGround(v) => blocks.extend(v.required_blocks()),
+            }
         }
         blocks
+    }
+    pub fn needs_survival(&self, name: &str) -> bool {
+        self.trunk.needs_survival(name)
+            || self.foliage.needs_survival(name)
+            || self.below.needs_survival(name)
+            || self
+                .decorators
+                .iter()
+                .any(|d| matches!(d, TreeDecorator::PlaceOnGround(v) if v.needs_survival(name)))
     }
     /// Apply decorators only after successful trunk and foliage placement.
     pub fn place_decorators(
         &self,
-        world: &mut impl BeehiveWorld,
+        world: &mut (impl BeehiveWorld + GroundDecorationWorld<State = S>),
         random: &mut DecorationRandom,
         logs: &[[i32; 3]],
         leaves: &[[i32; 3]],
     ) -> Result<()> {
         for decorator in &self.decorators {
-            decorator.place(world, random, logs, leaves)?;
+            match decorator {
+                TreeDecorator::Beehive(v) => v.place(world, random, logs, leaves)?,
+                TreeDecorator::PlaceOnGround(v) => v.place(world, random, logs, &[])?,
+            }
         }
         Ok(())
     }

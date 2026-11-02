@@ -7,6 +7,66 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 
+/// Block tags used by vibration filtering, occlusion, and resonance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VibrationBlockTags {
+    registry: BTreeSet<String>,
+    occludes: BTreeSet<String>,
+    dampens: BTreeSet<String>,
+    resonators: BTreeSet<String>,
+}
+
+impl VibrationBlockTags {
+    /// `registry` must contain the full active block registry.
+    pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
+        ensure!(!registry.is_empty(), "block registry is empty");
+        let ids = [
+            "minecraft:occludes_vibration_signals",
+            "minecraft:dampens_vibrations",
+            "minecraft:vibration_resonators",
+        ]
+        .map(ResourceId::parse);
+        let [occludes, dampens, resonators] = ids;
+        let (occludes, dampens, resonators) = (occludes?, dampens?, resonators?);
+        let mut raw = BTreeMap::new();
+        let mut failed = BTreeSet::new();
+        for id in [&occludes, &dampens, &resonators] {
+            crate::transforms::read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
+        }
+        let mut cache = BTreeMap::new();
+        let mut resolve = |id: &ResourceId| {
+            crate::heightmap_tags::resolve(id, &raw, registry, &mut cache, &mut BTreeSet::new())
+                .with_context(|| {
+                    format!(
+                        "cannot resolve vibration block tag {}:{}",
+                        id.namespace, id.path
+                    )
+                })
+        };
+        Ok(Self {
+            registry: registry.clone(),
+            occludes: resolve(&occludes)?,
+            dampens: resolve(&dampens)?,
+            resonators: resolve(&resonators)?,
+        })
+    }
+    pub fn occludes(&self, block: &str) -> Option<bool> {
+        self.registry
+            .contains(block)
+            .then(|| self.occludes.contains(block))
+    }
+    pub fn dampens(&self, block: &str) -> Option<bool> {
+        self.registry
+            .contains(block)
+            .then(|| self.dampens.contains(block))
+    }
+    pub fn resonates(&self, block: &str) -> Option<bool> {
+        self.registry
+            .contains(block)
+            .then(|| self.resonators.contains(block))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameEventTags {
     vibrations: BTreeSet<String>,
@@ -158,5 +218,46 @@ mod tests {
             vec![br##"{"values":["#minecraft:vibrations"]}"##.to_vec()],
         );
         assert!(GameEventTags::load(&mut data, &registry).is_err());
+    }
+
+    #[test]
+    fn vibration_block_tags_apply_replacements_nested_tags_and_registry_validation() {
+        let registry = BTreeSet::from([
+            "minecraft:stone".into(),
+            "minecraft:white_wool".into(),
+            "minecraft:amethyst_block".into(),
+        ]);
+        let mut data = Data(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/occludes_vibration_signals.json".into(),
+                vec![
+                    br#"{"values":["minecraft:stone"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#example:wool"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/example/tags/block/wool.json".into(),
+                vec![br#"{"values":["minecraft:white_wool"]}"#.to_vec()],
+            ),
+            (
+                "data/minecraft/tags/block/dampens_vibrations.json".into(),
+                vec![br#"{"values":["minecraft:white_wool"]}"#.to_vec()],
+            ),
+            (
+                "data/minecraft/tags/block/vibration_resonators.json".into(),
+                vec![br#"{"values":["minecraft:amethyst_block"]}"#.to_vec()],
+            ),
+        ]));
+        let tags = VibrationBlockTags::load(&mut data, &registry).unwrap();
+        assert_eq!(tags.occludes("minecraft:white_wool"), Some(true));
+        assert_eq!(tags.occludes("minecraft:stone"), Some(false));
+        assert_eq!(tags.dampens("minecraft:white_wool"), Some(true));
+        assert_eq!(tags.resonates("minecraft:amethyst_block"), Some(true));
+        assert_eq!(tags.occludes("example:unknown"), None);
+        data.0.insert(
+            "data/example/tags/block/wool.json".into(),
+            vec![br#"{"values":["example:unknown"]}"#.to_vec()],
+        );
+        assert!(VibrationBlockTags::load(&mut data, &registry).is_err());
     }
 }

@@ -9,6 +9,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.tags.*;
 import net.minecraft.world.level.gameevent.*;
 import net.minecraft.world.level.gameevent.vibrations.*;
@@ -16,10 +17,11 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now;
+        long now; Set<BlockPos> occluders;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
+        @Override public BlockState getBlockState(BlockPos pos) { return occluders != null && occluders.contains(pos) ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(); }
         @Override public <T extends ParticleOptions> int sendParticles(T type, double x, double y, double z, int count, double dx, double dy, double dz, double speed) { return 0; }
     }
     static class User implements VibrationSystem.User {
@@ -109,7 +111,25 @@ public class VibrationOracle {
             var context=GameEvent.Context.of(present ? entity : null, Blocks.STONE.defaultBlockState());
             var row=new JsonObject(); row.addProperty("mask",mask); row.addProperty("accepted",user.isValidVibration(GameEvent.SPLASH,context)); filter.add(row);
         }
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter);
+        bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.OCCLUDES_VIBRATION_SIGNALS));
+        var isOccluded=VibrationSystem.Listener.class.getDeclaredMethod("isOccluded",net.minecraft.world.level.Level.class,Vec3.class,Vec3.class); isOccluded.setAccessible(true);
+        var rays=new JsonArray(); var random=new Random(31337);
+        for (int n=0; n<1200; n++) {
+            int x=random.nextInt(9)-4,y=random.nextInt(9)-4,z=random.nextInt(9)-4;
+            int shift=n%3==0 ? 30000000 : n%3==1 ? -30000000 : 0;
+            var from=new Vec3(shift+0.25,0.75,shift+0.1); var to=new Vec3(shift+x+0.3,y+0.8,shift+z+0.9);
+            world.occluders=new HashSet<>();
+            if ((n%3)==0) {
+                int plane=random.nextInt(7)-3;
+                for (int a=-5;a<=5;a++) for (int b=-5;b<=5;b++)
+                    if (random.nextInt(9)!=0) world.occluders.add(new BlockPos(shift+plane,a,shift+b));
+            } else for(int i=0;i<40;i++) world.occluders.add(new BlockPos(shift+random.nextInt(11)-5,random.nextInt(11)-5,shift+random.nextInt(11)-5));
+            var blocks=new JsonArray(); for (var pos:world.occluders) { var p=new JsonArray();p.add(pos.getX());p.add(pos.getY());p.add(pos.getZ());blocks.add(p); }
+            var row=new JsonObject(); row.addProperty("x",x);row.addProperty("y",y);row.addProperty("z",z);row.addProperty("shift",shift);row.add("blocks",blocks);
+            row.addProperty("occluded",(boolean)isOccluded.invoke(null,world,from,to));rays.add(row);
+        }
+        var blockRegistry=new JsonArray(); for (var entry:BuiltInRegistries.BLOCK.entrySet()) blockRegistry.add(entry.getKey().identifier().toString());
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry);
         Files.writeString(Path.of(args[0]), result.toString());
     }
 }

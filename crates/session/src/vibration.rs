@@ -1,7 +1,6 @@
 //! Java 26.3 game-event frequencies and vibration candidate selection.
 //!
-//! This module does not yet discover listeners, test occlusion, or activate
-//! sculk sensors. Callers must only submit events that passed those checks.
+//! This module does not yet discover listeners or activate sculk sensors.
 
 use glam::{DVec3, IVec3};
 
@@ -59,6 +58,115 @@ pub fn travel_distance(event: DVec3, listener: DVec3) -> Option<f32> {
 pub fn block_distance(event: IVec3, listener: IVec3) -> f32 {
     let d = event.as_dvec3() - listener.as_dvec3();
     (d.x * d.x + d.y * d.y + d.z * d.z).sqrt() as f32
+}
+
+/// Java checks six rays between block centers, shifted at the source by a
+/// small amount in each cardinal direction. `occludes` reads the active block
+/// tag; None means the block or its tag is unavailable. A definite clear ray
+/// or six definite blocked rays can still be resolved despite unknown cells.
+pub fn occluded(
+    event: DVec3,
+    listener: DVec3,
+    mut occludes: impl FnMut(IVec3) -> Option<bool>,
+) -> Option<bool> {
+    fn center(value: DVec3) -> Option<DVec3> {
+        if !value.is_finite()
+            || value.min_element() < f64::from(i32::MIN) + 1.0
+            || value.max_element() >= f64::from(i32::MAX) - 1.0
+        {
+            return None;
+        }
+        Some(value.floor() + DVec3::splat(0.5))
+    }
+    let from = center(event)?;
+    let to = center(listener)?;
+    // Sensor radii are small; avoid unbounded walks for malformed input.
+    if (from - to).abs().element_sum() > 4096.0 {
+        return None;
+    }
+    let epsilon = f64::from(1.0e-5_f32);
+    let mut uncertain = false;
+    for offset in [
+        DVec3::NEG_Y,
+        DVec3::Y,
+        DVec3::NEG_Z,
+        DVec3::Z,
+        DVec3::NEG_X,
+        DVec3::X,
+    ] {
+        match occlusion_ray(from + offset * epsilon, to, &mut occludes) {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => uncertain = true,
+        }
+    }
+    (!uncertain).then_some(true)
+}
+
+fn occlusion_ray(
+    from: DVec3,
+    to: DVec3,
+    occludes: &mut impl FnMut(IVec3) -> Option<bool>,
+) -> Option<bool> {
+    if from == to {
+        return Some(false);
+    }
+    // BlockGetter.traverseBlocks extends both endpoints by 1e-7.
+    let end = to + (from - to) * -1.0e-7;
+    let start = from + (to - from) * -1.0e-7;
+    let delta = end - start;
+    let mut cell = start.floor().as_ivec3();
+    let mut unknown = false;
+    let mut visit = |cell| match occludes(cell) {
+        Some(true) => true,
+        Some(false) => false,
+        None => {
+            unknown = true;
+            false
+        }
+    };
+    if visit(cell) {
+        return Some(true);
+    }
+    let mut step = [0_i32; 3];
+    let mut increment = [0.0; 3];
+    let mut next = [0.0; 3];
+    for axis in 0..3 {
+        step[axis] = if delta[axis] > 0.0 {
+            1
+        } else if delta[axis] < 0.0 {
+            -1
+        } else {
+            0
+        };
+        increment[axis] = if step[axis] == 0 {
+            f64::MAX
+        } else {
+            f64::from(step[axis]) / delta[axis]
+        };
+        let fraction = start[axis] - start[axis].floor();
+        next[axis] = increment[axis]
+            * if step[axis] > 0 {
+                1.0 - fraction
+            } else {
+                fraction
+            };
+    }
+    while next.iter().any(|value| *value <= 1.0) {
+        let axis = if next[0] < next[1] {
+            if next[0] < next[2] { 0 } else { 2 }
+        } else if next[1] < next[2] {
+            1
+        } else {
+            2
+        };
+        cell[axis] = cell[axis].checked_add(step[axis])?;
+        next[axis] += increment[axis];
+        if visit(cell) {
+            return Some(true);
+        }
+    }
+    if unknown { None } else { Some(false) }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -222,6 +330,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn occlusion_keeps_unknowns_unless_a_clear_ray_or_six_blocked_rays_prove_the_result() {
+        let from = DVec3::new(0.5, 0.5, 0.5);
+        let to = DVec3::new(3.5, 0.5, 0.5);
+        assert_eq!(occluded(from, to, |_| Some(false)), Some(false));
+        assert_eq!(occluded(from, to, |p| Some(p.x == 2)), Some(true));
+        assert_eq!(
+            occluded(from, to, |p| if p.x == 1 { None } else { Some(false) }),
+            None
+        );
+        assert_eq!(
+            occluded(from, to, |p| if p.x == 1 { None } else { Some(p.x == 2) }),
+            Some(true)
+        );
+        assert_eq!(occluded(DVec3::splat(f64::NAN), to, |_| Some(false)), None);
+        assert_eq!(occluded(from, DVec3::splat(5000.0), |_| Some(false)), None);
+    }
+
+    #[test]
     fn selector_waits_and_orders_distance_then_frequency() {
         let event = |name: &str, distance: f32| Vibration {
             event: name.into(),
@@ -353,6 +479,21 @@ mod tests {
         assert!(tags.vibrates("minecraft:splash"));
         assert!(tags.ignored_while_sneaking("minecraft:step"));
         assert!(!tags.ignored_while_sneaking("minecraft:splash"));
+        let block_registry = data["block_registry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        let block_tags = native_resources::game_event_tags::VibrationBlockTags::load(
+            &mut resources,
+            &block_registry,
+        )
+        .unwrap();
+        assert_eq!(block_tags.occludes("minecraft:white_wool"), Some(true));
+        assert_eq!(block_tags.occludes("minecraft:white_carpet"), Some(false));
+        assert_eq!(block_tags.dampens("minecraft:white_carpet"), Some(true));
+        assert_eq!(block_tags.resonates("minecraft:amethyst_block"), Some(true));
         for (event, value) in frequencies {
             assert_eq!(frequency(event), value.as_u64().unwrap() as u8, "{event}");
         }
@@ -383,6 +524,36 @@ mod tests {
             assert_eq!(
                 block_distance(a.floor().as_ivec3(), b.floor().as_ivec3()).to_bits(),
                 row["blocks"].as_i64().unwrap() as u32,
+                "{row}"
+            );
+        }
+        let rays = data["rays"].as_array().unwrap();
+        assert_eq!(rays.len(), 1200);
+        for row in rays {
+            let shift = row["shift"].as_i64().unwrap() as f64;
+            let blocks: std::collections::HashSet<IVec3> = row["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    let n = v.as_array().unwrap();
+                    IVec3::new(
+                        n[0].as_i64().unwrap() as i32,
+                        n[1].as_i64().unwrap() as i32,
+                        n[2].as_i64().unwrap() as i32,
+                    )
+                })
+                .collect();
+            let to = DVec3::new(
+                shift + row["x"].as_i64().unwrap() as f64 + 0.3,
+                row["y"].as_i64().unwrap() as f64 + 0.8,
+                shift + row["z"].as_i64().unwrap() as f64 + 0.9,
+            );
+            assert_eq!(
+                occluded(DVec3::new(shift + 0.25, 0.75, shift + 0.1), to, |pos| Some(
+                    blocks.contains(&pos)
+                )),
+                Some(row["occluded"].as_bool().unwrap()),
                 "{row}"
             );
         }

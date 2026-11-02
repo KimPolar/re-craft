@@ -43,6 +43,7 @@ enum StateSchema {
     SmallDripleaf,
     BigDripleaf,
     BigDripleafStem,
+    HangingRoots,
 }
 
 impl StateSchema {
@@ -116,6 +117,7 @@ impl StateSchema {
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
+            Self::HangingRoots => ("waterlogged", "false"),
             Self::DoublePlant => ("half", "lower"),
             Self::BerryBush => ("age", "0"),
             Self::Age15 => ("age", "0"),
@@ -126,6 +128,9 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::HangingRoots if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
             Self::SmallDripleaf | Self::BigDripleaf | Self::BigDripleafStem
                 if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
                     || (name == "waterlogged" && matches!(value, "true" | "false")) =>
@@ -376,6 +381,9 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/BigDripleafStemBlock" => {
                     Some(StateSchema::BigDripleafStem)
+                }
+                "net/minecraft/world/level/block/HangingRootsBlock" => {
+                    Some(StateSchema::HangingRoots)
                 }
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"

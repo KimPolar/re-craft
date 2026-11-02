@@ -3551,6 +3551,37 @@ mod tests {
     }
 
     #[test]
+    fn generated_light_waits_for_writers_and_uses_current_blocks() {
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        for z in -2..=2 {
+            for x in -2..=2 {
+                terrain.completed_decoration.insert(ChunkPos { x, z });
+            }
+        }
+        // Even an outer feature center can write into the sampled halo.
+        terrain
+            .completed_decoration
+            .remove(&ChunkPos { x: 2, z: 2 });
+        assert!(terrain.calculate_generated_block_light(center).is_err());
+        terrain.completed_decoration.insert(ChunkPos { x: 2, z: 2 });
+        let world = Arc::make_mut(&mut terrain.world);
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(-1, 10, 8, torch).unwrap();
+        let before = terrain.snapshot();
+        let light = terrain.calculate_generated_block_light(center).unwrap();
+        let index = 8 * 16 + 10 * 256;
+        assert_eq!(light[&0][index / 2] & 15, 13);
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        let world = Arc::make_mut(&mut terrain.world);
+        let air = world.intern_state(state("air"));
+        world.set_block_id(-1, 10, 8, air).unwrap();
+        let updated = terrain.calculate_generated_block_light(center).unwrap();
+        assert_eq!(updated[&0][index / 2] & 15, 0);
+        assert_eq!(light[&0][index / 2] & 15, 13);
+    }
+
+    #[test]
     fn spring_writes_and_fluid_ticks_commit_or_rollback_together() {
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

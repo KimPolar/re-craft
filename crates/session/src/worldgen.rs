@@ -184,6 +184,40 @@ impl CarvedTerrainWorld {
         Arc::clone(&self.world)
     }
 
+    /// Calculate a draft block-light snapshot after every feature center that
+    /// can write into the three-by-three input area has completed. The caller
+    /// must discard the result if any of those blocks are subsequently edited.
+    /// This does not initialize sky light, publish arrays, or finish the chunk.
+    pub fn calculate_generated_block_light(
+        &self,
+        center: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
+        for dz in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let position = native_world::loaded::ChunkPos {
+                    x: center.x.checked_add(dx).context("light chunk X overflow")?,
+                    z: center.z.checked_add(dz).context("light chunk Z overflow")?,
+                };
+                ensure!(
+                    self.completed_decoration.contains(&position),
+                    "surrounding feature centers have not all completed"
+                );
+            }
+        }
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported generated light bounds")?;
+        native_world::generation_block_light::initialize_generated_block_light(
+            &self.world,
+            bounds,
+            center,
+        )
+        .context("generated light inputs are missing or unsupported")
+    }
+
     /// Known nests produced by tree decoration in these intermediate chunks.
     /// Other block-entity data may still be unavailable.
     pub fn generated_bee_nests(&self) -> impl Iterator<Item = &GeneratedBeeNest> {

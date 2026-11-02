@@ -9,6 +9,7 @@ pub mod block_light;
 pub mod collision;
 pub mod fluid;
 pub mod fluid_sim;
+pub mod generation_block_light;
 pub mod generation_light;
 pub mod lighting;
 pub mod loaded;

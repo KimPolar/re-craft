@@ -596,7 +596,7 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
 #[derive(Clone)]
 pub(crate) struct LightProperties {
     pub(crate) opacity: u8,
-    emission: u8,
+    pub(crate) emission: u8,
     pub(crate) faces: [[u16; 16]; 6],
     pub(crate) has_faces: bool,
 }

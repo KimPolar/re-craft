@@ -3151,6 +3151,65 @@ impl GeodeEnvironment for DecorationRegion<'_> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn integer_property_bounds(
+        &mut self,
+        state: &BlockState,
+        name: &str,
+    ) -> Result<Option<(i32, i32)>> {
+        let Some(raw) = state.properties.get(name) else {
+            return Ok(None);
+        };
+        let bounds = match (state.name.as_str(), name) {
+            ("minecraft:cave_vines", "age") => Some((0, 25)),
+            ("minecraft:sugar_cane" | "minecraft:cactus", "age") => Some((0, 15)),
+            ("minecraft:sweet_berry_bush", "age") => Some((0, 3)),
+            ("minecraft:water" | "minecraft:lava", "level") => Some((0, 15)),
+            ("minecraft:oak_leaves" | "minecraft:dark_oak_leaves", "distance") => Some((1, 7)),
+            ("minecraft:leaf_litter", "segment_amount") => Some((1, 4)),
+            ("minecraft:snow", "layers") => Some((1, 8)),
+            (
+                "minecraft:oak_sapling"
+                | "minecraft:spruce_sapling"
+                | "minecraft:birch_sapling"
+                | "minecraft:jungle_sapling"
+                | "minecraft:acacia_sapling"
+                | "minecraft:dark_oak_sapling"
+                | "minecraft:cherry_sapling"
+                | "minecraft:pale_oak_sapling",
+                "stage",
+            ) => Some((0, 1)),
+            _ if raw.parse::<i32>().is_ok() => {
+                bail!("unsupported integer property {name} on {}", state.name)
+            }
+            _ => None,
+        };
+        if let Some((min, max)) = bounds {
+            let current = raw
+                .parse::<i32>()
+                .context("invalid integer block property")?;
+            ensure!(
+                (min..=max).contains(&current) && current.to_string() == *raw,
+                "invalid integer block property"
+            );
+        }
+        Ok(bounds)
+    }
+    fn with_integer_property(
+        &mut self,
+        mut state: BlockState,
+        name: &str,
+        value: i32,
+    ) -> Result<BlockState> {
+        let (min, max) = self
+            .integer_property_bounds(&state, name)?
+            .context("integer property is absent")?;
+        ensure!(
+            (min..=max).contains(&value),
+            "integer block property is out of range"
+        );
+        state.properties.insert(name.into(), value.to_string());
+        Ok(state)
+    }
     fn mushroom_survives(&mut self, pos: [i32; 3]) -> Result<bool> {
         self.mushroom_survival(pos)
     }
@@ -3670,6 +3729,25 @@ impl ColumnWorld for DecorationRegion<'_> {
                     state.properties.len() == 1 && age.is_some_and(|v| v <= 15)
                 }
                 "minecraft:cactus_flower" => state.properties.is_empty(),
+                "minecraft:cave_vines_plant" => {
+                    state.properties.len() == 1
+                        && matches!(
+                            state.properties.get("berries").map(String::as_str),
+                            Some("true" | "false")
+                        )
+                }
+                "minecraft:cave_vines" => {
+                    state.properties.len() == 2
+                        && matches!(
+                            state.properties.get("berries").map(String::as_str),
+                            Some("true" | "false")
+                        )
+                        && state.properties.get("age").is_some_and(|raw| {
+                            raw.parse::<u8>()
+                                .ok()
+                                .is_some_and(|v| v <= 25 && v.to_string() == *raw)
+                        })
+                }
                 _ => false,
             };
             ensure!(valid, "unsupported column replacement effects");
@@ -3680,6 +3758,10 @@ impl ColumnWorld for DecorationRegion<'_> {
             ensure!(
                 disk_safe_solid(&old.name).is_some()
                     || old.name == "minecraft:sugar_cane"
+                    || matches!(
+                        old.name.as_str(),
+                        "minecraft:cave_vines" | "minecraft:cave_vines_plant"
+                    )
                     || simple_plant_kind(&old).is_ok(),
                 "unsupported column source effects"
             );
@@ -6437,6 +6519,75 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    fn randomized_cave_vines_write_to_generated_chunk() {
+        struct VinesData;
+        impl ResourceProvider for VinesData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/example/worldgen/block_state_provider/head.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"type":"minecraft:randomized_int","property":"age","source":{"id":"minecraft:cave_vines","properties":{"age":"0","berries":"true"}},"values":{"type":"minecraft:uniform","min_inclusive":23,"max_inclusive":25}}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let value = json!({"feature":{"type":"minecraft:block_column","direction":"down","allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},"prioritize_tip":true,"layers":[
+            {"height":2,"provider":{"id":"minecraft:cave_vines_plant","properties":{"berries":"true"}}},
+            {"height":1,"provider":"example:head"}
+        ]},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut VinesData,
+            PlacedFeature::decode(&value).unwrap(),
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:cave_vines".into(),
+            "minecraft:cave_vines_plant".into(),
+        ]);
+        let tags = OreBlockTags::load(&mut VinesData, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut VinesData, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(
+                    &placed,
+                    &mut DecorationRandom::new(42),
+                    [8, 12, 8],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        for y in [12, 11] {
+            let body = after.block(8, y, 8).unwrap();
+            assert_eq!(body.name, "minecraft:cave_vines_plant");
+            assert_eq!(body.properties["berries"], "true");
+        }
+        let head = after.block(8, 10, 8).unwrap();
+        assert_eq!(head.name, "minecraft:cave_vines");
+        assert_eq!(head.properties["berries"], "true");
+        assert!((23..=25).contains(&head.properties["age"].parse::<i32>().unwrap()));
+        assert_eq!(before.block(8, 10, 8).unwrap().name, "minecraft:air");
     }
 
     #[test]

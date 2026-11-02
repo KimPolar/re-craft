@@ -294,7 +294,16 @@ impl FreshGenerationLightTracker {
             .context("unsupported light height")?;
         let sources =
             native_world::sky_light::generated_chunk_sky_sources(&terrain.world, bounds, pos)
-                .context("generated sky sources are incomplete or unsupported")?;
+                .with_context(|| {
+                    format!(
+                        "generated sky sources are incomplete or unsupported: {}",
+                        native_world::sky_light::generated_chunk_sky_issue(
+                            &terrain.world,
+                            bounds,
+                            pos
+                        )
+                    )
+                })?;
         self.register_chunk(terrain, pos, registry)?;
         self.sky_sources.insert(pos, Arc::from(sources));
         Ok(())
@@ -324,7 +333,16 @@ impl FreshGenerationLightTracker {
             .context("unsupported light height")?;
         let sources =
             native_world::sky_light::generated_chunk_sky_sources(&terrain.world, bounds, pos)
-                .context("generated sky sources are incomplete or unsupported")?;
+                .with_context(|| {
+                    format!(
+                        "generated sky sources are incomplete or unsupported: {}",
+                        native_world::sky_light::generated_chunk_sky_issue(
+                            &terrain.world,
+                            bounds,
+                            pos
+                        )
+                    )
+                })?;
         self.sky_sources.insert(pos, Arc::from(sources));
         Ok(())
     }

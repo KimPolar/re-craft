@@ -154,6 +154,57 @@ pub fn generated_chunk_sky_sources(
     Some(result)
 }
 
+/// Diagnose a failed generated-chunk scan without changing the normal path.
+pub fn generated_chunk_sky_issue(world: &World, bounds: LightBounds, pos: ChunkPos) -> String {
+    let Some(chunk) = world.chunks.get(&pos) else {
+        return format!("missing chunk {pos:?}");
+    };
+    let range = bounds.build_range();
+    for sy in range.start.div_euclid(16)..range.end.div_euclid(16) {
+        let Some(section) = i8::try_from(sy).ok().and_then(|y| chunk.sections.get(&y)) else {
+            return format!("missing section {sy} in {pos:?}");
+        };
+        if section.blocks.is_none() {
+            return format!("missing section blocks {sy} in {pos:?}");
+        }
+    }
+    let Some(base_x) = pos.x.checked_mul(16) else {
+        return "sky x coordinate overflow".into();
+    };
+    let Some(base_z) = pos.z.checked_mul(16) else {
+        return "sky z coordinate overflow".into();
+    };
+    let mut scanner = SkySourceScanner {
+        world,
+        bounds,
+        require_full: false,
+        empty_sections: BTreeMap::new(),
+    };
+    for z in 0..16 {
+        for x in 0..16 {
+            let (Some(x), Some(z)) = (base_x.checked_add(x), base_z.checked_add(z)) else {
+                return "sky coordinate overflow".into();
+            };
+            if scanner.load(x, z).is_some() {
+                continue;
+            }
+            for y in range.clone().rev() {
+                let Some(id) = world.block_id(x, y, z) else {
+                    return format!("missing block at [{x}, {y}, {z}]");
+                };
+                let Some(state) = world.state(id) else {
+                    return format!("missing state at [{x}, {y}, {z}]");
+                };
+                if light_properties(state).is_none() {
+                    return format!("unsupported light state {state:?} at [{x}, {y}, {z}]");
+                }
+            }
+            return format!("unavailable sky data at column [{x}, {z}]");
+        }
+    }
+    "sky source scan failed despite available columns".into()
+}
+
 struct ColumnReader<'a> {
     world: &'a World,
     range: std::ops::Range<i32>,

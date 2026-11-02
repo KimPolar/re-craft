@@ -1,7 +1,7 @@
 use native_world::{
     block_light::LightBounds,
     loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, Section, World},
-    sky_light::{UNBOUNDED_SKY_SOURCE, generated_chunk_sky_sources},
+    sky_light::{UNBOUNDED_SKY_SOURCE, generated_chunk_sky_issue, generated_chunk_sky_sources},
 };
 use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 
@@ -83,6 +83,7 @@ fn generated_sources_reject_incomplete_data_without_mutation() {
         .sections
         .remove(&-1);
     assert!(generated_chunk_sky_sources(&world, bounds, pos).is_none());
+    assert!(generated_chunk_sky_issue(&world, bounds, pos).contains("missing section -1"));
     let (mut world, pos) = fixture();
     let unknown = world.intern_state(BlockState {
         name: "example:unknown".into(),
@@ -90,6 +91,9 @@ fn generated_sources_reject_incomplete_data_without_mutation() {
     });
     world.set_block_id(-16, 15, 32, unknown).unwrap();
     assert!(generated_chunk_sky_sources(&world, bounds, pos).is_none());
+    let issue = generated_chunk_sky_issue(&world, bounds, pos);
+    assert!(issue.contains("example:unknown"), "{issue}");
+    assert!(issue.contains("[-16, 15, 32]"), "{issue}");
 }
 
 #[test]

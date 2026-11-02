@@ -20,6 +20,15 @@ pub trait DiskWorld: OreWorld {
     fn fluid_is(&mut self, state: &Self::State, id: &ResourceId) -> Result<bool>;
     fn set_disk_block(&mut self, pos: [i32; 3], state: &Self::State) -> Result<bool>;
     fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()>;
+    /// Java BlockState.isFaceSturdy at the specified block and face.
+    fn face_sturdy(
+        &mut self,
+        _state: &Self::State,
+        _pos: [i32; 3],
+        _direction: [i32; 3],
+    ) -> Result<bool> {
+        bail!("block support shape is unavailable")
+    }
     /// Resolve an integer property's actual block-state definition. None means
     /// the property is absent or has a non-integer type.
     fn integer_property_bounds(
@@ -134,6 +143,7 @@ pub(crate) enum Predicate {
     Tag([i32; 3], ResourceId),
     Fluids([i32; 3], Vec<ResourceId>),
     Solid([i32; 3]),
+    HasSturdyFace([i32; 3], [i32; 3]),
     InsideWorldBounds([i32; 3]),
     WouldSurvive([i32; 3], ResourceId, Value),
     Not(Box<Predicate>),
@@ -241,6 +251,23 @@ impl Predicate {
                 ids(value.get("fluids").context("missing predicate fluids")?)?,
             ),
             "solid" => Self::Solid(offset(value)?),
+            "has_sturdy_face" => {
+                let offset = offset(value)?;
+                ensure!(
+                    offset.iter().all(|n| (-16..=16).contains(n)),
+                    "sturdy-face offset exceeds Java codec"
+                );
+                let direction = match value.get("direction").and_then(Value::as_str) {
+                    Some("down") => [0, -1, 0],
+                    Some("up") => [0, 1, 0],
+                    Some("north") => [0, 0, -1],
+                    Some("south") => [0, 0, 1],
+                    Some("west") => [-1, 0, 0],
+                    Some("east") => [1, 0, 0],
+                    _ => bail!("invalid sturdy-face direction"),
+                };
+                Self::HasSturdyFace(offset, direction)
+            }
             "inside_world_bounds" => {
                 let offset = offset(value)?;
                 ensure!(
@@ -373,6 +400,11 @@ impl Predicate {
             Self::Solid(offset) => {
                 let state = world.block(at(offset))?;
                 world.is_solid(&state)?
+            }
+            Self::HasSturdyFace(offset, direction) => {
+                let pos = at(offset);
+                let state = world.block(pos)?;
+                world.face_sturdy(&state, pos, *direction)?
             }
             Self::InsideWorldBounds(offset) => world.inside_build_height(at(offset)[1])?,
             Self::WouldSurvive(offset, _, state) => world.would_survive(state, at(offset))?,

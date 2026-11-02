@@ -3151,6 +3151,9 @@ impl GeodeEnvironment for DecorationRegion<'_> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn face_sturdy(&mut self, state: &BlockState, _: [i32; 3], _: [i32; 3]) -> Result<bool> {
+        tree_sturdy_up(state)
+    }
     fn integer_property_bounds(
         &mut self,
         state: &BlockState,

@@ -115,6 +115,14 @@ fn definition(ignore: bool) -> Value {
 fn unsupported_tree_effects_are_rejected_before_placement() {
     let mut v = definition(true);
     v["decorators"] = json!([{"type":"minecraft:beehive","probability":0.05}]);
+    let tree = TreeFeature::decode(&mut Data, &v, &mut resolve).unwrap();
+    assert!(
+        tree.required_blocks()
+            .contains(&ResourceId::parse("minecraft:bee_nest").unwrap())
+    );
+    v["decorators"] = json!([{"type":"minecraft:beehive","probability":2.0}]);
+    assert!(TreeFeature::decode(&mut Data, &v, &mut resolve).is_err());
+    v["decorators"] = json!([{"type":"minecraft:trunk_vine"}]);
     assert!(TreeFeature::decode(&mut Data, &v, &mut resolve).is_err());
     v["decorators"] = json!([]);
     v["root_placer"] = json!({"type":"minecraft:mangrove_root_placer"});
@@ -139,6 +147,27 @@ fn named_soil_provider_is_used_before_trunk_and_foliage() {
             .writes
             .iter()
             .any(|v| v.contains("minecraft:oak_leaves"))
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3"]
+fn installed_oak_bees_definition_is_supported() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = ResourceStack::open(&game).unwrap();
+    let definition: Value = serde_json::from_slice(
+        &resources
+            .read_data("data/minecraft/worldgen/feature/oak_bees_005.json")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let tree = TreeFeature::decode(&mut resources, &definition, &mut resolve).unwrap();
+    assert!(
+        tree.required_blocks()
+            .contains(&ResourceId::parse("minecraft:bee_nest").unwrap())
     );
 }
 

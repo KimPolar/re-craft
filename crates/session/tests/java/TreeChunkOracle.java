@@ -12,6 +12,7 @@ import net.minecraft.util.valueproviders.ConstantInt;
 import net.minecraft.world.level.WorldGenLevel;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BeehiveBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.FluidState;
@@ -23,6 +24,7 @@ import net.minecraft.world.level.levelgen.feature.featuresize.TwoLayersFeatureSi
 import net.minecraft.world.level.levelgen.feature.foliageplacers.BlobFoliagePlacer;
 import net.minecraft.world.level.levelgen.feature.stateproviders.BlockStateProvider;
 import net.minecraft.world.level.levelgen.feature.trunkplacers.StraightTrunkPlacer;
+import net.minecraft.world.level.levelgen.feature.treedecorators.BeehiveDecorator;
 
 public class TreeChunkOracle {
   static String pos(BlockPos p){return p.getX()+","+p.getY()+","+p.getZ();}
@@ -31,7 +33,8 @@ public class TreeChunkOracle {
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
     bind.invoke(Blocks.OAK_LOG.builtInRegistryHolder(),List.of(BlockTags.LOGS,BlockTags.PREVENTS_NEARBY_LEAF_DECAY));
     bind.invoke(Blocks.OAK_LEAVES.builtInRegistryHolder(),List.of(BlockTags.REPLACEABLE_BY_TREES));
-    var blocks=new HashMap<BlockPos,BlockState>();var ticks=new LinkedHashSet<String>();
+    var blocks=new HashMap<BlockPos,BlockState>();var ticks=new LinkedHashSet<String>();var nests=new HashMap<BlockPos,BeehiveBlockEntity>();
+    boolean bees=args.length>0 && args[0].equals("bees");
     if(args.length>0 && args[0].equals("grass"))blocks.put(new BlockPos(8,8,9),Blocks.GRASS_BLOCK.defaultBlockState().setValue(BlockStateProperties.SNOWY,true));
     if(args.length>0 && args[0].startsWith("vegetation")){
       blocks.put(new BlockPos(8,8,9),Blocks.SHORT_GRASS.defaultBlockState());
@@ -50,11 +53,12 @@ public class TreeChunkOracle {
         if(m.getName().equals("getBlockState"))return s;return ((Predicate<BlockState>)v[1]).test(s);
       }
       if(m.getName().equals("isFluidAtPosition"))return ((Predicate<FluidState>)v[1]).test(Fluids.EMPTY.defaultFluidState());
-      if(m.getName().equals("setBlock")){var p=((BlockPos)v[0]).immutable();if(p.getY()>=0&&p.getY()<16)blocks.put(p,(BlockState)v[1]);return true;}
+      if(m.getName().equals("setBlock")){var p=((BlockPos)v[0]).immutable();var state=(BlockState)v[1];if(p.getY()>=0&&p.getY()<16){blocks.put(p,state);if(state.is(Blocks.BEE_NEST))nests.put(p,new BeehiveBlockEntity(p,state));}return true;}
+      if(m.getName().equals("getBlockEntity"))return Optional.ofNullable(nests.get((BlockPos)v[0]));
       if(m.getName().equals("scheduleTick")){if(v[1] instanceof Block block)ticks.add(pos((BlockPos)v[0])+","+BuiltInRegistries.BLOCK.getKey(block));else throw new AssertionError("unexpected fluid tick");return null;}
       throw new UnsupportedOperationException(m.toString());
     });
-    var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),List.of(),true,BlockStateProvider.holderOf(Blocks.DIRT));
+    var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),bees?List.of(new BeehiveDecorator(1f)):List.of(),true,BlockStateProvider.holderOf(Blocks.DIRT));
     var random=new WorldgenRandom(new XoroshiroRandomSource(0));long decoration=random.setDecorationSeed(0,0,0);random.setFeatureSeed(decoration,0,0);
     boolean success=tree.place(world,null,random,new BlockPos(8,8,8));
     var result=new ArrayList<String>();
@@ -65,6 +69,7 @@ public class TreeChunkOracle {
       result.add(pos(p)+","+name+extra);
     }
     out.println("RESULT "+success+" B "+String.join(";",result)+" T "+String.join(";",ticks));
+    if(bees){var get=BeehiveBlockEntity.class.getDeclaredMethod("getBees");get.setAccessible(true);for(var entry:nests.entrySet()){var occupants=(List<BeehiveBlockEntity.Occupant>)get.invoke(entry.getValue());out.println("NEST "+pos(entry.getKey())+" "+String.join(",",occupants.stream().map(o->Integer.toString(o.ticksInHive())).toList()));}}
     for(boolean snowyTag:new boolean[]{false,true})for(boolean initial:new boolean[]{false,true})for(var direction:List.of(Direction.UP,Direction.EAST)){
       bind.invoke(Blocks.STONE.builtInRegistryHolder(),snowyTag?List.of(BlockTags.SNOW):List.of());
       var state=Blocks.GRASS_BLOCK.defaultBlockState().setValue(BlockStateProperties.SNOWY,initial);

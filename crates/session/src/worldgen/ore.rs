@@ -20,6 +20,7 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
     spring_feature::{SpringFeature, SpringWorld},
+    tree_beehive::BeehiveWorld,
     tree_feature::{TreeFeature, TreeWorld, TreeWrite},
     tree_leaf_update::{LeafUpdateWorld, finish_generated_tree},
     underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
@@ -51,6 +52,8 @@ pub struct DecorationRegion<'a> {
     motion_cache: BTreeMap<BlockStateId, bool>,
     tree_logs: Vec<[i32; 3]>,
     tree_leaves: Vec<[i32; 3]>,
+    tree_decorations: Vec<[i32; 3]>,
+    bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     failed: bool,
 }
 
@@ -288,14 +291,22 @@ impl ConfiguredDecoration {
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
+                world.tree_decorations.clear();
                 let placed = v.place_components(world, random, pos)?;
                 let mut logs = std::mem::take(&mut world.tree_logs);
                 let mut leaves = std::mem::take(&mut world.tree_leaves);
-                let result = finish_generated_tree(world, placed, &logs, &leaves, &[], &[]);
+                if placed && (!logs.is_empty() || !leaves.is_empty()) {
+                    v.place_decorators(world, random, &logs, &leaves)?;
+                }
+                let mut decorations = std::mem::take(&mut world.tree_decorations);
+                let result =
+                    finish_generated_tree(world, placed, &logs, &leaves, &[], &decorations);
                 logs.clear();
                 leaves.clear();
+                decorations.clear();
                 world.tree_logs = logs;
                 world.tree_leaves = leaves;
+                world.tree_decorations = decorations;
                 result
             }
             Self::Selector(values) => {
@@ -730,6 +741,7 @@ impl CarvedTerrainWorld {
         let surface_heights = self.feature_world_surface_heights.clone();
         let final_heights = self.final_heightmaps.clone();
         let feature_marks = self.feature_postprocessing.clone();
+        let bee_nests = self.generated_bee_nests.clone();
         Ok(DecorationRegion {
             target: self,
             world,
@@ -748,6 +760,8 @@ impl CarvedTerrainWorld {
             motion_cache: BTreeMap::new(),
             tree_logs: Vec::new(),
             tree_leaves: Vec::new(),
+            tree_decorations: Vec::new(),
+            bee_nests,
             failed: false,
         })
     }
@@ -928,6 +942,7 @@ impl DecorationRegion<'_> {
         self.target.feature_world_surface_heights = self.surface_heights;
         self.target.final_heightmaps = self.final_heights;
         self.target.feature_postprocessing = self.feature_marks;
+        self.target.generated_bee_nests = self.bee_nests;
         Ok(())
     }
 
@@ -1445,6 +1460,43 @@ impl TreeWorld for DecorationRegion<'_> {
     }
 }
 
+impl BeehiveWorld for DecorationRegion<'_> {
+    fn is_air(&mut self, pos: [i32; 3]) -> Result<bool> {
+        Ok(is_air(&OreWorld::block(self, pos)?))
+    }
+    fn place_bee_nest(&mut self, pos: [i32; 3]) -> Result<bool> {
+        self.tree_decorations.push(pos);
+        if !self.writable.contains(&chunk(pos)) || self.is_outside(pos[1]) {
+            return Ok(false);
+        }
+        ensure!(
+            !self.bee_nests.contains_key(&pos),
+            "existing generated bee nest"
+        );
+        ensure!(is_air(&self.read(pos)?), "bee nest target is not air");
+        let state = BlockState {
+            name: "minecraft:bee_nest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("honey_level".into(), "0".into()),
+            ]),
+        };
+        self.set_section_block(pos, &state)?;
+        self.update_final_heightmaps(pos, &state)?;
+        Ok(true)
+    }
+    fn store_bees(&mut self, pos: [i32; 3], ticks: &[i32]) -> Result<()> {
+        let nest = super::GeneratedBeeNest::new(pos, ticks.to_vec())?;
+        ensure!(
+            Arc::make_mut(&mut self.bee_nests)
+                .insert(pos, nest)
+                .is_none(),
+            "duplicate generated bee nest"
+        );
+        Ok(())
+    }
+}
+
 impl LeafUpdateWorld for DecorationRegion<'_> {
     fn optional_leaf_distance(&mut self, pos: [i32; 3]) -> Result<Option<u8>> {
         let state = OreWorld::block(self, pos)?;
@@ -1560,6 +1612,13 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
         } else {
             ensure!(
                 tree_oak_log(state)
+                    || (state.name == "minecraft:bee_nest"
+                        && state.properties.len() == 2
+                        && state.properties.get("facing").is_some_and(|v| v == "south")
+                        && state
+                            .properties
+                            .get("honey_level")
+                            .is_some_and(|v| v == "0"))
                     || (state.properties.is_empty()
                         && matches!(
                             state.name.as_str(),
@@ -2220,6 +2279,12 @@ impl OreVeinWorld for DecorationRegion<'_> {
     }
     fn set_section_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
         ensure!(!self.is_outside(p[1]), "ore write outside build height");
+        if self.bee_nests.contains_key(&p) {
+            ensure!(
+                self.read(p)? == *state,
+                "generated bee nest replacement is not supported"
+            );
+        }
         // Preserve both original maps before the first direct write in this
         // chunk; untouched neighbors need no heightmap scan.
         self.prime_heightmaps(chunk(p))?;
@@ -2370,6 +2435,7 @@ mod tests {
             surface_postprocessing: BTreeMap::new(),
             carver_postprocessing: BTreeMap::new(),
             feature_postprocessing: BTreeMap::new(),
+            generated_bee_nests: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
     }
@@ -3680,6 +3746,38 @@ mod tests {
     }
 
     #[test]
+    fn generated_bee_nest_cannot_be_overwritten_without_entity_handling() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let pos = [2, 8, 2];
+        let nest = BlockState {
+            name: "minecraft:bee_nest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("honey_level".into(), "0".into()),
+            ]),
+        };
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(nest.clone());
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[2 + 2 * 16 + 8 * 256] = id;
+        Arc::make_mut(&mut terrain.generated_bee_nests).insert(
+            pos,
+            super::super::GeneratedBeeNest::new(pos, vec![1, 2]).unwrap(),
+        );
+        let writable = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        assert!(region.set_section_block(pos, &state("air")).is_err());
+        assert_eq!(region.read(pos).unwrap(), nest);
+        drop(region);
+        assert_eq!(terrain.generated_bee_nests().count(), 1);
+        assert_eq!(
+            terrain.snapshot().block(pos[0], pos[1], pos[2]).unwrap(),
+            &nest
+        );
+    }
+
+    #[test]
     fn repeated_oak_placements_reset_and_reuse_position_buffers() {
         let (schedule, neighborhood, registry) = prepare_tree_fixture();
         let plan = fixture_plan(&schedule, &neighborhood);
@@ -4099,6 +4197,131 @@ mod tests {
                 blocks.join(";"),
                 ticks.join(";")
             )
+        );
+
+        struct BeeTreeData;
+        impl ResourceProvider for BeeTreeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let Some(bytes) = TreeData.read_data(path)? else {
+                    return Ok(None);
+                };
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let mut v: Value = serde_json::from_slice(&bytes)?;
+                    v["features"][0][0]["feature"]["decorators"] =
+                        json!([{"type":"minecraft:beehive","probability":1.0}]);
+                    return Ok(Some(serde_json::to_vec(&v)?));
+                }
+                if path.contains("blocks_motion_in_heightmap") {
+                    let mut v: Value = serde_json::from_slice(&bytes)?;
+                    v["values"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("minecraft:bee_nest"));
+                    return Ok(Some(serde_json::to_vec(&v)?));
+                }
+                Ok(Some(bytes))
+            }
+        }
+        let bee_output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeChunkOracle")
+            .arg("bees"));
+        let bee_actual = bee_output
+            .lines()
+            .find(|line| line.starts_with("RESULT "))
+            .unwrap();
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let bee_schedule =
+            FeatureSchedule::load(&mut BeeTreeData, &[plains], &BTreeSet::new()).unwrap();
+        let bee_plan = fixture_plan(&bee_schedule, &neighborhood);
+        let mut bee_registry = registry.clone();
+        bee_registry.insert("minecraft:bee_nest".into());
+        let bee_prepared = PreparedDecoration::load(
+            &mut BeeTreeData,
+            &bee_plan,
+            &bee_registry,
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        let (mut bee_terrain, _, _, _) = fixture();
+        let bee_success = bee_prepared.execute(&mut bee_terrain, false).unwrap();
+        let bee_world = bee_terrain.snapshot();
+        let mut bee_blocks = Vec::new();
+        for x in 0..16 {
+            for y in 7..16 {
+                for z in 0..16 {
+                    let b = bee_world.block(x, y, z).unwrap();
+                    let extra = match b.name.as_str() {
+                        "minecraft:oak_log" => format!(",axis={}", b.properties["axis"]),
+                        "minecraft:oak_leaves" => format!(
+                            ",distance={},persistent={},waterlogged={}",
+                            b.properties["distance"],
+                            b.properties["persistent"],
+                            b.properties["waterlogged"]
+                        ),
+                        "minecraft:dirt" => String::new(),
+                        "minecraft:bee_nest" => {
+                            assert_eq!(
+                                b.properties.get("facing").map(String::as_str),
+                                Some("south")
+                            );
+                            assert_eq!(
+                                b.properties.get("honey_level").map(String::as_str),
+                                Some("0")
+                            );
+                            String::new()
+                        }
+                        _ => continue,
+                    };
+                    bee_blocks.push(format!("{x},{y},{z},{}{extra}", b.name));
+                }
+            }
+        }
+        let bee_ticks = bee_world
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                format!(
+                    "{},{},{},{}",
+                    t.position[0], t.position[1], t.position[2], t.block
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bee_actual,
+            format!(
+                "RESULT {} B {} T {}",
+                bee_success[0],
+                bee_blocks.join(";"),
+                bee_ticks.join(";")
+            )
+        );
+        let nests = bee_terrain.generated_bee_nests().collect::<Vec<_>>();
+        assert_eq!(nests.len(), 1);
+        let nest = nests[0];
+        let entity = nest.block_entity();
+        let Some(native_persistence::nbt::Tag::List { values, .. }) = entity.get("bees") else {
+            panic!("missing bees")
+        };
+        let ticks = values
+            .iter()
+            .map(|b| match b.get("ticks_in_hive") {
+                Some(native_persistence::nbt::Tag::Int(v)) => v.to_string(),
+                _ => panic!("missing bee ticks"),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let [x, y, z] = nest.position;
+        assert!(
+            bee_output
+                .lines()
+                .any(|line| line == format!("NEST {x},{y},{z} {ticks}"))
         );
 
         // Load the named oak and its below-trunk provider from the verified

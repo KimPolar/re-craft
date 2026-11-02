@@ -28,10 +28,12 @@ use native_world::biome_zoom::{obfuscate_seed, quart_position};
 use serde_json::Value;
 
 mod carving;
+mod generated_beehive;
 mod generated_chest;
 mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
+pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
@@ -84,6 +86,7 @@ pub struct CarvedTerrainWorld {
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     feature_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
+    generated_bee_nests: Arc<BTreeMap<[i32; 3], GeneratedBeeNest>>,
 }
 
 impl CarvedTerrainWorld {
@@ -123,6 +126,7 @@ impl CarvedTerrainWorld {
                 .map(|value| (position, value))
                 .collect(),
             feature_postprocessing: BTreeMap::new(),
+            generated_bee_nests: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -167,6 +171,12 @@ impl CarvedTerrainWorld {
     /// A snapshot retains its existing chunks when another chunk is inserted.
     pub fn snapshot(&self) -> Arc<native_world::loaded::World> {
         Arc::clone(&self.world)
+    }
+
+    /// Known nests produced by tree decoration in these intermediate chunks.
+    /// Other block-entity data may still be unavailable.
+    pub fn generated_bee_nests(&self) -> impl Iterator<Item = &GeneratedBeeNest> {
+        self.generated_bee_nests.values()
     }
 
     /// Z, X, Y order, with Y measured from this collection's minimum height.

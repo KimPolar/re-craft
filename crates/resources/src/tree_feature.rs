@@ -10,6 +10,7 @@ use crate::{
     disk_feature::{DiskWorld, Provider},
     packs::{ResourceId, ResourceProvider},
     placed_feature::IntProvider,
+    tree_beehive::{BeehiveDecorator, BeehiveWorld},
     tree_placers::{
         TreeFeatureSize, TrunkHeight, VanillaTreeClearance, permitted_tree_height,
         place_blob_foliage, place_straight_trunk,
@@ -41,10 +42,11 @@ pub struct TreeFeature<S> {
     offset: IntProvider,
     size: TreeFeatureSize,
     ignore_vines: bool,
+    decorators: Vec<BeehiveDecorator>,
 }
 
 impl<S: Clone + Eq> TreeFeature<S> {
-    /// Decode a straight-trunk, blob-foliage tree without roots or decorators.
+    /// Decode a straight-trunk, blob-foliage tree without roots.
     /// Reject unsupported configurations before a world can be modified.
     pub fn decode(
         provider: &mut impl ResourceProvider,
@@ -95,13 +97,20 @@ impl<S: Clone + Eq> TreeFeature<S> {
             value.get("root_placer").is_none(),
             "tree root placer is not supported"
         );
-        ensure!(
-            field(value, "decorators")?
-                .as_array()
-                .context("invalid tree decorators")?
-                .is_empty(),
-            "tree decorators are not supported"
-        );
+        let mut decorators = Vec::new();
+        for decorator in field(value, "decorators")?
+            .as_array()
+            .context("invalid tree decorators")?
+        {
+            ensure!(
+                name(decorator)? == ResourceId::parse("minecraft:beehive")?,
+                "unsupported tree decorator"
+            );
+            let probability = field(decorator, "probability")?
+                .as_f64()
+                .context("invalid beehive probability")? as f32;
+            decorators.push(BeehiveDecorator::new(probability)?);
+        }
         let trunk_placer = field(value, "trunk_placer")?;
         ensure!(
             name(trunk_placer)? == ResourceId::parse("minecraft:straight_trunk_placer")?,
@@ -141,6 +150,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
             offset,
             size: TreeFeatureSize::decode(field(value, "minimum_size")?)?,
             ignore_vines,
+            decorators,
         })
     }
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
@@ -158,7 +168,23 @@ impl<S: Clone + Eq> TreeFeature<S> {
         self.trunk.blocks(&mut blocks);
         self.foliage.blocks(&mut blocks);
         self.below.blocks(&mut blocks);
+        if !self.decorators.is_empty() {
+            blocks.insert(ResourceId::parse("minecraft:bee_nest").unwrap());
+        }
         blocks
+    }
+    /// Apply decorators only after successful trunk and foliage placement.
+    pub fn place_decorators(
+        &self,
+        world: &mut impl BeehiveWorld,
+        random: &mut DecorationRandom,
+        logs: &[[i32; 3]],
+        leaves: &[[i32; 3]],
+    ) -> Result<()> {
+        for decorator in &self.decorators {
+            decorator.place(world, random, logs, leaves)?;
+        }
+        Ok(())
     }
     /// Run `TreeFeature.doPlace`; caller must subsequently run vanilla's tree
     /// finalization before publishing or saving the resulting world.

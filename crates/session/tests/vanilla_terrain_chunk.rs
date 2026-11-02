@@ -482,6 +482,12 @@ fn terrain_matches_java_before_and_after_carvers() {
             )
             .unwrap();
         let carver_marks = chunk.carver_postprocessing.as_ref().unwrap().clone();
+        let encoded = native_persistence::postprocessing::encode(&carver_marks);
+        let decoded = native_persistence::postprocessing::decode(&encoded, min_y, height).unwrap();
+        assert_eq!(
+            decoded, carver_marks,
+            "postprocessing NBT {dimension} {seed} {pos:?}"
+        );
         for (section, values) in carver_marks.sections().iter().enumerate() {
             let expected: Vec<i16> = ordered_updates[i * 3 + 2]
                 .get(&section)

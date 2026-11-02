@@ -24,6 +24,17 @@ impl PostProcessing {
         })
     }
 
+    /// Restore the raw signed shorts without normalizing unused bits, ordering,
+    /// or duplicates. They may have originated in an existing Java chunk.
+    pub fn from_sections(min_y: i32, height: i32, sections: Vec<Vec<i16>>) -> Option<Self> {
+        let mut result = Self::new(min_y, height)?;
+        if result.sections.len() != sections.len() {
+            return None;
+        }
+        result.sections = sections;
+        Some(result)
+    }
+
     /// Match ProtoChunk.markPosForPostProcessing: out-of-height positions are
     /// ignored, and the low four bits of X and Z are stored.
     pub fn mark(&mut self, x: i32, y: i32, z: i32) -> bool {

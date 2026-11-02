@@ -3403,6 +3403,38 @@ fn multiface_support(state: &BlockState) -> Result<bool> {
     if tree_generated_log(state) || tree_generated_leaf(state)? {
         return Ok(true);
     }
+    if tree_mushroom_block(state)? || tree_grass_block(state) {
+        return Ok(true);
+    }
+    if tree_leaf_litter(state)? {
+        return Ok(false);
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:moss_block"
+            | "minecraft:dirt"
+            | "minecraft:coarse_dirt"
+            | "minecraft:rooted_dirt"
+            | "minecraft:clay"
+            | "minecraft:gravel"
+            | "minecraft:sand"
+            | "minecraft:red_sand"
+            | "minecraft:sandstone"
+            | "minecraft:red_sandstone"
+            | "minecraft:ice"
+            | "minecraft:packed_ice"
+            | "minecraft:blue_ice"
+            | "minecraft:snow_block"
+            | "minecraft:magma_block"
+            | "minecraft:netherrack"
+            | "minecraft:blackstone"
+    ) {
+        ensure!(
+            state.properties.is_empty(),
+            "invalid multiface support state"
+        );
+        return Ok(true);
+    }
     if matches!(
         state.name.as_str(),
         "minecraft:stone"
@@ -6502,6 +6534,170 @@ mod tests {
         assert_eq!(random.next_long(), original.next_long());
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_vine_support_matches_java_states_and_placement() {
+        use native_resources::multiface_growth::MultifaceWorld;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GenerationMultifaceSupportOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GenerationMultifaceSupportOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GenerationMultifaceSupportOracle"));
+        let (mut terrain, tags, _, _) = fixture();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let origin = [8, 8, 8];
+        let lichen = ResourceId::parse("minecraft:glow_lichen").unwrap();
+        let mut checked = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
+            let p: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(p.len(), 4, "{line}");
+            let mut support = state(p[0]);
+            if p[1] != "-" {
+                for property in p[1].split(',') {
+                    let (k, v) = property.split_once('=').unwrap();
+                    support.properties.insert(k.into(), v.into());
+                }
+            }
+            let face = match p[2] {
+                "down" => MultifaceFace::Down,
+                "up" => MultifaceFace::Up,
+                "north" => MultifaceFace::North,
+                "south" => MultifaceFace::South,
+                "west" => MultifaceFace::West,
+                "east" => MultifaceFace::East,
+                _ => panic!("{line}"),
+            };
+            let expected = p[3] == "true";
+            assert_eq!(multiface_support(&support).unwrap(), expected, "{line}");
+            let pos = face.offset(origin);
+            region.set_section_block(pos, &support).unwrap();
+            assert_eq!(
+                region.vines_can_attach(pos, face).unwrap(),
+                expected,
+                "{line}"
+            );
+            assert_eq!(
+                region
+                    .state_for_placement(&lichen, &state("air"), origin, face)
+                    .unwrap()
+                    .is_some(),
+                expected,
+                "{line}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 2_000, "missing Java state comparisons: {checked}");
+        let vine = VinesFeature::decode(&json!({"type":"minecraft:vines"}), &mut |_| {
+            let mut value = state("vine");
+            value.properties = ["up", "north", "south", "west", "east"]
+                .into_iter()
+                .map(|face| (face.into(), "false".into()))
+                .collect();
+            Ok(value)
+        })
+        .unwrap();
+        let faces = [
+            MultifaceFace::Up,
+            MultifaceFace::North,
+            MultifaceFace::South,
+            MultifaceFace::West,
+            MultifaceFace::East,
+        ];
+        let mut cases = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("V ")) {
+            let (head, rest) = line.split_once(" W ").unwrap();
+            let (writes, next) = rest.split_once(" R ").unwrap();
+            let values: Vec<_> = head.split_whitespace().collect();
+            let mask: usize = values[0].parse().unwrap();
+            let occupied = values[1] == "true";
+            let expected = values[2] == "true";
+            region
+                .set_section_block(origin, &state(if occupied { "stone" } else { "air" }))
+                .unwrap();
+            for (bit, face) in faces.iter().enumerate() {
+                region
+                    .set_section_block(
+                        face.offset(origin),
+                        &state(if mask & (1 << bit) != 0 {
+                            "moss_block"
+                        } else {
+                            "air"
+                        }),
+                    )
+                    .unwrap();
+            }
+            let mut random = DecorationRandom::new(42);
+            assert_eq!(vine.place(&mut region, origin).unwrap(), expected, "{line}");
+            assert_eq!(random.next_long(), next.parse::<i64>().unwrap(), "{line}");
+            if expected {
+                let actual = region.read(origin).unwrap();
+                let props = actual
+                    .properties
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                assert_eq!(props, writes, "{line}");
+            } else {
+                assert!(writes.is_empty());
+                assert_eq!(
+                    region.read(origin).unwrap().name,
+                    if occupied {
+                        "minecraft:stone"
+                    } else {
+                        "minecraft:air"
+                    }
+                );
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 64);
     }
 
     #[test]

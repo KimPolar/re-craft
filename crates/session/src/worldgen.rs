@@ -114,6 +114,7 @@ pub struct FreshGenerationLightTracker {
     has_skylight: bool,
     registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
     allocated: BTreeMap<native_world::loaded::ChunkPos, BTreeSet<i32>>,
+    sky_sources: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     checked_blocks: BTreeSet<String>,
     zero_layer: Arc<[u8; native_world::loaded::LIGHT_BYTES]>,
 }
@@ -155,6 +156,7 @@ impl FreshGenerationLightTracker {
             has_skylight,
             registered: BTreeMap::new(),
             allocated: BTreeMap::new(),
+            sky_sources: BTreeMap::new(),
             checked_blocks: BTreeSet::new(),
             zero_layer: Arc::new([0; native_world::loaded::LIGHT_BYTES]),
         })
@@ -262,6 +264,52 @@ impl FreshGenerationLightTracker {
         self.checked_blocks.extend(checked);
         self.registered.insert(pos, Arc::clone(chunk));
         Ok(())
+    }
+
+    /// Complete the fresh INITIALIZE_LIGHT inputs for one chunk. Source
+    /// heights are computed before registering so a failure leaves no partial
+    /// registration behind, including in dimensions without sky light.
+    pub fn initialize_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        self.validate_terrain(terrain)?;
+        ensure!(
+            !self.registered.contains_key(&pos),
+            "light chunk is already registered"
+        );
+        ensure!(
+            terrain.completed_decoration.contains(&pos),
+            "light initialization requires completed features"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        let sources =
+            native_world::sky_light::generated_chunk_sky_sources(&terrain.world, bounds, pos)
+                .context("generated sky sources are incomplete or unsupported")?;
+        self.register_chunk(terrain, pos, registry)?;
+        self.sky_sources.insert(pos, Arc::from(sources));
+        Ok(())
+    }
+
+    /// Return source heights only while the registered generation data remains
+    /// unchanged. The array uses X + 16 * Z within the chunk.
+    pub fn sky_sources(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<Arc<[i32; 256]>> {
+        self.validate_terrain(terrain)?;
+        self.sky_sources
+            .get(&pos)
+            .cloned()
+            .context("sky sources were not initialized")
     }
 
     /// Capture one immutable engine revision. Any later registered-chunk edit

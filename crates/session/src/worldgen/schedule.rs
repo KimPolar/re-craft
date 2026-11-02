@@ -337,6 +337,23 @@ impl GenerationSchedule {
         self.complete(center, Features)?;
         Ok(result)
     }
+
+    /// Calculate direct-sky sources and register sections before advancing the
+    /// fresh INITIALIZE_LIGHT stage. No light propagation is performed here.
+    pub fn run_light_initialization(
+        &mut self,
+        terrain: &super::CarvedTerrainWorld,
+        center: ChunkPos,
+        tracker: &mut super::FreshGenerationLightTracker,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        ensure!(
+            self.ready(center, InitializeLight),
+            "light initialization dependencies are incomplete"
+        );
+        tracker.initialize_chunk(terrain, center, registry)?;
+        self.complete(center, InitializeLight)
+    }
 }
 
 #[cfg(test)]

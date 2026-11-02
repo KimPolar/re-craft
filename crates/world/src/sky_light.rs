@@ -63,7 +63,7 @@ impl SkyColumn {
         if y.checked_add(1)? < previous {
             return Some(false);
         }
-        let mut reader = ColumnReader::new(world, self.bounds, self.x, self.z)?;
+        let mut reader = ColumnReader::new(world, self.bounds, self.x, self.z, true)?;
         let upper = reader.get(y.checked_add(1)?)?;
         let current = reader.get(y)?;
         if let Some(next) = reader.update_edge(y.checked_add(1)?, previous, upper, current)? {
@@ -84,6 +84,7 @@ impl SkyColumn {
 pub struct SkySourceScanner<'a> {
     world: &'a World,
     bounds: LightBounds,
+    require_full: bool,
     empty_sections: BTreeMap<(ChunkPos, i8), Option<bool>>,
 }
 
@@ -92,12 +93,20 @@ impl<'a> SkySourceScanner<'a> {
         Self {
             world,
             bounds,
+            require_full: true,
             empty_sections: BTreeMap::new(),
         }
     }
 
     pub fn load(&mut self, x: i32, z: i32) -> Option<SkyColumn> {
-        let lowest = scan(self.world, self.bounds, x, z, &mut self.empty_sections)?;
+        let lowest = scan(
+            self.world,
+            self.bounds,
+            x,
+            z,
+            self.require_full,
+            &mut self.empty_sections,
+        )?;
         Some(SkyColumn {
             x,
             z,
@@ -105,6 +114,44 @@ impl<'a> SkySourceScanner<'a> {
             lowest,
         })
     }
+}
+
+/// Calculate initial direct-sky sources for a generated chunk. The caller
+/// controls generation ordering; all build-height sections must be present.
+pub fn generated_chunk_sky_sources(
+    world: &World,
+    bounds: LightBounds,
+    pos: ChunkPos,
+) -> Option<Box<[i32; 256]>> {
+    let chunk = world.chunks.get(&pos)?;
+    if chunk.position != pos {
+        return None;
+    }
+    let range = bounds.build_range();
+    for sy in range.start.div_euclid(16)..range.end.div_euclid(16) {
+        chunk
+            .sections
+            .get(&i8::try_from(sy).ok()?)?
+            .blocks
+            .as_ref()?;
+    }
+    let base_x = pos.x.checked_mul(16)?;
+    let base_z = pos.z.checked_mul(16)?;
+    base_x.checked_add(15)?;
+    base_z.checked_add(15)?;
+    let mut scanner = SkySourceScanner {
+        world,
+        bounds,
+        require_full: false,
+        empty_sections: BTreeMap::new(),
+    };
+    let mut result = Box::new([0; 256]);
+    for z in 0..16 {
+        for x in 0..16 {
+            result[(x + z * 16) as usize] = scanner.load(base_x + x, base_z + z)?.lowest_source_y();
+        }
+    }
+    Some(result)
 }
 
 struct ColumnReader<'a> {
@@ -117,7 +164,13 @@ struct ColumnReader<'a> {
 }
 
 impl<'a> ColumnReader<'a> {
-    fn new(world: &'a World, bounds: LightBounds, x: i32, z: i32) -> Option<Self> {
+    fn new(
+        world: &'a World,
+        bounds: LightBounds,
+        x: i32,
+        z: i32,
+        require_full: bool,
+    ) -> Option<Self> {
         let range = bounds.build_range();
         let chunk = world.chunks.get(
             &BlockPosition {
@@ -127,7 +180,7 @@ impl<'a> ColumnReader<'a> {
             }
             .chunk(),
         )?;
-        if chunk.status.as_deref() != Some("minecraft:full") {
+        if require_full && chunk.status.as_deref() != Some("minecraft:full") {
             return None;
         }
         Some(Self {
@@ -196,9 +249,10 @@ fn scan(
     bounds: LightBounds,
     x: i32,
     z: i32,
+    require_full: bool,
     empty_sections: &mut BTreeMap<(ChunkPos, i8), Option<bool>>,
 ) -> Option<i32> {
-    let mut reader = ColumnReader::new(world, bounds, x, z)?;
+    let mut reader = ColumnReader::new(world, bounds, x, z, require_full)?;
     let pos = BlockPosition {
         x,
         y: reader.range.start,

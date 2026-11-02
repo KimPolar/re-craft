@@ -3965,8 +3965,17 @@ mod tests {
                     .request(center, GenerationStage::InitializeLight)
                     .unwrap();
                 assert!(steps.ready(center, GenerationStage::InitializeLight));
-                tracker.register_chunk(&terrain, center, &vanilla).unwrap();
-                assert_eq!(steps.completed(center), Some(GenerationStage::Features));
+                steps
+                    .run_light_initialization(&terrain, center, &mut tracker, &vanilla)
+                    .unwrap();
+                assert_eq!(
+                    steps.completed(center),
+                    Some(GenerationStage::InitializeLight)
+                );
+                assert_eq!(
+                    tracker.sky_sources(&terrain, center).unwrap()[8 + 8 * 16],
+                    8
+                );
                 assert_eq!(
                     tracker
                         .snapshot(&terrain, [center], &vanilla)
@@ -3984,12 +3993,56 @@ mod tests {
             let air = world.intern_state(state("air"));
             world.set_block_id(16, 0, 0, air).unwrap();
             assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
+            if x == 8 {
+                assert!(tracker.sky_sources(&terrain, center).is_err());
+            }
         }
+        let (mut invalid, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        invalid.completed_decoration.insert(center);
+        let world = Arc::make_mut(&mut invalid.world);
+        let unknown = world.intern_state(BlockState {
+            name: "example:unknown".into(),
+            properties: BTreeMap::new(),
+        });
+        world.set_block_id(0, 15, 0, unknown).unwrap();
+        let before = invalid.snapshot();
+        let mut failed_tracker = FreshGenerationLightTracker::new(&invalid, true).unwrap();
+        let mut failed_steps = super::super::schedule::GenerationSchedule::new();
+        use super::super::schedule::GenerationStage;
+        failed_steps
+            .request(center, GenerationStage::InitializeLight)
+            .unwrap();
+        while !failed_steps.ready(center, GenerationStage::InitializeLight) {
+            let (pos, stage) = failed_steps.next_ready().unwrap();
+            failed_steps.complete(pos, stage).unwrap();
+        }
+        assert!(
+            failed_steps
+                .run_light_initialization(&invalid, center, &mut failed_tracker, &vanilla)
+                .is_err()
+        );
+        assert_eq!(
+            failed_steps.completed(center),
+            Some(GenerationStage::Features)
+        );
+        assert!(Arc::ptr_eq(&before, &invalid.snapshot()));
+        assert!(failed_tracker.sky_sources(&invalid, center).is_err());
+        assert_eq!(
+            failed_tracker
+                .snapshot(&invalid, [center], &vanilla)
+                .unwrap()
+                .sky_light([0, 0, 0]),
+            Some(15)
+        );
         let (mut terrain, _, _, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };
         terrain.completed_decoration.insert(center);
         let mut tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
-        tracker.register_chunk(&terrain, center, &vanilla).unwrap();
+        tracker
+            .initialize_chunk(&terrain, center, &vanilla)
+            .unwrap();
+        assert_eq!(tracker.sky_sources(&terrain, center).unwrap()[0], 8);
         let cached = tracker.snapshot(&terrain, [center], &vanilla).unwrap();
         let direct = terrain
             .fresh_generation_light([center], [center], &vanilla, false)

@@ -65,6 +65,28 @@ public class SkyColumnOracle implements BlockGetter {
             world.minY = Integer.parseInt(args[3]);
             world.height = Integer.parseInt(args[4]);
         }
+        if (args.length > 2 && args[2].equals("initial_all")) {
+            var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            var unsafe = (sun.misc.Unsafe)field.get(null);
+            var chunk = (FakeChunk)unsafe.allocateInstance(FakeChunk.class);
+            chunk.minY = world.minY; chunk.height = world.height;
+            chunk.sections = new LevelChunkSection[world.height / 16];
+            for (int i=0;i<chunk.sections.length;i++) {
+                var container=new PalettedContainer<>(Blocks.AIR.defaultBlockState(),Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
+                chunk.sections[i]=new LevelChunkSection(container,null);
+            }
+            for (var item:input) {
+                var entry=item.getAsJsonObject();
+                int y=entry.get("y").getAsInt(), x=entry.get("x").getAsInt(), z=entry.get("z").getAsInt();
+                chunk.sections[(y-world.minY)>>4].setBlockState(x,Math.floorMod(y,16),z,state(entry.get("state").getAsString()));
+            }
+            var sources=new ChunkSkyLightSources(world); sources.fillFrom(chunk);
+            var result=new JsonArray();
+            for(int z=0;z<16;z++)for(int x=0;x<16;x++)result.add(sources.getLowestSourceY(x,z));
+            Files.writeString(Path.of(args[1]),result.toString());
+            return;
+        }
         if (args.length > 2 && args[2].equals("initial")) {
             var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
             field.setAccessible(true);

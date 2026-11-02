@@ -17,6 +17,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     final Map<ChunkPos, TestChunk> chunks = new HashMap<>();
     final Map<BlockPos, BlockState> edits = new HashMap<>();
     boolean mixed;
+    boolean magmaOnly;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -25,7 +26,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     public BlockState getBlockState(BlockPos p){
         if(edits.containsKey(p)) return edits.get(p);
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
-        if(p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
+        if(magmaOnly && p.getX()==16 && p.getY()==8 && p.getZ()==8) return Blocks.WATER.defaultBlockState();
+        if(!magmaOnly && p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=(mixed?2:1) && Math.abs(Math.floorDiv(p.getZ(),16))<=(mixed?2:1)) return Blocks.STONE.defaultBlockState();
         return Blocks.AIR.defaultBlockState();
     }
@@ -41,7 +43,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public int getHeight(){ return 16; }
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
-            if(x==1 && z==0) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !magmaOnly) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && edits.get(new BlockPos(16,7,8))==Blocks.MAGMA_BLOCK.defaultBlockState()) f.accept(new BlockPos(16,7,8),Blocks.MAGMA_BLOCK.defaultBlockState());
             if(mixed && x==0 && z==0) f.accept(new BlockPos(0,10,8),Blocks.TORCH.defaultBlockState());
         }
     }
@@ -72,7 +75,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var engine=new LevelLightEngine(w,true,true);
         boolean ore=args.length>1 && args[1].equals("ore");
         boolean normal=args.length>1 && args[1].equals("normal");
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal);
+        boolean queued=args.length>1 && args[1].equals("magma_queued");
+        boolean magma=queued || args.length>1 && args[1].equals("magma");
+        w.magmaOnly=magma;
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
         int radius=w.mixed?2:1;
@@ -84,7 +90,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             fake.section=new LevelChunkSection(container,null);
             if(x==1 && z==0) eastSection=fake;
             for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
-            if(x==1 && z==0) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !magma) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
             if((!partial && !w.mixed) || (x==1 && z==0) || (w.mixed && x==0 && z==0)){
                 chunk.sources.fillFrom(fake);
@@ -92,6 +99,15 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(magma){
+            var pos=new BlockPos(16,7,8);var old=eastSection.section.setBlockState(0,7,8,Blocks.MAGMA_BLOCK.defaultBlockState());
+            w.edits.put(pos,Blocks.MAGMA_BLOCK.defaultBlockState());
+            if(!LightEngine.hasDifferentLightProperties(old,Blocks.MAGMA_BLOCK.defaultBlockState()))throw new AssertionError("missing light check");
+            w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,7,8);
+            engine.checkBlock(pos);stages.add(capture(engine));if(!queued)drain(engine);stages.add(capture(engine));
+            engine.propagateLightSources(new ChunkPos(1,0));drain(engine);stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(normal){
             // Mirror ProtoChunk.setBlockState's section and light checks.
             boolean wasEmpty=eastSection.section.hasOnlyAir();

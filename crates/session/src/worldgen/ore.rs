@@ -73,7 +73,6 @@ pub struct DecorationRegion<'a> {
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
-    direct_ore_write: bool,
     failed: bool,
 }
 
@@ -571,12 +570,7 @@ impl ConfiguredDecoration {
         generator_height: i32,
     ) -> Result<bool> {
         match self {
-            Self::Ore(v) => {
-                world.direct_ore_write = matches!(v, ConfiguredOre::Vein(_));
-                let result = v.place(world, random, pos);
-                world.direct_ore_write = false;
-                result
-            }
+            Self::Ore(v) => v.place(world, random, pos),
             Self::Disk(v) => v.place(world, random, pos),
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
@@ -896,9 +890,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
     }
 
-    /// Use the tracked fresh light-engine revision. Direct ore writes may
-    /// preserve it when light behavior and air status do not change. Ordinary
-    /// writes must also skip Java's light check; other edits are discarded.
+    /// Use a fresh, unpropagated light-engine revision. Writes preserve it when
+    /// section occupancy and sky behavior stay unchanged. Emission changes
+    /// become visible only when the affected chunk's sources are activated.
     pub fn execute_with_tracked_light(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -1360,7 +1354,6 @@ impl CarvedTerrainWorld {
             monster_entities,
             pending_monster_spawners: 0,
             light_guard: None,
-            direct_ore_write: false,
             failed: false,
         })
     }
@@ -1404,10 +1397,7 @@ impl DecorationRegion<'_> {
         ensure!(!self.failed, "generation attempt previously failed");
         let mut next = random.clone();
         self.failed = true;
-        self.direct_ore_write = true;
-        let result = feature.place(self, &mut next, origin);
-        self.direct_ore_write = false;
-        let result = result?;
+        let result = feature.place(self, &mut next, origin)?;
         *random = next;
         self.failed = false;
         Ok(result)
@@ -4575,13 +4565,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     unchanged_registered = true;
                 } else {
                     ensure!(
-                        (self.direct_ore_write
-                            || native_world::block_light::skips_light_check_for_edit(&old, state)
-                                == Some(true))
-                            && super::generated_state_is_air(guard.registry, &old)
-                                .zip(super::generated_state_is_air(guard.registry, state))
-                                .is_some_and(|(a, b)| a == b)
-                            && native_world::block_light::same_light_behavior(&old, state)
+                        super::generated_state_is_air(guard.registry, &old)
+                            .zip(super::generated_state_is_air(guard.registry, state))
+                            .is_some_and(|(a, b)| a == b)
+                            && native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
                         old.name,
@@ -5984,9 +5971,115 @@ mod tests {
                 }
             }
         }
+        {
+            struct MagmaData;
+            impl ResourceProvider for MagmaData {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    if path == "data/minecraft/worldgen/biome/plains.json" {
+                        let magma = json!({"feature":{"type":"minecraft:underwater_magma", "floor_search_range":4,
+                        "placement_radius_around_floor":0,"placement_probability_per_valid_position":1.0},
+                        "placement":[{"type":"minecraft:offset","x":16,"y":8,"z":8}]});
+                        return Ok(Some(serde_json::to_vec(&json!({"features":[[magma]]}))?));
+                    }
+                    Data.read_data(path)
+                }
+            }
+            let plains = ResourceId::parse("minecraft:plains").unwrap();
+            let schedule =
+                FeatureSchedule::load(&mut MagmaData, &[plains], &BTreeSet::new()).unwrap();
+            let (_, _, biomes) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &biomes);
+            let mut blocks = batch_registry();
+            blocks.extend(["minecraft:water".into(), "minecraft:magma_block".into()]);
+            let prepared =
+                PreparedDecoration::load(&mut MagmaData, &plan, &blocks, &mut resolve_test)
+                    .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let mut water = state("water");
+            water.properties.insert("level".into(), "0".into());
+            let water = world.intern_state(water);
+            world.set_block_id(16, 8, 8, water).unwrap();
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker.initialize_chunk(&terrain, east, &registry).unwrap();
+            let sources = tracker.sky_sources(&terrain, east).unwrap();
+            assert_eq!(
+                prepared
+                    .execute_with_tracked_light(&mut terrain, false, &mut tracker, &registry)
+                    .unwrap(),
+                [true]
+            );
+            assert_eq!(
+                terrain.snapshot().block(16, 7, 8).unwrap().name,
+                "minecraft:magma_block"
+            );
+            assert_eq!(&*sources, &*tracker.sky_sources(&terrain, east).unwrap());
+            let expected_path = temp.path().join("magma.json");
+            let output = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("StagedGenerationLightEngineOracle")
+                .arg(&expected_path)
+                .arg("magma")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected: Vec<Vec<Vec<u8>>> =
+                serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
+            let queued_path = temp.path().join("magma_queued.json");
+            let queued = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("StagedGenerationLightEngineOracle")
+                .arg(&queued_path)
+                .arg("magma_queued")
+                .output()
+                .unwrap();
+            assert!(
+                queued.status.success(),
+                "{}",
+                String::from_utf8_lossy(&queued.stderr)
+            );
+            let queued: Vec<Vec<Vec<u8>>> =
+                serde_json::from_slice(&std::fs::read(queued_path).unwrap()).unwrap();
+            assert_eq!(queued, expected, "queued and drained pre-activation checks");
+            let dark = tracker.snapshot(&terrain, [center], &registry).unwrap();
+            let mut engine = StagedGenerationLightEngine::new(tracker);
+            let active = engine
+                .activate(&terrain, east, [center], &registry)
+                .unwrap();
+            for (stage, actual) in [&dark, &dark, &active].into_iter().enumerate() {
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let pos = [x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                actual.block_light(pos),
+                                Some(expected[stage][0][index]),
+                                "magma block {stage} {pos:?}"
+                            );
+                            assert_eq!(
+                                actual.sky_light(pos),
+                                Some(expected[stage][1][index]),
+                                "magma sky {stage} {pos:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let tracker = &engine.fresh;
 
-        for (direct, replacement) in [(false, "diamond_ore"), (true, "air"), (true, "torch")] {
+        for replacement in ["air", "torch"] {
             let before = terrain.snapshot();
             let mut region = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))
@@ -5997,7 +6090,6 @@ mod tests {
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
             });
-            region.direct_ore_write = true;
             let initial = region.read([16, 0, 0]).unwrap();
             let valid = if initial.name == "minecraft:stone" {
                 state("diamond_ore")
@@ -6005,7 +6097,6 @@ mod tests {
                 state("stone")
             };
             region.set_section_block([16, 0, 0], &valid).unwrap();
-            region.direct_ore_write = direct;
             let old = region.read([16, 0, 0]).unwrap();
             let replacement = if old.name == format!("minecraft:{replacement}") {
                 state("stone")

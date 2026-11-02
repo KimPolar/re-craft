@@ -18,10 +18,18 @@ pub fn sky_change_for_edit(
     old: Option<&crate::loaded::BlockState>,
     new: &crate::loaded::BlockState,
 ) -> bool {
-    match (old.and_then(light_properties), light_properties(new)) {
-        (Some(old), Some(new)) => old.opacity != new.opacity || old.faces != new.faces,
-        _ => true,
-    }
+    old.and_then(|old| same_sky_behavior(old, new)) != Some(true)
+}
+
+/// Compare only the properties affecting sky light, ignoring block emission.
+/// Unknown states cannot be assumed equivalent.
+pub fn same_sky_behavior(
+    a: &crate::loaded::BlockState,
+    b: &crate::loaded::BlockState,
+) -> Option<bool> {
+    let a = light_properties(a)?;
+    let b = light_properties(b)?;
+    Some(a.opacity == b.opacity && a.faces == b.faces)
 }
 
 /// Java represents an unobstructed source below the world with this sentinel.
@@ -536,6 +544,12 @@ mod tests {
         assert!(!sky_change_for_edit(Some(&air), &torch));
         assert!(sky_change_for_edit(None, &air));
         assert!(sky_change_for_edit(Some(&air), &unknown));
+        assert_eq!(
+            same_sky_behavior(&state("stone", &[]), &state("magma_block", &[])),
+            Some(true)
+        );
+        assert_eq!(same_sky_behavior(&air, &water), Some(false));
+        assert_eq!(same_sky_behavior(&air, &unknown), None);
     }
 
     #[test]

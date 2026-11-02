@@ -26,6 +26,7 @@ pub struct GeneratedBlockRegistry {
 enum StateSchema {
     Stateless,
     Snowy,
+    Lit,
     Liquid,
     Axis,
     DoublePlant,
@@ -69,6 +70,7 @@ impl StateSchema {
                 .collect();
             }
             Self::Snowy => ("snowy", "false"),
+            Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
             Self::DoublePlant => ("half", "lower"),
@@ -99,6 +101,9 @@ impl StateSchema {
                 Some(value.to_owned())
             }
             Self::Snowy if name == "snowy" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::Lit if name == "lit" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
             Self::Axis if name == "axis" && matches!(value, "x" | "y" | "z") => {
@@ -269,6 +274,7 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/GrassBlock"
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
+                "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
                 }

@@ -54,12 +54,13 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         @Override public int getHighestFilledSectionIndex(){ return 0; }
     }
     static void drain(LevelLightEngine e){ while(e.hasLightWork()) e.runLightUpdates(); }
-    static JsonArray capture(LevelLightEngine e){ return capture(e,0); }
-    static JsonArray capture(LevelLightEngine e,int chunkX){
+    static JsonArray capture(LevelLightEngine e){ return capture(e,0,0); }
+    static JsonArray capture(LevelLightEngine e,int chunkX){ return capture(e,chunkX,0); }
+    static JsonArray capture(LevelLightEngine e,int chunkX,int chunkZ){
         var result=new JsonArray();
         for(var layer:new LightLayer[]{LightLayer.BLOCK,LightLayer.SKY}){
             var values=new JsonArray(); var listener=e.getLayerListener(layer);
-            for(int y=-16;y<32;y++) for(int z=0;z<16;z++) for(int x=0;x<16;x++) values.add(listener.getLightValue(new BlockPos(chunkX*16+x,y,z)));
+            for(int y=-16;y<32;y++) for(int z=0;z<16;z++) for(int x=0;x<16;x++) values.add(listener.getLightValue(new BlockPos(chunkX*16+x,y,chunkZ*16+z)));
             result.add(values);
         }
         return result;
@@ -70,7 +71,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
         boolean partial=args.length>1 && args[1].equals("partial");
-        w.mixed=args.length>1 && args[1].equals("mixed");
+        boolean equivalent=args.length>1 && args[1].equals("equivalent");
+        w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
         int radius=w.mixed?2:1;
         for(int z=-radius;z<=radius;z++) for(int x=-radius;x<=radius;x++){
             var chunk=w.new TestChunk(x,z); w.chunks.put(new ChunkPos(x,z),chunk);
@@ -88,10 +90,11 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         drain(engine); var stages=new JsonArray();
         if(w.mixed){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
-            var first=new JsonArray(); first.add(capture(engine,0)); first.add(capture(engine,-1)); stages.add(first);
-            w.edits.put(new BlockPos(-1,10,8),Blocks.STONE.defaultBlockState());
+            var first=new JsonArray(); first.add(capture(engine,0)); first.add(capture(engine,-1)); first.add(capture(engine,0,-1)); stages.add(first);
+            if(equivalent) w.edits.put(new BlockPos(15,10,-1),Blocks.RED_MUSHROOM.defaultBlockState());
+            else w.edits.put(new BlockPos(-1,10,8),Blocks.STONE.defaultBlockState());
             engine.propagateLightSources(new ChunkPos(1,0)); drain(engine);
-            var second=new JsonArray(); second.add(capture(engine,0)); second.add(capture(engine,-1)); stages.add(second);
+            var second=new JsonArray(); second.add(capture(engine,0)); second.add(capture(engine,-1)); second.add(capture(engine,0,-1)); stages.add(second);
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(partial){

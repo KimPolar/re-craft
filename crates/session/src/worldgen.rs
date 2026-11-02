@@ -498,11 +498,59 @@ impl FreshGenerationLightTracker {
 /// the tracker is moved here. Requested columns need their 3x3 neighborhood;
 /// uninitialized chunks must retain their default sky-source heightmaps.
 /// Once propagation starts, reads use the blocks seen at activation. Further
-/// activation is rejected if its 3x3 input neighborhood changed in the meantime.
+/// activation requires its 3x3 input neighborhood to retain equivalent light
+/// behavior; registered chunks must remain completely unchanged.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,
     frozen_world: Option<Arc<native_world::loaded::World>>,
+}
+
+// These worlds share the same append-only state registry lineage. Compare only
+// changed sections and cache block-state pairs within each changed chunk.
+fn unchanged_chunk_light_behavior(
+    before_world: &native_world::loaded::World,
+    current_world: &native_world::loaded::World,
+    before: &native_world::loaded::Chunk,
+    current: &native_world::loaded::Chunk,
+    min_y: i32,
+    height: i32,
+) -> Result<bool> {
+    let end = min_y.checked_add(height).context("light height overflow")?;
+    let mut compared = BTreeMap::new();
+    for y in min_y.div_euclid(16)..end.div_euclid(16) {
+        let y = i8::try_from(y).context("light section out of range")?;
+        let (Some(a), Some(b)) = (before.sections.get(&y), current.sections.get(&y)) else {
+            return Ok(false);
+        };
+        if Arc::ptr_eq(a, b) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (&a.blocks, &b.blocks) else {
+            return Ok(false);
+        };
+        for (&a, &b) in a.iter().zip(b.iter()) {
+            if a == b {
+                continue;
+            }
+            let equal = if let Some(&equal) = compared.get(&(a, b)) {
+                equal
+            } else {
+                let old = before_world.state(a).context("old light state missing")?;
+                let new = current_world
+                    .state(b)
+                    .context("current light state missing")?;
+                let equal = native_world::block_light::same_light_behavior(old, new)
+                    .context("unsupported light state change")?;
+                compared.insert((a, b), equal);
+                equal
+            };
+            if !equal {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 impl StagedGenerationLightEngine {
@@ -550,7 +598,17 @@ impl StagedGenerationLightEngine {
                         frozen.chunks.get(&neighbor),
                         terrain.world.chunks.get(&neighbor),
                     ) {
-                        (Some(before), Some(now)) => Arc::ptr_eq(before, now),
+                        (Some(before), Some(now)) => {
+                            Arc::ptr_eq(before, now)
+                                || unchanged_chunk_light_behavior(
+                                    frozen,
+                                    &terrain.world,
+                                    before,
+                                    now,
+                                    self.fresh.min_y,
+                                    self.fresh.height,
+                                )?
+                        }
                         (None, None) => true,
                         _ => false,
                     };

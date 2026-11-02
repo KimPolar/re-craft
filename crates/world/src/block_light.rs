@@ -593,7 +593,7 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
     Some(masks)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LightProperties {
     pub(crate) opacity: u8,
     pub(crate) emission: u8,
@@ -614,6 +614,12 @@ pub(crate) fn light_properties(state: &BlockState) -> Option<LightProperties> {
         has_faces: faces.iter().flatten().any(|&row| row != 0),
         faces,
     })
+}
+
+/// Whether supported block states have identical emission, attenuation and
+/// occluding faces for both block and sky light. Unknown states return None.
+pub fn same_light_behavior(a: &BlockState, b: &BlockState) -> Option<bool> {
+    Some(light_properties(a)? == light_properties(b)?)
 }
 
 pub(crate) fn transparent_light_properties() -> LightProperties {

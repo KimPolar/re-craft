@@ -17350,6 +17350,7 @@ impl GameSession for LoadedSession {
                 &mut self.dropped_items,
                 &mut self.experience_orbs,
             );
+            crate::collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
             processed += 1;
         }
         if processed > 0 {
@@ -30650,6 +30651,53 @@ pub(crate) mod tests {
                     .all(|event| event.position.y == 2.0 && event.tick == 1)
             );
         }
+    }
+
+    #[test]
+    fn dropped_item_water_entry_reaches_session_sound_queue() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.set_game_mode(GameMode::Spectator);
+        let position = session.origin.as_dvec3() + DVec3::new(8.5, 5.0, 8.5);
+        let stack = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            native_persistence::nbt::Tag::Compound(vec![]),
+        )
+        .unwrap();
+        session.dropped_items.spawn_from_entity(position, stack);
+        session.update(TICK);
+        assert!(
+            session
+                .take_consume_sounds()
+                .iter()
+                .all(|event| event.info.event != "entity.generic.splash")
+        );
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(IVec3::new(8, 5, 8), water, false));
+        session.update(TICK);
+        let sounds: Vec<_> = session
+            .take_consume_sounds()
+            .into_iter()
+            .filter(|event| event.info.event == "entity.generic.splash")
+            .collect();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(
+            sounds[0].info.category,
+            crate::ConsumeSoundCategory::Ambient
+        );
+        assert_eq!(
+            sounds[0].position,
+            session.snapshot().dropped_items[0].previous_position
+        );
+        session.update(TICK);
+        assert!(
+            session
+                .take_consume_sounds()
+                .iter()
+                .all(|event| event.info.event != "entity.generic.splash")
+        );
     }
 
     #[test]

@@ -1566,6 +1566,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn item_water_entry_sound_uses_ambient_volume_and_installed_asset() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: Vec::new(),
+        })
+        .unwrap();
+        let ambient = Arc::new(AtomicU32::new(0));
+        let neutral = Arc::new(AtomicU32::new(0));
+        let position = glam::DVec3::new(2.5, 10.0, -3.5);
+        let event = native_session::ConsumeSound {
+            position,
+            info: native_session::ConsumeSoundInfo {
+                event: "entity.generic.splash".into(),
+                volume: 0.3,
+                pitch: 0.95,
+                category: native_session::ConsumeSoundCategory::Ambient,
+            },
+        };
+        let voice = catalog
+            .consume(event, &mut LegacyRandom::new(3), 48000, &neutral, &ambient)
+            .unwrap()
+            .unwrap();
+        assert!(voice.clip.samples.iter().any(|sample| *sample != 0));
+        assert_eq!(voice.spatial.unwrap().position, position);
+        assert!(Arc::ptr_eq(voice.category_gain.as_ref().unwrap(), &ambient));
+    }
+
+    #[test]
     fn mixer_resamples_and_finishes_multiple_voices() {
         let clip = Arc::new(Clip {
             samples: vec![0, 16384, 0],

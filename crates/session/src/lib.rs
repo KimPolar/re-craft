@@ -65,6 +65,7 @@ mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
 pub mod time_command;
+mod water_entry;
 pub mod weather;
 pub mod weather_command;
 pub mod world_spawn;
@@ -145,6 +146,15 @@ pub struct ConsumeSoundInfo {
 pub struct ConsumeSound {
     pub position: DVec3,
     pub info: ConsumeSoundInfo,
+}
+
+fn collect_water_entry_sounds(queue: &mut VecDeque<ConsumeSound>, items: &mut items::ItemEntities) {
+    for event in items.drain_water_entry_sounds() {
+        if queue.len() == 4096 {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
 }
 
 fn collect_consume_sounds(
@@ -2319,6 +2329,7 @@ impl GameSession for LocalSession {
                 &mut self.dropped_items,
                 &mut self.experience_orbs,
             );
+            collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
             processed += 1;
         }
         if processed > 0 {

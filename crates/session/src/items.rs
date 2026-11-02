@@ -346,6 +346,7 @@ struct ItemEntity {
     section_sequence: u64,
     random: LegacyRandom,
     last_bubble_movement: Option<(DVec3, DVec3, DVec3)>,
+    water_entry: crate::water_entry::WaterEntry,
     _damage_state: ItemDamageState,
 }
 
@@ -622,6 +623,7 @@ pub(crate) struct ItemEntities {
     created_pickups: Vec<CreatedPickupRecord>,
     pickup_sounds: VecDeque<DVec3>,
     extinguish_sounds: VecDeque<crate::ExtinguishSound>,
+    water_entry_sounds: VecDeque<crate::ConsumeSound>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -648,6 +650,7 @@ impl Default for ItemEntities {
             created_pickups: Vec::new(),
             pickup_sounds: VecDeque::new(),
             extinguish_sounds: VecDeque::new(),
+            water_entry_sounds: VecDeque::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1312,6 +1315,12 @@ impl ItemEntities {
         self.extinguish_sounds.drain(..)
     }
 
+    pub(crate) fn drain_water_entry_sounds(
+        &mut self,
+    ) -> impl Iterator<Item = crate::ConsumeSound> + '_ {
+        self.water_entry_sounds.drain(..)
+    }
+
     #[cfg(test)]
     fn take_pickup_sounds(&mut self) -> Vec<DVec3> {
         self.drain_pickup_sounds().collect()
@@ -1394,6 +1403,7 @@ impl ItemEntities {
                 // lifetime is saved, but Entity.tickCount is not.
                 entity.item.age = 0;
                 entity.item.previous_position = entity.item.position;
+                entity.water_entry = crate::water_entry::WaterEntry::default();
                 entity.item.bob_offset = bob_offset;
                 entity.id = new_id;
                 entity.random = random;
@@ -1455,6 +1465,7 @@ impl ItemEntities {
             section_sequence: self.next_section_sequence,
             random: entity_random,
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState {
                 health: i32::from(saved.health),
                 fire_ticks: i32::from(saved.fire_ticks),
@@ -1504,6 +1515,7 @@ impl ItemEntities {
             section_sequence: self.next_section_sequence,
             random: entity_random,
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1602,6 +1614,7 @@ impl ItemEntities {
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
                     last_bubble_movement: None,
+                    water_entry: crate::water_entry::WaterEntry::default(),
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -1658,6 +1671,7 @@ impl ItemEntities {
             section_sequence: self.next_section_sequence,
             random: entity_random,
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1732,6 +1746,7 @@ impl ItemEntities {
             section_sequence: self.next_section_sequence,
             random: entity_random,
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -2080,6 +2095,7 @@ impl ItemEntities {
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
                     last_bubble_movement: None,
+                    water_entry: crate::water_entry::WaterEntry::default(),
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -2214,6 +2230,7 @@ impl ItemEntities {
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
                     last_bubble_movement: None,
+                    water_entry: crate::water_entry::WaterEntry::default(),
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -2401,6 +2418,29 @@ impl ItemEntities {
             let relative = entity.item.position - origin.as_dvec3();
             let bounds = item_bounds(relative);
             let contacts = fluid(bounds);
+            let splash = entity.water_entry.update(
+                contacts.water.depth > 0.0,
+                entity.velocity,
+                0.25_f32,
+                &mut entity.random,
+            );
+            if let Some(info) = splash {
+                let silent = entity
+                    ._saved_source
+                    .as_ref()
+                    .and_then(|source| source.get("Silent"))
+                    .and_then(crate::player_data::numeric_byte)
+                    .is_some_and(|value| value != 0);
+                if !silent {
+                    if self.water_entry_sounds.len() == 4096 {
+                        self.water_entry_sounds.pop_front();
+                    }
+                    self.water_entry_sounds.push_back(crate::ConsumeSound {
+                        position: entity.item.position,
+                        info,
+                    });
+                }
+            }
             if let Some(fall) = &mut entity.saved_fall_distance {
                 if contacts.water.depth > 0.0 {
                     *fall = 0.0;
@@ -4339,6 +4379,7 @@ mod tests {
             section_sequence: 0,
             random: LegacyRandom::new(0),
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         };
         let mut stone = make("minecraft:stone");
@@ -4702,6 +4743,54 @@ mod tests {
         saved.stack =
             ItemStack::new("minecraft:stone".into(), count, 64, Tag::Compound(vec![])).unwrap();
         saved
+    }
+
+    #[test]
+    fn item_water_entry_sounds_follow_first_tick_reentry_and_silent_flag() {
+        for silent in [false, true] {
+            let mut saved = test_saved_item([1, 2, 3, 4], 1);
+            if silent {
+                let Tag::Compound(fields) = Arc::make_mut(&mut saved.source) else {
+                    unreachable!()
+                };
+                fields.push(("Silent".into(), Tag::Byte(1)));
+            }
+            let mut items = ItemEntities::default();
+            items.spawn_saved(saved);
+            let mut events = Vec::new();
+            for in_water in [false, true, true, false, true] {
+                items.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    DVec3::splat(100.0),
+                    PlayerPose::Standing,
+                    GameMode::Spectator,
+                    &mut Arc::new(PlayerInventory::default()),
+                    |_| &[],
+                    |_| 0.6,
+                    |_| 0.0,
+                    |_| false,
+                    |_| {
+                        let mut contacts = native_world::fluid::FluidContacts::default();
+                        if in_water {
+                            contacts.water.depth = 1.0;
+                        }
+                        contacts
+                    },
+                    false,
+                    |_, _, _| Some(Vec::new()),
+                    |_, _| true,
+                    |_| Some(false),
+                );
+                events.extend(items.drain_water_entry_sounds());
+            }
+            assert_eq!(events.len(), if silent { 0 } else { 2 });
+            assert!(
+                events
+                    .iter()
+                    .all(|sound| sound.info.event == "entity.generic.splash"
+                        && sound.info.category == crate::ConsumeSoundCategory::Ambient)
+            );
+        }
     }
 
     #[test]
@@ -5468,6 +5557,7 @@ mod tests {
                             section_sequence: 0,
                             random: LegacyRandom::new(0),
                             last_bubble_movement: None,
+                            water_entry: crate::water_entry::WaterEntry::default(),
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -5558,6 +5648,7 @@ mod tests {
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
             cells.entry(item_cell(position)).or_default().push(index);
@@ -5633,6 +5724,7 @@ mod tests {
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5721,6 +5813,7 @@ mod tests {
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5781,6 +5874,7 @@ mod tests {
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5844,6 +5938,7 @@ mod tests {
                 section_sequence: index as u64,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5895,6 +5990,7 @@ mod tests {
             section_sequence: 4,
             random: LegacyRandom::new(0),
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         items.next_section_sequence = 5;
@@ -5937,6 +6033,7 @@ mod tests {
             section_sequence: 0,
             random: LegacyRandom::new(0),
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -6000,6 +6097,7 @@ mod tests {
             section_sequence: 0,
             random: LegacyRandom::new(0),
             last_bubble_movement: None,
+            water_entry: crate::water_entry::WaterEntry::default(),
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -7443,6 +7541,7 @@ public class ItemMotionOracle {
                         section_sequence: 0,
                         random: LegacyRandom::new(0),
                         last_bubble_movement: None,
+                        water_entry: crate::water_entry::WaterEntry::default(),
                         _damage_state: ItemDamageState::default(),
                     });
                 }
@@ -7512,6 +7611,7 @@ public class ItemMotionOracle {
                             section_sequence: 0,
                             random: LegacyRandom::new(0),
                             last_bubble_movement: None,
+                            water_entry: crate::water_entry::WaterEntry::default(),
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -7663,6 +7763,7 @@ public class ItemMotionOracle {
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
                 last_bubble_movement: None,
+                water_entry: crate::water_entry::WaterEntry::default(),
                 _damage_state: ItemDamageState::default(),
             });
             let mut inventory = Arc::new(PlayerInventory::default());

@@ -1,12 +1,15 @@
 //! Initial sky-light values for generated blocks and a complete one-chunk halo.
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use crate::{
     block_light::{
         DIRECTIONS, LightBounds, LightProperties, faces_occlude, light_properties,
         transparent_light_properties,
     },
-    generation_light::VisibleLayers,
+    generation_light::{VisibleLayers, VisibleLightSnapshot},
     loaded::{ChunkPos, LIGHT_BYTES, World},
 };
 
@@ -16,6 +19,29 @@ pub fn initialize_generated_sky_light(
     world: &World,
     bounds: LightBounds,
     center: ChunkPos,
+) -> Option<VisibleLayers> {
+    calculate_generated_sky_light(world, bounds, center, None, None)
+}
+
+/// Preview a fresh sky engine after activating the specified chunks. The source
+/// heights for every 3x3 input chunk must already reflect these immutable blocks.
+/// Every light section in that area must be allocated; sparse storage is rejected.
+pub fn generated_sky_light_from_active_chunks(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    active: &BTreeSet<ChunkPos>,
+    fresh_storage: &VisibleLightSnapshot,
+) -> Option<VisibleLayers> {
+    calculate_generated_sky_light(world, bounds, center, Some(active), Some(fresh_storage))
+}
+
+fn calculate_generated_sky_light(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    active: Option<&BTreeSet<ChunkPos>>,
+    fresh_storage: Option<&VisibleLightSnapshot>,
 ) -> Option<VisibleLayers> {
     const SIDE: usize = 48;
     const PLANE: usize = SIDE * SIDE;
@@ -36,6 +62,13 @@ pub fn initialize_generated_sky_light(
             let chunk = world.chunks.get(&pos)?;
             if chunk.position != pos {
                 return None;
+            }
+            if let Some(storage) = fresh_storage {
+                for section_y in light.start.div_euclid(16)..light.end.div_euclid(16) {
+                    if !storage.sky_section_allocated(pos, section_y)? {
+                        return None;
+                    }
+                }
             }
             for section_index in 0..sections {
                 let section_y = build.start.div_euclid(16) + section_index as i32;
@@ -70,8 +103,13 @@ pub fn initialize_generated_sky_light(
         }
     }
     let mut levels = vec![0u8; behavior.len()];
+    let mut source_y = vec![0usize; PLANE];
     for z in 0..SIDE {
         for x in 0..SIDE {
+            let pos = ChunkPos {
+                x: center.x.checked_add((x / 16) as i32 - 1)?,
+                z: center.z.checked_add((z / 16) as i32 - 1)?,
+            };
             let mut above = 0usize;
             let mut lowest = 0usize;
             'scan: for sy in (0..sections).rev() {
@@ -93,8 +131,11 @@ pub fn initialize_generated_sky_light(
                     above = below;
                 }
             }
-            for y in lowest..height {
-                levels[x + z * SIDE + y * PLANE] = 15;
+            source_y[x + z * SIDE] = lowest;
+            if active.is_none_or(|chunks| chunks.contains(&pos)) {
+                for y in lowest..height {
+                    levels[x + z * SIDE + y * PLANE] = 15;
+                }
             }
         }
     }
@@ -145,6 +186,14 @@ pub fn initialize_generated_sky_light(
                     continue;
                 }
                 let next = nx as usize + nz as usize * SIDE + ny as usize * PLANE;
+                // Direct sky seeds only below the neighbor's source boundary,
+                // including when that neighboring chunk is not enabled yet.
+                if active.is_some()
+                    && level == 15
+                    && ny as usize >= source_y[nx as usize + nz as usize * SIDE]
+                {
+                    continue;
+                }
                 let to = &properties[behavior[next] as usize];
                 let candidate = level.saturating_sub(to.opacity.max(1));
                 if candidate <= levels[next] {

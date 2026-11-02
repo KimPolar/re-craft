@@ -4,7 +4,9 @@ use native_world::{
         generated_block_light_from_active_chunks, initialize_generated_block_light,
     },
     generation_light::{VisibleLayers, VisibleLightSnapshot},
-    generation_sky_light::initialize_generated_sky_light,
+    generation_sky_light::{
+        generated_sky_light_from_active_chunks, initialize_generated_sky_light,
+    },
     loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, Section, World},
 };
 use std::{
@@ -135,7 +137,7 @@ fn generated_sky_light_matches_java_initial_engine() {
         .arg("GeneratedSkyLightOracle")
         .arg(&input)
         .arg(&output));
-    let expected: Vec<u8> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let expected: Vec<u8> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
     let actual = initialize_generated_sky_light(
         &world,
         LightBounds::new(0, 32).unwrap(),
@@ -153,6 +155,121 @@ fn generated_sky_light_matches_java_initial_engine() {
                     "{x},{y},{z}"
                 );
             }
+        }
+    }
+    run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("GeneratedSkyLightOracle")
+        .arg(&input)
+        .arg(&output)
+        .arg("staged")
+        .arg("1,0,-1"));
+    let expected: Vec<Vec<u8>> = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let mut statuses = Vec::new();
+    let mut covered = Vec::new();
+    for z in -1..=1 {
+        for x in -1..=1 {
+            let p = ChunkPos { x, z };
+            covered.push(p);
+            for y in 0..2 {
+                statuses.push((p, y));
+            }
+        }
+    }
+    let storage =
+        VisibleLightSnapshot::fresh_after_section_updates(true, true, statuses, covered).unwrap();
+    let center = ChunkPos { x: 0, z: 0 };
+    let bounds = LightBounds::new(0, 32).unwrap();
+    let mut active = BTreeSet::new();
+    assert_eq!(expected.len(), 4);
+    for stage in 0..4 {
+        if stage > 0 {
+            active.insert(ChunkPos {
+                x: [1, 0, -1][stage - 1],
+                z: 0,
+            });
+        }
+        let actual =
+            generated_sky_light_from_active_chunks(&world, bounds, center, &active, &storage)
+                .unwrap();
+        let mut differences = Vec::new();
+        for y in -16..48 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let i = ((y + 16) * 256 + z * 16 + x) as usize;
+                    let found = value(&actual, x as usize, y, z as usize);
+                    if found != expected[stage][i] && differences.len() < 30 {
+                        differences.push((x, y, z, found, expected[stage][i]));
+                    }
+                }
+            }
+        }
+        assert!(
+            differences.is_empty(),
+            "stage {stage} differences {differences:?}"
+        );
+    }
+    let mut terrain = fixture();
+    let mut varied = Vec::new();
+    for z in -16i32..32 {
+        for x in -16i32..32 {
+            let y = 8 + (x * 3 + z * 5).rem_euclid(9);
+            let kind = (x * 11 - z * 7).rem_euclid(7);
+            let blocks: &[(i32, &str)] = match kind {
+                0 => &[],
+                1 => &[(0, "water")],
+                2 => &[(0, "slab_bottom")],
+                3 => &[(0, "slab_top")],
+                4 => &[(0, "stone"), (1, "water")],
+                _ => &[(0, "stone")],
+            };
+            for &(offset, name) in blocks {
+                varied.push(serde_json::json!({"x":x,"y":y+offset,"z":z,"state":name}));
+                let id = terrain.intern_state(state(name));
+                terrain.set_block_id(x, y + offset, z, id).unwrap();
+            }
+        }
+    }
+    std::fs::write(&input, serde_json::to_vec(&varied).unwrap()).unwrap();
+    for (order, java_order) in [([0, 1, -1], "0,1,-1"), ([1, 0, -1], "1,0,-1")] {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GeneratedSkyLightOracle")
+            .arg(&input)
+            .arg(&output)
+            .arg("staged")
+            .arg(java_order));
+        let expected: Vec<Vec<u8>> =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        let mut active = BTreeSet::new();
+        for stage in 0..4 {
+            if stage > 0 {
+                active.insert(ChunkPos {
+                    x: order[stage - 1],
+                    z: 0,
+                });
+            }
+            let actual =
+                generated_sky_light_from_active_chunks(&terrain, bounds, center, &active, &storage)
+                    .unwrap();
+            let mut differences = Vec::new();
+            for y in -16..48 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                        let found = value(&actual, x as usize, y, z as usize);
+                        if found != expected[stage][index] && differences.len() < 30 {
+                            differences.push((x, y, z, found, expected[stage][index]));
+                        }
+                    }
+                }
+            }
+            assert!(
+                differences.is_empty(),
+                "varied order {java_order} stage {stage} differences {differences:?}"
+            );
         }
     }
 }
@@ -311,6 +428,13 @@ fn generated_sky_handles_open_columns_and_incomplete_inputs() {
     let mut world = fixture();
     let center = ChunkPos { x: 0, z: 0 };
     let bounds = LightBounds::new(0, 32).unwrap();
+    let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+    let sparse =
+        VisibleLightSnapshot::fresh_after_section_updates(true, true, [], covered).unwrap();
+    assert!(
+        generated_sky_light_from_active_chunks(&world, bounds, center, &BTreeSet::new(), &sparse)
+            .is_none()
+    );
     let sky = initialize_generated_sky_light(&world, bounds, center).unwrap();
     assert!(sky.values().all(|layer| layer.iter().all(|&b| b == 0xff)));
     let stone = world.intern_state(state("stone"));

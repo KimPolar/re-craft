@@ -298,6 +298,35 @@ impl FreshGenerationLightTracker {
         Ok(())
     }
 
+    /// Complete source heights for a chunk whose section status was already
+    /// registered in this fresh-engine revision and has not changed.
+    pub fn initialize_registered_sources(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        self.validate_terrain(terrain)?;
+        ensure!(
+            self.registered.contains_key(&pos),
+            "light chunk is not registered"
+        );
+        ensure!(
+            !self.sky_sources.contains_key(&pos),
+            "sky sources already initialized"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        let sources =
+            native_world::sky_light::generated_chunk_sky_sources(&terrain.world, bounds, pos)
+                .context("generated sky sources are incomplete or unsupported")?;
+        self.sky_sources.insert(pos, Arc::from(sources));
+        Ok(())
+    }
+
     /// Return source heights only while the registered generation data remains
     /// unchanged. The array uses X + 16 * Z within the chunk.
     pub fn sky_sources(
@@ -350,6 +379,51 @@ impl FreshGenerationLightTracker {
             &storage,
         )
         .context("active generated block-light inputs are incomplete or unsupported")
+    }
+
+    /// Preview sky light for activated chunks in a fresh engine. Sparse sky
+    /// section storage is not yet supported by this calculation.
+    pub fn calculate_sky_light_for_active_chunks(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        center: native_world::loaded::ChunkPos,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
+        ensure!(self.has_skylight, "dimension has no sky-light engine");
+        ensure!(
+            active.iter().all(|pos| self.sky_sources.contains_key(pos)),
+            "active sky-light chunk was not initialized"
+        );
+        let mut covered = BTreeSet::new();
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let pos = native_world::loaded::ChunkPos {
+                    x: center.x.checked_add(dx).context("light X overflow")?,
+                    z: center.z.checked_add(dz).context("light Z overflow")?,
+                };
+                ensure!(
+                    self.sky_sources.contains_key(&pos),
+                    "surrounding sky sources are not initialized"
+                );
+                covered.insert(pos);
+            }
+        }
+        let storage = self.snapshot(terrain, covered, registry)?;
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        native_world::generation_sky_light::generated_sky_light_from_active_chunks(
+            &terrain.world,
+            bounds,
+            center,
+            active,
+            &storage,
+        )
+        .context("active generated sky-light inputs are incomplete or unsupported")
     }
 
     /// Capture one immutable engine revision. Any later registered-chunk edit

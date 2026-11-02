@@ -4008,6 +4008,42 @@ mod tests {
                     tracker.sky_sources(&terrain, center).unwrap()[8 + 8 * 16],
                     8
                 );
+                assert!(
+                    tracker
+                        .calculate_sky_light_for_active_chunks(
+                            &terrain,
+                            center,
+                            &BTreeSet::from([center]),
+                            &vanilla
+                        )
+                        .is_err()
+                );
+                for z in -1..=1 {
+                    for x in -1..=1 {
+                        let pos = ChunkPos { x, z };
+                        if pos == center {
+                            continue;
+                        }
+                        terrain.completed_decoration.insert(pos);
+                        if pos == registered || pos == second {
+                            tracker
+                                .initialize_registered_sources(&terrain, pos)
+                                .unwrap();
+                        } else {
+                            tracker.initialize_chunk(&terrain, pos, &vanilla).unwrap();
+                        }
+                    }
+                }
+                let sky = tracker
+                    .calculate_sky_light_for_active_chunks(
+                        &terrain,
+                        center,
+                        &BTreeSet::from([center]),
+                        &vanilla,
+                    )
+                    .unwrap();
+                let index = 8 + 8 * 16 + 10 * 256;
+                assert_eq!(sky[&0][index / 2] & 15, 15);
                 assert_eq!(
                     tracker
                         .snapshot(&terrain, [center], &vanilla)
@@ -4080,6 +4116,11 @@ mod tests {
             .initialize_chunk(&terrain, center, &vanilla)
             .unwrap();
         assert_eq!(tracker.sky_sources(&terrain, center).unwrap()[0], 8);
+        assert!(
+            tracker
+                .calculate_sky_light_for_active_chunks(&terrain, center, &BTreeSet::new(), &vanilla)
+                .is_err()
+        );
         let cached = tracker.snapshot(&terrain, [center], &vanilla).unwrap();
         let direct = terrain
             .fresh_generation_light([center], [center], &vanilla, false)

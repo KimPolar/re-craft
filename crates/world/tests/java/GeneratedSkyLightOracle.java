@@ -57,6 +57,11 @@ public class GeneratedSkyLightOracle implements LightChunkGetter, BlockGetter {
             default -> throw new IllegalArgumentException(name);
         };
     }
+    static JsonArray capture(LevelLightEngine engine) {
+        var result=new JsonArray(); var listener=engine.getLayerListener(LightLayer.SKY);
+        for (int y=-16;y<48;y++) for (int z=0;z<16;z++) for (int x=0;x<16;x++) result.add(listener.getLightValue(new BlockPos(x,y,z)));
+        return result;
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var world = new GeneratedSkyLightOracle();
@@ -84,10 +89,20 @@ public class GeneratedSkyLightOracle implements LightChunkGetter, BlockGetter {
             chunk.sources.fillFrom(fake);
         }
         while (engine.hasLightWork()) engine.runLightUpdates();
+        if (args.length>2 && args[2].equals("staged")) {
+            var results=new JsonArray(); results.add(capture(engine));
+            var order=(args.length>3 ? args[3] : "0,1,-1").split(",");
+            for (var value:order) {
+                int x=Integer.parseInt(value);
+                engine.propagateLightSources(new ChunkPos(x,0));
+                while (engine.hasLightWork()) engine.runLightUpdates();
+                results.add(capture(engine));
+            }
+            Files.writeString(Path.of(args[1]),results.toString());
+            return;
+        }
         for (int z=-1;z<=2;z++) for (int x=-1;x<=2;x++) engine.propagateLightSources(new ChunkPos(x,z));
         while (engine.hasLightWork()) engine.runLightUpdates();
-        var result=new JsonArray(); var listener=engine.getLayerListener(LightLayer.SKY);
-        for (int y=-16;y<48;y++) for (int z=0;z<16;z++) for (int x=0;x<16;x++) result.add(listener.getLightValue(new BlockPos(x,y,z)));
-        Files.writeString(Path.of(args[1]),result.toString());
+        Files.writeString(Path.of(args[1]),capture(engine).toString());
     }
 }

@@ -106,6 +106,14 @@ impl VisibleLightSnapshot {
         Some(self.columns.get(&pos)?.block.contains_key(&section_y))
     }
 
+    /// Whether the visible engine revision has storage for a sky-light section.
+    pub fn sky_section_allocated(&self, pos: ChunkPos, section_y: i32) -> Option<bool> {
+        if !self.has_sky {
+            return Some(false);
+        }
+        Some(self.columns.get(&pos)?.sky.contains_key(&section_y))
+    }
+
     /// Capture a newly created engine after the listed nonempty section status
     /// updates have been drained. No lighting may have been enabled, queued,
     /// propagated, removed or restored before this snapshot. The caller must

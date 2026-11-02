@@ -33,7 +33,7 @@ public class BlockColumnOracle {
   public static void main(String[]args)throws Exception {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
-    bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_SUGAR_CANE));
+    bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_SUGAR_CANE,BlockTags.SUPPORTS_VEGETATION));
     bind.invoke(Blocks.SAND.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_CACTUS));
     bind.invoke(Blocks.FROSTED_ICE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_SUGAR_CANE_ADJACENTLY));
     bind.invoke(Fluids.WATER.builtInRegistryHolder(),List.of(FluidTags.SUPPORTS_SUGAR_CANE_ADJACENTLY));
@@ -41,6 +41,13 @@ public class BlockColumnOracle {
     bind.invoke(Fluids.LAVA.builtInRegistryHolder(),List.of(FluidTags.LAVA));
     bind.invoke(Fluids.FLOWING_LAVA.builtInRegistryHolder(),List.of(FluidTags.LAVA));
     var sugar=Blocks.SUGAR_CANE.defaultBlockState();
+    for(String name:List.of("oak_sapling","spruce_sapling","birch_sapling","jungle_sapling","acacia_sapling","dark_oak_sapling","cherry_sapling","pale_oak_sapling")) {
+      var b=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));if(!(b instanceof SaplingBlock))throw new AssertionError("not sapling "+name);
+      for(int base=0;base<4;base++) {var state=switch(base){case 0->Blocks.STONE.defaultBlockState();case 1->Blocks.DIRT.defaultBlockState();case 2->Blocks.AIR.defaultBlockState();default->Blocks.WATER.defaultBlockState();};
+        var level=(LevelReader)Proxy.newProxyInstance(LevelReader.class.getClassLoader(),new Class[]{LevelReader.class},(o,m,a)->{if(m.getName().equals("getBlockState"))return state;throw new UnsupportedOperationException(m.getName());});
+        out.printf("P minecraft:%s %d %s%n",name,base,b.defaultBlockState().canSurvive(level,BlockPos.ZERO));
+      }
+    }
     out.println("E "+sugar.hasBlockEntity()+" "+net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(sugar)+" "+sugar.getPostProcessPos(null,BlockPos.ZERO));
     for(var b:List.of(Blocks.CACTUS,Blocks.CACTUS_FLOWER,Blocks.SUGAR_CANE,Blocks.SAND,Blocks.STONE,Blocks.AIR,Blocks.WATER,Blocks.LAVA)) {
       var s=b.defaultBlockState();out.printf("J %s %s %s %s %s %s%n",BuiltInRegistries.BLOCK.getKey(b),s.isSolid(),s.liquid(),s.hasBlockEntity(),net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(s),s.getPostProcessPos(null,BlockPos.ZERO));

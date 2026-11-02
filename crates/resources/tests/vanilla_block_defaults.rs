@@ -203,6 +203,36 @@ fn generated_block_defaults_match_java() {
             cases.push(serde_json::json!({"id":id,"properties":{"age":age.to_string()}}));
         }
     }
+    for id in [
+        "minecraft:oak_sapling",
+        "minecraft:spruce_sapling",
+        "minecraft:birch_sapling",
+        "minecraft:jungle_sapling",
+        "minecraft:acacia_sapling",
+        "minecraft:dark_oak_sapling",
+        "minecraft:cherry_sapling",
+        "minecraft:pale_oak_sapling",
+    ] {
+        cases.push(serde_json::json!(id));
+        for stage in -1..=2 {
+            cases.push(serde_json::json!({"id":id,"properties":{"stage":stage.to_string()}}));
+        }
+    }
+    for id in [
+        "minecraft:oak_leaves",
+        "minecraft:spruce_leaves",
+        "minecraft:birch_leaves",
+        "minecraft:jungle_leaves",
+        "minecraft:acacia_leaves",
+        "minecraft:dark_oak_leaves",
+        "minecraft:cherry_leaves",
+        "minecraft:pale_oak_leaves",
+    ] {
+        cases.push(serde_json::json!(id));
+        for distance in 0..=8 {
+            cases.push(serde_json::json!({"id":id,"properties":{"distance":distance.to_string(),"persistent":"true","waterlogged":"true"}}));
+        }
+    }
     for snowy in ["true", "false", "yes", "TRUE"] {
         cases.push(serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":snowy,"extra":"ignored"}}));
     }

@@ -640,7 +640,7 @@ impl Class {
     }
 
     /// Accept straight-line constructors returning their first allocated
-    /// object. Reject branches, helper calls, mutations and stack shuffling.
+    /// object. Reject branches, mutations, stack shuffling and unrecognized helpers.
     fn block_lambda_constructor(&self, name: &str) -> Result<Option<String>> {
         let Some(code) = self.block_factory_lambdas.get(name) else {
             return Ok(None);
@@ -691,7 +691,16 @@ impl Class {
                         && descriptor == "(I)Lnet/minecraft/util/valueproviders/ConstantInt;";
                     let uniform = owner == "net/minecraft/util/valueproviders/UniformInt"
                         && descriptor == "(II)Lnet/minecraft/util/valueproviders/UniformInt;";
-                    if method != "of" || !(constant || uniform) {
+                    let ambient_leaves = matches!(
+                        class.as_str(),
+                        "net/minecraft/world/level/block/LeavesBlock"
+                            | "net/minecraft/world/level/block/UntintedParticleLeavesBlock"
+                    ) && owner
+                        == "net/minecraft/world/level/block/sounds/AmbientLeavesBlockSoundPlayer"
+                        && method == "noAmbientSound"
+                        && descriptor
+                            == "()Lnet/minecraft/world/level/block/sounds/AmbientLeavesBlockSoundPlayer;";
+                    if !(method == "of" && (constant || uniform)) && !ambient_leaves {
                         return Ok(None);
                     }
                 }

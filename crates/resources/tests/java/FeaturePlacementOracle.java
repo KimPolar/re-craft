@@ -15,7 +15,7 @@ public class FeaturePlacementOracle {
   static class Context extends PlacementContext {
     Context(){super(null,null,Optional.empty());}
     @Override public int getMinY(){return -64;}
-    @Override public int getHeight(Heightmap.Types type,int x,int z){return ((x^z)&7)==0?-64:70+(x&7);}
+    @Override public int getHeight(Heightmap.Types type,int x,int z){int base=((x^z)&7)==0?-64:70+(x&7);return type==Heightmap.Types.WORLD_SURFACE?base+(x&3):base;}
   }
   static void emit(List<PlacementModifier> mods,int depth,Context context,RandomSource random,BlockPos p) {
     if(depth==mods.size()){out.printf("P %d %d %d %d%n",p.getX(),p.getY(),p.getZ(),random.nextInt(101));return;}

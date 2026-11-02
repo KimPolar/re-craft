@@ -30,18 +30,28 @@ enum StateSchema {
     DoublePlant,
     BerryBush,
     Age15,
+    Sapling,
+    Leaves,
 }
 
 impl StateSchema {
     fn default_properties(self) -> BTreeMap<String, String> {
         let value = match self {
             Self::Stateless => return BTreeMap::new(),
+            Self::Leaves => {
+                return BTreeMap::from([
+                    ("distance".into(), "7".into()),
+                    ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::Snowy => ("snowy", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
             Self::DoublePlant => ("half", "lower"),
             Self::BerryBush => ("age", "0"),
             Self::Age15 => ("age", "0"),
+            Self::Sapling => ("stage", "0"),
         };
         BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
     }
@@ -66,6 +76,18 @@ impl StateSchema {
             Self::Age15 if name == "age" => java_decimal(value)
                 .filter(|n| (0..=15).contains(n))
                 .map(|n| n.to_string()),
+            Self::Sapling if name == "stage" => java_decimal(value)
+                .filter(|n| (0..=1).contains(n))
+                .map(|n| n.to_string()),
+            Self::Leaves if name == "distance" => java_decimal(value)
+                .filter(|n| (1..=7).contains(n))
+                .map(|n| n.to_string()),
+            Self::Leaves
+                if matches!(name, "persistent" | "waterlogged")
+                    && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
             _ => None,
         }
     }
@@ -217,6 +239,12 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/SugarCaneBlock"
                 | "net/minecraft/world/level/block/CactusBlock" => Some(StateSchema::Age15),
+                "net/minecraft/world/level/block/SaplingBlock" => Some(StateSchema::Sapling),
+                "net/minecraft/world/level/block/LeavesBlock"
+                | "net/minecraft/world/level/block/TintedParticleLeavesBlock"
+                | "net/minecraft/world/level/block/UntintedParticleLeavesBlock" => {
+                    Some(StateSchema::Leaves)
+                }
                 _ if stateless_class(
                     &class,
                     &mut read_class,

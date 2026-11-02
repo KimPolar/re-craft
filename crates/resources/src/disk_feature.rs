@@ -36,6 +36,10 @@ pub trait DiskWorld: OreWorld {
             id.namespace == "minecraft",
             "unsupported would_survive block"
         );
+        if is_tree_sapling(&id) {
+            let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            return self.in_tag(&below, &ResourceId::parse("minecraft:supports_vegetation")?);
+        }
         if id.path == "cactus" {
             let lava = ResourceId::parse("minecraft:lava")?;
             for [dx, dz] in [[0, -1], [1, 0], [0, 1], [-1, 0]] {
@@ -76,6 +80,21 @@ pub trait DiskWorld: OreWorld {
         }
         Ok(false)
     }
+}
+
+fn is_tree_sapling(id: &ResourceId) -> bool {
+    id.namespace == "minecraft"
+        && matches!(
+            id.path.as_str(),
+            "oak_sapling"
+                | "spruce_sapling"
+                | "birch_sapling"
+                | "jungle_sapling"
+                | "acacia_sapling"
+                | "dark_oak_sapling"
+                | "cherry_sapling"
+                | "pale_oak_sapling"
+        )
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +269,11 @@ impl Predicate {
             }
             Self::WouldSurvive(_, id, _) if id.namespace == "minecraft" && id.path == "cactus" => {
                 tags.insert(ResourceId::parse("minecraft:supports_cactus").expect("constant tag"));
+            }
+            Self::WouldSurvive(_, id, _) if is_tree_sapling(id) => {
+                tags.insert(
+                    ResourceId::parse("minecraft:supports_vegetation").expect("constant tag"),
+                );
             }
             Self::Not(value) => value.tags(tags),
             Self::Any(values) | Self::All(values) => {

@@ -14,8 +14,13 @@ impl PlacementEnvironment for Environment {
     fn min_y(&self) -> i32 {
         -64
     }
-    fn heightmap(&mut self, _: &str, x: i32, z: i32) -> Result<i32> {
-        Ok(if (x ^ z) & 7 == 0 { -64 } else { 70 + (x & 7) })
+    fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32> {
+        let base = if (x ^ z) & 7 == 0 { -64 } else { 70 + (x & 7) };
+        Ok(if kind == "WORLD_SURFACE" {
+            base + (x & 3)
+        } else {
+            base
+        })
     }
     fn biome_allows(&mut self, _: [i32; 3]) -> Result<bool> {
         Ok(self.allow)
@@ -138,9 +143,25 @@ fn modifiers_and_feature_randomness_match_java() {
         json!({"feature":"minecraft:ore_dirt","origin":[0,-2147483648,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG"}]}),
         json!({"feature":"minecraft:ore_dirt","origin":[0,2147483647,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG","min_inclusive":2147483647}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":{"type":"minecraft:clamped","min_inclusive":0,"max_inclusive":2,"source":{"type":"minecraft:uniform","min_inclusive":-3,"max_inclusive":4}}},{"type":"minecraft:in_square"}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:in_square"},{"type":"minecraft:surface_water_depth_filter","max_water_depth":0}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:in_square"},{"type":"minecraft:surface_water_depth_filter","max_water_depth":2}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:in_square"},{"type":"minecraft:surface_water_depth_filter","max_water_depth":-1}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[]}),
     ];
     let mut resources = ResourceStack::open(&game).unwrap();
+    let tree = PlacedFeature::load(
+        &mut resources,
+        &ResourceId::parse("minecraft:trees_plains").unwrap(),
+    )
+    .unwrap();
+    assert!(
+        tree.required_tags()
+            .contains(&ResourceId::parse("minecraft:supports_vegetation").unwrap())
+    );
+    assert!(
+        tree.required_blocks()
+            .contains(&ResourceId::parse("minecraft:oak_sapling").unwrap())
+    );
     for name in [
         "ore_diamond",
         "ore_dirt",

@@ -323,6 +323,7 @@ enum Modifier {
     Rarity(i32),
     Heightmap(String),
     SurfaceRelativeThreshold(String, i32, i32),
+    SurfaceWaterDepth(i32),
     EnvironmentScan {
         direction: i32,
         target: BlockPredicate,
@@ -494,6 +495,9 @@ impl PlacedFeature {
                         .transpose()?
                         .unwrap_or(i32::MAX),
                 ),
+                "surface_water_depth_filter" => {
+                    Modifier::SurfaceWaterDepth(integer(entry, "max_water_depth")?)
+                }
                 "environment_scan" => {
                     let direction = match entry.get("direction_of_search").and_then(Value::as_str) {
                         Some("up") => 1,
@@ -709,6 +713,13 @@ impl PlacementPositions<'_> {
                                 (height + i64::from(*min) <= i64::from(position[1])
                                     && i64::from(position[1]) <= height + i64::from(*max))
                                 .then_some(position)
+                            }
+                            Modifier::SurfaceWaterDepth(max) => {
+                                let floor =
+                                    env.heightmap("OCEAN_FLOOR", position[0], position[2])?;
+                                let surface =
+                                    env.heightmap("WORLD_SURFACE", position[0], position[2])?;
+                                surface.wrapping_sub(floor).le(max).then_some(position)
                             }
                             Modifier::EnvironmentScan {
                                 direction,

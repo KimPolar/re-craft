@@ -3610,6 +3610,84 @@ mod tests {
     }
 
     #[test]
+    fn planned_tree_filters_use_water_depth_and_sapling_tags() {
+        struct TreeData {
+            supports: bool,
+        }
+        impl ResourceProvider for TreeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[[{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[
+                            {"type":"minecraft:offset","x":8,"y":8,"z":8},{"type":"minecraft:surface_water_depth_filter","max_water_depth":0},{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:would_survive","state":"minecraft:oak_sapling"}}
+                        ]}]]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/supports_vegetation.json" {
+                    return Ok(Some(if self.supports {
+                        br#"{"values":["minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    }));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut TreeData { supports: true },
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:oak_sapling".into(),
+            "minecraft:melon".into(),
+            "minecraft:water".into(),
+        ]);
+        for (wet, supports, expected) in [
+            (false, true, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            let prepared = PreparedDecoration::load(
+                &mut TreeData { supports },
+                &plan,
+                &registry,
+                &mut resolve_test,
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            if wet {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let world = Arc::make_mut(&mut terrain.world);
+                let water_id = world.intern_state(water);
+                let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                section.blocks.as_mut().unwrap()[8 + 8 * 16 + 8 * 256] = water_id;
+            }
+            assert_eq!(
+                prepared.execute(&mut terrain, false).unwrap(),
+                [expected],
+                "wet {wet}, support {supports}"
+            );
+            if expected {
+                assert_eq!(
+                    terrain.snapshot().block(8, 8, 8).unwrap().name,
+                    "minecraft:melon"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn installed_spring_and_magma_definitions_load_with_the_block_registry() {
         let game = std::env::var_os("MINECRAFT_DIR")

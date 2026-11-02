@@ -309,6 +309,12 @@ enum Modifier {
     Rarity(i32),
     Heightmap(String),
     SurfaceRelativeThreshold(String, i32, i32),
+    EnvironmentScan {
+        direction: i32,
+        target: BlockPredicate,
+        allowed: BlockPredicate,
+        max_steps: i32,
+    },
     Biome,
     BlockPredicate(BlockPredicate),
     Offset(IntProvider, IntProvider, IntProvider),
@@ -324,15 +330,26 @@ impl PlacedFeature {
         self.needs_survival("sugar_cane")
     }
     pub fn needs_survival(&self, name: &str) -> bool {
-        self.modifiers.iter().any(
-            |modifier| matches!(modifier,Modifier::BlockPredicate(p) if p.needs_survival(name)),
-        )
+        self.modifiers.iter().any(|modifier| match modifier {
+            Modifier::BlockPredicate(p) => p.needs_survival(name),
+            Modifier::EnvironmentScan {
+                target, allowed, ..
+            } => target.needs_survival(name) || allowed.needs_survival(name),
+            _ => false,
+        })
     }
     pub fn required_tags(&self) -> std::collections::BTreeSet<ResourceId> {
         self.modifiers
             .iter()
             .filter_map(|m| match m {
                 Modifier::BlockPredicate(p) => Some(p.required_tags()),
+                Modifier::EnvironmentScan {
+                    target, allowed, ..
+                } => {
+                    let mut tags = target.required_tags();
+                    tags.extend(allowed.required_tags());
+                    Some(tags)
+                }
                 _ => None,
             })
             .flatten()
@@ -343,6 +360,13 @@ impl PlacedFeature {
             .iter()
             .filter_map(|m| match m {
                 Modifier::BlockPredicate(p) => Some(p.required_blocks()),
+                Modifier::EnvironmentScan {
+                    target, allowed, ..
+                } => {
+                    let mut blocks = target.required_blocks();
+                    blocks.extend(allowed.required_blocks());
+                    Some(blocks)
+                }
                 _ => None,
             })
             .flatten()
@@ -373,7 +397,7 @@ impl PlacedFeature {
                 matches!(
                     modifier,
                     Modifier::BlockPredicate(predicate) if predicate.has_independent_identity()
-                )
+                ) || matches!(modifier,Modifier::EnvironmentScan{target,allowed,..} if target.has_independent_identity() || allowed.has_independent_identity())
             })
     }
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
@@ -456,6 +480,35 @@ impl PlacedFeature {
                         .transpose()?
                         .unwrap_or(i32::MAX),
                 ),
+                "environment_scan" => {
+                    let direction = match entry.get("direction_of_search").and_then(Value::as_str) {
+                        Some("up") => 1,
+                        Some("down") => -1,
+                        _ => bail!("invalid environment scan direction"),
+                    };
+                    let max_steps = integer(entry, "max_steps")?;
+                    ensure!(
+                        (1..=32).contains(&max_steps),
+                        "invalid environment scan length"
+                    );
+                    let target = BlockPredicate::decode(
+                        entry
+                            .get("target_condition")
+                            .context("missing scan target")?,
+                    )?;
+                    let allowed = match entry.get("allowed_search_condition") {
+                        Some(v) => BlockPredicate::decode(v)?,
+                        None => {
+                            BlockPredicate::decode(&serde_json::json!({"type":"minecraft:true"}))?
+                        }
+                    };
+                    Modifier::EnvironmentScan {
+                        direction,
+                        target,
+                        allowed,
+                        max_steps,
+                    }
+                }
                 "biome" => Modifier::Biome,
                 "block_predicate_filter" => Modifier::BlockPredicate(BlockPredicate::decode(
                     entry
@@ -509,6 +562,9 @@ impl PlacedFeature {
 pub trait PlacementEnvironment {
     /// Minimum Y of the actual level, which may differ from generator bounds.
     fn min_y(&self) -> i32;
+    fn inside_build_height(&self, _y: i32) -> Result<bool> {
+        bail!("world build height unavailable")
+    }
     /// Java's first available Y in this heightmap.
     fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32>;
     /// The environment checks the top-level placed feature at this position.
@@ -639,6 +695,39 @@ impl PlacementPositions<'_> {
                                 (height + i64::from(*min) <= i64::from(position[1])
                                     && i64::from(position[1]) <= height + i64::from(*max))
                                 .then_some(position)
+                            }
+                            Modifier::EnvironmentScan {
+                                direction,
+                                target,
+                                allowed,
+                                max_steps,
+                            } => {
+                                let mut p = position;
+                                if !env.block_predicate(allowed, p)? {
+                                    None
+                                } else {
+                                    let mut found = false;
+                                    let mut outside = false;
+                                    for _ in 0..*max_steps {
+                                        if env.block_predicate(target, p)? {
+                                            found = true;
+                                            break;
+                                        }
+                                        p[1] = p[1].wrapping_add(*direction);
+                                        if !env.inside_build_height(p[1])? {
+                                            outside = true;
+                                            break;
+                                        }
+                                        if !env.block_predicate(allowed, p)? {
+                                            break;
+                                        }
+                                    }
+                                    if !outside && (found || env.block_predicate(target, p)?) {
+                                        Some(p)
+                                    } else {
+                                        None
+                                    }
+                                }
                             }
                             Modifier::Biome => env.biome_allows(position)?.then_some(position),
                             Modifier::BlockPredicate(predicate) => env

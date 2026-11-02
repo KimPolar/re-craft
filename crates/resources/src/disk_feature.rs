@@ -23,6 +23,9 @@ pub trait DiskWorld: OreWorld {
     fn is_liquid(&mut self, _state: &Self::State) -> Result<bool> {
         bail!("unsupported block liquid property")
     }
+    fn inside_build_height(&mut self, _y: i32) -> Result<bool> {
+        bail!("world build height unavailable")
+    }
     fn would_survive(&mut self, state: &Value, pos: [i32; 3]) -> Result<bool> {
         let raw = state
             .as_str()
@@ -82,6 +85,7 @@ pub(crate) enum Predicate {
     Tag([i32; 3], ResourceId),
     Fluids([i32; 3], Vec<ResourceId>),
     Solid([i32; 3]),
+    InsideWorldBounds([i32; 3]),
     WouldSurvive([i32; 3], ResourceId, Value),
     Not(Box<Predicate>),
     Any(Vec<Predicate>),
@@ -188,6 +192,14 @@ impl Predicate {
                 ids(value.get("fluids").context("missing predicate fluids")?)?,
             ),
             "solid" => Self::Solid(offset(value)?),
+            "inside_world_bounds" => {
+                let offset = offset(value)?;
+                ensure!(
+                    offset.iter().all(|n| (-16..=16).contains(n)),
+                    "world bounds offset exceeds Java codec"
+                );
+                Self::InsideWorldBounds(offset)
+            }
             "would_survive" => {
                 let state = value.get("state").context("missing survival state")?;
                 let raw = state
@@ -299,6 +311,7 @@ impl Predicate {
                 let state = world.block(at(offset))?;
                 world.is_solid(&state)?
             }
+            Self::InsideWorldBounds(offset) => world.inside_build_height(at(offset)[1])?,
             Self::WouldSurvive(offset, _, state) => world.would_survive(state, at(offset))?,
             Self::Not(child) => !child.test(world, pos)?,
             Self::Any(children) => {

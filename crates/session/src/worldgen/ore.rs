@@ -823,6 +823,9 @@ struct PlannedDecorationEnvironment<'a, 'b, F> {
 impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
     for PlannedDecorationEnvironment<'_, '_, F>
 {
+    fn inside_build_height(&self, y: i32) -> Result<bool> {
+        Ok(!self.region.is_outside(y))
+    }
     fn min_y(&self) -> i32 {
         self.region.target.min_y
     }
@@ -932,6 +935,9 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn inside_build_height(&mut self, y: i32) -> Result<bool> {
+        Ok(!self.is_outside(y))
+    }
     fn fluid_in_tag(&mut self, state: &BlockState, tag: &ResourceId) -> Result<bool> {
         let fluids = match (tag.namespace.as_str(), tag.path.as_str()) {
             ("minecraft", "supports_sugar_cane_adjacently") => self
@@ -2049,6 +2055,27 @@ mod tests {
             generator_min_y: 0,
             generator_height: 16,
         }
+    }
+    #[test]
+    fn environment_scan_reads_generated_blocks_and_real_world_bounds() {
+        let (_, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let feature=PlacedFeature::decode(&json!({"feature":"minecraft:lake_lava","placement":[{"type":"minecraft:environment_scan","direction_of_search":"down","max_steps":32,"target_condition":{"type":"minecraft:all_of","predicates":[{"type":"minecraft:not","predicate":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"}},{"type":"minecraft:inside_world_bounds","offset":[0,-5,0]}]}}]})).unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut allow = |_: &FeatureKey, _: &ResourceId| Ok(true);
+        let mut env = PlannedDecorationEnvironment {
+            region: &mut region,
+            plan: &plan,
+            key: plan.features[0].feature,
+            biome_allows: &mut allow,
+        };
+        let mut random = DecorationRandom::new(42);
+        let mut scan = feature.positions([8, 12, 8], -64, 384).unwrap();
+        assert_eq!(scan.next(&mut random, &mut env).unwrap(), Some([8, 7, 8]));
+        let mut outside = feature.positions([8, 3, 8], -64, 384).unwrap();
+        assert_eq!(outside.next(&mut random, &mut env).unwrap(), None);
     }
     fn resolve_test(v: &Value) -> Result<BlockState> {
         Ok(state(

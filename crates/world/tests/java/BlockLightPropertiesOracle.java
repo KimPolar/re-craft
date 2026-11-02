@@ -13,6 +13,8 @@ import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.block.state.properties.Tilt;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.core.Direction;
 
 public class BlockLightPropertiesOracle {
@@ -25,6 +27,7 @@ public class BlockLightPropertiesOracle {
             var entry = item.getAsJsonObject();
             var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse(entry.get("name").getAsString()));
             var state = block.defaultBlockState();
+            if (entry.has("axis")) state = state.setValue(BlockStateProperties.AXIS, Direction.Axis.byName(entry.get("axis").getAsString()));
             if (entry.has("lit")) state = state.setValue(RedStoneOreBlock.LIT, entry.get("lit").getAsBoolean());
             if (entry.has("berries")) state = state.setValue(CaveVines.BERRIES, entry.get("berries").getAsBoolean());
             if (entry.has("age")) state = state.setValue(GrowingPlantHeadBlock.AGE, entry.get("age").getAsInt());
@@ -38,6 +41,7 @@ public class BlockLightPropertiesOracle {
             row.add(state.getLightDampening());
             row.add(state.getLightEmission());
             row.add(state.useShapeForLightOcclusion());
+            row.add(LightEngine.hasDifferentLightProperties(state, Blocks.STONE.defaultBlockState()));
             output.add(row);
         }
         Files.writeString(Path.of(args[1]), output.toString());

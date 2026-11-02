@@ -670,6 +670,29 @@ pub fn same_light_behavior(a: &BlockState, b: &BlockState) -> Option<bool> {
     Some(light_properties(a)? == light_properties(b)?)
 }
 
+/// Whether Java's ProtoChunk can skip checkBlock for a supported state pair.
+/// Both blocks must have Java's useShapeForLightOcclusion flag disabled; the
+/// whitelist is compared with the installed 26.3 registry in tests.
+pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    fn known_without_shape(state: &BlockState) -> bool {
+        matches!(
+            state.name.as_str(),
+            "minecraft:stone"
+                | "minecraft:deepslate"
+                | "minecraft:dirt"
+                | "minecraft:sand"
+                | "minecraft:gravel"
+        )
+    }
+    if !known_without_shape(a) || !known_without_shape(b) {
+        return None;
+    }
+    Some(properties(a)? == properties(b)?)
+}
+
 pub(crate) fn transparent_light_properties() -> LightProperties {
     LightProperties {
         opacity: 0,
@@ -1652,6 +1675,32 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_light_checks_only_skip_known_equivalent_states() {
+        let blocks: Vec<_> = ["stone", "dirt", "sand", "gravel"]
+            .into_iter()
+            .map(|name| state(name, None))
+            .chain(["x", "y", "z"].into_iter().map(|axis| BlockState {
+                name: "minecraft:deepslate".into(),
+                properties: BTreeMap::from([("axis".into(), axis.into())]),
+            }))
+            .collect();
+        for old in &blocks {
+            for new in &blocks {
+                assert_eq!(skips_light_check_for_edit(old, new), Some(true));
+                assert_eq!(same_light_behavior(old, new), Some(true));
+            }
+        }
+        assert_eq!(
+            skips_light_check_for_edit(&state("stone", None), &state("torch", None)),
+            None
+        );
+        assert_eq!(
+            skips_light_check_for_edit(&state("stone", None), &state("deepslate", None)),
+            None
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn build_height_padding_matches_vanilla_light_engine() {
@@ -2619,6 +2668,8 @@ mod tests {
             "void_air",
             "stone",
             "dirt",
+            "sand",
+            "gravel",
             "granite",
             "diorite",
             "andesite",
@@ -2742,6 +2793,9 @@ mod tests {
             .iter()
             .map(|s| {
                 let mut row = serde_json::json!({"name": s.name});
+                if let Some(axis) = s.properties.get("axis") {
+                    row["axis"] = serde_json::json!(axis);
+                }
                 if let Some(lit) = s.properties.get("lit") {
                     row["lit"] = serde_json::json!(lit == "true");
                 }
@@ -2786,7 +2840,11 @@ mod tests {
         assert_eq!(rows.len(), states.len());
         for (s, row) in states.iter().zip(rows) {
             let (opacity, emission) = properties(s).unwrap();
-            assert_eq!(row, serde_json::json!([opacity, emission, false]), "{s:?}");
+            assert_eq!(
+                row,
+                serde_json::json!([opacity, emission, false, opacity != 15 || emission != 0]),
+                "{s:?}"
+            );
         }
     }
 }

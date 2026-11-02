@@ -33,7 +33,9 @@ mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
-pub use ore::{OreRegion, PlacedOreFeature, PreparedOreDecoration, ScheduledOreFeature};
+pub use ore::{
+    DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
+};
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
@@ -80,6 +82,8 @@ pub struct CarvedTerrainWorld {
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     carver_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
+    feature_postprocessing:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
 }
 
 impl CarvedTerrainWorld {
@@ -118,6 +122,7 @@ impl CarvedTerrainWorld {
                 .into_iter()
                 .map(|value| (position, value))
                 .collect(),
+            feature_postprocessing: BTreeMap::new(),
         }
     }
 
@@ -191,6 +196,30 @@ impl CarvedTerrainWorld {
         pos: native_world::loaded::ChunkPos,
     ) -> Option<&native_core::postprocessing::PostProcessing> {
         self.carver_postprocessing.get(&pos).map(AsRef::as_ref)
+    }
+
+    /// Marks added by features only, in their original per-section order.
+    /// The preceding carver list must be retained separately.
+    pub fn feature_postprocessing(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<&native_core::postprocessing::PostProcessing> {
+        self.feature_postprocessing.get(&pos).map(AsRef::as_ref)
+    }
+
+    /// Marks through the features executed so far, if the complete preceding
+    /// carver history is available. The chunk may still need more features.
+    pub fn postprocessing_marks_to_date(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<native_core::postprocessing::PostProcessing> {
+        let mut marks = self.carver_postprocessing.get(&pos)?.as_ref().clone();
+        if let Some(features) = self.feature_postprocessing.get(&pos) {
+            if !marks.append(features) {
+                return None;
+            }
+        }
+        Some(marks)
     }
 }
 

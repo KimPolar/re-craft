@@ -1,4 +1,4 @@
-//! Apply ore features to intermediate generated chunk sections.
+//! Apply supported decoration features to intermediate generated chunks.
 //!
 //! The surrounding decoration scheduler must still supply Java's feature order,
 //! random seed, writable region and complete CARVERS-stage neighborhood.
@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
+    disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
     feature_order::{FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
@@ -23,7 +24,7 @@ use super::{CarvedTerrainWorld, DecorationPlan};
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
-pub struct OreRegion<'a> {
+pub struct DecorationRegion<'a> {
     target: &'a mut CarvedTerrainWorld,
     world: World,
     tags: &'a OreBlockTags,
@@ -32,6 +33,7 @@ pub struct OreRegion<'a> {
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     final_heights: BTreeMap<ChunkPos, Arc<FinalHeightmaps>>,
+    feature_marks: BTreeMap<ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -42,29 +44,75 @@ pub(super) struct FinalHeightmaps {
     values: Box<[[i32; 256]; 4]>,
 }
 
-/// A placed feature bound to the exact configured ore it references.
-pub struct PlacedOreFeature {
+/// A placed feature bound to the exact configured feature it references.
+pub struct PlacedDecorationFeature {
     placement: PlacedFeature,
-    ore: ConfiguredOre<BlockState>,
+    feature: ConfiguredDecoration,
 }
 
-/// A placed ore resolved from one exact entry of the decoration schedule.
-pub struct ScheduledOreFeature<'a> {
+enum ConfiguredDecoration {
+    Ore(ConfiguredOre<BlockState>),
+    Disk(DiskFeature<BlockState>),
+}
+impl ConfiguredDecoration {
+    fn decode(
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        let id = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing feature type")?,
+        )?;
+        match (id.namespace.as_str(), id.path.as_str()) {
+            ("minecraft", "ore" | "scattered_ore") => {
+                Ok(Self::Ore(ConfiguredOre::decode(value, resolve)?))
+            }
+            ("minecraft", "disk") => Ok(Self::Disk(DiskFeature::decode(value, resolve)?)),
+            _ => bail!(
+                "unsupported decoration feature {}:{}",
+                id.namespace,
+                id.path
+            ),
+        }
+    }
+    fn required_tags(&self) -> BTreeSet<ResourceId> {
+        match self {
+            Self::Ore(v) => v.required_tags(),
+            Self::Disk(v) => v.required_tags(),
+        }
+    }
+    fn place(
+        &self,
+        world: &mut DecorationRegion<'_>,
+        random: &mut DecorationRandom,
+        pos: [i32; 3],
+    ) -> Result<bool> {
+        match self {
+            Self::Ore(v) => v.place(world, random, pos),
+            Self::Disk(v) => v.place(world, random, pos),
+        }
+    }
+}
+
+/// A placed feature resolved from one exact entry of the decoration schedule.
+pub struct ScheduledDecorationFeature<'a> {
     key: FeatureKey,
-    placed: PlacedOreFeature,
+    placed: PlacedDecorationFeature,
     schedule: &'a FeatureSchedule,
 }
 
-/// A fully resolved ore-only chunk decoration attempt. Unsupported selected
+/// A fully resolved chunk decoration attempt. Unsupported selected
 /// features are rejected before any generated terrain is changed.
-pub struct PreparedOreDecoration<'p, 's> {
+pub struct PreparedDecoration<'p, 's> {
     plan: &'p DecorationPlan<'s>,
-    ores: BTreeMap<FeatureKey, ScheduledOreFeature<'s>>,
+    features: BTreeMap<FeatureKey, ScheduledDecorationFeature<'s>>,
     tags: OreBlockTags,
     motion: HeightmapTags,
 }
 
-impl<'p, 's> PreparedOreDecoration<'p, 's> {
+impl<'p, 's> PreparedDecoration<'p, 's> {
     /// The provider, complete block registry and resolver must describe the
     /// same immutable data-pack stack as the plan and generated terrain.
     pub fn load(
@@ -73,7 +121,7 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
         block_registry: &BTreeSet<String>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Self> {
-        let mut ores = BTreeMap::new();
+        let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
@@ -88,21 +136,35 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
                 std::ptr::eq(canonical, selected.feature),
                 "plan refers to a different feature schedule"
             );
-            if !ores.contains_key(selected.feature) {
-                let ore =
-                    ScheduledOreFeature::load(provider, plan.schedule, selected.feature, resolve)
-                        .with_context(|| {
-                        format!("unsupported planned feature {:?}", selected.feature)
-                    })?;
-                required.extend(ore.required_tags());
-                ores.insert(selected.feature.clone(), ore);
+            if !features.contains_key(selected.feature) {
+                let feature = ScheduledDecorationFeature::load(
+                    provider,
+                    plan.schedule,
+                    selected.feature,
+                    resolve,
+                )
+                .with_context(|| format!("unsupported planned feature {:?}", selected.feature))?;
+                let mut blocks = feature.placed.placement.required_blocks();
+                if let ConfiguredDecoration::Disk(disk) = &feature.placed.feature {
+                    blocks.extend(disk.required_blocks());
+                }
+                for id in blocks {
+                    ensure!(
+                        block_registry.contains(&format!("{}:{}", id.namespace, id.path)),
+                        "feature predicate references an unregistered block {}:{}",
+                        id.namespace,
+                        id.path
+                    );
+                }
+                required.extend(feature.required_tags());
+                features.insert(selected.feature.clone(), feature);
             }
         }
         let tags = OreBlockTags::load(provider, block_registry, &required)?;
         let motion = HeightmapTags::load(provider, block_registry)?;
         Ok(Self {
             plan,
-            ores,
+            features,
             tags,
             motion,
         })
@@ -150,11 +212,11 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
                 });
             }
         }
-        let mut region = terrain.ore_region(&self.tags, &self.motion, writable)?;
+        let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
         let mut results = Vec::with_capacity(self.plan.features.len());
         for (index, selected) in self.plan.features.iter().enumerate() {
             let ore = self
-                .ores
+                .features
                 .get(selected.feature)
                 .context("prepared ore is missing")?;
             results.push(region.place_planned_auto(self.plan, index, ore)?);
@@ -165,7 +227,7 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
     }
 }
 
-impl<'a> ScheduledOreFeature<'a> {
+impl<'a> ScheduledDecorationFeature<'a> {
     /// Read both named and inline placed features from the same active packs
     /// and block registry that were used to prepare the schedule.
     pub fn load(
@@ -179,7 +241,7 @@ impl<'a> ScheduledOreFeature<'a> {
             "feature is absent from the schedule"
         );
         let placed = match key {
-            FeatureKey::Registered(id) => PlacedOreFeature::load(provider, id, resolve)?,
+            FeatureKey::Registered(id) => PlacedDecorationFeature::load(provider, id, resolve)?,
             FeatureKey::Inline { biome, .. } => {
                 let definition = schedule
                     .biome(biome)
@@ -187,7 +249,7 @@ impl<'a> ScheduledOreFeature<'a> {
                     .inline
                     .get(key)
                     .context("inline feature definition is missing")?;
-                PlacedOreFeature::from_placement(
+                PlacedDecorationFeature::from_placement(
                     provider,
                     PlacedFeature::decode(definition)?,
                     resolve,
@@ -224,7 +286,7 @@ impl<'a> ScheduledOreFeature<'a> {
     }
 }
 
-impl PlacedOreFeature {
+impl PlacedDecorationFeature {
     pub fn load(
         provider: &mut impl ResourceProvider,
         id: &ResourceId,
@@ -239,16 +301,25 @@ impl PlacedOreFeature {
         placement: PlacedFeature,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Self> {
-        let ore = if let Some(id) = placement.feature.as_str() {
-            ConfiguredOre::load(provider, &ResourceId::parse(id)?, resolve)?
+        let feature = if let Some(id) = placement.feature.as_str() {
+            let id = ResourceId::parse(id)?;
+            let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
+            let data = provider
+                .read_data(&path)?
+                .with_context(|| format!("missing feature {path}"))?;
+            let value =
+                serde_json::from_slice(&data).with_context(|| format!("invalid feature {path}"))?;
+            ConfiguredDecoration::decode(&value, resolve)?
         } else {
-            ConfiguredOre::decode(&placement.feature, resolve)?
+            ConfiguredDecoration::decode(&placement.feature, resolve)?
         };
-        Ok(Self { placement, ore })
+        Ok(Self { placement, feature })
     }
 
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
-        self.ore.required_tags()
+        let mut tags = self.feature.required_tags();
+        tags.extend(self.placement.required_tags());
+        tags
     }
 }
 
@@ -258,12 +329,12 @@ impl CarvedTerrainWorld {
     /// The tags must belong to the same registry and active data packs for the
     /// lifetime of the terrain. Other generation writes must apply the Java
     /// heightmap rules before this interface can be combined with them.
-    pub fn ore_region<'a>(
+    pub fn decoration_region<'a>(
         &'a mut self,
         tags: &'a OreBlockTags,
         motion: &'a HeightmapTags,
         writable: BTreeSet<ChunkPos>,
-    ) -> Result<OreRegion<'a>> {
+    ) -> Result<DecorationRegion<'a>> {
         ensure!(
             writable.iter().all(|p| self.world.chunks.contains_key(p)),
             "writable generation chunk is missing"
@@ -272,7 +343,8 @@ impl CarvedTerrainWorld {
         let heights = self.ore_ocean_floor_heights.clone();
         let surface_heights = self.feature_world_surface_heights.clone();
         let final_heights = self.final_heightmaps.clone();
-        Ok(OreRegion {
+        let feature_marks = self.feature_postprocessing.clone();
+        Ok(DecorationRegion {
             target: self,
             world,
             tags,
@@ -281,13 +353,14 @@ impl CarvedTerrainWorld {
             heights,
             surface_heights,
             final_heights,
+            feature_marks,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
     }
 }
 
-impl OreRegion<'_> {
+impl DecorationRegion<'_> {
     /// A failed attempt must be discarded; on failure the caller's RNG is unchanged.
     /// If the region contains earlier successful placements, the caller must
     /// also restore its RNG to the beginning of the discarded region.
@@ -306,7 +379,7 @@ impl OreRegion<'_> {
         Ok(result)
     }
 
-    /// Run placement modifiers and their ore feature in Java's depth-first
+    /// Run placement modifiers and their feature in Java's depth-first
     /// order on one RNG. The environment must use the active biome settings,
     /// top-level placed feature, current heightmaps and level minimum Y.
     /// `generator_min_y` and `generator_height` are the placement context's
@@ -314,7 +387,7 @@ impl OreRegion<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn place_placed(
         &mut self,
-        placed: &PlacedOreFeature,
+        placed: &PlacedDecorationFeature,
         random: &mut DecorationRandom,
         origin: [i32; 3],
         generator_min_y: i32,
@@ -330,14 +403,14 @@ impl OreRegion<'_> {
                 .positions(origin, generator_min_y, generator_height)?;
         let mut result = false;
         while let Some(position) = positions.next(&mut next, environment)? {
-            result |= placed.ore.place(self, &mut next, position)?;
+            result |= placed.feature.place(self, &mut next, position)?;
         }
         *random = next;
         self.failed = false;
         Ok(result)
     }
 
-    /// Place one planned ore using its own Java feature seed and the plan's
+    /// Place one planned feature using its own Java feature seed and the plan's
     /// biome neighborhood. Callers must execute every preceding feature and
     /// structure in order, and provide Java `hasFeature` semantics from the
     /// active biome settings; unknown equivalence must be an error.
@@ -345,7 +418,7 @@ impl OreRegion<'_> {
         &mut self,
         plan: &DecorationPlan<'_>,
         index: usize,
-        ore: &ScheduledOreFeature<'_>,
+        ore: &ScheduledDecorationFeature<'_>,
         biome_allows: &mut impl FnMut(&FeatureKey, &ResourceId) -> Result<bool>,
     ) -> Result<bool> {
         ensure!(!self.failed, "generation attempt previously failed");
@@ -373,7 +446,7 @@ impl OreRegion<'_> {
         let mut result = false;
         loop {
             let next = {
-                let mut env = PlannedOreEnvironment {
+                let mut env = PlannedDecorationEnvironment {
                     region: self,
                     plan,
                     key: &ore.key,
@@ -382,13 +455,13 @@ impl OreRegion<'_> {
                 positions.next(&mut random, &mut env)?
             };
             let Some(position) = next else { break };
-            result |= ore.placed.ore.place(self, &mut random, position)?;
+            result |= ore.placed.feature.place(self, &mut random, position)?;
         }
         self.failed = false;
         Ok(result)
     }
 
-    /// Resolve biome membership from the active schedule for supported ores.
+    /// Resolve biome membership from the active schedule for supported features.
     /// Distinct placed features with uniform/trapezoid height providers are
     /// never equal in Java because each decoded provider has object identity.
     /// Ambiguous data-pack feature equality and unknown biomes are errors.
@@ -396,7 +469,7 @@ impl OreRegion<'_> {
         &mut self,
         plan: &DecorationPlan<'_>,
         index: usize,
-        ore: &ScheduledOreFeature<'_>,
+        ore: &ScheduledDecorationFeature<'_>,
     ) -> Result<bool> {
         let selected = plan
             .features
@@ -424,6 +497,7 @@ impl OreRegion<'_> {
         self.target.ore_ocean_floor_heights = self.heights;
         self.target.feature_world_surface_heights = self.surface_heights;
         self.target.final_heightmaps = self.final_heights;
+        self.target.feature_postprocessing = self.feature_marks;
         Ok(())
     }
 
@@ -645,14 +719,14 @@ impl OreRegion<'_> {
     }
 }
 
-struct PlannedOreEnvironment<'a, 'b, F> {
-    region: &'a mut OreRegion<'b>,
+struct PlannedDecorationEnvironment<'a, 'b, F> {
+    region: &'a mut DecorationRegion<'b>,
     plan: &'a DecorationPlan<'a>,
     key: &'a FeatureKey,
     biome_allows: &'a mut F,
 }
 impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
-    for PlannedOreEnvironment<'_, '_, F>
+    for PlannedDecorationEnvironment<'_, '_, F>
 {
     fn min_y(&self) -> i32 {
         self.region.target.min_y
@@ -672,6 +746,9 @@ impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
         let biome = self.plan.biomes.biome_at_block(pos[0], pos[1], pos[2])?;
         (self.biome_allows)(self.key, biome)
     }
+    fn block_predicate(&mut self, predicate: &BlockPredicate, pos: [i32; 3]) -> Result<bool> {
+        predicate.test(self.region, pos)
+    }
 }
 
 fn is_air(state: &BlockState) -> bool {
@@ -687,7 +764,7 @@ fn chunk(p: [i32; 3]) -> ChunkPos {
     }
 }
 
-impl OreWorld for OreRegion<'_> {
+impl OreWorld for DecorationRegion<'_> {
     type State = BlockState;
     fn block(&mut self, p: [i32; 3]) -> Result<BlockState> {
         if self.is_outside(p[1]) {
@@ -719,7 +796,141 @@ impl OreWorld for OreRegion<'_> {
         result
     }
 }
-impl OreVeinWorld for OreRegion<'_> {
+
+// These complete vanilla block-state families were checked for solidness,
+// block entities, POIs and postprocessing effects against Java 26.3.
+fn disk_safe_solid(name: &str) -> Option<bool> {
+    match name {
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:water"
+        | "minecraft:lava" => Some(false),
+        "minecraft:stone"
+        | "minecraft:deepslate"
+        | "minecraft:netherrack"
+        | "minecraft:basalt"
+        | "minecraft:blackstone"
+        | "minecraft:ancient_debris"
+        | "minecraft:dirt"
+        | "minecraft:grass_block"
+        | "minecraft:mud"
+        | "minecraft:clay"
+        | "minecraft:sand"
+        | "minecraft:sandstone"
+        | "minecraft:gravel"
+        | "minecraft:packed_ice"
+        | "minecraft:snow_block"
+        | "minecraft:ice"
+        | "minecraft:podzol"
+        | "minecraft:coarse_dirt"
+        | "minecraft:mycelium"
+        | "minecraft:tuff"
+        | "minecraft:calcite"
+        | "minecraft:granite"
+        | "minecraft:diorite"
+        | "minecraft:andesite"
+        | "minecraft:bedrock"
+        | "minecraft:red_sand"
+        | "minecraft:moss_block" => Some(true),
+        _ => None,
+    }
+}
+
+impl DiskWorld for DecorationRegion<'_> {
+    fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
+        disk_safe_solid(&state.name).context("unsupported disk solid predicate block")
+    }
+
+    fn fluid_is(&mut self, state: &BlockState, id: &ResourceId) -> Result<bool> {
+        use native_world::fluid::{FluidKind, FluidState};
+        ensure!(
+            id.namespace == "minecraft",
+            "unsupported disk fluid namespace"
+        );
+        let (kind, source) = match id.path.as_str() {
+            "water" => (FluidKind::Water, true),
+            "flowing_water" => (FluidKind::Water, false),
+            "lava" => (FluidKind::Lava, true),
+            "flowing_lava" => (FluidKind::Lava, false),
+            _ => bail!("unsupported disk fluid {}:{}", id.namespace, id.path),
+        };
+        Ok(FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|fluid| fluid.kind == kind && fluid.source == source))
+    }
+
+    fn set_disk_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(p)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(p)),
+                "generation block chunk is missing"
+            );
+            let allowed = match state.name.as_str() {
+                "minecraft:dirt"
+                | "minecraft:clay"
+                | "minecraft:sand"
+                | "minecraft:sandstone"
+                | "minecraft:gravel"
+                | "minecraft:packed_ice" => state.properties.is_empty(),
+                "minecraft:grass_block" => {
+                    state.properties.len() == 1
+                        && matches!(
+                            state.properties.get("snowy").map(String::as_str),
+                            Some("true" | "false")
+                        )
+                }
+                _ => false,
+            };
+            ensure!(allowed, "unsupported disk replacement effects");
+            if self.is_outside(p[1]) {
+                return Ok(true);
+            }
+            ensure!(
+                disk_safe_solid(&self.read(p)?.name).is_some(),
+                "unsupported disk source effects"
+            );
+            self.set_section_block(p, state)?;
+            self.update_final_heightmaps(p, state)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn mark_postprocessing(&mut self, p: [i32; 3]) -> Result<()> {
+        let pos = chunk(p);
+        let result = (|| {
+            ensure!(
+                self.world.chunks.contains_key(&pos),
+                "postprocessing chunk is missing"
+            );
+            if !self.feature_marks.contains_key(&pos) {
+                let marks = native_core::postprocessing::PostProcessing::new(
+                    self.target.min_y,
+                    self.target.height,
+                )
+                .context("invalid generation postprocessing bounds")?;
+                self.feature_marks.insert(pos, Arc::new(marks));
+            }
+            Arc::make_mut(
+                self.feature_marks
+                    .get_mut(&pos)
+                    .expect("marks were inserted"),
+            )
+            .mark(p[0], p[1], p[2]);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
+impl OreVeinWorld for DecorationRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
         self.prime_heightmaps(pos)?;
@@ -778,6 +989,8 @@ impl OreVeinWorld for OreRegion<'_> {
 }
 
 #[cfg(test)]
+mod disk_tests;
+#[cfg(test)]
 mod scattered_tests;
 
 #[cfg(test)]
@@ -823,6 +1036,7 @@ mod tests {
             "minecraft:diamond_ore",
             "minecraft:water",
             "minecraft:ancient_debris",
+            "minecraft:clay",
             "minecraft:cave_air",
             "minecraft:void_air",
             "minecraft:netherrack",
@@ -884,6 +1098,7 @@ mod tests {
             noise_postprocessing: BTreeMap::new(),
             surface_postprocessing: BTreeMap::new(),
             carver_postprocessing: BTreeMap::new(),
+            feature_postprocessing: BTreeMap::new(),
         };
         (result, tags, motion, feature)
     }
@@ -893,7 +1108,7 @@ mod tests {
         let (mut terrain, tags, motion, feature) = fixture();
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(123);
         assert!(region.place(&feature, &mut random, [15, 4, 7]).unwrap());
         region.finish().unwrap();
@@ -916,7 +1131,7 @@ mod tests {
     fn primes_whole_heightmap_and_keeps_direct_section_writes_out_of_it() {
         let (mut terrain, tags, motion, _) = fixture();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         region
             .set_section_block([1, 12, 1], &state("stone"))
@@ -925,7 +1140,7 @@ mod tests {
         assert_eq!(region.section_neighbor([1, -1, 1]).unwrap(), state("air"));
         region.finish().unwrap();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut next = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut next = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert_eq!(next.ocean_floor_height(1, 1).unwrap(), 8);
     }
 
@@ -933,7 +1148,7 @@ mod tests {
     fn neighboring_chunk_maps_are_primed_before_direct_feature_writes() {
         let (mut terrain, tags, motion, _) = fixture();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert!(region.heights.is_empty() && region.surface_heights.is_empty());
         // Neither neighbor column was queried before these direct writes.
         region.set_section_block([16, 7, 5], &state("air")).unwrap();
@@ -946,7 +1161,7 @@ mod tests {
         }
         region.finish().unwrap();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut next = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut next = terrain.decoration_region(&tags, &motion, writable).unwrap();
         for x in [16, 17] {
             assert_eq!(next.ocean_floor_height(x, 5).unwrap(), 8);
             assert_eq!(next.world_surface_height(x, 5).unwrap(), 8);
@@ -962,7 +1177,7 @@ mod tests {
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         section.blocks.as_mut().unwrap()[12 * 256] = water;
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 13);
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
@@ -975,7 +1190,7 @@ mod tests {
     fn scattered_set_block_preserves_worldgen_maps_and_respects_write_bounds() {
         let (mut terrain, tags, motion, _) = fixture();
         let writable = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
         for kind in 0..4 {
@@ -1017,7 +1232,7 @@ mod tests {
         );
         region.finish().unwrap();
         let mut next = terrain
-            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
             .unwrap();
         assert_eq!(next.final_height(0, 0, 0).unwrap(), 13);
         assert_eq!(next.final_height(1, 0, 0).unwrap(), 7);
@@ -1028,7 +1243,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
             .unwrap();
         assert!(
             region
@@ -1043,7 +1258,7 @@ mod tests {
     fn final_heightmaps_keep_stale_direct_section_writes() {
         let (mut terrain, tags, motion, _) = fixture();
         let mut region = terrain
-            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
             .unwrap();
         region
             .set_section_block([0, 12, 0], &state("stone"))
@@ -1075,7 +1290,7 @@ mod tests {
             .remove(&ChunkPos { x: 0, z: -1 });
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(123);
         let mut expected = random.clone();
         assert!(region.place(&feature, &mut random, [15, 4, 7]).is_err());
@@ -1103,12 +1318,12 @@ mod tests {
         }
     }
 
-    fn inline_placed_ore() -> PlacedOreFeature {
+    fn inline_placed_ore() -> PlacedDecorationFeature {
         let placement = PlacedFeature::decode(&json!({"feature": {
             "type":"minecraft:ore", "size":9, "discard_chance_on_air_exposure":0.0,
             "targets":[{"target":{"predicate_type":"minecraft:block_match", "block":"minecraft:stone"}, "state":"minecraft:diamond_ore"}]
         }, "placement":[{"type":"minecraft:count", "count":4},{"type":"minecraft:biome"}]})).unwrap();
-        PlacedOreFeature::from_placement(&mut Data, placement, &mut |v| {
+        PlacedDecorationFeature::from_placement(&mut Data, placement, &mut |v| {
             Ok(state(
                 v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
             ))
@@ -1121,7 +1336,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(7);
         let mut env = PlacementTestEnv {
             allow: false,
@@ -1170,7 +1385,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(7);
         let mut expected = random.clone();
         let mut env = PlacementTestEnv {
@@ -1290,6 +1505,7 @@ mod tests {
     fn resolve_test(v: &Value) -> Result<BlockState> {
         Ok(state(
             v.as_str()
+                .or_else(|| v.get("id").and_then(Value::as_str))
                 .context("expected test block")?
                 .strip_prefix("minecraft:")
                 .context("expected minecraft namespace")?,
@@ -1301,14 +1517,14 @@ mod tests {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         assert_eq!(plan.features.len(), 2);
-        let named = ScheduledOreFeature::load(
+        let named = ScheduledDecorationFeature::load(
             &mut data,
             &schedule,
             plan.features[0].feature,
             &mut resolve_test,
         )
         .unwrap();
-        let inline = ScheduledOreFeature::load(
+        let inline = ScheduledDecorationFeature::load(
             &mut data,
             &schedule,
             plan.features[1].feature,
@@ -1318,7 +1534,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut calls = 0;
         let mut allows = |_: &FeatureKey, biome: &ResourceId| {
             calls += 1;
@@ -1345,7 +1561,7 @@ mod tests {
     fn scheduled_biome_failure_discards_prior_writes() {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
-        let ore = ScheduledOreFeature::load(
+        let ore = ScheduledDecorationFeature::load(
             &mut data,
             &schedule,
             plan.features[0].feature,
@@ -1355,7 +1571,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         let mut calls = 0;
         assert!(
@@ -1384,7 +1600,7 @@ mod tests {
         ] {
             let (mut data, schedule, neighborhood) = scheduled_fixture(Some(kind));
             let plan = fixture_plan(&schedule, &neighborhood);
-            let ore = ScheduledOreFeature::load(
+            let ore = ScheduledDecorationFeature::load(
                 &mut data,
                 &schedule,
                 plan.features[0].feature,
@@ -1394,7 +1610,7 @@ mod tests {
             let (mut terrain, tags, motion, _) = fixture();
             let before = terrain.snapshot();
             let mut region = terrain
-                .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
+                .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
                 .unwrap();
             assert!(
                 region
@@ -1422,7 +1638,8 @@ mod tests {
         )
         .unwrap();
         let key = FeatureKey::Registered(ResourceId::parse("test:ore").unwrap());
-        let ore = ScheduledOreFeature::load(&mut data, &schedule, &key, &mut resolve_test).unwrap();
+        let ore = ScheduledDecorationFeature::load(&mut data, &schedule, &key, &mut resolve_test)
+            .unwrap();
         assert!(ore.biome_allows(&plains).unwrap());
         assert!(
             !ore.biome_allows(&desert).unwrap(),
@@ -1441,7 +1658,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         assert!(region.place_planned_auto(&plan, index, &ore).unwrap());
         region.finish().unwrap();
@@ -1453,12 +1670,16 @@ mod tests {
             &registry,
         )
         .unwrap();
-        let other_ore =
-            ScheduledOreFeature::load(&mut other_data, &other_schedule, &key, &mut resolve_test)
-                .unwrap();
+        let other_ore = ScheduledDecorationFeature::load(
+            &mut other_data,
+            &other_schedule,
+            &key,
+            &mut resolve_test,
+        )
+        .unwrap();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         assert!(region.place_planned_auto(&plan, index, &other_ore).is_err());
         region.finish().unwrap();
@@ -1476,9 +1697,13 @@ mod tests {
             &registry,
         )
         .unwrap();
-        let ambiguous_ore =
-            ScheduledOreFeature::load(&mut ambiguous, &ambiguous_schedule, &key, &mut resolve_test)
-                .unwrap();
+        let ambiguous_ore = ScheduledDecorationFeature::load(
+            &mut ambiguous,
+            &ambiguous_schedule,
+            &key,
+            &mut resolve_test,
+        )
+        .unwrap();
         assert!(ambiguous_ore.biome_allows(&plains).unwrap());
         assert!(ambiguous_ore.biome_allows(&desert).is_err());
         assert!(!ambiguous_ore.biome_allows(&forest).unwrap());
@@ -1511,6 +1736,7 @@ mod tests {
             "minecraft:stone",
             "minecraft:diamond_ore",
             "minecraft:ancient_debris",
+            "minecraft:clay",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1522,7 +1748,7 @@ mod tests {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         let prepared =
-            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+            PreparedDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
                 .unwrap();
         let (mut terrain, _, _, _) = fixture();
         let before = terrain.snapshot();
@@ -1551,7 +1777,7 @@ mod tests {
             FeatureSchedule::load(&mut data, std::slice::from_ref(&plains), &registry).unwrap();
         let plan = fixture_plan(&schedule, &neighborhood);
         assert!(
-            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+            PreparedDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
                 .is_err()
         );
 
@@ -1560,7 +1786,7 @@ mod tests {
             FeatureSchedule::load(&mut data, std::slice::from_ref(&plains), &registry).unwrap();
         let plan = fixture_plan(&schedule, &neighborhood);
         let prepared =
-            PreparedOreDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
+            PreparedDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)
                 .unwrap();
         let (mut terrain, _, _, _) = fixture();
         let before = terrain.snapshot();
@@ -1594,13 +1820,9 @@ mod tests {
                 .unwrap();
         let (_, _, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
-        let batch = PreparedOreDecoration::load(
-            &mut MixedData,
-            &plan,
-            &batch_registry(),
-            &mut resolve_test,
-        )
-        .unwrap();
+        let batch =
+            PreparedDecoration::load(&mut MixedData, &plan, &batch_registry(), &mut resolve_test)
+                .unwrap();
         let (mut terrain, _, _, _) = fixture();
         let results = batch.execute(&mut terrain, false).unwrap();
         assert_eq!(results.len(), 2);
@@ -1609,6 +1831,104 @@ mod tests {
         assert!((-8..8).any(|x| (-8..8).any(|z| {
             (0..8).any(|y| world.block(x, y, z).unwrap().name == "minecraft:ancient_debris")
         })));
+    }
+
+    #[test]
+    fn prepared_batch_runs_vein_then_disk_and_publishes_marks() {
+        struct MixedData;
+        impl ResourceProvider for MixedData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let disk = json!({"feature":{"type":"minecraft:disk","target":{"type":"minecraft:matching_blocks","blocks":"minecraft:stone"},"state_provider":{"id":"minecraft:clay"},"radius":1,"half_height":1},"placement":[{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":4},"max_inclusive":{"absolute":4}}},{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_blocks","blocks":["minecraft:stone","minecraft:diamond_ore"]}},{"type":"minecraft:biome"}]});
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[["test:ore",disk]]}),
+                    )?));
+                }
+                ScheduledData { heightmap: None }.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let schedule =
+            FeatureSchedule::load(&mut MixedData, std::slice::from_ref(&plains), &registry)
+                .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut incomplete = batch_registry();
+        incomplete.remove("minecraft:stone");
+        assert!(
+            PreparedDecoration::load(&mut MixedData, &plan, &incomplete, &mut resolve_test)
+                .is_err()
+        );
+        let batch =
+            PreparedDecoration::load(&mut MixedData, &plan, &batch_registry(), &mut resolve_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let results = batch.execute(&mut terrain, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[1]);
+        assert!(terrain.snapshot().chunks.keys().any(|p| {
+            terrain
+                .feature_postprocessing(*p)
+                .is_some_and(|v| v.sections().iter().any(|s| !s.is_empty()))
+        }));
+        assert!((-2..=2).any(|x| (-2..=2).any(|z| {
+            (0..8).any(|y| terrain.snapshot().block(x, y, z).unwrap().name == "minecraft:clay")
+        })));
+    }
+
+    #[test]
+    fn failed_disk_write_discards_blocks_and_marks() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        assert!(region.set_disk_block([0, 4, 0], &state("clay")).unwrap());
+        region.mark_postprocessing([0, 5, 0]).unwrap();
+        assert!(
+            region
+                .set_disk_block([0, 5, 0], &state("diamond_ore"))
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert!(terrain.feature_postprocessing(center).is_none());
+    }
+
+    #[test]
+    fn feature_marks_follow_carvers_without_losing_duplicates() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        assert!(terrain.postprocessing_marks_to_date(center).is_none());
+        let mut earlier = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
+        earlier.mark(0, 5, 0);
+        terrain
+            .carver_postprocessing
+            .insert(center, Arc::new(earlier));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.mark_postprocessing([0, 5, 0]).unwrap();
+        region.mark_postprocessing([1, 5, 0]).unwrap();
+        region.finish().unwrap();
+        assert_eq!(
+            terrain.carver_postprocessing(center).unwrap().sections()[0],
+            [0x50]
+        );
+        assert_eq!(
+            terrain
+                .postprocessing_marks_to_date(center)
+                .unwrap()
+                .sections()[0],
+            [0x50, 0x50, 0x51]
+        );
     }
 
     #[test]
@@ -1635,7 +1955,7 @@ mod tests {
             "ore_ancient_debris_large",
             "ore_debris_small",
         ] {
-            PlacedOreFeature::load(
+            PlacedDecorationFeature::load(
                 &mut installed,
                 &ResourceId::parse(&format!("minecraft:{name}")).unwrap(),
                 &mut |v| super::super::resolve_generated_terrain_state(v, &registry),
@@ -1840,7 +2160,7 @@ mod tests {
                     let mut terrain = oracle_terrain();
                     let previous = terrain.snapshot();
                     let writable = previous.chunks.keys().copied().collect();
-                    let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+                    let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
                     let mut random = DecorationRandom::new(0);
                     let deco = random.set_decoration_seed(seed, -32, 48);
                     random.set_feature_seed(deco, 7, 3);
@@ -1884,7 +2204,7 @@ mod tests {
             {"type":"minecraft:count","count":4},{"type":"minecraft:in_square"},
             {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-5},"max_inclusive":{"absolute":5}}}
         ]})).unwrap();
-        let placed = PlacedOreFeature::from_placement(&mut data, placement, &mut |v| {
+        let placed = PlacedDecorationFeature::from_placement(&mut data, placement, &mut |v| {
             Ok(state(
                 v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
             ))
@@ -1895,7 +2215,7 @@ mod tests {
             let mut terrain = oracle_terrain();
             let previous = terrain.snapshot();
             let writable = previous.chunks.keys().copied().collect();
-            let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
             let mut random = DecorationRandom::new(0);
             let deco = random.set_decoration_seed(seed, -32, 48);
             random.set_feature_seed(deco, 7, 3);
@@ -1926,7 +2246,7 @@ mod tests {
         }
         let key = FeatureKey::Registered(ResourceId::parse("example:ore").unwrap());
         let (_, java_schedule, _) = scheduled_fixture(None);
-        let scheduled = ScheduledOreFeature {
+        let scheduled = ScheduledDecorationFeature {
             key: key.clone(),
             placed,
             schedule: &java_schedule,
@@ -1969,7 +2289,7 @@ mod tests {
                 generator_height: 32,
             };
             let mut region = terrain
-                .ore_region(&tags, &motion, previous.chunks.keys().copied().collect())
+                .decoration_region(&tags, &motion, previous.chunks.keys().copied().collect())
                 .unwrap();
             region
                 .place_planned(&plan, 0, &scheduled, &mut |_, _| {
@@ -2066,7 +2386,7 @@ mod tests {
                 generator_height: 32,
             };
             assert_eq!(plan.features.len(), 2);
-            let batch = PreparedOreDecoration::load(
+            let batch = PreparedDecoration::load(
                 &mut batch_data,
                 &plan,
                 &block_registry,

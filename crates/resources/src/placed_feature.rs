@@ -4,10 +4,13 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use serde_json::Value;
 
-use crate::packs::{ResourceId, ResourceProvider};
+use crate::{
+    disk_feature::BlockPredicate,
+    packs::{ResourceId, ResourceProvider},
+};
 
 #[derive(Clone, Debug)]
-enum IntProvider {
+pub(crate) enum IntProvider {
     Constant(i32),
     Uniform(i32, i32),
     Biased(i32, i32),
@@ -36,7 +39,7 @@ fn kind(value: &Value) -> Result<String> {
     Ok(id.path)
 }
 impl IntProvider {
-    fn parse(value: &Value, depth: u8) -> Result<Self> {
+    pub(crate) fn parse(value: &Value, depth: u8) -> Result<Self> {
         ensure!(depth < 32, "integer provider nesting is too deep");
         if let Some(value) = value.as_i64() {
             return Ok(Self::Constant(i32::try_from(value)?));
@@ -104,7 +107,7 @@ impl IntProvider {
             name => bail!("unsupported integer provider {name}"),
         })
     }
-    fn bounds(&self) -> (i32, i32) {
+    pub(crate) fn bounds(&self) -> (i32, i32) {
         match self {
             Self::Constant(v) => (*v, *v),
             Self::Uniform(a, b) | Self::Biased(a, b) | Self::Trapezoid(a, b, _) => (*a, *b),
@@ -114,7 +117,7 @@ impl IntProvider {
                 .fold((i32::MAX, i32::MIN), |(a, b), (c, d)| (a.min(c), b.max(d))),
         }
     }
-    fn sample(&self, random: &mut DecorationRandom) -> i32 {
+    pub(crate) fn sample(&self, random: &mut DecorationRandom) -> i32 {
         match self {
             Self::Constant(v) => *v,
             Self::Uniform(a, b) => a.wrapping_add(random.next_int_bound(b - a + 1).unwrap()),
@@ -249,6 +252,7 @@ enum Modifier {
     Rarity(i32),
     Heightmap(String),
     Biome,
+    BlockPredicate(BlockPredicate),
     Offset(IntProvider, IntProvider, IntProvider),
 }
 
@@ -258,6 +262,26 @@ pub struct PlacedFeature {
     modifiers: Vec<Modifier>,
 }
 impl PlacedFeature {
+    pub fn required_tags(&self) -> std::collections::BTreeSet<ResourceId> {
+        self.modifiers
+            .iter()
+            .filter_map(|m| match m {
+                Modifier::BlockPredicate(p) => Some(p.required_tags()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+    pub fn required_blocks(&self) -> std::collections::BTreeSet<ResourceId> {
+        self.modifiers
+            .iter()
+            .filter_map(|m| match m {
+                Modifier::BlockPredicate(p) => Some(p.required_blocks()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
     /// Each codec decode creates a distinct uniform/trapezoid height-provider
     /// object in 26.3. Since HeightRangePlacement is a record containing that
     /// object, separately decoded placed features cannot be equal when this
@@ -337,6 +361,11 @@ impl PlacedFeature {
                     Modifier::Heightmap(name.to_owned())
                 }
                 "biome" => Modifier::Biome,
+                "block_predicate_filter" => Modifier::BlockPredicate(BlockPredicate::decode(
+                    entry
+                        .get("predicate")
+                        .context("missing placement block predicate")?,
+                )?),
                 "offset" => {
                     let parse = |name| -> Result<IntProvider> {
                         let provider = IntProvider::parse(
@@ -388,6 +417,14 @@ pub trait PlacementEnvironment {
     fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32>;
     /// The environment checks the top-level placed feature at this position.
     fn biome_allows(&mut self, position: [i32; 3]) -> Result<bool>;
+    /// Evaluate against current world blocks, including earlier placements.
+    fn block_predicate(
+        &mut self,
+        _predicate: &BlockPredicate,
+        _position: [i32; 3],
+    ) -> Result<bool> {
+        bail!("placement block predicates are unavailable")
+    }
 }
 struct Frame {
     position: [i32; 3],
@@ -472,6 +509,9 @@ impl PlacementPositions<'_> {
                                 (y > env.min_y()).then_some([position[0], y, position[2]])
                             }
                             Modifier::Biome => env.biome_allows(position)?.then_some(position),
+                            Modifier::BlockPredicate(predicate) => env
+                                .block_predicate(predicate, position)?
+                                .then_some(position),
                             Modifier::Offset(x, y, z) => Some([
                                 position[0].wrapping_add(x.sample(random)),
                                 position[1].wrapping_add(y.sample(random)),

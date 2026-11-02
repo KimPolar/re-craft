@@ -20,6 +20,7 @@ pub mod carver;
 pub mod chest_loot;
 pub mod datapacks;
 pub mod density;
+pub mod disk_feature;
 pub mod enchantments;
 pub mod entity_collision;
 pub mod feature_order;

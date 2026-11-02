@@ -52,6 +52,18 @@ impl PostProcessing {
         &self.sections
     }
 
+    /// Append a later generation stage without changing earlier ordering or
+    /// duplicate entries. Incompatible dimension bounds leave this unchanged.
+    pub fn append(&mut self, later: &Self) -> bool {
+        if self.min_y != later.min_y || self.max_y != later.max_y {
+            return false;
+        }
+        for (target, source) in self.sections.iter_mut().zip(&later.sections) {
+            target.extend_from_slice(source);
+        }
+        true
+    }
+
     /// Decode one packed offset with Java's 32-bit coordinate arithmetic.
     pub fn unpack(
         &self,
@@ -91,5 +103,20 @@ mod tests {
         assert_eq!(updates.unpack(24, 0, 0, 0), None);
         assert!(PostProcessing::new(-63, 384).is_none());
         assert!(PostProcessing::new(0, 0).is_none());
+    }
+
+    #[test]
+    fn append_preserves_stage_order_and_rejects_different_bounds() {
+        let mut earlier = PostProcessing::new(-16, 32).unwrap();
+        earlier.mark(-1, -1, 0);
+        let mut later = PostProcessing::new(-16, 32).unwrap();
+        later.mark(-1, -1, 0);
+        later.mark(0, 0, 0);
+        assert!(earlier.append(&later));
+        assert_eq!(earlier.sections()[0], [0xff, 0xff]);
+        assert_eq!(earlier.sections()[1], [0]);
+        let before = earlier.clone();
+        assert!(!earlier.append(&PostProcessing::new(0, 32).unwrap()));
+        assert_eq!(earlier, before);
     }
 }

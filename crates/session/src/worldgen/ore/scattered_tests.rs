@@ -108,6 +108,7 @@ fn terrain(seed: i64) -> CarvedTerrainWorld {
         noise_postprocessing: BTreeMap::new(),
         surface_postprocessing: BTreeMap::new(),
         carver_postprocessing: BTreeMap::new(),
+        feature_postprocessing: BTreeMap::new(),
     }
 }
 struct Env;
@@ -282,7 +283,7 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
         let mut data = Data { mode: case.mode };
         let value = json!({"feature":{"type":"minecraft:scattered_ore","size":case.size,"discard_chance_on_air_exposure":case.discard.parse::<f32>().unwrap(),"targets":[{"target":{"predicate_type":"minecraft:tag_match","tag":"minecraft:base_stone_nether"},"state":"minecraft:ancient_debris"}]},"placement":[]});
         let placement = PlacedFeature::decode(&value).unwrap();
-        let feature = PlacedOreFeature::from_placement(&mut data, placement, &mut |v| {
+        let feature = PlacedDecorationFeature::from_placement(&mut data, placement, &mut |v| {
             Ok(block(
                 v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
             ))
@@ -293,7 +294,7 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
         let mut terrain = terrain(case.seed);
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         let mut random = DecorationRandom::new(0);
         let deco = random.set_decoration_seed(case.seed, -16, 32);
@@ -350,7 +351,7 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
         );
         assert_eq!(case.direct_count, 3);
         let mut region = terrain
-            .ore_region(&tags, &motion, after.chunks.keys().copied().collect())
+            .decoration_region(&tags, &motion, after.chunks.keys().copied().collect())
             .unwrap();
         for step in 0..3 {
             match step {

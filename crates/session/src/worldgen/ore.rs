@@ -18,7 +18,7 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
 };
-use native_world::loaded::{BlockState, BlockStateId, ChunkPos, World};
+use native_world::loaded::{BlockState, BlockStateId, ChunkPos, SavedBlockTick, World};
 use serde_json::Value;
 
 use super::{CarvedTerrainWorld, DecorationPlan};
@@ -35,6 +35,7 @@ pub struct DecorationRegion<'a> {
     surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     final_heights: BTreeMap<ChunkPos, Arc<FinalHeightmaps>>,
     feature_marks: BTreeMap<ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
+    block_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -382,6 +383,7 @@ impl CarvedTerrainWorld {
             surface_heights,
             final_heights,
             feature_marks,
+            block_tick_keys: BTreeMap::new(),
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -1128,9 +1130,40 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
         result
     }
 
-    fn schedule_simple_tick(&mut self, _: [i32; 3]) -> Result<()> {
-        self.failed = true;
-        bail!("simple-block scheduled ticks are not implemented")
+    fn schedule_simple_tick(&mut self, pos: [i32; 3]) -> Result<()> {
+        let result = (|| {
+            // WorldGenTickAccess uses the chunk at the position even if a
+            // preceding setBlock was rejected by the feature write radius.
+            let block = self.block(pos)?.name;
+            let chunk = chunk(pos);
+            let keys = self.block_tick_keys.entry(chunk).or_insert_with(|| {
+                self.world
+                    .saved_block_ticks
+                    .get(&chunk)
+                    .into_iter()
+                    .flatten()
+                    .map(|tick| (tick.position, tick.block.clone()))
+                    .collect()
+            });
+            if keys.insert((pos, block.clone())) {
+                // ProtoChunkTicks discards the requested delay and stores 0.
+                self.world
+                    .saved_block_ticks
+                    .entry(chunk)
+                    .or_default()
+                    .push(SavedBlockTick {
+                        block,
+                        position: pos,
+                        delay: 0,
+                        priority: 0,
+                    });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 }
 
@@ -2235,7 +2268,7 @@ mod tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if path == "data/minecraft/worldgen/biome/plains.json" {
-                    let grass = json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"}},"placement":[
+                    let grass = json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"},"schedule_tick":true},"placement":[
                         {"type":"minecraft:noise_threshold_count","noise_level":0.0,"below_noise":4,"above_noise":4},
                         {"type":"minecraft:in_square"},
                         {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":8},"max_inclusive":{"absolute":8}}},
@@ -2269,10 +2302,22 @@ mod tests {
         assert!((0..16).any(|x| {
             (0..16).any(|z| world.block(x, 8, z).unwrap().name == "minecraft:short_grass")
         }));
+        let ticks = world
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .unwrap();
+        assert!(!ticks.is_empty());
+        assert!(
+            ticks
+                .iter()
+                .all(|tick| tick.block == "minecraft:short_grass"
+                    && tick.delay == 0
+                    && tick.priority == 0)
+        );
     }
 
     #[test]
-    fn unsupported_simple_tick_does_not_publish_plant() {
+    fn simple_ticks_are_deduplicated_and_use_the_actual_block() {
         let (mut terrain, _, motion, _) = fixture();
         let tags = OreBlockTags::load(
             &mut Data,
@@ -2287,9 +2332,89 @@ mod tests {
             .unwrap();
         let feature=SimpleBlockFeature::decode(&json!({"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"},"schedule_tick":true}),&mut resolve_test).unwrap();
         let mut random = DecorationRandom::new(0);
-        assert!(feature.place(&mut region, &mut random, [0, 8, 0]).is_err());
+        assert!(feature.place(&mut region, &mut random, [0, 8, 0]).unwrap());
+        assert!(feature.place(&mut region, &mut random, [0, 8, 0]).unwrap());
+        // A feature outside the write radius still schedules its current block.
+        assert!(feature.place(&mut region, &mut random, [16, 8, 0]).unwrap());
+        region.schedule_simple_tick([0, -1, 0]).unwrap();
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert!(before.saved_block_ticks.is_empty());
+        assert_eq!(
+            after.saved_block_ticks[&center],
+            [
+                SavedBlockTick {
+                    block: "minecraft:short_grass".into(),
+                    position: [0, 8, 0],
+                    delay: 0,
+                    priority: 0
+                },
+                SavedBlockTick {
+                    block: "minecraft:void_air".into(),
+                    position: [0, -1, 0],
+                    delay: 0,
+                    priority: 0
+                },
+            ]
+        );
+        assert_eq!(
+            after.saved_block_ticks[&ChunkPos { x: 1, z: 0 }],
+            [SavedBlockTick {
+                block: "minecraft:air".into(),
+                position: [16, 8, 0],
+                delay: 0,
+                priority: 0
+            },]
+        );
+        let mut next = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        next.schedule_simple_tick([0, 8, 0]).unwrap();
+        next.set_section_block([0, 8, 0], &state("stone")).unwrap();
+        next.schedule_simple_tick([0, 8, 0]).unwrap();
+        next.schedule_simple_tick([0, 8, 0]).unwrap();
+        next.finish().unwrap();
+        let current = terrain.snapshot();
+        let ticks = &current.saved_block_ticks[&center];
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(
+            ticks[2],
+            SavedBlockTick {
+                block: "minecraft:stone".into(),
+                position: [0, 8, 0],
+                delay: 0,
+                priority: 0
+            }
+        );
+        assert_eq!(after.saved_block_ticks[&center].len(), 2);
+    }
+
+    #[test]
+    fn failed_simple_attempt_discards_scheduled_ticks() {
+        let (mut terrain, _, motion, _) = fixture();
+        let tags = OreBlockTags::load(
+            &mut Data,
+            &batch_registry(),
+            &BTreeSet::from([ResourceId::parse("minecraft:supports_vegetation").unwrap()]),
+        )
+        .unwrap();
+        let before = terrain.snapshot();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let feature=SimpleBlockFeature::decode(&json!({"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"},"schedule_tick":true}),&mut resolve_test).unwrap();
+        let invalid = SimpleBlockFeature::decode(
+            &json!({"type":"minecraft:simple_block","to_place":{"id":"minecraft:diamond_ore"}}),
+            &mut resolve_test,
+        )
+        .unwrap();
+        let mut random = DecorationRandom::new(0);
+        assert!(feature.place(&mut region, &mut random, [0, 8, 0]).unwrap());
+        assert!(invalid.place(&mut region, &mut random, [1, 8, 0]).is_err());
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert!(terrain.snapshot().saved_block_ticks.is_empty());
     }
 
     #[test]

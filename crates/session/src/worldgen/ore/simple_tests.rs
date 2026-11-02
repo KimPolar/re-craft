@@ -164,6 +164,7 @@ fn registry() -> BTreeSet<String> {
         "tall_dry_grass",
         "sweet_berry_bush",
         "melon",
+        "closed_eyeblossom",
     ]
     .into_iter()
     .map(|s| format!("minecraft:{s}"))
@@ -181,7 +182,8 @@ fn feature(kind: i32) -> Value {
         3 => json!({"id":"minecraft:tall_grass","properties":{"half":"lower"}}),
         4 => json!({"id":"minecraft:sunflower","properties":{"half":"upper"}}),
         5 => json!({"id":"minecraft:sweet_berry_bush","properties":{"age":"3"}}),
-        _ => json!({"id":"minecraft:melon"}),
+        6 => json!({"id":"minecraft:melon"}),
+        _ => json!({"id":"minecraft:closed_eyeblossom"}),
     };
     json!({"type":"minecraft:simple_block","to_place":to_place})
 }
@@ -198,10 +200,13 @@ struct Case {
     restricted: i32,
     n: i32,
     seed: i64,
+    scheduled: bool,
     result: bool,
+    second: bool,
     next: i64,
     blocks: BTreeMap<i32, String>,
     heights: [i32; 4],
+    ticks: Vec<SavedBlockTick>,
 }
 fn run(cmd: &mut Command) -> String {
     let out = cmd.output().unwrap();
@@ -255,16 +260,18 @@ fn simple_features_match_java_survival_writes_and_randomness() {
         let w: Vec<_> = line.split_whitespace().collect();
         match w.as_slice() {
             ["E", "safe"] => safe = true,
-            ["C", kind, restricted, n, seed] => cases.push(Case {
+            ["C", kind, restricted, n, seed, scheduled] => cases.push(Case {
                 kind: kind.parse().unwrap(),
                 restricted: restricted.parse().unwrap(),
                 n: n.parse().unwrap(),
                 seed: seed.parse().unwrap(),
+                scheduled: *scheduled == "1",
                 ..Case::default()
             }),
-            ["R", result, next] => {
+            ["R", result, second, next] => {
                 let c = cases.last_mut().unwrap();
                 c.result = result.parse().unwrap();
+                c.second = second.parse().unwrap();
                 c.next = next.parse().unwrap();
             }
             ["B", y, value] => {
@@ -277,11 +284,19 @@ fn simple_features_match_java_survival_writes_and_randomness() {
             ["H", a, b, c, d] => {
                 cases.last_mut().unwrap().heights = [a, b, c, d].map(|v| v.parse().unwrap())
             }
+            ["T", name, x, y, z, delay, priority] => {
+                cases.last_mut().unwrap().ticks.push(SavedBlockTick {
+                    block: (*name).into(),
+                    position: [x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap()],
+                    delay: delay.parse().unwrap(),
+                    priority: priority.parse().unwrap(),
+                })
+            }
             _ => {}
         }
     }
     assert!(safe);
-    assert_eq!(cases.len(), 224);
+    assert_eq!(cases.len(), 512);
     let registry = registry();
     let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
     let required = [
@@ -292,7 +307,9 @@ fn simple_features_match_java_survival_writes_and_randomness() {
     .collect();
     let tags = OreBlockTags::load(&mut Data, &registry, &required).unwrap();
     for case in cases {
-        let plant = SimpleBlockFeature::decode(&feature(case.kind), &mut resolve).unwrap();
+        let mut config = feature(case.kind);
+        config["schedule_tick"] = json!(case.scheduled);
+        let plant = SimpleBlockFeature::decode(&config, &mut resolve).unwrap();
         let mut terrain = terrain();
         let center = ChunkPos { x: -1, z: 2 };
         let writable = if case.restricted == 0 {
@@ -312,6 +329,13 @@ fn simple_features_match_java_survival_writes_and_randomness() {
             case.kind,
             case.n
         );
+        assert_eq!(
+            plant.place(&mut region, &mut random, pos).unwrap(),
+            case.second,
+            "second attempt kind {} n {}",
+            case.kind,
+            case.n
+        );
         assert_eq!(random.next_long(), case.next);
         for kind in 0..4 {
             assert_eq!(
@@ -324,6 +348,19 @@ fn simple_features_match_java_survival_writes_and_randomness() {
         }
         region.finish().unwrap();
         let world = terrain.snapshot();
+        assert_eq!(
+            world
+                .saved_block_ticks
+                .get(&center)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            case.ticks,
+            "ticks kind {} restricted {} n {} seed {}",
+            case.kind,
+            case.restricted,
+            case.n,
+            case.seed
+        );
         for y in [1, 2] {
             assert_eq!(
                 key(world.block(pos[0], y, pos[2]).unwrap()),
@@ -348,6 +385,8 @@ fn simple_features_match_java_survival_writes_and_randomness() {
         "firefly_bush",
         "melon",
         "pumpkin",
+        "flower_pale_garden",
+        "pale_forest_flower",
     ] {
         SimpleBlockFeature::load(
             &mut resources,

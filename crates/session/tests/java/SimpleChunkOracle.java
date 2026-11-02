@@ -17,6 +17,7 @@ import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.levelgen.feature.*;
 import net.minecraft.world.level.levelgen.feature.stateproviders.*;
 import net.minecraft.util.random.WeightedList;
+import net.minecraft.world.ticks.*;
 
 public class SimpleChunkOracle {
   static java.io.PrintStream out;
@@ -34,7 +35,7 @@ public class SimpleChunkOracle {
     for(var e:props.entrySet())s.append(e.getKey()).append('=').append(e.getValue()).append(';');
     return s.toString();
   }
-  static SimpleBlockFeature feature(int kind) {
+  static SimpleBlockFeature feature(int kind,boolean schedule) {
     BlockStateProvider p=switch(kind) {
       case 0 -> BlockStateProvider.of(Blocks.SHORT_GRASS);
       case 1 -> new WeightedStateProvider(WeightedList.<BlockState>builder().add(Blocks.SHORT_GRASS.defaultBlockState(),3).add(Blocks.FERN.defaultBlockState(),1));
@@ -43,9 +44,10 @@ public class SimpleChunkOracle {
       case 4 -> BlockStateProvider.of(Blocks.SUNFLOWER.defaultBlockState().setValue(DoublePlantBlock.HALF,DoubleBlockHalf.UPPER));
       case 5 -> BlockStateProvider.of(Blocks.SWEET_BERRY_BUSH.defaultBlockState().setValue(SweetBerryBushBlock.AGE,3));
       case 6 -> BlockStateProvider.of(Blocks.MELON);
+      case 7 -> BlockStateProvider.of(Blocks.CLOSED_EYEBLOSSOM);
       default -> throw new AssertionError();
     };
-    return new SimpleBlockFeature(p);
+    return new SimpleBlockFeature(Holder.direct(p),schedule);
   }
   public static void main(String[]args)throws Exception {
     out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
@@ -60,20 +62,24 @@ public class SimpleChunkOracle {
     var biome=Holder.direct((Biome)unsafe.allocateInstance(Biome.class));var ids=new IdMapper<Holder<Biome>>();ids.add(biome);
     var palette=new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState(),null,Strategy.createForBiomes(ids),biome,null);
     var height=LevelHeightAccessor.create(-16,32);
-    for(int kind=0;kind<7;kind++)for(int restricted=0;restricted<2;restricted++)for(int n=0;n<8;n++)for(long seed:new long[]{0,7}) {
+    for(int kind=0;kind<8;kind++)for(int restricted=0;restricted<2;restricted++)for(int n=0;n<8;n++)for(long seed:new long[]{0,7})for(int scheduled=0;scheduled<2;scheduled++) {
       int x=-16+n,z=32;final int limit=restricted;
       var c=new ProtoChunk(new ChunkPos(-1,2),UpgradeData.EMPTY,height,palette,null);c.setPersistedStatus(ChunkStatus.TERRAIN);
       for(int y=-16;y<16;y++)for(int dz=0;dz<16;dz++)for(int dx=0;dx<16;dx++){var s=initial(-16+dx,y,32+dz);if(!s.isAir())c.getSection((y+16)>>4).setBlockState(dx,y&15,dz,s,false);}
       Heightmap.primeHeightmaps(c,EnumSet.of(Heightmap.Types.WORLD_SURFACE_WG,Heightmap.Types.OCEAN_FLOOR_WG,Heightmap.Types.WORLD_SURFACE,Heightmap.Types.OCEAN_FLOOR,Heightmap.Types.MOTION_BLOCKING,Heightmap.Types.MOTION_BLOCKING_NO_LEAVES));
       var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
         var p=(BlockPos)a[0];if((p.getX()>>4)!=-1||(p.getZ()>>4)!=2)throw new AssertionError("missing chunk");
-        return switch(m.getName()) {case "getBlockState" -> c.getBlockState(p);case "setBlock" -> {if(limit==1)yield false;c.setBlockState(p,(BlockState)a[1],(int)a[2]);yield true;}default -> throw new UnsupportedOperationException(m.getName());};
+        return switch(m.getName()) {case "getBlockState" -> c.getBlockState(p);case "setBlock" -> {if(limit==1)yield false;c.setBlockState(p,(BlockState)a[1],(int)a[2]);yield true;}case "scheduleTick" -> {c.getBlockTicks().schedule(new ScheduledTick<>((Block)a[1],p,1L,0L));yield null;}default -> throw new UnsupportedOperationException(m.getName());};
       });
       var random=new WorldgenRandom(new XoroshiroRandomSource(0));long deco=random.setDecorationSeed(seed,-16,32);random.setFeatureSeed(deco,7,3);
-      out.printf("C %d %d %d %d%n",kind,restricted,n,seed);
-      boolean result=feature(kind).place(world,null,random,new BlockPos(x,1,z));out.println("R "+result+" "+random.nextLong());
+      out.printf("C %d %d %d %d %d%n",kind,restricted,n,seed,scheduled);
+      var placed=feature(kind,scheduled==1);
+      boolean result=placed.place(world,null,random,new BlockPos(x,1,z));
+      boolean second=placed.place(world,null,random,new BlockPos(x,1,z));
+      out.println("R "+result+" "+second+" "+random.nextLong());
       out.println("B 1 "+key(c.getBlockState(new BlockPos(x,1,z))));out.println("B 2 "+key(c.getBlockState(new BlockPos(x,2,z))));
       out.printf("H %d %d %d %d%n",c.getHeight(Heightmap.Types.WORLD_SURFACE,x,z)+1,c.getHeight(Heightmap.Types.OCEAN_FLOOR,x,z)+1,c.getHeight(Heightmap.Types.MOTION_BLOCKING,x,z)+1,c.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,x,z)+1);
+      for(var tick:((ProtoChunkTicks<Block>)c.getBlockTicks()).scheduledTicks())out.printf("T %s %d %d %d %d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),tick.pos().getX(),tick.pos().getY(),tick.pos().getZ(),tick.delay(),tick.priority().getValue());
     }
   }
 }

@@ -186,6 +186,20 @@ fn climate_index_and_vanilla_presets_match_java() {
                 group = Some(group.map_or(0, |v| v + 1));
                 index = 0;
             }
+            Some("O") => {
+                let actual = sources[group.unwrap()]
+                    .possible_biomes_in_order()
+                    .iter()
+                    .map(|id| format!("{}:{}", id.namespace, id.path))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                assert_eq!(
+                    actual,
+                    parts.next().unwrap(),
+                    "biome iteration order group {}",
+                    group.unwrap()
+                );
+            }
             Some("P") => {
                 let point: [f32; 6] = targets[index].clone().try_into().unwrap();
                 let selected = sources[group.unwrap()].select(point).unwrap();

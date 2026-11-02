@@ -302,6 +302,21 @@ impl BiomeSource {
             SourceKind::End(ids) => ids.iter().cloned().collect(),
         }
     }
+    /// Java retains each biome's first appearance in the parameter stream.
+    /// Decoration feature indices depend on this order.
+    pub fn possible_biomes_in_order(&self) -> Vec<ResourceId> {
+        let mut seen = BTreeSet::new();
+        let entries: &[ResourceId] = match &self.kind {
+            SourceKind::Fixed(id) => std::slice::from_ref(id),
+            SourceKind::Multi(tree) => &tree.biomes,
+            SourceKind::End(ids) => ids,
+        };
+        entries
+            .iter()
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect()
+    }
     pub fn is_end(&self) -> bool {
         matches!(self.kind, SourceKind::End(_))
     }

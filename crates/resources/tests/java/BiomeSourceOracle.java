@@ -30,6 +30,9 @@ public class BiomeSourceOracle {
         parameters=new Climate.ParameterList<>(entries);
       }
       out.println("S");
+      var ordered = new LinkedHashSet<String>();
+      for(var pair:parameters.values()) ordered.add(pair.getSecond());
+      out.println("O "+String.join(",", ordered));
       for(var entry:document.getAsJsonArray("targets")) {
         var t=entry.getAsJsonArray();
         var target=Climate.target(t.get(0).getAsFloat(),t.get(1).getAsFloat(),t.get(2).getAsFloat(),t.get(3).getAsFloat(),t.get(4).getAsFloat(),t.get(5).getAsFloat());

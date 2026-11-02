@@ -2513,6 +2513,160 @@ mod tests {
         }})
     }
     #[test]
+    fn fresh_batch_executes_features_with_initial_light_and_rolls_back_failures() {
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        struct FeatureData {
+            unsupported: bool,
+        }
+        impl ResourceProvider for FeatureData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let kind = if self.unsupported {
+                        "example:unsupported"
+                    } else {
+                        "minecraft:simple_block"
+                    };
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[[
+                            {"feature":{"type":kind,"to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]},
+                            {"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:red_mushroom"}},"placement":[{"type":"minecraft:offset","x":9,"y":8,"z":8}]}
+                        ]]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    || path == "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:dirt","minecraft:melon"]}"#
+                            .to_vec(),
+                    ));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Data.list_data(folder)
+            }
+        }
+        let registry: BTreeSet<_> = [
+            "air",
+            "cave_air",
+            "void_air",
+            "bedrock",
+            "stone",
+            "dirt",
+            "water",
+            "lava",
+            "melon",
+            "red_mushroom",
+        ]
+        .into_iter()
+        .map(|s| format!("minecraft:{s}"))
+        .collect();
+        let center = ChunkPos { x: 0, z: 0 };
+        for (has_sky, unsupported) in [(true, false), (false, false), (false, true)] {
+            let mut data = FeatureData { unsupported };
+            let tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                    .unwrap();
+            let mut batch =
+                FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
+                    .unwrap();
+            assert!(batch.request_features(center).is_err());
+            let lighting = GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+                dimension_type: None,
+                min_y: 0,
+                height: 16,
+                has_skylight: has_sky,
+            };
+            let mut invalid = lighting.clone();
+            invalid.height = 32;
+            assert!(
+                batch
+                    .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &invalid)
+                    .is_err()
+            );
+            batch
+                .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
+                .unwrap();
+            batch.request_features(center).unwrap();
+            let mut classify = |v: &Value| -> Result<CarverBlockState> {
+                let name = v
+                    .as_str()
+                    .or_else(|| v.get("id").and_then(Value::as_str))
+                    .context("state ID")?;
+                Ok(CarverBlockState {
+                    is_air: name == "minecraft:air",
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            };
+            let mut resolve = |v: &Value| -> Result<BlockState> {
+                Ok(BlockState {
+                    name: v
+                        .as_str()
+                        .or_else(|| v.get("id").and_then(Value::as_str))
+                        .context("state ID")?
+                        .into(),
+                    properties: BTreeMap::new(),
+                })
+            };
+            let mut before_feature = None;
+            loop {
+                if batch
+                    .schedule()
+                    .next_ready()
+                    .is_some_and(|(_, stage)| stage == schedule::GenerationStage::Features)
+                {
+                    before_feature = batch.snapshot();
+                }
+                match batch.step(&mut data, &mut classify, &mut resolve) {
+                    Ok(Some(_)) => {}
+                    Ok(None) if !unsupported => break,
+                    Err(_) if unsupported => break,
+                    other => panic!("unexpected batch result {other:?}"),
+                }
+            }
+            let before = before_feature.unwrap();
+            assert_eq!(before.chunks.len(), 9);
+            assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:dirt");
+            if unsupported {
+                assert!(Arc::ptr_eq(&before, &batch.snapshot().unwrap()));
+                assert_eq!(
+                    batch.schedule().completed(center),
+                    Some(schedule::GenerationStage::Terrain)
+                );
+                assert!(!batch.is_complete());
+                continue;
+            }
+            assert!(batch.is_complete());
+            assert_eq!(
+                batch.schedule().completed(center),
+                Some(schedule::GenerationStage::Features)
+            );
+            let after = batch.snapshot().unwrap();
+            assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:melon");
+            assert_eq!(
+                after.block(9, 8, 8).unwrap().name,
+                if has_sky {
+                    "minecraft:dirt"
+                } else {
+                    "minecraft:red_mushroom"
+                }
+            );
+            assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:dirt");
+        }
+    }
+    #[test]
     fn fresh_terrain_batch_runs_dependencies_and_stops_after_failure() {
         use native_resources::carver::tags::CarverBlockTags;
         use native_world::loaded::{BlockState, ChunkPos};

@@ -463,6 +463,24 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Apply features against a complete, immutable visible light revision.
+    pub fn run_features_with_visible_light(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures_enabled: bool,
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<Vec<bool>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result = prepared.execute_with_visible_light(terrain, structures_enabled, light)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Calculate direct-sky sources and register sections before advancing the
     /// fresh INITIALIZE_LIGHT stage. No light propagation is performed here.
     pub fn run_light_initialization(

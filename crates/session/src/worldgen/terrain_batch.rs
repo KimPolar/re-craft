@@ -3,18 +3,20 @@ use anyhow::{Context, Result, bail, ensure};
 use native_resources::{
     carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
+    dimension_lighting::GeneratedDimensionLighting,
+    feature_order::FeatureSchedule,
     packs::{ResourceId, ResourceProvider},
 };
 use native_world::loaded::{BlockState, ChunkPos, World};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
-    BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, TerrainGenerator,
+    BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, PreparedDecoration, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
 };
 
-/// A single-threaded, incrementally driven batch for fresh terrain only.
+/// A single-threaded, incrementally driven batch for fresh generation.
 /// Its generator, provider, block registry and tags must belong to the same
 /// immutable pack stack. No old-chunk blending or structures are supported.
 /// Its deterministic work order has not been proven to match Java's thread
@@ -28,7 +30,14 @@ pub struct FreshTerrainBatch {
     tags: CarverBlockTags,
     dimension: String,
     terrain: Option<CarvedTerrainWorld>,
+    decoration: Option<DecorationConfig>,
     failed: bool,
+}
+
+struct DecorationConfig {
+    schedule: FeatureSchedule,
+    block_registry: BTreeSet<String>,
+    has_skylight: bool,
 }
 
 impl FreshTerrainBatch {
@@ -54,14 +63,60 @@ impl FreshTerrainBatch {
             tags,
             dimension: format!("{}:{}", id.namespace, id.path),
             terrain: None,
+            decoration: None,
             failed: false,
         })
+    }
+
+    /// Configure FEATURES before requesting work. The lighting settings and
+    /// registries must come from the same immutable pack stack as the generator.
+    /// This batch uses a freshly empty light engine and never initializes or
+    /// propagates light; no external light work may be interleaved with it.
+    pub fn enable_decoration(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        placed_features: &BTreeSet<ResourceId>,
+        block_registry: BTreeSet<String>,
+        lighting: &GeneratedDimensionLighting,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed && self.schedule.requested_chunks() == 0 && self.decoration.is_none(),
+            "decoration must be configured before requests"
+        );
+        ensure!(
+            format!(
+                "{}:{}",
+                lighting.dimension.namespace, lighting.dimension.path
+            ) == self.dimension
+                && lighting.min_y == self.generator.min_y
+                && lighting.height == self.generator.height,
+            "lighting settings differ from generation dimension"
+        );
+        ensure!(!block_registry.is_empty(), "block registry is empty");
+        let schedule = self.generator.feature_schedule(provider, placed_features)?;
+        self.decoration = Some(DecorationConfig {
+            schedule,
+            block_registry,
+            has_skylight: lighting.has_skylight,
+        });
+        Ok(())
     }
 
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
         self.schedule.request(pos, GenerationStage::Terrain)
+    }
+
+    /// Request terrain and supported FEATURES for one chunk. No light stage is
+    /// requested, so all decoration observes the initial empty light engine.
+    pub fn request_features(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        ensure!(self.decoration.is_some(), "decoration is not configured");
+        self.schedule.request(pos, GenerationStage::Features)
     }
 
     pub fn is_complete(&self) -> bool {
@@ -115,6 +170,46 @@ impl FreshTerrainBatch {
                 classify,
                 resolve,
             ),
+            GenerationStage::Features => (|| {
+                let config = self
+                    .decoration
+                    .as_ref()
+                    .context("decoration is not configured")?;
+                let plan = self.generator.decoration_plan(
+                    &config.schedule,
+                    &self.biomes,
+                    [pos.x, pos.z],
+                )?;
+                let prepared =
+                    PreparedDecoration::load(provider, &plan, &config.block_registry, resolve)?;
+                let mut covered = Vec::with_capacity(9);
+                for dz in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        covered.push(ChunkPos {
+                            x: pos.x.checked_add(dx).context("light X overflow")?,
+                            z: pos.z.checked_add(dz).context("light Z overflow")?,
+                        });
+                    }
+                }
+                let light = native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(true, config.has_skylight, [], covered)
+                    .context("invalid initial light columns")?;
+                let terrain = self
+                    .terrain
+                    .as_mut()
+                    .context("feature terrain is missing")?;
+                ensure!(
+                    !terrain.has_published_light
+                        && terrain
+                            .world
+                            .chunks
+                            .values()
+                            .all(|chunk| !chunk.block_light_correct),
+                    "feature batch light engine is not fresh"
+                );
+                self.schedule
+                    .run_features_with_visible_light(terrain, &prepared, false, &light)?;
+                Ok(())
+            })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),
         };
         if let Err(error) = result {

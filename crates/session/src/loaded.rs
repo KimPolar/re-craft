@@ -6821,9 +6821,7 @@ impl LoadedSession {
                 name,
                 self.origin.as_dvec3() + self.motion.position,
                 self.player_uuid,
-                true,
-                self.game_mode == GameMode::Spectator,
-                self.sneak,
+                Some(self.player_vibration_source()),
                 affected.as_deref(),
             );
         }
@@ -6847,10 +6845,42 @@ impl LoadedSession {
             event,
             position.as_dvec3() + DVec3::splat(0.5),
             self.player_uuid,
-            true,
-            self.game_mode == GameMode::Spectator,
-            self.sneak,
+            Some(self.player_vibration_source()),
             Some(&name),
+        );
+    }
+
+    fn player_vibration_source(&self) -> crate::vibration::VibrationSource {
+        crate::vibration::VibrationSource {
+            spectator: self.game_mode == GameMode::Spectator,
+            stepping_carefully: self.sneak,
+            dampens_vibrations: false,
+            server_player: true,
+        }
+    }
+
+    /// Buttons use their player source; levers and timed releases do not.
+    fn block_action_vibration(&mut self, relative: IVec3, powered: bool, player_source: bool) {
+        let Some(position) = add(self.origin, relative) else {
+            return;
+        };
+        let event = if powered {
+            "minecraft:block_activate"
+        } else {
+            "minecraft:block_deactivate"
+        };
+        let source = player_source.then(|| self.player_vibration_source());
+        let uuid = if player_source {
+            self.player_uuid
+        } else {
+            None
+        };
+        self.dispatch_vibration(
+            event,
+            position.as_dvec3() + DVec3::splat(0.5),
+            uuid,
+            source,
+            None,
         );
     }
 
@@ -6880,9 +6910,7 @@ impl LoadedSession {
             "minecraft:splash",
             event.position,
             event.source_uuid,
-            false,
-            false,
-            false,
+            Some(crate::vibration::VibrationSource::default()),
             None,
         );
     }
@@ -6893,9 +6921,7 @@ impl LoadedSession {
         event_name: &str,
         event_position: DVec3,
         source_uuid: Option<[i32; 4]>,
-        server_player: bool,
-        spectator: bool,
-        stepping_carefully: bool,
+        source: Option<crate::vibration::VibrationSource>,
         affected_block: Option<&str>,
     ) {
         let (Some(events), Some(blocks)) = (
@@ -6914,13 +6940,7 @@ impl LoadedSession {
             },
             None => false,
         };
-        let source = crate::vibration::VibrationSource {
-            spectator,
-            stepping_carefully,
-            dampens_vibrations: false,
-            server_player,
-        };
-        if crate::vibration::filter(&events, event_name, Some(source), affected_dampens, true)
+        if crate::vibration::filter(&events, event_name, source, affected_dampens, true)
             != crate::vibration::FilterResult::Accept
         {
             return;
@@ -13775,6 +13795,7 @@ impl LoadedSession {
             self.schedule_button(relative, kind);
             self.first_person.swing.start(crate::animation::Hand::Main);
             self.push_button_sound(relative, kind, true);
+            self.block_action_vibration(relative, true, true);
         }
         true
     }
@@ -13817,6 +13838,7 @@ impl LoadedSession {
                     sequence,
                 });
             }
+            self.block_action_vibration(relative, !powered, false);
         }
         true
     }
@@ -14044,6 +14066,7 @@ impl LoadedSession {
                 executed += 1;
                 if self.set_button_power(relative, key.kind, false) {
                     self.push_button_sound(relative, key.kind, false);
+                    self.block_action_vibration(relative, false, false);
                 }
             } else if kind == 3 {
                 let (order, key) = self
@@ -17574,9 +17597,7 @@ impl LoadedSession {
                         "minecraft:hit_ground",
                         self.origin.as_dvec3() + self.motion.position,
                         self.player_uuid,
-                        true,
-                        self.game_mode == GameMode::Spectator,
-                        self.sneak,
+                        Some(self.player_vibration_source()),
                         Some(&affected),
                     );
                 }
@@ -21186,6 +21207,9 @@ pub(crate) mod tests {
             "minecraft:air".into(),
             "minecraft:stone".into(),
             "minecraft:sculk_sensor".into(),
+            "minecraft:stone_button".into(),
+            "minecraft:oak_button".into(),
+            "minecraft:lever".into(),
         ]);
         let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
             &mut BlockEventPacks { dampens, occludes },
@@ -21267,6 +21291,95 @@ pub(crate) mod tests {
                 assert_eq!(row["center"], true);
                 assert_eq!(row["source"], true);
                 assert_eq!(row["affected"], true);
+            }
+        }
+    }
+
+    fn action_event_session(ignore_sneak: bool) -> (LoadedSession, IVec3) {
+        let (mut session, sensor) = block_event_session(false, false, false);
+        let events = BTreeSet::from([
+            "minecraft:block_activate".into(),
+            "minecraft:block_deactivate".into(),
+        ]);
+        let ignored = if ignore_sneak {
+            events.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let blocks = Arc::clone(session.vibration_block_tags.as_ref().unwrap());
+        session.set_vibration_tags(
+            Arc::new(native_resources::game_event_tags::GameEventTags::new(
+                events, ignored,
+            )),
+            blocks,
+        );
+        (session, sensor)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_block_actions_with_java(rows: &[serde_json::Value]) {
+        assert_eq!(rows.len(), 20);
+        for (index, row) in rows.iter().enumerate() {
+            let (mut session, sensor) = action_event_session(false);
+            let name = row["kind"].as_str().unwrap();
+            let powered = row["powered"].as_bool().unwrap();
+            let careful = row["careful"].as_bool().unwrap();
+            let release = row["release"].as_bool().unwrap();
+            session.sneak = careful;
+            let relative = IVec3::new(8, 2, 6);
+            let mut block = stone_button_state(IVec3::Z, 0.0).unwrap();
+            block.name = format!("minecraft:{name}");
+            block
+                .properties
+                .insert("powered".into(), powered.to_string());
+            let id = session.intern_block(block);
+            assert!(session.set(relative, id));
+            if name == "lever" {
+                assert!(session.use_lever(relative));
+            } else if release {
+                let kind =
+                    native_core::button::Button::from_id(&format!("minecraft:{name}")).unwrap();
+                session.schedule_button(relative, kind);
+                session.tick += u64::from(kind.duration());
+                session
+                    .advance_scheduled_block_ticks(false, true, false, false, false, false, false);
+            } else {
+                assert!(session.use_button(relative));
+            }
+            let pos = session.origin + relative;
+            let actual_powered =
+                session.world.block(pos.x, pos.y, pos.z).unwrap().properties["powered"] == "true";
+            assert_eq!(
+                actual_powered,
+                row["after"].as_bool().unwrap(),
+                "Java action {index}: {row}"
+            );
+            let pending = session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending()
+                .map(|(_, event)| event);
+            let expected = row["event"].as_str().unwrap();
+            assert_eq!(
+                pending.map(|event| event.event.as_str()).unwrap_or("none"),
+                match expected {
+                    "block_activate" => "minecraft:block_activate",
+                    "block_deactivate" => "minecraft:block_deactivate",
+                    "none" => "none",
+                    _ => panic!("unexpected action"),
+                },
+                "Java action {index}: {row}"
+            );
+            if let Some(event) = pending {
+                assert_eq!(event.position, pos.as_dvec3() + DVec3::splat(0.5));
+                assert_eq!(
+                    event.source,
+                    if row["source"] == "player" {
+                        session.player_uuid
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(row["center"], true);
             }
         }
     }
@@ -32219,6 +32332,76 @@ pub(crate) mod tests {
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
         );
+    }
+
+    #[test]
+    fn button_and_lever_vibrations_keep_java_sources_and_ignore_affected_block() {
+        struct DampensActions;
+        impl native_resources::packs::ResourceProvider for DampensActions {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![if path.ends_with("dampens_vibrations.json") {
+                    br#"{"values":["minecraft:stone_button","minecraft:lever"]}"#.to_vec()
+                } else {
+                    br#"{"values":[]}"#.to_vec()
+                }])
+            }
+        }
+        for (lever, release) in [(false, false), (false, true), (true, false)] {
+            let (mut session, sensor) = action_event_session(true);
+            let registry = session.vanilla_block_ids.as_ref().unwrap();
+            let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+                &mut DampensActions,
+                registry,
+            )
+            .unwrap();
+            let events = Arc::clone(session.vibration_event_tags.as_ref().unwrap());
+            session.set_vibration_tags(events, Arc::new(blocks));
+            session.sneak = true;
+            let relative = IVec3::new(8, 2, 6);
+            let mut block = stone_button_state(IVec3::Z, 0.0).unwrap();
+            if lever {
+                block.name = "minecraft:lever".into();
+            }
+            if release {
+                block.properties.insert("powered".into(), "true".into());
+            }
+            let id = session.intern_block(block);
+            assert!(session.set(relative, id));
+            if lever {
+                assert!(session.use_lever(relative));
+            } else if release {
+                let kind = native_core::button::Button::from_id("minecraft:stone_button").unwrap();
+                session.schedule_button(relative, kind);
+                session.tick += u64::from(kind.duration());
+                session
+                    .advance_scheduled_block_ticks(false, true, false, false, false, false, false);
+            } else {
+                assert!(session.use_button(relative));
+            }
+            let pending = session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending()
+                .map(|(_, event)| event);
+            assert_eq!(
+                pending.is_some(),
+                lever || release,
+                "lever={lever}, release={release}"
+            );
+            if let Some(event) = pending {
+                assert_eq!(event.source, None);
+                assert_eq!(
+                    event.event,
+                    if release {
+                        "minecraft:block_deactivate"
+                    } else {
+                        "minecraft:block_activate"
+                    }
+                );
+            }
+        }
     }
 
     #[test]

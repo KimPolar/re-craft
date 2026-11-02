@@ -557,6 +557,9 @@ mod tests {
         crate::loaded::tests::compare_player_block_events_with_java(
             data["block_events"].as_array().unwrap(),
         );
+        crate::loaded::tests::compare_block_actions_with_java(
+            data["block_actions"].as_array().unwrap(),
+        );
         let landings = data["landing"].as_array().unwrap();
         assert_eq!(landings.len(), 200);
         for (index, row) in landings.iter().enumerate() {

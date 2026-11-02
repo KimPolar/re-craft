@@ -38,6 +38,8 @@ enum StateSchema {
     Multiface,
     HugeMushroom,
     LeafLitter,
+    CaveVinesBody,
+    CaveVinesHead,
 }
 
 impl StateSchema {
@@ -83,6 +85,13 @@ impl StateSchema {
                     ("segment_amount".into(), "1".into()),
                 ]);
             }
+            Self::CaveVinesBody => return BTreeMap::from([("berries".into(), "false".into())]),
+            Self::CaveVinesHead => {
+                return BTreeMap::from([
+                    ("age".into(), "0".into()),
+                    ("berries".into(), "false".into()),
+                ]);
+            }
             Self::Snowy => ("snowy", "false"),
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
@@ -118,6 +127,14 @@ impl StateSchema {
             }
             Self::LeafLitter if name == "segment_amount" => java_decimal(value)
                 .filter(|n| (1..=4).contains(n))
+                .map(|n| n.to_string()),
+            Self::CaveVinesBody | Self::CaveVinesHead
+                if name == "berries" && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::CaveVinesHead if name == "age" => java_decimal(value)
+                .filter(|n| (0..=25).contains(n))
                 .map(|n| n.to_string()),
             Self::AmethystCluster
                 if name == "facing"
@@ -311,6 +328,12 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::HugeMushroom)
                 }
                 "net/minecraft/world/level/block/LeafLitterBlock" => Some(StateSchema::LeafLitter),
+                "net/minecraft/world/level/block/CaveVinesPlantBlock" => {
+                    Some(StateSchema::CaveVinesBody)
+                }
+                "net/minecraft/world/level/block/CaveVinesBlock" => {
+                    Some(StateSchema::CaveVinesHead)
+                }
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"
                 | "net/minecraft/world/level/block/TallFlowerBlock" => {
